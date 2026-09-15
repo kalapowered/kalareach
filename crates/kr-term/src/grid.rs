@@ -157,10 +157,19 @@ impl AlertHandler for AlertCollector {
 /// Every alert is bounded and the list is bounded, so this is a constant rather than a
 /// measurement: it is what the session is charged for the channel, whether or not anything is on
 /// it at the moment.
-pub(crate) const ALERT_LIST_BYTES: u64 =
+pub const ALERT_LIST_BYTES: u64 =
     // Twice, because the list grows by appending and can be holding twice the alerts it has. Each
     // alert carries at most two strings, each cut to the bound.
     (2 * MAX_ALERTS * (size_of::<GridAlert>() + 2 * MAX_ALERT_BYTES)) as u64;
+
+/// What the two screen buffers hold, measured together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BufferBytes {
+    /// What each buffer's rows hold beyond their cell slots, primary first.
+    pub content: [u64; 2],
+    /// What the hyperlinks of both buffers cost, the pen's and the saved cursors' included.
+    pub links: u64,
+}
 
 /// The configuration the grid library runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,10 +452,12 @@ impl CanonicalGrid {
     /// # Errors
     ///
     /// Returns [`crate::error::TermError::Geometry`] for dimensions outside the three simultaneous
-    /// constraints, and [`crate::error::TermError::Budget`] when the screens would not fit.
+    /// constraints, and [`crate::error::TermError::Admission`] when what both buffers can hold at
+    /// that size does not fit the session budget.
     pub fn new(size: GridSize, config: GridConfig, budget: &mut SessionBudget) -> Result<Self> {
         let size = size.validate()?;
-        let cost = budget.check_geometry(size)?;
+        let footprint =
+            budget.check_geometry(size, config.scrollback_rows, config.cell_bytes as u64)?;
         let writer_log = Arc::new(Mutex::new(WriterLog::default()));
         let alerts = Arc::new(Mutex::new(Vec::new()));
         let alerts_dropped = Arc::new(AtomicUsize::new(0));
@@ -468,7 +479,7 @@ impl CanonicalGrid {
             alerts: Arc::clone(&alerts),
             dropped: Arc::clone(&alerts_dropped),
         }));
-        budget.commit_geometry(cost);
+        budget.commit_geometry(footprint);
         Ok(Self {
             terminal,
             writer_log,
@@ -835,40 +846,59 @@ impl CanonicalGrid {
 
     /// Lowers the scrollback row count so the retained rows fit the byte bound.
     ///
-    /// Returns whether the cache was over its bound. The library evicts as it appends, so the
-    /// retained rows converge back under the bound over the following rows rather than being
-    /// dropped all at once. The lowered row count is proportional to the overshoot, so the
-    /// sequence converges rather than oscillating.
+    /// Returns whether the rows were over it. `bytes` is what they cost now, which the caller has
+    /// already measured.
+    ///
+    /// One pass is enough, and it lands under the bound rather than converging towards it. The row
+    /// count kept is read off the rows themselves: the oldest rows are dropped one at a time until
+    /// what is left costs no more than the bound, and that count becomes the library's scrollback
+    /// size. Working it out from the average cost of a row would leave the answer wrong whenever
+    /// the rows are not all the same size, which is the usual case.
     pub fn enforce_row_cache(&mut self, bytes: u64, limit: u64) -> bool {
         if bytes <= limit {
             return false;
         }
-        let rows = self.scrollback_rows().max(1);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the quotient of two byte counts times a row count stays inside usize here"
-        )]
-        // Aim a little under the bound rather than exactly at it. The row count is worked out from
-        // the average cost of a row, the rows are not all the same size, and the visible rows are
-        // measured but are not part of the scrollback the count bounds, so aiming exactly at the
-        // bound lands just above it.
-        let target =
-            ((rows as u64).saturating_mul(limit) * 9 / (bytes.max(1).saturating_mul(10))) as usize;
+        let keep = self.newest_history_rows_within(bytes, limit);
         let current = self.configuration.scrollback_rows.load(Ordering::Relaxed);
         // There is no floor: the retained rows are a cache, and at a wide geometry even a screen's
         // worth of them can pass the bound on its own. Keeping none of them is the right answer
         // then, and the spool still has everything.
-        let next = target.min(current);
-        if next < current {
+        if keep < current {
             self.configuration
                 .scrollback_rows
-                .store(next, Ordering::Relaxed);
+                .store(keep, Ordering::Relaxed);
             self.configuration
                 .generation
                 .fetch_add(1, Ordering::Relaxed);
         }
         self.trim_scrollback();
         true
+    }
+
+    /// How many of the newest retained rows cost no more than `limit`, given that all of them
+    /// cost `total`.
+    ///
+    /// The rows are visited oldest first, so what is dropped is counted rather than what is kept:
+    /// once the rows still ahead cost no more than the bound, the rest of the walk changes
+    /// nothing. Every row is visited at most once.
+    fn newest_history_rows_within(&self, total: u64, limit: u64) -> usize {
+        let screen = self.terminal.screen();
+        let history = screen
+            .scrollback_rows()
+            .saturating_sub(self.size.rows as usize);
+        let mut remaining = total;
+        let mut dropped = 0usize;
+        let mut index = 0usize;
+        screen.for_each_phys_line(|_, line| {
+            let oldest = index < history;
+            index += 1;
+            if !oldest || remaining <= limit {
+                return;
+            }
+            remaining = remaining.saturating_sub(history_row_bytes(line));
+            dropped += 1;
+        });
+        history.saturating_sub(dropped)
     }
 
     /// Drops the rows that are now past the scrollback bound, without waiting for more output.
@@ -896,15 +926,19 @@ impl CanonicalGrid {
     /// # Errors
     ///
     /// Returns [`crate::error::TermError::Geometry`] for invalid dimensions and
-    /// [`crate::error::TermError::Budget`] when the new screens would not fit. The current grid is
-    /// unchanged in both cases.
+    /// [`crate::error::TermError::Admission`] when what both buffers can hold at the new size does
+    /// not fit the session budget. The current grid is unchanged in both cases.
     pub fn resize(&mut self, size: GridSize, budget: &mut SessionBudget) -> Result<()> {
         let size = size.validate()?;
-        let cost = budget.check_geometry(size)?;
+        let footprint = budget.check_geometry(
+            size,
+            self.config.scrollback_rows,
+            self.config.cell_bytes as u64,
+        )?;
         // The rows reflow, so the cell a mark would have joined is no longer where it was.
         self.tail = None;
         self.terminal.resize(to_library_size(size));
-        budget.commit_geometry(cost);
+        budget.commit_geometry(footprint);
         self.size = size;
         Ok(())
     }
@@ -1197,52 +1231,65 @@ impl CanonicalGrid {
             .saturating_sub(self.size.rows as usize)
     }
 
-    /// Bytes the retained rows are currently using.
+    /// What the two screen buffers are holding.
     ///
-    /// This counts the encoded text plus the per-cell bookkeeping the grid keeps for it, because
-    /// the bound in section 8 is on resident state rather than on characters.
+    /// Both, because the buffer that is not showing still holds its own: a session can fill the
+    /// primary buffer, switch, and fill the alternate one as well. One walk of each screen answers
+    /// for its content and its hyperlinks together, because the two are read from the same cells.
     #[must_use]
-    pub fn screen_content_bytes(&self) -> u64 {
-        let screen = self.terminal.screen();
+    pub fn buffer_bytes(&self) -> BufferBytes {
+        // Each distinct link object once, wherever it is held. The cells of one link share it, a
+        // link can run past the end of a row, and the pen keeps the one it is inside, so counting
+        // it where it appears would report a session as holding many times what it does.
+        let mut seen = BTreeSet::new();
+        let mut links = 0u64;
+        // The pen's link and the saved cursors' links come first, because they are on no row: a
+        // link that is opened and then saved, or opened over an empty screen, is held by the pen
+        // alone, and a measurement that only walked rows would report it as free.
+        if let Some(link) = self.terminal.pen().hyperlink() {
+            add_link_object(link, &mut seen, &mut links);
+        }
+        for alternate in [false, true] {
+            if let Some(saved) = self.terminal.saved_cursor(alternate)
+                && let Some(link) = saved.pen.hyperlink()
+            {
+                add_link_object(link, &mut seen, &mut links);
+            }
+        }
+        let active = self.content_showing(self.terminal.screen(), &mut seen, &mut links);
+        let inactive =
+            self.content_showing(self.terminal.inactive_screen(), &mut seen, &mut links);
+        let content = if self.alternate_active() {
+            [inactive, active]
+        } else {
+            [active, inactive]
+        };
+        BufferBytes { content, links }
+    }
+
+    /// What one screen's rows that are showing hold, adding their links to a running total.
+    ///
+    /// The rows above the screen are the historical cache's, which has a bound of its own.
+    fn content_showing(
+        &self,
+        screen: &wezterm_term::screen::Screen,
+        seen: &mut BTreeSet<*const Hyperlink>,
+        links: &mut u64,
+    ) -> u64 {
         let history = screen
             .scrollback_rows()
             .saturating_sub(self.size.rows as usize);
-        let mut bytes = 0u64;
+        let mut content = 0u64;
         let mut index = 0usize;
         screen.for_each_phys_line(|_, line| {
             let counted = index >= history;
             index += 1;
             if counted {
-                bytes = bytes.saturating_add(row_content_bytes(line));
+                content = content.saturating_add(row_content_bytes(line));
+                add_row_links(line, seen, links);
             }
         });
-        bytes
-    }
-
-    /// The most one buffer's content can cost at this geometry.
-    ///
-    /// Printing is charged before it is applied, and a screen is a fixed number of cells, so the
-    /// charge is held to what those cells can hold rather than to how much was printed through
-    /// them.
-    #[must_use]
-    pub fn screen_content_ceiling(&self) -> u64 {
-        u64::from(self.size.cols)
-            .saturating_mul(u64::from(self.size.rows))
-            .saturating_mul((self.config.cell_bytes as u64).saturating_add(CELL_ATTRIBUTE_BYTES))
-    }
-
-    /// The most one buffer's cells can cost in attribute allocations at this geometry.
-    #[must_use]
-    pub fn screen_attribute_ceiling(&self) -> u64 {
-        u64::from(self.size.cols)
-            .saturating_mul(u64::from(self.size.rows))
-            .saturating_mul(CELL_ATTRIBUTE_BYTES)
-    }
-
-    /// Whether the current pen makes every cell it writes keep an allocation of its own.
-    #[must_use]
-    pub fn pen_is_allocated(&self) -> bool {
-        attributes_are_allocated(&self.terminal.pen())
+        content
     }
 
     /// The stable identifier the retained history ends at, which is the top visible row.
@@ -1272,29 +1319,7 @@ impl CanonicalGrid {
             let counted = index >= first && index < history;
             index += 1;
             if counted {
-                let cells = line.len() as u64;
-                bytes = bytes
-                    .saturating_add(row_content_bytes(line) + cells * CELL_OVERHEAD_BYTES)
-                    .saturating_add(link_bytes(line));
-            }
-        });
-        bytes
-    }
-
-    /// Bytes the hyperlinks of the rows that are showing cost.
-    #[must_use]
-    pub fn screen_link_bytes(&self) -> u64 {
-        let screen = self.terminal.screen();
-        let history = screen
-            .scrollback_rows()
-            .saturating_sub(self.size.rows as usize);
-        let mut bytes = 0u64;
-        let mut index = 0usize;
-        screen.for_each_phys_line(|_, line| {
-            let counted = index >= history;
-            index += 1;
-            if counted {
-                bytes = bytes.saturating_add(link_bytes(line));
+                bytes = bytes.saturating_add(history_row_bytes(line));
             }
         });
         bytes
@@ -1318,41 +1343,62 @@ impl CanonicalGrid {
         screen.for_each_phys_line(|_, line| {
             let counted = index < history;
             index += 1;
-            if !counted {
-                return;
+            if counted {
+                bytes = bytes.saturating_add(history_row_bytes(line));
             }
-            let cells = line.len() as u64;
-            bytes = bytes.saturating_add(row_content_bytes(line) + cells * CELL_OVERHEAD_BYTES);
-            bytes = bytes.saturating_add(link_bytes(line));
         });
         bytes
     }
 }
 
-/// What the hyperlinks of one row cost.
+/// What one retained row costs the historical cache.
+///
+/// Its cells, the text and attribute allocations they hold, and the hyperlink objects on it. The
+/// slot the row takes in its screen's array is not here: that array is reserved whole when the
+/// geometry is admitted, scrollback slots included, so charging it again would count it twice.
+fn history_row_bytes(line: &wezterm_term::Line) -> u64 {
+    let cells = line.len() as u64;
+    row_content_bytes(line)
+        .saturating_add(cells.saturating_mul(CELL_OVERHEAD_BYTES))
+        .saturating_add(link_bytes(line))
+}
+
+/// What the hyperlinks of one row cost, on their own.
 ///
 /// A cell inside a hyperlink holds a reference to the whole link, and a row of them costs far more
 /// than its text. Each distinct link object is counted once: the cells of one link share it, and two
 /// links that happen to have the same target do not share anything.
 fn link_bytes(line: &wezterm_term::Line) -> u64 {
-    if !line.has_hyperlink() {
-        return 0;
-    }
+    let mut seen = BTreeSet::new();
     let mut bytes = 0u64;
-    // Every distinct object on the row, not every run of them: one link can be opened once and used
-    // in cells that are not next to each other, and charging it again each time would report a row
-    // as costing a thousand times what it does.
-    let mut seen: BTreeSet<*const Hyperlink> = BTreeSet::new();
-    for cell in line.visible_cells() {
-        let Some(link) = cell.attrs().hyperlink() else {
-            continue;
-        };
-        if !seen.insert(Arc::as_ptr(link)) {
-            continue;
-        }
-        bytes = bytes.saturating_add(link_object_bytes(link));
-    }
+    add_row_links(line, &mut seen, &mut bytes);
     bytes
+}
+
+/// Adds the link objects of one row that `seen` has not already counted.
+fn add_row_links(
+    line: &wezterm_term::Line,
+    seen: &mut BTreeSet<*const Hyperlink>,
+    bytes: &mut u64,
+) {
+    if !line.has_hyperlink() {
+        return;
+    }
+    // Every distinct object, not every run of them: one link can be opened once and used in cells
+    // that are not next to each other, and charging it again each time would report a row as
+    // costing a thousand times what it does.
+    for cell in line.visible_cells() {
+        if let Some(link) = cell.attrs().hyperlink() {
+            add_link_object(link, seen, bytes);
+        }
+    }
+}
+
+/// Adds one link object, if it has not been counted already.
+fn add_link_object(link: &Arc<Hyperlink>, seen: &mut BTreeSet<*const Hyperlink>, bytes: &mut u64) {
+    if seen.insert(Arc::as_ptr(link)) {
+        *bytes = bytes.saturating_add(link_object_bytes(link));
+    }
 }
 
 /// What a link of this length will cost once the grid holds it.
@@ -1388,8 +1434,51 @@ fn link_object_bytes(link: &Hyperlink) -> u64 {
     bytes
 }
 
+/// What the table of distinct hyperlink targets costs for one entry, beyond the bytes of the
+/// target it holds.
+///
+/// The table keeps its entries in nodes that hold several of them and are allocated whole, so an
+/// entry is charged for the slot it takes, for the room beside it the node is holding empty, and
+/// for the pointer the node above keeps to it.
+pub const LINK_TABLE_ENTRY_BYTES: u64 =
+    (2 * size_of::<String>() + 2 * size_of::<usize>()) as u64;
+
+/// What the first node of the table of distinct hyperlink targets costs.
+///
+/// A node holds several entries and is allocated whole, so the first target to arrive pays for a
+/// node that is almost all empty.
+pub const LINK_TABLE_NODE_BYTES: u64 =
+    (11 * size_of::<String>() + 4 * size_of::<usize>()) as u64;
+
+/// What the table of distinct hyperlink targets costs for `target`.
+///
+/// The string as it is held rather than as it reads: it is built by appending, so it can be
+/// holding twice the bytes of the target.
+pub fn link_table_entry_bytes(target: &String) -> u64 {
+    STRING_HANDLE_BYTES + target.capacity() as u64 + LINK_TABLE_ENTRY_BYTES
+}
+
+/// What one row costs in the array its screen keeps, whether or not anything is on it.
+///
+/// A screen holds its rows in one array of row records, and the array is grown by doubling, so it
+/// can be holding room for twice the rows it has. An empty row is a record like any other: it
+/// occupies its slot, and a screen of them is not free.
+pub const ROW_SLOT_BYTES: u64 = 2 * size_of::<wezterm_term::Line>() as u64;
+
+/// What a cell's text costs beyond its bytes once it no longer fits inside the cell.
+///
+/// A cell holds its text in the cell itself while that text is shorter than a machine word and
+/// covers at most two columns. Past either of those the grid puts the text on the heap behind a
+/// header that holds the byte vector and the width the text was measured at.
+pub const CELL_TEXT_HEAP_BYTES: u64 = (size_of::<Vec<u8>>() + size_of::<usize>()) as u64;
+
+/// Whether a cell's text is too big to live inside the cell.
+fn cell_text_is_on_the_heap(text: &str, width: usize) -> bool {
+    text.len() >= size_of::<u64>() || width > 2
+}
+
 /// What a string costs beyond the bytes it holds: the pointer, the length and the capacity.
-pub(crate) const STRING_HANDLE_BYTES: u64 = size_of::<String>() as u64;
+pub const STRING_HANDLE_BYTES: u64 = size_of::<String>() as u64;
 
 /// What one link object costs before the bytes its strings hold.
 ///
@@ -1411,7 +1500,7 @@ const TABLE_GROUP_BYTES: u64 = 16;
 /// allocation of its own, reached through a pointer, and the grid makes that allocation as soon as
 /// any of them is more than the packed form on the cell can hold. Its fields are the three colour
 /// attributes, the link handle and the image list.
-pub(crate) const CELL_ATTRIBUTE_BYTES: u64 = {
+pub const CELL_ATTRIBUTE_BYTES: u64 = {
     let fields = 3 * size_of::<ColorAttribute>() + 4 * size_of::<usize>();
     // The allocation is aligned to a pointer, so what it occupies rounds up to a multiple of one.
     (fields.next_multiple_of(size_of::<usize>())) as u64
@@ -1454,19 +1543,22 @@ fn attributes_are_allocated(attrs: &CellAttributes) -> bool {
 
 /// What one row holds beyond the cells the screens are already charged for.
 ///
-/// The text as it is encoded, plus the allocation each cell that needs one keeps for its
-/// attributes. Counting the text alone would report a screen of coloured cells as costing what a
-/// screen of plain ones costs.
+/// The text as it is encoded, the allocation each cell that needs one keeps for its attributes,
+/// and the header a cell keeps once its text is too big to live inside the cell. Counting the text
+/// alone would report a screen of coloured cells as costing what a screen of plain ones costs.
 fn row_content_bytes(line: &wezterm_term::Line) -> u64 {
     // The text as the row is holding it rather than as it reads: a row grows its string by
     // appending, so it can be holding twice what it shows.
     let mut bytes = 2 * line.as_str().len() as u64;
     for cell in line.visible_cells() {
+        let width = cell.width().max(1);
         if attributes_are_allocated(cell.attrs()) {
             // The columns a wide cell covers carry its attributes, and while the row is held as a
             // vector of cells each of those columns is a cell with an allocation of its own.
-            bytes = bytes
-                .saturating_add(CELL_ATTRIBUTE_BYTES.saturating_mul(cell.width().max(1) as u64));
+            bytes = bytes.saturating_add(CELL_ATTRIBUTE_BYTES.saturating_mul(width as u64));
+        }
+        if cell_text_is_on_the_heap(cell.str(), width) {
+            bytes = bytes.saturating_add(CELL_TEXT_HEAP_BYTES);
         }
     }
     bytes

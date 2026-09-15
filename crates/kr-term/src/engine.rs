@@ -205,30 +205,6 @@ const ROW_CACHE_ROW_STEP: usize = 32;
 /// How many hyperlinks may arrive before the resident state is measured again.
 const LINK_MEASURE_INTERVAL: u64 = 64;
 
-/// How many times eviction re-measures before leaving the rest to the next read.
-const EVICTION_PASSES: u32 = 4;
-
-/// What one entry of the link table costs beyond the bytes of the target it holds.
-///
-/// The set keeps its entries in nodes that hold several of them and are allocated whole, so an
-/// entry is charged for the slot it takes, for the room beside it the node is holding empty, and
-/// for the pointer the node above keeps to it.
-const TABLE_ENTRY_BYTES: u64 = (2 * size_of::<String>() + 2 * size_of::<usize>()) as u64;
-
-/// What the first node of the link table costs.
-///
-/// A node holds several entries and is allocated whole, so the first target to arrive pays for a
-/// node that is almost all empty.
-const TABLE_NODE_BYTES: u64 = (11 * size_of::<String>() + 4 * size_of::<usize>()) as u64;
-
-/// What the link table costs for one target.
-///
-/// The string as it is held rather than as it reads: it is built by appending, so it can be
-/// holding twice the bytes of the target.
-fn link_table_entry_bytes(uri: &String) -> u64 {
-    crate::grid::STRING_HANDLE_BYTES + uri.capacity() as u64 + TABLE_ENTRY_BYTES
-}
-
 /// How many rows a history page builds at a time before checking its byte bound.
 const PAGE_BATCH_ROWS: usize = 32;
 
@@ -444,7 +420,12 @@ impl Engine {
     /// The lexer holds back the last scalar of a text run so that a combining mark in the next read
     /// still joins it. This releases that scalar. The session loop calls it when a read returns
     /// nothing, and a snapshot calls it itself, so a quiet stream never leaves a character held.
+    ///
+    /// The resident state is measured here too. This is the moment a caller asks what the session
+    /// is holding, and it is the moment the screen is settled, so a figure taken here is the whole
+    /// of what is on it rather than most of it.
     pub fn quiesce(&mut self, now_ms: u64) -> FeedOutcome {
+        self.measure_now = true;
         let mut events = core::mem::take(&mut self.scratch);
         events.clear();
         self.lexer.flush_tail(&mut events);
@@ -496,12 +477,6 @@ impl Engine {
                 self.enforce_resident_state(now_ms);
             }
             if decision.apply_to_grid {
-                // The primary buffer's rows are not reachable while the alternate buffer is
-                // showing, so they are measured before the switch rather than after it.
-                if !self.grid.alternate_active() && enters_alternate(&event.kind) {
-                    self.measure_now = true;
-                    self.enforce_resident_state(now_ms);
-                }
                 if let Some(reason) = self.link_refusal(event) {
                     self.diagnostics.record(
                         DiagnosticKind::ResidentStateTruncated,
@@ -519,9 +494,6 @@ impl Engine {
                         .get_or_insert(event.span.start());
                     disposition = DirectDisposition::Withhold;
                 } else {
-                    // What printing will add to the buffer is charged before it is applied. A
-                    // measurement is periodic and a read can fill a screen between two of them.
-                    self.reserve_content(event);
                     let adapted = self.grid.apply(event);
                     self.charge_rows_that_left_the_screen(now_ms);
                     if adapted.clamped {
@@ -671,7 +643,6 @@ impl Engine {
             };
             let decision = self.policy.decide(&inner);
             if decision.apply_to_grid {
-                self.reserve_content(&inner);
                 self.grid.apply(&inner);
                 self.charge_rows_that_left_the_screen(now_ms);
                 self.revision = self.next_revision();
@@ -788,75 +759,33 @@ impl Engine {
         // noticed at the next measurement. One read can carry a session's worth of links.
         let parameters = parts[1].iter().filter(|byte| **byte == b':').count() + 1;
         let resident = crate::grid::link_cost(&uri, parameters);
-        if !self.budget.metadata_fits(resident) {
+        if !self.budget.links_fit(resident) {
             self.budget.record_truncation();
             return Some("the session has no room left for another hyperlink");
         }
-        let alternate = self.grid.alternate_active();
-        self.budget.add_screen_links(alternate, resident);
+        self.budget.add_links(resident);
         if self.links.contains(&uri) {
             return None;
         }
         // What the table will cost for this entry, worked out the way the measurement works it
         // out, so admission and measurement cannot disagree about the same entry. The first target
         // pays for the node it opens, which the measurement charges once the set is not empty.
-        let cost = link_table_entry_bytes(&uri)
+        let cost = crate::grid::link_table_entry_bytes(&uri)
             + if self.links.is_empty() {
-                TABLE_NODE_BYTES
+                crate::grid::LINK_TABLE_NODE_BYTES
             } else {
                 0
             };
-        if self.links.len() >= self.budget.limits().unique_links || !self.budget.metadata_fits(cost)
-        {
+        if self.links.len() >= self.budget.limits().unique_links || !self.budget.links_fit(cost) {
             // The link is refused after all, so what was reserved for it is given back rather than
             // left to be corrected at the next measurement.
-            self.budget.release_screen_links(alternate, resident);
+            self.budget.release_links(resident);
             self.budget.record_truncation();
             return Some("the session hyperlink table is full");
         }
-        let metadata = self.budget.usage().metadata + cost;
-        self.budget.set_metadata(metadata);
+        self.budget.add_links(cost);
         self.links.insert(uri);
         None
-    }
-
-    /// Charges what an event about to be applied can add to the buffer it draws into.
-    ///
-    /// Text is the only thing that grows a buffer, and what it can add is its own bytes plus the
-    /// allocation each cell it fills would need for attributes the packed form cannot hold.
-    fn reserve_content(&mut self, event: &Event) {
-        let cells = match &event.kind {
-            EventKind::Text { scalars } => *scalars,
-            EventKind::Replacement { count, .. } => *count,
-            _ => {
-                // An erase or a fill writes cells as well, and with a pen that needs an allocation
-                // of its own every cell it writes needs one. How many it writes is not known from
-                // the event, so what a buffer's cells can cost in those allocations is charged: the
-                // charge is held at the ceiling anyway, so charging it once is charging it.
-                if self.grid.pen_is_allocated() {
-                    self.budget.add_screen_content(
-                        self.grid.alternate_active(),
-                        self.grid.screen_attribute_ceiling(),
-                        self.grid.screen_content_ceiling(),
-                    );
-                }
-                return;
-            }
-        };
-        // Twice the bytes, because a row grows its text by appending and the measurement charges
-        // what it is holding. Twice the scalars, because a scalar can take two columns and each
-        // column a cell covers carries an allocation of its own.
-        let cost = 2u64
-            .saturating_mul(event.bytes.len() as u64)
-            .saturating_add(
-                2u64.saturating_mul(cells as u64)
-                    .saturating_mul(crate::grid::CELL_ATTRIBUTE_BYTES),
-            );
-        self.budget.add_screen_content(
-            self.grid.alternate_active(),
-            cost,
-            self.grid.screen_content_ceiling(),
-        );
     }
 
     /// Charges the rows that have just left the screen, and evicts when they pass the bound.
@@ -889,21 +818,14 @@ impl Engine {
     }
 
     /// Brings the historical cache back under its bound.
+    ///
+    /// One pass. The grid works the row count out from the rows themselves rather than from an
+    /// average, so what is left after it costs no more than the bound; the measurement afterwards
+    /// is what the rows cost, not an estimate of it.
     fn evict_history(&mut self, now_ms: u64) {
         let limit = self.budget.limits().row_cache_bytes;
-        let mut bytes = self.grid.history_bytes();
-        let mut evicted = false;
-        // The row count to keep is worked out from the average cost of a row, and the rows are not
-        // all the same size, so one pass can land just over the bound. A few passes converge; the
-        // count is bounded so a pathological row cannot make this loop.
-        for _ in 0..EVICTION_PASSES {
-            if !self.grid.enforce_row_cache(bytes, limit) {
-                break;
-            }
-            evicted = true;
-            bytes = self.grid.history_bytes();
-        }
-        if evicted {
+        let bytes = self.grid.history_bytes();
+        if self.grid.enforce_row_cache(bytes, limit) {
             self.measured_rows = self.grid.scrollback_rows();
             self.history_end_seen = self.grid.history_end();
             self.diagnostics.record(
@@ -912,6 +834,8 @@ impl Engine {
                 now_ms,
                 format!("historical rows passed the {limit}-byte cache bound; older rows evicted"),
             );
+            self.budget.set_row_cache(self.grid.history_bytes());
+            return;
         }
         self.budget.set_row_cache(bytes);
     }
@@ -951,10 +875,10 @@ impl Engine {
     /// not changing either, so the last measurement of it stands rather than being replaced by the
     /// alternate buffer's nothing.
     fn enforce_resident_state(&mut self, now_ms: u64) {
-        // Measuring walks every cell of the screens and every retained row, so it happens when the
-        // rows have grown, when something asked, or periodically. Between two of them the charge
-        // is the reservation each applied event made, which is never less than what was
-        // allocated, so the bound holds without a walk on every read.
+        // Measuring walks every cell of both screens and every retained row, so it happens when
+        // the rows have grown, when something asked, or periodically. Between two of them what the
+        // screens hold is already reserved, and every hyperlink charged itself where it arrived,
+        // so the bounds hold without a walk on every read.
         let rows = self.grid.scrollback_rows();
         let grew = rows.abs_diff(self.measured_rows) >= ROW_CACHE_ROW_STEP;
         if !grew && !self.measure_now && !self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) {
@@ -962,57 +886,42 @@ impl Engine {
         }
         self.measure_now = false;
         self.measured_rows = rows;
-        let alternate = self.grid.alternate_active();
+        self.measure_now_unconditionally(now_ms);
+    }
+
+    /// Takes the measurement, whatever the interval says.
+    fn measure_now_unconditionally(&mut self, now_ms: u64) {
+        let buffers = self.grid.buffer_bytes();
+        self.budget.set_screen_content(false, buffers.content[0]);
+        self.budget.set_screen_content(true, buffers.content[1]);
         self.budget
-            .set_screen_links(alternate, self.grid.screen_link_bytes());
-        self.budget
-            .set_screen_content(alternate, self.grid.screen_content_bytes());
-        self.budget.set_metadata(self.metadata_bytes());
-        if alternate {
+            .set_links(buffers.links.saturating_add(self.link_table_bytes()));
+        self.budget.set_titles(self.titles.resident_bytes());
+        if self.grid.alternate_active() {
+            // The primary buffer's history is not reachable while the alternate buffer is showing,
+            // and it is not changing either, so the last measurement of it stands rather than being
+            // replaced by the alternate buffer's nothing.
             return;
         }
         self.evict_history(now_ms);
         self.history_end_seen = self.grid.history_end();
     }
 
-    /// What the session's own tables hold.
+    /// What the table of distinct hyperlink targets holds.
     ///
-    /// The distinct link targets and the titles, as they are allocated rather than as many
-    /// characters as they carry: a table that has grown keeps room it is not using, and a session
-    /// that filled one would otherwise be charged for the characters alone.
-    fn metadata_bytes(&self) -> u64 {
-        let links: u64 = self.links.iter().map(link_table_entry_bytes).sum::<u64>()
+    /// As it is allocated rather than as many characters as it carries: a table that has grown
+    /// keeps room it is not using, and a session that filled one would otherwise be charged for
+    /// the characters alone.
+    fn link_table_bytes(&self) -> u64 {
+        self.links
+            .iter()
+            .map(crate::grid::link_table_entry_bytes)
+            .sum::<u64>()
             + if self.links.is_empty() {
                 0
             } else {
-                TABLE_NODE_BYTES
-            };
-        let titles = crate::grid::STRING_HANDLE_BYTES * 2
-            + 2 * self.titles.icon().len() as u64
-            + 2 * self.titles.window().len() as u64;
-        let stack: u64 = self
-            .titles
-            .entries()
-            .iter()
-            .map(|entry| {
-                crate::grid::STRING_HANDLE_BYTES * 2
-                    + entry
-                        .icon
-                        .as_ref()
-                        .map_or(0, |title| title.capacity() as u64)
-                    + entry
-                        .window
-                        .as_ref()
-                        .map_or(0, |title| title.capacity() as u64)
-            })
-            .sum();
-        // The stack grows by appending, so it can be holding twice the entries it is using.
-        links
-            .saturating_add(titles)
-            .saturating_add(2 * stack)
-            // The alert channel is bounded per alert and in how many it holds, so what it can be
-            // holding is charged whether or not anything is on it.
-            .saturating_add(crate::grid::ALERT_LIST_BYTES)
+                crate::grid::LINK_TABLE_NODE_BYTES
+            }
     }
 
     /// Whether resident state is over one of its bounds right now.
@@ -1113,9 +1022,11 @@ impl Engine {
                 ..
             } => match final_byte {
                 b'c' => {
-                    // A reset empties both screens, so what they were holding is no longer held.
-                    self.budget.clear_screen_links();
-                    self.budget.clear_screen_content();
+                    // A reset empties both screens, so what they were holding is no longer held,
+                    // the targets they held are no longer on any cell, and the table that
+                    // remembered them goes with them.
+                    self.links.clear();
+                    self.budget.clear_measurements();
                     self.measure_now = true;
                     self.modes.full_reset();
                     self.titles = TitleState::new();
@@ -1366,8 +1277,15 @@ impl Engine {
     /// Returns [`TermError::Geometry`] for dimensions outside the three simultaneous constraints
     /// and [`TermError::Budget`] when the new screens would not fit. The grid is unchanged in both
     /// cases, and so is the projection.
-    pub fn resize(&mut self, size: GridSize) -> Result<()> {
+    pub fn resize(&mut self, size: GridSize, now_ms: u64) -> Result<()> {
         self.grid.resize(size, &mut self.budget)?;
+        // Rows move between the screen and the history when the grid reflows, and the two are
+        // charged to different bounds, so both are measured again here rather than at whichever
+        // read comes next. The row the history ends at is read again for the same reason: the rows
+        // that moved did not arrive from the screen and must not be charged as if they had.
+        self.measured_rows = self.grid.scrollback_rows();
+        self.history_end_seen = self.grid.history_end();
+        self.measure_now_unconditionally(now_ms);
         self.dimensions_revision = self.next_revision();
         self.advance_projection();
         Ok(())
@@ -1691,24 +1609,6 @@ impl Engine {
     pub fn diagnostic_totals(&self) -> Vec<(DiagnosticKind, u64)> {
         self.diagnostics.totals()
     }
-}
-
-/// Whether a sequence switches to the alternate buffer.
-fn enters_alternate(kind: &EventKind) -> bool {
-    let EventKind::Csi {
-        params,
-        final_byte: b'h',
-        ..
-    } = kind
-    else {
-        return false;
-    };
-    let csi = crate::classify::CsiView::new(params, b'h');
-    csi.private == Some(b'?')
-        && csi
-            .numbers
-            .iter()
-            .any(|slot| matches!(slot, Some(47 | 1047 | 1049)))
 }
 
 /// Whether a sequence saves or restores a cursor, directly or as part of a buffer switch.

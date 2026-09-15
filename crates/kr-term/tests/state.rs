@@ -74,11 +74,11 @@ fn an_invalid_resize_leaves_the_grid_alone() {
     let mut engine = engine();
     let before = engine.grid().size();
     let error = engine
-        .resize(GridSize::new(4_000, 4_000))
+        .resize(GridSize::new(4_000, 4_000), 0)
         .expect_err("refused");
     assert!(matches!(error, TermError::Geometry { .. }));
     assert_eq!(engine.grid().size(), before);
-    engine.resize(GridSize::new(100, 30)).expect("accepted");
+    engine.resize(GridSize::new(100, 30), 0).expect("accepted");
     assert_eq!(engine.grid().size(), GridSize::new(100, 30));
 }
 
@@ -95,9 +95,24 @@ fn the_budget_refuses_before_it_allocates() {
         &mut budget,
     )
     .expect_err("the screens do not fit");
-    assert!(matches!(error, TermError::Budget { .. }));
+    let TermError::Admission {
+        cells,
+        footprint,
+        budget: limit,
+        ..
+    } = error
+    else {
+        panic!("a geometry that does not fit is refused as an admission failure: {error}");
+    };
+    assert_eq!(cells, 10_000, "the refusal names the cells that were asked for");
+    assert!(footprint > limit, "the refusal names what the cells would cost");
     assert_eq!(
-        budget.usage().total(),
+        error.code(),
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "a geometry the session cannot hold is a resource that is not available"
+    );
+    assert_eq!(
+        budget.committed(),
         0,
         "nothing was committed for a refused allocation"
     );
@@ -1003,7 +1018,7 @@ fn a_delta_carries_the_presentation_state_that_changed() {
     let view = viewport(&resized);
     let (snapshot, _) = resized.snapshot(view, 0);
     resized
-        .resize(kr_term::budget::GridSize::new(40, 12))
+        .resize(kr_term::budget::GridSize::new(40, 12), 0)
         .expect("valid geometry");
     resized.quiesce(0);
     let error = resized
@@ -1036,32 +1051,26 @@ fn one_large_read_is_measured_before_the_next_one() {
     );
 }
 
-/// What printing adds is charged as it is applied, so the bound holds between two measurements.
+/// Printing into an admitted screen is never refused, and never finds more than the geometry
+/// reserved for it, however much goes through the same cells.
 #[test]
-fn printing_is_charged_before_anything_measures_it() {
+fn printing_into_an_admitted_screen_stays_inside_its_reservation() {
     let mut engine = Engine::new(EngineConfig {
         size: GridSize::new(8, 2),
         ..EngineConfig::DEFAULT
     })
     .expect("engine");
     // True colour, so every cell keeps an allocation of its own for its attributes.
-    engine.feed(b"\x1b[38;2;10;20;30mabcdefgh", 0);
-    let charged = engine.budget().usage().screen_content[0];
-    assert!(
-        charged > 0,
-        "what was printed is charged before a measurement looks at it"
-    );
-
-    // Printing through the same cells cannot charge more than those cells can hold, however much
-    // goes through them.
-    let ceiling = engine.grid().screen_content_ceiling();
     for _ in 0..128 {
         engine.feed(b"\x1b[H\x1b[38;2;10;20;30mabcdefgh", 0);
-        assert!(
-            engine.budget().usage().screen_content[0] <= ceiling,
-            "a buffer is never charged more than its cells can hold"
+        engine.quiesce(0);
+        assert_eq!(
+            engine.budget().excess(),
+            0,
+            "a measurement found more than the geometry reserved"
         );
     }
+    assert!(engine.budget().usage().screens() > 0, "the cells hold what was printed");
     assert!(!engine.budget().session_over_budget());
 }
 
@@ -1074,7 +1083,7 @@ fn a_link_costs_no_more_than_what_was_reserved_for_it() {
     engine.feed(format!("\x1b]8;{text}\x1b\\X").as_bytes(), 0);
     engine.quiesce(0);
     let reserved = kr_term::grid::link_cost(text, 2);
-    let measured = engine.grid().screen_link_bytes();
+    let measured = engine.grid().buffer_bytes().links;
     assert!(measured > 0, "a link on the screen is resident state");
     assert!(
         measured <= reserved,
@@ -1093,11 +1102,14 @@ fn a_wide_cell_is_reserved_for_the_columns_it_covers() {
     .expect("engine");
     engine.feed("\x1b[38;2;10;20;30m\u{754c}\u{754c}".as_bytes(), 0);
     engine.quiesce(0);
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "a wide cell measured more than the geometry reserved for its columns"
+    );
     assert!(
-        engine.budget().usage().screen_content[0] >= engine.grid().screen_content_bytes(),
-        "reserved {} against a measurement of {}",
-        engine.budget().usage().screen_content[0],
-        engine.grid().screen_content_bytes()
+        engine.budget().usage().screen_content[0] >= 2 * kr_term::grid::CELL_ATTRIBUTE_BYTES,
+        "each column of a wide cell keeps its own attribute allocation"
     );
 }
 
@@ -1113,7 +1125,7 @@ fn a_cell_is_charged_for_the_attributes_it_keeps() {
         .expect("engine");
         engine.feed(input, 0);
         engine.quiesce(0);
-        engine.grid().screen_content_bytes()
+        engine.grid().buffer_bytes().content[0]
     }
 
     let plain = content(b"abcdefghabcdefgh");
@@ -1134,18 +1146,27 @@ fn each_buffer_keeps_its_own_charge_across_a_switch() {
     })
     .expect("engine");
     engine.feed(b"\x1b[41mfilled with colour", 0);
+    engine.quiesce(0);
     assert!(engine.budget().usage().screen_content[0] > 0);
+    let primary = engine.budget().usage().screen_content[0];
 
     engine.feed(b"\x1b[?1049h", 0);
+    engine.quiesce(0);
     assert!(
-        engine.budget().usage().screen_content[0] > 0,
+        engine.budget().usage().screen_content[0] >= primary,
         "the primary buffer still holds its rows while the alternate one is showing"
     );
-    assert_eq!(
-        engine.budget().usage().screen_content[1],
-        0,
-        "the alternate buffer has nothing on it yet"
+    engine.feed(b"\x1b[44malternate content", 0);
+    engine.quiesce(0);
+    assert!(
+        engine.budget().usage().screen_content[1] > 0,
+        "the alternate buffer holds its own rows"
     );
+    assert!(
+        engine.budget().usage().screen_content[0] >= primary,
+        "and the primary buffer is still measured while it is not showing"
+    );
+    assert_eq!(engine.budget().excess(), 0);
 }
 
 /// A reservation and a measurement round a hyperlink's parameter table the same way, so a
@@ -1165,7 +1186,7 @@ fn a_link_costs_no_more_than_was_reserved_at_every_table_size() {
         engine.feed(format!("\x1b]8;{text}\x1b\\X").as_bytes(), 0);
         engine.quiesce(0);
         let reserved = kr_term::grid::link_cost(&text, parameters + 1);
-        let measured = engine.grid().screen_link_bytes();
+        let measured = engine.grid().buffer_bytes().links;
         assert!(
             measured > 0,
             "{parameters} parameters: the link is resident state"
@@ -1232,18 +1253,18 @@ fn rows_that_replace_older_ones_are_charged() {
 #[test]
 fn a_hyperlink_with_no_target_keeps_no_parameters() {
     let mut engine = engine();
-    let before = engine.budget().usage().metadata;
+    let before = engine.budget().usage().links;
     let identifier = "a".repeat(1_000);
     engine.feed(format!("\x1b]8;id={identifier};\x1b\\X").as_bytes(), 0);
     engine.quiesce(0);
     assert!(engine.budget().truncations() > 0);
     assert_eq!(
-        engine.budget().usage().metadata,
+        engine.budget().usage().links,
         before,
         "the identifier of a link that points nowhere is not kept"
     );
     assert_eq!(
-        engine.grid().screen_link_bytes(),
+        engine.grid().buffer_bytes().links,
         0,
         "nothing on the screen belongs to a link that points nowhere"
     );
@@ -1252,7 +1273,7 @@ fn a_hyperlink_with_no_target_keeps_no_parameters() {
     let mut closing = Engine::new(EngineConfig::DEFAULT).expect("engine");
     closing.feed(b"\x1b]8;;https://example.invalid/\x1b\\A\x1b]8;;\x1b\\B", 0);
     closing.quiesce(0);
-    assert!(closing.grid().screen_link_bytes() > 0);
+    assert!(closing.grid().buffer_bytes().links > 0);
 }
 
 /// Two rows can carry more than the whole historical cache, so the bound is enforced where they
@@ -1302,8 +1323,9 @@ fn hyperlink_identifiers_are_counted() {
         input.extend_from_slice(b";https://example.invalid/\x1b\\X");
     }
     counted.feed(&input, 0);
+    counted.quiesce(0);
     assert!(
-        counted.budget().usage().metadata > 8 * 256,
+        counted.budget().usage().links > 8 * 256,
         "the identifiers are counted, not just the targets"
     );
 
@@ -1315,7 +1337,7 @@ fn hyperlink_identifiers_are_counted() {
     let outcome = oversized.feed(&input, 0);
     assert!(outcome.forward.is_empty());
     assert!(oversized.budget().truncations() > 0);
-    assert_eq!(oversized.budget().usage().metadata, 0);
+    assert_eq!(oversized.budget().usage().links, 0);
 }
 
 /// A cell that reaches its content bound says so rather than losing marks quietly.
@@ -1376,7 +1398,7 @@ fn a_mark_after_a_resize_does_not_overwrite_another_cell() {
     engine.feed(b"e", 0);
     engine.quiesce(0);
     engine
-        .resize(kr_term::budget::GridSize::new(8, 3))
+        .resize(kr_term::budget::GridSize::new(8, 3), 0)
         .expect("valid geometry");
     let before: Vec<String> = engine
         .grid()
@@ -1501,7 +1523,7 @@ fn hyperlinks_on_the_screen_are_counted() {
     engine.feed(input.as_bytes(), 0);
     engine.quiesce(0);
     assert!(
-        engine.budget().usage().screen_links[0] > 0,
+        engine.budget().usage().links > 0,
         "the links the rows on screen hold are resident state"
     );
 }
@@ -1601,12 +1623,12 @@ fn a_reset_releases_what_the_buffers_held() {
     }
     engine.feed(input.as_bytes(), 0);
     engine.quiesce(0);
-    assert!(engine.budget().usage().screen_links[0] > 0);
+    assert!(engine.budget().usage().links > 0);
     engine.feed(b"\x1bc", 0);
     engine.quiesce(0);
     assert_eq!(
-        engine.budget().usage().screen_links,
-        [0, 0],
+        engine.budget().usage().links,
+        0,
         "both screens were emptied"
     );
 }

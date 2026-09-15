@@ -15,6 +15,22 @@ pub const MAX_DEPTH: usize = 10;
 /// per-entry bound is what stops repeated OSC updates from allocating without bound.
 pub const MAX_TITLE_BYTES: usize = 1024;
 
+/// The most the titles and the virtual stack can hold.
+///
+/// Both bounds are fixed, so this is a figure rather than a measurement: it is what a session
+/// reserves for its titles when its geometry is admitted, which is why a title is never refused.
+/// A string is counted at twice the bytes it may hold, which is the most a doubling allocator
+/// keeps for it, and the stack at twice its depth in slots, which is the most its array rounds up
+/// to.
+pub const MAX_RESIDENT_BYTES: u64 = {
+    let handle = size_of::<String>() as u64;
+    let title = 2 * MAX_TITLE_BYTES as u64;
+    let current = 2 * (handle + title);
+    let slots = 2 * MAX_DEPTH as u64 * size_of::<SavedTitle>() as u64;
+    let saved = MAX_DEPTH as u64 * 2 * title;
+    current + slots + saved
+};
+
 /// Which title an OSC selector addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleTarget {
@@ -191,11 +207,42 @@ impl TitleState {
         &self.stack
     }
 
+    /// What the titles and the virtual stack are holding.
+    ///
+    /// The room the strings and the stack are keeping rather than the characters they show. A
+    /// stack that grew to its depth and then had entries popped still has the array it grew, and a
+    /// measurement that counted the entries left on it would report a session as having given back
+    /// something it is still holding.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        let handle = size_of::<String>() as u64;
+        let mut bytes = 2 * handle
+            + self.current.icon.capacity() as u64
+            + self.current.window.capacity() as u64;
+        bytes += (self.stack.capacity() * size_of::<SavedTitle>()) as u64;
+        for entry in &self.stack {
+            bytes += entry.icon.as_ref().map_or(0, |title| title.capacity()) as u64;
+            bytes += entry.window.as_ref().map_or(0, |title| title.capacity()) as u64;
+        }
+        bytes
+    }
+
     /// Restores a snapshot's titles and stack.
+    ///
+    /// Every title goes through the same per-entry bound a title from the session does. A snapshot
+    /// is state this session once held, but it arrives from outside, and a restoration that took
+    /// it at its word could put back more than a session is allowed to hold.
     pub fn restore(&mut self, current: TitleEntry, stack: Vec<SavedTitle>, underflows: u32) {
-        self.current = current;
+        self.current = TitleEntry {
+            icon: truncate(&current.icon),
+            window: truncate(&current.window),
+        };
         self.stack = stack;
         self.stack.truncate(MAX_DEPTH);
+        for entry in &mut self.stack {
+            entry.icon = entry.icon.as_deref().map(truncate);
+            entry.window = entry.window.as_deref().map(truncate);
+        }
         self.underflows = underflows;
     }
 }

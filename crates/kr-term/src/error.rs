@@ -1,7 +1,10 @@
 //! Typed failures.
 //!
 //! Every variant names a rule from section 8 rather than a place in the code, so a caller can map
-//! it to a protocol error and a person can read what went wrong.
+//! it to a protocol error and a person can read what went wrong. [`TermError::code`] is that
+//! mapping: a host returns the code it gives, with the failure's own text as the message.
+
+use kr_protocol::error::ErrorCode;
 
 /// A terminal engine failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -27,19 +30,22 @@ pub enum TermError {
         max_cells: u32,
     },
 
-    /// An allocation was refused before it happened because it did not fit the session budget.
+    /// A geometry was refused before anything was allocated for it, because what both screen
+    /// buffers can hold at that size does not fit the session budget.
     #[error(
-        "{what} needs {requested} bytes; {used} of the {budget}-byte session budget is already \
-         committed"
+        "geometry {cols}x{rows} is {cells} cells, which needs {footprint} bytes of the \
+         {budget}-byte session budget"
     )]
-    Budget {
-        /// What was being allocated.
-        what: &'static str,
-        /// Bytes the allocation needed.
-        requested: u64,
-        /// Bytes already committed.
-        used: u64,
-        /// The budget.
+    Admission {
+        /// Requested columns.
+        cols: u32,
+        /// Requested rows.
+        rows: u32,
+        /// Requested cells.
+        cells: u64,
+        /// Bytes both screen buffers would need at that size.
+        footprint: u64,
+        /// The session budget.
         budget: u64,
     },
 
@@ -89,6 +95,26 @@ pub enum TermError {
         /// The encoding the attachment can produce.
         offered: String,
     },
+}
+
+impl TermError {
+    /// The protocol error code this failure is reported as.
+    ///
+    /// The two geometry rules are answered differently on purpose. Dimensions outside the three
+    /// simultaneous constraints are a malformed request, and no session has room for them, so they
+    /// are `INVALID_ARGUMENT`. A geometry inside those constraints that this session cannot hold is
+    /// a resource that is not available: the same request on a session with less resident state, or
+    /// after this one gives some back, can succeed, so it is `RESOURCE_UNAVAILABLE`.
+    #[must_use]
+    pub const fn code(&self) -> ErrorCode {
+        match self {
+            Self::Geometry { .. } | Self::ColourSpec { .. } => ErrorCode::InvalidArgument,
+            Self::Admission { .. } => ErrorCode::ResourceUnavailable,
+            Self::ProbeFailed { .. } => ErrorCode::TerminalProbeFailed,
+            Self::CursorGap { .. } | Self::HistoryEvicted { .. } => ErrorCode::ResyncRequired,
+            Self::InputIncompatible { .. } => ErrorCode::InputIncompatible,
+        }
+    }
 }
 
 /// Why a probe handshake failed.

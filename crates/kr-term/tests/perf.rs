@@ -117,7 +117,7 @@ fn drain(stream: &[u8], drain_replies: bool) -> Run {
         peak_lane_bytes,
         peak_pending_events,
         degraded,
-        session_bytes: engine.budget().usage().total(),
+        session_bytes: engine.budget().committed(),
     }
 }
 
@@ -210,5 +210,10 @@ fn sustained_output_stays_inside_the_row_cache_bound() {
         "the row cache grew past {} bytes",
         limits.row_cache_bytes
     );
-    assert!(usage.total() <= limits.session_bytes);
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "a measurement found more than the admitted geometry reserved"
+    );
+    assert!(engine.budget().committed() <= limits.session_bytes);
 }
