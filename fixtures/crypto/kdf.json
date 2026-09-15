@@ -1,0 +1,29 @@
+{
+  "description": "Key derivation vectors: RFC 5869 HKDF-SHA256, HMAC-SHA256 and the KRRECOV1 recovery subkeys.",
+  "hkdf_sha256": {
+    "description": "RFC 5869 appendix A.1, truncated to the 32-byte output this build derives.",
+    "ikm_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+    "info_hex": "f0f1f2f3f4f5f6f7f8f9",
+    "okm_hex": "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf",
+    "salt_hex": "000102030405060708090a0b0c"
+  },
+  "hmac_sha256": {
+    "description": "HMAC-SHA256 under a fixed 32-byte key.",
+    "key_hex": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a",
+    "message_utf8": "kr-crypto vector message",
+    "tag_hex": "f5c5c4565b10bfed44b87609d63530bade5f6438e926a212c5528adff2b75d59"
+  },
+  "name": "kdf",
+  "note": "The recovery seed below is test material. A real seed is 256 random bits from libsodium.",
+  "recovery": {
+    "bundle_key_hex": "7429476b502f78bf5bb283265f37b9fa2c077639db6678c35c796d4088483644",
+    "bundle_subkey_id": 1,
+    "context": "KRRECOV1",
+    "description": "libsodium crypto_kdf with context KRRECOV1: subkey 1 is the recovery-bundle key and subkey 2 seeds the recovery recipient's crypto_box keypair.",
+    "recipient_key_id_hex": "6f8a8c29bc6afcc8a76935f3327e96c93039a744217f67183c3edc8ee73eb997",
+    "recipient_public_key_hex": "e2e6aa4550b1027ed87bbba56cf8966933c0bcf267287a54be0d40178e5a2574",
+    "recipient_subkey_id": 2,
+    "seed_checksum_hex": "e2be22e4",
+    "seed_hex": "d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7"
+  }
+}

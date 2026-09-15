@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/kr-cbor", "crates/kr-protocol"]
+members = ["crates/kr-cbor", "crates/kr-crypto", "crates/kr-protocol"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,12 +14,21 @@ publish = false
 base64 = "=0.23.1"
 ciborium = "=0.2.2"
 hex = "=0.4.3"
+hkdf = "=0.13.0"
+hmac = "=0.13.0"
+keyring = "=4.2.0"
 kr-cbor = { path = "crates/kr-cbor", version = "=0.1.0" }
+kr-crypto = { path = "crates/kr-crypto", version = "=0.1.0" }
+kr-protocol = { path = "crates/kr-protocol", version = "=0.1.0" }
+libsodium-sys-stable = "=1.24.0"
 schemars = "=1.2.2"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
+spake2 = "=0.4.0"
+subtle = "=2.6.1"
 thiserror = "=2.0.20"
+zeroize = { version = "=1.9.0", features = ["derive"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

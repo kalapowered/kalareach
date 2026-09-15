@@ -1,0 +1,42 @@
+[package]
+name = "kr-crypto"
+description = "KalaReach cryptography: a narrow libsodium wrapper, purpose-separated keys and secret storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kr-crypto-vectors"
+path = "src/bin/kr-crypto-vectors.rs"
+
+[dependencies]
+hkdf.workspace = true
+hmac.workspace = true
+keyring.workspace = true
+kr-cbor.workspace = true
+kr-protocol.workspace = true
+libsodium-sys-stable.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dependencies.serde]
+workspace = true
+
+[dependencies.hex]
+workspace = true
+
+# The workspace forbids unsafe code, which a crate that calls a C library cannot honour. This
+# crate denies it instead and allows it in exactly one module, `sodium`, which owns every call
+# into libsodium. Nothing else in the tree may relax the workspace rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
