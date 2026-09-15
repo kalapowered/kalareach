@@ -73,6 +73,15 @@ pub enum SideEffectKind {
         title: Option<String>,
         /// The body.
         body: String,
+        /// The application's own identifier for it, when it gave one.
+        ///
+        /// It groups the parts of one notification and lets a later one replace an earlier one, so
+        /// it travels with the effect rather than being dropped at the boundary.
+        id: Option<String>,
+        /// How urgent the application says it is.
+        urgency: NotificationUrgency,
+        /// When the application asks for it to be shown.
+        display: NotificationDisplay,
     },
     /// A progress report.
     Progress {
@@ -94,6 +103,30 @@ pub enum SideEffectKind {
         /// Which clipboard.
         selection: ClipboardSelection,
     },
+}
+
+/// How urgent an application says its notification is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NotificationUrgency {
+    /// The application asked for the lowest urgency.
+    Low,
+    /// The default.
+    #[default]
+    Normal,
+    /// The application asked for the highest urgency.
+    Critical,
+}
+
+/// When an application asks for its notification to be shown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NotificationDisplay {
+    /// Always.
+    #[default]
+    Always,
+    /// Only when the session is not focused.
+    Unfocused,
+    /// Only when the session is not visible.
+    Invisible,
 }
 
 /// Where a side effect goes.

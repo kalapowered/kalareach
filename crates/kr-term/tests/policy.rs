@@ -184,6 +184,9 @@ fn notifications_and_progress_are_recognised_by_subcommand() {
         SideEffectKind::Notification {
             title: Some("Title".to_owned()),
             body: "Body".to_owned(),
+            id: None,
+            urgency: kr_term::sideeffect::NotificationUrgency::Normal,
+            display: kr_term::sideeffect::NotificationDisplay::Always,
         }
     );
 
@@ -224,6 +227,19 @@ fn notifications_and_progress_are_recognised_by_subcommand() {
             "{input:?} reached a physical terminal"
         );
     }
+
+    // Qualified metadata reaches the destination rather than stopping at the boundary.
+    let outcome = engine.feed(b"\x1b]99;i=build:o=invisible:u=2;Hello\x07", 0);
+    assert_eq!(
+        outcome.side_effects[0].kind,
+        SideEffectKind::Notification {
+            title: None,
+            body: "Hello".to_owned(),
+            id: Some("build".to_owned()),
+            urgency: kr_term::sideeffect::NotificationUrgency::Critical,
+            display: kr_term::sideeffect::NotificationDisplay::Invisible,
+        }
+    );
 
     // The qualified forms still work, including the one with no state at all.
     for input in [

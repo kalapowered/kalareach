@@ -1518,14 +1518,13 @@ fn observe_osc(selector: Option<u32>, parts: &[Vec<u8>], at: u64, outcome: &mut 
 /// Counting only the text would let a page of short, heavily linked rows pass the bound several
 /// times over, because a hyperlink target can be far longer than the text it covers.
 fn encoded_row_bytes(row: &GridRow) -> usize {
-    const RUN_OVERHEAD: usize = 24;
     const ROW_OVERHEAD: usize = 16;
     ROW_OVERHEAD
         + row
             .runs
             .iter()
             .map(|run| {
-                RUN_OVERHEAD
+                crate::grid::RUN_OVERHEAD_BYTES
                     + run.text.len()
                     + run.hyperlink.as_ref().map_or(0, std::string::String::len)
             })

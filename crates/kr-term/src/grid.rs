@@ -130,6 +130,8 @@ pub struct GridConfig {
     pub unicode: UnicodeModel,
     /// Bytes of encoded content one cell may hold.
     pub cell_bytes: usize,
+    /// Bytes one row may carry when it is read, which bounds what building a page can allocate.
+    pub row_bytes: usize,
 }
 
 impl GridConfig {
@@ -138,6 +140,7 @@ impl GridConfig {
         scrollback_rows: 3_500,
         unicode: UnicodeModel::KR_VT_1,
         cell_bytes: 64,
+        row_bytes: 1024 * 1024,
     };
 }
 
@@ -941,11 +944,12 @@ impl CanonicalGrid {
             .map(|(index, line)| {
                 let visible = i64::try_from(index).unwrap_or(0);
                 let stable = screen.visible_row_to_stable_row(visible);
+                let (runs, truncated) = runs_of(line, self.config.row_bytes);
                 GridRow {
                     stable_id: i64::try_from(stable).unwrap_or(0),
                     soft_wrapped: line.last_cell_was_wrapped(),
-                    truncated: false,
-                    runs: runs_of(line),
+                    truncated,
+                    runs,
                 }
             })
             .collect()
@@ -967,11 +971,14 @@ impl CanonicalGrid {
             .lines_in_phys_range(phys)
             .iter()
             .enumerate()
-            .map(|(index, line)| GridRow {
-                stable_id: start.saturating_add(i64::try_from(index).unwrap_or(0)),
-                soft_wrapped: line.last_cell_was_wrapped(),
-                truncated: false,
-                runs: runs_of(line),
+            .map(|(index, line)| {
+                let (runs, truncated) = runs_of(line, self.config.row_bytes);
+                GridRow {
+                    stable_id: start.saturating_add(i64::try_from(index).unwrap_or(0)),
+                    soft_wrapped: line.last_cell_was_wrapped(),
+                    truncated,
+                    runs,
+                }
             })
             .collect()
     }
@@ -1053,8 +1060,10 @@ fn rendition_of(attrs: &CellAttributes) -> Rendition {
     }
 }
 
-fn runs_of(line: &wezterm_term::Line) -> Vec<Run> {
+fn runs_of(line: &wezterm_term::Line, budget: usize) -> (Vec<Run>, bool) {
     let mut runs: Vec<Run> = Vec::new();
+    let mut bytes = 0usize;
+    let mut truncated = false;
     // A wide cell covers the column after it. Depending on how the library is storing the row at
     // the moment, that covered column may or may not come back as a cell of its own, so it is
     // skipped by position instead. Without this the same screen reads differently.
@@ -1068,6 +1077,13 @@ fn runs_of(line: &wezterm_term::Line) -> Vec<Run> {
             continue;
         }
         next_column = column + width.max(1);
+        // A row is bounded while it is built, not after. Every cell inside a hyperlink carries the
+        // target, so a row of linked cells can cost many times the bound before anyone counts it.
+        bytes += cell.str().len() + hyperlink.as_ref().map_or(0, String::len) + RUN_OVERHEAD_BYTES;
+        if bytes > budget {
+            truncated = true;
+            break;
+        }
         match runs.last_mut() {
             Some(last)
                 if last.rendition == rendition
@@ -1086,8 +1102,11 @@ fn runs_of(line: &wezterm_term::Line) -> Vec<Run> {
             }),
         }
     }
-    runs
+    (runs, truncated)
 }
+
+/// What one run costs beyond its text and its hyperlink target.
+pub(crate) const RUN_OVERHEAD_BYTES: usize = 24;
 
 /// Renders a cell rendition as SGR parameters, without the introducer or the final byte.
 ///

@@ -17,8 +17,8 @@ use crate::classify::CsiView;
 use crate::diag::DiagnosticKind;
 use crate::event::{DirectDisposition, DiscardCause, Event, EventKind, SequenceFamily};
 use crate::sideeffect::{
-    ClipboardReadPolicy, ClipboardSelection, ClipboardWritePolicy, Progress, SideEffectKind,
-    SideEffectPolicy, SideEffectRefusal,
+    ClipboardReadPolicy, ClipboardSelection, ClipboardWritePolicy, NotificationDisplay,
+    NotificationUrgency, Progress, SideEffectKind, SideEffectPolicy, SideEffectRefusal,
 };
 
 /// Which backend owns the PTY on the other side of the engine.
@@ -276,11 +276,14 @@ impl Policy {
             .map(|part| String::from_utf8_lossy(part).into_owned())
             .collect::<Vec<_>>()
             .join(";");
-        self.decide_notification(Some((None, body)))
+        self.decide_notification(Some(Notification {
+            body,
+            ..Notification::default()
+        }))
     }
 
-    fn decide_notification(&self, parsed: Option<(Option<String>, String)>) -> Outcome {
-        let Some((title, body)) = parsed else {
+    fn decide_notification(&self, parsed: Option<Notification>) -> Outcome {
+        let Some(notification) = parsed else {
             return Outcome {
                 refusal: Some(SideEffectRefusal::Malformed),
                 ..Outcome::withheld(DirectDisposition::Withhold)
@@ -293,10 +296,26 @@ impl Policy {
             };
         }
         Outcome {
-            side_effect: Some(SideEffectKind::Notification { title, body }),
+            side_effect: Some(SideEffectKind::Notification {
+                title: notification.title,
+                body: notification.body,
+                id: notification.id,
+                urgency: notification.urgency,
+                display: notification.display,
+            }),
             ..Outcome::withheld(DirectDisposition::Withhold)
         }
     }
+}
+
+/// What a notification sequence asked for, before policy has looked at it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Notification {
+    title: Option<String>,
+    body: String,
+    id: Option<String>,
+    urgency: NotificationUrgency,
+    display: NotificationDisplay,
 }
 
 /// Whether an event asks for the ConPTY win32 input mode.
@@ -324,10 +343,11 @@ fn parse_u8(part: &[u8]) -> Option<u8> {
 /// The metadata says what the payload is and how it is encoded, and the class table has already
 /// refused the forms this profile does not implement. `p` selects the title or the body, and `e=1`
 /// means the payload is base64.
-fn kitty_notification(parts: &[Vec<u8>]) -> Option<(Option<String>, String)> {
+fn kitty_notification(parts: &[Vec<u8>]) -> Option<Notification> {
     let metadata = parts.get(1).map_or(&[][..], Vec::as_slice);
     let mut encoded = false;
     let mut is_title = false;
+    let mut notification = Notification::default();
     for pair in metadata.split(|byte| *byte == b':') {
         let mut halves = pair.splitn(2, |byte| *byte == b'=');
         let key = halves.next().unwrap_or(b"");
@@ -335,6 +355,23 @@ fn kitty_notification(parts: &[Vec<u8>]) -> Option<(Option<String>, String)> {
         match key {
             b"e" => encoded = value == b"1",
             b"p" => is_title = value == b"title",
+            b"i" | b"g" => {
+                notification.id = Some(String::from_utf8_lossy(value).into_owned());
+            }
+            b"u" => {
+                notification.urgency = match value {
+                    b"0" => NotificationUrgency::Low,
+                    b"2" => NotificationUrgency::Critical,
+                    _ => NotificationUrgency::Normal,
+                };
+            }
+            b"o" => {
+                notification.display = match value {
+                    b"unfocused" => NotificationDisplay::Unfocused,
+                    b"invisible" => NotificationDisplay::Invisible,
+                    _ => NotificationDisplay::Always,
+                };
+            }
             _ => {}
         }
     }
@@ -349,14 +386,15 @@ fn kitty_notification(parts: &[Vec<u8>]) -> Option<(Option<String>, String)> {
     };
     let text = String::from_utf8_lossy(&decoded).into_owned();
     if is_title {
-        Some((Some(text), String::new()))
+        notification.title = Some(text);
     } else {
-        Some((None, text))
+        notification.body = text;
     }
+    Some(notification)
 }
 
 /// `OSC 777 ; notify ; <title> ; <body>`.
-fn rxvt_notification(parts: &[Vec<u8>]) -> Option<(Option<String>, String)> {
+fn rxvt_notification(parts: &[Vec<u8>]) -> Option<Notification> {
     if parts.get(1).map(Vec::as_slice) != Some(b"notify") {
         return None;
     }
@@ -367,7 +405,11 @@ fn rxvt_notification(parts: &[Vec<u8>]) -> Option<(Option<String>, String)> {
         .get(3)
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .unwrap_or_default();
-    Some((title, body))
+    Some(Notification {
+        title,
+        body,
+        ..Notification::default()
+    })
 }
 
 fn extension_diagnostic(event: &Event) -> (DiagnosticKind, String) {
