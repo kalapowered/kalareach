@@ -1,0 +1,730 @@
+{
+  "name": "transcripts",
+  "description": "Domain-separated transcripts and payload digests.",
+  "note": "Values use the same description grammar as fixtures/cbor. cbor_hex is the canonical KR-CBOR-1 encoding of the value; frame_hex is that payload behind its four-byte big-endian length prefix.",
+  "cases": [
+    {
+      "id": "connect_transcript",
+      "description": "CBOR([\"kr-connect/1\", client offer, host selection, client endpoint, host endpoint]).",
+      "domain": "kr-connect/1",
+      "client_offer": {
+        "map": [
+          [
+            "offered_versions",
+            {
+              "array": [
+                {
+                  "map": [
+                    [
+                      "major",
+                      {
+                        "int": "1"
+                      }
+                    ],
+                    [
+                      "minor",
+                      {
+                        "int": "0"
+                      }
+                    ]
+                  ]
+                }
+              ]
+            }
+          ],
+          [
+            "build_id",
+            {
+              "text": "kr/0.1.0+fixture"
+            }
+          ],
+          [
+            "device_id",
+            {
+              "bytes": "9c2f1a6e4b774f109f2a6de0f5c4a311"
+            }
+          ],
+          [
+            "device_key_revision",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "capabilities",
+            {
+              "array": [
+                {
+                  "text": "semantic.updates"
+                },
+                {
+                  "text": "terminal.direct"
+                }
+              ]
+            }
+          ],
+          [
+            "max_receive",
+            {
+              "map": [
+                [
+                  "max_control_frame_len",
+                  {
+                    "int": "1048576"
+                  }
+                ],
+                [
+                  "max_input_frame_len",
+                  {
+                    "int": "65536"
+                  }
+                ],
+                [
+                  "max_attachment_frame_len",
+                  {
+                    "int": "1052672"
+                  }
+                ],
+                [
+                  "max_outstanding_mutations",
+                  {
+                    "int": "8"
+                  }
+                ],
+                [
+                  "max_send_queue_bytes",
+                  {
+                    "int": "8388608"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "client_nonce",
+            {
+              "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          ]
+        ]
+      },
+      "host_selection": {
+        "map": [
+          [
+            "host_nonce",
+            {
+              "bytes": "2222222222222222222222222222222222222222222222222222222222222222"
+            }
+          ],
+          [
+            "client_nonce",
+            {
+              "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          ],
+          [
+            "connection_id",
+            {
+              "bytes": "7f1c0f2a2c1e4c619d2e0b9f8a7c6d55"
+            }
+          ],
+          [
+            "selected_version",
+            {
+              "map": [
+                [
+                  "major",
+                  {
+                    "int": "1"
+                  }
+                ],
+                [
+                  "minor",
+                  {
+                    "int": "0"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "capabilities",
+            {
+              "array": [
+                {
+                  "text": "semantic.updates"
+                },
+                {
+                  "text": "terminal.direct"
+                }
+              ]
+            }
+          ],
+          [
+            "limits",
+            {
+              "map": [
+                [
+                  "max_control_frame_len",
+                  {
+                    "int": "1048576"
+                  }
+                ],
+                [
+                  "max_input_frame_len",
+                  {
+                    "int": "65536"
+                  }
+                ],
+                [
+                  "max_attachment_frame_len",
+                  {
+                    "int": "1052672"
+                  }
+                ],
+                [
+                  "max_outstanding_mutations",
+                  {
+                    "int": "8"
+                  }
+                ],
+                [
+                  "max_send_queue_bytes",
+                  {
+                    "int": "8388608"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "endpoint_id",
+            {
+              "bytes": "4444444444444444444444444444444444444444444444444444444444444444"
+            }
+          ],
+          [
+            "device_id",
+            {
+              "bytes": "2a4b6c8d0e1f4a2b8c3d4e5f60718293"
+            }
+          ],
+          [
+            "device_key_revision",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "boot_epoch",
+            {
+              "int": "7"
+            }
+          ],
+          [
+            "clock_epoch",
+            {
+              "int": "3"
+            }
+          ]
+        ]
+      },
+      "client_endpoint_id": "3333333333333333333333333333333333333333333333333333333333333333",
+      "host_endpoint_id": "4444444444444444444444444444444444444444444444444444444444444444",
+      "value": {
+        "array": [
+          {
+            "text": "kr-connect/1"
+          },
+          {
+            "map": [
+              [
+                "offered_versions",
+                {
+                  "array": [
+                    {
+                      "map": [
+                        [
+                          "major",
+                          {
+                            "int": "1"
+                          }
+                        ],
+                        [
+                          "minor",
+                          {
+                            "int": "0"
+                          }
+                        ]
+                      ]
+                    }
+                  ]
+                }
+              ],
+              [
+                "build_id",
+                {
+                  "text": "kr/0.1.0+fixture"
+                }
+              ],
+              [
+                "device_id",
+                {
+                  "bytes": "9c2f1a6e4b774f109f2a6de0f5c4a311"
+                }
+              ],
+              [
+                "device_key_revision",
+                {
+                  "int": "1"
+                }
+              ],
+              [
+                "capabilities",
+                {
+                  "array": [
+                    {
+                      "text": "semantic.updates"
+                    },
+                    {
+                      "text": "terminal.direct"
+                    }
+                  ]
+                }
+              ],
+              [
+                "max_receive",
+                {
+                  "map": [
+                    [
+                      "max_control_frame_len",
+                      {
+                        "int": "1048576"
+                      }
+                    ],
+                    [
+                      "max_input_frame_len",
+                      {
+                        "int": "65536"
+                      }
+                    ],
+                    [
+                      "max_attachment_frame_len",
+                      {
+                        "int": "1052672"
+                      }
+                    ],
+                    [
+                      "max_outstanding_mutations",
+                      {
+                        "int": "8"
+                      }
+                    ],
+                    [
+                      "max_send_queue_bytes",
+                      {
+                        "int": "8388608"
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "client_nonce",
+                {
+                  "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
+                }
+              ]
+            ]
+          },
+          {
+            "map": [
+              [
+                "host_nonce",
+                {
+                  "bytes": "2222222222222222222222222222222222222222222222222222222222222222"
+                }
+              ],
+              [
+                "client_nonce",
+                {
+                  "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
+                }
+              ],
+              [
+                "connection_id",
+                {
+                  "bytes": "7f1c0f2a2c1e4c619d2e0b9f8a7c6d55"
+                }
+              ],
+              [
+                "selected_version",
+                {
+                  "map": [
+                    [
+                      "major",
+                      {
+                        "int": "1"
+                      }
+                    ],
+                    [
+                      "minor",
+                      {
+                        "int": "0"
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "capabilities",
+                {
+                  "array": [
+                    {
+                      "text": "semantic.updates"
+                    },
+                    {
+                      "text": "terminal.direct"
+                    }
+                  ]
+                }
+              ],
+              [
+                "limits",
+                {
+                  "map": [
+                    [
+                      "max_control_frame_len",
+                      {
+                        "int": "1048576"
+                      }
+                    ],
+                    [
+                      "max_input_frame_len",
+                      {
+                        "int": "65536"
+                      }
+                    ],
+                    [
+                      "max_attachment_frame_len",
+                      {
+                        "int": "1052672"
+                      }
+                    ],
+                    [
+                      "max_outstanding_mutations",
+                      {
+                        "int": "8"
+                      }
+                    ],
+                    [
+                      "max_send_queue_bytes",
+                      {
+                        "int": "8388608"
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "endpoint_id",
+                {
+                  "bytes": "4444444444444444444444444444444444444444444444444444444444444444"
+                }
+              ],
+              [
+                "device_id",
+                {
+                  "bytes": "2a4b6c8d0e1f4a2b8c3d4e5f60718293"
+                }
+              ],
+              [
+                "device_key_revision",
+                {
+                  "int": "1"
+                }
+              ],
+              [
+                "boot_epoch",
+                {
+                  "int": "7"
+                }
+              ],
+              [
+                "clock_epoch",
+                {
+                  "int": "3"
+                }
+              ]
+            ]
+          },
+          {
+            "bytes": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "bytes": "4444444444444444444444444444444444444444444444444444444444444444"
+          }
+        ]
+      },
+      "hex": "856c6b722d636f6e6e6563742f31a7686275696c645f6964706b722f302e312e302b66697874757265696465766963655f6964509c2f1a6e4b774f109f2a6de0f5c4a3116b6d61785f72656365697665a5736d61785f696e7075745f6672616d655f6c656e1a00010000746d61785f73656e645f71756575655f62797465731a00800000756d61785f636f6e74726f6c5f6672616d655f6c656e1a0010000078186d61785f6174746163686d656e745f6672616d655f6c656e1a0010100078196d61785f6f75747374616e64696e675f6d75746174696f6e73086c6361706162696c6974696573827073656d616e7469632e757064617465736f7465726d696e616c2e6469726563746c636c69656e745f6e6f6e636558201111111111111111111111111111111111111111111111111111111111111111706f6666657265645f76657273696f6e7381a2656d616a6f7201656d696e6f7200736465766963655f6b65795f7265766973696f6e01ab666c696d697473a5736d61785f696e7075745f6672616d655f6c656e1a00010000746d61785f73656e645f71756575655f62797465731a00800000756d61785f636f6e74726f6c5f6672616d655f6c656e1a0010000078186d61785f6174746163686d656e745f6672616d655f6c656e1a0010100078196d61785f6f75747374616e64696e675f6d75746174696f6e7308696465766963655f6964502a4b6c8d0e1f4a2b8c3d4e5f607182936a626f6f745f65706f6368076a686f73745f6e6f6e6365582022222222222222222222222222222222222222222222222222222222222222226b636c6f636b5f65706f6368036b656e64706f696e745f6964582044444444444444444444444444444444444444444444444444444444444444446c6361706162696c6974696573827073656d616e7469632e757064617465736f7465726d696e616c2e6469726563746c636c69656e745f6e6f6e6365582011111111111111111111111111111111111111111111111111111111111111116d636f6e6e656374696f6e5f6964507f1c0f2a2c1e4c619d2e0b9f8a7c6d557073656c65637465645f76657273696f6ea2656d616a6f7201656d696e6f7200736465766963655f6b65795f7265766973696f6e015820333333333333333333333333333333333333333333333333333333333333333358204444444444444444444444444444444444444444444444444444444444444444",
+      "sha256": "e1fbf23cf3f065ceaff977343ca63b6afaee5530751e55c84fb0780b38f2e651"
+    },
+    {
+      "id": "mutation_digest",
+      "description": "CBOR([\"kr-mutation/1\", covered fields]). request_id is deliberately excluded so an exact retry on a new connection keeps the same digest.",
+      "domain": "kr-mutation/1",
+      "actor_id": "device:9c2f1a6e-4b77-4f10-9f2a-6de0f5c4a311",
+      "mutation": {
+        "map": [
+          [
+            "request_id",
+            {
+              "int": "41"
+            }
+          ],
+          [
+            "method",
+            {
+              "text": "agent.approval.respond"
+            }
+          ],
+          [
+            "method_version",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "action_id",
+            {
+              "bytes": "e52e8d1a68184be7b4b8f93a8b1c0c6d"
+            }
+          ],
+          [
+            "grant_id",
+            {
+              "bytes": "39a6b26ee8fd4e0c9a378f3dc4911641"
+            }
+          ],
+          [
+            "target",
+            {
+              "map": [
+                [
+                  "environment_id",
+                  {
+                    "bytes": "3de5e6cbbf2149c18d34b9a8729539da"
+                  }
+                ],
+                [
+                  "session_id",
+                  {
+                    "bytes": "b4a1bc38157d4e84bf521137b15b462b"
+                  }
+                ],
+                [
+                  "session_epoch",
+                  {
+                    "int": "1"
+                  }
+                ],
+                [
+                  "application_instance_id",
+                  {
+                    "bytes": "4fe334a4e9344bb881c7568252d9cd84"
+                  }
+                ],
+                [
+                  "agent_binding_revision",
+                  {
+                    "int": "2"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "expected",
+            {
+              "map": [
+                [
+                  "approval_request_id",
+                  {
+                    "text": "upstream-opaque-request-id"
+                  }
+                ],
+                [
+                  "request_revision",
+                  {
+                    "int": "3"
+                  }
+                ],
+                [
+                  "state",
+                  {
+                    "text": "pending"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "action_window_id",
+            {
+              "text": "host-issued-window-id"
+            }
+          ],
+          [
+            "requested_ttl_ms",
+            {
+              "int": "120000"
+            }
+          ],
+          [
+            "params",
+            {
+              "map": [
+                [
+                  "decision",
+                  {
+                    "text": "deny"
+                  }
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "value": {
+        "array": [
+          {
+            "text": "kr-mutation/1"
+          },
+          {
+            "map": [
+              [
+                "action_id",
+                {
+                  "bytes": "e52e8d1a68184be7b4b8f93a8b1c0c6d"
+                }
+              ],
+              [
+                "action_window_id",
+                {
+                  "text": "host-issued-window-id"
+                }
+              ],
+              [
+                "actor_id",
+                {
+                  "text": "device:9c2f1a6e-4b77-4f10-9f2a-6de0f5c4a311"
+                }
+              ],
+              [
+                "expected",
+                {
+                  "map": [
+                    [
+                      "approval_request_id",
+                      {
+                        "text": "upstream-opaque-request-id"
+                      }
+                    ],
+                    [
+                      "request_revision",
+                      {
+                        "int": "3"
+                      }
+                    ],
+                    [
+                      "state",
+                      {
+                        "text": "pending"
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "grant_id",
+                {
+                  "bytes": "39a6b26ee8fd4e0c9a378f3dc4911641"
+                }
+              ],
+              [
+                "method",
+                {
+                  "text": "agent.approval.respond"
+                }
+              ],
+              [
+                "method_version",
+                {
+                  "int": "1"
+                }
+              ],
+              [
+                "params",
+                {
+                  "map": [
+                    [
+                      "decision",
+                      {
+                        "text": "deny"
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "requested_ttl_ms",
+                {
+                  "int": "120000"
+                }
+              ],
+              [
+                "target",
+                {
+                  "map": [
+                    [
+                      "environment_id",
+                      {
+                        "bytes": "3de5e6cbbf2149c18d34b9a8729539da"
+                      }
+                    ],
+                    [
+                      "session_id",
+                      {
+                        "bytes": "b4a1bc38157d4e84bf521137b15b462b"
+                      }
+                    ],
+                    [
+                      "session_epoch",
+                      {
+                        "int": "1"
+                      }
+                    ],
+                    [
+                      "application_instance_id",
+                      {
+                        "bytes": "4fe334a4e9344bb881c7568252d9cd84"
+                      }
+                    ],
+                    [
+                      "agent_binding_revision",
+                      {
+                        "int": "2"
+                      }
+                    ]
+                  ]
+                }
+              ]
+            ]
+          }
+        ]
+      },
+      "hex": "826d6b722d6d75746174696f6e2f31aa666d6574686f64766167656e742e617070726f76616c2e726573706f6e6466706172616d73a1686465636973696f6e6464656e7966746172676574a56a73657373696f6e5f696450b4a1bc38157d4e84bf521137b15b462b6d73657373696f6e5f65706f6368016e656e7669726f6e6d656e745f6964503de5e6cbbf2149c18d34b9a8729539da766167656e745f62696e64696e675f7265766973696f6e02776170706c69636174696f6e5f696e7374616e63655f6964504fe334a4e9344bb881c7568252d9cd84686163746f725f6964782b6465766963653a39633266316136652d346237372d346631302d396632612d366465306635633461333131686578706563746564a36573746174656770656e64696e6770726571756573745f7265766973696f6e0373617070726f76616c5f726571756573745f6964781a757073747265616d2d6f70617175652d726571756573742d6964686772616e745f69645039a6b26ee8fd4e0c9a378f3dc491164169616374696f6e5f696450e52e8d1a68184be7b4b8f93a8b1c0c6d6e6d6574686f645f76657273696f6e0170616374696f6e5f77696e646f775f696475686f73742d6973737565642d77696e646f772d6964707265717565737465645f74746c5f6d731a0001d4c0",
+      "sha256": "c82075c992acbd8c6cd7aab709b44f79da54c3789a32e6c5e8121bb897f8ecf6"
+    }
+  ]
+}
