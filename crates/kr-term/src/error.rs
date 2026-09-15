@@ -100,6 +100,9 @@ pub enum ProbeFailure {
     /// The DA1 terminator never arrived, so late answers cannot be ruled out.
     #[error("the DA1 terminator never arrived")]
     NoTerminator,
+    /// A question the probe asked went unanswered.
+    #[error("a question the probe asked went unanswered")]
+    MissingAnswer,
     /// An answer arrived that the probe did not ask for.
     #[error("an answer arrived that the probe did not ask for")]
     UnexpectedAnswer,

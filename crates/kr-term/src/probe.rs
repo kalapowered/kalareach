@@ -40,29 +40,7 @@ pub enum ProbeItem {
     DeviceAttributes,
 }
 
-/// Whether an unanswered question fails the attach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProbeRequirement {
-    /// The attach fails without this answer.
-    Required,
-    /// Silence is an answer: the terminal does not have the feature.
-    ///
-    /// This is safe only because the terminator comes last. Once primary device attributes arrive,
-    /// every earlier answer has either arrived or is never coming, so an unanswered optional
-    /// question is a fact about the terminal rather than a reply still in flight.
-    Optional,
-}
-
 impl ProbeItem {
-    /// Whether the attach fails without this answer.
-    #[must_use]
-    pub const fn requirement(self) -> ProbeRequirement {
-        match self {
-            Self::DeviceAttributes => ProbeRequirement::Required,
-            _ => ProbeRequirement::Optional,
-        }
-    }
-
     /// The bytes that ask this question.
     #[must_use]
     pub const fn request(self) -> &'static [u8] {
@@ -77,9 +55,12 @@ impl ProbeItem {
     }
 }
 
-/// The complete probe set, in the order it is written.
+/// Every question a probe may ask, in the order they are written.
 ///
-/// Device attributes is last and is the terminator. Nothing may be added after it.
+/// Device attributes is last and is the terminator; nothing may be added after it. A caller passes
+/// the subset its qualified profile needs, and every question it asks must be answered: a terminal
+/// that stays silent on one of them is not probe-qualified for that profile and belongs on the
+/// `--no-probe` path with a saved or conservative profile.
 pub const PROBE_SET: &[ProbeItem] = &[
     ProbeItem::Version,
     ProbeItem::Foreground,
@@ -132,6 +113,7 @@ pub enum ProbeProgress {
 #[derive(Debug)]
 pub struct ProbeSession {
     deadline_ms: u64,
+    asked: Vec<ProbeItem>,
     answers: BTreeMap<ProbeItem, ProbeAnswer>,
     lexer: Lexer,
     buffered: usize,
@@ -145,18 +127,29 @@ impl ProbeSession {
     ///
     /// Refuses to start on a stream that a previous failed probe contaminated. Calling
     /// `--no-probe` on that stream does not clean it either; only a fresh input context does.
-    pub fn start(now_ms: u64, context: InputContext) -> Result<(Self, Vec<u8>)> {
+    pub fn start(
+        now_ms: u64,
+        context: InputContext,
+        questions: &[ProbeItem],
+    ) -> Result<(Self, Vec<u8>)> {
         if context == InputContext::Contaminated {
             return Err(TermError::ProbeFailed {
                 reason: ProbeFailure::ContaminatedInput,
             });
         }
+        let mut asked: Vec<ProbeItem> = questions
+            .iter()
+            .copied()
+            .filter(|item| *item != ProbeItem::DeviceAttributes)
+            .collect();
+        asked.push(ProbeItem::DeviceAttributes);
         let mut request = Vec::new();
-        for item in PROBE_SET {
+        for item in &asked {
             request.extend_from_slice(item.request());
         }
         let session = Self {
             deadline_ms: now_ms + PROBE_DEADLINE_MS,
+            asked,
             answers: BTreeMap::new(),
             lexer: Lexer::new(),
             buffered: 0,
@@ -208,7 +201,7 @@ impl ProbeSession {
     /// # Errors
     ///
     /// Fails when the terminator never arrived, which is the only thing that proves no further
-    /// answer is in flight, and when a required answer is missing.
+    /// answer is in flight, and when any question the probe asked went unanswered.
     pub fn finish(self, now_ms: u64) -> Result<ProbeOutcome> {
         if !self.complete {
             return Err(TermError::ProbeFailed {
@@ -219,22 +212,19 @@ impl ProbeSession {
                 },
             });
         }
-        let missing: Vec<ProbeItem> = PROBE_SET
+        let missing: Vec<ProbeItem> = self
+            .asked
             .iter()
             .copied()
             .filter(|item| !self.answers.contains_key(item))
             .collect();
-        if missing
-            .iter()
-            .any(|item| item.requirement() == ProbeRequirement::Required)
-        {
+        if !missing.is_empty() {
             return Err(TermError::ProbeFailed {
-                reason: ProbeFailure::NoTerminator,
+                reason: ProbeFailure::MissingAnswer,
             });
         }
         Ok(ProbeOutcome {
             answers: self.answers,
-            unanswered: missing,
         })
     }
 
@@ -263,7 +253,6 @@ impl ProbeSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeOutcome {
     answers: BTreeMap<ProbeItem, ProbeAnswer>,
-    unanswered: Vec<ProbeItem>,
 }
 
 impl ProbeOutcome {
@@ -279,13 +268,10 @@ impl ProbeOutcome {
         &self.answers
     }
 
-    /// The optional questions the terminal did not answer.
-    ///
-    /// Each one is a feature the saved profile must not claim. Silence here is evidence, because
-    /// the terminator arrived after it.
+    /// The questions this exchange asked, all of which were answered.
     #[must_use]
-    pub fn unanswered(&self) -> &[ProbeItem] {
-        &self.unanswered
+    pub fn asked(&self) -> Vec<ProbeItem> {
+        self.answers.keys().copied().collect()
     }
 
     /// The session palette this probe supports, when the terminal shared its colours.
