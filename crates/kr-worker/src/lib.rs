@@ -16,6 +16,7 @@
 //! | [`pty`] | The pseudo-terminal, created before the root shell, and the shell it runs |
 //! | [`session`] | The session: lifecycle, the serial order every change shares, and closure |
 //! | [`runtime`] | The reader, the writer, the recogniser timer and the closure sequence |
+//! | [`service`] | The private endpoint: the handshake, the challenge and the method dispatch |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
 pub mod attachments;
@@ -27,6 +28,7 @@ pub mod journal;
 pub mod output;
 pub mod pty;
 pub mod runtime;
+pub mod service;
 pub mod session;
 
 pub use crate::error::{Result, WorkerError};
