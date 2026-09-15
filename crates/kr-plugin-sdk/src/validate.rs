@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 
@@ -505,7 +505,9 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                     ));
                     continue;
                 }
-                match current.open_dir(&name_os) {
+                // The open refuses a link, so a directory replaced by one between the metadata
+                // check and this call is refused rather than descended into.
+                match current.open_dir_nofollow(&name_os) {
                     Ok(child) => queue.push((child, segments)),
                     Err(error) => report.push(Finding::at(
                         FindingCode::DirectoryUnreadable,

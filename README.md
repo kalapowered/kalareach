@@ -59,6 +59,8 @@ After changing anything the cryptography vectors cover, regenerate them and comm
 
 ```bash
 cargo run -p kr-crypto --bin kr-crypto-vectors
+```
+
 After changing a manifest type, do the same for the plugin SDK:
 
 ```bash
