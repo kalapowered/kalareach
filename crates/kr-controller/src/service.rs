@@ -103,6 +103,8 @@ pub struct Controller {
     boot_epoch: BootEpoch,
     /// The suspend-aware continuous clock every deadline this daemon decides is measured on.
     clock: Arc<SystemContinuousClock>,
+    /// The machine's own continuous clock, which is the one a deadline crosses a socket on.
+    shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     /// The action windows of every connection this daemon serves.
     ///
     /// One issuer for the whole daemon, so ending a connection retires its windows and a window
@@ -168,6 +170,7 @@ impl Controller {
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
+            shared_clock: Arc::new(kr_ipc::clock::SystemSharedClock),
             leases: LeaseIssuer::with_maximum_validity(generation, authority_revision),
             clock,
             supervisor: setup.supervisor,
@@ -1785,12 +1788,15 @@ impl Controller {
             // continuous clock: the same clock the worker reads, so the deadline does not restart
             // on arrival and nothing has to guess at what the journey cost. A deadline already
             // spent is never forwarded as though it had time left.
-            let accepted_deadline_boot_ms =
-                remaining_deadline(&*self.clock, accepted.deadline, lease_deadline).ok_or_else(
-                    || ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under has passed".to_owned(),
-                    },
-                )?;
+            let accepted_deadline_boot_ms = remaining_deadline(
+                &*self.shared_clock,
+                &*self.clock,
+                accepted.deadline,
+                lease_deadline,
+            )
+            .ok_or_else(|| ControllerError::WindowExpired {
+                detail: "the deadline this action was admitted under has passed".to_owned(),
+            })?;
             let client = held.as_mut().expect("the connection is open");
             match client
                 .forward(mutation, actor, accepted_deadline_boot_ms)
@@ -2153,24 +2159,23 @@ fn closed_summary(
 /// Returns the accepted deadline on the machine's own continuous clock, bounded by any lease.
 ///
 /// The daemon decides deadlines on its own anchored clock, which nothing outside this process can
-/// read. This converts one of those into the shared reading a worker can compare against: what is
-/// left of it, from the machine's clock as it stands now. `None` means the deadline has already
-/// passed, which is never forwarded as though it had time left.
+/// read. This converts one of those into the shared reading a worker can compare against. The
+/// machine's clock is read **first** and the daemon's own clock second, so a pause between the two
+/// readings shortens the answer rather than lengthening it: what is left is measured from the later
+/// moment and anchored at the earlier one. `None` means the deadline has already passed, which is
+/// never forwarded as though it had time left.
 fn remaining_deadline(
+    shared: &dyn kr_ipc::clock::SharedClock,
     clock: &dyn ContinuousClock,
     accepted: kr_transport::clock::ContinuousInstant,
     lease: Option<kr_transport::clock::ContinuousInstant>,
 ) -> Option<U64> {
+    // The machine's clock first, the daemon's own clock second.
+    let shared_now = shared.boot_elapsed_ms();
     let now = clock.now();
     let deadline = lease.map_or(accepted, |lease| lease.min(accepted));
     let remaining = deadline.saturating_duration_since(now);
-    if remaining.is_zero() {
-        return None;
-    }
-    let remaining = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-    Some(U64::new(
-        kr_ipc::clock::boot_elapsed_ms().saturating_add(remaining),
-    ))
+    kr_ipc::clock::transferred_deadline(shared_now, remaining).map(U64::new)
 }
 
 /// Returns the sentence a caller is given when a window cannot first-admit a request.
@@ -2229,4 +2234,134 @@ fn whoami() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| format!("uid {}", kr_ipc::paths::current_uid()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use kr_transport::clock::{ContinuousInstant, ManualClock};
+
+    use super::{ContinuousClock, remaining_deadline};
+
+    /// Two clocks with one pause between the first reading and the second.
+    ///
+    /// Converting a deadline between two clocks is two readings and a subtraction, and what decides
+    /// whether the conversion can add time is which reading comes first. A pause between them is
+    /// not something a test can arrange with the real clocks, so this arranges it: whichever side
+    /// is read first, both clocks move on by `pause` before the other side is read.
+    #[derive(Debug)]
+    struct PausedPair {
+        shared: kr_ipc::clock::ManualSharedClock,
+        process: ManualClock,
+        paused: AtomicBool,
+        pause: Duration,
+    }
+
+    impl PausedPair {
+        fn new(pause: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                shared: kr_ipc::clock::ManualSharedClock::new(),
+                process: ManualClock::new(),
+                paused: AtomicBool::new(false),
+                pause,
+            })
+        }
+
+        fn pause_once(&self) {
+            if !self.paused.swap(true, Ordering::AcqRel) {
+                self.shared.advance(self.pause);
+                self.process.advance(self.pause);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct SharedSide(Arc<PausedPair>);
+
+    impl kr_ipc::clock::SharedClock for SharedSide {
+        fn boot_elapsed_ms(&self) -> u64 {
+            let reading = kr_ipc::clock::SharedClock::boot_elapsed_ms(&self.0.shared);
+            self.0.pause_once();
+            reading
+        }
+    }
+
+    #[derive(Debug)]
+    struct ProcessSide(Arc<PausedPair>);
+
+    impl ContinuousClock for ProcessSide {
+        fn now(&self) -> ContinuousInstant {
+            let reading = self.0.process.now();
+            self.0.pause_once();
+            reading
+        }
+    }
+
+    #[test]
+    fn a_pause_between_the_two_readings_never_lengthens_a_forwarded_deadline() {
+        // A hundred milliseconds left, and a second passes between the two clock readings. The
+        // deadline is spent by the time the conversion finishes, so nothing is forwarded.
+        let pair = PausedPair::new(Duration::from_secs(1));
+        let accepted = pair
+            .process
+            .now()
+            .checked_add(Duration::from_millis(100))
+            .expect("a deadline a hundred milliseconds out");
+        assert_eq!(
+            remaining_deadline(
+                &SharedSide(Arc::clone(&pair)),
+                &ProcessSide(Arc::clone(&pair)),
+                accepted,
+                None,
+            ),
+            None,
+            "a deadline whose remaining time was spent between the readings is not forwarded"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_deadline_loses_the_pause_rather_than_gaining_it() {
+        let pair = PausedPair::new(Duration::from_millis(10));
+        let accepted = pair
+            .process
+            .now()
+            .checked_add(Duration::from_millis(100))
+            .expect("a deadline a hundred milliseconds out");
+        let forwarded = remaining_deadline(
+            &SharedSide(Arc::clone(&pair)),
+            &ProcessSide(Arc::clone(&pair)),
+            accepted,
+            None,
+        )
+        .expect("some of the deadline is left");
+        // The machine's clock read zero, and the deadline was a hundred milliseconds away on it.
+        // What crosses is ninety: the ten milliseconds spent between the readings are gone.
+        assert_eq!(forwarded.get(), 90);
+    }
+
+    #[test]
+    fn a_lease_shortens_a_forwarded_deadline_and_never_extends_it() {
+        let pair = PausedPair::new(Duration::ZERO);
+        let accepted = pair
+            .process
+            .now()
+            .checked_add(Duration::from_millis(5_000))
+            .expect("a deadline five seconds out");
+        let lease = pair
+            .process
+            .now()
+            .checked_add(Duration::from_millis(400))
+            .expect("a lease four hundred milliseconds out");
+        let forwarded = remaining_deadline(
+            &SharedSide(Arc::clone(&pair)),
+            &ProcessSide(Arc::clone(&pair)),
+            accepted,
+            Some(lease),
+        )
+        .expect("some of the deadline is left");
+        assert_eq!(forwarded.get(), 400);
+    }
 }

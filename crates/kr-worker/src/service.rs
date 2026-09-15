@@ -121,6 +121,8 @@ pub struct WorkerService {
     boot_epoch: BootEpoch,
     /// The suspend-aware continuous clock every deadline this worker decides is measured on.
     clock: Arc<SystemContinuousClock>,
+    /// The machine's own continuous clock, which is the one a forwarded deadline arrives on.
+    shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     /// The action windows of every connection this worker serves.
     windows: ActionWindowIssuer,
     controller_public_key: AuthorisationKey,
@@ -198,6 +200,7 @@ impl WorkerService {
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
             clock,
+            shared_clock: Arc::new(kr_ipc::clock::SystemSharedClock),
             controller_public_key: binding.controller_public_key,
             authority: Mutex::new(Authority {
                 accepted_generation: Some(binding.controller_generation),
@@ -1057,25 +1060,18 @@ impl WorkerService {
         }
         // The daemon's deadline is on the machine's own continuous clock, which this worker reads
         // too, so what is left of it is a subtraction rather than a guess: the journey cost
-        // whatever it cost, and the deadline does not restart on arrival. It is then anchored on
-        // this worker's own clock, here, before the dispatch barrier and before anything else this
-        // worker waits for, and bounded by the protocol maximum so a daemon cannot hand a worker a
-        // longer life than the protocol allows.
-        let remaining = forwarded
-            .accepted_deadline_boot_ms
-            .get()
-            .saturating_sub(kr_ipc::clock::boot_elapsed_ms())
-            .min(kr_protocol::limits::MAX_MUTATION_TTL.get());
-        let Some(deadline) = self
-            .clock
-            .now()
-            .checked_add(std::time::Duration::from_millis(remaining))
-        else {
+        // whatever it cost, and the deadline does not restart on arrival. It is anchored here,
+        // before the dispatch barrier and before anything else this worker waits for.
+        let Some(deadline) = vouched_deadline(
+            &*self.clock,
+            &*self.shared_clock,
+            forwarded.accepted_deadline_boot_ms.get(),
+        ) else {
             return failure(
                 forwarded.mutation.request_id,
                 &ProtocolError::new(
                     ErrorCode::PermissionDenied,
-                    "the accepted deadline for this action is out of range",
+                    "the accepted deadline for this action has passed",
                 ),
             );
         };
@@ -2217,6 +2213,26 @@ async fn send_screen(
 /// Section 7's exception for an authorised stop is about storage: a full disk, a read-only tree, a
 /// database that will not open. It is not about anything the journal *decided*, and a reused action
 /// identifier is a decision.
+/// Anchors a deadline the control daemon accepted on this worker's own clock.
+///
+/// The daemon measured it on the machine's own continuous clock, which this worker reads too. This
+/// worker's own clock is read **first** and the machine's clock second, so a pause between the two
+/// readings shortens the answer rather than lengthening it. The result is bounded by the protocol
+/// maximum, so a daemon cannot hand a worker a longer life than the protocol allows, and `None`
+/// means the deadline has already passed.
+fn vouched_deadline(
+    clock: &dyn ContinuousClock,
+    shared: &dyn kr_ipc::clock::SharedClock,
+    accepted_deadline_boot_ms: u64,
+) -> Option<ContinuousInstant> {
+    let now = clock.now();
+    let remaining =
+        kr_ipc::clock::remaining_of(shared.boot_elapsed_ms(), accepted_deadline_boot_ms)?.min(
+            std::time::Duration::from_millis(kr_protocol::limits::MAX_MUTATION_TTL.get()),
+        );
+    now.checked_add(remaining)
+}
+
 const fn is_storage_failure(error: &WorkerError) -> bool {
     matches!(
         error,
@@ -2328,5 +2344,126 @@ pub fn local_actor(
         grant_revision: Nullable::null(),
         controller_generation: generation,
         connection_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use kr_transport::clock::ManualClock;
+
+    use super::{ContinuousClock, ContinuousInstant, vouched_deadline};
+
+    /// Two clocks with one pause between the first reading and the second.
+    ///
+    /// Anchoring a forwarded deadline is two readings and a subtraction, and what decides whether
+    /// the conversion can add time is which reading comes first. A pause between them is not
+    /// something a test can arrange with the real clocks, so this arranges it: whichever side is
+    /// read first, both clocks move on by `pause` before the other side is read.
+    #[derive(Debug)]
+    struct PausedPair {
+        shared: kr_ipc::clock::ManualSharedClock,
+        process: ManualClock,
+        paused: AtomicBool,
+        pause: Duration,
+    }
+
+    impl PausedPair {
+        fn new(pause: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                shared: kr_ipc::clock::ManualSharedClock::new(),
+                process: ManualClock::new(),
+                paused: AtomicBool::new(false),
+                pause,
+            })
+        }
+
+        fn pause_once(&self) {
+            if !self.paused.swap(true, Ordering::AcqRel) {
+                self.shared.advance(self.pause);
+                self.process.advance(self.pause);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct SharedSide(Arc<PausedPair>);
+
+    impl kr_ipc::clock::SharedClock for SharedSide {
+        fn boot_elapsed_ms(&self) -> u64 {
+            let reading = kr_ipc::clock::SharedClock::boot_elapsed_ms(&self.0.shared);
+            self.0.pause_once();
+            reading
+        }
+    }
+
+    #[derive(Debug)]
+    struct ProcessSide(Arc<PausedPair>);
+
+    impl ContinuousClock for ProcessSide {
+        fn now(&self) -> ContinuousInstant {
+            let reading = self.0.process.now();
+            self.0.pause_once();
+            reading
+        }
+    }
+
+    #[test]
+    fn a_pause_between_the_two_readings_never_lengthens_an_arriving_deadline() {
+        // The daemon's deadline is a hundred milliseconds away on the machine's own clock, and a
+        // second passes between this worker's two clock readings. Nothing is left to admit.
+        let pair = PausedPair::new(Duration::from_secs(1));
+        let accepted = kr_ipc::clock::SharedClock::boot_elapsed_ms(&pair.shared) + 100;
+        assert_eq!(
+            vouched_deadline(
+                &ProcessSide(Arc::clone(&pair)),
+                &SharedSide(Arc::clone(&pair)),
+                accepted,
+            ),
+            None,
+            "a deadline whose remaining time was spent between the readings admits nothing"
+        );
+    }
+
+    #[test]
+    fn an_arriving_deadline_loses_the_pause_rather_than_gaining_it() {
+        let pair = PausedPair::new(Duration::from_millis(10));
+        let start = pair.process.now();
+        let accepted = kr_ipc::clock::SharedClock::boot_elapsed_ms(&pair.shared) + 100;
+        let anchored = vouched_deadline(
+            &ProcessSide(Arc::clone(&pair)),
+            &SharedSide(Arc::clone(&pair)),
+            accepted,
+        )
+        .expect("some of the deadline is left");
+        // This worker's clock read zero, and the deadline was a hundred milliseconds away. What is
+        // anchored is ninety: the ten milliseconds spent between the readings are gone.
+        assert_eq!(
+            anchored.saturating_duration_since(start),
+            Duration::from_millis(90)
+        );
+    }
+
+    #[test]
+    fn an_arriving_deadline_is_bounded_by_the_protocol_maximum() {
+        let pair = PausedPair::new(Duration::ZERO);
+        let start = pair.process.now();
+        let accepted = kr_ipc::clock::SharedClock::boot_elapsed_ms(&pair.shared)
+            + kr_protocol::limits::MAX_MUTATION_TTL.get()
+            + 60_000;
+        let anchored = vouched_deadline(
+            &ProcessSide(Arc::clone(&pair)),
+            &SharedSide(Arc::clone(&pair)),
+            accepted,
+        )
+        .expect("some of the deadline is left");
+        assert_eq!(
+            anchored.saturating_duration_since(start),
+            Duration::from_millis(kr_protocol::limits::MAX_MUTATION_TTL.get()),
+            "a daemon cannot hand a worker a longer life than the protocol allows"
+        );
     }
 }
