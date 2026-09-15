@@ -429,7 +429,7 @@ impl Session {
                 });
             }
         }
-        self.hub.unsubscribe(attachment_id);
+        self.hub.detached(attachment_id);
         let previous = self.attachments.geometry();
         let change = self.attachments.detach(attachment_id)?;
         if change.resize_required

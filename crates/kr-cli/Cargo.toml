@@ -29,7 +29,12 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
+# The attach tests host a real session and run `kr` against it on a real pseudo-terminal. Both
+# dependencies are tests only, so the command itself does not carry them.
+kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
+kr-worker.workspace = true
+portable-pty.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

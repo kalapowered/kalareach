@@ -34,13 +34,15 @@ pub enum OutputDelivery {
     },
     /// The subscriber must discard its partial state and install a fresh snapshot.
     Resync(ResyncRequired),
+    /// The attachment was detached. Nothing more will arrive on this stream.
+    Detached,
 }
 
 impl OutputDelivery {
     fn len(&self) -> usize {
         match self {
             Self::Bytes { bytes, .. } => bytes.len(),
-            Self::Resync(_) => 0,
+            Self::Resync(_) | Self::Detached => 0,
         }
     }
 }
@@ -105,6 +107,18 @@ impl OutputHub {
             },
         );
         OutputStream { receiver, queued }
+    }
+
+    /// Tells a subscriber its attachment has been detached, then removes it.
+    ///
+    /// A terminal whose attachment was ended somewhere else has to learn that it was, or it sits
+    /// waiting for output that is never coming and only finds out when its next keystroke is
+    /// refused.
+    pub fn detached(&mut self, attachment_id: AttachmentId) {
+        if let Some(subscriber) = self.subscribers.get(&attachment_id) {
+            let _ = subscriber.sender.send(OutputDelivery::Detached);
+        }
+        self.unsubscribe(attachment_id);
     }
 
     /// Removes a subscription.
@@ -233,7 +247,7 @@ mod tests {
                     assert_eq!(cursor, 0);
                     assert_eq!(bytes.as_slice(), b"hello");
                 }
-                OutputDelivery::Resync(_) => panic!("unexpected resynchronisation"),
+                other => panic!("an unexpected delivery: {other:?}"),
             }
         }
     }
@@ -256,7 +270,7 @@ mod tests {
                 assert_eq!(cursor, 8);
                 assert_eq!(bytes.len(), 8);
             }
-            OutputDelivery::Resync(_) => panic!("the quick subscriber kept up"),
+            other => panic!("the quick subscriber kept up: {other:?}"),
         }
 
         // The slow one receives what it had, then the marker, and nothing after it.
@@ -267,7 +281,7 @@ mod tests {
                 assert_eq!(marker.reason, ResyncReason::SendQueueFull);
                 assert_eq!(marker.cursor.get(), 8);
             }
-            OutputDelivery::Bytes { .. } => panic!("the slow subscriber was resynchronised"),
+            other => panic!("the slow subscriber was resynchronised: {other:?}"),
         }
         hub.publish(16, &Arc::new(vec![b'c'; 8]), 0);
         assert!(

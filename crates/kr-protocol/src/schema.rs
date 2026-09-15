@@ -11,7 +11,6 @@
 use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings, json_schema};
 use serde_json::{Map, Value, json};
 
-use crate::account::{MembershipLease, PolicyAuthority};
 use crate::actor::ActorEnvelope;
 use crate::archive::{ArchiveDescriptor, RecoveryBundle, RecoveryKit, SignedArchiveManifest};
 use crate::authority::MethodEntry;
@@ -33,6 +32,53 @@ use crate::receipt::{Receipt, ReceiptResponse};
 use crate::relay::{
     RelayConsumptionAck, RelayConsumptionReport, RelayLeaseAck, RelayLeaseRequest,
     SignedRelayConsumptionReceipt, SignedRelayInstanceRegistration,
+use crate::attachment::{
+    AttachmentConfigureParams, AttachmentSummary, AttachmentViewportParams,
+    AttachmentViewportResult, GeometryResult, GeometryState, SessionAttachParams,
+    SessionAttachResult, SessionDetachParams, SessionDetachResult, TerminalGeometryTransferParams,
+    TerminalResizeParams,
+};
+use crate::authority::MethodEntry;
+use crate::envelope::{ControlFrame, MutationRequest, Notification, Request, Response};
+use crate::error::ProtocolError;
+use crate::frame::StreamHeader;
+use crate::grant::Grant;
+use crate::hello::{ActionWindow, ClientOffer, ConnectReply, HelloReply, HostSelection};
+use crate::hostinfo::{EnvironmentListResult, HostDoctorResult, HostInfoResult};
+use crate::ids;
+use crate::ids::SessionRef;
+use crate::input::{
+    InputAcquireParams, InputAcquireResult, InputInterruptParams, InputLeaseResult,
+    InputLeaseState, InputReleaseParams, InputWriteParams, InputWriteResult,
+};
+use crate::local::{
+    ActionWindowGrant, ActionWindowRenew, ControlMessage, ForwardedMutation, LocalHello,
+    LocalHelloAck,
+};
+use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
+use crate::method::{Method, REGISTRY};
+use crate::pairing::{
+    AuthorityRevisionRecord, DirectChallenge, DirectRedeemProof, GenerationCheckpoint,
+    OwnerConfirmationProof, OwnerConfirmationRequest, PairFinishRequest, PairStatus, ProposedGrant,
+    RevocationAcknowledgement, RevocationRequest, SignedClientBundle, SignedHostBundle,
+};
+use crate::receipt::{
+    ActionCancelParams, ActionCancelResult, ActionReadParams, ActionReadResult, Receipt,
+    ReceiptResponse,
+};
+use crate::recovery::{
+    EventsSnapshotParams, EventsSnapshotResult, EventsSubscribeParams, EventsSubscribeResult,
+    HistoryPageParams, HistoryPageResult, OutputEvent, ResyncRequired,
+};
+use crate::session::{
+    ClosureRecord, SessionCloseParams, SessionCloseResult, SessionCreateParams,
+    SessionCreateResult, SessionListParams, SessionListResult, SessionReadParams,
+    SessionReadResult, SessionSummary,
+};
+use crate::worker::{
+    AuthorityRevisionAck, AuthorityRevisionNotice, ControllerGenerationToken, GenerationAccepted,
+    GenerationChallenge, WorkerDescriptor, WorkerLaunchSpec, WorkerReady, WorkerRendezvous,
+    WorkerVerifyChallenge, WorkerVerifyProof,
 };
 
 /// The generated JSON Schema bundle.
@@ -63,28 +109,66 @@ pub fn protocol_schema() -> Value {
     roots! {
         generator, properties,
         "action_window" => ActionWindow,
+        "action_cancel_params" => ActionCancelParams,
+        "action_cancel_result" => ActionCancelResult,
+        "action_read_params" => ActionReadParams,
+        "action_read_result" => ActionReadResult,
+        "action_window_grant" => ActionWindowGrant,
+        "action_window_renew" => ActionWindowRenew,
         "actor_envelope" => ActorEnvelope,
         "archive_descriptor" => ArchiveDescriptor,
+        "attachment_configure_params" => AttachmentConfigureParams,
+        "attachment_summary" => AttachmentSummary,
+        "attachment_viewport_params" => AttachmentViewportParams,
+        "attachment_viewport_result" => AttachmentViewportResult,
+        "authority_revision_ack" => AuthorityRevisionAck,
+        "authority_revision_notice" => AuthorityRevisionNotice,
         "authority_revision_record" => AuthorityRevisionRecord,
         "client_offer" => ClientOffer,
         "connect_reply" => ConnectReply,
         "control_frame" => ControlFrame,
+        "closure_record" => ClosureRecord,
+        "control_message" => ControlMessage,
+        "controller_generation_token" => ControllerGenerationToken,
         "direct_challenge" => DirectChallenge,
         "direct_redeem_proof" => DirectRedeemProof,
         "envelope_plaintext" => EnvelopePlaintext,
+        "environment_list_result" => EnvironmentListResult,
+        "events_snapshot_params" => EventsSnapshotParams,
+        "events_snapshot_result" => EventsSnapshotResult,
+        "events_subscribe_params" => EventsSubscribeParams,
+        "events_subscribe_result" => EventsSubscribeResult,
+        "forwarded_mutation" => ForwardedMutation,
+        "generation_accepted" => GenerationAccepted,
+        "generation_challenge" => GenerationChallenge,
         "generation_checkpoint" => GenerationCheckpoint,
+        "geometry_result" => GeometryResult,
+        "geometry_state" => GeometryState,
         "grant" => Grant,
         "hello_reply" => HelloReply,
+        "history_page_params" => HistoryPageParams,
+        "history_page_result" => HistoryPageResult,
+        "host_doctor_result" => HostDoctorResult,
+        "host_info_result" => HostInfoResult,
         "host_selection" => HostSelection,
-        "membership_lease" => MembershipLease,
+        "input_acquire_params" => InputAcquireParams,
+        "input_acquire_result" => InputAcquireResult,
+        "input_interrupt_params" => InputInterruptParams,
+        "input_lease_result" => InputLeaseResult,
+        "input_lease_state" => InputLeaseState,
+        "input_release_params" => InputReleaseParams,
+        "input_write_params" => InputWriteParams,
+        "input_write_result" => InputWriteResult,
+        "local_hello" => LocalHello,
+        "local_hello_ack" => LocalHelloAck,
         "method_entry" => MethodEntry,
         "mutation_request" => MutationRequest,
         "notification" => Notification,
+        "output_event" => OutputEvent,
         "owner_confirmation_proof" => OwnerConfirmationProof,
         "owner_confirmation_request" => OwnerConfirmationRequest,
         "pair_finish_request" => PairFinishRequest,
         "pair_status" => PairStatus,
-        "policy_authority" => PolicyAuthority,
         "proposed_grant" => ProposedGrant,
         "protocol_error" => ProtocolError,
         "receipt" => Receipt,
@@ -97,16 +181,38 @@ pub fn protocol_schema() -> Value {
         "recovery_kit" => RecoveryKit,
         "request" => Request,
         "response" => Response,
+        "resync_required" => ResyncRequired,
         "revocation_acknowledgement" => RevocationAcknowledgement,
         "revocation_request" => RevocationRequest,
         "sealed_envelope" => SealedEnvelope,
+        "session_attach_params" => SessionAttachParams,
+        "session_attach_result" => SessionAttachResult,
+        "session_close_params" => SessionCloseParams,
+        "session_close_result" => SessionCloseResult,
+        "session_create_params" => SessionCreateParams,
+        "session_create_result" => SessionCreateResult,
+        "session_detach_params" => SessionDetachParams,
+        "session_detach_result" => SessionDetachResult,
+        "session_list_params" => SessionListParams,
+        "session_list_result" => SessionListResult,
+        "session_read_params" => SessionReadParams,
+        "session_read_result" => SessionReadResult,
         "session_ref" => SessionRef,
+        "session_summary" => SessionSummary,
         "signed_archive_manifest" => SignedArchiveManifest,
         "signed_client_bundle" => SignedClientBundle,
         "signed_host_bundle" => SignedHostBundle,
         "signed_relay_consumption_receipt" => SignedRelayConsumptionReceipt,
         "signed_relay_instance_registration" => SignedRelayInstanceRegistration,
         "stream_header" => StreamHeader,
+        "terminal_geometry_transfer_params" => TerminalGeometryTransferParams,
+        "terminal_resize_params" => TerminalResizeParams,
+        "worker_descriptor" => WorkerDescriptor,
+        "worker_launch_spec" => WorkerLaunchSpec,
+        "worker_ready" => WorkerReady,
+        "worker_rendezvous" => WorkerRendezvous,
+        "worker_verify_challenge" => WorkerVerifyChallenge,
+        "worker_verify_proof" => WorkerVerifyProof,
     }
     properties.insert(
         "identifiers".to_owned(),
@@ -192,7 +298,6 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "pairing_sequence" => ids::PairingSequence,
         "payer_authorisation_id" => ids::PayerAuthorisationId,
         "plugin_id" => ids::PluginId,
-        "policy_key_revision" => ids::PolicyKeyRevision,
         "project_repository_id" => ids::ProjectRepositoryId,
         "question_id" => ids::QuestionId,
         "question_revision" => ids::QuestionRevision,

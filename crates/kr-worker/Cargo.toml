@@ -26,6 +26,9 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 
 [dev-dependencies]
 kr-cbor.workspace = true
+# The host tests start a real control daemon beside a real worker. The dependency is only in
+# tests, so the two crates do not depend on each other at build time.
+kr-controller.workspace = true
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 

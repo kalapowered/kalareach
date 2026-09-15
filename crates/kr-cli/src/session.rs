@@ -223,6 +223,11 @@ async fn drive(
                         if notification.event_type.as_str() == "session.resync" {
                             return AttachOutcome::Disconnected;
                         }
+                        // This attachment was ended somewhere else, which is what `kr detach` from
+                        // another window does. The terminal comes back and the command finishes.
+                        if notification.event_type.as_str() == "session.detached" {
+                            return AttachOutcome::Detached;
+                        }
                     }
                     Ok(ControlMessage::Response(response)) => {
                         let Some(sent) = outstanding.remove(&response.request_id) else {

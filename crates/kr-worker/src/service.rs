@@ -363,6 +363,20 @@ impl WorkerService {
                             OutputDelivery::Resync(marker) => {
                                 notification(&stream_id, sequence, "session.resync", &marker)
                             }
+                            OutputDelivery::Detached => {
+                                // The attachment has ended. The client is told so it can put its
+                                // terminal back, rather than waiting for output that is not coming.
+                                if let Some(notification) = notification(
+                                    &stream_id,
+                                    sequence,
+                                    "session.detached",
+                                    &kr_protocol::attachment::SessionDetachParams { attachment_id },
+                                ) {
+                                    let mut sender = sender.lock().await;
+                                    let _ = sender.write_message(&notification).await;
+                                }
+                                return;
+                            }
                         };
                         let Some(notification) = notification else {
                             continue;
