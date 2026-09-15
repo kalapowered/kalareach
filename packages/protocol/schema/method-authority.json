@@ -3401,19 +3401,16 @@
           "when": "always"
         },
         {
-          "authority": {
-            "right": {
-              "right": "session.view"
-            }
-          },
+          "authority": "present_view_authority",
           "when": "always"
         }
       ],
       "resource_selectors": [
         "action",
+        "environment",
         "session"
       ],
-      "summary": "Read a retained receipt. Owning the identifier is not enough: present view authority over the receipt's subject is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier.",
+      "summary": "Read a retained receipt. Owning the identifier is not enough: present view authority over the subject the receipt names is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier. A receipt for a host effect resolves against that host scope, not against a session.",
       "version": 1
     },
     {

@@ -41,3 +41,21 @@ describe('generated types', () => {
     expect(names).not.toContain('host.shutdown')
   })
 })
+
+describe('identifier vocabulary', () => {
+  it('exports a named type for every identifier the schema declares', () => {
+    const schema = JSON.parse(
+      readFileSync(join(packageRoot, 'schema', 'kalareach-protocol.schema.json'), 'utf8')
+    ) as { properties: Record<string, { properties?: Record<string, { $ref?: string }> }> }
+    const generated = readFileSync(join(packageRoot, 'src', 'generated', 'protocol.ts'), 'utf8')
+    const vocabulary = schema.properties.identifiers?.properties ?? {}
+    const names = Object.values(vocabulary)
+      .map((entry) => entry.$ref?.replace('#/$defs/', ''))
+      .filter((name): name is string => name !== undefined)
+    expect(names.length).toBeGreaterThanOrEqual(55)
+    const missing = names.filter(
+      (name) => !new RegExp(`^export (type|interface) ${name}\\b`, 'm').test(generated)
+    )
+    expect(missing, `identifiers with no generated type: ${missing.join(', ')}`).toEqual([])
+  })
+})

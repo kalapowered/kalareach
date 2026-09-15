@@ -1,8 +1,10 @@
 {
   "$defs": {
     "ActionId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One submitted intent and its receipt, generated as a UUIDv4."
+      "description": "One submitted intent and its receipt, generated as a UUIDv4.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "ActionRight": {
       "description": "One permitted action in a grant.",
@@ -289,8 +291,9 @@
       ]
     },
     "AgentBindingRevision": {
-      "$ref": "#/$defs/U64",
-      "description": "Changes when the active upstream execution owner or selected thread changes."
+      "description": "Changes when the active upstream execution owner or selected thread changes.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "AgentThreadId": {
       "description": "The upstream agent's conversation identifier, where available. Correlation data, not authority.",
@@ -305,8 +308,10 @@
       "type": "string"
     },
     "ApplicationInstanceId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One foreground application within a terminal session."
+      "description": "One foreground application within a terminal session.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "ApprovalRequestId": {
       "description": "An upstream approval request identifier. Opaque to KalaReach.",
@@ -315,29 +320,42 @@
       "type": "string"
     },
     "AttachmentId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One CLI or application attachment, independently of its device."
+      "description": "One CLI or application attachment, independently of its device.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "AttachmentOrdinal": {
-      "$ref": "#/$defs/U64",
-      "description": "Monotonic attachment join order, used for deterministic geometry-owner succession."
+      "description": "Monotonic attachment join order, used for deterministic geometry-owner succession.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "AttemptId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One pairing attempt by one candidate: 128 random bits."
+      "description": "One pairing attempt by one candidate: 128 random bits.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "AuthorityRevision": {
-      "$ref": "#/$defs/U64",
-      "description": "The host's ordered authority revision. Only the host issues its own revisions."
+      "description": "The host's ordered authority revision. Only the host issues its own revisions.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "BootEpoch": {
-      "$ref": "#/$defs/U64",
-      "description": "The host boot epoch, which binds continuous-time deadlines to one boot."
+      "description": "The host boot epoch, which binds continuous-time deadlines to one boot.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "BuildId": {
       "description": "A build identifier reported in hello.",
       "maxLength": 256,
       "minLength": 1,
+      "type": "string"
+    },
+    "Bytes": {
+      "contentEncoding": "base64url",
+      "description": "An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
+      "pattern": "^[A-Za-z0-9_-]*$",
       "type": "string"
     },
     "CapabilityId": {
@@ -385,20 +403,26 @@
       ]
     },
     "CapabilityRevision": {
-      "$ref": "#/$defs/U64",
-      "description": "Current evidence for a versioned capability. Never permission."
+      "description": "Current evidence for a versioned capability. Never permission.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "CausalRootId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "The root of a bounded cross-run causal chain."
+      "description": "The root of a bounded cross-run causal chain.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "ChangeSetId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One immutable captured change set."
+      "description": "One immutable captured change set.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "ChangeSetVersion": {
-      "$ref": "#/$defs/U64",
-      "description": "The exact version of a change set that was tested or reviewed."
+      "description": "The exact version of a change set that was tested or reviewed.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "ClientOffer": {
       "additionalProperties": false,
@@ -452,8 +476,9 @@
       "type": "object"
     },
     "ClockEpoch": {
-      "$ref": "#/$defs/U64",
-      "description": "The host clock epoch, advanced when wall-clock trust changes."
+      "description": "The host clock epoch, advanced when wall-clock trust changes.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "ConfirmationRequirement": {
       "description": "Whether a method needs a fresh owner confirmation.",
@@ -476,12 +501,15 @@
       ]
     },
     "ConnectionId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One transport connection, allocated by the host during hello."
+      "description": "One transport connection, allocated by the host during hello.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "ControllerGeneration": {
-      "$ref": "#/$defs/U64",
-      "description": "The controller's persistent generation, advanced on every controller start."
+      "description": "The controller's persistent generation, advanced on every controller start.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "DesktopSessionId": {
       "description": "A host-derived desktop session identity binding OS user, boot identity and login-session generation.",
@@ -490,12 +518,15 @@
       "type": "string"
     },
     "DeviceId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One paired device."
+      "description": "One paired device.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "DeviceKeyRevision": {
-      "$ref": "#/$defs/U64",
-      "description": "The revision of a device's purpose-separated public keys."
+      "description": "The revision of a device's purpose-separated public keys.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "DiagnosticId": {
       "description": "An opaque diagnostic identifier. It carries no protocol meaning.",
@@ -510,12 +541,15 @@
       "type": "string"
     },
     "DraftId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One durable device-owned draft, independent of an attachment."
+      "description": "One durable device-owned draft, independent of an attachment.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "DraftRevision": {
-      "$ref": "#/$defs/U64",
-      "description": "The exact version of a draft."
+      "description": "The exact version of a draft.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "DurationMs": {
       "description": "A duration in milliseconds, as a decimal string in JSON.",
@@ -544,8 +578,10 @@
       "type": "string"
     },
     "EnvironmentId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One installed OS, distribution or container environment and OS user."
+      "description": "One installed OS, distribution or container environment and OS user.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "EnvironmentSelector": {
       "description": "Which environments a grant covers.",
@@ -830,8 +866,9 @@
       ]
     },
     "EventSequence": {
-      "$ref": "#/$defs/U64",
-      "description": "A position in one notification stream."
+      "description": "A position in one notification stream.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "EventType": {
       "description": "The type of one notification event.",
@@ -870,8 +907,9 @@
       ]
     },
     "GeometryEpoch": {
-      "$ref": "#/$defs/U64",
-      "description": "The current geometry-owner epoch, separate from the input lease."
+      "description": "The current geometry-owner epoch, separate from the input lease.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "Grant": {
       "additionalProperties": false,
@@ -989,8 +1027,10 @@
       ]
     },
     "GrantId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One host-issued authority object."
+      "description": "One host-issued authority object.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "HistoryFilter": {
       "description": "How the shared host-side history filter applies to a method's result.",
@@ -1173,24 +1213,32 @@
       ]
     },
     "InputLeaseEpoch": {
-      "$ref": "#/$defs/U64",
-      "description": "The current input lease epoch."
+      "description": "The current input lease epoch.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "InputSequence": {
-      "$ref": "#/$defs/U64",
-      "description": "An increasing sequence number inside one raw input stream."
+      "description": "An increasing sequence number inside one raw input stream.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "InstallationId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One native application installation registered with a push gateway."
+      "description": "One native application installation registered with a push gateway.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "InvitationId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One pairing invitation: 128 random bits, not necessarily a UUIDv4."
+      "description": "One pairing invitation: 128 random bits, not necessarily a UUIDv4.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "MachineId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "A logical machine group. Not a hardware identity."
+      "description": "A logical machine group. Not a hardware identity.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "Method": {
       "description": "Every method in the section 23 method-groups table.",
@@ -1722,7 +1770,7 @@
         },
         {
           "const": "action.read",
-          "description": "Read a retained receipt. Owning the identifier is not enough: present view authority over the receipt's subject is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier.",
+          "description": "Read a retained receipt. Owning the identifier is not enough: present view authority over the subject the receipt names is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier. A receipt for a host effect resolves against that host scope, not against a session.",
           "type": "string"
         },
         {
@@ -2180,8 +2228,10 @@
       "type": "object"
     },
     "OrganisationId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One organisation whose signed policy a host has opted into."
+      "description": "One organisation whose signed policy a host has opted into.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "OrganisationRequirement": {
       "additionalProperties": false,
@@ -2243,8 +2293,10 @@
       "type": "string"
     },
     "ProjectRepositoryId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One environment-bound source repository."
+      "description": "One environment-bound source repository.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "ProtocolError": {
       "additionalProperties": false,
@@ -2308,12 +2360,15 @@
       "type": "object"
     },
     "QuestionId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One agent-to-user question."
+      "description": "One agent-to-user question.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "QuestionRevision": {
-      "$ref": "#/$defs/U64",
-      "description": "The exact version of a question that a person answers."
+      "description": "The exact version of a question that a person answers.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "Receipt": {
       "additionalProperties": false,
@@ -2524,12 +2579,15 @@
       ]
     },
     "RemoteDispatchLeaseId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One remote dispatch lease from the current controller generation."
+      "description": "One remote dispatch lease from the current controller generation.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "RepositoryGeneration": {
-      "$ref": "#/$defs/U64",
-      "description": "The catalogue generation a plugin package was resolved against."
+      "description": "The catalogue generation a plugin package was resolved against.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "Request": {
       "additionalProperties": false,
@@ -2561,8 +2619,9 @@
       "type": "object"
     },
     "RequestId": {
-      "$ref": "#/$defs/U64",
-      "description": "A request identifier, unique for the lifetime of one connection."
+      "description": "A request identifier, unique for the lifetime of one connection.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "RequiredAuthority": {
       "description": "What a request must present besides a valid current grant.\n\nAn empty required-rights list is not \"no check\". It means scoped read authority and nothing\nmore: a valid, unexpired, unrevoked grant for this actor that covers the named environment and\nthe named resource. Only reads of host and environment configuration use it.",
@@ -2628,6 +2687,11 @@
         {
           "const": "issuer_delegation",
           "description": "Current issuer or delegation authority over the named grant: the actor holds the parent\ngrant it is delegating from, or issued the grant it is revoking. Holding a right that a\ngrant happens to contain never implies authority over the grant itself.",
+          "type": "string"
+        },
+        {
+          "const": "present_view_authority",
+          "description": "Present view authority over the subject the host resolves from the named resource, rather\nthan over a resource the request states. For a session subject that is `session.view` at\nthe session's current scope; for a host or environment subject it is the scope that permits\nthe effect the subject records. Holding a stale identifier is never enough.",
           "type": "string"
         }
       ]
@@ -2931,12 +2995,15 @@
       ]
     },
     "SessionEpoch": {
-      "$ref": "#/$defs/U64",
-      "description": "The session epoch, fixed at 1 in protocol version 1."
+      "description": "The session epoch, fixed at 1 in protocol version 1.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "SessionId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One KalaReach terminal session."
+      "description": "One KalaReach terminal session.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "SessionRef": {
       "additionalProperties": false,
@@ -3006,8 +3073,9 @@
       "type": "string"
     },
     "StreamCursor": {
-      "$ref": "#/$defs/U64",
-      "description": "A position in one event stream."
+      "description": "A position in one event stream.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "StreamHeader": {
       "additionalProperties": false,
@@ -3137,8 +3205,10 @@
       "type": "string"
     },
     "TransferId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One upload or download transfer."
+      "description": "One upload or download transfer.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "U64": {
       "description": "An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.",
@@ -3152,16 +3222,22 @@
       "type": "string"
     },
     "WorkflowId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One automation definition."
+      "description": "One automation definition.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "WorkflowRunId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One automation run."
+      "description": "One automation run.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     },
     "WorkspaceId": {
-      "$ref": "#/$defs/Uuid",
-      "description": "One selected working copy and its policy."
+      "description": "One selected working copy and its policy.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3310,6 +3386,21 @@
         },
         "question_revision": {
           "$ref": "#/$defs/QuestionRevision"
+        },
+        "raw_bytes": {
+          "$ref": "#/$defs/Bytes"
+        },
+        "raw_duration_ms": {
+          "$ref": "#/$defs/DurationMs"
+        },
+        "raw_timestamp_ms": {
+          "$ref": "#/$defs/TimestampMs"
+        },
+        "raw_u64": {
+          "$ref": "#/$defs/U64"
+        },
+        "raw_uuid": {
+          "$ref": "#/$defs/Uuid"
         },
         "remote_dispatch_lease_id": {
           "$ref": "#/$defs/RemoteDispatchLeaseId"

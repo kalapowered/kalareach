@@ -977,3 +977,56 @@ fn opaque_parameters_keep_every_integer_exact_in_json() {
         "a2636269671bffffffffffffffff65736d616c6c03"
     );
 }
+
+#[test]
+fn an_alternate_representation_of_the_same_typed_value_is_rejected() {
+    use kr_cbor::CborError;
+    use kr_protocol::envelope::Outcome;
+    use kr_protocol::ids::CapabilityId;
+
+    // A unit variant has one canonical form: its name as text. The same value also arrives as a
+    // single-entry map holding null, which deserialises identically but serialises back to the
+    // text form, so a signature taken over the map form would not verify against the value.
+    let text_form = hex::decode("656e65766572").expect("hex");
+    assert_eq!(
+        kr_cbor::from_canonical_slice::<GrantExpiry>(&text_form, &Limits::DEFAULT)
+            .expect("the canonical form"),
+        GrantExpiry::Never
+    );
+    let map_form = hex::decode("a1656e65766572f6").expect("hex");
+    assert!(
+        matches!(
+            kr_cbor::from_canonical_slice::<GrantExpiry>(&map_form, &Limits::DEFAULT),
+            Err(CborError::NonCanonical)
+        ),
+        "a second representation of the same value must be rejected"
+    );
+
+    // The same applies inside a set, where the order check alone would not notice.
+    let member_map_form = kr_cbor::encode(&CanonicalValue::Array(vec![CanonicalValue::Map(
+        kr_cbor::CanonicalMap::from_entries([("session.view".to_owned(), CanonicalValue::Null)])
+            .expect("map"),
+    )]));
+    assert!(matches!(
+        kr_cbor::from_canonical_slice::<CanonicalSet<ActionRight>>(
+            &member_map_form,
+            &Limits::DEFAULT
+        ),
+        Err(CborError::NonCanonical)
+    ));
+
+    // And to a variant that carries data: "ok" alone is not the encoding of any Outcome.
+    let bare = kr_cbor::encode(&CanonicalValue::text("ok"));
+    assert!(matches!(
+        kr_cbor::from_canonical_slice::<Outcome>(&bare, &Limits::DEFAULT),
+        Err(CborError::NonCanonical)
+    ));
+
+    // A plain string enum still round trips through its own form.
+    let capability = CapabilityId::new("terminal.direct").expect("name");
+    let wire = kr_cbor::to_canonical_vec(&capability).expect("encode");
+    assert_eq!(
+        kr_cbor::from_canonical_slice::<CapabilityId>(&wire, &Limits::DEFAULT).expect("decode"),
+        capability
+    );
+}

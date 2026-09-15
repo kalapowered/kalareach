@@ -489,13 +489,28 @@ fn a_conditional_pair_is_a_choice_and_not_an_intersection() {
 
 #[test]
 fn reading_a_retained_receipt_needs_present_view_authority() {
-    // Owning an action identifier is not permission to read what the receipt exposes.
+    // Owning an action identifier is not permission to read what the receipt exposes. The
+    // requirement resolves against the subject the receipt names, so a receipt for a host effect
+    // such as device.revoke is reachable under host scope rather than under session.view.
     let entry = lookup("action.read").expect("listed");
     assert!(
         entry
+            .required_rights
+            .iter()
+            .any(|required| matches!(required.authority, RequiredAuthority::PresentViewAuthority)),
+        "action.read must require present view authority"
+    );
+    assert!(
+        !entry
             .unconditional_rights()
             .any(|right| right == ActionRight::SessionView),
-        "action.read must require present view authority"
+        "a receipt for a host effect has no session to view"
+    );
+    assert!(
+        entry
+            .resource_selectors
+            .contains(&kr_protocol::authority::ResourceSelectorKind::Environment),
+        "the subject may be an environment rather than a session"
     );
     assert_eq!(entry.history_filter, HistoryFilter::GrantLowerBound);
 }

@@ -67,8 +67,10 @@ macro_rules! uuid_id {
             }
 
             fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-                // Reference the shared scalar so the representation is defined once.
-                let mut schema = generator.subschema_for::<Uuid>();
+                // The scalar's schema is written out rather than referenced. A definition that is
+                // only a reference to another definition is an alias of an alias, and a generator
+                // that flattens one drops the named type, which is the whole point of this type.
+                let mut schema = Uuid::json_schema(generator);
                 schema.insert("description".to_owned(), $description.into());
                 schema
             }
@@ -115,8 +117,8 @@ macro_rules! counter_id {
             }
 
             fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-                // Reference the shared scalar so the representation is defined once.
-                let mut schema = generator.subschema_for::<U64>();
+                // See the note on the UUID identifiers above.
+                let mut schema = U64::json_schema(generator);
                 schema.insert("description".to_owned(), $description.into());
                 schema
             }

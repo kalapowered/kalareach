@@ -76,7 +76,7 @@ impl ParamsValue {
     /// # Errors
     ///
     /// Returns an error when the value does not match the target schema.
-    pub fn to_typed<T: DeserializeOwned>(&self) -> Result<T, kr_cbor::CborError> {
+    pub fn to_typed<T: DeserializeOwned + Serialize>(&self) -> Result<T, kr_cbor::CborError> {
         kr_cbor::from_canonical_value(&self.0)
     }
 }

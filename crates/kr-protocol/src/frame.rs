@@ -315,7 +315,7 @@ impl FrameCodec {
     ///
     /// Returns a framing failure, or a CBOR failure when the payload is not a canonical message of
     /// the expected shape.
-    pub fn decode_message<T: serde::de::DeserializeOwned>(
+    pub fn decode_message<T: serde::de::DeserializeOwned + serde::Serialize>(
         self,
         buffer: &[u8],
     ) -> Result<(T, usize), FrameError> {

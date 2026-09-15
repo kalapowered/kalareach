@@ -7,6 +7,18 @@
  */
 
 /**
+ * One paired device.
+ */
+export type DeviceId = string
+/**
+ * One host-issued authority object.
+ */
+export type GrantId = string
+/**
+ * The host's ordered authority revision. Only the host issues its own revisions.
+ */
+export type AuthorityRevision = string
+/**
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
 export type CapabilityId = string
@@ -48,6 +60,14 @@ export type TimestampMs = string
  */
 export type ApprovalRequestId = string
 /**
+ * One agent-to-user question.
+ */
+export type QuestionId = string
+/**
+ * One KalaReach terminal session.
+ */
+export type SessionId = string
+/**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
 export type ActionId = string
@@ -60,6 +80,10 @@ export type ActionWindowId = string
  */
 export type ActorId = string
 /**
+ * Changes when the active upstream execution owner or selected thread changes.
+ */
+export type AgentBindingRevision = string
+/**
  * The upstream agent's conversation identifier, where available. Correlation data, not authority.
  */
 export type AgentThreadId = string
@@ -67,6 +91,10 @@ export type AgentThreadId = string
  * The upstream agent's current turn identifier, where available.
  */
 export type AgentTurnId = string
+/**
+ * One foreground application within a terminal session.
+ */
+export type ApplicationInstanceId = string
 /**
  * One CLI or application attachment, independently of its device.
  */
@@ -184,6 +212,22 @@ export type ProjectRepositoryId = string
  */
 export type QuestionRevision = string
 /**
+ * An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+ */
+export type Bytes = string
+/**
+ * A duration in milliseconds, as a decimal string in JSON.
+ */
+export type DurationMs = string
+/**
+ * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+ */
+export type U64 = string
+/**
+ * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
+ */
+export type Uuid = string
+/**
  * One remote dispatch lease from the current controller generation.
  */
 export type RemoteDispatchLeaseId = string
@@ -196,6 +240,10 @@ export type RepositoryGeneration = string
  */
 export type RequestId = string
 /**
+ * The session epoch, fixed at 1 in protocol version 1.
+ */
+export type SessionEpoch = string
+/**
  * A private broker handle for immutable upstream bytes and their execution provenance.
  */
 export type SourceEventHandle = string
@@ -207,6 +255,10 @@ export type StreamCursor = string
  * The name of one event stream.
  */
 export type StreamId = string
+/**
+ * One upload or download transfer.
+ */
+export type TransferId = string
 /**
  * One automation definition.
  */
@@ -278,24 +330,15 @@ export interface KalaReachProtocol {
     action_id?: ActionId
     action_window_id?: ActionWindowId
     actor_id?: ActorId
-    /**
-     * Changes when the active upstream execution owner or selected thread changes.
-     */
-    agent_binding_revision?: string
+    agent_binding_revision?: AgentBindingRevision
     agent_thread_id?: AgentThreadId
     agent_turn_id?: AgentTurnId
-    /**
-     * One foreground application within a terminal session.
-     */
-    application_instance_id?: string
+    application_instance_id?: ApplicationInstanceId
     approval_request_id?: ApprovalRequestId
     attachment_id?: AttachmentId
     attachment_ordinal?: AttachmentOrdinal
     attempt_id?: AttemptId
-    /**
-     * The host's ordered authority revision. Only the host issues its own revisions.
-     */
-    authority_revision?: string
+    authority_revision?: AuthorityRevision
     boot_epoch?: BootEpoch
     build_id?: BuildId
     capability_id?: CapabilityId
@@ -307,10 +350,7 @@ export interface KalaReachProtocol {
     connection_id?: ConnectionId
     controller_generation?: ControllerGeneration
     desktop_session_id?: DesktopSessionId
-    /**
-     * One paired device.
-     */
-    device_id?: string
+    device_id?: DeviceId
     device_key_revision?: DeviceKeyRevision
     diagnostic_id?: DiagnosticId
     draft_id?: DraftId
@@ -319,10 +359,7 @@ export interface KalaReachProtocol {
     event_sequence?: EventSequence
     event_type?: EventType
     geometry_epoch?: GeometryEpoch
-    /**
-     * One host-issued authority object.
-     */
-    grant_id?: string
+    grant_id?: GrantId
     input_lease_epoch?: InputLeaseEpoch
     input_sequence?: InputSequence
     installation_id?: InstallationId
@@ -331,29 +368,22 @@ export interface KalaReachProtocol {
     organisation_id?: OrganisationId
     plugin_id?: PluginId
     project_repository_id?: ProjectRepositoryId
-    /**
-     * One agent-to-user question.
-     */
-    question_id?: string
+    question_id?: QuestionId
     question_revision?: QuestionRevision
+    raw_bytes?: Bytes
+    raw_duration_ms?: DurationMs
+    raw_timestamp_ms?: TimestampMs
+    raw_u64?: U64
+    raw_uuid?: Uuid
     remote_dispatch_lease_id?: RemoteDispatchLeaseId
     repository_generation?: RepositoryGeneration
     request_id?: RequestId
-    /**
-     * The session epoch, fixed at 1 in protocol version 1.
-     */
-    session_epoch?: string
-    /**
-     * One KalaReach terminal session.
-     */
-    session_id?: string
+    session_epoch?: SessionEpoch
+    session_id?: SessionId
     source_event_handle?: SourceEventHandle
     stream_cursor?: StreamCursor
     stream_id?: StreamId
-    /**
-     * One upload or download transfer.
-     */
-    transfer_id?: string
+    transfer_id?: TransferId
     workflow_id?: WorkflowId
     workflow_run_id?: WorkflowRunId
     workspace_id?: WorkspaceId
@@ -392,15 +422,15 @@ export interface ActorEnvelope {
   /**
    * The paired device, when the ingress is a device.
    */
-  device_id: string | null
+  device_id: DeviceId | null
   /**
    * The grant the request is being checked against, when one applies.
    */
-  grant_id: string | null
+  grant_id: GrantId | null
   /**
    * The authority revision the grant was validated at.
    */
-  grant_revision: string | null
+  grant_revision: AuthorityRevision | null
   /**
    * Where the request entered the host.
    */
@@ -529,7 +559,7 @@ export interface Grant {
   /**
    * The grant this one was delegated from. Revoking a parent revokes its descendants.
    */
-  parent_grant_id: string | null
+  parent_grant_id: GrantId | null
   /**
    * One paired device.
    */
@@ -543,10 +573,8 @@ export interface Grant {
         these: {
           /**
            * The permitted sessions.
-           *
-           * Items: One KalaReach terminal session.
            */
-          session_ids: string[]
+          session_ids: SessionId[]
         }
       }
     | 'none'
@@ -570,10 +598,8 @@ export interface HistoryScope {
   named_approvals: ApprovalRequestId[]
   /**
    * Current questions named explicitly, even when they were created before the lower bound.
-   *
-   * Items: One agent-to-user question.
    */
-  named_questions: string[]
+  named_questions: QuestionId[]
 }
 /**
  * An organisation membership requirement attached to a grant.
@@ -983,6 +1009,7 @@ export interface RequiredRight {
     | 'plugin_effect_rights'
     | 'local_caller_token'
     | 'issuer_delegation'
+    | 'present_view_authority'
   /**
    * When it must be presented.
    */
@@ -1020,7 +1047,7 @@ export interface MutationRequest {
    * The grant this mutation is claimed under. A local caller's host-stamped context leaves this
    * null and the host resolves its own owner authority.
    */
-  grant_id: string | null
+  grant_id: GrantId | null
   /**
    * The method name.
    */
@@ -1053,11 +1080,11 @@ export interface ActionTarget {
   /**
    * The agent binding revision, present exactly when `application_instance_id` is.
    */
-  agent_binding_revision: string | null
+  agent_binding_revision: AgentBindingRevision | null
   /**
    * The foreground application instance, when the effect has one.
    */
-  application_instance_id: string | null
+  application_instance_id: ApplicationInstanceId | null
   /**
    * The environment that owns the effect.
    */
@@ -1065,11 +1092,11 @@ export interface ActionTarget {
   /**
    * The session epoch, present exactly when `session_id` is.
    */
-  session_epoch: string | null
+  session_epoch: SessionEpoch | null
   /**
    * The session, when the effect has one.
    */
-  session_id: string | null
+  session_id: SessionId | null
 }
 /**
  * One event on a subscribed stream.
@@ -1382,9 +1409,9 @@ export interface StreamResource {
   /**
    * The session, for session streams.
    */
-  session_id: string | null
+  session_id: SessionId | null
   /**
    * The transfer, for attachment chunk streams.
    */
-  transfer_id: string | null
+  transfer_id: TransferId | null
 }

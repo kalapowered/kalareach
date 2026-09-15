@@ -1110,12 +1110,14 @@ methods! {
 
     ActionRead = "action.read", StateRecovery,
     effect: Read, ingress: [LocalIpc, PairedDevice, Workflow],
-    rights: [basis(ResourceOwner), req(SessionView)], selectors: [Action, Session],
+    rights: [basis(ResourceOwner), basis(PresentViewAuthority)],
+    selectors: [Action, Environment, Session],
     history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
     doc: "Read a retained receipt. Owning the identifier is not enough: present view authority \
-          over the receipt's subject is checked before it is returned, so a device that lost its \
-          scope cannot retrieve protected information through an old action identifier.";
+          over the subject the receipt names is checked before it is returned, so a device that \
+          lost its scope cannot retrieve protected information through an old action identifier. \
+          A receipt for a host effect resolves against that host scope, not against a session.";
 
     // ----- Sharing --------------------------------------------------------------------------
     GrantCreate = "grant.create", Sharing,

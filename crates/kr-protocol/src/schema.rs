@@ -94,6 +94,13 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         };
     }
     vocabulary! {
+        // The scalars every identifier is built from.
+        "raw_uuid" => crate::scalars::Uuid,
+        "raw_u64" => crate::scalars::U64,
+        "raw_bytes" => crate::scalars::Bytes,
+        "raw_timestamp_ms" => crate::scalars::TimestampMs,
+        "raw_duration_ms" => crate::scalars::DurationMs,
+        // The identity and object model.
         "action_id" => ids::ActionId,
         "action_window_id" => ids::ActionWindowId,
         "actor_id" => ids::ActorId,

@@ -89,8 +89,14 @@ fn scalars_declare_their_json_representation() {
     assert_eq!(definitions["U64"]["type"], "string");
     assert_eq!(definitions["U64"]["pattern"], "^(0|[1-9][0-9]*)$");
     assert_eq!(definitions["Digest256"]["contentEncoding"], "base64url");
-    assert_eq!(definitions["SessionId"]["$ref"], "#/$defs/Uuid");
-    assert_eq!(definitions["AuthorityRevision"]["$ref"], "#/$defs/U64");
+    // An identifier writes its scalar's schema out rather than referring to it. A definition that
+    // is only a reference to another definition is dropped by the TypeScript generator, and the
+    // package exists so no consumer has to hand-write these types.
+    assert_eq!(definitions["SessionId"]["format"], "uuid");
+    assert_eq!(
+        definitions["AuthorityRevision"]["pattern"],
+        "^(0|[1-9][0-9]*)$"
+    );
     assert_eq!(definitions["Digest256"]["pattern"], "^[A-Za-z0-9_-]{43}$");
 }
 
@@ -137,6 +143,36 @@ fn nullable_fields_are_required_and_accept_null() {
     let alternatives = session["anyOf"].as_array().expect("anyOf");
     assert_eq!(alternatives.len(), 2);
     assert!(alternatives.iter().any(|value| value["type"] == "null"));
+}
+
+#[test]
+fn every_identifier_has_its_own_named_definition() {
+    let schema = protocol_schema();
+    let vocabulary = schema["properties"]["identifiers"]["properties"]
+        .as_object()
+        .expect("the identifier vocabulary");
+    assert!(
+        vocabulary.len() >= 55,
+        "the vocabulary names every identifier, found {}",
+        vocabulary.len()
+    );
+    for (field, entry) in vocabulary {
+        let reference = entry["$ref"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} is not a reference"));
+        let name = reference
+            .strip_prefix("#/$defs/")
+            .unwrap_or_else(|| panic!("{field} refers outside the bundle"));
+        let definition = &schema["$defs"][name];
+        assert!(
+            definition.get("$ref").is_none(),
+            "{name} is a reference to another definition, so the generated types drop it"
+        );
+        assert!(
+            definition.get("type").is_some(),
+            "{name} has no concrete type"
+        );
+    }
 }
 
 #[test]
