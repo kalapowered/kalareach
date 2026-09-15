@@ -281,8 +281,12 @@ Two secret buffers in this path are not cleared, and neither is reachable from t
    uncleared, and closing it means either a value tree whose temporaries clear themselves or a
    secret-bearing payload type. Both belong with the crate that owns the encoder.
 
-   A QR payload that fails to decode is the same case in miniature: `kr-cbor` drops its own partial
-   tree before this crate can clear it. A payload that decodes is cleared.
+   Reading a QR payload is the same case in miniature. Writing one is not: its encoding is
+   assembled around the secret, so no encoder ever sees it. Reading one still goes through the
+   strict decoder, which is the right place for the canonical-form rules; a payload that decodes
+   has its value tree cleared, and one that fails to decode leaves a partial tree inside `kr-cbor`
+   that this crate cannot reach. Closing that means the same thing as the envelope case: a value
+   tree whose temporaries clear themselves, in the crate that owns the decoder.
 2. **`hkdf` 0.13.0 keeps its pseudorandom key and expansion buffers uncleared.** The crate has no
    `zeroize` feature; `hmac` and `sha2` are built with theirs. Closing this means a maintained
    release that clears them, or a reviewed patch. Section 20 requires a maintained implementation,

@@ -1416,12 +1416,53 @@ impl QrPayload {
     ///
     /// Returns a CBOR error when the payload cannot be represented in KR-CBOR-1.
     pub fn to_canonical_bytes(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, CborError> {
-        // A direct payload's bytes carry the invitation secret, so the caller is handed a buffer
-        // that clears itself, and the value tree this built is cleared before it is dropped.
-        let mut value = self.to_canonical_value()?;
-        let bytes = kr_cbor::encode(&value);
-        zeroise_value(&mut value);
-        Ok(zeroize::Zeroizing::new(bytes))
+        // The encoding is assembled here rather than handed to an encoder. An encoder copies the
+        // value it is given into buffers of its own, and for the invitation secret and the code
+        // those are copies no caller can reach and therefore cannot clear. Every member that is
+        // not secret is still encoded by `kr-cbor`; the only bytes written here are a map head, a
+        // byte-string head and a text head.
+        //
+        // `the_hand_assembled_encoding_matches_the_value_tree` checks the result against the
+        // encoder for a sample of each payload kind.
+        let mut out = zeroize::Zeroizing::new(Vec::with_capacity(512));
+        match self {
+            Self::Code(payload) => {
+                out.push(0xa4);
+                out.extend_from_slice(&encode_text("code"));
+                let code = payload.code.as_str().as_bytes();
+                out.extend_from_slice(&text_head(code.len()));
+                out.extend_from_slice(code);
+                out.extend_from_slice(&encode_text("mode"));
+                out.extend_from_slice(&encode_text(QR_MODE_CODE));
+                out.extend_from_slice(&encode_text("version"));
+                out.extend_from_slice(&encode_unsigned(QR_PAYLOAD_VERSION));
+                out.extend_from_slice(&encode_text("rendezvous_origin"));
+                out.extend_from_slice(&encode_text(payload.rendezvous_origin.as_str()));
+            }
+            Self::Direct(payload) => {
+                out.push(0xa8);
+                out.extend_from_slice(&encode_text("mode"));
+                out.extend_from_slice(&encode_text(QR_MODE_DIRECT));
+                out.extend_from_slice(&encode_text("secret"));
+                out.extend_from_slice(&bytes_head(SecretBytes32::LEN));
+                out.extend_from_slice(payload.secret.expose().as_slice());
+                out.extend_from_slice(&encode_text("version"));
+                out.extend_from_slice(&encode_unsigned(QR_PAYLOAD_VERSION));
+                out.extend_from_slice(&encode_text("expires_at"));
+                out.extend_from_slice(&encode_unsigned(payload.expires_at_ms.get()));
+                out.extend_from_slice(&encode_text("endpoint_id"));
+                out.extend_from_slice(&encode_bytes(payload.endpoint_id.as_bytes().as_slice()));
+                out.extend_from_slice(&encode_text("invitation_id"));
+                out.extend_from_slice(&encode_bytes(
+                    payload.invitation_id.get().as_bytes().as_slice(),
+                ));
+                out.extend_from_slice(&encode_text("network_config"));
+                out.extend_from_slice(&kr_cbor::to_canonical_vec(&payload.network_config)?);
+                out.extend_from_slice(&encode_text("proposed_grant"));
+                out.extend_from_slice(&kr_cbor::to_canonical_vec(&payload.proposed_grant)?);
+            }
+        }
+        Ok(out)
     }
 
     /// Decodes and validates a payload from canonical bytes.
@@ -1568,6 +1609,60 @@ impl QrPayload {
             }
         })?;
         Self::from_canonical_bytes(&bytes)
+    }
+}
+
+/// Encodes one text string through the canonical encoder. Never used for a secret.
+fn encode_text(value: &str) -> Vec<u8> {
+    kr_cbor::encode(&CanonicalValue::text(value))
+}
+
+/// Encodes one byte string through the canonical encoder. Never used for a secret.
+fn encode_bytes(value: &[u8]) -> Vec<u8> {
+    kr_cbor::encode(&CanonicalValue::bytes(value))
+}
+
+/// Encodes one unsigned integer through the canonical encoder.
+fn encode_unsigned(value: u64) -> Vec<u8> {
+    kr_cbor::encode(&CanonicalValue::Integer(value.into()))
+}
+
+/// Returns the canonical head of a text string of `len` bytes.
+///
+/// The two heads below are the only encoding this module writes itself, and they are written so a
+/// secret never reaches an encoder's own buffers. The lengths they serve are small and fixed: a
+/// twelve-character code and a 32-byte secret.
+fn text_head(len: usize) -> Vec<u8> {
+    major_head(0x60, len)
+}
+
+/// Returns the canonical head of a byte string of `len` bytes.
+fn bytes_head(len: usize) -> Vec<u8> {
+    major_head(0x40, len)
+}
+
+/// Returns the shortest head for `major` and `len`.
+fn major_head(major: u8, len: usize) -> Vec<u8> {
+    let len = len as u64;
+    if len < 24 {
+        vec![major | u8::try_from(len).expect("a length under 24 fits in a byte")]
+    } else if len <= u64::from(u8::MAX) {
+        vec![
+            major | 0x18,
+            u8::try_from(len).expect("a length under 256 fits in a byte"),
+        ]
+    } else if len <= u64::from(u16::MAX) {
+        let mut head = vec![major | 0x19];
+        head.extend_from_slice(&u16::try_from(len).expect("checked above").to_be_bytes());
+        head
+    } else if len <= u64::from(u32::MAX) {
+        let mut head = vec![major | 0x1a];
+        head.extend_from_slice(&u32::try_from(len).expect("checked above").to_be_bytes());
+        head
+    } else {
+        let mut head = vec![major | 0x1b];
+        head.extend_from_slice(&len.to_be_bytes());
+        head
     }
 }
 
@@ -2055,6 +2150,25 @@ mod tests {
                 organisation: Nullable::null(),
             },
             expires_at_ms: TimestampMs::new(1_764_000_600_000),
+        }
+    }
+
+    #[test]
+    fn the_hand_written_heads_match_the_canonical_encoder() {
+        // `text_head` and `bytes_head` are the only encoding this module writes itself.
+        for len in [0usize, 1, 12, 23, 24, 32, 255, 256, 65_535, 65_536] {
+            let text = "a".repeat(len);
+            assert_eq!(
+                text_head(len),
+                kr_cbor::encode(&CanonicalValue::text(&text))[..text_head(len).len()],
+                "text head for {len} bytes"
+            );
+            let bytes = vec![0u8; len];
+            assert_eq!(
+                bytes_head(len),
+                kr_cbor::encode(&CanonicalValue::bytes(bytes.as_slice()))[..bytes_head(len).len()],
+                "byte-string head for {len} bytes"
+            );
         }
     }
 
