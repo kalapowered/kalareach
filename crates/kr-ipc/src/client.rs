@@ -277,6 +277,9 @@ impl LocalClient {
         target: kr_protocol::envelope::ActionTarget,
         params: &T,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
+        // The window this mutation will quote is taken after everything the host has already
+        // pushed has been applied.
+        self.absorb_pending().await?;
         let request_id = self.next_id();
         let params = ParamsValue::from_typed(params)
             .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))?;
@@ -406,11 +409,43 @@ impl LocalClient {
     async fn read_frame(&mut self) -> Result<ControlFrame> {
         loop {
             let frame: ControlFrame = self.reader.read_message().await?;
-            if let ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) = frame {
-                self.acknowledgement.action_window = window;
-                continue;
+            match frame {
+                ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
+                    self.acknowledgement.action_window = window;
+                }
+                // A keepalive carries nothing; its arrival is the whole message. Returning it
+                // would make every caller that is waiting for an answer treat it as one.
+                ControlFrame::Event(ControlEvent::Keepalive) => {}
+                other => return Ok(other),
             }
-            return Ok(frame);
+        }
+    }
+
+    /// Applies anything the host has already pushed, without waiting for more.
+    ///
+    /// A connection that has been idle for longer than a window's validity has its replacement
+    /// waiting in the socket. Reading it before a mutation is built is what stops that mutation
+    /// quoting a window the host has already replaced: section 9 refuses a first admission through
+    /// an expired window, and replacing the window of a request that has already been submitted is
+    /// not allowed either, so the only place to take the current one is before the request exists.
+    async fn absorb_pending(&mut self) -> Result<()> {
+        loop {
+            // Biased, so the reader is polled first and the ready arm only wins when there is
+            // nothing waiting. The reader keeps its position inside a frame, so losing this race
+            // part way through a frame costs nothing.
+            let frame: Option<ControlFrame> = tokio::select! {
+                biased;
+                frame = self.reader.read_message::<ControlFrame>() => Some(frame?),
+                () = std::future::ready(()) => None,
+            };
+            match frame {
+                Some(ControlFrame::Event(ControlEvent::ActionWindowRenewed(window))) => {
+                    self.acknowledgement.action_window = window;
+                }
+                Some(ControlFrame::Event(ControlEvent::Keepalive)) => {}
+                // Anything else is an answer or an event a caller wants. It is not consumed here.
+                Some(_) | None => return Ok(()),
+            }
         }
     }
 

@@ -116,6 +116,8 @@ pub struct Session {
     root_exit: Option<ShellExit>,
     /// The canonical grid. Every byte the terminal produces passes through it.
     engine: crate::projection::TerminalEngine,
+    /// What the renderings this session has produced could not carry.
+    restoration_losses: crate::render::Carried,
 }
 
 impl std::fmt::Debug for Session {
@@ -178,6 +180,7 @@ impl Session {
             owned: None,
             root_exit: None,
             engine,
+            restoration_losses: crate::render::Carried::default(),
             config,
         })
     }
@@ -352,7 +355,17 @@ impl Session {
     /// its cursor by one and wrap by the other, so neither is moved without the other.
     fn resize_canonical(&mut self, dimensions: Dimensions) -> Result<()> {
         self.pty.resize(dimensions)?;
-        self.engine.resize(dimensions)
+        self.engine.resize(dimensions)?;
+        // A resize advances the engine's projection: every client's screen is at the old size and
+        // nothing continues from it. They are told, here, rather than on the next byte the
+        // application happens to write, which for an idle session may be never.
+        let next = self.history.next_cursor();
+        let oldest = self.history.oldest_retained_cursor();
+        for attachment_id in self.hub.subscribers() {
+            self.hub
+                .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
+        }
+        Ok(())
     }
 
     /// Tells the canonical grid where a side effect currently goes.
@@ -390,8 +403,42 @@ impl Session {
                 attachment: attachment_id.to_string(),
             })?
             .unwrap_or_else(|| self.attachments.geometry().dimensions);
-        let (cursor, restoration) = self.engine.restoration(dimensions, kr_ipc::now_ms().get());
+        let gate = self.lane_gate();
+        let (cursor, restoration, settled) =
+            self.engine
+                .restoration(dimensions, gate, kr_ipc::now_ms().get());
+        // Taking a snapshot settles the screen, and whatever that released belongs to the
+        // attachments that were already watching. Delivering it here is what stops one client's
+        // snapshot swallowing a character that was owed to another.
+        self.deliver(settled);
+        self.note_restoration(&restoration);
         Ok((cursor, restoration.bytes))
+    }
+
+    /// Records what a rendered restoration could not carry.
+    ///
+    /// Nothing is silently lost: the renderer counts every omission, and this is where the session
+    /// keeps the count so a person asking the host doctor can be told.
+    fn note_restoration(&mut self, restoration: &crate::render::Restoration) {
+        let carried = restoration.carried;
+        self.restoration_losses.inactive_rows += carried.inactive_rows;
+        self.restoration_losses.other_saved_cursors += carried.other_saved_cursors;
+        self.restoration_losses.title_stack += carried.title_stack;
+        self.restoration_losses.clipped_rows += carried.clipped_rows;
+        self.restoration_losses.soft_wraps += carried.soft_wraps;
+        self.restoration_losses.other_keyboard |= carried.other_keyboard;
+    }
+
+    /// Returns what the renderings this session has produced could not carry.
+    #[must_use]
+    pub const fn restoration_losses(&self) -> crate::render::Carried {
+        self.restoration_losses
+    }
+
+    /// Returns the terminal engine's rate-limited diagnostic totals.
+    #[must_use]
+    pub fn terminal_diagnostics(&self) -> Vec<(kr_term::diag::DiagnosticKind, u64)> {
+        self.engine.diagnostics()
     }
 
     /// Adds an attachment.
@@ -438,18 +485,18 @@ impl Session {
         // it had open is closed first, so the application is not left inside a bracketed paste
         // whose source has gone.
         let held = self.lease.holder() == Some(attachment_id);
-        let epoch = self.lease.epoch();
         self.lease.release_attachment(attachment_id);
         if held {
             let framing = self.framer.close_for_takeover();
             if let Some(terminator) = framing.terminator {
                 self.pending_input.push(InputBatch {
-                    origin: InputOrigin::Lease(epoch),
+                    origin: InputOrigin::Host,
                     bytes: terminator.to_vec(),
                 });
             }
         }
         self.note_lease_holder();
+        self.pump_replies();
         self.hub.detached(attachment_id);
         let previous = self.attachments.geometry();
         let change = self.attachments.detach(attachment_id)?;
@@ -582,14 +629,18 @@ impl Session {
         discarded += framing.discarded_prefix.len() as u64;
         let closed_open_paste = framing.terminator.is_some();
         if let Some(terminator) = framing.terminator {
-            // The terminator belongs to the paste the previous lease opened, so it is written
-            // under the epoch that opened it rather than the one taking over.
+            // The terminator closes the paste the previous lease opened. It is the host's own
+            // correction rather than that lease's keystrokes: fencing it would leave the
+            // application inside a bracketed paste that nothing was ever going to end, which is
+            // exactly the failure closing it exists to prevent.
+            let _ = previous_epoch;
             self.pending_input.push(InputBatch {
-                origin: InputOrigin::Lease(previous_epoch),
+                origin: InputOrigin::Host,
                 bytes: terminator.to_vec(),
             });
         }
         self.note_lease_holder();
+        self.pump_replies();
         Ok(InputAcquireResult {
             lease: self.lease.to_wire(),
             discarded_bytes: U64::new(discarded),
@@ -616,11 +667,12 @@ impl Session {
         let framing = self.framer.close_for_takeover();
         if let Some(terminator) = framing.terminator {
             self.pending_input.push(InputBatch {
-                origin: InputOrigin::Lease(epoch),
+                origin: InputOrigin::Host,
                 bytes: terminator.to_vec(),
             });
         }
         self.note_lease_holder();
+        self.pump_replies();
         Ok(self.lease.to_wire())
     }
 
@@ -801,17 +853,18 @@ impl Session {
         if bytes.is_empty() {
             return Vec::new();
         }
-        // The application is the only thing that decides whether bracketed paste is on, and it says
-        // so on this stream. Watching for it here is what connects the recogniser to the terminal
-        // it is recognising for; without it the recogniser would hold delimiters no application
-        // had asked for, or miss the ones it had.
-        if let Some(enabled) = crate::input::bracketed_paste_mode(bytes) {
-            self.framer.set_bracketed_paste(enabled);
-        }
         let cursor = self.history.append(bytes);
+        let gate = self.lane_gate();
         let filtered = self
             .engine
-            .feed(cursor, bytes, self.lane_gate(), kr_ipc::now_ms().get());
+            .feed(cursor, bytes, gate, kr_ipc::now_ms().get());
+        // The application is the only thing that decides whether bracketed paste is on, and the
+        // canonical parser is the only thing that knows what it decided: a sequence split across
+        // two reads, and one that appears inside a string and sets nothing, are both answered
+        // correctly here and by nothing else. The recogniser is told after the batch is parsed,
+        // which is the first moment the answer exists.
+        self.framer
+            .set_bracketed_paste(self.engine.bracketed_paste());
         self.deliver(filtered)
     }
 
@@ -825,6 +878,46 @@ impl Session {
             .engine
             .quiesce(self.lane_gate(), kr_ipc::now_ms().get());
         self.deliver(filtered)
+    }
+
+    /// Writes anything the host owes the application that the gate now allows.
+    ///
+    /// The lane is drained when output arrives, which is the common case: an application that asked
+    /// a question is usually about to write something. It is not the only case. A reply held back
+    /// because a bracketed paste was open has nothing to wait for once the paste closes, and an
+    /// application that asked and then sat still would wait for ever. Every place that opens the
+    /// gate calls this.
+    pub fn pump_replies(&mut self) {
+        let gate = self.lane_gate();
+        let replies = self.engine.drain_replies(gate, kr_ipc::now_ms().get());
+        self.queue_replies(replies);
+    }
+
+    /// Queues the host's own answers for the application, up to what one may wait for.
+    ///
+    /// The response lane bounds what it holds; this bounds what has left the lane and is waiting
+    /// for an application that has stopped reading its input. One that asks questions and never
+    /// reads the answers stops being answered here rather than growing this queue without limit.
+    fn queue_replies(&mut self, replies: Vec<Vec<u8>>) {
+        if replies.is_empty() {
+            return;
+        }
+        let mut held: usize = self
+            .pending_input
+            .iter()
+            .filter(|batch| batch.origin == InputOrigin::Host)
+            .map(|batch| batch.bytes.len())
+            .sum();
+        for reply in replies {
+            if held >= MAX_PENDING_REPLY_BYTES {
+                return;
+            }
+            held += reply.len();
+            self.pending_input.push(InputBatch {
+                origin: InputOrigin::Host,
+                bytes: reply,
+            });
+        }
     }
 
     /// Returns what the response lane is allowed to write right now.
@@ -844,45 +937,46 @@ impl Session {
     }
 
     /// Delivers one interpreted batch to the attachments and the application.
-    fn deliver(&mut self, filtered: crate::projection::Filtered) -> Vec<AttachmentId> {
-        // What the host owes the application goes into its terminal input, ahead of anything a
-        // person may be typing: the application asked for it and is waiting.
-        for reply in filtered.replies {
-            self.pending_input.push(InputBatch {
-                origin: InputOrigin::Host,
-                bytes: reply,
-            });
-        }
-        let oldest = self.history.oldest_retained_cursor();
-        let mut resynchronised = Vec::new();
-        // A terminal of the session's own size takes the spans the engine cleared. The cursors are
-        // positions in the raw stream, so what the engine withheld leaves a gap rather than
-        // shifting everything after it.
-        for (cursor, span) in filtered.direct {
-            let shared = Arc::new(span);
-            resynchronised.extend(self.hub.publish_direct(cursor, &shared, oldest));
-        }
-        // A side effect has one destination. It goes to the attachment holding the input lease and
-        // to nothing else, which is what stops one person's clipboard reaching every device that
-        // happens to be watching.
-        if let Some(holder) = self.lease.holder() {
-            for (cursor, bytes) in filtered.effects {
-                let shared = Arc::new(bytes);
-                if self.hub.publish_to(holder, cursor, &shared, oldest) {
-                    resynchronised.push(holder);
-                }
-            }
-        }
-        // Every terminal of another size is drawn the canonical screen it can see. The repaint is
-        // taken once per attachment because each one is looking at its own window.
+    ///
+    /// The order this runs in is the contract:
+    ///
+    /// 1. **What the host owes the application** goes into its terminal input. It asked and it is
+    ///    waiting, and nothing a person is typing comes before an answer that only the host has.
+    /// 2. **The presentation of every subscriber is settled**, and one that has just moved between
+    ///    the two is told to install a fresh screen. A terminal that is about to be drawn a
+    ///    rendering must not first receive the bytes that assume it is the session's size.
+    /// 3. **The stream is published in source order.** A bell that happened between two spans is
+    ///    delivered between them, so the attachment holding the input lease never sees a cursor go
+    ///    backwards and never hears a bell in the wrong place.
+    /// 4. **Every terminal of another size is drawn the screen it can see**, once per attachment,
+    ///    because each is looking at its own window.
+    fn deliver(&mut self, mut filtered: crate::projection::Filtered) -> Vec<AttachmentId> {
         // The engine's answer is recorded first, so a summary and a delivery cannot disagree about
         // how an attachment is being served.
         self.attachments
             .set_carryable(self.engine.direct_is_carryable());
         let projected = self.attachments.projected();
-        // A terminal that has just moved between the two presentations cannot continue from what
-        // it holds: the bytes it was receiving and the screen it is about to be drawn are not two
-        // parts of one picture. It installs a fresh one instead.
+        if !projected.is_empty() {
+            // Taking a snapshot settles the screen, which releases whatever the engine was holding
+            // back. Settling once here, before any snapshot, is what stops those bytes disappearing
+            // inside the first projected subscriber's repaint when a direct attachment was owed
+            // them.
+            let gate = self.lane_gate();
+            let settled = self.engine.quiesce(gate, kr_ipc::now_ms().get());
+            filtered.absorb(settled);
+        }
+        self.queue_replies(filtered.replies);
+        for effect in filtered.host_events {
+            // Nothing holds the input lease, so there is no terminal this belongs to. Section 8
+            // makes it a durable host event rather than something shown to whoever is watching.
+            if let Some(journal) = self.journal.as_mut() {
+                let _ = journal.record_host_event(&effect, kr_ipc::now_ms());
+            }
+        }
+        let oldest = self.history.oldest_retained_cursor();
+        let next = self.history.next_cursor();
+        let mut resynchronised = Vec::new();
+
         let projecting: std::collections::BTreeSet<AttachmentId> =
             projected.iter().map(|(id, _)| *id).collect();
         for attachment_id in self.hub.subscribers() {
@@ -892,28 +986,72 @@ impl Session {
                 crate::output::Presentation::Direct
             };
             if self.hub.set_presentation(attachment_id, presentation) {
-                let next = self.history.next_cursor();
                 self.hub
                     .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
                 resynchronised.push(attachment_id);
             }
         }
-        for (attachment_id, dimensions) in projected {
-            let (cursor, restoration) = self.engine.restoration(dimensions, kr_ipc::now_ms().get());
-            let shared = Arc::new(restoration.bytes);
-            if self.hub.publish_to(attachment_id, cursor, &shared, oldest) {
-                resynchronised.push(attachment_id);
-            }
-        }
-        // A projection reset means no client's screen continues from the one it holds. Every
-        // subscriber installs a fresh one rather than drawing on top of a screen that is gone.
-        if filtered.projection_reset {
-            let next = self.history.next_cursor();
+        // A projection reset, or a span the engine cleared that this host could no longer produce,
+        // means no client's screen continues from the one it holds. Both are answered the same
+        // way: install a fresh screen rather than drawing on top of one with a hole in it.
+        if filtered.projection_reset || filtered.lost {
             for attachment_id in self.hub.subscribers() {
                 self.hub
                     .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
                 resynchronised.push(attachment_id);
             }
+        }
+
+        // One ordered stream. The spans a terminal may take and the side effects that belong to
+        // the lease holder are two views of the same output, and the holder receives both, so they
+        // are published in the order the application produced them.
+        let mut pieces: Vec<(u64, bool, Vec<u8>)> =
+            Vec::with_capacity(filtered.direct.len() + filtered.effects.len());
+        pieces.extend(
+            filtered
+                .direct
+                .into_iter()
+                .map(|(cursor, bytes)| (cursor, false, bytes)),
+        );
+        pieces.extend(
+            filtered
+                .effects
+                .into_iter()
+                .map(|(cursor, bytes)| (cursor, true, bytes)),
+        );
+        pieces.sort_by_key(|(cursor, effect, _)| (*cursor, *effect));
+        let holder = self.lease.holder();
+        for (cursor, is_effect, bytes) in pieces {
+            let shared = Arc::new(bytes);
+            if is_effect {
+                if let Some(holder) = holder
+                    && self.hub.publish_to(holder, cursor, &shared, oldest)
+                {
+                    resynchronised.push(holder);
+                }
+            } else {
+                resynchronised.extend(self.hub.publish_direct(cursor, &shared, oldest));
+            }
+        }
+
+        for (attachment_id, dimensions) in projected {
+            let gate = self.lane_gate();
+            let (cursor, restoration, settled) =
+                self.engine
+                    .restoration(dimensions, gate, kr_ipc::now_ms().get());
+            self.note_restoration(&restoration);
+            let shared = Arc::new(restoration.bytes);
+            if self
+                .hub
+                .publish_screen(attachment_id, cursor, &shared, oldest)
+            {
+                resynchronised.push(attachment_id);
+            }
+            // The screen was settled before this loop began, so this snapshot released nothing.
+            debug_assert!(
+                settled.is_empty(),
+                "the screen is settled once, before any snapshot is taken"
+            );
         }
         resynchronised.sort_unstable();
         resynchronised.dedup();
@@ -1282,6 +1420,14 @@ pub struct InputAccepted {
     /// When that prefix must be forwarded even if nothing else arrives.
     pub deadline: Option<Instant>,
 }
+
+/// How much of the host's own answers may wait for an application that is not reading.
+///
+/// The response lane bounds what it queues; this bounds what has left the lane and is waiting for a
+/// terminal whose application has stopped reading its input. An application that asks questions
+/// without ever reading the answers stops being answered at this point rather than growing the
+/// queue without limit.
+pub const MAX_PENDING_REPLY_BYTES: usize = 64 * 1024;
 
 /// A cursor on the output stream.
 #[must_use]

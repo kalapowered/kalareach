@@ -314,6 +314,17 @@ impl Engine {
         self.mode_revisions.insert((kind, mode), revision);
     }
 
+    /// Returns whether the application has bracketed paste on.
+    ///
+    /// The canonical parser is the only thing that knows. A host that scanned the output stream for
+    /// the sequence itself would miss one split across two reads and would find one inside a
+    /// string that set no mode at all, and it would then frame a person's paste under an
+    /// assumption the application never made.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.modes.is_set(ModeKind::Dec, 2004)
+    }
+
     /// Records who holds the input lease, which is the default destination for a side effect.
     pub const fn set_lease_holder(&mut self, lease: LeaseHolder) {
         self.lease = lease;

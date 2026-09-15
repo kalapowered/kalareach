@@ -558,7 +558,9 @@ async fn read_loop(transport: Arc<dyn ControlTransport>, state: Arc<SessionState
             Ok(Some(frame)) => frame,
             Ok(None) | Err(_) => break,
         };
-        route(&state, frame).await;
+        if !route(&state, frame).await {
+            break;
+        }
     }
     // The control stream has ended, so the connection goes with it: closing revokes every data
     // stream it authorised and releases the transport rather than leaving queued traffic on a
@@ -567,7 +569,14 @@ async fn read_loop(transport: Arc<dyn ControlTransport>, state: Arc<SessionState
     state.end();
 }
 
-async fn route(state: &Arc<SessionState>, frame: ControlFrame) {
+/// Routes one frame, and returns whether the session may continue.
+///
+/// A frame that does not belong on this ingress ends the session. The union is closed so that a
+/// receiver can *name* what arrived rather than guess at it, and naming it is only worth anything
+/// if the receiver then refuses it: a host that sent a client a worker's startup handshake is not
+/// a host this client understands, and carrying on would mean deciding, frame by frame, which of
+/// its messages to believe.
+async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
     match frame {
         ControlFrame::Response(response) => {
             let request_id = response.request_id;
@@ -608,8 +617,8 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) {
         // rest of the union belongs to the host's own local endpoints — the local opening frames,
         // a worker's startup handshake, the generation and revision exchange, and a mutation one
         // host process forwarded to another. None of them is a frame a network peer may send a
-        // client, so each is dropped rather than acted on. They are named rather than swept up by
-        // a wildcard, so a variant added later has to be decided here instead of silently ignored.
+        // client. They are named rather than swept up by a wildcard, so a variant added later has
+        // to be decided here instead of quietly joining this list.
         ControlFrame::Request(_)
         | ControlFrame::Mutation(_)
         | ControlFrame::Hello(_)
@@ -626,6 +635,7 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) {
         | ControlFrame::AuthorityRevision(_)
         | ControlFrame::AuthorityRevisionAck(_)
         | ControlFrame::Forwarded(_)
-        | ControlFrame::AcceptanceDelivered(_) => {}
+        | ControlFrame::AcceptanceDelivered(_) => return false,
     }
+    true
 }

@@ -195,18 +195,24 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
     }
     assert_eq!(views.len(), ATTACHED_VIEWS);
 
-    let workers: Vec<u32> = sessions
-        .iter()
-        .filter_map(|created| {
-            created
-                .session
-                .root_process
-                .as_ref()
-                .map(|root| u32::try_from(root.pid.get()).unwrap_or_default())
-        })
-        .collect();
-    // The worker is the root shell's parent, so the shell's identifier names the process tree this
-    // host is paying for; the daemon is this test process.
+    // Every process this host is paying for: each session's root shell, and the worker that owns
+    // it. The worker is where the canonical grid and the retained output live, so a measurement
+    // that counted only the shell would leave out the thing it is meant to be measuring.
+    let mut measured: Vec<u32> = Vec::new();
+    for created in &sessions {
+        let Some(root) = created.session.root_process.as_ref() else {
+            continue;
+        };
+        let shell = u32::try_from(root.pid.get()).unwrap_or_default();
+        measured.push(shell);
+        if let Some(worker) = parent_of(shell) {
+            measured.push(worker);
+        }
+    }
+    measured.sort_unstable();
+    measured.dedup();
+    let workers = measured;
+    // The daemon is this test process.
     let daemon = std::process::id();
 
     let started = Instant::now();
@@ -241,7 +247,8 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
         elapsed
     );
     println!(
-        "  resident: {resident} KiB across {} worker processes and the daemon",
+        "  resident: {resident} KiB across {} processes (each session's worker and its root shell) \
+         and the daemon",
         workers.len()
     );
     println!(
@@ -276,8 +283,9 @@ async fn attach_to_a_usable_screen() {
     println!("KR-PERF-004 measurement");
     println!(
         "  conditions: a local attachment to a live session at 120x40, a release build, measured \
-         from the connection to the screen the terminal draws, which is the last thing the person \
-         waits for"
+         from the connection to the moment the host has delivered the screen: the connection, the \
+         worker's proof, the attachment, the input lease, the subscription, and the screen itself \
+         arriving and decoding. Drawing it is the terminal's own work and is not in these numbers."
     );
     println!(
         "  direct, a terminal of the session's own size: {}",
@@ -298,6 +306,19 @@ async fn attach_to_a_usable_screen() {
         "the slowest attach reached a usable screen within {ATTACH_BOUND:?}: {worst:?}"
     );
     let _ = host.controller;
+}
+
+/// Returns a process's parent, which for a session's root shell is its worker.
+fn parent_of(pid: u32) -> Option<u32> {
+    let listing = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&listing.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|parent| *parent > 1)
 }
 
 /// Renders a set of samples for the measurement's own output.
@@ -378,14 +399,23 @@ async fn attach_samples(
                 };
                 if let kr_protocol::envelope::ControlFrame::Notification(notification) = frame
                     && notification.event_type.as_str() == "session.output"
+                    && let Ok(event) = notification
+                        .payload
+                        .to_typed::<kr_protocol::recovery::OutputEvent>()
                 {
-                    return true;
+                    // A screen a terminal can draw, not merely a frame that arrived: the payload
+                    // decodes and it places the cursor, which every restoration ends by doing.
+                    return event
+                        .bytes
+                        .as_slice()
+                        .windows(4)
+                        .any(|window| window == b"\x1b[?25" || window.starts_with(b"\x1b["));
                 }
             }
         })
         .await
         .unwrap_or(false);
-        assert!(screen, "the attachment was drawn a screen");
+        assert!(screen, "the attachment was delivered a screen it can draw");
         samples.push(started.elapsed());
     }
     samples

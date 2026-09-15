@@ -32,6 +32,17 @@ pub enum OutputDelivery {
         /// The bytes. Shared, because every subscriber receives the same ones.
         bytes: Arc<Vec<u8>>,
     },
+    /// A rendering of the canonical screen as it stands at one cursor.
+    ///
+    /// It is not a span of the output stream: it is what that stream *produced*, drawn for one
+    /// subscriber's own window. Its cursor is the state it describes rather than an offset, so it
+    /// is delivered whole, at one cursor, however many frames that takes.
+    Screen {
+        /// The cursor the screen describes.
+        cursor: u64,
+        /// The bytes that draw it.
+        bytes: Arc<Vec<u8>>,
+    },
     /// The subscriber must discard its partial state and install a fresh snapshot.
     Resync(ResyncRequired),
     /// The attachment was detached. Nothing more will arrive on this stream.
@@ -43,7 +54,7 @@ impl OutputDelivery {
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            Self::Bytes { bytes, .. } => bytes.len(),
+            Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
             Self::Resync(_) | Self::Detached => 0,
         }
     }
@@ -286,6 +297,30 @@ impl OutputHub {
         bytes: &Arc<Vec<u8>>,
         oldest_retained_cursor: u64,
     ) -> bool {
+        self.deliver_one(attachment_id, cursor, bytes, oldest_retained_cursor, false)
+    }
+
+    /// Delivers a rendering of the canonical screen to one subscriber.
+    ///
+    /// Returns whether the subscriber was told to resynchronise.
+    pub fn publish_screen(
+        &mut self,
+        attachment_id: AttachmentId,
+        cursor: u64,
+        bytes: &Arc<Vec<u8>>,
+        oldest_retained_cursor: u64,
+    ) -> bool {
+        self.deliver_one(attachment_id, cursor, bytes, oldest_retained_cursor, true)
+    }
+
+    fn deliver_one(
+        &mut self,
+        attachment_id: AttachmentId,
+        cursor: u64,
+        bytes: &Arc<Vec<u8>>,
+        oldest_retained_cursor: u64,
+        screen: bool,
+    ) -> bool {
         let Some(subscriber) = self.subscribers.get_mut(&attachment_id) else {
             return false;
         };
@@ -310,14 +345,18 @@ impl OutputHub {
             return true;
         }
         subscriber.queued.fetch_add(bytes.len(), Ordering::AcqRel);
-        if subscriber
-            .sender
-            .send(OutputDelivery::Bytes {
+        let delivery = if screen {
+            OutputDelivery::Screen {
                 cursor,
                 bytes: Arc::clone(bytes),
-            })
-            .is_err()
-        {
+            }
+        } else {
+            OutputDelivery::Bytes {
+                cursor,
+                bytes: Arc::clone(bytes),
+            }
+        };
+        if subscriber.sender.send(delivery).is_err() {
             self.subscribers.remove(&attachment_id);
         }
         false

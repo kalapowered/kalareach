@@ -577,6 +577,11 @@ async fn a_subscription_on_a_fenced_connection_stops_delivering() {
         .await
         .expect("the replacement connection is served");
 
+    // Whatever the delivery task had already written is in the socket, so it is read off first.
+    // What the fence decides is whether anything *new* arrives, and the shell writes a line every
+    // second, so three quiet seconds is the answer.
+    let _already_in_flight = output_within(&mut first, std::time::Duration::from_millis(500)).await;
+    while output_within(&mut first, std::time::Duration::from_millis(200)).await {}
     assert!(
         !output_within(&mut first, std::time::Duration::from_secs(3)).await,
         "the fenced connection's subscription stopped delivering"

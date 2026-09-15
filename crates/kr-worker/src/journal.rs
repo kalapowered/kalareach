@@ -171,7 +171,16 @@ impl Journal {
                  CREATE TABLE IF NOT EXISTS session (
                      session_id BLOB PRIMARY KEY,
                      summary    BLOB NOT NULL
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS host_events (
+                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     kind           TEXT    NOT NULL,
+                     detail         TEXT    NOT NULL,
+                     output_cursor  INTEGER NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS host_events_recorded_at
+                     ON host_events (recorded_at_ms);",
             )
             .map_err(unavailable)?;
         let recorded: Option<i64> = self
@@ -219,11 +228,80 @@ impl Journal {
                      session_id BLOB PRIMARY KEY,
                      summary    BLOB NOT NULL
                  );
+                 CREATE TABLE IF NOT EXISTS host_events (
+                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     kind           TEXT    NOT NULL,
+                     detail         TEXT    NOT NULL,
+                     output_cursor  INTEGER NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
+                 );
                  UPDATE schema_version SET version = 2;
                  COMMIT;",
             )
             .map_err(unavailable)?;
         Ok(())
+    }
+
+    /// Records a side effect that had no attachment to go to.
+    ///
+    /// Section 8 sends a side effect to exactly one destination: the attachment holding the input
+    /// lease. When nothing holds it there is no destination, and the effect becomes a durable host
+    /// event rather than something shown to whoever happens to be watching. What is kept is what
+    /// the effect asked for and where in the stream it happened; a clipboard write's own content is
+    /// deliberately not kept, because nothing has asked for it and a durable copy of it is a copy
+    /// of somebody's data with no reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn record_host_event(
+        &mut self,
+        effect: &kr_term::sideeffect::SideEffect,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let (kind, detail) = describe_effect(&effect.kind);
+        self.connection
+            .execute(
+                "INSERT INTO host_events (kind, detail, output_cursor, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    kind,
+                    detail,
+                    i64::try_from(effect.at).unwrap_or(i64::MAX),
+                    i64::try_from(now_ms.get()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Returns the host events this session recorded, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn host_events(&self) -> Result<Vec<HostEvent>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT kind, detail, output_cursor, recorded_at_ms FROM host_events
+                 ORDER BY sequence",
+            )
+            .map_err(unavailable)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(HostEvent {
+                    kind: row.get::<_, String>(0)?,
+                    detail: row.get::<_, String>(1)?,
+                    output_cursor: u64::try_from(row.get::<_, i64>(2)?).unwrap_or_default(),
+                    recorded_at_ms: TimestampMs::new(
+                        u64::try_from(row.get::<_, i64>(3)?).unwrap_or_default(),
+                    ),
+                })
+            })
+            .map_err(unavailable)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(unavailable)
     }
 
     /// Commits an intent, or returns the retained receipt for an exact duplicate.
@@ -999,6 +1077,47 @@ fn unavailable_detail(detail: &str) -> WorkerError {
 
 fn unavailable_detail_owned(detail: String) -> WorkerError {
     WorkerError::JournalUnavailable { detail }
+}
+
+/// One side effect that had no attachment to go to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostEvent {
+    /// What the application asked for.
+    pub kind: String,
+    /// What it said, with no content a person did not ask to keep.
+    pub detail: String,
+    /// Where in the output stream it happened.
+    pub output_cursor: u64,
+    /// When the host recorded it.
+    pub recorded_at_ms: TimestampMs,
+}
+
+/// Returns the kind and the description one side effect is recorded under.
+fn describe_effect(kind: &kr_term::sideeffect::SideEffectKind) -> (&'static str, String) {
+    use kr_term::sideeffect::SideEffectKind;
+    match kind {
+        SideEffectKind::Bell => ("bell", String::new()),
+        SideEffectKind::Notification {
+            title,
+            body,
+            urgency,
+            ..
+        } => (
+            "notification",
+            match title {
+                Some(title) => format!("{urgency:?}: {title} - {body}"),
+                None => format!("{urgency:?}: {body}"),
+            },
+        ),
+        SideEffectKind::Progress { progress } => ("progress", format!("{progress:?}")),
+        // The content is not kept. Nothing has asked for it, and a durable copy of somebody's
+        // clipboard with no reader is a copy nobody wanted.
+        SideEffectKind::ClipboardWrite { selection, content } => (
+            "clipboard_write",
+            format!("{selection:?}, {} bytes", content.len()),
+        ),
+        SideEffectKind::ClipboardRead { selection } => ("clipboard_read", format!("{selection:?}")),
+    }
 }
 
 #[cfg(test)]

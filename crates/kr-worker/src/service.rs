@@ -142,7 +142,7 @@ pub struct WorkerService {
     /// stays revocable for the life of the session. Section 9's dispatch barrier covers a
     /// mutation; it does not cover a read or a subscription already running on a connection that
     /// was authorised a moment before its authority was withdrawn. This is what covers those.
-    admitted: Mutex<std::collections::BTreeMap<ConnectionId, Arc<tokio::sync::Notify>>>,
+    admitted: Mutex<std::collections::BTreeMap<ConnectionId, Registration>>,
     build_id: kr_protocol::ids::BuildId,
 }
 
@@ -273,7 +273,8 @@ impl WorkerService {
         if peer.authorise(kr_ipc::paths::current_uid()).is_err() {
             return Ok(());
         }
-        let withdrawn = self.admit(connection_id);
+        let registration = self.admit(connection_id);
+        let withdrawn = Arc::clone(&registration.withdrawn);
         // Both timers fire once immediately; that first tick is consumed here so a connection is
         // not handed a replacement window before it has read the one in its acknowledgement.
         let mut renewal = tokio::time::interval(WINDOW_RENEWAL);
@@ -292,9 +293,9 @@ impl WorkerService {
                 // holds authority. The connection itself stays open, so the caller is told why its
                 // next request is refused rather than finding a socket that closed.
                 () = withdrawn.notified() => {
-                    if let Some(task) = state.delivery.take() {
-                        task.abort();
-                    }
+                    // The delivery task has already been stopped by the withdrawal itself; what is
+                    // left is the attachments it held.
+                    state.delivery = None;
                     for attachment_id in state.attachments.drain(..) {
                         let mut session = self.runtime.session();
                         let _ = session.detach(attachment_id);
@@ -387,51 +388,58 @@ impl WorkerService {
                                 return;
                             }
                         }
-                        if !joined.bytes.is_empty() {
-                            let event = OutputEvent {
-                                cursor: U64::new(joined.cursor),
-                                bytes: kr_protocol::scalars::Bytes::new(joined.bytes),
-                            };
-                            let Some(notification) =
-                                notification(&stream_id, sequence, "session.output", &event)
-                            else {
-                                return;
-                            };
-                            sequence += 1;
-                            let mut sender = sender.lock().await;
-                            if sender.write_message(&notification).await.is_err() {
-                                return;
-                            }
+                        if !send_screen(
+                            &sender,
+                            &stream_id,
+                            &mut sequence,
+                            joined.cursor,
+                            &joined.bytes,
+                        )
+                        .await
+                        {
+                            return;
                         }
                     }
                     while let Some(delivery) = stream.recv().await {
                         let delivered = delivery.len();
-                        let notification = match delivery {
+                        let written = match delivery {
                             OutputDelivery::Bytes { cursor, bytes } => {
-                                // Anything the replay already covered is dropped here rather than
+                                // Anything the screen already covered is dropped here rather than
                                 // sent again; a batch that straddles the boundary is trimmed to
                                 // the part that follows it.
                                 let end = cursor + bytes.len() as u64;
                                 if end <= live_from {
+                                    stream.written(delivered);
                                     continue;
                                 }
                                 let skip = usize::try_from(live_from.saturating_sub(cursor))
                                     .unwrap_or(0)
                                     .min(bytes.len());
-                                notification(
+                                send_stream(
+                                    &sender,
                                     &stream_id,
-                                    sequence,
-                                    "session.output",
-                                    &OutputEvent {
-                                        cursor: U64::new(cursor + skip as u64),
-                                        bytes: kr_protocol::scalars::Bytes::new(
-                                            bytes[skip..].to_vec(),
-                                        ),
-                                    },
+                                    &mut sequence,
+                                    cursor + skip as u64,
+                                    &bytes[skip..],
                                 )
+                                .await
+                            }
+                            // A rendering is one screen at one cursor, however many frames it
+                            // takes: its cursor is the state it describes rather than an offset,
+                            // so the parts do not carry advancing cursors of their own.
+                            OutputDelivery::Screen { cursor, bytes } => {
+                                send_screen(&sender, &stream_id, &mut sequence, cursor, &bytes)
+                                    .await
                             }
                             OutputDelivery::Resync(marker) => {
-                                notification(&stream_id, sequence, "session.resync", &marker)
+                                let Some(notification) =
+                                    notification(&stream_id, sequence, "session.resync", &marker)
+                                else {
+                                    continue;
+                                };
+                                sequence += 1;
+                                let mut sender = sender.lock().await;
+                                sender.write_message(&notification).await.is_ok()
                             }
                             OutputDelivery::Detached => {
                                 // The attachment has ended. The client is told so it can put its
@@ -448,21 +456,21 @@ impl WorkerService {
                                 return;
                             }
                         };
-                        let Some(notification) = notification else {
-                            continue;
-                        };
-                        sequence += 1;
-                        let mut sender = sender.lock().await;
-                        if sender.write_message(&notification).await.is_err() {
+                        if !written {
                             break;
                         }
-                        drop(sender);
                         // Released only now. Until the bytes have reached the peer they are still
                         // queued for it, which is what the bound is about.
                         stream.written(delivered);
                     }
                     let _ = attachment_id;
                 });
+                // The registry holds the handle too, so a withdrawal can stop the delivery
+                // without waiting for this loop to come back round.
+                *registration
+                    .delivery
+                    .lock()
+                    .expect("the delivery slot is not poisoned") = Some(task.abort_handle());
                 state.delivery = Some(task);
             }
         }
@@ -811,8 +819,11 @@ impl WorkerService {
     /// The registration is written under the authority lock, in the same critical section as the
     /// check that admitted the connection, so nothing can be admitted against authority that has
     /// already been replaced.
-    fn admit(&self, connection_id: ConnectionId) -> Arc<tokio::sync::Notify> {
-        let withdrawn = Arc::new(tokio::sync::Notify::new());
+    fn admit(&self, connection_id: ConnectionId) -> Registration {
+        let registration = Registration {
+            withdrawn: Arc::new(tokio::sync::Notify::new()),
+            delivery: Arc::new(Mutex::new(None)),
+        };
         let _authority = self
             .authority
             .lock()
@@ -820,21 +831,34 @@ impl WorkerService {
         self.admitted
             .lock()
             .expect("the connection registry is not poisoned")
-            .insert(connection_id, Arc::clone(&withdrawn));
-        withdrawn
+            .insert(connection_id, registration.clone());
+        registration
     }
 
-    /// Withdraws one connection's registration, which ends it.
+    /// Withdraws one connection's registration.
+    ///
+    /// The delivery task is stopped here rather than left for the connection's own loop to notice.
+    /// That loop may be blocked writing to a socket nobody is reading, and a subscription that kept
+    /// delivering this session's output until the peer read again would be exactly the thing the
+    /// withdrawal exists to stop.
     fn withdraw(&self, connection_id: ConnectionId) {
         let held = self
             .admitted
             .lock()
             .expect("the connection registry is not poisoned")
             .remove(&connection_id);
-        if let Some(withdrawn) = held {
+        if let Some(registration) = held {
+            if let Some(task) = registration
+                .delivery
+                .lock()
+                .expect("the delivery slot is not poisoned")
+                .take()
+            {
+                task.abort();
+            }
             // A stored permit, so a connection that is not waiting at this instant still learns of
             // it the moment it next looks.
-            withdrawn.notify_one();
+            registration.withdrawn.notify_one();
         }
     }
 
@@ -910,6 +934,15 @@ impl WorkerService {
                 method.as_str()
             ))),
         };
+        // Checked again, now that the read has finished. A read that passed its check and then
+        // waited for the session lock can complete after the authority behind it was withdrawn,
+        // and what the contract forbids is *serving* that state rather than reading it. A
+        // subscription this read started is ended with the connection it belongs to.
+        if let Err(error) = self.check_authority(state) {
+            state.subscribed = None;
+            state.restoration = None;
+            return failure(request.request_id, &error.to_protocol_error());
+        }
         respond(request.request_id, outcome)
     }
 
@@ -2003,6 +2036,87 @@ impl ConnectionState {
         self.next_request += 1;
         RequestId::new(self.next_request)
     }
+}
+
+/// One connection's registration in the worker's authority store.
+///
+/// It is what a withdrawal acts on: the notification that ends the connection's own loop, and the
+/// delivery task it started, which is stopped directly rather than when that loop next looks.
+#[derive(Clone, Debug)]
+struct Registration {
+    withdrawn: Arc<tokio::sync::Notify>,
+    delivery: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+}
+
+/// The largest payload one output notification carries.
+///
+/// A control frame is bounded at 1 MiB including its metadata, so a payload stays well inside that
+/// rather than filling it exactly. A rendering of a large screen is bigger than one frame, and a
+/// restoration that was written as one frame would simply fail to be written at all.
+pub const MAX_OUTPUT_EVENT_BYTES: usize = 256 * 1024;
+
+/// Writes a span of the output stream, in frames the control stream can carry.
+///
+/// Each frame carries the cursor its own bytes start at, because they are consecutive positions in
+/// one stream.
+async fn send_stream(
+    sender: &Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
+    stream_id: &StreamId,
+    sequence: &mut u64,
+    cursor: u64,
+    bytes: &[u8],
+) -> bool {
+    let mut at = cursor;
+    for chunk in bytes.chunks(MAX_OUTPUT_EVENT_BYTES) {
+        let event = OutputEvent {
+            cursor: U64::new(at),
+            bytes: kr_protocol::scalars::Bytes::new(chunk.to_vec()),
+        };
+        let Some(notification) = notification(stream_id, *sequence, "session.output", &event)
+        else {
+            return false;
+        };
+        *sequence += 1;
+        let mut sender = sender.lock().await;
+        if sender.write_message(&notification).await.is_err() {
+            return false;
+        }
+        drop(sender);
+        at += chunk.len() as u64;
+    }
+    true
+}
+
+/// Writes a rendering of the canonical screen, in frames the control stream can carry.
+///
+/// Every frame carries the same cursor: they are parts of one screen at one moment, not
+/// consecutive positions in a stream, and a client draws them in the order they arrive.
+async fn send_screen(
+    sender: &Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
+    stream_id: &StreamId,
+    sequence: &mut u64,
+    cursor: u64,
+    bytes: &[u8],
+) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    for chunk in bytes.chunks(MAX_OUTPUT_EVENT_BYTES) {
+        let event = OutputEvent {
+            cursor: U64::new(cursor),
+            bytes: kr_protocol::scalars::Bytes::new(chunk.to_vec()),
+        };
+        let Some(notification) = notification(stream_id, *sequence, "session.output", &event)
+        else {
+            return false;
+        };
+        *sequence += 1;
+        let mut sender = sender.lock().await;
+        if sender.write_message(&notification).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Returns the sentence a caller is given when a window cannot first-admit a request.

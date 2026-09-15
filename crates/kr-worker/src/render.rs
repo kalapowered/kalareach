@@ -13,21 +13,28 @@
 //!
 //! Everything a terminal can be told over its own wire is emitted: the buffer, the palette, the
 //! modes, the keypad and keyboard negotiation, the tab stops, the character sets, the margins, the
-//! rows with their renditions and hyperlinks, the titles and their stack, the saved cursor of the
-//! buffer that is showing, and the cursor.
+//! rows with their renditions and hyperlinks, the current title, the saved cursor of the buffer
+//! that is showing, and the cursor.
 //!
-//! Two things are named here rather than approximated:
+//! What a byte stream cannot carry is named here rather than approximated, and every one of them
+//! is counted in [`Restoration::carried`] rather than left for a caller to discover:
 //!
-//! * **The buffer that is not showing.** Painting it over a byte stream means switching to it,
-//!   painting, and switching back, and a switch either clears the buffer it enters or moves the
-//!   cursor of the one it leaves. A restoration must not disturb the screen it is restoring, so
-//!   those rows are not painted. The engine's snapshot carries `None` for them on the pinned grid
-//!   library in any case; a client that holds its own grid has no such constraint and paints both.
-//! * **The saved cursor of the buffer that is not showing.** `DECSC` saves the state of the
-//!   current buffer, so there is no sequence that installs the other one's without switching.
+//! * **The buffer that is not showing, and its saved cursor and keyboard negotiation.** Painting
+//!   or saving into it over a byte stream means switching to it and back, and a switch either
+//!   clears the buffer it enters or moves the cursor of the one it leaves. A restoration must not
+//!   disturb the screen it is restoring. A client that holds its own grid has no such constraint.
+//! * **The virtual title stack.** Pushing it onto the terminal's own stack would grow that stack
+//!   on every repaint and could evict what the person's own terminal had saved. Only the current
+//!   title is set.
+//! * **Soft-wrap markers.** A row this writer draws itself is a hard row as far as the terminal is
+//!   concerned, so a line the application wrapped is copied as two lines rather than one.
+//! * **The right-hand side of a row wider than the window.** A terminal narrower than the session
+//!   is shown the part it has room for; nothing is reflowed and nothing wraps into the next row.
 //!
-//! Nothing here is lossy in a way a caller cannot see: [`Restoration::carried`] reports exactly
-//! what was left out.
+//! Two things the pinned grid library does not expose are missing before this module sees them,
+//! and are recorded in `kr_term::unicode::LIBRARY`: the pending-wrap flag, and the saved cursor of
+//! either buffer. A restoration therefore cannot reproduce a pending wrap, and the saved cursor it
+//! installs is whichever one the snapshot managed to carry.
 
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
 use kr_term::modes::ALTERNATE_BUFFER_MODES;
@@ -45,13 +52,26 @@ pub struct Carried {
     pub inactive_rows: usize,
     /// Saved cursors belonging to the buffer that is not showing.
     pub other_saved_cursors: usize,
+    /// Title-stack entries, which are held virtually rather than pushed onto the terminal's own.
+    pub title_stack: usize,
+    /// Rows whose right-hand side lies outside the window this terminal is looking at.
+    pub clipped_rows: usize,
+    /// Soft-wrap markers, which a byte stream cannot set on a row it has drawn itself.
+    pub soft_wraps: usize,
+    /// The keyboard negotiation of the buffer that is not showing.
+    pub other_keyboard: bool,
 }
 
 impl Carried {
     /// Returns whether everything the operations described was emitted.
     #[must_use]
     pub const fn complete(self) -> bool {
-        self.inactive_rows == 0 && self.other_saved_cursors == 0
+        self.inactive_rows == 0
+            && self.other_saved_cursors == 0
+            && self.title_stack == 0
+            && self.clipped_rows == 0
+            && self.soft_wraps == 0
+            && !self.other_keyboard
     }
 }
 
@@ -80,6 +100,12 @@ pub fn render(operations: &[RestoreOp], viewport: Viewport) -> Restoration {
 
 /// The escape introducer.
 const ESC: u8 = 0x1B;
+
+/// DEC private mode 6, origin mode, which changes what every absolute address means.
+const ORIGIN_MODE: u16 = 6;
+
+/// DEC private mode 1048, which is a cursor save and restore rather than a state to be left in.
+const CURSOR_SAVE_MODE: u16 = 1048;
 /// The string terminator this writer uses, which every profile in the repertoire accepts.
 const ST: &[u8] = b"\x1b\\";
 
@@ -95,6 +121,17 @@ struct Writer {
     pen: Option<Rendition>,
     /// The hyperlink currently open, so a run does not reopen the one it is already inside.
     link: Option<String>,
+    /// True once the snapshot's own open hyperlink has been installed, so it is not closed again.
+    link_is_the_snapshots: bool,
+    /// The scroll region, held back until the rows have been painted.
+    ///
+    /// Every row is addressed absolutely, and an absolute address means something different once
+    /// margins and origin mode are in force. The screen is therefore painted with neither, and both
+    /// are installed afterwards together with the cursor, which is the only thing whose position
+    /// they then apply to.
+    margins: Option<Margins>,
+    /// Whether the snapshot had origin mode set, held back for the same reason.
+    origin_mode: bool,
     carried: Carried,
 }
 
@@ -106,14 +143,17 @@ impl Writer {
             active: ActiveBuffer::Primary,
             pen: None,
             link: None,
+            link_is_the_snapshots: false,
+            margins: None,
+            origin_mode: false,
             carried: Carried::default(),
         }
     }
 
     fn finish(mut self) -> Restoration {
-        // A restoration never leaves a link open that the snapshot did not have open, because the
-        // next character the application prints would join it.
-        if self.link.is_some() {
+        // A link the snapshot had open stays open: the next character the application prints
+        // belongs to it. A link this writer opened only to draw a run does not.
+        if self.link.is_some() && !self.link_is_the_snapshots {
             self.close_link();
         }
         Restoration {
@@ -148,13 +188,27 @@ impl Writer {
             }
             RestoreOp::SetPalette { palette } => self.palette(palette),
             RestoreOp::SetMode { entry } => {
-                // The alternate-buffer modes are the buffer selection under another spelling, and
-                // that has already been made. Setting them again here would clear the buffer this
-                // restoration is about to paint.
-                if entry.kind == kr_term::modes::ModeKind::Dec
-                    && ALTERNATE_BUFFER_MODES.contains(&entry.mode)
-                {
-                    return;
+                if entry.kind == kr_term::modes::ModeKind::Dec {
+                    // The alternate-buffer modes are the buffer selection under another spelling,
+                    // and that has already been made. Setting them again here would clear the
+                    // buffer this restoration is about to paint.
+                    if ALTERNATE_BUFFER_MODES.contains(&entry.mode) {
+                        return;
+                    }
+                    // 1048 is not a mode a terminal can be left in: setting it saves the cursor and
+                    // clearing it restores one, either of which would overwrite the pen, the
+                    // character sets and the origin this restoration is installing. The saved
+                    // cursor is installed by its own operation instead.
+                    if entry.mode == CURSOR_SAVE_MODE {
+                        return;
+                    }
+                    // Origin mode changes what every absolute address afterwards means, and
+                    // enabling it homes the cursor. It is installed with the margins, after the
+                    // rows are painted.
+                    if entry.mode == ORIGIN_MODE {
+                        self.origin_mode = entry.enabled;
+                        return;
+                    }
                 }
                 let prefix: &[u8] = match entry.kind {
                     kr_term::modes::ModeKind::Ansi => b"",
@@ -173,34 +227,35 @@ impl Writer {
             RestoreOp::SetKeyboard { keyboard } => self.keyboard(keyboard),
             RestoreOp::SetTabStops { columns } => self.tab_stops(columns),
             RestoreOp::SetCharsets { charsets } => self.charsets(charsets),
-            RestoreOp::SetMargins { margins } => self.margins(*margins),
+            // Held back until the rows are painted; see the field's own note.
+            RestoreOp::SetMargins { margins } => self.margins = Some(*margins),
             RestoreOp::PaintInactiveRow { .. } => self.carried.inactive_rows += 1,
             RestoreOp::PaintRow { row } => self.paint(row),
             // Inert metadata. The runs of each row carry the link they belong to, and this writer
             // opens and closes it around them, so a terminal already has every range this names.
             RestoreOp::RecordHyperlink { .. } => {}
             RestoreOp::SetTitle { title, stack } => {
-                for saved in stack {
-                    if let Some(icon) = saved.icon.as_ref() {
-                        self.osc(b"1", icon.as_bytes());
-                    }
-                    if let Some(window) = saved.window.as_ref() {
-                        self.osc(b"2", window.as_bytes());
-                    }
-                    self.csi(b"22;0t");
-                }
+                // The stack stays virtual. Pushing it onto the terminal's own would grow that stack
+                // by its whole depth on every repaint, and could evict a title the person's
+                // terminal had saved for itself.
+                self.carried.title_stack += stack.len();
                 self.osc(b"1", title.icon.as_bytes());
                 self.osc(b"2", title.window.as_bytes());
             }
             RestoreOp::SetRendition { rendition } => self.rendition(*rendition),
-            RestoreOp::SetHyperlink { uri } => match uri {
-                Some(uri) => self.open_link(uri),
-                None => {
-                    if self.link.is_some() {
-                        self.close_link();
+            RestoreOp::SetHyperlink { uri } => {
+                match uri {
+                    Some(uri) => self.open_link(uri),
+                    None => {
+                        if self.link.is_some() {
+                            self.close_link();
+                        }
                     }
                 }
-            },
+                // Whatever this leaves open is the link the application has open, so the next
+                // character it prints belongs to it and this writer does not close it again.
+                self.link_is_the_snapshots = uri.is_some();
+            }
             RestoreOp::SetSavedCursor { cursor } => self.saved_cursor(cursor),
             RestoreOp::SetCursor { cursor } => self.cursor(*cursor),
         }
@@ -219,16 +274,27 @@ impl Writer {
     /// character inside a string would end the command early and leave the rest as screen text, so
     /// they are dropped rather than passed on.
     fn osc(&mut self, number: &[u8], payload: &[u8]) {
+        osc_into(&mut self.out, number, payload);
+    }
+
+    /// Writes one OSC command that carries no parameter at all.
+    ///
+    /// A command with an empty parameter and one with no parameter are two different commands:
+    /// `OSC 104` with nothing after it resets every indexed colour, and `OSC 104 ;` asks about an
+    /// index that is not there.
+    fn osc_bare(&mut self, number: &[u8]) {
         self.out.push(ESC);
         self.out.push(b']');
         self.out.extend_from_slice(number);
-        self.out.push(b';');
-        self.out
-            .extend(payload.iter().copied().filter(|byte| *byte >= 0x20));
         self.out.extend_from_slice(ST);
     }
 
     fn palette(&mut self, palette: &PaletteSnapshot) {
+        // Every indexed colour goes back to the terminal's own default first. Applying only the
+        // session's overrides would leave an index this terminal had been given earlier and the
+        // session has since put back, because a colour that matches the default is not an override
+        // and so says nothing at all.
+        self.osc_bare(b"104");
         for (index, colour) in &palette.overrides {
             let mut body = index.to_string().into_bytes();
             body.push(b';');
@@ -254,21 +320,33 @@ impl Writer {
         // result the snapshot's stack rather than the snapshot's stack on top of whatever the
         // terminal already had.
         self.csi(b"<65535u");
-        let kitty = match self.active {
-            ActiveBuffer::Primary => &keyboard.primary,
-            ActiveBuffer::Alternate => &keyboard.alternate,
+        let (kitty, other) = match self.active {
+            ActiveBuffer::Primary => (&keyboard.primary, &keyboard.alternate),
+            ActiveBuffer::Alternate => (&keyboard.alternate, &keyboard.primary),
         };
-        for entry in &kitty.stack {
-            let mut push = b">".to_vec();
-            push.extend_from_slice(entry.to_string().as_bytes());
-            push.push(b'u');
-            self.csi(&push);
+        // The other buffer's negotiation has no sequence that installs it without switching to that
+        // buffer, which a restoration must not do.
+        if other.flags.is_some() || !other.stack.is_empty() {
+            self.carried.other_keyboard = true;
         }
-        if let Some(flags) = kitty.flags {
+        // A push saves the flags that are *current* and installs its argument, so rebuilding a
+        // stack means setting each value first and pushing the next one on top of it. Pushing the
+        // stack's own values in order would save whatever happened to be current instead, and the
+        // next pop would select an encoding the application never negotiated.
+        let mut values = kitty.stack.clone();
+        values.extend(kitty.flags);
+        let mut values = values.into_iter();
+        if let Some(first) = values.next() {
             let mut set = b"=".to_vec();
-            set.extend_from_slice(flags.to_string().as_bytes());
+            set.extend_from_slice(first.to_string().as_bytes());
             set.extend_from_slice(b";1u");
             self.csi(&set);
+        }
+        for value in values {
+            let mut push = b">".to_vec();
+            push.extend_from_slice(value.to_string().as_bytes());
+            push.push(b'u');
+            self.csi(&push);
         }
     }
 
@@ -288,38 +366,17 @@ impl Writer {
     }
 
     fn charsets(&mut self, charsets: &Charsets) {
-        // A designation is one or two bytes from the engine's own table. Anything else would be a
-        // sequence this writer invented, so it is skipped rather than guessed at.
         if let Some(designation) = designation(&charsets.g0) {
             self.out.push(ESC);
             self.out.push(b'(');
-            self.out.extend_from_slice(designation);
+            self.out.push(designation);
         }
         if let Some(designation) = designation(&charsets.g1) {
             self.out.push(ESC);
             self.out.push(b')');
-            self.out.extend_from_slice(designation);
+            self.out.push(designation);
         }
         self.out.push(if charsets.shift_out { 0x0E } else { 0x0F });
-    }
-
-    fn margins(&mut self, margins: Margins) {
-        let mut vertical = (margins.top.saturating_add(1)).to_string().into_bytes();
-        vertical.push(b';');
-        vertical.extend_from_slice((margins.bottom.saturating_add(1)).to_string().as_bytes());
-        vertical.push(b'r');
-        self.csi(&vertical);
-        // Left and right margins need the mode that enables them. A session that never set them
-        // has them at the full width, and enabling the mode for that would change nothing while
-        // leaving a mode set that the snapshot did not have set.
-        if margins.left > 0 || margins.right.saturating_add(1) < self.viewport.cols {
-            self.csi(b"?69h");
-            let mut horizontal = (margins.left.saturating_add(1)).to_string().into_bytes();
-            horizontal.push(b';');
-            horizontal.extend_from_slice((margins.right.saturating_add(1)).to_string().as_bytes());
-            horizontal.push(b's');
-            self.csi(&horizontal);
-        }
     }
 
     fn paint(&mut self, row: &GridRow) {
@@ -330,17 +387,33 @@ impl Writer {
         // The row is drawn from an empty line, so a shorter row does not leave the tail of
         // whatever the terminal had there before.
         self.csi(b"K");
+        let mut clipped = false;
         for run in &row.runs {
-            self.run(run);
+            clipped |= self.run(run);
         }
-        // A row that ends in a soft wrap is one the terminal itself wrapped; nothing is emitted
-        // for it, because the next row is painted at its own line either way.
+        if clipped {
+            self.carried.clipped_rows += 1;
+        }
+        // A row the application wrapped is drawn as a row of its own, because a terminal has no
+        // sequence that marks one. Copying it will produce two lines rather than one.
+        if row.soft_wrapped {
+            self.carried.soft_wraps += 1;
+        }
     }
 
-    fn run(&mut self, run: &Run) {
+    fn run(&mut self, run: &Run) -> bool {
         let Some(column) = self.column_of(run.column) else {
-            return;
+            // The run begins to the right of the window. Nothing of it is shown, and the row it
+            // belongs to is reported as clipped.
+            return run.column >= self.viewport.left_col;
         };
+        // What the window has room for, in cells. Drawing a run wider than that would wrap into
+        // the row below and, on the last row, scroll the screen this restoration is drawing.
+        let room = self.viewport.cols.saturating_sub(column);
+        let (text, clipped) = clip_to_cells(&run.text, room as usize);
+        if text.is_empty() {
+            return clipped;
+        }
         self.move_to_column(column);
         self.rendition(run.rendition);
         match run.hyperlink.as_ref() {
@@ -355,14 +428,14 @@ impl Writer {
         // anything below the space keeps that true of this writer as well, so no row can carry a
         // sequence back into the stream it was parsed out of.
         self.out.extend(
-            run.text
-                .chars()
+            text.chars()
                 .filter(|character| !character.is_control())
                 .flat_map(|character| {
                     let mut buffer = [0_u8; 4];
                     character.encode_utf8(&mut buffer).as_bytes().to_vec()
                 }),
         );
+        clipped
     }
 
     fn rendition(&mut self, rendition: Rendition) {
@@ -492,16 +565,61 @@ impl Writer {
     }
 
     fn cursor(&mut self, cursor: CursorState) {
+        // The scroll region and origin mode go in here, after every row has been painted at an
+        // absolute address and before the one position they apply to.
+        let margins = self.margins.take();
+        if let Some(margins) = margins {
+            self.install_margins(margins);
+        }
+        if self.origin_mode {
+            // Enabling origin mode homes the cursor, so it happens before the cursor is placed and
+            // the placement is then expressed in the origin's own coordinates.
+            self.csi(b"?6h");
+        }
         let mut style = cursor.style.to_string().into_bytes();
         style.extend_from_slice(b" q");
         self.csi(&style);
-        if let (Some(line), Some(column)) =
-            (self.line_of_row(cursor.row), self.column_of(cursor.col))
-        {
-            self.move_to(line, column);
-        }
+        let placed = match (self.line_of_row(cursor.row), self.column_of(cursor.col)) {
+            (Some(line), Some(column)) => {
+                let (line, column) = if self.origin_mode {
+                    let top = margins.map_or(0, |margins| margins.top);
+                    let left = margins.map_or(0, |margins| margins.left);
+                    (line.saturating_sub(top), column.saturating_sub(left))
+                } else {
+                    (line, column)
+                };
+                self.move_to(line, column);
+                true
+            }
+            // The cursor is outside the window this terminal is looking at. Leaving it visible
+            // wherever the last row happened to end would show a cursor that is not the session's.
+            _ => false,
+        };
         // Visibility comes last, so the person never watches a cursor travel across a repaint.
-        self.csi(if cursor.visible { b"?25h" } else { b"?25l" });
+        self.csi(if cursor.visible && placed {
+            b"?25h"
+        } else {
+            b"?25l"
+        });
+    }
+
+    fn install_margins(&mut self, margins: Margins) {
+        let mut vertical = (margins.top.saturating_add(1)).to_string().into_bytes();
+        vertical.push(b';');
+        vertical.extend_from_slice((margins.bottom.saturating_add(1)).to_string().as_bytes());
+        vertical.push(b'r');
+        self.csi(&vertical);
+        // Left and right margins need the mode that enables them. A session that never set them
+        // has them at the full width, and enabling the mode for that would change nothing while
+        // leaving a mode set that the snapshot did not have set.
+        if margins.left > 0 || margins.right.saturating_add(1) < self.viewport.cols {
+            self.csi(b"?69h");
+            let mut horizontal = (margins.left.saturating_add(1)).to_string().into_bytes();
+            horizontal.push(b';');
+            horizontal.extend_from_slice((margins.right.saturating_add(1)).to_string().as_bytes());
+            horizontal.push(b's');
+            self.csi(&horizontal);
+        }
     }
 
     /// Returns the screen line one canonical row lands on, when the viewport shows it.
@@ -556,16 +674,44 @@ fn rgb_specification(colour: Rgb) -> Vec<u8> {
     format!("rgb:{:02x}/{:02x}/{:02x}", colour.r, colour.g, colour.b).into_bytes()
 }
 
-/// Returns the bytes of a character-set designation, when it is one this writer can emit.
-fn designation(name: &str) -> Option<&[u8]> {
-    let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() > 2 {
-        return None;
+/// Returns as much of `text` as fits in `room` cells, and whether anything was left out.
+///
+/// The grid's own width model decides how many cells a grapheme occupies, so a wide character is
+/// never split in half: a cell that would be cut leaves the character out instead of drawing a
+/// half of it that the terminal would place somewhere of its own choosing.
+fn clip_to_cells(text: &str, room: usize) -> (&str, bool) {
+    if room == 0 {
+        return ("", !text.is_empty());
     }
-    bytes
-        .iter()
-        .all(|byte| (0x20..0x7F).contains(byte))
-        .then_some(bytes)
+    if kr_term::unicode::cells_for(text) <= room {
+        return (text, false);
+    }
+    let mut end = 0;
+    let mut used = 0;
+    for (offset, character) in text.char_indices() {
+        let width = kr_term::unicode::cells_for(character.encode_utf8(&mut [0_u8; 4]));
+        if used + width > room {
+            break;
+        }
+        used += width;
+        end = offset + character.len_utf8();
+    }
+    (&text[..end], true)
+}
+
+/// Returns the DEC designation byte of one character set the engine named.
+///
+/// The engine reports the grid library's own names. They are the three sets the kr-vt/1 profile
+/// implements, and each has exactly one designation byte in the `SCS` sequences. A name this build
+/// does not know is not guessed at: the designation is left alone and the run is drawn under
+/// whatever the terminal already had, which is what the snapshot's own text already assumes.
+const fn designation(name: &str) -> Option<u8> {
+    match name.as_bytes() {
+        b"Ascii" => Some(b'B'),
+        b"Uk" => Some(b'A'),
+        b"DecLineDrawing" => Some(b'0'),
+        _ => None,
+    }
 }
 
 /// Returns the bytes one side effect takes when its destination is a terminal.
@@ -769,6 +915,115 @@ mod tests {
     }
 
     #[test]
+    fn a_run_wider_than_the_window_is_clipped_rather_than_wrapped() {
+        // A run drawn past the last column would wrap into the row below, and on the last row it
+        // would scroll the screen this restoration is drawing.
+        let rendered = render(
+            &[RestoreOp::PaintRow {
+                row: row(0, 0, "abcdefghij"),
+            }],
+            viewport(24, 4),
+        );
+        let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+        assert!(text.ends_with("abcd"), "{text:?}");
+        assert_eq!(rendered.carried.clipped_rows, 1);
+    }
+
+    #[test]
+    fn a_wide_character_is_left_out_rather_than_half_drawn() {
+        let rendered = render(
+            &[RestoreOp::PaintRow {
+                row: row(0, 0, "a\u{4e00}"),
+            }],
+            viewport(24, 2),
+        );
+        let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+        assert!(text.ends_with('a'), "{text:?}");
+        assert_eq!(rendered.carried.clipped_rows, 1);
+    }
+
+    #[test]
+    fn a_cursor_outside_the_window_is_hidden_rather_than_left_somewhere_else() {
+        let rendered = render(
+            &[RestoreOp::SetCursor {
+                cursor: CursorState {
+                    col: 100,
+                    row: 0,
+                    visible: true,
+                    style: 1,
+                    pending_wrap: None,
+                },
+            }],
+            viewport(24, 40),
+        );
+        let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+        assert!(text.ends_with("\x1b[?25l"), "{text:?}");
+    }
+
+    #[test]
+    fn rows_are_painted_before_the_margins_and_origin_that_would_move_them() {
+        let operations = vec![
+            RestoreOp::SetMode {
+                entry: ModeEntry {
+                    kind: kr_term::modes::ModeKind::Dec,
+                    mode: 6,
+                    enabled: true,
+                },
+            },
+            RestoreOp::SetMargins {
+                margins: Margins {
+                    top: 5,
+                    bottom: 20,
+                    left: 0,
+                    right: 79,
+                },
+            },
+            RestoreOp::PaintRow {
+                row: row(0, 0, "top"),
+            },
+            RestoreOp::SetCursor {
+                cursor: CursorState {
+                    col: 0,
+                    row: 7,
+                    visible: true,
+                    style: 1,
+                    pending_wrap: None,
+                },
+            },
+        ];
+        let rendered = render(&operations, viewport(24, 80));
+        let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+        let painted = text.find("top").expect("the row is painted");
+        let region = text.find("\x1b[6;21r").expect("the scroll region is set");
+        let origin = text.find("\x1b[?6h").expect("origin mode is set");
+        assert!(painted < region, "the row is painted first: {text:?}");
+        assert!(
+            region < origin,
+            "then the region, then origin mode: {text:?}"
+        );
+        // With origin mode in force, the cursor's absolute row 7 is row 2 of the region.
+        assert!(text.contains("\x1b[3;1H"), "{text:?}");
+    }
+
+    #[test]
+    fn a_cursor_save_is_not_treated_as_a_mode() {
+        let rendered = render(
+            &[RestoreOp::SetMode {
+                entry: ModeEntry {
+                    kind: kr_term::modes::ModeKind::Dec,
+                    mode: 1048,
+                    enabled: false,
+                },
+            }],
+            viewport(24, 80),
+        );
+        assert!(
+            rendered.bytes.is_empty(),
+            "restoring a saved cursor is not a mode to be left in"
+        );
+    }
+
+    #[test]
     fn a_viewport_offsets_the_rows_and_columns_it_shows() {
         let looking_at = Viewport {
             top_row: 10,
@@ -860,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn a_title_stack_is_rebuilt_oldest_first() {
+    fn the_title_stack_stays_virtual_rather_than_growing_the_terminals_own() {
         let rendered = render(
             &[RestoreOp::SetTitle {
                 title: TitleEntry {
@@ -875,9 +1130,16 @@ mod tests {
             viewport(24, 80),
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
-        assert!(text.contains("older"));
-        assert!(text.contains("22;0t"));
+        assert!(
+            !text.contains("older"),
+            "the stack is not replayed: {text:?}"
+        );
+        assert!(
+            !text.contains("22;0t"),
+            "nothing is pushed onto the terminal's own stack: {text:?}"
+        );
         assert!(text.ends_with("\x1b]2;now\x1b\\"));
+        assert_eq!(rendered.carried.title_stack, 1, "and the loss is reported");
     }
 
     #[test]
@@ -889,7 +1151,9 @@ mod tests {
     }
 
     #[test]
-    fn an_open_link_is_closed_before_the_restoration_ends() {
+    fn the_link_the_application_has_open_is_left_open() {
+        // The next character the application prints belongs to it, so closing it here would put
+        // that text outside the link.
         let rendered = render(
             &[RestoreOp::SetHyperlink {
                 uri: Some("https://example.invalid/".to_owned()),
@@ -897,8 +1161,22 @@ mod tests {
             viewport(24, 80),
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
-        assert!(text.contains("\x1b]8;;https://example.invalid/\x1b\\"));
-        assert!(text.ends_with("\x1b]8;;\x1b\\"));
+        assert_eq!(text, "\x1b]8;;https://example.invalid/\x1b\\");
+    }
+
+    #[test]
+    fn a_link_opened_only_to_draw_a_run_is_closed_again() {
+        let mut linked = row(0, 0, "text");
+        linked.runs[0].hyperlink = Some("https://example.invalid/".to_owned());
+        let rendered = render(
+            &[
+                RestoreOp::PaintRow { row: linked },
+                RestoreOp::SetHyperlink { uri: None },
+            ],
+            viewport(24, 80),
+        );
+        let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+        assert!(text.ends_with("\x1b]8;;\x1b\\"), "{text:?}");
     }
 
     #[test]
@@ -919,9 +1197,12 @@ mod tests {
             }],
             viewport(24, 80),
         );
+        // A push saves what is current, so the stack is rebuilt by setting each value and pushing
+        // the next on top of it: set 1, push 3 (saving 1), push 5 (saving 3). The result is the
+        // stack [1, 3] with 5 in force.
         assert_eq!(
             rendered.bytes,
-            b"\x1b[>4;2m\x1b[<65535u\x1b[>1u\x1b[>3u\x1b[=5;1u".to_vec()
+            b"\x1b[>4;2m\x1b[<65535u\x1b[=1;1u\x1b[>3u\x1b[>5u".to_vec()
         );
     }
 }

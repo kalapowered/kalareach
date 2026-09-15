@@ -45,14 +45,6 @@ use kr_term::snapshot::{HandoffOutcome, LiveForwardingHandoff, Viewport, restora
 use crate::error::{Result, WorkerError};
 use crate::render::{Restoration, render};
 
-/// How many recent raw bytes are kept so a span released later can still be resolved.
-///
-/// The engine holds the last scalar of a run back in case a combining mark follows it, so a span
-/// it clears when the stream goes quiet names bytes that arrived in an earlier call. A grapheme
-/// cluster is far smaller than this; the margin is there so nothing depends on exactly how much
-/// the engine chooses to hold.
-const HELD_TAIL_BYTES: usize = 1024;
-
 /// The largest batch of query answers written into the application in one go.
 ///
 /// The lane is already bounded by its own limits; this bounds what one read of the terminal can
@@ -76,8 +68,42 @@ pub struct Filtered {
     pub projection_required_at: Option<u64>,
     /// Whether the projection generation advanced, which invalidates every client's screen.
     pub projection_reset: bool,
+    /// Whether a span the engine cleared named bytes this host could no longer produce.
+    ///
+    /// It should never happen: the retained window begins at the engine's own committed offset, and
+    /// nothing before that can be forwarded afterwards. If it ever does, the direct stream has a
+    /// hole in it, and a hole a client is not told about is the one failure section 9 forbids.
+    pub lost: bool,
     /// Side effects that had no attachment to go to and became host events.
     pub host_events: Vec<SideEffect>,
+}
+
+impl Filtered {
+    /// Returns whether this batch carries nothing at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.direct.is_empty()
+            && self.effects.is_empty()
+            && self.replies.is_empty()
+            && self.host_events.is_empty()
+            && self.projection_required_at.is_none()
+            && !self.projection_reset
+            && !self.lost
+    }
+
+    /// Takes everything another batch carries into this one.
+    ///
+    /// The two are consecutive parts of one stream, so the cursors each piece carries keep them in
+    /// order; nothing here has to know which came first.
+    pub fn absorb(&mut self, other: Self) {
+        self.direct.extend(other.direct);
+        self.effects.extend(other.effects);
+        self.replies.extend(other.replies);
+        self.host_events.extend(other.host_events);
+        self.projection_required_at = self.projection_required_at.or(other.projection_required_at);
+        self.projection_reset |= other.projection_reset;
+        self.lost |= other.lost;
+    }
 }
 
 /// The canonical grid of one session.
@@ -91,7 +117,12 @@ pub struct TerminalEngine {
     projection_required: bool,
     /// The handoff waiting for a parser-ground boundary before byte forwarding may resume.
     handoff: Option<LiveForwardingHandoff>,
-    /// The most recent raw bytes, so a span the engine clears later can still be resolved.
+    /// The raw bytes the engine has not committed yet, so a span it clears later can be resolved.
+    ///
+    /// It begins at the engine's own committed offset and is trimmed to it after every call, which
+    /// is exactly what is needed and no more: a span the engine emits names committed bytes, and
+    /// nothing before the committed offset can be emitted afterwards. The engine's own lexer
+    /// bounds how much it can be collecting, so this is bounded with it.
     tail: Vec<u8>,
     /// The raw cursor `tail` starts at.
     tail_cursor: u64,
@@ -160,10 +191,10 @@ impl TerminalEngine {
         let size = grid_size(canonical)?;
         self.engine.resize(size).map_err(term_failure)?;
         self.canonical = canonical;
-        self.tail.clear();
-        self.tail_cursor = self.engine.read_offset();
-        // A resize advances the projection, so every client's screen is described again from a
-        // snapshot rather than continued from one taken at another size.
+        // A resize advances the engine's projection, so every client's screen is described again
+        // from a snapshot rather than continued from one taken at another size. The retained bytes
+        // are kept: the lexer's position does not move, so a sequence that was arriving across the
+        // resize still has to be resolvable when it completes.
         self.projection_required = false;
         self.handoff = None;
         Ok(())
@@ -192,6 +223,34 @@ impl TerminalEngine {
         let outcome = self.engine.feed(bytes, now_ms);
         self.tail.extend_from_slice(bytes);
         self.collect(&outcome, gate, now_ms)
+    }
+
+    /// Returns whether the application has bracketed paste on, as the canonical parser has it.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.engine.bracketed_paste()
+    }
+
+    /// Takes whatever the response lane is allowed to write right now.
+    ///
+    /// The lane holds a reply back while a bracketed paste or a human input frame is open, so the
+    /// moment one of those closes is a moment to look again. Nothing else in the engine changes.
+    pub fn drain_replies(&mut self, gate: LaneGate, now_ms: u64) -> Vec<Vec<u8>> {
+        self.engine
+            .lane_mut()
+            .drain(gate, MAX_REPLY_BYTES, now_ms)
+            .into_iter()
+            .map(|reply| reply.bytes().to_vec())
+            .collect()
+    }
+
+    /// Reads the engine's own rate-limited diagnostic totals.
+    ///
+    /// The engine consumes a sequence the profile does not name and counts it rather than
+    /// forwarding it. Nothing is lost: the totals are here.
+    #[must_use]
+    pub fn diagnostics(&self) -> Vec<(kr_term::diag::DiagnosticKind, u64)> {
+        self.engine.diagnostic_totals()
     }
 
     /// Settles the screen when the stream goes quiet.
@@ -227,9 +286,20 @@ impl TerminalEngine {
     /// This is what an attachment is given instead of replayed history. Nothing in it can ring,
     /// copy, notify, download, launch or ask anything, because the operations it is built from
     /// have no member that can.
-    pub fn restoration(&mut self, dimensions: Dimensions, now_ms: u64) -> (u64, Restoration) {
+    /// Returns the bytes that put a terminal into the session's current screen.
+    ///
+    /// Taking a snapshot settles the screen, which releases whatever the engine was holding back.
+    /// Those bytes belong to every direct attachment, so they come back with the restoration rather
+    /// than disappearing inside one subscriber's snapshot.
+    pub fn restoration(
+        &mut self,
+        dimensions: Dimensions,
+        gate: LaneGate,
+        now_ms: u64,
+    ) -> (u64, Restoration, Filtered) {
         let mut viewport = self.viewport_for(dimensions);
-        let (mut snapshot, _settled) = self.engine.snapshot(viewport, now_ms);
+        let (mut snapshot, settled) = self.engine.snapshot(viewport, now_ms);
+        let settled = self.collect(&settled, gate, now_ms);
         // The page's own first row is what the window is anchored to. It is read from the snapshot
         // rather than guessed at, because eviction and scrolling both move it.
         if let Some(first) = snapshot.rows.first() {
@@ -237,7 +307,11 @@ impl TerminalEngine {
         }
         snapshot.viewport = viewport;
         let operations = restoration_operations(&snapshot);
-        (snapshot.output_cursor, render(&operations, viewport))
+        (
+            snapshot.output_cursor,
+            render(&operations, viewport),
+            settled,
+        )
     }
 
     /// Decides whether byte forwarding may resume for a direct attachment.
@@ -277,27 +351,32 @@ impl TerminalEngine {
         for span in &outcome.forward {
             let start = span.start();
             let Some(offset) = start.checked_sub(self.tail_cursor) else {
+                filtered.lost = true;
                 continue;
             };
-            let Ok(offset) = usize::try_from(offset) else {
-                continue;
-            };
-            let Ok(len) = usize::try_from(span.len()) else {
+            let (Ok(offset), Ok(len)) = (usize::try_from(offset), usize::try_from(span.len()))
+            else {
+                filtered.lost = true;
                 continue;
             };
             let end = offset.saturating_add(len).min(self.tail.len());
             if offset >= end {
+                filtered.lost = true;
                 continue;
             }
             filtered
                 .direct
                 .push((start, self.tail[offset..end].to_vec()));
         }
-        // Everything older than the margin is behind whatever the engine can still be holding.
-        if self.tail.len() > HELD_TAIL_BYTES {
-            let surplus = self.tail.len() - HELD_TAIL_BYTES;
-            self.tail.drain(..surplus);
-            self.tail_cursor = self.tail_cursor.saturating_add(surplus as u64);
+        // Everything up to the engine's committed offset has been decided. Nothing before it can
+        // be forwarded afterwards, so nothing before it needs keeping.
+        let committed = self.engine.output_cursor();
+        if let Some(spent) = committed.checked_sub(self.tail_cursor)
+            && let Ok(spent) = usize::try_from(spent)
+        {
+            let spent = spent.min(self.tail.len());
+            self.tail.drain(..spent);
+            self.tail_cursor = self.tail_cursor.saturating_add(spent as u64);
         }
         for effect in &outcome.side_effects {
             match effect.destination {
@@ -417,7 +496,8 @@ mod tests {
     fn a_restoration_describes_the_screen_rather_than_the_bytes_that_made_it() {
         let mut engine = engine();
         engine.feed(0, b"\x07before\x1b[c after", LaneGate::default(), 0);
-        let (cursor, restoration) = engine.restoration(dimensions(80, 24), 0);
+        let (cursor, restoration, _) =
+            engine.restoration(dimensions(80, 24), LaneGate::default(), 0);
         assert!(cursor > 0);
         let text = String::from_utf8_lossy(&restoration.bytes).into_owned();
         assert!(text.contains("before"), "the screen's text is drawn");

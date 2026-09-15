@@ -169,6 +169,18 @@ it resynchronises, is the screen as it is now, rendered from a closed set of ope
 member that can ring, copy, notify, download, launch or ask anything. A terminal that was not there
 when the history happened does not have the history happen to it.
 
+Rendering a screen back into bytes cannot carry everything a client that holds its own grid could
+apply. What it leaves out is counted rather than assumed away — the buffer that is not showing and
+its saved cursor and keyboard negotiation, the virtual title stack, soft-wrap markers, and the
+right-hand side of a row wider than the window — and `Session::restoration_losses` is the count.
+Two further gaps are missing before the host sees them, and `kr_term::unicode::LIBRARY` records
+them: the pending-wrap flag and the saved cursor of either buffer.
+
+A sequence the profile does not name is consumed rather than forwarded, and the engine counts it;
+`Session::terminal_diagnostics` reports those totals. A side effect that arrives while nothing holds
+the input lease has no destination, so it becomes a durable host event in the worker's own journal
+rather than being shown to whoever happens to be watching.
+
 ## Action windows and the dispatch lease
 
 Both are the transport's own components (`kr_transport::window`, `kr_transport::lease`), used

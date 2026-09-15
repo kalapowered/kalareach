@@ -1192,7 +1192,21 @@ impl Controller {
                 }
                 ControlFrame::Request(request) if negotiated => {
                     match self.authorised(connection_id).await {
-                        Ok(_) => self.read_method(&request).await,
+                        Ok(_) => {
+                            let answer = self.read_method(&request).await;
+                            // Checked again now the read has finished. A read that passed its check
+                            // and then waited for the registry can complete after the authority
+                            // behind it was withdrawn, and what the contract forbids is *serving*
+                            // that state rather than reading it.
+                            match self.authorised(connection_id).await {
+                                Ok(_) => answer,
+                                Err(error) => error_reply(
+                                    request.request_id,
+                                    ErrorCode::PermissionDenied,
+                                    error.to_string(),
+                                ),
+                            }
+                        }
                         Err(error) => error_reply(
                             request.request_id,
                             ErrorCode::PermissionDenied,
@@ -1691,11 +1705,15 @@ impl Controller {
                 }),
             };
         };
-        // Remote dispatch additionally needs a live lease. It is taken here, at the moment the
-        // dispatch runs, rather than trusting one that was valid when the request arrived; the
-        // lease's own remaining time then bounds the deadline the worker is given.
-        let lease_deadline = self.dispatch_lease(params.session_id, actor).await?;
         let result = {
+            // The connection comes first. Waiting for it can take as long as whatever else is using
+            // it, and a deadline computed before that wait would hand the worker time that had
+            // already been spent queueing.
+            let mut held = self.worker_client(&worker).await?;
+            // Remote dispatch additionally needs a live lease, taken at the moment the dispatch
+            // runs rather than one that was valid when the request arrived. Its own remaining time
+            // then bounds the deadline the worker is given.
+            let lease_deadline = self.dispatch_lease(params.session_id, actor).await?;
             // What the worker is told is what remains of the accepted deadline at the instant it is
             // forwarded, measured on this daemon's continuous clock. A deadline already spent is
             // never forwarded as though it had time left.
@@ -1703,7 +1721,6 @@ impl Controller {
                 .ok_or_else(|| ControllerError::WindowExpired {
                     detail: "the deadline this action was admitted under has passed".to_owned(),
                 })?;
-            let mut held = self.worker_client(&worker).await?;
             let client = held.as_mut().expect("the connection is open");
             match client.forward(mutation, actor, accepted_ttl_ms).await {
                 Ok(result) => result,

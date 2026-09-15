@@ -76,9 +76,11 @@ impl Attachment {
     ///
     /// * **The size.** Wrapping and cursor coordinates depend on the column count, so only a
     ///   terminal of exactly the canonical size can take the byte stream unchanged.
-    /// * **The profile.** A client declares which terminal it is after probing it. Without that
-    ///   declaration the host does not know what the bytes would do there, and `--no-probe` is
-    ///   exactly the case where the client has chosen not to find out.
+    /// * **The profile.** A client declares which terminal it is after probing it, and the name it
+    ///   declares has to be one this build has qualified against the kr-vt/1 output the session
+    ///   produces. Without a declaration the host does not know what those bytes would do there,
+    ///   and `--no-probe` is exactly the case where the client chose not to find out; with an
+    ///   unqualified one the host knows, and the answer is that they would not do the right thing.
     /// * **The stream.** The engine reports when the output stops being something a physical
     ///   terminal can be handed at all, and `carryable` is that answer.
     ///
@@ -92,13 +94,48 @@ impl Attachment {
             return None;
         }
         match self.dimensions {
-            Some(own) if carryable && own == geometry && self.terminal_profile_id.is_some() => {
+            Some(own)
+                if carryable
+                    && own == geometry
+                    && self
+                        .terminal_profile_id
+                        .as_deref()
+                        .is_some_and(is_qualified_terminal) =>
+            {
                 Some(TerminalPresentationMode::Direct)
             }
             Some(_) => Some(TerminalPresentationMode::Viewport),
             None => None,
         }
     }
+}
+
+/// The terminal names this build will hand its own output stream to unchanged.
+///
+/// The session writes the kr-vt/1 profile, and `kr_term::terminfo` describes that profile as the
+/// `xterm-256color` entry with the kr-vt/1 deltas. A terminal that implements that entry can take
+/// the stream; one that does not is shown a rendering of the canonical grid instead, which needs
+/// nothing of it beyond cursor addressing and colour.
+///
+/// The list is a qualification record, not a guess. A name is added to it when the profile's own
+/// conformance corpus has been run against that terminal, and `TERM=dumb`, `TERM=vt100` and an
+/// unknown name are all outside it for the same reason: this build has not established what its
+/// output does there.
+pub const QUALIFIED_TERMINALS: &[&str] = &[
+    "xterm-256color",
+    "xterm-kitty",
+    "wezterm",
+    "alacritty",
+    "foot",
+    "ghostty",
+    "tmux-256color",
+    "screen-256color",
+];
+
+/// Returns whether this build has qualified a terminal to take the session's stream unchanged.
+#[must_use]
+pub fn is_qualified_terminal(name: &str) -> bool {
+    QUALIFIED_TERMINALS.contains(&name)
 }
 
 /// Every attachment of one session, and the geometry they compete for.
@@ -714,6 +751,24 @@ mod tests {
                 .viewport(identifier(1), Dimensions::new(120, 40))
                 .expect("reports"),
             TerminalPresentationMode::Direct
+        );
+    }
+
+    #[test]
+    fn a_terminal_this_build_has_not_qualified_is_projected() {
+        // Knowing the name is not the same as having established what this session's output does
+        // there. `TERM=dumb` is the clearest case: it is a real name and it cannot take the stream.
+        let mut table = AttachmentTable::new(Dimensions::new(120, 40));
+        let unqualified = SessionAttachParams {
+            terminal_profile_id: Nullable::some("dumb".to_owned()),
+            ..terminal(120, 40, true)
+        };
+        attach(&mut table, 1, &unqualified);
+        assert_eq!(
+            table
+                .viewport(identifier(1), Dimensions::new(120, 40))
+                .expect("reports"),
+            TerminalPresentationMode::Viewport
         );
     }
 
