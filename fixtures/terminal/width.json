@@ -7,17 +7,43 @@
       "covers": "KR-REQ-08.39 CJK width",
       "cursor": {
         "col": 6,
+        "pending_wrap": false,
         "row": 0,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "cjk_pair",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "e4b8ade696876162",
       "output_cursor": 8,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 6,
@@ -46,21 +72,47 @@
       "covers": "KR-REQ-08.39 wide cell at the margin",
       "cursor": {
         "col": 1,
+        "pending_wrap": false,
         "row": 1,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "cjk_at_right_margin",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "61626364e4b8ad65",
       "output_cursor": 8,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 6,
-          "soft_wrapped": false,
+          "soft_wrapped": true,
           "stable_id": 0,
           "text": "abcd中"
         },
@@ -85,17 +137,43 @@
       "covers": "KR-REQ-08.39 combining marks add no cells",
       "cursor": {
         "col": 3,
+        "pending_wrap": false,
         "row": 0,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "combining_marks",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "65cc8161cc88cca37a",
       "output_cursor": 9,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 3,
@@ -124,17 +202,43 @@
       "covers": "KR-REQ-08.39 ambiguous characters are one cell",
       "cursor": {
         "col": 4,
+        "pending_wrap": false,
         "row": 0,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "ambiguous_is_narrow",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "c2b1e28098e2809978",
       "output_cursor": 9,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 4,
@@ -163,17 +267,43 @@
       "covers": "KR-REQ-08.39 emoji followed by ASCII",
       "cursor": {
         "col": 6,
+        "pending_wrap": false,
         "row": 0,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "emoji_then_ascii_left_margin",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "f09f91a9e2808df09f92bb4142",
       "output_cursor": 13,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 6,
@@ -202,21 +332,47 @@
       "covers": "KR-REQ-08.39 emoji at the right margin",
       "cursor": {
         "col": 3,
+        "pending_wrap": false,
         "row": 1,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "emoji_then_ascii_right_margin",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "61626364f09f91a9e2808df09f92bb45",
       "output_cursor": 16,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 6,
-          "soft_wrapped": false,
+          "soft_wrapped": true,
           "stable_id": 0,
           "text": "abcd👩‍"
         },
@@ -241,17 +397,43 @@
       "covers": "KR-REQ-08.39 delayed wrap",
       "cursor": {
         "col": 1,
+        "pending_wrap": false,
         "row": 1,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "delayed_wrap",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "616263646558",
       "output_cursor": 6,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 5,
@@ -280,17 +462,43 @@
       "covers": "KR-REQ-08.39 delayed wrap cancelled",
       "cursor": {
         "col": 1,
+        "pending_wrap": false,
         "row": 0,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "delayed_wrap_then_cr",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "61626364650d5a",
       "output_cursor": 7,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 5,
@@ -319,17 +527,50 @@
       "covers": "KR-REQ-08.39 bottom-row scrolling",
       "cursor": {
         "col": 4,
+        "pending_wrap": false,
         "row": 2,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [
+        {
+          "cells": 3,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": "one"
+        }
+      ],
       "hyperlinks": [],
       "id": "bottom_row_scrolling",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "6f6e650d0a74776f0d0a74687265650d0a666f7572",
       "output_cursor": 21,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 3,
@@ -358,17 +599,43 @@
       "covers": "KR-REQ-08.39 autowrap off",
       "cursor": {
         "col": 4,
+        "pending_wrap": false,
         "row": 0,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "autowrap_disabled",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "1b5b3f376c6162636465666768",
       "output_cursor": 13,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 5,
@@ -397,17 +664,43 @@
       "covers": "KR-REQ-08.39 an emoji modifier is its own cell",
       "cursor": {
         "col": 5,
+        "pending_wrap": false,
         "row": 0,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "emoji_modifier",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "f09f918df09f8fbb58",
       "output_cursor": 9,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 5,
@@ -436,17 +729,43 @@
       "covers": "KR-REQ-08.39 a regional-indicator pair is two cells",
       "cursor": {
         "col": 3,
+        "pending_wrap": false,
         "row": 0,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "regional_indicators",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "f09f87bff09f87a658",
       "output_cursor": 9,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 3,
@@ -475,17 +794,43 @@
       "covers": "KR-REQ-08.39 a keycap sequence is one cell",
       "cursor": {
         "col": 2,
+        "pending_wrap": false,
         "row": 0,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "keycap_sequence",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "31efb88fe283a358",
       "output_cursor": 8,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 2,
@@ -514,17 +859,43 @@
       "covers": "KR-REQ-08.39 a mark joins the cell in the last column",
       "cursor": {
         "col": 1,
+        "pending_wrap": false,
         "row": 1,
         "visible": true
       },
       "grid_unrecognised": 0,
       "grid_writes": 0,
+      "history": [],
       "hyperlinks": [],
       "id": "combining_mark_at_the_right_margin",
+      "inactive_screen": [
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ],
       "input": "6162636465cc8166",
       "output_cursor": 8,
       "projection_generation": 1,
       "rows": 3,
+      "saved_cursors": [
+        null,
+        null
+      ],
       "screen": [
         {
           "cells": 5,
@@ -553,7 +924,7 @@
   "unicode": {
     "ambiguous_are_wide": false,
     "grapheme_clustering": false,
-    "library_revision": "699fd77b44641c43476c945054cfae6518dbd632",
+    "library_revision": "9a9015119497fd5803c35a10ea4ffc503f2a7dfb",
     "width_table_generation": 9
   }
 }

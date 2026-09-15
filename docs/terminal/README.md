@@ -206,10 +206,10 @@ them in one call and the cell count follows the pinned model. Listing the joins 
 faster and wrong, because the list is longer than emoji and grows with the library; cutting at every
 cell costs nothing on ordinary output, because plain ASCII is not cut at all.
 
-The library also keeps a row in one of two representations and reads a compact row by clustering its
-text again, which would undo the cut. A cell of the row is read back before every write, which
-converts a live row to the representation that remembers where its cells are. A row that has
-scrolled is the narrow patch recorded below.
+The library also keeps a row in one of two representations, and the compact one stores the row as a
+single string. Reading that string back by clustering it again would undo the cut, so the pinned
+revision has a compact row record where its cells are whenever clustering would not give them back.
+A row therefore keeps the cells it was given, on screen and in the scrollback alike.
 
 Three rules keep the answer the same however the reads fall.
 
@@ -267,8 +267,12 @@ Three kinds of sequence never reach the library, because the profile owns them o
 
 ### The library qualification record
 
-Repository: `https://github.com/wezterm/wezterm`
-Revision: `699fd77b44641c43476c945054cfae6518dbd632`
+Repository: `https://github.com/kalapowered/wezterm`
+Revision: `9a9015119497fd5803c35a10ea4ffc503f2a7dfb`
+
+That revision is `https://github.com/wezterm/wezterm` at
+`699fd77b44641c43476c945054cfae6518dbd632` plus the four accessors listed below, each of which is
+a published change to the smallest surface that gives it.
 
 The revision serves kr-vt/1 for these reasons.
 
@@ -292,23 +296,21 @@ The revision serves kr-vt/1 for these reasons.
 The Unicode data behind the width model is pinned by the same revision: `emoji-data.txt` dated
 2020-01-28 and `emoji-variation-sequences-14.0.0.txt` dated 2021-06-08.
 
-#### What the revision needs before the profile is complete
+#### The four accessors the revision adds
 
-Three pieces of state section 8 lists among what a snapshot restores are not reachable from the
-pinned revision. All three need the same narrow published patch: a public accessor.
+Section 8 lists four pieces of state that the upstream revision keeps and does not let a consumer
+read. Each is a published accessor over the smallest surface that provides it, and each is what a
+snapshot needs rather than a convenience.
 
-| State | Why the profile needs it | What happens until then |
-| --- | --- | --- |
-| `TerminalState::pending_wrap()` | Section 8 lists pending wrap among the restored state | The snapshot carries `None`; a reconnecting client re-derives it from the next character it places. At the bottom-right corner that character can change what scrolls, so this is a real gap and not a cosmetic one |
-| `TerminalState::saved_cursor()` as a shared reference for both buffers, with the saved rendition, character sets and origin mode among its public fields | Section 8 lists saved cursors among the restored state, and a saved cursor carrying only a position restores the wrong colours from the wrong origin | The snapshot carries `None` for each buffer; a restored session behaves as though nothing was saved until the application saves again. The snapshot's own type carries the full saved state, so only the reading of it is missing |
-| `TerminalState::inactive_screen()` | Section 8 requires a restoration sequence to reproduce **both** buffer states, and the accessor the revision exposes returns whichever buffer is active | The snapshot carries the active buffer's rows and `None` for the other. A client that reconnects while a full-screen application is running gets that application's screen and no primary-buffer content until the application exits and the shell redraws |
-| `Line::compress_for_scrollback()` keeping the cells it was given, rather than working out where they are by clustering the row's text again | The pinned width model gives a cell to every scalar that has a width of its own, and the compact representation joins adjacent scalars the library's own clustering would join, which also drops the columns they held | A row keeps its cells while it is on screen. A row that has scrolled loses the columns reserved for joined scalars: its text is all still there and the row is narrower than it was. Rows without emoji sequences or Hangul jamo are unaffected, which is nearly all of them |
+| Accessor | Why the profile needs it |
+| --- | --- |
+| `TerminalState::pending_wrap()` | Section 8 lists pending wrap among the restored state. The same cursor coordinates place the next character in different cells with and without it, and at the bottom-right corner that character decides what scrolls |
+| `TerminalState::saved_cursor()`, a shared reference to either buffer's saved cursor, with the saved rendition and character sets among its public fields | Section 8 lists saved cursors among the restored state, and a saved cursor that carries only a position restores the wrong colours from the wrong origin. Each buffer keeps its own, so a restoration reads both |
+| `TerminalState::inactive_screen()` | Section 8 requires a restoration sequence to reproduce **both** buffer states, and the accessor upstream exposes returns whichever buffer is active. Copying the primary buffer aside on every switch would be a second copy of state that can drift from the first, which is the failure the single-reducer rule exists to prevent |
+| `Line::compress_for_scrollback()` keeping the cells, attributes and wrap markers it was given | The pinned width model gives a cell to every scalar that has a width of its own, and the compact row representation used to work out where the cells were by clustering the row's text again, which joined adjacent scalars and dropped the columns they held |
 
-The last one is worth being plain about. The worker does maintain both buffers, because the library
-holds both; what is missing is a way to read the one that is not showing. Copying the primary
-buffer's rows aside on every switch would be a second copy of state that can drift from the first,
-which is the failure the single-reducer rule exists to prevent. So the gap is declared rather than
-papered over.
+`kr_term::unicode::LIBRARY` carries the same record in the crate, and its `required_patch` list is
+empty: the pinned revision exposes everything section 8 asks a snapshot to carry.
 
 #### What constrains the direct compatibility profile
 
@@ -482,9 +484,10 @@ tracked mode, the keypad mode, the keyboard protocol an input encoder has to rep
 and the virtual title stack, the hyperlink ranges, the whole palette with its source, and paged rows
 with stable identifiers and wrap markers.
 
-Pending wrap, the saved cursor and the inactive buffer's rows are the three fields the pinned
-library does not expose; see the narrow patch above. Each is `None` rather than a plausible-looking
-default, because a client that is told a saved cursor is at the origin will restore it there.
+It also carries the pending wrap, the saved cursor of each buffer with the rendition and character
+sets that were saved with it, and the rows of the buffer that is not showing. A saved cursor is
+`None` only when that buffer has saved none, so a restoration never invents one: a client told a
+saved cursor is at the origin would restore it there.
 
 The cursor a snapshot names is the committed output cursor, not the read offset: it is the point
 every delivered event has reached. Taking a snapshot settles the held cell, and `Engine::snapshot`

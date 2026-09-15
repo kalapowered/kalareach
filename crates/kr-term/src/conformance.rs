@@ -591,7 +591,84 @@ pub const SNAPSHOT_CASES: &[GridCase] = &[
         rows: 4,
         input: b"primary\r\n\x1b[?1049halt\x1b[!p",
     },
+    GridCase {
+        id: "alternate_holds_primary_content",
+        covers: "KR-REQ-08.40 both buffers are restored",
+        cols: 12,
+        rows: 3,
+        // A shell leaves three rows behind, a full-screen application takes the alternate buffer
+        // and draws over it. The snapshot carries what the application is showing and what the
+        // shell left, so leaving the application puts the session back where it was.
+        input: b"one\r\ntwo\r\nthree\r\n\x1b[?1049h\x1b[2J\x1b[Hediting",
+    },
+    GridCase {
+        id: "saved_cursors_both_buffers",
+        covers: "KR-REQ-08.40 saved cursors of both buffers",
+        cols: 12,
+        rows: 3,
+        // A save in each buffer, with a different rendition and a different G1 designation, so a
+        // restoration that carried only positions would be visibly wrong.
+        input: b"\x1b)0\x1b[1;31m\x1b[2;4H\x1b7\x1b[?1047h\x1b)B\x1b[42m\x1b[3;2H\x1b7",
+    },
+    GridCase {
+        id: "pending_wrap_at_margin",
+        covers: "KR-REQ-08.40 pending wrap",
+        cols: 4,
+        rows: 3,
+        // The cursor sits in the final column with the wrap deferred: the same coordinates as a
+        // row with space left, and the next character goes somewhere else.
+        input: b"abcd",
+    },
+    GridCase {
+        id: "scrollback_keeps_columns",
+        covers: "KR-REQ-08.39 a scrolled row keeps its columns",
+        cols: 8,
+        rows: 2,
+        // An emoji sequence and a Hangul syllable built from jamo, each of which the library's own
+        // clustering would fold into one cell, scrolled off the screen so the row is compacted.
+        input: "\u{1f469}\u{200d}\u{1f4bb}\u{1100}\u{1161}\r\nb\r\nc".as_bytes(),
+    },
 ];
+
+/// Records the rows of one buffer.
+fn row_values(rows: &[crate::grid::GridRow]) -> Vec<Value> {
+    rows.iter()
+        .map(|row| {
+            json!({
+                "stable_id": row.stable_id,
+                "soft_wrapped": row.soft_wrapped,
+                "text": row.runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+                "cells": row.runs.iter().map(|run| run.cells).sum::<u32>(),
+            })
+        })
+        .collect()
+}
+
+/// Records one saved cursor, including the rendition and the character sets saved with it.
+fn saved_cursor_value(saved: &crate::snapshot::SavedCursor) -> Value {
+    json!({
+        "buffer": format!("{:?}", saved.buffer),
+        "col": saved.col,
+        "row": saved.row,
+        "pending_wrap": saved.pending_wrap,
+        "origin_mode": saved.origin_mode,
+        "style": saved.style,
+        "charsets": {
+            "g0": saved.charsets.g0,
+            "g1": saved.charsets.g1,
+            "shift_out": saved.charsets.shift_out,
+        },
+        "hyperlink": saved.hyperlink,
+        "rendition": {
+            "foreground": format!("{:?}", saved.rendition.foreground),
+            "background": format!("{:?}", saved.rendition.background),
+            "bold": saved.rendition.bold,
+            "italic": saved.rendition.italic,
+            "underline": format!("{:?}", saved.rendition.underline),
+            "reverse": saved.rendition.reverse,
+        },
+    })
+}
 
 /// Runs one case through a fresh engine and records what happened.
 #[must_use]
@@ -684,18 +761,17 @@ pub fn summarise_grid(case: &GridCase) -> Value {
         cols: case.cols,
     };
     let (snapshot, _) = engine.snapshot(viewport, 0);
-    let rows: Vec<Value> = snapshot
-        .rows
-        .iter()
-        .map(|row| {
-            json!({
-                "stable_id": row.stable_id,
-                "soft_wrapped": row.soft_wrapped,
-                "text": row.runs.iter().map(|run| run.text.as_str()).collect::<String>(),
-                "cells": row.runs.iter().map(|run| run.cells).sum::<u32>(),
-            })
-        })
-        .collect();
+    let rows = row_values(&snapshot.rows);
+    let inactive = row_values(&snapshot.inactive_rows);
+    // The rows above the screen, so a case can show that a row keeps its columns after it has
+    // scrolled and the grid has compacted it.
+    let newest = snapshot.rows.first().map_or(0, |row| row.stable_id);
+    let history = usize::try_from(newest - snapshot.oldest_retained_row).unwrap_or(0);
+    let history = row_values(
+        &engine
+            .grid()
+            .history_rows(snapshot.oldest_retained_row, history),
+    );
     json!({
         "input": hex(case.input),
         "cols": case.cols,
@@ -707,8 +783,16 @@ pub fn summarise_grid(case: &GridCase) -> Value {
             "col": snapshot.cursor.col,
             "row": snapshot.cursor.row,
             "visible": snapshot.cursor.visible,
+            "pending_wrap": snapshot.cursor.pending_wrap,
         }),
+        "saved_cursors": snapshot
+            .saved_cursors
+            .iter()
+            .map(|saved| saved.as_ref().map_or(Value::Null, saved_cursor_value))
+            .collect::<Vec<_>>(),
         "screen": rows,
+        "inactive_screen": inactive,
+        "history": history,
         "hyperlinks": snapshot.hyperlinks.iter().map(|link| json!({
             "row": link.row,
             "start_col": link.start_col,

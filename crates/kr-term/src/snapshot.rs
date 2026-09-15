@@ -39,11 +39,9 @@ pub struct CursorState {
     pub style: u32,
     /// Whether the next printable character wraps before it is placed.
     ///
-    /// `None` means the pinned grid library does not expose it. See the narrow patch recorded in
-    /// [`crate::unicode::LIBRARY`]: until it lands, a reconnecting client re-derives the pending
-    /// wrap from the next character it places, which costs that character's position and nothing
-    /// else.
-    pub pending_wrap: Option<bool>,
+    /// The same coordinates mean different things with and without it, so a restoration that left
+    /// it out would put the next character in the wrong cell.
+    pub pending_wrap: bool,
 }
 
 /// A saved cursor, from DECSC or the alternate-buffer switch.
@@ -208,9 +206,8 @@ pub struct Snapshot {
     pub cursor: CursorState,
     /// The saved cursor of each buffer, primary first.
     ///
-    /// `None` means the pinned grid library does not expose it; see the narrow patch recorded in
-    /// [`crate::unicode::LIBRARY`]. Each buffer has its own, because the switch into the alternate
-    /// buffer saves one of its own.
+    /// Each buffer has its own, because the switch into the alternate buffer saves one of its own.
+    /// `None` for a buffer means nothing has been saved for it.
     pub saved_cursors: [Option<SavedCursor>; 2],
     /// The scroll region.
     pub margins: Margins,
@@ -244,12 +241,10 @@ pub struct Snapshot {
     pub rows: Vec<GridRow>,
     /// The rows of the buffer that is not active.
     ///
-    /// Section 8 requires restoration to reproduce both buffers. `None` means the pinned grid
-    /// library does not expose the inactive one; see the narrow patch recorded in
-    /// [`crate::unicode::LIBRARY`]. Until it lands, a client that reconnects while a full-screen
-    /// application is running gets that application's screen and no primary-buffer content until
-    /// the application exits and redraws.
-    pub inactive_rows: Option<Vec<GridRow>>,
+    /// Section 8 requires restoration to reproduce both buffers, so a client that reconnects while
+    /// a full-screen application is running still has what the shell left behind, and sees it
+    /// again when the application exits.
+    pub inactive_rows: Vec<GridRow>,
     /// The oldest row still retained anywhere.
     pub oldest_retained_row: i64,
     /// Whether rows have been evicted since the session started.
@@ -297,8 +292,7 @@ pub struct Delta {
     /// The saved cursor of each buffer, when one was saved or restored since the base.
     ///
     /// A save changes what a later restore will do, and two sessions whose saved pens differ are
-    /// two different sessions. `None` for a buffer means the pinned grid library does not expose
-    /// its saved cursor; see the narrow patch recorded in [`crate::unicode::LIBRARY`].
+    /// two different sessions. `None` for a buffer means nothing is saved for it.
     pub saved_cursors: Option<[Option<SavedCursor>; 2]>,
     /// The hyperlink the next character would be part of, when the presentation state changed.
     ///
@@ -483,10 +477,8 @@ pub fn restoration_operations(snapshot: &Snapshot) -> Vec<RestoreOp> {
     });
     // The buffer that is not showing is painted first, so that leaving the active buffer later
     // finds it as it was.
-    if let Some(rows) = &snapshot.inactive_rows {
-        for row in rows {
-            ops.push(RestoreOp::PaintInactiveRow { row: row.clone() });
-        }
+    for row in &snapshot.inactive_rows {
+        ops.push(RestoreOp::PaintInactiveRow { row: row.clone() });
     }
     for row in &snapshot.rows {
         ops.push(RestoreOp::PaintRow { row: row.clone() });

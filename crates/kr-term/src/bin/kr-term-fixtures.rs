@@ -187,12 +187,17 @@ fn profile() -> Value {
         "grid_library": {
             "repository": LIBRARY.repository,
             "revision": LIBRARY.revision,
+            "upstream": LIBRARY.upstream,
+            "upstream_revision": LIBRARY.upstream_revision,
             "notes": LIBRARY.notes,
             "direct_mode_constraints": LIBRARY.direct_mode_constraints,
-            "required_patch": LIBRARY.required_patch.iter().map(|patch| json!({
-                "state": patch.state,
-                "reason": patch.reason,
-                "interim": patch.interim,
+            "qualified_additions": LIBRARY.qualified_additions.iter().map(|addition| json!({
+                "state": addition.state,
+                "reason": addition.reason,
+            })).collect::<Vec<_>>(),
+            "required_patch": LIBRARY.required_patch.iter().map(|addition| json!({
+                "state": addition.state,
+                "reason": addition.reason,
             })).collect::<Vec<_>>(),
         },
     })

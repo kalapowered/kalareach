@@ -117,15 +117,13 @@ pub fn last_cell_start(text: &str) -> usize {
     start
 }
 
-/// One accessor the profile needs and the pinned revision does not expose.
+/// One accessor the pinned revision adds to the upstream tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequiredPatch {
-    /// The state the profile needs to read.
+pub struct QualifiedAddition {
+    /// The state the profile reads.
     pub state: &'static str,
     /// Why the profile needs it.
     pub reason: &'static str,
-    /// What the session does until the patch lands.
-    pub interim: &'static str,
 }
 
 /// The record of why the pinned terminal state revision may serve kr-vt/1.
@@ -135,22 +133,32 @@ pub struct RequiredPatch {
 /// This record says which it is, and the qualification fixtures prove each claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LibraryQualification {
-    /// The upstream repository.
+    /// The repository the pinned revision comes from.
     pub repository: &'static str,
     /// The pinned revision.
     pub revision: &'static str,
+    /// The upstream repository the pinned revision follows.
+    pub upstream: &'static str,
+    /// The upstream revision the pinned revision is built on.
+    pub upstream_revision: &'static str,
     /// How the profile keeps the library inside its bounds.
     pub notes: &'static [&'static str],
     /// Behaviour that differs from xterm and therefore constrains the direct compatibility profile.
     pub direct_mode_constraints: &'static [&'static str],
-    /// The accessors the profile needs and the revision does not expose.
-    pub required_patch: &'static [RequiredPatch],
+    /// The accessors the pinned revision adds to the upstream tree.
+    pub qualified_additions: &'static [QualifiedAddition],
+    /// The accessors the profile needs and the pinned revision does not expose.
+    ///
+    /// Empty: the pinned revision exposes everything section 8 asks a snapshot to carry.
+    pub required_patch: &'static [QualifiedAddition],
 }
 
 /// The qualification record for the pinned revision.
 pub const LIBRARY: LibraryQualification = LibraryQualification {
-    repository: "https://github.com/wezterm/wezterm",
-    revision: "699fd77b44641c43476c945054cfae6518dbd632",
+    repository: "https://github.com/kalapowered/wezterm",
+    revision: "9a9015119497fd5803c35a10ea4ffc503f2a7dfb",
+    upstream: "https://github.com/wezterm/wezterm",
+    upstream_revision: "699fd77b44641c43476c945054cfae6518dbd632",
     notes: &[
         "The revision accepts already-parsed actions, so the engine parses once and the library \
          never re-frames a byte. That is what makes a second parse unnecessary rather than merely \
@@ -168,10 +176,10 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          scalars are left where they are, because folding those is exactly what the model asks \
          for.",
         "The library keeps a row in one of two representations and converts a row to the compact \
-         one when it scrolls. The compact one stores the row as a single string and works out \
-         where its cells are by clustering that string again, which would undo the cut, so a cell \
-         of the row is read back before every write to keep a live row in the representation that \
-         remembers. A row that has scrolled is the patch below.",
+         one when it scrolls. The compact one stores the row as a single string, and the pinned \
+         revision has it record where the cells are whenever clustering that string again would \
+         not give them back, so a row keeps the cells it was given whichever representation it is \
+         in and whether it is on screen or in the scrollback.",
         "Raster graphics are disabled in configuration and no image sequence is ever forwarded, so \
          the library's sixel, iTerm2 and Kitty image paths stay unreachable.",
         "The library is built with a writer that accepts no bytes. Every reply comes from the \
@@ -195,40 +203,34 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          blanks the last column and wraps the character. A projected renderer clips or safely \
          replaces the overhanging cell.",
     ],
-    required_patch: &[
-        RequiredPatch {
+    qualified_additions: &[
+        QualifiedAddition {
             state: "TerminalState::pending_wrap()",
-            reason: "section 8 lists pending wrap among the state a snapshot restores",
-            interim: "the snapshot carries None and a reconnecting client re-derives it from the \
-                      next character it places",
+            reason: "section 8 lists pending wrap among the state a snapshot restores, and the \
+                     same cursor coordinates place the next character in different cells with and \
+                     without it",
         },
-        RequiredPatch {
-            state: "TerminalState::saved_cursor() as a shared reference, with the saved rendition \
-                    and character sets among its public fields",
+        QualifiedAddition {
+            state: "TerminalState::saved_cursor(), a shared reference to either buffer's saved \
+                    cursor, with the saved rendition and character sets among its public fields",
             reason: "section 8 lists saved cursors among the state a snapshot restores, and a \
-                     saved cursor that carries only a position restores the wrong colours",
-            interim: "the snapshot carries None; a restored session behaves as though nothing was \
-                      saved until the application saves again",
+                     saved cursor that carries only a position restores the wrong colours from the \
+                     wrong origin",
         },
-        RequiredPatch {
-            state: "Line::compress_for_scrollback() keeping the cells it was given, rather than \
-                    working out where they are by clustering the row's text again",
-            reason: "the pinned width model gives a cell to every scalar that has a width of its \
-                     own, and the compact row representation joins adjacent scalars that the \
-                     library's own clustering would join, which also drops the columns they held",
-            interim: "a row keeps its cells while it is on screen, because a cell of the row is \
-                      read back before every write, which keeps the row out of that representation. \
-                      A row that has scrolled loses the columns reserved for joined scalars: its \
-                      text is all still there and the row is narrower than it was. Rows without \
-                      emoji sequences or Hangul jamo are unaffected, which is nearly all of them",
-        },
-        RequiredPatch {
+        QualifiedAddition {
             state: "TerminalState::inactive_screen(), the buffer that is not active",
             reason: "section 8 requires a restoration sequence to reproduce both buffer states, \
-                     and the accessor the revision exposes returns whichever buffer is active",
-            interim: "the snapshot carries the active buffer and None for the other; a client that \
-                      reconnects during a full-screen application has no primary-buffer content \
-                      until that application exits and the shell redraws",
+                     and the accessor the upstream revision exposes returns whichever buffer is \
+                     active",
+        },
+        QualifiedAddition {
+            state: "Line::compress_for_scrollback() keeping the cells, attributes and wrap \
+                    markers it was given",
+            reason: "the pinned width model gives a cell to every scalar that has a width of its \
+                     own, and the compact row representation used to work out where the cells were \
+                     by clustering the row's text again, which joined adjacent scalars and dropped \
+                     the columns they held",
         },
     ],
+    required_patch: &[],
 };

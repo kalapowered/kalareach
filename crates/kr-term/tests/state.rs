@@ -6,7 +6,7 @@
 use kr_term::budget::{BudgetLimits, GridSize, MAX_CELLS, MAX_COLS, MAX_ROWS, SessionBudget};
 use kr_term::engine::{Engine, EngineConfig};
 use kr_term::error::{ProbeFailure, TermError};
-use kr_term::grid::CanonicalGrid;
+use kr_term::grid::{CanonicalGrid, Colour};
 use kr_term::palette::{PaletteSource, Rgb};
 use kr_term::probe::{
     InputContext, NoProbeProfile, PROBE_SET, ProbeItem, ProbeProgress, ProbeSession,
@@ -24,6 +24,12 @@ fn viewport(engine: &Engine) -> Viewport {
         left_col: 0,
         cols: engine.grid().size().cols,
     }
+}
+
+fn text_of(rows: &[kr_term::grid::GridRow]) -> Vec<String> {
+    rows.iter()
+        .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+        .collect()
 }
 
 fn engine() -> Engine {
@@ -140,6 +146,162 @@ fn a_snapshot_carries_the_state_a_reconnection_needs() {
     assert_eq!(
         snapshot.projection_generation,
         engine.projection_generation()
+    );
+}
+
+/// The pending wrap is part of the snapshot, because the same coordinates place the next
+/// character in different cells with and without it.
+#[test]
+fn a_snapshot_carries_the_pending_wrap() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(4, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let view = viewport(&engine);
+
+    engine.feed(b"abc", 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
+    assert_eq!((snapshot.cursor.col, snapshot.cursor.row), (3, 0));
+    assert!(!snapshot.cursor.pending_wrap);
+
+    // The final column is filled and the cursor stays on it.
+    engine.feed(b"d", 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
+    assert_eq!((snapshot.cursor.col, snapshot.cursor.row), (3, 0));
+    assert!(snapshot.cursor.pending_wrap);
+
+    // Moving the cursor cancels it, at the same coordinates.
+    engine.feed(b"\x1b[1;4H", 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
+    assert_eq!((snapshot.cursor.col, snapshot.cursor.row), (3, 0));
+    assert!(!snapshot.cursor.pending_wrap);
+}
+
+/// Each buffer's saved cursor is carried, with the rendition and the character sets that were
+/// saved with it. A restoration that carried only positions would put an application back in the
+/// wrong colours.
+#[test]
+fn a_snapshot_carries_both_saved_cursors() {
+    let mut engine = engine();
+    let view = viewport(&engine);
+    let (snapshot, _) = engine.snapshot(view, 0);
+    assert_eq!(snapshot.saved_cursors, [None, None]);
+
+    // Bold red with line drawing designated as G1, saved on the primary buffer.
+    engine.feed(b"\x1b)0\x1b[1;31m\x1b[2;4H\x1b7", 0);
+    // Green on the alternate buffer with ASCII back in G1, saved there.
+    engine.feed(b"\x1b[?1047h\x1b)B\x1b[42m\x1b[3;2H\x1b7", 0);
+
+    let (snapshot, _) = engine.snapshot(view, 0);
+    let primary = snapshot.saved_cursors[0]
+        .as_ref()
+        .expect("the primary buffer saved a cursor");
+    assert_eq!(primary.buffer, ActiveBuffer::Primary);
+    assert_eq!((primary.col, primary.row), (3, 1));
+    assert!(primary.rendition.bold);
+    assert_eq!(primary.rendition.foreground, Colour::Indexed(1));
+    assert_eq!(primary.charsets.g1, "DecLineDrawing");
+    assert!(!primary.charsets.shift_out);
+
+    let alternate = snapshot.saved_cursors[1]
+        .as_ref()
+        .expect("the alternate buffer saved a cursor");
+    assert_eq!(alternate.buffer, ActiveBuffer::Alternate);
+    assert_eq!((alternate.col, alternate.row), (1, 2));
+    assert!(!alternate.rendition.bold);
+    assert_eq!(alternate.rendition.background, Colour::Indexed(2));
+    assert_eq!(alternate.charsets.g1, "Ascii");
+
+    // Both reach a reconnecting client.
+    let saved: Vec<_> = restoration_operations(&snapshot)
+        .into_iter()
+        .filter_map(|op| match op {
+            RestoreOp::SetSavedCursor { cursor } => Some(cursor.buffer),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        saved,
+        vec![ActiveBuffer::Primary, ActiveBuffer::Alternate],
+        "a restoration puts back the saved cursor of each buffer"
+    );
+}
+
+/// A snapshot taken while a full-screen application is running carries what the shell left behind,
+/// so leaving the application puts the session back where it was.
+#[test]
+fn a_snapshot_carries_the_buffer_that_is_not_showing() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(12, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let view = viewport(&engine);
+    engine.feed(b"shell one\r\nshell two", 0);
+
+    // Before the switch the buffer that is not showing is the empty alternate one.
+    let (snapshot, _) = engine.snapshot(view, 0);
+    assert_eq!(snapshot.active_buffer, ActiveBuffer::Primary);
+    assert_eq!(snapshot.inactive_rows.len(), 3);
+    assert!(
+        snapshot.inactive_rows.iter().all(|row| row.runs.is_empty()),
+        "the alternate buffer has nothing on it yet"
+    );
+
+    engine.feed(b"\x1b[?1049h\x1b[2J\x1b[Hediting", 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
+    assert_eq!(snapshot.active_buffer, ActiveBuffer::Alternate);
+    assert_eq!(text_of(&snapshot.rows), ["editing", "", ""]);
+    assert_eq!(
+        text_of(&snapshot.inactive_rows),
+        ["shell one", "shell two", ""]
+    );
+
+    // The buffer that is not showing is painted before the one that is.
+    let operations = restoration_operations(&snapshot);
+    let first_inactive = operations
+        .iter()
+        .position(|op| matches!(op, RestoreOp::PaintInactiveRow { .. }))
+        .expect("the inactive buffer is painted");
+    let first_active = operations
+        .iter()
+        .position(|op| matches!(op, RestoreOp::PaintRow { .. }))
+        .expect("the active buffer is painted");
+    assert!(first_inactive < first_active);
+}
+
+/// A row that scrolls keeps the columns the pinned width model gave it, including for scalars the
+/// grid library's own clustering would fold into one cell.
+#[test]
+fn a_scrolled_row_keeps_its_columns() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(8, 2),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let view = viewport(&engine);
+    // A woman-technologist emoji sequence and a Hangul syllable written as jamo: six columns under
+    // the pinned model, two under the library's own clustering.
+    engine.feed(
+        "\u{1f469}\u{200d}\u{1f4bb}\u{1100}\u{1161}\r\nb\r\nc".as_bytes(),
+        0,
+    );
+    let (snapshot, _) = engine.snapshot(view, 0);
+
+    let history = engine.grid().history_rows(snapshot.oldest_retained_row, 8);
+    let row = history.first().expect("the first row has scrolled off");
+    assert_eq!(
+        row.runs.iter().map(|run| run.cells).sum::<u32>(),
+        6,
+        "a scrolled row keeps the columns it was given"
+    );
+    assert_eq!(
+        row.runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>(),
+        "\u{1f469}\u{200d}\u{1f4bb}\u{1100}\u{1161}"
     );
 }
 

@@ -37,6 +37,7 @@ use crate::budget::{CELL_OVERHEAD_BYTES, GridSize, SessionBudget};
 use crate::error::Result;
 use crate::event::{Event, EventKind};
 use crate::palette::Rgb;
+use crate::snapshot::{ActiveBuffer, Charsets, SavedCursor};
 use crate::unicode::UnicodeModel;
 
 /// A writer that accepts bytes and delivers none, counting what it was given.
@@ -550,13 +551,7 @@ impl CanonicalGrid {
     /// clusters what it is given by its own rules, which would split some of them off and drop
     /// them; and printing them separately is exactly what happens when they arrive in a later read,
     /// so doing it the same way here is what makes the two answers identical.
-    ///
-    /// The row is read first because the library has two row representations, and the compact one
-    /// stores a row as one string and works out where its cells are by clustering that string
-    /// again. Reading a cell converts the row to the representation that remembers.
     fn print_cell(&mut self, base: &str, marks: &str) {
-        let (_, row) = self.cursor_cell();
-        let _ = self.terminal.screen_mut().get_cell(0, row);
         let before = self.print_origin();
         self.terminal
             .perform_actions(vec![Action::PrintString(base.to_owned())]);
@@ -910,15 +905,59 @@ impl CanonicalGrid {
     /// so the reducer is the answer rather than a tracker watching sequences.
     #[must_use]
     pub fn cursor_style(&self) -> u32 {
-        match self.terminal.cursor_pos().shape {
-            CursorShape::BlinkingBlock => 1,
-            CursorShape::SteadyBlock => 2,
-            CursorShape::BlinkingUnderline => 3,
-            CursorShape::SteadyUnderline => 4,
-            CursorShape::BlinkingBar => 5,
-            CursorShape::SteadyBar => 6,
-            CursorShape::Default => 0,
-        }
+        style_of(self.terminal.cursor_pos().shape)
+    }
+
+    /// Whether the next printable character wraps before it is placed.
+    ///
+    /// A cursor in the last column of a full row and a cursor in the last column of a row that
+    /// still has space are the same coordinates, and the next character goes to a different place
+    /// in each, so a snapshot that left this out would put it in the wrong cell.
+    #[must_use]
+    pub fn pending_wrap(&self) -> bool {
+        self.terminal.pending_wrap()
+    }
+
+    /// The cursor one buffer has saved, if it has saved one.
+    ///
+    /// Each buffer keeps its own, and a save carries the rendition, the character sets, origin
+    /// mode and the cursor shape with it. A restore that put back only a position would leave an
+    /// application drawing in the wrong colours from the wrong origin.
+    #[must_use]
+    pub fn saved_cursor(&self, alternate: bool) -> Option<SavedCursor> {
+        let saved = self.terminal.saved_cursor(alternate)?;
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "a saved row index is bounded by the validated row count"
+        )]
+        let row = saved.position.y.max(0) as u32;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a saved column index is bounded by the validated column count"
+        )]
+        let col = saved.position.x as u32;
+        Some(SavedCursor {
+            buffer: if alternate {
+                ActiveBuffer::Alternate
+            } else {
+                ActiveBuffer::Primary
+            },
+            col,
+            row,
+            pending_wrap: saved.wrap_next,
+            rendition: rendition_of(&saved.pen),
+            charsets: Charsets {
+                g0: format!("{:?}", saved.g0_charset),
+                g1: format!("{:?}", saved.g1_charset),
+                // A save does not carry the locking shift: a restore leaves G0 selected, so a
+                // restored session that recorded one would shift a buffer that never was shifted.
+                shift_out: false,
+            },
+            origin_mode: saved.dec_origin_mode,
+            style: style_of(saved.position.shape),
+            hyperlink: saved.pen.hyperlink().map(|link| link.uri().to_owned()),
+        })
     }
 
     /// Whether autowrap is on.
@@ -1053,7 +1092,21 @@ impl CanonicalGrid {
     /// The visible rows of the active buffer.
     #[must_use]
     pub fn visible_rows(&self) -> Vec<GridRow> {
-        let screen = self.terminal.screen();
+        self.rows_of(self.terminal.screen())
+    }
+
+    /// The visible rows of the buffer that is not active.
+    ///
+    /// Section 8 asks a restoration to reproduce both buffers. A client that reconnects while a
+    /// full-screen application is running gets the application's screen from [`Self::visible_rows`]
+    /// and what the shell left behind from here, so leaving the application puts the session back
+    /// where it was instead of on a blank screen.
+    #[must_use]
+    pub fn inactive_rows(&self) -> Vec<GridRow> {
+        self.rows_of(self.terminal.inactive_screen())
+    }
+
+    fn rows_of(&self, screen: &wezterm_term::screen::Screen) -> Vec<GridRow> {
         let rows = i64::from(self.size.rows);
         let lines = screen.lines_in_phys_range(screen.phys_range(&(0..rows)));
         lines
@@ -1259,6 +1312,19 @@ fn colour_of(attribute: wezterm_term::color::ColorAttribute) -> Colour {
             let (r, g, b, _) = tuple.to_srgb_u8();
             Colour::Direct(Rgb::new(r, g, b))
         }
+    }
+}
+
+/// The DECSCUSR style number for a cursor shape.
+fn style_of(shape: CursorShape) -> u32 {
+    match shape {
+        CursorShape::BlinkingBlock => 1,
+        CursorShape::SteadyBlock => 2,
+        CursorShape::BlinkingUnderline => 3,
+        CursorShape::SteadyUnderline => 4,
+        CursorShape::BlinkingBar => 5,
+        CursorShape::SteadyBar => 6,
+        CursorShape::Default => 0,
     }
 }
 

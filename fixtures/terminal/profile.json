@@ -36,36 +36,35 @@
       "The width model is configuration, not a fork: generation 9 with narrow ambiguous characters is exactly the pinned kr-vt/1 model.",
       "In-band resize and DECCOLM never reach the library, because the policy layer classifies them before the reducer sees anything. The library's own support for them is therefore not part of the profile.",
       "The library's cluster reducer runs on ordinary text and is more modern than the pinned width model: it folds emoji sequences, Hangul jamo and more into one cell where this model gives each scalar with a width of its own a cell of its own. The qualified change is in what the library is given rather than in the library: a run that is not plain ASCII is cut at every cell, so the reducer never sees two of them in one call. Zero-width scalars are left where they are, because folding those is exactly what the model asks for.",
-      "The library keeps a row in one of two representations and converts a row to the compact one when it scrolls. The compact one stores the row as a single string and works out where its cells are by clustering that string again, which would undo the cut, so a cell of the row is read back before every write to keep a live row in the representation that remembers. A row that has scrolled is the patch below.",
+      "The library keeps a row in one of two representations and converts a row to the compact one when it scrolls. The compact one stores the row as a single string, and the pinned revision has it record where the cells are whenever clustering that string again would not give them back, so a row keeps the cells it was given whichever representation it is in and whether it is on screen or in the scrollback.",
       "Raster graphics are disabled in configuration and no image sequence is ever forwarded, so the library's sixel, iTerm2 and Kitty image paths stay unreachable.",
       "The library is built with a writer that accepts no bytes. Every reply comes from the query broker, and the fixtures fail if the library ever writes one.",
       "A sequence the library marks unspecified, at any nesting, is not applied and not forwarded. The mapping is therefore checked by what the library does with it rather than by whether it parsed.",
       "The library clusters the text of one call to its action interface, so the engine holds the final cell of a text run until it knows what follows, and draws that cell again with the marks on it when a combining mark arrives after the screen has settled. Without both, the same bytes would produce different screens depending on where a read happened to split them, or on whether the stream went quiet in the middle of a cell."
     ],
-    "repository": "https://github.com/wezterm/wezterm",
-    "required_patch": [
+    "qualified_additions": [
       {
-        "interim": "the snapshot carries None and a reconnecting client re-derives it from the next character it places",
-        "reason": "section 8 lists pending wrap among the state a snapshot restores",
+        "reason": "section 8 lists pending wrap among the state a snapshot restores, and the same cursor coordinates place the next character in different cells with and without it",
         "state": "TerminalState::pending_wrap()"
       },
       {
-        "interim": "the snapshot carries None; a restored session behaves as though nothing was saved until the application saves again",
-        "reason": "section 8 lists saved cursors among the state a snapshot restores, and a saved cursor that carries only a position restores the wrong colours",
-        "state": "TerminalState::saved_cursor() as a shared reference, with the saved rendition and character sets among its public fields"
+        "reason": "section 8 lists saved cursors among the state a snapshot restores, and a saved cursor that carries only a position restores the wrong colours from the wrong origin",
+        "state": "TerminalState::saved_cursor(), a shared reference to either buffer's saved cursor, with the saved rendition and character sets among its public fields"
       },
       {
-        "interim": "a row keeps its cells while it is on screen, because a cell of the row is read back before every write, which keeps the row out of that representation. A row that has scrolled loses the columns reserved for joined scalars: its text is all still there and the row is narrower than it was. Rows without emoji sequences or Hangul jamo are unaffected, which is nearly all of them",
-        "reason": "the pinned width model gives a cell to every scalar that has a width of its own, and the compact row representation joins adjacent scalars that the library's own clustering would join, which also drops the columns they held",
-        "state": "Line::compress_for_scrollback() keeping the cells it was given, rather than working out where they are by clustering the row's text again"
-      },
-      {
-        "interim": "the snapshot carries the active buffer and None for the other; a client that reconnects during a full-screen application has no primary-buffer content until that application exits and the shell redraws",
-        "reason": "section 8 requires a restoration sequence to reproduce both buffer states, and the accessor the revision exposes returns whichever buffer is active",
+        "reason": "section 8 requires a restoration sequence to reproduce both buffer states, and the accessor the upstream revision exposes returns whichever buffer is active",
         "state": "TerminalState::inactive_screen(), the buffer that is not active"
+      },
+      {
+        "reason": "the pinned width model gives a cell to every scalar that has a width of its own, and the compact row representation used to work out where the cells were by clustering the row's text again, which joined adjacent scalars and dropped the columns they held",
+        "state": "Line::compress_for_scrollback() keeping the cells, attributes and wrap markers it was given"
       }
     ],
-    "revision": "699fd77b44641c43476c945054cfae6518dbd632"
+    "repository": "https://github.com/kalapowered/wezterm",
+    "required_patch": [],
+    "revision": "9a9015119497fd5803c35a10ea4ffc503f2a7dfb",
+    "upstream": "https://github.com/wezterm/wezterm",
+    "upstream_revision": "699fd77b44641c43476c945054cfae6518dbd632"
   },
   "identity": "KalaReach(kr-vt/1)",
   "limits": {

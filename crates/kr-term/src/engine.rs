@@ -1233,11 +1233,9 @@ impl Engine {
                 row,
                 visible: self.modes.is_set(ModeKind::Dec, 25),
                 style: self.grid.cursor_style(),
-                // Not observable from the pinned grid library; see `crate::unicode::LIBRARY`.
-                pending_wrap: None,
+                pending_wrap: self.grid.pending_wrap(),
             },
-            // Not observable from the pinned grid library; see `crate::unicode::LIBRARY`.
-            saved_cursors: [None, None],
+            saved_cursors: self.saved_cursors(),
             margins: Margins {
                 top,
                 bottom,
@@ -1263,12 +1261,16 @@ impl Engine {
             hyperlink: self.grid.pen_hyperlink(),
             palette: self.palette_snapshot(),
             rows,
-            // Not reachable on the pinned grid library; see `crate::unicode::LIBRARY`.
-            inactive_rows: None,
+            inactive_rows: self.grid.inactive_rows(),
             oldest_retained_row: oldest,
             evicted: oldest > 0,
         };
         (snapshot, settled)
+    }
+
+    /// The cursor each buffer has saved, primary first.
+    fn saved_cursors(&self) -> [Option<crate::snapshot::SavedCursor>; 2] {
+        [self.grid.saved_cursor(false), self.grid.saved_cursor(true)]
     }
 
     fn active_buffer(&self) -> ActiveBuffer {
@@ -1394,7 +1396,7 @@ impl Engine {
                 row,
                 visible: self.modes.is_set(ModeKind::Dec, 25),
                 style: self.grid.cursor_style(),
-                pending_wrap: None,
+                pending_wrap: self.grid.pending_wrap(),
             },
             modes: self.changed_modes(base.revisions.any),
             margins: (self.presentation_revision > base.revisions.presentation).then_some(
@@ -1430,7 +1432,8 @@ impl Engine {
                 .then(|| self.grid.size()),
             title_stack: (self.title_revision > base.revisions.title)
                 .then(|| self.titles.entries().to_vec()),
-            saved_cursors: (self.saved_revision > base.revisions.saved).then_some([None, None]),
+            saved_cursors: (self.saved_revision > base.revisions.saved)
+                .then(|| self.saved_cursors()),
             hyperlink: (self.presentation_revision > base.revisions.presentation)
                 .then(|| self.grid.pen_hyperlink()),
         })
