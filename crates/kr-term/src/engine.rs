@@ -798,8 +798,14 @@ impl Engine {
             return None;
         }
         // What the table will cost for this entry, worked out the way the measurement works it
-        // out, so admission and measurement cannot disagree about the same entry.
-        let cost = link_table_entry_bytes(&uri);
+        // out, so admission and measurement cannot disagree about the same entry. The first target
+        // pays for the node it opens, which the measurement charges once the set is not empty.
+        let cost = link_table_entry_bytes(&uri)
+            + if self.links.is_empty() {
+                TABLE_NODE_BYTES
+            } else {
+                0
+            };
         if self.links.len() >= self.budget.limits().unique_links || !self.budget.metadata_fits(cost)
         {
             // The link is refused after all, so what was reserved for it is given back rather than
@@ -837,8 +843,15 @@ impl Engine {
                 return;
             }
         };
-        let cost = (event.bytes.len() as u64)
-            .saturating_add((cells as u64).saturating_mul(crate::grid::CELL_ATTRIBUTE_BYTES));
+        // Twice the bytes, because a row grows its text by appending and the measurement charges
+        // what it is holding. Twice the scalars, because a scalar can take two columns and each
+        // column a cell covers carries an allocation of its own.
+        let cost = 2u64
+            .saturating_mul(event.bytes.len() as u64)
+            .saturating_add(
+                2u64.saturating_mul(cells as u64)
+                    .saturating_mul(crate::grid::CELL_ATTRIBUTE_BYTES),
+            );
         self.budget.add_screen_content(
             self.grid.alternate_active(),
             cost,

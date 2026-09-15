@@ -575,7 +575,9 @@ retained rows converge back under the bound over the following rows rather than 
 Measuring every retained row means walking the scrollback, so doing it on every read would cost more
 than the bound saves. A full measurement happens when the rows have grown, when something asks, and
 every 64 reads otherwise; between two of them the charge is what each applied event reserved, plus
-what the rows that scrolled off cost, which is never less than what was allocated.
+what the rows that scrolled off cost. Eviction lowers the row count by a figure worked out from the
+average cost of a row, and rows are not all the same size, so it converges over a few passes rather
+than landing under the bound in one step.
 
 What the rows cost includes the hyperlinks they hold. Every cell inside a link holds a reference to
 the whole link, and the object behind that reference costs far more than its target's characters, so
@@ -589,33 +591,42 @@ Growth is charged as it happens rather than noticed at the next measurement, bec
 carry a session's worth of links or fill a screen, and a bound that is only checked afterwards is
 not a bound.
 
-What is refused before it is allocated: a geometry that cannot fit, and the metadata an application
-can grow without limit. A link's cost is reserved before it is applied, and one that will not fit is
-refused;
-refusing one ends the link that was open, because the text that belonged to the refused link must
-not end up inside the previous one. A link with parameters and no target is refused the same way:
+What is refused before it is allocated: a geometry that cannot fit, and hyperlinks. A link's cost is
+reserved before it is applied, and one that will not fit is refused; refusing one ends the link that
+was open, because the text that belonged to the refused link must not end up inside the previous
+one. A link with parameters and no target is refused the same way:
 that is a close, and keeping its parameters would let an application hold a session's worth of
 identifiers in links nothing can follow. A cell that reaches its content bound drops the marks past
 it. The alert channel holds a bounded number of alerts, each cut to a bounded length.
 
 What the screens hold is charged rather than refused. Printing is charged as it is applied, held at
 what the buffer's cells can hold, and an erase or fill made with a pen that needs an allocation of
-its own is charged what those allocations can come to, so the running figure is never below what
-was allocated. Rows that scroll off the screen are charged where they join the historical cache,
-counted by where the history ends rather than by how many rows it holds, and the cache is brought
-back under its bound there rather than at the next measurement, because two rows can carry more
+its own is charged what those allocations can come to. Rows that scroll off the screen are charged
+where they join the historical cache, counted by where the history ends rather than by how many rows
+it holds, so a row that arrives while the library drops an older one is still counted, and the cache
+is brought back towards its bound there rather than at the next measurement: two rows can carry more
 than the whole of it.
 
-A reservation covers what the measurement will find. Both sides work a link's parameter table out
-from an entry count through the same rounding, and a string is reserved at twice what it holds,
-which is the most a doubling allocator keeps for it.
+Where a reservation and a measurement look at the same thing, the reservation is the larger. Both
+work a link's parameter table out through the same rounding, from the separators the parameter field
+carries on one side and the room the table ended up with on the other; a string is reserved at twice
+what it holds, which is the most a doubling allocator keeps for it; and a cell is reserved for every
+column it can cover.
 
-What a measurement counts is what the grid is holding, not a figure standing in for it: a link's
-parameter table as it is allocated rather than as many entries as it has, each key and value at its
-capacity, and the allocation a cell keeps for the colours, underline colour, link handle and image
-list that the packed form on the cell cannot hold, counted for every column the cell covers.
-Counting only characters would report a screen of coloured, linked cells as costing what a screen of
-plain ones costs.
+What a measurement counts is what the grid is holding rather than a figure standing in for it: a
+link's parameter table as it is allocated rather than as many entries as it has, each key and value
+at its capacity, the first node the link table opens, and the allocation a cell keeps for the
+colours, underline colour, link handle and image list that the packed form on the cell cannot hold,
+counted for every column the cell covers. Counting only characters would report a screen of
+coloured, linked cells as costing what a screen of plain ones costs.
+
+The charges are conservative where they look, and they do not look everywhere yet. A cell holding
+eight bytes or more keeps a header of its own that nothing counts; an empty row and the array the
+rows sit in are not counted; a title that is set or pushed is applied before anything reserves for
+it, and the stack keeps the room it grew to after entries are popped; a resize moves rows between a
+screen and the history without moving their charges; and a link held only by the live pen or by a
+saved cursor is not on any row, so nothing measures it. Each of those is a figure lower than the
+truth rather than an unbounded one.
 
 One thing section 8 asks for is not here yet: it asks for rejection before a state allocation that
 cannot fit, and printing into a screen that has already been admitted is charged and reported

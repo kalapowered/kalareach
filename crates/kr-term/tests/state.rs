@@ -1082,6 +1082,25 @@ fn a_link_costs_no_more_than_what_was_reserved_for_it() {
     );
 }
 
+/// A wide cell covers two columns and the grid keeps an allocation for each of them, so a
+/// reservation that counted scalars would be below what the measurement finds.
+#[test]
+fn a_wide_cell_is_reserved_for_the_columns_it_covers() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(8, 2),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    engine.feed("\x1b[38;2;10;20;30m\u{754c}\u{754c}".as_bytes(), 0);
+    engine.quiesce(0);
+    assert!(
+        engine.budget().usage().screen_content[0] >= engine.grid().screen_content_bytes(),
+        "reserved {} against a measurement of {}",
+        engine.budget().usage().screen_content[0],
+        engine.grid().screen_content_bytes()
+    );
+}
+
 /// A cell that keeps an allocation of its own for its attributes costs more than one that does
 /// not, so a screen of coloured cells is not charged as a screen of plain ones.
 #[test]
