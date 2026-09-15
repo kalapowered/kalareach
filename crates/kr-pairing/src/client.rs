@@ -105,7 +105,7 @@ pub fn charge_attempt(
     let now = clock.monotonic_ms();
     let boot = clock.boot_identity();
     let wall = clock.wall_clock_ms();
-    store.expire(wall)?;
+    store.expire(now, boot, wall)?;
 
     let key = budget_key(store, origin, code)?;
     // The decision runs inside the store's lock, so this is how its outcome gets out. The store
@@ -133,7 +133,7 @@ fn next_record(
     wall: u64,
 ) -> (ClientAttemptRecord, bool) {
     let Some(record) = current else {
-        return (charge(fresh(now, boot, wall), wall), true);
+        return (charge(fresh(now, boot, wall), now, wall), true);
     };
     if record.exhausted {
         // Spent. Another advertised expiry does not reset the counter, and neither does anything
@@ -146,9 +146,9 @@ fn next_record(
         || now.saturating_sub(record.first_entry_monotonic_ms) >= INVITATION_LIFETIME_MS
         || record.attempts >= MAX_CLIENT_ATTEMPTS
     {
-        return (tombstone(record, wall), false);
+        return (tombstone(record, now, wall), false);
     }
-    (charge(record, wall), true)
+    (charge(record, now, wall), true)
 }
 
 /// Returns the record a first entry creates.
@@ -157,32 +157,36 @@ const fn fresh(now: u64, boot: BootIdentity, wall: u64) -> ClientAttemptRecord {
         attempts: 0,
         first_entry_monotonic_ms: now,
         boot_identity: boot,
+        retain_until_monotonic_ms: now,
         retain_until_wall_ms: wall,
         exhausted: false,
     }
 }
 
 /// Adds one attempt to a record and extends its retention.
-fn charge(record: ClientAttemptRecord, wall: u64) -> ClientAttemptRecord {
+fn charge(record: ClientAttemptRecord, now: u64, wall: u64) -> ClientAttemptRecord {
     let attempts = record.attempts.saturating_add(1);
+    let retention = INVITATION_LIFETIME_MS.saturating_add(CLIENT_TOMBSTONE_MS);
     ClientAttemptRecord {
         attempts,
         exhausted: attempts >= MAX_CLIENT_ATTEMPTS,
-        // A spent entry outlives its window by the tombstone period.
-        retain_until_wall_ms: wall
-            .saturating_add(INVITATION_LIFETIME_MS)
-            .saturating_add(CLIENT_TOMBSTONE_MS),
+        // A spent entry outlives its window by the tombstone period. Both clocks are written: the
+        // monotonic one governs while the machine is up, the wall one after a reboot.
+        retain_until_monotonic_ms: now.saturating_add(retention),
+        retain_until_wall_ms: wall.saturating_add(retention),
         ..record
     }
 }
 
 /// Marks a record spent and keeps it for the tombstone period.
 ///
-/// The retention is on the wall clock on purpose: a monotonic deadline from the previous boot
-/// means nothing after one, and the tombstone has to survive exactly that.
-fn tombstone(record: ClientAttemptRecord, wall: u64) -> ClientAttemptRecord {
+/// Both clocks again, and for the same reason: a wall clock that jumps forward must not delete a
+/// tombstone while the machine that wrote it is still up, and a monotonic deadline from the
+/// previous boot means nothing after one.
+fn tombstone(record: ClientAttemptRecord, now: u64, wall: u64) -> ClientAttemptRecord {
     ClientAttemptRecord {
         exhausted: true,
+        retain_until_monotonic_ms: now.saturating_add(CLIENT_TOMBSTONE_MS),
         retain_until_wall_ms: wall.saturating_add(CLIENT_TOMBSTONE_MS),
         ..record
     }
@@ -739,6 +743,23 @@ mod tests {
             charge(&store, &clock, &code()),
             Err(PairingError::ClientAttemptsExhausted)
         ));
+    }
+
+    #[test]
+    fn a_wall_clock_that_jumps_forward_does_not_restore_attempts() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let clock = TestClock::new();
+        for _ in 0..MAX_CLIENT_ATTEMPTS {
+            charge(&store, &clock, &code()).expect("an attempt");
+        }
+        // A year on the wall clock, no time at all on the monotonic one. Within this boot the
+        // monotonic deadline governs, so the tombstone is not swept and the code stays spent.
+        clock.skew_wall_clock(365 * 24 * 60 * 60 * 1000);
+        assert!(matches!(
+            charge(&store, &clock, &code()),
+            Err(PairingError::ClientAttemptsExhausted)
+        ));
+        assert_eq!(store.len(), 1, "the tombstone is still there");
     }
 
     #[test]

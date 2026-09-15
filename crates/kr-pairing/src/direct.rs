@@ -19,7 +19,8 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::secret::Secret;
 use kr_crypto::sign::{self, SigningTranscript};
 use kr_crypto::{constant_time_eq, kdf};
-use kr_protocol::ids::{AttemptId, DeviceId, GrantId, InvitationId};
+use kr_protocol::grant::Grant;
+use kr_protocol::ids::{AttemptId, InvitationId};
 use kr_protocol::pairing::{
     ClientBundle, DIRECT_DOMAIN, DevicePublicKeys, DirectChallenge, DirectQrPayload,
     DirectRedeemProof, DirectTranscript, INVITATION_LIFETIME_MS, PairStatus, PairingConsumedReason,
@@ -32,10 +33,11 @@ use kr_protocol::scalars::{
 use crate::bundles;
 use crate::confirm::ConfirmationLedger;
 use crate::error::{PairingError, Result};
-use crate::host::{HostIdentity, OwnerApproval, OwnerContext, confirm_action_digest};
+use crate::grants::{self, GrantIdentities, GrantKind};
+use crate::host::{HostIdentity, OwnerApproval, OwnerContext};
 use crate::platform::{
     InvitationRecord, InvitationState, InvitationStore, LivePeer, PairingClock, PairingCommitment,
-    require_completed_handshake,
+    TransitionOutcome, require_completed_handshake,
 };
 
 /// The candidate a direct redemption locked.
@@ -56,6 +58,35 @@ pub struct DirectCandidate {
     pub client_bundle: ClientBundle,
 }
 
+/// The domain a direct device confirmation's action digest is computed under.
+///
+/// The short-code route has its own, so a confirmation obtained for one entry mode cannot approve
+/// a candidate that arrived by the other.
+pub const CONFIRM_DEVICE_DOMAIN: &str = "kr-pair/confirm-device/direct/1";
+
+/// Exactly what the owner is shown for a direct redemption, and names back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApprovedRedemption {
+    /// The digest of the transcript `D`.
+    pub transcript_digest: Digest256,
+    /// The digest of the candidate's complete purpose-key bundle.
+    pub client_key_digest: Digest256,
+}
+
+impl ApprovedRedemption {
+    /// Returns the digest an owner's device-confirmation challenge must name.
+    #[must_use]
+    pub fn action_digest(&self) -> Digest256 {
+        Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(
+            &kr_cbor::CanonicalValue::Array(vec![
+                kr_cbor::CanonicalValue::text(CONFIRM_DEVICE_DOMAIN),
+                kr_cbor::CanonicalValue::bytes(self.transcript_digest.as_bytes().as_slice()),
+                kr_cbor::CanonicalValue::bytes(self.client_key_digest.as_bytes().as_slice()),
+            ]),
+        )))
+    }
+}
+
 /// The host's side of one direct invitation.
 pub struct DirectInvitation<S: InvitationStore, C: PairingClock> {
     store: S,
@@ -64,13 +95,24 @@ pub struct DirectInvitation<S: InvitationStore, C: PairingClock> {
     secret: Secret<32>,
     host: HostIdentity,
     proposed_grant: ProposedGrant,
+    grant_kind: GrantKind,
     issuing_owner: OwnerContext,
     expires_at_ms: TimestampMs,
     /// The outstanding challenge. A challenge is single use and expires with the invitation.
-    challenge: Option<Nonce256>,
+    challenge: Option<OutstandingChallenge>,
     candidate: Option<DirectCandidate>,
     /// Set when a durable write failed. The invitation serves nobody afterwards.
     fenced: bool,
+}
+
+/// One challenge the host has issued, and the connection it issued it to.
+///
+/// The connection is part of it because a challenge is an offer to one candidate: answering it
+/// from somewhere else is another device using a challenge it was not given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutstandingChallenge {
+    host_nonce: Nonce256,
+    client_endpoint: EndpointKey,
 }
 
 impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
@@ -78,22 +120,26 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     ///
     /// Issuing a persistent pairing invitation needs a fresh owner confirmation bound to the
     /// rights being proposed, the same as the short-code route: the QR carries the full secret, so
-    /// producing one is handing out the invitation itself.
+    /// producing one is handing out the invitation itself. The proposal is checked against the
+    /// rules for its kind before anything is written.
     ///
     /// # Errors
     ///
     /// Returns [`PairingError::OwnerConfirmationRequired`] without a valid single-use
-    /// confirmation, [`PairingError::Store`] when the record cannot be persisted, and a crypto
-    /// error when libsodium is unavailable.
+    /// confirmation, [`PairingError::GrantNotPermitted`] for a proposal its kind does not allow,
+    /// [`PairingError::Store`] when the record cannot be persisted, and a crypto error when
+    /// libsodium is unavailable.
     pub fn issue(
         store: S,
         clock: C,
         host: HostIdentity,
         proposed_grant: ProposedGrant,
+        grant_kind: GrantKind,
         approval: &OwnerApproval<'_>,
         ledger: &mut ConfirmationLedger,
     ) -> Result<Self> {
-        approval.accept_issue(ledger, &clock, &proposed_grant)?;
+        approval.accept_issue(ledger, &clock, &host, &proposed_grant)?;
+        grants::validate_proposal(&proposed_grant, grant_kind, clock.wall_clock_ms())?;
         bundles::require_consistent_keys(
             &host.keys,
             &host.endpoint_id,
@@ -110,7 +156,7 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             deadline_monotonic_ms: clock.monotonic_ms().saturating_add(INVITATION_LIFETIME_MS),
             boot_identity: clock.boot_identity(),
         };
-        store.save(&record)?;
+        store.create(&record)?;
         let expires_at_ms =
             TimestampMs::new(clock.wall_clock_ms().saturating_add(INVITATION_LIFETIME_MS));
         let issuing_owner = approval.owner.clone();
@@ -121,6 +167,7 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             secret: Secret::random()?,
             host,
             proposed_grant,
+            grant_kind,
             issuing_owner,
             expires_at_ms,
             challenge: None,
@@ -157,10 +204,20 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         &self.record
     }
 
+    /// Returns the candidate that holds the invitation, when one does.
+    #[must_use]
+    pub fn candidate(&self) -> Option<&DirectCandidate> {
+        self.candidate.as_ref()
+    }
+
     /// Issues a fresh single-use challenge and returns it with the host's complete key bundle.
     ///
     /// A redemption starts here rather than at the QR: the challenge is the host's, so a proof
-    /// cannot be prepared before the host has agreed to serve one.
+    /// cannot be prepared before the host has agreed to serve one. The challenge is bound to the
+    /// connection it is issued on, so it is an offer to that candidate and to nobody else.
+    ///
+    /// An invitation with a candidate already holding it issues no challenge at all, by this route
+    /// or the other: a single-use invitation has one candidate.
     ///
     /// # Errors
     ///
@@ -168,13 +225,17 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     /// [`PairingError::CandidateLocked`], [`PairingError::EarlyData`] or a crypto error.
     pub fn issue_challenge(&mut self, live_peer: &dyn LivePeer) -> Result<DirectChallenge> {
         require_completed_handshake(live_peer)?;
-        self.require_open()?;
+        let client_endpoint = live_peer.live_endpoint()?;
+        self.require_no_candidate()?;
         let mut nonce = [0u8; 32];
         kr_crypto::random_bytes(&mut nonce)?;
         let host_nonce = Nonce256::from_bytes(nonce);
         // Issuing a new challenge retires the previous one: a challenge is single use, and a stale
         // one is not held open beside its replacement.
-        self.challenge = Some(host_nonce);
+        self.challenge = Some(OutstandingChallenge {
+            host_nonce,
+            client_endpoint,
+        });
         Ok(DirectChallenge {
             invitation_id: self.record.invitation_id,
             host_nonce,
@@ -186,6 +247,11 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     }
 
     /// Verifies a redemption and locks the candidate.
+    ///
+    /// Nothing about the challenge is spent until the redemption is one this challenge could
+    /// answer: a stale nonce, another connection or a submitted endpoint that is not the live peer
+    /// are all refused with the outstanding challenge left intact, so a bystander cannot cancel
+    /// the candidate's redemption by sending rubbish.
     ///
     /// # Errors
     ///
@@ -200,26 +266,26 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         live_peer: &dyn LivePeer,
     ) -> Result<DirectCandidate> {
         require_completed_handshake(live_peer)?;
-        self.require_open()?;
+        self.require_no_candidate()?;
         if proof.invitation_id != self.record.invitation_id {
             return Err(PairingError::ContextMismatch {
                 what: "the invitation a redemption names",
             });
         }
-        // The challenge is single use: it is taken here, so a second redemption with the same
-        // nonce finds none outstanding.
-        let Some(expected) = self.challenge.take() else {
+        let Some(outstanding) = self.challenge else {
             return Err(PairingError::ContextMismatch {
                 what: "a redemption with no outstanding challenge",
             });
         };
-        if proof.host_nonce != expected {
+        if proof.host_nonce != outstanding.host_nonce {
             return Err(PairingError::ContextMismatch {
                 what: "the challenge a redemption answers",
             });
         }
-        // The submitted endpoint must be the live authenticated peer, before anything is locked.
-        if live_peer.live_endpoint()? != *client_endpoint {
+        // The submitted endpoint must be the live authenticated peer, and that peer must be the
+        // one the challenge was issued to. Both are checked before anything is spent or locked.
+        let live = live_peer.live_endpoint()?;
+        if live != *client_endpoint || live != outstanding.client_endpoint {
             return Err(PairingError::EndpointMismatch { side: "client" });
         }
         // And the key bundle must declare that same endpoint as its transport key, so the device
@@ -230,6 +296,10 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             "the endpoint a redemption declares, which is not its own transport key",
         )?;
 
+        // From here the redemption is one this challenge answers, so the challenge is spent
+        // whatever the proofs say: a single-use challenge does not survive a wrong answer.
+        self.challenge = None;
+
         let transcript = DirectTranscript {
             invitation_id: self.record.invitation_id,
             host_endpoint_id: self.host.endpoint_id,
@@ -237,7 +307,7 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             host_keys: self.host.keys,
             client_keys: proof.client_keys,
             proposed_grant_digest: proposed_grant_digest(&self.proposed_grant)?,
-            host_nonce: expected,
+            host_nonce: outstanding.host_nonce,
             client_nonce: proof.client_nonce,
             expires_at_ms: self.expires_at_ms,
         };
@@ -284,22 +354,24 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     /// Commits the device record, the grant and the consumed invitation after the owner approves.
     ///
     /// Confirming a new device is a sensitive action, so this needs a fresh single-use owner
-    /// confirmation naming the digest of the exact transcript and key bundle the owner was shown.
-    /// The three writes are one store transaction and success is reported only after it returns.
+    /// confirmation naming this host, the candidate's key bundle, the proposed rights and the
+    /// digest of the exact redemption the owner was shown. The grant is issued here, validated
+    /// against the rules for its kind and narrowed against its parent. The writes are one store
+    /// transaction and success is reported only after it returns.
     ///
     /// # Errors
     ///
     /// Returns [`PairingError::NotIssuingOwner`], [`PairingError::OwnerConfirmationRequired`],
-    /// [`PairingError::WrongPhase`], [`PairingError::Store`] or [`PairingError::ContextMismatch`]
-    /// when the owner names another transcript or another client-key digest.
+    /// [`PairingError::GrantNotPermitted`], [`PairingError::WrongPhase`],
+    /// [`PairingError::Store`] or [`PairingError::ContextMismatch`] when the owner names another
+    /// transcript or another client-key digest.
     pub fn confirm(
         &mut self,
         approval: &OwnerApproval<'_>,
         ledger: &mut ConfirmationLedger,
-        transcript_digest: Digest256,
-        client_key_digest: Digest256,
-        device_id: DeviceId,
-        grant_id: GrantId,
+        approved: &ApprovedRedemption,
+        identities: &GrantIdentities,
+        parent: Option<&Grant>,
     ) -> Result<PairingCommitment> {
         if approval.owner != &self.issuing_owner {
             return Err(PairingError::NotIssuingOwner);
@@ -316,41 +388,58 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
                 actual: "an invitation with no locked candidate",
             });
         };
-        if candidate.transcript_digest != transcript_digest {
+        if candidate.transcript_digest != approved.transcript_digest {
             return Err(PairingError::ContextMismatch {
                 what: "the transcript the owner approved",
             });
         }
-        if client_keys_digest(&candidate.transcript.client_keys)? != client_key_digest {
+        if client_keys_digest(&candidate.transcript.client_keys)? != approved.client_key_digest {
             return Err(PairingError::ContextMismatch {
                 what: "the client key digest the owner approved",
+            });
+        }
+        if identities.issuer_device_id != self.host.device_id {
+            return Err(PairingError::ContextMismatch {
+                what: "the host device a grant is issued by",
             });
         }
         approval.accept_confirm_device(
             ledger,
             &self.clock,
-            confirm_action_digest(transcript_digest, client_key_digest),
+            &self.host,
+            &candidate.transcript.client_keys,
+            &self.proposed_grant,
+            approved.action_digest(),
+        )?;
+        let grant = grants::issue_grant(
+            self.proposed_grant.clone(),
+            self.grant_kind,
+            self.clock.wall_clock_ms(),
+            identities,
+            parent,
         )?;
 
         let commitment = PairingCommitment {
             invitation_id: self.record.invitation_id,
             attempt_id: candidate.attempt_id,
-            device_id,
-            grant_id,
+            device_id: identities.recipient_device_id,
+            grant,
             client_keys: candidate.transcript.client_keys,
             client_bundle: Some(candidate.client_bundle.clone()),
             proposed_grant: self.proposed_grant.clone(),
             verification_value: candidate.verification_value.clone(),
+            owner_confirmation: approval.proof.clone(),
             committed_at_ms: TimestampMs::new(self.clock.wall_clock_ms()),
         };
-        let mut record = self.record.clone();
-        record.state = InvitationState::Committed;
-        match self.store.commit(&record, &commitment) {
-            Ok(()) => {
-                self.record = record;
+        let mut next = self.record.clone();
+        next.state = InvitationState::Committed;
+        match self.store.commit(&self.record, &next, &commitment) {
+            Ok(TransitionOutcome::Written) => {
+                self.record = next;
                 self.challenge = None;
                 Ok(commitment)
             }
+            Ok(TransitionOutcome::Stale(current)) => Err(self.adopt_stale(current)),
             Err(error) => {
                 self.fenced = true;
                 Err(error)
@@ -367,6 +456,8 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         if owner != &self.issuing_owner {
             return Err(PairingError::NotIssuingOwner);
         }
+        self.require_not_fenced()?;
+        self.reload()?;
         self.consume(PairingConsumedReason::Cancelled)
     }
 
@@ -377,14 +468,15 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::NotIssuingOwner`] when the viewer is neither, and
-    /// [`PairingError::EarlyData`] for a candidate asking in 0-RTT.
+    /// Returns [`PairingError::NotIssuingOwner`] when the viewer is neither,
+    /// [`PairingError::EarlyData`] for a candidate asking in 0-RTT, and [`PairingError::Store`]
+    /// when a failed write has fenced the invitation.
     pub fn status(&mut self, viewer: DirectStatusViewer<'_>) -> Result<PairStatus> {
-        // Reading the record rather than remembering it: the other entry mode may have consumed or
-        // locked this invitation since the last transition here.
-        if let Some(record) = self.store.load(self.record.invitation_id)? {
-            self.record = record;
+        if let DirectStatusViewer::Candidate { live_peer, .. } = viewer {
+            require_completed_handshake(live_peer)?;
         }
+        self.require_not_fenced()?;
+        self.reload()?;
         if self.is_expired() {
             self.consume(PairingConsumedReason::Expired)?;
         }
@@ -395,10 +487,11 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
                 attempt_id,
                 live_peer,
             } => {
-                require_completed_handshake(live_peer)?;
                 let endpoint = live_peer.live_endpoint()?;
                 committed.as_ref().map_or_else(
                     || {
+                        // The candidate's identity outlives its lock, so a denied, cancelled or
+                        // expired invitation still answers the device that redeemed it.
                         self.candidate.as_ref().is_some_and(|candidate| {
                             candidate.attempt_id == attempt_id
                                 && candidate.transcript.client_endpoint_id == endpoint
@@ -417,7 +510,7 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         if let Some(committed) = committed {
             return Ok(PairStatus::Committed {
                 device_id: committed.device_id,
-                grant_id: committed.grant_id,
+                grant_id: committed.grant.grant_id,
             });
         }
         Ok(match self.record.state {
@@ -455,18 +548,30 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             || self.clock.monotonic_ms() >= self.record.deadline_monotonic_ms
     }
 
-    /// Reloads the authoritative record and checks the invitation.
-    fn require_open(&mut self) -> Result<()> {
+    /// Refuses everything once a durable write has failed.
+    fn require_not_fenced(&self) -> Result<()> {
         if self.fenced {
             return Err(PairingError::Store {
                 reason: "this invitation was fenced by a failed write".to_owned(),
             });
         }
-        // One invitation may offer a short code and a direct QR. The store is the authority, so
-        // both routes read one candidate and one consumption and neither replaces the other's.
+        Ok(())
+    }
+
+    /// Reads the authoritative record. The store is where an invitation's state lives.
+    fn reload(&mut self) -> Result<()> {
         if let Some(record) = self.store.load(self.record.invitation_id)? {
             self.record = record;
         }
+        Ok(())
+    }
+
+    /// Reloads the authoritative record and checks the invitation.
+    fn require_open(&mut self) -> Result<()> {
+        self.require_not_fenced()?;
+        // One invitation may offer a short code and a direct QR. The store is the authority, so
+        // both routes read one candidate and one consumption and neither replaces the other's.
+        self.reload()?;
         if let InvitationState::Consumed { reason } = self.record.state {
             return Err(PairingError::Consumed { reason });
         }
@@ -491,18 +596,46 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         Ok(())
     }
 
-    /// Writes a record and adopts it, fencing the invitation when the write fails.
-    fn persist(&mut self, record: InvitationRecord) -> Result<()> {
-        match self.store.save(&record) {
-            Ok(()) => {
-                self.record = record;
+    /// Checks the invitation and refuses once any candidate holds it, this flow's own included.
+    ///
+    /// A direct invitation is single use. Once a candidate has redeemed it, another challenge or
+    /// another redemption would replace a candidate the owner may already be looking at.
+    fn require_no_candidate(&mut self) -> Result<()> {
+        self.require_open()?;
+        if self.record.state.locked_attempt().is_some() {
+            return Err(PairingError::CandidateLocked);
+        }
+        Ok(())
+    }
+
+    /// Writes a record if the stored one is still the one this decision was made from.
+    fn persist(&mut self, next: InvitationRecord) -> Result<()> {
+        match self.store.transition(&self.record, &next) {
+            Ok(TransitionOutcome::Written) => {
+                self.record = next;
                 Ok(())
             }
+            Ok(TransitionOutcome::Stale(current)) => Err(self.adopt_stale(current)),
             Err(error) => {
                 self.fenced = true;
                 Err(error)
             }
         }
+    }
+
+    /// Adopts a record another writer wrote first, and returns why this decision is void.
+    fn adopt_stale(&mut self, current: InvitationRecord) -> PairingError {
+        let refusal = match current.state {
+            InvitationState::Consumed { reason } => PairingError::Consumed { reason },
+            InvitationState::Committed => PairingError::AlreadyCommitted,
+            InvitationState::Locked { .. } => PairingError::CandidateLocked,
+            InvitationState::Open => PairingError::ContextMismatch {
+                what: "an invitation record another writer changed",
+            },
+        };
+        self.record = current;
+        self.challenge = None;
+        refusal
     }
 
     fn consume(&mut self, reason: PairingConsumedReason) -> Result<()> {

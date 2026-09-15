@@ -59,17 +59,25 @@ A host restart cancels every unfinished invitation, a locked one included, becau
 attempt state lives only in memory and nothing can resume it — consumed records and failure counts
 survive.
 
-Each candidate also has ten seconds to finish its handshake. A slot that runs out frees itself and
-charges no guess, and `abort` frees one on request, so four silent candidates cannot hold the room
-shut for the invitation's whole five minutes.
+Each candidate also has ten seconds to finish its handshake, and holding the invitation does not
+suspend that. A slot that runs out frees itself and charges no guess, `abort` frees one on request,
+and a candidate that proved the code and then stopped consumes the invitation instead of holding it
+for the remaining five minutes: the owner issues another rather than waiting.
 
 Every durable decision is written before it is acted on, and a write that fails **fences** the
-invitation: it serves nobody until a restart cancels it. Handing a spent guess back is the one
-outcome that must not happen, so a host that cannot record one stops instead.
+invitation: it reports no status, accepts no candidate, consumes nothing and commits nothing until
+a restart cancels it. Handing a spent guess back is the one outcome that must not happen, so a host
+that cannot record one stops instead of guessing which way the write went.
 
-The store is the authority on the record. Both entry modes reload it before every transition and
-write it back, so an invitation that offers a short code and a direct QR has one candidate and one
-consumption whichever route reaches it first.
+The store is the authority on the record, and every write is conditional on the record the
+decision was made from. Both entry modes reload before they decide and write back only if nothing
+has moved since, so an invitation that offers a short code and a direct QR has one candidate and
+one consumption whichever route reaches it first, and the slower of two writers is refused rather
+than allowed to undo the faster one's lock, spent guess or consumption.
+
+A restart loses the invitation object but not the pairing. The device record, the grant and the
+owner's proof are in the store under the invitation identity, so a host that comes back answers a
+retry and tells the candidate what happened without holding anything in memory.
 
 **The candidate** permits five attempts per entered code, and never retries a failed key
 confirmation automatically. The counter is keyed by an HMAC of the configured origin and the
@@ -81,6 +89,10 @@ reboot and a window that ran out both leave the same 24-hour tombstone as exhaus
 device cannot buy five more guesses by restarting and another advertised expiry cannot reset the
 counter. The tombstone's retention is on the wall clock, because a monotonic deadline from the
 previous boot means nothing after one.
+
+Retention is kept on both clocks. Within the boot that wrote the record the monotonic deadline
+governs, so moving the wall clock forward cannot delete a tombstone or an open window; after a
+reboot the monotonic value means nothing and the wall clock is what is left.
 
 The whole rule is one pure function applied inside the store's own lock, so the read, the decision
 and the write are one transition: two entries of the same code cannot both see four attempts and
@@ -107,7 +119,13 @@ grants nothing until the candidate proves possession of that secret over an iroh
 authenticated against the pinned endpoint.
 
 A redemption starts with a fresh host challenge and the host's complete purpose-key bundle, so a
-proof cannot be prepared before the host agrees to serve one. The transcript `D` is
+proof cannot be prepared before the host agrees to serve one. The challenge is bound to the
+connection it was issued on: it is an offer to that candidate, and answering it from anywhere else
+is another device using a challenge it was not given. It is spent only once a redemption is one it
+could answer, so a stale nonce or a stranger's message cannot cancel the candidate's redemption.
+
+A direct invitation is single use, so once a candidate has redeemed it the host issues no further
+challenge and accepts no further redemption, by this route or the other. The transcript `D` is
 `CBOR(["kr-pair/direct/1", invitation_id, host_endpoint, client_endpoint, host_keys, client_keys,
 proposed_grant_digest, host_nonce, client_nonce, expires_at])`. The candidate supplies
 `HMAC-SHA256(invitation_secret, D)` **and** an Ed25519 signature over `D`: the tag proves possession
@@ -129,7 +147,9 @@ verification value is the first eight hexadecimal characters of
 `SHA256(CBOR(["kr-pair/direct-verify/1", D]))`, grouped identically on both devices. `pair.confirm`
 is accepted only from the issuing owner and binds that exact transcript and client-key digest.
 `pair.status` reports only to the candidate's authenticated endpoint or the issuing owner and never
-reveals secret material; `pair.cancel` consumes the invitation without a grant. An idempotent retry
+reveals secret material, and the candidate's identity outlives its attempt, so a denied, cancelled
+or expired invitation still tells the device that redeemed it what happened; `pair.cancel` consumes
+the invitation without a grant. An idempotent retry
 retrieves the committed result and cannot change the submitted keys or the proposed rights.
 
 The two entry modes use distinct proof domains, so a proof from one route is not a proof in the
@@ -147,6 +167,12 @@ Delegation narrows. `issue_grant` refuses a child that asks for more rights, mor
 history or a longer life than its parent, that names a parent it was not given, or that omits one it
 was. The candidate cannot enlarge the grant through its bundle either: the host commits the grant
 the invitation proposed.
+
+Neither check is optional. An invitation validates its proposal against the rules for its kind
+before it is reserved or written, so a grant that could never be issued does not become an
+invitation somebody can answer; and the grant itself is issued through `issue_grant` inside the
+committing transaction, so what is written is a grant that passed both rules rather than one a
+caller handed in.
 
 A remote owner publishes a signed revocation **request**, which carries no host revision: only the
 target host issues ordered authority revisions, and a device that could name one would be assigning
@@ -179,11 +205,24 @@ is monotonic and tied to the boot the challenge was issued in; the `expires_at_m
 request is the same interval on the wall clock, for the signer to read. Winding the wall clock back
 therefore reopens nothing, and a reboot ends every outstanding challenge.
 
+The challenge is compared member for member before the proof is verified: the action, the digest,
+the host device and endpoint, the destination keys and the rights. Checking the digest alone would
+accept a challenge answered for a different device or a different set of permissions than the one
+about to be written. The host also keeps the challenge it issued, not just its identity, and
+compares the presented one against it, so nothing can substitute different text under an identity
+the host did issue.
+
 Both flows depend on this rather than describing it. `HostInvitation::issue` and
-`DirectInvitation::issue` require a confirmation naming `issue_invitation` and the digest of the
-exact proposed grant; `confirm` on either requires one naming `confirm_device` and the digest of the
-exact transcript and candidate the owner was shown, so a confirmation obtained for one candidate
-cannot approve another.
+`DirectInvitation::issue` require a confirmation naming `issue_invitation`, this host, the proposed
+rights, the digest of the exact proposed grant and **no** destination device, because an invitation
+is issued before anybody answers it. `confirm` on either requires one naming `confirm_device`, this
+host, the candidate's own key bundle, the proposed rights, and a digest over exactly what the owner
+was shown: the transcript and both bundle hashes for a short code, the transcript and key digests
+for a redemption. The two entry modes compute that digest under different domains, so a
+confirmation obtained for one cannot approve a candidate that arrived by the other.
+
+The accepted proof is written with the pairing rather than checked and forgotten. Afterwards the
+host can show which challenge, which channel and which signer authorised each device it holds.
 
 ## The PAKE profile
 

@@ -9,18 +9,20 @@ use kr_pairing::confirm::{
     ConfirmationLedger, HostEnrolment, request_confirmation, sign_confirmation,
 };
 use kr_pairing::direct::{
-    DirectInvitation, DirectStatusViewer, client_keys_digest, redeem_proof,
+    ApprovedRedemption, DirectInvitation, DirectStatusViewer, client_keys_digest, redeem_proof,
     verification_values_match,
 };
-use kr_pairing::host::{HostIdentity, OwnerApproval, OwnerContext, confirm_action_digest};
+use kr_pairing::grants::{GrantIdentities, GrantKind};
+use kr_pairing::host::{HostIdentity, OwnerApproval, OwnerContext};
 use kr_pairing::platform::{InvitationState, TestClock, TestInvitationStore, TestLivePeer};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
-use kr_protocol::ids::{ActorId, DeviceId, DeviceKeyRevision, GrantId};
+use kr_protocol::ids::{ActorId, AuthorityRevision, DeviceId, DeviceKeyRevision, GrantId};
 use kr_protocol::pairing::{
-    ConfirmationChannel, DeviceName, DevicePlatform, DirectQrPayload, INVITATION_LIFETIME_MS,
-    NetworkConfig, OwnerConfirmationProof, OwnerConfirmationRequest, PairStatus,
-    PairingConsumedReason, ProposedGrant, QrPayload, SensitiveAction, direct_verification_value,
+    ConfirmationChannel, DeviceName, DevicePlatform, DevicePublicKeys, DirectQrPayload,
+    INVITATION_LIFETIME_MS, NetworkConfig, OwnerConfirmationProof, OwnerConfirmationRequest,
+    PairStatus, PairingConsumedReason, ProposedGrant, QrPayload, SensitiveAction,
+    direct_verification_value,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{
@@ -118,13 +120,18 @@ impl Harness {
         }
     }
 
-    fn approval(&self, action: SensitiveAction, digest: Digest256) -> Approval {
+    fn approval(
+        &self,
+        action: SensitiveAction,
+        digest: Digest256,
+        destination_keys: Option<DevicePublicKeys>,
+    ) -> Approval {
         let request = request_confirmation(
             &self.clock,
             action,
             digest,
-            None,
-            BTreeSet::new(),
+            destination_keys,
+            proposal().actions.iter().copied().collect::<BTreeSet<_>>(),
             DeviceId::new(Uuid::from_bytes([1; 16])),
             *self.host_keys.transport.public(),
         )
@@ -143,16 +150,27 @@ impl Harness {
         let approval = self.approval(
             SensitiveAction::IssueInvitation,
             kr_pairing::confirm::action_digest(&proposal()).expect("a digest"),
+            None,
         );
         DirectInvitation::issue(
             &self.store,
             &self.clock,
             self.identity(),
             proposal(),
+            GrantKind::SessionInvitation,
             &approval.by(&self.issuing_owner, self.signer()),
             &mut self.ledger.borrow_mut(),
         )
         .expect("an invitation")
+    }
+
+    fn grant_identities(&self) -> GrantIdentities {
+        GrantIdentities {
+            grant_id: GrantId::new(Uuid::from_bytes([8; 16])),
+            issuer_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
+            recipient_device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
+            authority_revision: AuthorityRevision::new(1),
+        }
     }
 
     fn host_peer(&self) -> TestLivePeer {
@@ -168,19 +186,23 @@ impl Harness {
         &self,
         invitation: &mut Invitation<'_>,
         transcript_digest: Digest256,
-        keys_digest: Digest256,
+        client_key_digest: Digest256,
     ) -> Result<kr_pairing::platform::PairingCommitment, PairingError> {
+        let approved = ApprovedRedemption {
+            transcript_digest,
+            client_key_digest,
+        };
         let approval = self.approval(
             SensitiveAction::ConfirmDevice,
-            confirm_action_digest(transcript_digest, keys_digest),
+            approved.action_digest(),
+            Some(self.client_keys.public_keys()),
         );
         invitation.confirm(
             &approval.by(&self.issuing_owner, self.signer()),
             &mut self.ledger.borrow_mut(),
-            transcript_digest,
-            keys_digest,
-            DeviceId::new(Uuid::from_bytes([9; 16])),
-            GrantId::new(Uuid::from_bytes([8; 16])),
+            &approved,
+            &self.grant_identities(),
+            None,
         )
     }
 
@@ -546,19 +568,23 @@ fn only_the_issuing_owner_confirms_the_exact_transcript_and_keys() {
     let (candidate, _) = run_redemption(&harness, &mut invitation, &payload).expect("a redemption");
     let keys_digest = client_keys_digest(&harness.client_keys.public_keys()).expect("a digest");
 
+    let approved = ApprovedRedemption {
+        transcript_digest: candidate.transcript_digest,
+        client_key_digest: keys_digest,
+    };
     let stranger = owner(2);
     let approval = harness.approval(
         SensitiveAction::ConfirmDevice,
-        confirm_action_digest(candidate.transcript_digest, keys_digest),
+        approved.action_digest(),
+        Some(harness.client_keys.public_keys()),
     );
     assert!(matches!(
         invitation.confirm(
             &approval.by(&stranger, harness.signer()),
             &mut harness.ledger.borrow_mut(),
-            candidate.transcript_digest,
-            keys_digest,
-            DeviceId::new(Uuid::from_bytes([9; 16])),
-            GrantId::new(Uuid::from_bytes([8; 16])),
+            &approved,
+            &harness.grant_identities(),
+            None,
         ),
         Err(PairingError::NotIssuingOwner)
     ));
@@ -582,16 +608,43 @@ fn only_the_issuing_owner_confirms_the_exact_transcript_and_keys() {
     // And a confirmation naming another candidate does not approve this one.
     let elsewhere = harness.approval(
         SensitiveAction::ConfirmDevice,
-        confirm_action_digest(Digest256::from_bytes([0x21; 32]), keys_digest),
+        ApprovedRedemption {
+            transcript_digest: Digest256::from_bytes([0x21; 32]),
+            client_key_digest: keys_digest,
+        }
+        .action_digest(),
+        Some(harness.client_keys.public_keys()),
     );
     assert!(matches!(
         invitation.confirm(
             &elsewhere.by(&harness.issuing_owner, harness.signer()),
             &mut harness.ledger.borrow_mut(),
-            candidate.transcript_digest,
-            keys_digest,
-            DeviceId::new(Uuid::from_bytes([9; 16])),
-            GrantId::new(Uuid::from_bytes([8; 16])),
+            &approved,
+            &harness.grant_identities(),
+            None,
+        ),
+        Err(PairingError::OwnerConfirmationRequired)
+    ));
+
+    // A short-code confirmation does not approve a direct redemption: the two entry modes compute
+    // their action digests under different domains.
+    let short_code = harness.approval(
+        SensitiveAction::ConfirmDevice,
+        kr_pairing::host::ApprovedCandidate {
+            transcript: candidate.transcript_digest,
+            host_bundle_hash: Digest256::from_bytes([0; 32]),
+            client_bundle_hash: keys_digest,
+        }
+        .action_digest(),
+        Some(harness.client_keys.public_keys()),
+    );
+    assert!(matches!(
+        invitation.confirm(
+            &short_code.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
+            &approved,
+            &harness.grant_identities(),
+            None,
         ),
         Err(PairingError::OwnerConfirmationRequired)
     ));
@@ -704,15 +757,56 @@ fn a_locked_candidate_is_not_replaced_by_the_other_entry_mode() {
 
     // A short-code route locked a candidate on the same invitation record. The direct route reads
     // that record from the store before every transition, so it refuses rather than replacing it.
-    let mut record = invitation.record().clone();
-    record.state = InvitationState::Locked {
+    let expected = invitation.record().clone();
+    let mut next = expected.clone();
+    next.state = InvitationState::Locked {
         attempt_id: kr_pairing::host::new_attempt_id().expect("an attempt"),
     };
-    kr_pairing::platform::InvitationStore::save(&&harness.store, &record).expect("a write");
+    assert_eq!(
+        kr_pairing::platform::InvitationStore::transition(&&harness.store, &expected, &next)
+            .expect("a write"),
+        kr_pairing::platform::TransitionOutcome::Written
+    );
     assert!(matches!(
         run_redemption(&harness, &mut invitation, &payload),
         Err(PairingError::CandidateLocked)
     ));
+}
+
+#[test]
+fn a_write_that_lost_a_race_does_not_undo_the_writer_that_won() {
+    let harness = Harness::new();
+    let mut invitation = harness.issue();
+    let payload = harness.scan(&invitation);
+    let host_peer = harness.client_peer();
+    let challenge = invitation.issue_challenge(&host_peer).expect("a challenge");
+    let (proof, _) = redeem_proof(
+        &payload,
+        &challenge,
+        &harness.client_keys.authorisation,
+        &candidate_identity(&harness),
+        &harness.host_peer(),
+    )
+    .expect("a proof");
+
+    // The other entry mode consumes the invitation after this flow read the record and before it
+    // writes. The conditional write refuses rather than reopening a consumed invitation.
+    let expected = invitation.record().clone();
+    let mut consumed = expected.clone();
+    consumed.state = InvitationState::Consumed {
+        reason: PairingConsumedReason::Cancelled,
+    };
+    kr_pairing::platform::InvitationStore::transition(&&harness.store, &expected, &consumed)
+        .expect("a write");
+
+    let peer = harness.client_peer();
+    assert!(matches!(
+        invitation.redeem(&proof, harness.client_keys.transport.public(), &peer),
+        Err(PairingError::Consumed {
+            reason: PairingConsumedReason::Cancelled
+        })
+    ));
+    assert_eq!(invitation.record().state, consumed.state);
 }
 
 #[test]

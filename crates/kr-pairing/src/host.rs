@@ -12,25 +12,30 @@
 //! local configuration error consume bounded rate and slot budgets instead, because none of them
 //! produced a password confirmation result.
 //!
-//! Three rules shape the rest of this file:
+//! Four rules shape the rest of this file:
 //!
 //! * **The lock is at the PAKE, not at `pair.finish`.** A successful key confirmation locks the
 //!   invitation to that candidate and cancels the others there and then. Leaving the invitation
 //!   open until `finish` would let a second candidate keep guessing against an invitation someone
 //!   had already proved.
-//! * **The store is the authority.** Every transition reloads the record before it decides and
-//!   persists before it reports, so a host that crashed between deciding and persisting comes back
-//!   with the decision it persisted, and an invitation that offers both entry modes has one
-//!   candidate and one consumption whichever route reaches it first.
+//! * **The store is the authority, and every write is conditional.** A transition reloads the
+//!   record, decides from it, and writes only if the stored record is still exactly that one. An
+//!   invitation may be served by this state machine and by the direct-QR one at the same time, so
+//!   an unconditional write would let the slower of the two undo the faster one's lock, spent
+//!   guess or consumption.
 //! * **A write that fails fences the invitation.** If the host cannot record a spent guess, it
 //!   refuses to serve the invitation at all rather than hand the guess back.
+//! * **Nothing is committed that was not authorised.** Issuing needs a fresh owner confirmation
+//!   naming the proposed rights; confirming needs one naming the exact candidate; and the grant
+//!   itself is validated and narrowed against its parent inside the committing transaction.
 
 use std::collections::BTreeMap;
 
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::secret::SymmetricKey;
 use kr_protocol::actor::ActorIngress;
-use kr_protocol::ids::{ActorId, AttemptId, DeviceId, DeviceKeyRevision, GrantId, InvitationId};
+use kr_protocol::grant::Grant;
+use kr_protocol::ids::{ActorId, AttemptId, DeviceId, DeviceKeyRevision, InvitationId};
 use kr_protocol::pairing::{
     BundleMessageType, DevicePublicKeys, HostBundle, INVITATION_LIFETIME_MS,
     MAX_CONFIRMATION_FAILURES, NetworkConfig, OwnerConfirmationProof, OwnerConfirmationRequest,
@@ -43,11 +48,12 @@ use kr_protocol::scalars::{
 
 use crate::bundles::{self, BundleFrame, ExchangeBudget};
 use crate::code::{CodeSecret, GeneratedCode, generate_code};
-use crate::confirm::{self, ConfirmationLedger, HostEnrolment};
+use crate::confirm::{self, ConfirmationExpectation, ConfirmationLedger, HostEnrolment};
 use crate::error::{PairingError, Result};
+use crate::grants::{self, GrantIdentities, GrantKind};
 use crate::platform::{
     InvitationRecord, InvitationState, InvitationStore, LivePeer, LocatorReservation, PairingClock,
-    PairingCommitment, RendezvousHost, require_completed_handshake,
+    PairingCommitment, RendezvousHost, TransitionOutcome, require_completed_handshake,
 };
 use crate::spake::{Role, SpakeState};
 use crate::transcript::AttemptKeys;
@@ -66,6 +72,12 @@ pub const MAX_CANDIDATES: usize = 4;
 /// cannot hold the four slots shut for the invitation's whole life. The deadline is monotonic and
 /// tied to the boot, and no message extends it.
 pub const HANDSHAKE_DEADLINE_MS: u64 = 10_000;
+
+/// The domain a short-code device confirmation's action digest is computed under.
+///
+/// The direct route has its own, so a confirmation obtained for one entry mode cannot approve a
+/// candidate that arrived by the other.
+pub const CONFIRM_DEVICE_DOMAIN: &str = "kr-pair/confirm-device/short-code/1";
 
 /// How many locators a host tries before it gives up on the service.
 ///
@@ -114,6 +126,11 @@ pub struct InvitationProposal {
     pub host: HostIdentity,
     /// The rights the invitation proposes.
     pub proposed_grant: ProposedGrant,
+    /// Which kind of grant those rights are, which decides the rules they are checked against.
+    ///
+    /// Nothing infers this: a session invitation and a personal owner grant have different rules,
+    /// and a caller says which it is issuing so the rules for that kind are the ones applied.
+    pub grant_kind: GrantKind,
 }
 
 /// One owner confirmation, as the host receives it.
@@ -137,30 +154,6 @@ pub struct OwnerApproval<'a> {
 }
 
 impl OwnerApproval<'_> {
-    /// Checks the challenge describes this action, verifies the proof and consumes the challenge.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PairingError::OwnerConfirmationRequired`] or
-    /// [`PairingError::AuthenticationFailed`].
-    fn accept(
-        &self,
-        ledger: &mut ConfirmationLedger,
-        clock: &dyn PairingClock,
-        action: SensitiveAction,
-        action_digest: Digest256,
-    ) -> Result<()> {
-        confirm::require_action(self.request, action, action_digest)?;
-        confirm::accept_confirmation(
-            ledger,
-            clock,
-            self.request,
-            self.proof,
-            self.signer,
-            self.enrolment,
-        )
-    }
-
     /// Accepts a confirmation to issue an invitation proposing exactly these rights.
     ///
     /// # Errors
@@ -171,17 +164,26 @@ impl OwnerApproval<'_> {
         &self,
         ledger: &mut ConfirmationLedger,
         clock: &dyn PairingClock,
+        host: &HostIdentity,
         proposed_grant: &ProposedGrant,
     ) -> Result<()> {
         self.accept(
             ledger,
             clock,
-            SensitiveAction::IssueInvitation,
-            confirm::action_digest(proposed_grant)?,
+            &ConfirmationExpectation {
+                action: SensitiveAction::IssueInvitation,
+                action_digest: confirm::action_digest(proposed_grant)?,
+                host_device_id: host.device_id,
+                host_endpoint_id: host.endpoint_id,
+                // There is no destination device yet: the invitation is issued before anybody
+                // answers it, and a challenge that named one would be naming a guess.
+                destination_keys: None,
+                destination_rights: &proposed_grant.actions,
+            },
         )
     }
 
-    /// Accepts a confirmation to add exactly the device this digest names.
+    /// Accepts a confirmation to add exactly this device with exactly these rights.
     ///
     /// # Errors
     ///
@@ -191,9 +193,40 @@ impl OwnerApproval<'_> {
         &self,
         ledger: &mut ConfirmationLedger,
         clock: &dyn PairingClock,
+        host: &HostIdentity,
+        client_keys: &DevicePublicKeys,
+        proposed_grant: &ProposedGrant,
         action_digest: Digest256,
     ) -> Result<()> {
-        self.accept(ledger, clock, SensitiveAction::ConfirmDevice, action_digest)
+        self.accept(
+            ledger,
+            clock,
+            &ConfirmationExpectation {
+                action: SensitiveAction::ConfirmDevice,
+                action_digest,
+                host_device_id: host.device_id,
+                host_endpoint_id: host.endpoint_id,
+                destination_keys: Some(client_keys),
+                destination_rights: &proposed_grant.actions,
+            },
+        )
+    }
+
+    fn accept(
+        &self,
+        ledger: &mut ConfirmationLedger,
+        clock: &dyn PairingClock,
+        expectation: &ConfirmationExpectation<'_>,
+    ) -> Result<()> {
+        confirm::accept_confirmation(
+            ledger,
+            clock,
+            self.request,
+            self.proof,
+            self.signer,
+            self.enrolment,
+            expectation,
+        )
     }
 }
 
@@ -251,12 +284,55 @@ pub struct HostConfirmation {
 pub struct LockedCandidate {
     /// The candidate that holds the invitation.
     pub attempt_id: AttemptId,
-    /// The transcript both devices confirmed.
-    pub transcript: Digest256,
+    /// The three digests the owner approves by name.
+    pub approved: ApprovedCandidate,
     /// The candidate's signed bundle.
     pub client_bundle: SignedClientBundle,
     /// The eight hexadecimal characters both devices display.
     pub verification_value: String,
+}
+
+/// Exactly what the owner is shown and names back.
+///
+/// All three digests travel together because the approval is over all three: the transcript the
+/// two devices confirmed, and the two bundles that transcript authenticated. An approval that
+/// named only the transcript would not say which host bundle the candidate was shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApprovedCandidate {
+    /// The transcript both devices confirmed.
+    pub transcript: Digest256,
+    /// The host bundle's hash.
+    pub host_bundle_hash: Digest256,
+    /// The candidate bundle's hash.
+    pub client_bundle_hash: Digest256,
+}
+
+impl ApprovedCandidate {
+    /// Returns the digest an owner's device-confirmation challenge must name.
+    ///
+    /// The domain separates this route from the direct one, so a confirmation obtained for a QR
+    /// redemption cannot approve a short-code candidate or the reverse.
+    #[must_use]
+    pub fn action_digest(&self) -> Digest256 {
+        Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(
+            &kr_cbor::CanonicalValue::Array(vec![
+                kr_cbor::CanonicalValue::text(CONFIRM_DEVICE_DOMAIN),
+                kr_cbor::CanonicalValue::bytes(self.transcript.as_bytes().as_slice()),
+                kr_cbor::CanonicalValue::bytes(self.host_bundle_hash.as_bytes().as_slice()),
+                kr_cbor::CanonicalValue::bytes(self.client_bundle_hash.as_bytes().as_slice()),
+            ]),
+        )))
+    }
+
+    /// Returns the eight hexadecimal characters both devices display for this candidate.
+    #[must_use]
+    pub fn verification_value(&self) -> String {
+        verification_value(
+            self.transcript,
+            self.host_bundle_hash,
+            self.client_bundle_hash,
+        )
+    }
 }
 
 /// The host's side of one short-code invitation.
@@ -270,8 +346,20 @@ pub struct HostInvitation<S: InvitationStore, C: PairingClock> {
     issuing_owner: OwnerContext,
     advertised_expires_at_ms: TimestampMs,
     attempts: BTreeMap<AttemptId, HostAttempt>,
+    /// The candidate whose bundle this invitation authenticated, kept after its attempt is gone.
+    ///
+    /// A denied, cancelled or expired invitation clears its attempts, and the candidate still has
+    /// to be able to ask what happened. This is the identity that answer is checked against.
+    last_candidate: Option<AuthenticatedCandidate>,
     /// Set when a durable write failed. The invitation serves nobody afterwards.
     fenced: bool,
+}
+
+/// A candidate this invitation authenticated, kept for as long as the invitation is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AuthenticatedCandidate {
+    attempt_id: AttemptId,
+    endpoint_id: EndpointKey,
 }
 
 impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
@@ -279,8 +367,10 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
     ///
     /// Issuing a persistent pairing invitation is one of the six actions that need a fresh owner
     /// confirmation bound to the exact rights being proposed, so the challenge must name
-    /// [`SensitiveAction::IssueInvitation`] and carry the digest of this proposed grant. The
-    /// challenge is consumed here and works exactly once.
+    /// [`SensitiveAction::IssueInvitation`], this host, and the digest and rights of this proposed
+    /// grant. The challenge is consumed here and works exactly once. The proposal is checked
+    /// against the rules for its kind before anything is reserved or written, so a grant that
+    /// could never be issued does not become an invitation somebody can answer.
     ///
     /// The identity is 128 random bits, the deadline is five minutes on the monotonic clock, and
     /// the record-control token is a separate random 256-bit value the service only ever sees
@@ -289,9 +379,10 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
     /// # Errors
     ///
     /// Returns [`PairingError::OwnerConfirmationRequired`] without a valid single-use
-    /// confirmation, [`PairingError::RendezvousUnavailable`] when the service cannot reserve a
-    /// locator, [`PairingError::Store`] when the record cannot be persisted, and a crypto error
-    /// when libsodium is unavailable.
+    /// confirmation, [`PairingError::GrantNotPermitted`] for a proposal its kind does not allow,
+    /// [`PairingError::RendezvousUnavailable`] when the service cannot reserve a locator,
+    /// [`PairingError::Store`] when the record cannot be persisted, and a crypto error when
+    /// libsodium is unavailable.
     pub fn issue(
         store: S,
         clock: C,
@@ -300,7 +391,12 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         approval: &OwnerApproval<'_>,
         ledger: &mut ConfirmationLedger,
     ) -> Result<Self> {
-        approval.accept_issue(ledger, &clock, &proposal.proposed_grant)?;
+        approval.accept_issue(ledger, &clock, &proposal.host, &proposal.proposed_grant)?;
+        grants::validate_proposal(
+            &proposal.proposed_grant,
+            proposal.grant_kind,
+            clock.wall_clock_ms(),
+        )?;
         bundles::require_consistent_keys(
             &proposal.host.keys,
             &proposal.host.endpoint_id,
@@ -350,7 +446,7 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
             deadline_monotonic_ms,
             boot_identity: clock.boot_identity(),
         };
-        store.save(&record)?;
+        store.create(&record)?;
         let issuing_owner = approval.owner.clone();
         Ok(Self {
             store,
@@ -362,6 +458,7 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
             issuing_owner,
             advertised_expires_at_ms,
             attempts: BTreeMap::new(),
+            last_candidate: None,
             fenced: false,
         })
     }
@@ -404,33 +501,35 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         self.record.state.locked_attempt()
     }
 
-    /// Returns the transcript of the candidate that holds the invitation.
+    /// Returns the three digests the candidate holding the invitation produced.
     ///
-    /// The issuing device shows the owner what this candidate proved; the owner then names that
-    /// transcript back in `pair.confirm`, which is what stops an approval being applied to a
-    /// candidate the owner was not shown.
-    #[must_use]
-    pub fn locked_transcript(&self) -> Option<Digest256> {
-        let attempt_id = self.record.state.locked_attempt()?;
-        self.attempts
-            .get(&attempt_id)
-            .and_then(|attempt| attempt.transcript)
-    }
-
-    /// Returns the bundle hash of the candidate that holds the invitation.
+    /// The issuing device shows the owner what this candidate proved; the owner then names those
+    /// digests back in `pair.confirm`, which is what stops an approval being applied to a
+    /// candidate the owner was not shown. It answers only once both bundles are in, because the
+    /// two bundle hashes are part of what the owner approves.
     ///
     /// # Errors
     ///
-    /// Returns an encoding error when the bundle is outside KR-CBOR-1.
-    pub fn locked_client_bundle_hash(&self) -> Result<Option<Digest256>> {
+    /// Returns an encoding error when a bundle is outside KR-CBOR-1.
+    pub fn locked_candidate(&self) -> Result<Option<ApprovedCandidate>> {
         let Some(attempt_id) = self.record.state.locked_attempt() else {
             return Ok(None);
         };
-        self.attempts
-            .get(&attempt_id)
-            .and_then(|attempt| attempt.client_bundle.as_ref())
-            .map(|signed| bundles::bundle_hash(&signed.bundle))
-            .transpose()
+        let Some(attempt) = self.attempts.get(&attempt_id) else {
+            return Ok(None);
+        };
+        let (Some(transcript), Some(host_bundle_hash), Some(client_bundle)) = (
+            attempt.transcript,
+            attempt.host_bundle_hash,
+            attempt.client_bundle.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(ApprovedCandidate {
+            transcript,
+            host_bundle_hash,
+            client_bundle_hash: bundles::bundle_hash(&client_bundle.bundle)?,
+        }))
     }
 
     /// Admits a candidate and returns the host's PAKE message.
@@ -503,6 +602,12 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         }
         self.attempts.remove(&attempt_id);
         Ok(())
+    }
+
+    /// Returns the owner that issued this invitation.
+    #[must_use]
+    pub const fn issuing_owner(&self) -> &OwnerContext {
+        &self.issuing_owner
     }
 
     /// Returns how many candidate slots are in use.
@@ -698,6 +803,12 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         bundles::verify_client_bundle(&signed, transcript)?;
         attempt.client_bundle = Some(signed.clone());
         attempt.phase = AttemptPhase::AwaitingFinish;
+        // From here the candidate has an authenticated identity, which outlives its attempt: a
+        // denied or cancelled invitation still has to answer the candidate that asks what happened.
+        self.last_candidate = Some(AuthenticatedCandidate {
+            attempt_id,
+            endpoint_id: signed.bundle.endpoint_id,
+        });
         Ok(signed)
     }
 
@@ -717,8 +828,10 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         request: &PairFinishRequest,
         live_peer: &dyn LivePeer,
     ) -> Result<LockedCandidate> {
-        self.require_open()?;
+        // Before anything reads or writes the record: a request in early data is replayable, and a
+        // replay must not be able to expire an invitation or move it on.
         require_completed_handshake(live_peer)?;
+        self.require_open()?;
         let host_endpoint = self.proposal.host.endpoint_id;
         let live_client_endpoint = live_peer.live_endpoint()?;
         let attempt_id = request.attempt_id;
@@ -772,41 +885,46 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         )?;
 
         attempt.phase = AttemptPhase::AwaitingApproval;
+        let approved = ApprovedCandidate {
+            transcript,
+            host_bundle_hash,
+            client_bundle_hash,
+        };
         Ok(LockedCandidate {
             attempt_id,
-            transcript,
+            approved,
             client_bundle,
-            verification_value: verification_value(
-                transcript,
-                host_bundle_hash,
-                client_bundle_hash,
-            ),
+            verification_value: approved.verification_value(),
         })
     }
 
     /// Commits the device record and grant after the issuing owner approves.
     ///
     /// Confirming a new device is a sensitive action, so this needs a fresh single-use owner
-    /// confirmation naming [`SensitiveAction::ConfirmDevice`] and the digest of the exact
-    /// transcript and client bundle the owner was shown. The grant committed is the one the
-    /// invitation proposed: the candidate cannot enlarge it through its bundle.
+    /// confirmation naming this host, the candidate's own key bundle, the proposed rights and the
+    /// digest of the exact transcript and bundles the owner was shown.
     ///
-    /// The device record, the grant, the consumed invitation and the security event are one store
-    /// transaction, and this reports success only after that transaction returns.
+    /// The grant is issued here rather than assumed: `issue_grant` checks it against the rules for
+    /// its kind and against the parent it is delegated from, so a grant that widens its parent is
+    /// refused inside the committing transition rather than written and relied on. The rights are
+    /// the invitation's: the candidate cannot enlarge them through its bundle.
+    ///
+    /// The device record, the validated grant, the consumed invitation, the owner's proof and the
+    /// security event are one store transaction, and this reports success only after that
+    /// transaction returns.
     ///
     /// # Errors
     ///
     /// Returns [`PairingError::NotIssuingOwner`], [`PairingError::OwnerConfirmationRequired`],
-    /// [`PairingError::ContextMismatch`], [`PairingError::WrongPhase`] and
-    /// [`PairingError::Store`].
+    /// [`PairingError::GrantNotPermitted`], [`PairingError::ContextMismatch`],
+    /// [`PairingError::WrongPhase`] and [`PairingError::Store`].
     pub fn confirm(
         &mut self,
         approval: &OwnerApproval<'_>,
         ledger: &mut ConfirmationLedger,
-        transcript: Digest256,
-        client_bundle_hash: Digest256,
-        device_id: DeviceId,
-        grant_id: GrantId,
+        approved: &ApprovedCandidate,
+        identities: &GrantIdentities,
+        parent: Option<&Grant>,
     ) -> Result<PairingCommitment> {
         self.require_issuing_owner(approval.owner)?;
         if let Some(committed) = self.store.commitment(self.record.invitation_id)? {
@@ -824,60 +942,70 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         };
         let attempt = self.attempt(attempt_id)?;
         let phase = attempt.phase;
-        let (Some(recorded), Some(host_bundle_hash), Some(client_bundle)) = (
-            attempt.transcript,
-            attempt.host_bundle_hash,
-            attempt.client_bundle.clone(),
-        ) else {
-            return Err(PairingError::WrongPhase {
-                expected: AttemptPhase::AwaitingApproval.as_str(),
-                actual: phase.as_str(),
-            });
-        };
         if phase != AttemptPhase::AwaitingApproval {
             return Err(PairingError::WrongPhase {
                 expected: AttemptPhase::AwaitingApproval.as_str(),
                 actual: phase.as_str(),
             });
         }
-        if recorded != transcript
-            || bundles::bundle_hash(&client_bundle.bundle)? != client_bundle_hash
-        {
+        let client_bundle = attempt.client_bundle.clone();
+        let recorded = self.locked_candidate()?;
+        let (Some(recorded), Some(client_bundle)) = (recorded, client_bundle) else {
+            return Err(PairingError::WrongPhase {
+                expected: AttemptPhase::AwaitingApproval.as_str(),
+                actual: phase.as_str(),
+            });
+        };
+        if recorded != *approved {
             return Err(PairingError::ContextMismatch {
-                what: "the transcript the owner approved",
+                what: "the candidate the owner approved",
+            });
+        }
+        if identities.issuer_device_id != self.proposal.host.device_id {
+            return Err(PairingError::ContextMismatch {
+                what: "the host device a grant is issued by",
             });
         }
         approval.accept_confirm_device(
             ledger,
             &self.clock,
-            confirm_action_digest(transcript, client_bundle_hash),
+            &self.proposal.host,
+            &client_bundle.bundle.keys,
+            &self.proposal.proposed_grant,
+            approved.action_digest(),
+        )?;
+        let grant = grants::issue_grant(
+            self.proposal.proposed_grant.clone(),
+            self.proposal.grant_kind,
+            self.clock.wall_clock_ms(),
+            identities,
+            parent,
         )?;
 
         let commitment = PairingCommitment {
             invitation_id: self.record.invitation_id,
             attempt_id,
-            device_id,
-            grant_id,
+            device_id: identities.recipient_device_id,
+            grant,
             client_keys: client_bundle.bundle.keys,
             client_bundle: Some(client_bundle.bundle.clone()),
             proposed_grant: self.proposal.proposed_grant.clone(),
-            verification_value: verification_value(
-                transcript,
-                host_bundle_hash,
-                client_bundle_hash,
-            ),
+            verification_value: approved.verification_value(),
+            owner_confirmation: approval.proof.clone(),
             committed_at_ms: TimestampMs::new(self.clock.wall_clock_ms()),
         };
-        let mut record = self.record.clone();
-        record.state = InvitationState::Committed;
-        // One transaction. A pairing is reported as complete only after it returns, so a crash
-        // cannot leave a device with no grant or a completed pairing with no security event.
-        match self.store.commit(&record, &commitment) {
-            Ok(()) => {
-                self.record = record;
+        let mut next = self.record.clone();
+        next.state = InvitationState::Committed;
+        // One transaction, conditional on the record nothing else has moved. A pairing is reported
+        // as complete only after it returns, so a crash cannot leave a device with no grant or a
+        // completed pairing with no security event.
+        match self.store.commit(&self.record, &next, &commitment) {
+            Ok(TransitionOutcome::Written) => {
+                self.record = next;
                 self.attempts.clear();
                 Ok(commitment)
             }
+            Ok(TransitionOutcome::Stale(current)) => Err(self.adopt_stale(current)),
             Err(error) => {
                 self.fenced = true;
                 Err(error)
@@ -892,6 +1020,8 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
     /// Returns [`PairingError::NotIssuingOwner`] or [`PairingError::Store`].
     pub fn deny(&mut self, owner: &OwnerContext) -> Result<()> {
         self.require_issuing_owner(owner)?;
+        self.require_not_fenced()?;
+        self.reload()?;
         self.consume(PairingConsumedReason::Denied)
     }
 
@@ -902,6 +1032,8 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
     /// Returns [`PairingError::NotIssuingOwner`] or [`PairingError::Store`].
     pub fn cancel(&mut self, owner: &OwnerContext) -> Result<()> {
         self.require_issuing_owner(owner)?;
+        self.require_not_fenced()?;
+        self.reload()?;
         self.consume(PairingConsumedReason::Cancelled)
     }
 
@@ -914,14 +1046,19 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::NotIssuingOwner`] when the viewer is neither, and
-    /// [`PairingError::EarlyData`] for a candidate asking in 0-RTT.
+    /// Returns [`PairingError::NotIssuingOwner`] when the viewer is neither,
+    /// [`PairingError::EarlyData`] for a candidate asking in 0-RTT, and [`PairingError::Store`]
+    /// when a failed write has fenced the invitation.
     pub fn status(&mut self, viewer: StatusViewer<'_>) -> Result<PairStatus> {
-        // Reading the record rather than remembering it: the other entry mode may have consumed or
-        // locked this invitation since the last transition here.
-        if let Some(record) = self.store.load(self.record.invitation_id)? {
-            self.record = record;
+        // A candidate's connection is checked before the record is read or written: a status
+        // request in early data is replayable, and a replay must not expire an invitation.
+        if let StatusViewer::Candidate { live_peer, .. } = viewer {
+            require_completed_handshake(live_peer)?;
         }
+        // Fenced means the last durable decision is unknown, and an unknown state is not reported
+        // as an open invitation.
+        self.require_not_fenced()?;
+        self.reload()?;
         if self.is_expired() {
             self.consume(PairingConsumedReason::Expired)?;
         }
@@ -941,7 +1078,7 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         if let Some(committed) = committed {
             return Ok(PairStatus::Committed {
                 device_id: committed.device_id,
-                grant_id: committed.grant_id,
+                grant_id: committed.grant.grant_id,
             });
         }
         Ok(match self.record.state {
@@ -953,35 +1090,20 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
                 // A locked candidate has an entry here only while this state machine is serving
                 // it. After a restart, or when the other entry mode holds it, there is none, and
                 // "locked" is still the honest answer.
-                let ready = self.attempts.get(&attempt_id).and_then(|attempt| {
-                    match (
-                        attempt.phase,
-                        attempt.transcript,
-                        attempt.host_bundle_hash,
-                        attempt.client_bundle.as_ref(),
-                    ) {
-                        (
-                            AttemptPhase::AwaitingApproval,
-                            Some(transcript),
-                            Some(host_hash),
-                            Some(client_bundle),
-                        ) => Some((transcript, host_hash, client_bundle)),
-                        _ => None,
-                    }
-                });
-                match ready {
-                    Some((transcript, host_hash, client_bundle)) => PairStatus::AwaitingApproval {
+                let ready = self
+                    .attempts
+                    .get(&attempt_id)
+                    .filter(|attempt| attempt.phase == AttemptPhase::AwaitingApproval)
+                    .is_some();
+                match (ready, self.locked_candidate()?) {
+                    (true, Some(approved)) => PairStatus::AwaitingApproval {
                         attempt_id,
-                        verification_value: verification_value(
-                            transcript,
-                            host_hash,
-                            bundles::bundle_hash(&client_bundle.bundle)?,
-                        ),
+                        verification_value: approved.verification_value(),
                         expires_at_ms: self.advertised_expires_at_ms,
                     },
                     // Locked, but the bundles are not both in yet: there is no verification value
                     // to show, and saying "open" would say another candidate could still take it.
-                    None => PairStatus::Locked {
+                    _ => PairStatus::Locked {
                         attempt_id,
                         expires_at_ms: self.advertised_expires_at_ms,
                     },
@@ -1012,25 +1134,54 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         live_peer: &dyn LivePeer,
         committed: Option<&PairingCommitment>,
     ) -> Result<bool> {
-        require_completed_handshake(live_peer)?;
         let endpoint = live_peer.live_endpoint()?;
         if let Some(committed) = committed {
             return Ok(
                 committed.attempt_id == attempt_id && committed.client_keys.transport == endpoint
             );
         }
-        // Before the bundle exchange the candidate has proved the code but not its endpoint, so
-        // there is nothing to check an asker against and the answer is the ambiguous refusal.
-        Ok(self
+        // The live attempt first, then the identity kept from it. The second is what answers a
+        // candidate after a denial, a cancellation or an expiry has cleared the attempts: the
+        // candidate still authenticated itself, and it is still the only one that may be told.
+        // Before the bundle exchange there is no authenticated endpoint at all, and then the
+        // answer is the ambiguous refusal.
+        if let Some(signed) = self
             .attempts
             .get(&attempt_id)
             .and_then(|attempt| attempt.client_bundle.as_ref())
-            .is_some_and(|signed| signed.bundle.endpoint_id == endpoint))
+        {
+            return Ok(signed.bundle.endpoint_id == endpoint);
+        }
+        Ok(self.last_candidate.is_some_and(|candidate| {
+            candidate.attempt_id == attempt_id && candidate.endpoint_id == endpoint
+        }))
     }
 
     fn require_issuing_owner(&self, owner: &OwnerContext) -> Result<()> {
         if owner != &self.issuing_owner {
             return Err(PairingError::NotIssuingOwner);
+        }
+        Ok(())
+    }
+
+    /// Refuses everything once a durable write has failed.
+    ///
+    /// The last decision is not known to have been recorded, so this invitation serves nobody: it
+    /// reports no status, accepts no candidate and consumes nothing until a restart cancels it.
+    /// Any other behaviour risks handing a spent guess back.
+    fn require_not_fenced(&self) -> Result<()> {
+        if self.fenced {
+            return Err(PairingError::Store {
+                reason: "this invitation was fenced by a failed write".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Reads the authoritative record. The store is where an invitation's state lives.
+    fn reload(&mut self) -> Result<()> {
+        if let Some(record) = self.store.load(self.record.invitation_id)? {
+            self.record = record;
         }
         Ok(())
     }
@@ -1045,16 +1196,11 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
 
     /// Reloads the authoritative record, drops timed-out candidates and checks the invitation.
     fn require_open(&mut self) -> Result<()> {
-        if self.fenced {
-            return Err(PairingError::Store {
-                reason: "this invitation was fenced by a failed write".to_owned(),
-            });
-        }
+        self.require_not_fenced()?;
         // The store is the authority. An invitation that offers both entry modes is served by two
-        // state machines over one record, so each reloads before it decides.
-        if let Some(record) = self.store.load(self.record.invitation_id)? {
-            self.record = record;
-        }
+        // state machines over one record, so each reloads before it decides and writes back only
+        // if the record has not moved.
+        self.reload()?;
         if let InvitationState::Consumed { reason } = self.record.state {
             return Err(PairingError::Consumed { reason });
         }
@@ -1071,22 +1217,38 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         self.attempts
             .retain(|id, attempt| Some(*id) == locked || now < attempt.deadline_monotonic_ms);
         if let Some(locked) = locked {
-            // A candidate already holds the invitation. The route it arrived by does not matter:
-            // whichever state machine reloaded this record refuses to start another candidate.
-            if !self.attempts.contains_key(&locked) {
+            let Some(attempt) = self.attempts.get(&locked) else {
+                // A candidate already holds the invitation, by the other entry mode or from
+                // before a restart. Whichever state machine reloaded this record refuses to start
+                // another candidate.
                 return Err(PairingError::CandidateLocked);
+            };
+            // Holding the invitation does not suspend the handshake deadline. A candidate that
+            // proved the code and then stopped would otherwise hold the invitation for its whole
+            // five minutes; the invitation is consumed instead, so the owner can issue another.
+            if attempt.phase != AttemptPhase::AwaitingApproval
+                && now >= attempt.deadline_monotonic_ms
+            {
+                self.consume(PairingConsumedReason::Expired)?;
+                return Err(PairingError::Expired);
             }
         }
         Ok(())
     }
 
-    /// Writes a record and adopts it, fencing the invitation when the write fails.
-    fn persist(&mut self, record: InvitationRecord) -> Result<()> {
-        match self.store.save(&record) {
-            Ok(()) => {
-                self.record = record;
+    /// Writes a record if the stored one is still the one this decision was made from.
+    ///
+    /// Three outcomes, and all three are decided here rather than by the caller: the write landed;
+    /// another writer moved the record first, so this decision is void and its record is adopted;
+    /// or the store failed, and the invitation is fenced because the decision may or may not have
+    /// been recorded.
+    fn persist(&mut self, next: InvitationRecord) -> Result<()> {
+        match self.store.transition(&self.record, &next) {
+            Ok(TransitionOutcome::Written) => {
+                self.record = next;
                 Ok(())
             }
+            Ok(TransitionOutcome::Stale(current)) => Err(self.adopt_stale(current)),
             Err(error) => {
                 // The decision could not be recorded, so it is not made. The invitation serves
                 // nobody until a restart cancels it: that is what stops a spent guess coming back.
@@ -1094,6 +1256,21 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
                 Err(error)
             }
         }
+    }
+
+    /// Adopts a record another writer wrote first, and returns why this decision is void.
+    fn adopt_stale(&mut self, current: InvitationRecord) -> PairingError {
+        let refusal = match current.state {
+            InvitationState::Consumed { reason } => PairingError::Consumed { reason },
+            InvitationState::Committed => PairingError::AlreadyCommitted,
+            InvitationState::Locked { .. } => PairingError::CandidateLocked,
+            InvitationState::Open => PairingError::ContextMismatch {
+                what: "an invitation record another writer changed",
+            },
+        };
+        self.record = current;
+        self.attempts.clear();
+        refusal
     }
 
     fn consume(&mut self, reason: PairingConsumedReason) -> Result<()> {
@@ -1139,21 +1316,6 @@ fn require_phase(attempt: &HostAttempt, expected: AttemptPhase) -> Result<()> {
     })
 }
 
-/// Returns the digest an owner's device-confirmation challenge must name.
-///
-/// It covers the exact transcript and client bundle the owner was shown, so a confirmation
-/// obtained for one candidate cannot approve another.
-#[must_use]
-pub fn confirm_action_digest(transcript: Digest256, client_bundle_hash: Digest256) -> Digest256 {
-    Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(
-        &kr_cbor::CanonicalValue::Array(vec![
-            kr_cbor::CanonicalValue::text("kr-pair/confirm-device/1"),
-            kr_cbor::CanonicalValue::bytes(transcript.as_bytes().as_slice()),
-            kr_cbor::CanonicalValue::bytes(client_bundle_hash.as_bytes().as_slice()),
-        ]),
-    )))
-}
-
 /// Who is asking for an invitation's status.
 #[derive(Clone, Copy)]
 pub enum StatusViewer<'a> {
@@ -1189,14 +1351,72 @@ impl core::fmt::Debug for StatusViewer<'_> {
 /// Returns [`PairingError::Store`].
 pub fn cancel_unfinished_invitations(store: &dyn InvitationStore) -> Result<Vec<InvitationId>> {
     let mut cancelled = Vec::new();
-    for mut record in store.unfinished()? {
-        record.state = InvitationState::Consumed {
+    for record in store.unfinished()? {
+        let mut next = record.clone();
+        next.state = InvitationState::Consumed {
             reason: PairingConsumedReason::HostRestarted,
         };
-        store.save(&record)?;
-        cancelled.push(record.invitation_id);
+        // Conditional, like every other write: an invitation somebody moved between the listing
+        // and here is left as they left it rather than overwritten by a sweep.
+        if store.transition(&record, &next)? == TransitionOutcome::Written {
+            cancelled.push(record.invitation_id);
+        }
     }
     Ok(cancelled)
+}
+
+/// Retrieves a completed pairing by invitation identity, for a host that has restarted.
+///
+/// A pairing's result lives in the store, not in the invitation object: that object is gone after
+/// a restart, and the candidate may still be asking. This is the host-side lookup, for code inside
+/// the host's own trust boundary.
+///
+/// # Errors
+///
+/// Returns [`PairingError::Store`].
+pub fn recover_commitment(
+    store: &dyn InvitationStore,
+    invitation_id: InvitationId,
+) -> Result<Option<PairingCommitment>> {
+    store.commitment(invitation_id)
+}
+
+/// Answers a candidate that asks what became of a pairing, after the host restarted.
+///
+/// The candidate proves the same endpoint its bundle declared and names its own attempt, so this
+/// tells nobody else anything. It reports a committed pairing from the commitment and everything
+/// else from the record.
+///
+/// # Errors
+///
+/// Returns [`PairingError::EarlyData`] in 0-RTT, [`PairingError::NotIssuingOwner`] when the asker
+/// is not that candidate, and [`PairingError::Store`].
+pub fn recover_candidate_status(
+    store: &dyn InvitationStore,
+    invitation_id: InvitationId,
+    attempt_id: AttemptId,
+    live_peer: &dyn LivePeer,
+) -> Result<PairStatus> {
+    require_completed_handshake(live_peer)?;
+    let endpoint = live_peer.live_endpoint()?;
+    if let Some(committed) = store.commitment(invitation_id)? {
+        if committed.attempt_id != attempt_id || committed.client_keys.transport != endpoint {
+            return Err(PairingError::NotIssuingOwner);
+        }
+        return Ok(PairStatus::Committed {
+            device_id: committed.device_id,
+            grant_id: committed.grant.grant_id,
+        });
+    }
+    let Some(record) = store.load(invitation_id)? else {
+        return Err(PairingError::NotIssuingOwner);
+    };
+    match record.state {
+        // Nothing here can prove which candidate is asking, because the endpoint a candidate
+        // authenticated with lives in the invitation object that the restart lost.
+        InvitationState::Consumed { reason } => Ok(PairStatus::Consumed { reason }),
+        _ => Err(PairingError::NotIssuingOwner),
+    }
 }
 
 /// Returns 128 random bits.

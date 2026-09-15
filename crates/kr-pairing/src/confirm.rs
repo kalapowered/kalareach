@@ -186,6 +186,13 @@ pub fn verify_confirmation(
 /// User-presence verification and the challenge-consumption transition are both part of the host's
 /// acceptance record, so consumption happens here and exactly once.
 ///
+/// The ledger keeps the whole challenge, not just its identity. A caller presents a challenge and
+/// a proof; if it kept only the identity, an attacker who could influence what the caller presents
+/// could hand over a challenge with the same identity and different contents, and the signature
+/// check would pass against the substituted text. Comparing the retained challenge with the
+/// presented one closes that, and it is also what makes the retained copy the host's own record of
+/// what the owner was asked.
+///
 /// The deadline this enforces is the host's own, on the monotonic clock and tied to the boot it
 /// was issued in. The `expires_at_ms` inside the request is the same interval expressed on the
 /// wall clock, which is what a signer and a paired owner device can read; it is not what the host
@@ -194,13 +201,14 @@ pub fn verify_confirmation(
 /// a ceremony across one.
 #[derive(Debug, Default)]
 pub struct ConfirmationLedger {
-    outstanding: BTreeMap<[u8; 16], ChallengeDeadline>,
+    outstanding: BTreeMap<[u8; 16], OutstandingChallenge>,
 }
 
-/// When one outstanding challenge stops being answerable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ChallengeDeadline {
-    monotonic_ms: u64,
+/// One challenge the host issued, as the host recorded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OutstandingChallenge {
+    request: OwnerConfirmationRequest,
+    deadline_monotonic_ms: u64,
     boot_identity: BootIdentity,
 }
 
@@ -215,8 +223,9 @@ impl ConfirmationLedger {
     pub fn issue(&mut self, request: &OwnerConfirmationRequest, clock: &dyn PairingClock) {
         self.outstanding.insert(
             *request.confirmation_id.get().as_bytes(),
-            ChallengeDeadline {
-                monotonic_ms: clock
+            OutstandingChallenge {
+                request: request.clone(),
+                deadline_monotonic_ms: clock
                     .monotonic_ms()
                     .saturating_add(CONFIRMATION_LIFETIME_MS),
                 boot_identity: clock.boot_identity(),
@@ -224,27 +233,46 @@ impl ConfirmationLedger {
         );
     }
 
+    /// Returns the challenge the host issued under this identity, while it is still outstanding.
+    #[must_use]
+    pub fn outstanding(
+        &self,
+        confirmation_id: ConfirmationId,
+    ) -> Option<&OwnerConfirmationRequest> {
+        self.outstanding
+            .get(confirmation_id.get().as_bytes())
+            .map(|challenge| &challenge.request)
+    }
+
     /// Consumes a challenge, which succeeds exactly once and only before its deadline.
+    ///
+    /// The presented challenge must equal the one the host issued, member for member.
     ///
     /// # Errors
     ///
     /// Returns [`PairingError::OwnerConfirmationRequired`] when the challenge was never issued,
-    /// has already been used, has run out, or belongs to an earlier boot.
+    /// differs from the one issued, has already been used, has run out, or belongs to an earlier
+    /// boot.
     pub fn consume(
         &mut self,
         request: &OwnerConfirmationRequest,
         clock: &dyn PairingClock,
     ) -> Result<()> {
-        let Some(deadline) = self
+        let Some(challenge) = self
             .outstanding
             .remove(request.confirmation_id.get().as_bytes())
         else {
             return Err(PairingError::OwnerConfirmationRequired);
         };
-        if deadline.boot_identity != clock.boot_identity()
-            || clock.monotonic_ms() >= deadline.monotonic_ms
+        if &challenge.request != request {
+            // Removed either way: something presented an identity the host issued with contents it
+            // did not, and the honest challenge is not left open beside that.
+            return Err(PairingError::OwnerConfirmationRequired);
+        }
+        if challenge.boot_identity != clock.boot_identity()
+            || clock.monotonic_ms() >= challenge.deadline_monotonic_ms
         {
-            // It is removed either way: an expired challenge is spent, not retryable.
+            // An expired challenge is spent, not retryable.
             return Err(PairingError::OwnerConfirmationRequired);
         }
         Ok(())
@@ -254,8 +282,9 @@ impl ConfirmationLedger {
     pub fn expire(&mut self, clock: &dyn PairingClock) {
         let now = clock.monotonic_ms();
         let boot = clock.boot_identity();
-        self.outstanding
-            .retain(|_, deadline| deadline.boot_identity == boot && now < deadline.monotonic_ms);
+        self.outstanding.retain(|_, challenge| {
+            challenge.boot_identity == boot && now < challenge.deadline_monotonic_ms
+        });
     }
 
     /// Returns how many challenges are outstanding.
@@ -278,9 +307,9 @@ impl ConfirmationLedger {
 /// one ceremony authorises exactly one action: a proof replayed at the next sensitive step finds
 /// nothing outstanding.
 ///
-/// The caller still checks that the challenge describes the action it is about to take. A
-/// confirmation of *something* is not a confirmation of *this*, which is why the action and the
-/// digest are compared by [`require_action`] before the proof is accepted.
+/// A confirmation of *something* is not a confirmation of *this*, so the challenge is compared
+/// with [`ConfirmationExpectation`] first: the action, the digest, the host, the destination keys
+/// and the rights all have to be the ones the caller is about to act on.
 ///
 /// # Errors
 ///
@@ -292,25 +321,56 @@ pub fn accept_confirmation(
     proof: &OwnerConfirmationProof,
     signer: &AuthorisationKey,
     enrolment: HostEnrolment,
+    expectation: &ConfirmationExpectation<'_>,
 ) -> Result<()> {
+    expectation.require(request)?;
     verify_confirmation(clock, request, proof, signer, enrolment)?;
     ledger.consume(request, clock)
 }
 
-/// Checks that a challenge describes the action a caller is about to take.
+/// What a caller is about to do, as the challenge must describe it.
 ///
-/// # Errors
-///
-/// Returns [`PairingError::OwnerConfirmationRequired`] when the action or the digest differs.
-pub fn require_action(
-    request: &OwnerConfirmationRequest,
-    action: SensitiveAction,
-    action_digest: Digest256,
-) -> Result<()> {
-    if request.action != action || request.action_digest != action_digest {
-        return Err(PairingError::OwnerConfirmationRequired);
+/// Section 10 binds a confirmation to the exact action digest, destination keys and rights, host
+/// and nonce. Checking the digest alone is not that: the owner is shown the destination and the
+/// rights, and a host that ignored those fields would accept a challenge answered for a different
+/// device or a different set of permissions than the one it is about to write.
+#[derive(Clone, Copy, Debug)]
+pub struct ConfirmationExpectation<'a> {
+    /// The action.
+    pub action: SensitiveAction,
+    /// The digest of what is being authorised.
+    pub action_digest: Digest256,
+    /// The host doing it.
+    pub host_device_id: DeviceId,
+    /// That host's endpoint.
+    pub host_endpoint_id: EndpointKey,
+    /// The device the action is about, when it is about one.
+    pub destination_keys: Option<&'a DevicePublicKeys>,
+    /// The rights it carries.
+    pub destination_rights: &'a CanonicalSet<ActionRight>,
+}
+
+impl ConfirmationExpectation<'_> {
+    /// Checks that a challenge describes exactly this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::OwnerConfirmationRequired`] when any member differs.
+    pub fn require(&self, request: &OwnerConfirmationRequest) -> Result<()> {
+        let destination = self
+            .destination_keys
+            .map_or_else(Nullable::null, |keys| Nullable::some(*keys));
+        if request.action != self.action
+            || request.action_digest != self.action_digest
+            || request.host_device_id != self.host_device_id
+            || request.host_endpoint_id != self.host_endpoint_id
+            || request.destination_keys != destination
+            || &request.destination_rights != self.destination_rights
+        {
+            return Err(PairingError::OwnerConfirmationRequired);
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Returns the digest of any canonical-CBOR value, which a challenge names as its action digest.
@@ -346,6 +406,35 @@ mod tests {
     impl OwnerConfirmation for DecliningCeremony {
         fn confirm(&self, _request: &OwnerConfirmationRequest) -> Result<OwnerConfirmationProof> {
             Err(PairingError::OwnerConfirmationRequired)
+        }
+    }
+
+    const HOST_DEVICE: [u8; 16] = [2; 16];
+    const HOST_ENDPOINT: [u8; 32] = [3; 32];
+
+    /// A destination bundle the challenges below never name.
+    fn destination() -> DevicePublicKeys {
+        DeviceKeys::generate().expect("keys").public_keys()
+    }
+
+    /// A right the challenges below never carry.
+    fn other_rights() -> CanonicalSet<ActionRight> {
+        [ActionRight::SessionView].into_iter().collect()
+    }
+
+    /// The expectation `request` below answers.
+    fn expectation<'a>(
+        action: SensitiveAction,
+        digest: Digest256,
+        rights: &'a CanonicalSet<ActionRight>,
+    ) -> ConfirmationExpectation<'a> {
+        ConfirmationExpectation {
+            action,
+            action_digest: digest,
+            host_device_id: DeviceId::new(Uuid::from_bytes(HOST_DEVICE)),
+            host_endpoint_id: EndpointKey::from_bytes(HOST_ENDPOINT),
+            destination_keys: None,
+            destination_rights: rights,
         }
     }
 
@@ -631,31 +720,45 @@ mod tests {
         )
         .expect("a proof");
 
-        // The challenge is for ConfirmDevice over digest [1; 32].
-        assert!(matches!(
-            require_action(
-                &challenge,
-                SensitiveAction::EnlargeGrant,
-                Digest256::from_bytes([1; 32])
-            ),
-            Err(PairingError::OwnerConfirmationRequired)
-        ));
-        assert!(matches!(
-            require_action(
-                &challenge,
-                SensitiveAction::ConfirmDevice,
-                Digest256::from_bytes([2; 32])
-            ),
-            Err(PairingError::OwnerConfirmationRequired)
-        ));
-        assert!(
-            require_action(
-                &challenge,
-                SensitiveAction::ConfirmDevice,
-                Digest256::from_bytes([1; 32])
-            )
-            .is_ok()
-        );
+        // The challenge is for ConfirmDevice over digest [1; 32], from this host, with no
+        // destination device and no rights. Each member is checked.
+        let rights = CanonicalSet::new();
+        let elsewhere = destination();
+        let more_rights = other_rights();
+        let digest = Digest256::from_bytes([1; 32]);
+        let good = expectation(SensitiveAction::ConfirmDevice, digest, &rights);
+        assert!(good.require(&challenge).is_ok());
+        for wrong in [
+            ConfirmationExpectation {
+                action: SensitiveAction::EnlargeGrant,
+                ..good
+            },
+            ConfirmationExpectation {
+                action_digest: Digest256::from_bytes([2; 32]),
+                ..good
+            },
+            ConfirmationExpectation {
+                host_device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
+                ..good
+            },
+            ConfirmationExpectation {
+                host_endpoint_id: EndpointKey::from_bytes([9; 32]),
+                ..good
+            },
+            ConfirmationExpectation {
+                destination_keys: Some(&elsewhere),
+                ..good
+            },
+            ConfirmationExpectation {
+                destination_rights: &more_rights,
+                ..good
+            },
+        ] {
+            assert!(matches!(
+                wrong.require(&challenge),
+                Err(PairingError::OwnerConfirmationRequired)
+            ));
+        }
 
         assert!(
             accept_confirmation(
@@ -665,6 +768,7 @@ mod tests {
                 &proof,
                 owner.authorisation.public(),
                 HostEnrolment::Enrolled,
+                &good,
             )
             .is_ok()
         );
@@ -677,6 +781,45 @@ mod tests {
                 &proof,
                 owner.authorisation.public(),
                 HostEnrolment::Enrolled,
+                &good,
+            ),
+            Err(PairingError::OwnerConfirmationRequired)
+        ));
+    }
+
+    #[test]
+    fn a_challenge_with_substituted_contents_is_not_the_one_the_host_issued() {
+        let clock = TestClock::new();
+        let owner = DeviceKeys::generate().expect("keys");
+        let mut ledger = ConfirmationLedger::new();
+        let issued = request(&clock);
+        ledger.issue(&issued, &clock);
+
+        // Same identity, different rights. A ledger that kept only the identity would check the
+        // signature against this text and accept it.
+        let mut substituted = issued.clone();
+        substituted.destination_rights = other_rights();
+        let proof = sign_confirmation(
+            &owner.authorisation,
+            &substituted,
+            ConfirmationChannel::OwnerDevicePresence,
+        )
+        .expect("a proof");
+        let rights = other_rights();
+        let expectation = expectation(
+            SensitiveAction::ConfirmDevice,
+            Digest256::from_bytes([1; 32]),
+            &rights,
+        );
+        assert!(matches!(
+            accept_confirmation(
+                &mut ledger,
+                &clock,
+                &substituted,
+                &proof,
+                owner.authorisation.public(),
+                HostEnrolment::Enrolled,
+                &expectation,
             ),
             Err(PairingError::OwnerConfirmationRequired)
         ));
@@ -696,6 +839,7 @@ mod tests {
             ConfirmationChannel::OwnerDevicePresence,
         )
         .expect("a proof");
+        let rights = CanonicalSet::new();
         assert!(
             accept_confirmation(
                 &mut ledger,
@@ -704,6 +848,11 @@ mod tests {
                 &forged,
                 owner.authorisation.public(),
                 HostEnrolment::Enrolled,
+                &expectation(
+                    SensitiveAction::ConfirmDevice,
+                    Digest256::from_bytes([1; 32]),
+                    &rights
+                ),
             )
             .is_err()
         );

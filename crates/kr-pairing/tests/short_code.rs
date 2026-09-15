@@ -13,9 +13,11 @@ use kr_pairing::code::EnteredCode;
 use kr_pairing::confirm::{
     ConfirmationLedger, HostEnrolment, request_confirmation, sign_confirmation,
 };
+use kr_pairing::grants::{GrantIdentities, GrantKind};
 use kr_pairing::host::{
-    HANDSHAKE_DEADLINE_MS, HostIdentity, HostInvitation, InvitationProposal, OwnerApproval,
-    OwnerContext, StatusViewer, cancel_unfinished_invitations, confirm_action_digest,
+    ApprovedCandidate, HANDSHAKE_DEADLINE_MS, HostIdentity, HostInvitation, InvitationProposal,
+    OwnerApproval, OwnerContext, StatusViewer, cancel_unfinished_invitations,
+    recover_candidate_status, recover_commitment,
 };
 use kr_pairing::platform::{
     InvitationState, LocatorRecord, TestClient, TestClientBudgetStore, TestClock,
@@ -23,11 +25,12 @@ use kr_pairing::platform::{
 };
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
-use kr_protocol::ids::{ActorId, DeviceId, DeviceKeyRevision, GrantId};
+use kr_protocol::ids::{ActorId, AuthorityRevision, DeviceId, DeviceKeyRevision, GrantId};
 use kr_protocol::pairing::{
-    ClientBundle, ConfirmationChannel, DeviceName, DevicePlatform, INVITATION_LIFETIME_MS,
-    MAX_CONFIRMATION_FAILURES, NetworkConfig, OwnerConfirmationProof, OwnerConfirmationRequest,
-    PairStatus, PairingConsumedReason, ProposedGrant, RendezvousOrigin, SensitiveAction,
+    ClientBundle, ConfirmationChannel, DeviceName, DevicePlatform, DevicePublicKeys,
+    INVITATION_LIFETIME_MS, MAX_CONFIRMATION_FAILURES, NetworkConfig, OwnerConfirmationProof,
+    OwnerConfirmationRequest, PairStatus, PairingConsumedReason, ProposedGrant, RendezvousOrigin,
+    SensitiveAction,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{
@@ -148,13 +151,18 @@ impl Harness {
     }
 
     /// Runs the ceremony: issues a challenge, records it and signs a proof for it.
-    fn approval(&self, action: SensitiveAction, digest: Digest256) -> Approval {
+    fn approval(
+        &self,
+        action: SensitiveAction,
+        digest: Digest256,
+        destination_keys: Option<DevicePublicKeys>,
+    ) -> Approval {
         let request = request_confirmation(
             &self.clock,
             action,
             digest,
-            None,
-            BTreeSet::new(),
+            destination_keys,
+            proposal().actions.iter().copied().collect::<BTreeSet<_>>(),
             self.host_device_id,
             *self.host_keys.transport.public(),
         )
@@ -173,7 +181,35 @@ impl Harness {
         self.approval(
             SensitiveAction::IssueInvitation,
             kr_pairing::confirm::action_digest(&proposal()).expect("a digest"),
+            None,
         )
+    }
+
+    /// The challenge that approves whatever candidate the host currently holds.
+    fn device_approval(&self, approved: &ApprovedCandidate) -> Approval {
+        self.approval(
+            SensitiveAction::ConfirmDevice,
+            approved.action_digest(),
+            Some(self.client_keys.public_keys()),
+        )
+    }
+
+    fn proposal_for(&self) -> InvitationProposal {
+        InvitationProposal {
+            origin: origin(),
+            host: self.identity(),
+            proposed_grant: proposal(),
+            grant_kind: GrantKind::SessionInvitation,
+        }
+    }
+
+    fn grant_identities(&self) -> GrantIdentities {
+        GrantIdentities {
+            grant_id: GrantId::new(Uuid::from_bytes([8; 16])),
+            issuer_device_id: self.host_device_id,
+            recipient_device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
+            authority_revision: AuthorityRevision::new(1),
+        }
     }
 
     fn issue(&self) -> Host<'_> {
@@ -182,11 +218,7 @@ impl Harness {
             &self.store,
             &self.clock,
             &self.service,
-            InvitationProposal {
-                origin: origin(),
-                host: self.identity(),
-                proposed_grant: proposal(),
-            },
+            self.proposal_for(),
             &approval.by(&self.issuing_owner, self.signer()),
             &mut self.ledger.borrow_mut(),
         )
@@ -250,32 +282,27 @@ fn run_exchange(
     Ok((client, client_value))
 }
 
-/// Returns the transcript and client bundle hash a locked candidate produced.
-fn locked_values(host: &Host<'_>) -> (Digest256, Digest256) {
-    (
-        host.locked_transcript().expect("a locked transcript"),
-        host.locked_client_bundle_hash()
-            .expect("a hash")
-            .expect("a locked candidate"),
-    )
+/// Returns the three digests the owner is shown for the candidate holding the invitation.
+fn locked_values(host: &Host<'_>) -> ApprovedCandidate {
+    host.locked_candidate()
+        .expect("a hash")
+        .expect("a locked candidate")
 }
 
 /// Approves the candidate the host currently holds, as the owner that issued the invitation.
-fn approve(harness: &Harness, host: &mut Host<'_>) -> Result<(), PairingError> {
-    let (transcript, client_hash) = locked_values(host);
-    let approval = harness.approval(
-        SensitiveAction::ConfirmDevice,
-        confirm_action_digest(transcript, client_hash),
-    );
+fn approve(
+    harness: &Harness,
+    host: &mut Host<'_>,
+) -> Result<kr_pairing::platform::PairingCommitment, PairingError> {
+    let approved = locked_values(host);
+    let approval = harness.device_approval(&approved);
     host.confirm(
         &approval.by(&harness.issuing_owner, harness.signer()),
         &mut harness.ledger.borrow_mut(),
-        transcript,
-        client_hash,
-        DeviceId::new(Uuid::from_bytes([9; 16])),
-        GrantId::new(Uuid::from_bytes([8; 16])),
-    )?;
-    Ok(())
+        &approved,
+        &harness.grant_identities(),
+        None,
+    )
 }
 
 #[test]
@@ -299,22 +326,8 @@ fn a_complete_pairing_commits_the_device_and_the_proposed_grant() {
     };
     assert_eq!(verification_value, value);
 
-    // The owner approves the exact transcript and client bundle hash it was shown.
-    let (transcript, client_hash) = locked_values(&host);
-    let approval = harness.approval(
-        SensitiveAction::ConfirmDevice,
-        confirm_action_digest(transcript, client_hash),
-    );
-    let committed = host
-        .confirm(
-            &approval.by(&harness.issuing_owner, harness.signer()),
-            &mut harness.ledger.borrow_mut(),
-            transcript,
-            client_hash,
-            DeviceId::new(Uuid::from_bytes([9; 16])),
-            GrantId::new(Uuid::from_bytes([8; 16])),
-        )
-        .expect("a commitment");
+    // The owner approves the exact transcript and the two bundle hashes it was shown.
+    let committed = approve(&harness, &mut host).expect("a commitment");
     assert_eq!(committed.proposed_grant, proposal());
     assert_eq!(committed.verification_value, value);
     assert_eq!(
@@ -322,14 +335,42 @@ fn a_complete_pairing_commits_the_device_and_the_proposed_grant() {
         harness.client_keys.public_keys(),
         "the device record is written from the bundle the candidate signed"
     );
+    // The grant is issued inside the commit, not assumed: it carries the proposed rights and the
+    // identities only the host can assign.
+    assert_eq!(committed.grant.actions, proposal().actions);
+    assert_eq!(committed.grant.issuer_device_id, harness.host_device_id);
+    assert_eq!(committed.grant.recipient_device_id, committed.device_id);
+    assert_eq!(
+        committed.owner_confirmation.request.action,
+        SensitiveAction::ConfirmDevice,
+        "the proof that authorised this device is written with it"
+    );
     assert_eq!(host.record().state, InvitationState::Committed);
 
-    // The commitment is in the store, so a restarted host answers the retry from there.
-    let stored =
-        kr_pairing::platform::InvitationStore::commitment(&&harness.store, host.invitation_id())
-            .expect("a read")
-            .expect("a commitment");
+    // The commitment is in the store, so a restarted host answers the retry from there, with no
+    // invitation object left at all.
+    let invitation_id = host.invitation_id();
+    drop(host);
+    let stored = recover_commitment(&&harness.store, invitation_id)
+        .expect("a read")
+        .expect("a commitment");
     assert_eq!(stored, committed);
+    let peer = harness.client_peer();
+    assert!(matches!(
+        recover_candidate_status(&&harness.store, invitation_id, committed.attempt_id, &peer),
+        Ok(PairStatus::Committed { .. })
+    ));
+    // And only for that candidate, on its own endpoint.
+    let impostor = TestLivePeer::new(EndpointKey::from_bytes([0x77; 32]));
+    assert!(matches!(
+        recover_candidate_status(
+            &&harness.store,
+            invitation_id,
+            committed.attempt_id,
+            &impostor
+        ),
+        Err(PairingError::NotIssuingOwner)
+    ));
 }
 
 #[test]
@@ -544,6 +585,124 @@ fn an_aborted_candidate_frees_its_slot_and_a_locked_one_cannot_be_aborted() {
         host.abort(locked),
         Err(PairingError::CandidateLocked)
     ));
+}
+
+#[test]
+fn a_locked_candidate_that_stops_consumes_the_invitation() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+
+    // Drive the exchange to the lock and stop there, before the bundles.
+    let budget = TestClientBudgetStore::new().expect("a store");
+    let service = TestClient::new(LocatorRecord {
+        invitation_id: host.invitation_id(),
+        advertised_expires_at_ms: TimestampMs::new(0),
+    });
+    let (mut client, admission, _) =
+        ClientAttempt::start(&budget, &harness.clock, &service, &origin(), &entered)
+            .expect("an attempt");
+    let host_pake = host
+        .admit(admission.attempt_id, admission.client_nonce)
+        .expect("a slot");
+    let client_pake = client
+        .with_host_nonce(
+            host.context(admission.attempt_id)
+                .expect("a context")
+                .host_nonce,
+            &harness.clock,
+        )
+        .expect("a message");
+    host.receive_client_pake(admission.attempt_id, &client_pake)
+        .expect("a message");
+    let client_tag = client
+        .receive_host_pake(&host_pake, &harness.clock)
+        .expect("a tag");
+    host.verify_client_confirmation(admission.attempt_id, &client_tag)
+        .expect("a tag");
+    assert!(host.locked_attempt().is_some());
+
+    // Holding the invitation does not suspend the handshake deadline. Ten seconds later the
+    // invitation is consumed, so the owner can issue another rather than waiting five minutes.
+    harness.clock.advance(HANDSHAKE_DEADLINE_MS);
+    assert!(matches!(
+        host.seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation),
+        Err(PairingError::Expired)
+    ));
+    assert_eq!(
+        host.record().state,
+        InvitationState::Consumed {
+            reason: PairingConsumedReason::Expired
+        }
+    );
+}
+
+#[test]
+fn a_denied_candidate_is_still_told_what_happened() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+    run_exchange(&harness, &mut host, &entered).expect("a pairing");
+    let attempt_id = host.locked_attempt().expect("a candidate holds it");
+
+    host.deny(&harness.issuing_owner).expect("a denial");
+    // The denial cleared the attempts, and the candidate that authenticated itself is still the
+    // one device this answers.
+    let peer = harness.client_peer();
+    assert!(matches!(
+        host.status(StatusViewer::Candidate {
+            attempt_id,
+            live_peer: &peer,
+        }),
+        Ok(PairStatus::Consumed {
+            reason: PairingConsumedReason::Denied
+        })
+    ));
+    let impostor = TestLivePeer::new(EndpointKey::from_bytes([0x77; 32]));
+    assert!(matches!(
+        host.status(StatusViewer::Candidate {
+            attempt_id,
+            live_peer: &impostor,
+        }),
+        Err(PairingError::NotIssuingOwner)
+    ));
+}
+
+#[test]
+fn a_fenced_invitation_reports_nothing_and_consumes_nothing() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let wrong = EnteredCode::parse("aB3x-Yz7-9Qw").expect("a code");
+
+    harness.store.set_failing_writes(true);
+    assert!(matches!(
+        run_exchange(&harness, &mut host, &wrong),
+        Err(PairingError::Store { .. })
+    ));
+    harness.store.set_failing_writes(false);
+
+    // Nothing this invitation can say about itself is known to be true, so it says nothing.
+    let peer = harness.client_peer();
+    for outcome in [
+        host.status(StatusViewer::IssuingOwner(&harness.issuing_owner)),
+        host.status(StatusViewer::Candidate {
+            attempt_id: kr_pairing::host::new_attempt_id().expect("an attempt"),
+            live_peer: &peer,
+        }),
+    ] {
+        assert!(matches!(outcome, Err(PairingError::Store { .. })));
+    }
+    assert!(matches!(
+        host.cancel(&harness.issuing_owner),
+        Err(PairingError::Store { .. })
+    ));
+    assert!(matches!(
+        host.deny(&harness.issuing_owner),
+        Err(PairingError::Store { .. })
+    ));
+    // A restart is what clears it, and the guess it spent is still spent.
+    let cancelled = cancel_unfinished_invitations(&harness.store).expect("a sweep");
+    assert_eq!(cancelled, vec![host.invitation_id()]);
 }
 
 #[test]
@@ -834,21 +993,17 @@ fn only_the_issuing_owner_confirms_or_cancels() {
     let mut host = harness.issue();
     let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
     run_exchange(&harness, &mut host, &entered).expect("a pairing");
-    let (transcript, client_hash) = locked_values(&host);
-    let approval = harness.approval(
-        SensitiveAction::ConfirmDevice,
-        confirm_action_digest(transcript, client_hash),
-    );
+    let approved = locked_values(&host);
+    let approval = harness.device_approval(&approved);
     let stranger = owner(2);
 
     assert!(matches!(
         host.confirm(
             &approval.by(&stranger, harness.signer()),
             &mut harness.ledger.borrow_mut(),
-            transcript,
-            client_hash,
-            DeviceId::new(Uuid::from_bytes([9; 16])),
-            GrantId::new(Uuid::from_bytes([8; 16])),
+            &approved,
+            &harness.grant_identities(),
+            None,
         ),
         Err(PairingError::NotIssuingOwner)
     ));
@@ -862,10 +1017,27 @@ fn only_the_issuing_owner_confirms_or_cancels() {
         host.confirm(
             &approval.by(&harness.issuing_owner, harness.signer()),
             &mut harness.ledger.borrow_mut(),
-            Digest256::from_bytes([0xcc; 32]),
-            client_hash,
-            DeviceId::new(Uuid::from_bytes([9; 16])),
-            GrantId::new(Uuid::from_bytes([8; 16])),
+            &ApprovedCandidate {
+                transcript: Digest256::from_bytes([0xcc; 32]),
+                ..approved
+            },
+            &harness.grant_identities(),
+            None,
+        ),
+        Err(PairingError::ContextMismatch { .. })
+    ));
+
+    // And a grant issued by some other host device is refused too.
+    assert!(matches!(
+        host.confirm(
+            &approval.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
+            &approved,
+            &GrantIdentities {
+                issuer_device_id: DeviceId::new(Uuid::from_bytes([0x5a; 16])),
+                ..harness.grant_identities()
+            },
+            None,
         ),
         Err(PairingError::ContextMismatch { .. })
     ));
@@ -879,18 +1051,33 @@ fn issuing_and_confirming_both_need_a_fresh_single_use_confirmation() {
     let wrong_action = harness.approval(
         SensitiveAction::EnlargeGrant,
         kr_pairing::confirm::action_digest(&proposal()).expect("a digest"),
+        None,
     );
     assert!(matches!(
         HostInvitation::issue(
             &harness.store,
             &harness.clock,
             &harness.service,
-            InvitationProposal {
-                origin: origin(),
-                host: harness.identity(),
-                proposed_grant: proposal(),
-            },
+            harness.proposal_for(),
             &wrong_action.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
+        ),
+        Err(PairingError::OwnerConfirmationRequired)
+    ));
+
+    // Nor does one naming a destination device: an invitation is issued before anybody answers it.
+    let premature = harness.approval(
+        SensitiveAction::IssueInvitation,
+        kr_pairing::confirm::action_digest(&proposal()).expect("a digest"),
+        Some(harness.client_keys.public_keys()),
+    );
+    assert!(matches!(
+        HostInvitation::issue(
+            &harness.store,
+            &harness.clock,
+            &harness.service,
+            harness.proposal_for(),
+            &premature.by(&harness.issuing_owner, harness.signer()),
             &mut harness.ledger.borrow_mut(),
         ),
         Err(PairingError::OwnerConfirmationRequired)
@@ -904,11 +1091,7 @@ fn issuing_and_confirming_both_need_a_fresh_single_use_confirmation() {
             &harness.store,
             &harness.clock,
             &harness.service,
-            InvitationProposal {
-                origin: origin(),
-                host: harness.identity(),
-                proposed_grant: proposal(),
-            },
+            harness.proposal_for(),
             &good.by(&harness.issuing_owner, impostor.authorisation.public()),
             &mut harness.ledger.borrow_mut(),
         ),
@@ -919,11 +1102,7 @@ fn issuing_and_confirming_both_need_a_fresh_single_use_confirmation() {
         &harness.store,
         &harness.clock,
         &harness.service,
-        InvitationProposal {
-            origin: origin(),
-            host: harness.identity(),
-            proposed_grant: proposal(),
-        },
+        harness.proposal_for(),
         &good.by(&harness.issuing_owner, harness.signer()),
         &mut harness.ledger.borrow_mut(),
     )
@@ -931,29 +1110,45 @@ fn issuing_and_confirming_both_need_a_fresh_single_use_confirmation() {
 
     let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
     run_exchange(&harness, &mut host, &entered).expect("a pairing");
-    let (transcript, client_hash) = locked_values(&host);
+    let approved = locked_values(&host);
 
     // A confirmation naming another candidate does not approve this one.
-    let elsewhere = harness.approval(
-        SensitiveAction::ConfirmDevice,
-        confirm_action_digest(Digest256::from_bytes([3; 32]), client_hash),
-    );
+    let elsewhere = harness.device_approval(&ApprovedCandidate {
+        transcript: Digest256::from_bytes([3; 32]),
+        ..approved
+    });
     assert!(matches!(
         host.confirm(
             &elsewhere.by(&harness.issuing_owner, harness.signer()),
             &mut harness.ledger.borrow_mut(),
-            transcript,
-            client_hash,
-            DeviceId::new(Uuid::from_bytes([9; 16])),
-            GrantId::new(Uuid::from_bytes([8; 16])),
+            &approved,
+            &harness.grant_identities(),
+            None,
+        ),
+        Err(PairingError::OwnerConfirmationRequired)
+    ));
+
+    // Nor does one naming another device as its destination.
+    let other_device = harness.approval(
+        SensitiveAction::ConfirmDevice,
+        approved.action_digest(),
+        Some(impostor.public_keys()),
+    );
+    assert!(matches!(
+        host.confirm(
+            &other_device.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
+            &approved,
+            &harness.grant_identities(),
+            None,
         ),
         Err(PairingError::OwnerConfirmationRequired)
     ));
 
     approve(&harness, &mut host).expect("a commitment");
-    // Two challenges were never answered, because the proofs presented for them named another
-    // action. They stay answerable until they run out, and then they are gone.
-    assert_eq!(harness.ledger.borrow().len(), 2);
+    // Four challenges were never answered, because the proofs presented for them described
+    // something else. They stay answerable until they run out, and then they are gone.
+    assert_eq!(harness.ledger.borrow().len(), 4);
     harness
         .clock
         .advance(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS);
@@ -967,22 +1162,15 @@ fn a_transport_retry_retrieves_the_committed_result() {
     let mut host = harness.issue();
     let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
     run_exchange(&harness, &mut host, &entered).expect("a pairing");
-    let (transcript, client_hash) = locked_values(&host);
-
-    let device_id = DeviceId::new(Uuid::from_bytes([9; 16]));
-    let grant_id = GrantId::new(Uuid::from_bytes([8; 16]));
-    let first_approval = harness.approval(
-        SensitiveAction::ConfirmDevice,
-        confirm_action_digest(transcript, client_hash),
-    );
+    let approved = locked_values(&host);
+    let first_approval = harness.device_approval(&approved);
     let first = host
         .confirm(
             &first_approval.by(&harness.issuing_owner, harness.signer()),
             &mut harness.ledger.borrow_mut(),
-            transcript,
-            client_hash,
-            device_id,
-            grant_id,
+            &approved,
+            &harness.grant_identities(),
+            None,
         )
         .expect("a commitment");
     // A retry with different identities still returns the committed result: it cannot replace the
@@ -991,10 +1179,13 @@ fn a_transport_retry_retrieves_the_committed_result() {
         .confirm(
             &first_approval.by(&harness.issuing_owner, harness.signer()),
             &mut harness.ledger.borrow_mut(),
-            transcript,
-            client_hash,
-            DeviceId::new(Uuid::from_bytes([0xdd; 16])),
-            GrantId::new(Uuid::from_bytes([0xee; 16])),
+            &approved,
+            &GrantIdentities {
+                grant_id: GrantId::new(Uuid::from_bytes([0xee; 16])),
+                recipient_device_id: DeviceId::new(Uuid::from_bytes([0xdd; 16])),
+                ..harness.grant_identities()
+            },
+            None,
         )
         .expect("the same commitment");
     assert_eq!(first, second);
@@ -1014,8 +1205,7 @@ fn a_commitment_that_cannot_be_written_is_not_reported_as_a_pairing() {
     ));
     harness.store.set_failing_writes(false);
     assert_eq!(
-        kr_pairing::platform::InvitationStore::commitment(&&harness.store, host.invitation_id())
-            .expect("a read"),
+        recover_commitment(&&harness.store, host.invitation_id()).expect("a read"),
         None,
         "nothing was written, so nothing is reported"
     );

@@ -9,8 +9,13 @@
 //! Two of the contracts are about atomicity rather than about mechanism, because the rules they
 //! carry cannot be enforced from here:
 //!
-//! * [`InvitationStore::commit`] writes the device record, the grant, the consumed invitation and
-//!   the security event in one transaction. A pairing reports success only after it returns.
+//! * [`InvitationStore::transition`] and [`InvitationStore::commit`] write only when the stored
+//!   record is still exactly the one the caller decided from. One invitation may be served by two
+//!   state machines at once, so a plain write would let the slower one undo a lock, a spent guess
+//!   or a consumption the other had already recorded.
+//! * [`InvitationStore::commit`] also writes the device record, the validated grant, the consumed
+//!   invitation, the owner's proof and the security event in one transaction. A pairing reports
+//!   success only after it returns.
 //! * [`ClientBudgetStore::update`] applies one read-modify-write to a code's counter atomically. A
 //!   separate read and write would let two entries of the same code both see four attempts.
 
@@ -18,7 +23,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use kr_crypto::secret::SymmetricKey;
-use kr_protocol::ids::{AttemptId, DeviceId, GrantId, InvitationId};
+use kr_protocol::grant::Grant;
+use kr_protocol::ids::{AttemptId, DeviceId, InvitationId};
 use kr_protocol::pairing::{
     ClientBundle, DevicePublicKeys, Locator, OwnerConfirmationProof, OwnerConfirmationRequest,
     ProposedGrant, RendezvousOrigin,
@@ -207,8 +213,8 @@ pub struct PairingCommitment {
     pub attempt_id: AttemptId,
     /// The device record the host created.
     pub device_id: DeviceId,
-    /// The grant the host issued.
-    pub grant_id: GrantId,
+    /// The grant the host issued, validated and narrowed against its parent before it was written.
+    pub grant: Grant,
     /// The candidate's complete purpose-key bundle.
     pub client_keys: DevicePublicKeys,
     /// The candidate's display bundle, for a short-code pairing. Display text, never authority.
@@ -217,19 +223,39 @@ pub struct PairingCommitment {
     pub proposed_grant: ProposedGrant,
     /// The value both devices displayed, recorded so the security event can name it.
     pub verification_value: String,
+    /// The owner confirmation this pairing was accepted under.
+    ///
+    /// Section 10 makes user-presence verification and the challenge-consumption transition part
+    /// of the host's acceptance record, so the proof is written with the pairing rather than
+    /// checked and forgotten: afterwards the host can show which challenge, which channel and
+    /// which signer authorised this exact device.
+    pub owner_confirmation: OwnerConfirmationProof,
     /// When the host committed it, in UTC milliseconds.
     pub committed_at_ms: TimestampMs,
 }
 
+/// What a conditional write did.
+///
+/// A stale outcome is not a failure of the store: it means another writer moved the record first,
+/// and it carries what the record now says so the caller can decide what that means.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransitionOutcome {
+    /// The record was exactly as expected and the new one was written.
+    Written,
+    /// The record had moved. Nothing was written; this is what it says now.
+    Stale(InvitationRecord),
+}
+
 /// Where the host keeps invitation state across a restart.
 pub trait InvitationStore {
-    /// Writes a record, replacing any earlier one for the same invitation.
+    /// Writes a record for an invitation that has none yet.
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::Store`] when the write fails. A failed write is a failed step: the
-    /// state machine does not proceed on state it could not persist.
-    fn save(&self, record: &InvitationRecord) -> Result<()>;
+    /// Returns [`PairingError::Store`] when the write fails or the invitation already exists. A
+    /// failed write is a failed step: the state machine does not proceed on state it could not
+    /// persist.
+    fn create(&self, record: &InvitationRecord) -> Result<()>;
 
     /// Reads a record.
     ///
@@ -238,21 +264,42 @@ pub trait InvitationStore {
     /// Returns [`PairingError::Store`].
     fn load(&self, invitation_id: InvitationId) -> Result<Option<InvitationRecord>>;
 
-    /// Writes the record and the commitment in **one** transaction.
+    /// Replaces `expected` with `next`, and only if the stored record is still exactly `expected`.
     ///
-    /// The device record, the grant, the consumed invitation and the security event are one
-    /// transition, and a pairing reports success only after this returns. An implementation that
-    /// wrote them separately would let a crash leave a device with no grant, a grant with no
-    /// device, or a completed pairing with no security event.
+    /// The comparison and the write are one transaction. One invitation may offer a short code and
+    /// a direct QR, and both routes decide from a record they read a moment earlier; without this
+    /// the slower writer would quietly undo the faster one's lock, spent guess or consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::Store`] when the transaction fails.
+    fn transition(
+        &self,
+        expected: &InvitationRecord,
+        next: &InvitationRecord,
+    ) -> Result<TransitionOutcome>;
+
+    /// Commits a pairing: the record and the commitment together, conditional on `expected`.
+    ///
+    /// The device record, the validated grant, the consumed invitation, the owner's proof and the
+    /// security event are one transition, and a pairing reports success only after this returns.
+    /// An implementation that wrote them separately would let a crash leave a device with no
+    /// grant, a grant with no device, or a completed pairing with no security event.
     ///
     /// # Errors
     ///
     /// Returns [`PairingError::Store`] when the transaction does not commit.
-    fn commit(&self, record: &InvitationRecord, commitment: &PairingCommitment) -> Result<()>;
+    fn commit(
+        &self,
+        expected: &InvitationRecord,
+        next: &InvitationRecord,
+        commitment: &PairingCommitment,
+    ) -> Result<TransitionOutcome>;
 
     /// Reads the commitment of an invitation that was committed.
     ///
-    /// A transport retry retrieves the committed result through this, including after a restart.
+    /// A transport retry retrieves the committed result through this, including after a restart
+    /// that lost every in-memory invitation.
     ///
     /// # Errors
     ///
@@ -271,16 +318,29 @@ pub trait InvitationStore {
 }
 
 impl<T: InvitationStore + ?Sized> InvitationStore for &T {
-    fn save(&self, record: &InvitationRecord) -> Result<()> {
-        (**self).save(record)
+    fn create(&self, record: &InvitationRecord) -> Result<()> {
+        (**self).create(record)
     }
 
     fn load(&self, invitation_id: InvitationId) -> Result<Option<InvitationRecord>> {
         (**self).load(invitation_id)
     }
 
-    fn commit(&self, record: &InvitationRecord, commitment: &PairingCommitment) -> Result<()> {
-        (**self).commit(record, commitment)
+    fn transition(
+        &self,
+        expected: &InvitationRecord,
+        next: &InvitationRecord,
+    ) -> Result<TransitionOutcome> {
+        (**self).transition(expected, next)
+    }
+
+    fn commit(
+        &self,
+        expected: &InvitationRecord,
+        next: &InvitationRecord,
+        commitment: &PairingCommitment,
+    ) -> Result<TransitionOutcome> {
+        (**self).commit(expected, next, commitment)
     }
 
     fn commitment(&self, invitation_id: InvitationId) -> Result<Option<PairingCommitment>> {
@@ -305,13 +365,34 @@ pub struct ClientAttemptRecord {
     pub first_entry_monotonic_ms: u64,
     /// The boot that monotonic value belongs to.
     pub boot_identity: BootIdentity,
-    /// When the record may be forgotten, on the **wall** clock.
+    /// When the record may be forgotten, on the monotonic clock of [`Self::boot_identity`].
     ///
-    /// A tombstone outlives a reboot, and a monotonic value cannot: it restarts. A wall clock that
-    /// runs backwards only lengthens the retention.
+    /// This is the deadline that governs while the machine is still up, so moving the wall clock
+    /// forward cannot delete a record whose window is open.
+    pub retain_until_monotonic_ms: u64,
+    /// When the record may be forgotten after a reboot, on the **wall** clock.
+    ///
+    /// A tombstone outlives a reboot, and a monotonic value cannot: it restarts. This is the only
+    /// clock left once the boot identity has changed, and a wall clock that runs backwards only
+    /// lengthens the retention.
     pub retain_until_wall_ms: u64,
     /// True once the code is spent, so a later entry is refused rather than restarted.
     pub exhausted: bool,
+}
+
+impl ClientAttemptRecord {
+    /// Returns true when this record may be forgotten.
+    ///
+    /// Within the boot that wrote it, the monotonic deadline decides: a wall-clock jump forwards
+    /// must not delete a record whose five minutes are still running. Once the boot has changed
+    /// that deadline means nothing, and the wall clock is what is left.
+    #[must_use]
+    pub fn is_expired(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> bool {
+        if self.boot_identity == boot {
+            return now_monotonic_ms >= self.retain_until_monotonic_ms;
+        }
+        now_wall_ms >= self.retain_until_wall_ms
+    }
 }
 
 /// Where the client keeps its own attempt budget.
@@ -350,12 +431,12 @@ pub trait ClientBudgetStore {
     /// Returns [`PairingError::Store`].
     fn load(&self, code_key: &Mac256) -> Result<Option<ClientAttemptRecord>>;
 
-    /// Drops records whose retention has ended.
+    /// Drops records whose retention has ended, by [`ClientAttemptRecord::is_expired`].
     ///
     /// # Errors
     ///
     /// Returns [`PairingError::Store`].
-    fn expire(&self, now_wall_ms: u64) -> Result<()>;
+    fn expire(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> Result<()>;
 }
 
 impl<T: ClientBudgetStore + ?Sized> ClientBudgetStore for &T {
@@ -375,8 +456,8 @@ impl<T: ClientBudgetStore + ?Sized> ClientBudgetStore for &T {
         (**self).load(code_key)
     }
 
-    fn expire(&self, now_wall_ms: u64) -> Result<()> {
-        (**self).expire(now_wall_ms)
+    fn expire(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> Result<()> {
+        (**self).expire(now_monotonic_ms, boot, now_wall_ms)
     }
 }
 
@@ -556,13 +637,15 @@ impl TestInvitationStore {
 }
 
 impl InvitationStore for TestInvitationStore {
-    fn save(&self, record: &InvitationRecord) -> Result<()> {
+    fn create(&self, record: &InvitationRecord) -> Result<()> {
         self.check_write()?;
-        self.state
-            .lock()
-            .expect("a test store")
-            .records
-            .insert(record.invitation_id, record.clone());
+        let mut state = self.state.lock().expect("a test store");
+        if state.records.contains_key(&record.invitation_id) {
+            return Err(PairingError::Store {
+                reason: "that invitation already exists".to_owned(),
+            });
+        }
+        state.records.insert(record.invitation_id, record.clone());
         Ok(())
     }
 
@@ -577,15 +660,49 @@ impl InvitationStore for TestInvitationStore {
             .cloned())
     }
 
-    fn commit(&self, record: &InvitationRecord, commitment: &PairingCommitment) -> Result<()> {
+    fn transition(
+        &self,
+        expected: &InvitationRecord,
+        next: &InvitationRecord,
+    ) -> Result<TransitionOutcome> {
+        self.check_write()?;
+        // The comparison and the write are under one lock, which is the whole point of this
+        // method: another writer cannot slip between them.
+        let mut state = self.state.lock().expect("a test store");
+        match state.records.get(&expected.invitation_id) {
+            Some(current) if current == expected => {
+                state.records.insert(next.invitation_id, next.clone());
+                Ok(TransitionOutcome::Written)
+            }
+            Some(current) => Ok(TransitionOutcome::Stale(current.clone())),
+            None => Err(PairingError::Store {
+                reason: "that invitation has no record".to_owned(),
+            }),
+        }
+    }
+
+    fn commit(
+        &self,
+        expected: &InvitationRecord,
+        next: &InvitationRecord,
+        commitment: &PairingCommitment,
+    ) -> Result<TransitionOutcome> {
         self.check_write()?;
         // One lock over both maps: the record and the commitment appear together or not at all.
         let mut state = self.state.lock().expect("a test store");
-        state.records.insert(record.invitation_id, record.clone());
-        state
-            .commitments
-            .insert(commitment.invitation_id, commitment.clone());
-        Ok(())
+        match state.records.get(&expected.invitation_id) {
+            Some(current) if current == expected => {
+                state.records.insert(next.invitation_id, next.clone());
+                state
+                    .commitments
+                    .insert(commitment.invitation_id, commitment.clone());
+                Ok(TransitionOutcome::Written)
+            }
+            Some(current) => Ok(TransitionOutcome::Stale(current.clone())),
+            None => Err(PairingError::Store {
+                reason: "that invitation has no record".to_owned(),
+            }),
+        }
     }
 
     fn commitment(&self, invitation_id: InvitationId) -> Result<Option<PairingCommitment>> {
@@ -677,11 +794,11 @@ impl ClientBudgetStore for TestClientBudgetStore {
             .cloned())
     }
 
-    fn expire(&self, now_wall_ms: u64) -> Result<()> {
+    fn expire(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> Result<()> {
         self.records
             .lock()
             .expect("a test store")
-            .retain(|_, record| record.retain_until_wall_ms > now_wall_ms);
+            .retain(|_, record| !record.is_expired(now_monotonic_ms, boot, now_wall_ms));
         Ok(())
     }
 }
@@ -878,25 +995,52 @@ mod tests {
         assert_ne!(hash.as_bytes().as_slice(), &[5u8; 32]);
     }
 
-    #[test]
-    fn the_client_store_keeps_a_tombstone_across_a_reboot() {
-        let store = TestClientBudgetStore::new().expect("a store");
-        let key = Mac256::from_bytes([1; 32]);
+    /// A spent record kept until monotonic 500 of boot 0, or wall 1_000_000 after a reboot.
+    fn tombstone(store: &TestClientBudgetStore, key: Mac256) {
         store
             .update(&key, &|_| {
                 Ok(ClientAttemptRecord {
                     attempts: 5,
                     first_entry_monotonic_ms: 0,
                     boot_identity: BootIdentity([0; 32]),
+                    retain_until_monotonic_ms: 500,
                     retain_until_wall_ms: 1_000_000,
                     exhausted: true,
                 })
             })
             .expect("a write");
-        // Retention is on the wall clock, so a reboot does not drop it.
-        store.expire(999_999).expect("an expiry sweep");
+    }
+
+    #[test]
+    fn the_client_store_keeps_a_tombstone_across_a_reboot() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let key = Mac256::from_bytes([1; 32]);
+        tombstone(&store, key);
+        // Another boot: the monotonic deadline means nothing, and the wall clock is what is left.
+        let rebooted = BootIdentity([9; 32]);
+        store.expire(0, rebooted, 999_999).expect("an expiry sweep");
         assert_eq!(store.len(), 1);
-        store.expire(1_000_000).expect("an expiry sweep");
+        store
+            .expire(0, rebooted, 1_000_000)
+            .expect("an expiry sweep");
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_wall_clock_jump_does_not_delete_a_tombstone_of_this_boot() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let key = Mac256::from_bytes([1; 32]);
+        tombstone(&store, key);
+        let boot = BootIdentity([0; 32]);
+        // The wall clock jumps a year forward. Within the boot that wrote the record, the
+        // monotonic deadline is what decides, so the tombstone stays.
+        store
+            .expire(499, boot, 1_000_000_000)
+            .expect("an expiry sweep");
+        assert_eq!(store.len(), 1);
+        store
+            .expire(500, boot, 1_000_000_000)
+            .expect("an expiry sweep");
         assert!(store.is_empty());
     }
 
