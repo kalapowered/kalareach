@@ -45,21 +45,51 @@ pub fn read(paths: &EnvironmentPaths, session_id: SessionId) -> Result<Option<Wo
     let Some(descriptor) = read_file(&path)? else {
         return Ok(None);
     };
-    // The filename is a hint. A descriptor whose contents name a different session or environment
-    // is not this session's descriptor, whatever it is called.
-    if descriptor.session_id != session_id {
-        return Err(IpcError::UntrustedFile {
-            path,
-            reason: "the descriptor names a different session from its filename",
-        });
+    check_identity(&path, &descriptor, Some(session_id), paths.environment_id())?;
+    Ok(Some(descriptor))
+}
+
+/// Checks a descriptor's contents against the name and directory it was found under.
+///
+/// The filename is a hint. A descriptor whose contents name a different session or environment is
+/// not this session's descriptor, whatever it is called, and this runs wherever a descriptor is
+/// read: one file by name, or every file in the directory.
+fn check_identity(
+    path: &Path,
+    descriptor: &WorkerDescriptor,
+    named: Option<SessionId>,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> Result<()> {
+    match named {
+        Some(named) if descriptor.session_id != named => {
+            return Err(IpcError::UntrustedFile {
+                path: path.to_path_buf(),
+                reason: "the descriptor names a different session from its filename",
+            });
+        }
+        Some(_) => {}
+        None => {
+            return Err(IpcError::UntrustedFile {
+                path: path.to_path_buf(),
+                reason: "a descriptor file is named after the session it describes",
+            });
+        }
     }
-    if descriptor.environment_id != paths.environment_id() {
+    if descriptor.environment_id != environment_id {
         return Err(IpcError::UntrustedFile {
-            path,
+            path: path.to_path_buf(),
             reason: "the descriptor names a different environment from its directory",
         });
     }
-    Ok(Some(descriptor))
+    Ok(())
+}
+
+/// Reads the session identity a descriptor file's name claims.
+fn named_session(path: &Path) -> Option<SessionId> {
+    path.file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|stem| stem.parse::<kr_protocol::scalars::Uuid>().ok())
+        .map(SessionId::new)
 }
 
 /// Reads every descriptor currently published for an environment.
@@ -84,7 +114,21 @@ pub fn read_all(paths: &EnvironmentPaths) -> Result<Vec<DescriptorEntry>> {
         if path.extension().is_none_or(|extension| extension != "kr") {
             continue;
         }
-        match read_file(&path) {
+        // Enumeration performs exactly the checks a read by name performs. A directory listing is
+        // not a warrant to trust a file that a direct read would have refused.
+        let outcome = read_file(&path).and_then(|descriptor| match descriptor {
+            Some(descriptor) => {
+                check_identity(
+                    &path,
+                    &descriptor,
+                    named_session(&path),
+                    paths.environment_id(),
+                )?;
+                Ok(Some(descriptor))
+            }
+            None => Ok(None),
+        });
+        match outcome {
             Ok(Some(descriptor)) => found.push(DescriptorEntry {
                 path: path.clone(),
                 descriptor: Ok(descriptor),
@@ -133,17 +177,16 @@ pub fn retire(paths: &EnvironmentPaths, session_id: SessionId) -> Result<()> {
 /// permissions is refused: a challenge cannot save a reader that was pointed at an impostor's
 /// endpoint *and* handed the impostor's key.
 fn read_file(path: &Path) -> Result<Option<WorkerDescriptor>> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(IpcError::io("inspect", path, error)),
+    use std::io::Read as _;
+
+    // One handle, opened without following a link, then checked and read. Inspecting the path and
+    // reading it afterwards would check one file and read whatever the name pointed at by then.
+    let Some(file) = open_without_following(path)? else {
+        return Ok(None);
     };
-    if metadata.file_type().is_symlink() {
-        return Err(IpcError::UntrustedFile {
-            path: path.to_path_buf(),
-            reason: "a descriptor must not be a symbolic link",
-        });
-    }
+    let metadata = file
+        .metadata()
+        .map_err(|error| IpcError::io("inspect", path, error))?;
     if !metadata.is_file() {
         return Err(IpcError::UntrustedFile {
             path: path.to_path_buf(),
@@ -157,10 +200,57 @@ fn read_file(path: &Path) -> Result<Option<WorkerDescriptor>> {
         });
     }
     check_owner(path, &metadata)?;
-    let bytes = std::fs::read(path).map_err(|error| IpcError::io("read", path, error))?;
+    let mut bytes = Vec::new();
+    // Bounded by one byte more than the maximum, so a file that grew between the check and the
+    // read is refused rather than read.
+    file.take(MAX_DESCRIPTOR_LEN + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| IpcError::io("read", path, error))?;
+    if bytes.len() as u64 > MAX_DESCRIPTOR_LEN {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "a descriptor is larger than any descriptor this host writes",
+        });
+    }
     kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
         .map(Some)
         .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))
+}
+
+#[cfg(unix)]
+fn open_without_following(path: &Path) -> Result<Option<std::fs::File>> {
+    use rustix::fs::{Mode, OFlags};
+
+    // `O_NOFOLLOW` refuses a symbolic link at the open itself, which is the only place the refusal
+    // cannot be raced: a check on the path can be true and then false before the file is opened.
+    match rustix::fs::open(path, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()) {
+        Ok(descriptor) => Ok(Some(std::fs::File::from(descriptor))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        // A symbolic link reports `ELOOP` on Linux and `EMLINK` on the BSDs, including macOS.
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::MLINK) => Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "a descriptor must not be a symbolic link",
+        }),
+        Err(error) => Err(IpcError::io("open", path, std::io::Error::from(error))),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_without_following(path: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    // Windows refuses to open a reparse point when the flag is set, which covers the symbolic
+    // links and junctions a planted descriptor could use.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(IpcError::io("open", path, error)),
+    }
 }
 
 #[cfg(unix)]
@@ -314,6 +404,41 @@ mod tests {
             .expect("writes");
         let error = read(&paths, filename_session).expect_err("refuses");
         assert!(matches!(error, IpcError::UntrustedFile { .. }));
+    }
+
+    #[test]
+    fn enumeration_refuses_a_descriptor_a_direct_read_would_refuse() {
+        let host = TempHost::create();
+        let paths = host.environment();
+        let mut planted = descriptor(&host, 11);
+        let filename_session = planted.session_id;
+        // The file is named after one session and describes another. A reader that trusted the
+        // listing would take the contents; a reader that performs the same checks does not.
+        planted.session_id = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([201; 16]));
+        let bytes = kr_cbor::to_canonical_vec(&planted).expect("encodes");
+        crate::paths::write_owner_only_file(&paths.descriptor_file(filename_session), &bytes)
+            .expect("writes");
+        let entries = read_all(&paths).expect("lists");
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].descriptor.is_err(),
+            "enumeration applies the identity checks a read by name applies"
+        );
+    }
+
+    #[test]
+    fn enumeration_refuses_a_descriptor_from_another_environment() {
+        let host = TempHost::create();
+        let paths = host.environment();
+        let mut planted = descriptor(&host, 12);
+        planted.environment_id =
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([77; 16]));
+        let bytes = kr_cbor::to_canonical_vec(&planted).expect("encodes");
+        crate::paths::write_owner_only_file(&paths.descriptor_file(planted.session_id), &bytes)
+            .expect("writes");
+        let entries = read_all(&paths).expect("lists");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].descriptor.is_err());
     }
 
     #[test]

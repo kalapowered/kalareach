@@ -652,6 +652,15 @@ pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
 pub fn create_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write as _;
 
+    // The contents are complete and on disk before the name exists. Creating the file at its final
+    // name and writing afterwards would let a reader open it in the window where it is empty, and
+    // would leave an empty file behind after a crash: for the environment identity that is the
+    // difference between reading an identity and reading nothing at all.
+    //
+    // A hard link publishes it. Unlike a rename it refuses to replace an existing name, so it
+    // answers "who got there first" as well as making the publication atomic.
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = directory.join(format!(".{}.tmp", crate::new_uuid()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -660,25 +669,46 @@ pub fn create_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
         options.mode(OWNER_ONLY_FILE_MODE);
     }
     let mut file = options
-        .open(path)
-        .map_err(|error| IpcError::io("create", path, error))?;
-    file.write_all(contents)
+        .open(&temporary)
+        .map_err(|error| IpcError::io("create", &temporary, error))?;
+    let written = file
+        .write_all(contents)
         .and_then(|()| file.sync_all())
-        .map_err(|error| IpcError::io("write", path, error))?;
+        .map_err(|error| IpcError::io("write", &temporary, error));
     drop(file);
-    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let linked =
+        std::fs::hard_link(&temporary, path).map_err(|error| IpcError::io("publish", path, error));
+    let _ = std::fs::remove_file(&temporary);
+    linked?;
+    sync_directory(directory)
 }
 
 /// Flushes a directory entry to disk after a file inside it is created or renamed.
+///
+/// A failure here is reported, not swallowed. The caller has been told its file is published; if
+/// the directory entry never reached the disk that claim is wrong, and the caller is the only one
+/// that can decide what to do about it.
+#[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<()> {
-    match std::fs::File::open(directory) {
-        Ok(handle) => handle
-            .sync_all()
-            .map_err(|error| IpcError::io("flush", directory, error)),
-        // Not every platform lets a directory be opened for synchronisation. Where it cannot be,
-        // the rename is still ordered by the filesystem's own rules.
-        Err(_) => Ok(()),
-    }
+    let handle = std::fs::File::open(directory)
+        .map_err(|error| IpcError::io("open for flushing", directory, error))?;
+    handle
+        .sync_all()
+        .map_err(|error| IpcError::io("flush", directory, error))
+}
+
+/// Flushes a directory entry to disk after a file inside it is created or renamed.
+///
+/// Windows has no directory handle a program can synchronise: a directory cannot be opened for
+/// reading and `FlushFileBuffers` has nothing to act on. The ordering the rename needs is the
+/// filesystem's own, so there is nothing here to do and nothing to report.
+#[cfg(not(unix))]
+const fn sync_directory(_directory: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

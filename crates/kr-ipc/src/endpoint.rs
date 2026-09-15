@@ -155,11 +155,16 @@ mod platform {
         inner: UnixListener,
         path: std::path::PathBuf,
         identity: (u64, u64),
+        // Held for this listener's lifetime. Probing, replacing, binding and removing one endpoint
+        // all happen under it, so two processes cannot interleave those steps and leave one of
+        // them bound to a socket the other has already unlinked.
+        _guard: EndpointGuard,
     }
 
     impl Listener {
         pub(super) fn bind(endpoint: &Endpoint) -> Result<Self> {
             let path = endpoint.as_path().to_path_buf();
+            let guard = EndpointGuard::take(&path)?;
             replace_stale_socket(&path)?;
             let inner =
                 UnixListener::bind(&path).map_err(|error| IpcError::socket("bind", error))?;
@@ -169,6 +174,7 @@ mod platform {
                 inner,
                 path,
                 identity,
+                _guard: guard,
             })
         }
 
@@ -191,6 +197,8 @@ mod platform {
             // the same socket this listener bound: another process may already have replaced it,
             // and deleting a working endpoint out from under it would be worse than leaving a
             // stale file.
+            // Removal happens under the same guard the bind was taken under, so it cannot
+            // interleave with another process's probe.
             if socket_identity(&self.path).is_ok_and(|identity| identity == self.identity) {
                 let _ = std::fs::remove_file(&self.path);
             }
@@ -215,19 +223,90 @@ mod platform {
                 reason: "an endpoint address is occupied by something that is not a socket",
             });
         }
-        match std::os::unix::net::UnixStream::connect(path) {
-            Ok(_) => Err(IpcError::socket(
+        match probe(path)? {
+            // Something answered, or its backlog was full, which only a live listener has. Either
+            // way the address belongs to a running process.
+            Probe::Listening => Err(IpcError::socket(
                 "bind",
                 std::io::Error::new(
                     std::io::ErrorKind::AddrInUse,
                     "another process is listening on this endpoint",
                 ),
             )),
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            Probe::Abandoned => {
                 std::fs::remove_file(path).map_err(|error| IpcError::io("replace", path, error))
             }
-            Err(error) => Err(IpcError::socket("probe", error)),
         }
+    }
+
+    enum Probe {
+        Listening,
+        Abandoned,
+    }
+
+    /// Asks whether anything is listening, without waiting for it.
+    ///
+    /// The connection is made on a non-blocking socket, so a listener whose backlog is full
+    /// answers immediately instead of holding this call. For a Unix socket that is the whole
+    /// bound: there is no network round trip to time out.
+    fn probe(path: &std::path::Path) -> Result<Probe> {
+        use rustix::net::{AddressFamily, SocketType};
+
+        let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)
+            .map_err(|error| IpcError::socket("probe", std::io::Error::from(error)))?;
+        // `SOCK_NONBLOCK` is a Linux extension, so the mode is set on the descriptor instead.
+        rustix::io::ioctl_fionbio(&socket, true)
+            .map_err(|error| IpcError::socket("probe", std::io::Error::from(error)))?;
+        let address = rustix::net::SocketAddrUnix::new(path)
+            .map_err(|error| IpcError::socket("probe", std::io::Error::from(error)))?;
+        match rustix::net::connect(&socket, &address) {
+            // Connected, or the handshake is still in progress against a listener that exists.
+            Ok(()) | Err(rustix::io::Errno::INPROGRESS) => Ok(Probe::Listening),
+            // A full backlog is a live listener that is busy, never an abandoned address.
+            Err(rustix::io::Errno::AGAIN) => Ok(Probe::Listening),
+            // Refused means the socket file outlived the process that bound it.
+            Err(rustix::io::Errno::CONNREFUSED) => Ok(Probe::Abandoned),
+            // Anything else proves nothing, and unlinking on it would let one process delete
+            // another's live endpoint.
+            Err(error) => Err(IpcError::socket("probe", std::io::Error::from(error))),
+        }
+    }
+
+    /// The exclusive right to change one endpoint address.
+    ///
+    /// Probing an address, unlinking it and binding it are three steps. Without a lock two
+    /// processes can interleave them: both probe a refused socket, both unlink, both bind, and the
+    /// one that bound first ends up with an address that no longer names its socket.
+    #[derive(Debug)]
+    pub(super) struct EndpointGuard {
+        _file: std::fs::File,
+    }
+
+    impl EndpointGuard {
+        fn take(path: &std::path::Path) -> Result<Self> {
+            use rustix::fs::{FlockOperation, flock};
+
+            let lock_path = lock_path(path);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|error| IpcError::io("open the endpoint lock", &lock_path, error))?;
+            // Blocking, deliberately: a bind that loses the race should wait for the other
+            // process to finish its three steps and then discover the address is in use, not
+            // decide the address is free because it arrived at an awkward moment.
+            flock(&file, FlockOperation::LockExclusive).map_err(|error| {
+                IpcError::io("lock the endpoint", &lock_path, std::io::Error::from(error))
+            })?;
+            Ok(Self { _file: file })
+        }
+    }
+
+    fn lock_path(path: &std::path::Path) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".lock");
+        std::path::PathBuf::from(name)
     }
 
     fn socket_identity(path: &std::path::Path) -> Result<(u64, u64)> {
@@ -253,10 +332,16 @@ mod platform {
 
     impl Connection {
         pub(super) async fn connect(endpoint: &Endpoint) -> Result<Self> {
-            UnixStream::connect(endpoint.as_path())
+            let connection = UnixStream::connect(endpoint.as_path())
                 .await
                 .map(Self)
-                .map_err(|error| IpcError::socket("connect", error))
+                .map_err(|error| IpcError::socket("connect", error))?;
+            // The listener authenticates its callers; a caller authenticates the listener the same
+            // way. An endpoint inside an owner-only directory should not be answered by another
+            // user's process, and if one ever is, the client stops there rather than beginning a
+            // handshake with it.
+            connection.peer()?.authorise(crate::paths::current_uid())?;
+            Ok(connection)
         }
 
         pub(super) fn peer(&self) -> Result<PeerIdentity> {
