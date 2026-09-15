@@ -622,3 +622,48 @@ fn attach_params(session_id: SessionId) -> kr_protocol::attachment::SessionAttac
         requested,
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_that_reuses_an_earlier_action_identifier_conflicts_rather_than_stopping() {
+    let host = host(1).await;
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    // An ordinary attachment, recorded under this identifier in a journal that is working.
+    let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    client
+        .mutate(
+            Method::SessionAttach,
+            action_id,
+            target(host.environment_id, host.session_id),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attach succeeds");
+
+    // The same identifier, a different payload. Section 9 answers that with `ID_CONFLICT` whatever
+    // the method is: a stop is not a reason to act on an identifier that already belongs to
+    // somebody else's action.
+    let mut mutation = close_mutation(
+        &client,
+        &host,
+        30_000,
+        kr_protocol::envelope::ParamsValue::empty(),
+    );
+    mutation.action_id = action_id;
+    let outcome = send_mutation(&mut client, mutation).await;
+    let kr_protocol::envelope::Outcome::Error(error) = outcome else {
+        panic!("a reused action identifier must not close the session");
+    };
+    assert_eq!(error.code, ErrorCode::IdConflict);
+    assert_eq!(
+        host.service.runtime().state().as_str(),
+        "live",
+        "a conflicting close neither dispatches nor settles"
+    );
+    assert!(
+        host.service.runtime().session().journal_failure().is_none(),
+        "and a healthy journal is not marked as having failed"
+    );
+}

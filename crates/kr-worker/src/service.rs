@@ -1119,7 +1119,13 @@ impl WorkerService {
             // A journal this host cannot read has no retained action to give back. For an ordinary
             // mutation that is a storage failure and the request stops here; for an authorised stop
             // it is the same condition section 7 names, so the close proceeds and says volatile.
-            Err(error) if stopping => {
+            //
+            // A conflict is not that condition. The journal answered, and what it said is that this
+            // identifier already belongs to a different payload: section 9 makes that `ID_CONFLICT`
+            // for every method, and there is no stop to admit because the action the caller named
+            // is not this one. Reading it as a storage failure would also mark durability lost over
+            // a journal that is working perfectly.
+            Err(error) if stopping && is_storage_failure(&error) => {
                 self.runtime
                     .session()
                     .note_journal_failure(error.to_string());
