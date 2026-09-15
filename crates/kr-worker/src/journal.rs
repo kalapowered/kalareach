@@ -29,7 +29,7 @@ use crate::error::{Result, WorkerError};
 pub const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// One mutation being admitted.
 #[derive(Clone, Debug)]
@@ -44,6 +44,12 @@ pub struct Submission {
     pub method_version: MethodVersion,
     /// The digest of everything the mutation names.
     pub payload_digest: Digest256,
+    /// The complete mutation envelope, canonically encoded.
+    ///
+    /// A digest proves an identifier was reused with a different payload. It cannot tell a
+    /// recovering worker what the action was going to do, so the envelope itself is kept: the
+    /// target, the preconditions, the window and the parameters, exactly as they arrived.
+    pub intent: Vec<u8>,
     /// The deadline the host derived at acceptance. An exact retry never gets a new one.
     pub accepted_deadline_ms: Option<TimestampMs>,
     /// When the submission arrived.
@@ -57,6 +63,23 @@ pub struct Admission {
     pub receipt: Receipt,
     /// True when an existing receipt was returned instead of a new one being committed.
     pub deduplicated: bool,
+}
+
+/// One recorded change to a receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceiptEvent {
+    /// The position in the journal's event order.
+    pub sequence: u64,
+    /// The actor the receipt belongs to.
+    pub actor_id: ActorId,
+    /// The action.
+    pub action_id: ActionId,
+    /// The receipt revision this event records.
+    pub revision: U64,
+    /// The state the receipt reached.
+    pub state: ReceiptState,
+    /// When it was recorded.
+    pub recorded_at_ms: TimestampMs,
 }
 
 /// The worker's private journal.
@@ -118,6 +141,7 @@ impl Journal {
                      state                TEXT    NOT NULL,
                      reason               TEXT,
                      payload_digest       BLOB    NOT NULL,
+                     intent               BLOB    NOT NULL,
                      accepted_deadline_ms INTEGER,
                      error_code           TEXT,
                      error_message        TEXT,
@@ -130,7 +154,19 @@ impl Journal {
                      actor_id  TEXT NOT NULL,
                      action_id BLOB NOT NULL,
                      result    BLOB NOT NULL,
-                     PRIMARY KEY (actor_id, action_id)
+                     PRIMARY KEY (actor_id, action_id),
+                     FOREIGN KEY (actor_id, action_id)
+                         REFERENCES receipts (actor_id, action_id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE IF NOT EXISTS receipt_events (
+                     sequence      INTEGER PRIMARY KEY AUTOINCREMENT,
+                     actor_id      TEXT    NOT NULL,
+                     action_id     BLOB    NOT NULL,
+                     revision      INTEGER NOT NULL,
+                     state         TEXT    NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL,
+                     FOREIGN KEY (actor_id, action_id)
+                         REFERENCES receipts (actor_id, action_id) ON DELETE CASCADE
                  );
                  CREATE TABLE IF NOT EXISTS closure (
                      session_id BLOB PRIMARY KEY,
@@ -199,9 +235,9 @@ impl Journal {
         self.connection
             .execute(
                 "INSERT INTO receipts (actor_id, action_id, method, method_version, revision,
-                     state, reason, payload_digest, accepted_deadline_ms, error_code,
+                     state, reason, payload_digest, intent, accepted_deadline_ms, error_code,
                      error_message, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, NULL, NULL, ?9, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, NULL, NULL, ?10, ?10)",
                 params![
                     receipt.actor_id.as_str(),
                     receipt.action_id.get().as_bytes().as_slice(),
@@ -210,6 +246,7 @@ impl Journal {
                     1_i64,
                     ReceiptState::Accepted.as_str(),
                     receipt.payload_digest.as_bytes().as_slice(),
+                    submission.intent.as_slice(),
                     submission
                         .accepted_deadline_ms
                         .map(|deadline| i64::try_from(deadline.get()).unwrap_or(i64::MAX)),
@@ -217,10 +254,208 @@ impl Journal {
                 ],
             )
             .map_err(unavailable)?;
+        self.append_event(&receipt)?;
         Ok(Admission {
             receipt,
             deduplicated: false,
         })
+    }
+
+    /// Reads the recoverable intent an action was accepted with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn read_intent(&self, actor_id: &ActorId, action_id: ActionId) -> Result<Option<Vec<u8>>> {
+        self.connection
+            .query_row(
+                "SELECT intent FROM receipts WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(unavailable)
+    }
+
+    /// Cancels an intent that has not been dispatched.
+    ///
+    /// After a dispatch marker there is nothing to cancel here: the effect may already have
+    /// happened, and section 9 makes cancelling it a separate upstream action with its own
+    /// receipt. This refuses that case rather than pretending to undo it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when there is no such receipt, or it already carries a dispatch marker.
+    pub fn cancel(
+        &mut self,
+        actor_id: ActorId,
+        action_id: ActionId,
+        now_ms: TimestampMs,
+    ) -> Result<Receipt> {
+        let receipt = self
+            .read(actor_id.clone(), action_id)?
+            .ok_or_else(|| WorkerError::InvalidArgument(format!("no receipt for {action_id}")))?;
+        if receipt.state.has_dispatch_marker() {
+            return Err(WorkerError::InvalidArgument(format!(
+                "action {action_id} is already {} and cannot be cancelled here",
+                receipt.state
+            )));
+        }
+        self.advance(
+            actor_id,
+            action_id,
+            ReceiptState::Rejected,
+            Some(RejectionReason::Cancelled),
+            None,
+            now_ms,
+        )
+    }
+
+    /// Commits the result, the receipt revision and the event record in one transaction.
+    ///
+    /// The three describe one thing. Writing them separately is what lets a crash leave a receipt
+    /// that says `applied` beside a result nobody can read, or an outcome nothing was notified of.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transition is not permitted or the write fails.
+    pub fn settle(
+        &mut self,
+        actor_id: ActorId,
+        action_id: ActionId,
+        state: ReceiptState,
+        result: Option<&[u8]>,
+        error: Option<ProtocolError>,
+        now_ms: TimestampMs,
+    ) -> Result<Receipt> {
+        let mut receipt = self
+            .read(actor_id.clone(), action_id)?
+            .ok_or_else(|| WorkerError::InvalidArgument(format!("no receipt for {action_id}")))?;
+        let revision = U64::new(receipt.revision.get() + 1);
+        receipt.advance(state, revision, None).map_err(|error| {
+            WorkerError::InvalidArgument(format!("receipt transition refused: {error}"))
+        })?;
+        receipt.error = Nullable(error);
+        receipt.updated_at_ms = now_ms;
+
+        let transaction = self.connection.transaction().map_err(unavailable)?;
+        if let Some(result) = result {
+            transaction
+                .execute(
+                    "INSERT INTO results (actor_id, action_id, result) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (actor_id, action_id) DO UPDATE SET result = excluded.result",
+                    params![
+                        receipt.actor_id.as_str(),
+                        receipt.action_id.get().as_bytes().as_slice(),
+                        result
+                    ],
+                )
+                .map_err(unavailable)?;
+        }
+        transaction
+            .execute(
+                "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5, error_code = ?6,
+                     error_message = ?7, updated_at_ms = ?8
+                 WHERE actor_id = ?1 AND action_id = ?2",
+                params![
+                    receipt.actor_id.as_str(),
+                    receipt.action_id.get().as_bytes().as_slice(),
+                    i64::try_from(receipt.revision.get()).unwrap_or(i64::MAX),
+                    receipt.state.as_str(),
+                    receipt.reason.as_ref().map(|reason| reason.as_str()),
+                    receipt
+                        .error
+                        .as_ref()
+                        .map(|error| error.code.as_str().to_owned()),
+                    receipt.error.as_ref().map(|error| error.message.clone()),
+                    i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(unavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO receipt_events (actor_id, action_id, revision, state, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    receipt.actor_id.as_str(),
+                    receipt.action_id.get().as_bytes().as_slice(),
+                    i64::try_from(receipt.revision.get()).unwrap_or(i64::MAX),
+                    receipt.state.as_str(),
+                    i64::try_from(now_ms.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(unavailable)?;
+        transaction.commit().map_err(unavailable)?;
+        Ok(receipt)
+    }
+
+    /// Returns the receipt revisions recorded after a sequence number.
+    ///
+    /// This is the transactional record every state change leaves behind, so a reader that
+    /// reconnects learns what happened to an action while it was away instead of inferring it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn events_after(&self, sequence: u64, limit: u64) -> Result<Vec<ReceiptEvent>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT sequence, actor_id, action_id, revision, state, recorded_at_ms
+                 FROM receipt_events WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
+            )
+            .map_err(unavailable)?;
+        let rows = statement
+            .query_map(
+                params![
+                    i64::try_from(sequence).unwrap_or(i64::MAX),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .map_err(unavailable)?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (sequence, actor, action, revision, state, recorded) = row.map_err(unavailable)?;
+            let action = <[u8; 16]>::try_from(action.as_slice())
+                .map_err(|_| unavailable_detail("a stored action identifier is not 16 bytes"))?;
+            events.push(ReceiptEvent {
+                sequence: u64::try_from(sequence).unwrap_or(0),
+                actor_id: ActorId::new(actor)
+                    .map_err(|_| unavailable_detail("a stored actor is not valid"))?,
+                action_id: ActionId::new(Uuid::from_bytes(action)),
+                revision: U64::new(u64::try_from(revision).unwrap_or(0)),
+                state: parse_state(&state)?,
+                recorded_at_ms: TimestampMs::new(u64::try_from(recorded).unwrap_or(0)),
+            });
+        }
+        Ok(events)
+    }
+
+    fn append_event(&self, receipt: &Receipt) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO receipt_events (actor_id, action_id, revision, state, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    receipt.actor_id.as_str(),
+                    receipt.action_id.get().as_bytes().as_slice(),
+                    i64::try_from(receipt.revision.get()).unwrap_or(i64::MAX),
+                    receipt.state.as_str(),
+                    i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
     }
 
     /// Commits the dispatch marker before the external effect.
@@ -303,6 +538,7 @@ impl Journal {
         receipt.error = Nullable(error);
         receipt.updated_at_ms = now_ms;
         self.write_state(&receipt)?;
+        self.append_event(&receipt)?;
         Ok(receipt)
     }
 
@@ -397,14 +633,32 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
     pub fn prune(&mut self, now_ms: TimestampMs) -> Result<usize> {
-        let cutoff = now_ms.get().saturating_sub(RETENTION_MS);
-        let removed = self
-            .connection
+        let cutoff = i64::try_from(now_ms.get().saturating_sub(RETENTION_MS)).unwrap_or(i64::MAX);
+        // The retained result and the event record are the receipt's, so they go when it goes.
+        // Leaving either behind would keep a duplicate answerable after the receipt that
+        // authorises the answer had been forgotten.
+        let transaction = self.connection.transaction().map_err(unavailable)?;
+        transaction
             .execute(
-                "DELETE FROM receipts WHERE created_at_ms < ?1",
-                params![i64::try_from(cutoff).unwrap_or(i64::MAX)],
+                "DELETE FROM results WHERE (actor_id, action_id) IN
+                     (SELECT actor_id, action_id FROM receipts WHERE created_at_ms < ?1)",
+                params![cutoff],
             )
             .map_err(unavailable)?;
+        transaction
+            .execute(
+                "DELETE FROM receipt_events WHERE (actor_id, action_id) IN
+                     (SELECT actor_id, action_id FROM receipts WHERE created_at_ms < ?1)",
+                params![cutoff],
+            )
+            .map_err(unavailable)?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM receipts WHERE created_at_ms < ?1",
+                params![cutoff],
+            )
+            .map_err(unavailable)?;
+        transaction.commit().map_err(unavailable)?;
         Ok(removed)
     }
 
@@ -644,6 +898,7 @@ mod tests {
             method: kr_protocol::method::Method::SessionClose.into(),
             method_version: MethodVersion::V1,
             payload_digest: Digest256::from_bytes([digest; 32]),
+            intent: vec![0xa0],
             accepted_deadline_ms: Some(TimestampMs::new(10_000)),
             now_ms: TimestampMs::new(1_000),
         }

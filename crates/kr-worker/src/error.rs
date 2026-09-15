@@ -57,6 +57,30 @@ pub enum WorkerError {
         /// The identifier that was reused.
         action: String,
     },
+    /// A controller connection no longer speaks for the generation this worker accepts.
+    #[error("{detail}")]
+    GenerationFenced {
+        /// Which part of the binding failed.
+        detail: String,
+    },
+    /// The freshness window this first admission is bound to is expired or unknown.
+    #[error("{detail}")]
+    WindowExpired {
+        /// What went wrong.
+        detail: String,
+    },
+    /// The subject preconditions the mutation requires did not hold.
+    #[error("{detail}")]
+    PreconditionFailed {
+        /// Which precondition failed.
+        detail: String,
+    },
+    /// The target named a session identity or epoch that is no longer current.
+    #[error("{detail}")]
+    StaleTarget {
+        /// What disagreed.
+        detail: String,
+    },
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
@@ -95,6 +119,11 @@ impl WorkerError {
             Self::NotGeometryOwner => ErrorCode::GeometryNotOwner,
             Self::SessionClosed => ErrorCode::SessionClosed,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
+            Self::GenerationFenced { .. } | Self::WindowExpired { .. } => {
+                ErrorCode::PermissionDenied
+            }
+            Self::PreconditionFailed { .. } => ErrorCode::DraftConflict,
+            Self::StaleTarget { .. } => ErrorCode::StaleSession,
             Self::Ipc(error) => error.code(),
             Self::Verification(_) => ErrorCode::PermissionDenied,
         }

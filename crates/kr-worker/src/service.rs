@@ -37,8 +37,8 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{
-    ActionWindowId, ActorId, AttachmentId, ConnectionId, ControllerGeneration, EnvironmentId,
-    RequestId, SessionId, StreamId,
+    ActorId, AttachmentId, ConnectionId, ControllerGeneration, EnvironmentId, RequestId, SessionId,
+    StreamId,
 };
 use kr_protocol::input::{
     InputAcquireParams, InputInterruptParams, InputLeaseResult, InputReleaseParams,
@@ -72,6 +72,22 @@ pub const OUTPUT_STREAM: &str = "session.output";
 /// that rather than filling it exactly.
 pub const MAX_REPLAY_PAGE_BYTES: u64 = 512 * 1024;
 
+/// What the worker currently accepts as controller authority.
+///
+/// The generation and the connection that speaks for it are one value under one lock, so a token
+/// can never install a generation without also installing the connection it arrived on. A request
+/// from a controller connection that is not the bound one is refused, which is what makes fencing
+/// something the dispatch path enforces rather than something the handshake merely records.
+#[derive(Clone, Debug)]
+struct Authority {
+    /// The highest generation this worker has accepted.
+    accepted_generation: Option<ControllerGeneration>,
+    /// The connection that presented it.
+    bound_connection: Option<ConnectionId>,
+    /// The authority revision the controller last announced and this worker acknowledged.
+    acknowledged_revision: Option<kr_protocol::ids::AuthorityRevision>,
+}
+
 /// The worker's endpoint server.
 pub struct WorkerService {
     runtime: Arc<SessionRuntime>,
@@ -80,8 +96,7 @@ pub struct WorkerService {
     environment_id: EnvironmentId,
     boot_identity: BootIdentity,
     controller_public_key: AuthorisationKey,
-    accepted_generation: Mutex<Option<ControllerGeneration>>,
-    generation_connection: Mutex<Option<ConnectionId>>,
+    authority: Mutex<Authority>,
     build_id: kr_protocol::ids::BuildId,
 }
 
@@ -130,10 +145,35 @@ impl WorkerService {
             environment_id: binding.environment_id,
             boot_identity: binding.boot_identity,
             controller_public_key: binding.controller_public_key,
-            accepted_generation: Mutex::new(Some(binding.controller_generation)),
-            generation_connection: Mutex::new(None),
+            authority: Mutex::new(Authority {
+                accepted_generation: Some(binding.controller_generation),
+                bound_connection: None,
+                acknowledged_revision: None,
+            }),
             build_id: binding.build_id,
         }
+    }
+
+    /// Returns the generation this worker currently accepts.
+    #[must_use]
+    pub fn accepted_generation(&self) -> Option<ControllerGeneration> {
+        self.authority
+            .lock()
+            .expect("the authority lock is not poisoned")
+            .accepted_generation
+    }
+
+    /// Returns the authority revision this worker has acknowledged.
+    ///
+    /// Revocation is reported as pending for a worker until the revision it names has been
+    /// acknowledged here or the worker is confirmed ended. The remote dispatch lease that consumes
+    /// this arrives with the transport; this is the worker half of that interface.
+    #[must_use]
+    pub fn acknowledged_revision(&self) -> Option<kr_protocol::ids::AuthorityRevision> {
+        self.authority
+            .lock()
+            .expect("the authority lock is not poisoned")
+            .acknowledged_revision
     }
 
     /// Serves the endpoint until the session has closed.
@@ -159,7 +199,7 @@ impl WorkerService {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         let (mut reader, writer) = split(connection, StreamKind::Control);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
-        let mut state = ConnectionState::new(connection_id, &peer);
+        let mut state = ConnectionState::new(connection_id, &peer, self.boot_identity.clone());
         loop {
             let message: ControlMessage = match reader.read_message().await {
                 Ok(message) => message,
@@ -286,6 +326,10 @@ impl WorkerService {
                 }
             }
             ControlMessage::GenerationToken(token) => Some(self.accept_generation(state, &token)),
+            ControlMessage::ActionWindowRenew(_) => Some(self.renew_window(state)),
+            ControlMessage::AuthorityRevision(notice) => {
+                Some(self.acknowledge_revision(state, &notice))
+            }
             ControlMessage::Request(request) => Some(self.request(state, &request)),
             ControlMessage::Mutation(mutation) => Some(self.mutation(state, &mutation)),
             _ => Some(failure(
@@ -320,12 +364,20 @@ impl WorkerService {
             );
         }
         state.negotiated = true;
+        state.client_kind = hello.client;
         if hello.client == LocalClientKind::Controller {
             // A controller has to prove which generation it speaks for before it acts. The
             // challenge is issued here, bound to this connection, and consumed exactly once.
             state.pending_challenge = Self::generation_challenge(state);
         }
-        let now = kr_ipc::now_ms();
+        // The window is stamped when the connection is authenticated, not when it was accepted,
+        // so its deadline starts from the handshake the client will quote it against.
+        state.window = kr_ipc::freshness::FreshnessWindow::issue(
+            state.connection_id,
+            self.boot_identity.clone(),
+            kr_ipc::now_ms().get(),
+            ACTION_WINDOW_MS,
+        );
         ControlMessage::HelloAck(LocalHelloAck {
             selected_version: PROTOCOL_VERSION,
             role: LocalRole::Worker,
@@ -333,12 +385,24 @@ impl WorkerService {
             environment_id: self.environment_id,
             boot_identity: self.boot_identity.clone(),
             peer: peer.to_wire(),
-            action_window_id: state.action_window.clone(),
-            action_window_expires_at_ms: kr_protocol::scalars::TimestampMs::new(
-                now.get().saturating_add(ACTION_WINDOW_MS),
-            ),
+            action_window_id: state.window.id().clone(),
+            action_window_expires_at_ms: state.window.expires_at_ms(),
             capabilities: CanonicalSet::new(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
+        })
+    }
+
+    /// Stamps a fresh window on a live authenticated connection.
+    ///
+    /// Renewal is explicit, as section 9 requires: a client asks for a new window and receives a
+    /// new identifier. Nothing extends the window a request already quoted, so an expired window
+    /// is never repaired underneath an original request that is being replayed.
+    fn renew_window(&self, state: &mut ConnectionState) -> ControlMessage {
+        state.window = state.window.renew(kr_ipc::now_ms().get());
+        ControlMessage::ActionWindow(kr_protocol::local::ActionWindowGrant {
+            connection_id: state.connection_id,
+            action_window_id: state.window.id().clone(),
+            action_window_expires_at_ms: state.window.expires_at_ms(),
         })
     }
 
@@ -366,51 +430,136 @@ impl WorkerService {
                 ),
             );
         };
-        let accepted = *self
-            .accepted_generation
+        // One lock for the whole decision. Reading the accepted generation, checking the token
+        // against it and installing the new generation with the connection that presented it
+        // happen without a window in between, so two tokens cannot interleave and leave the
+        // generation behind the connection that is bound to it.
+        let mut authority = self
+            .authority
             .lock()
-            .expect("the generation lock is not poisoned");
+            .expect("the authority lock is not poisoned");
         let acceptance = GenerationAcceptance {
             controller_public_key: self.controller_public_key,
             environment_id: self.environment_id,
             boot_identity: self.boot_identity.clone(),
-            accepted_generation: accepted,
+            accepted_generation: authority.accepted_generation,
         };
         match check_generation_token(&acceptance, &nonce, token) {
             Ok(()) => {
-                let mut current = self
-                    .accepted_generation
-                    .lock()
-                    .expect("the generation lock is not poisoned");
-                *current = Some(token.generation);
-                let mut bound = self
-                    .generation_connection
-                    .lock()
-                    .expect("the generation lock is not poisoned");
+                authority.accepted_generation = Some(token.generation);
                 // Installing this connection fences whatever was bound before it, including an
-                // earlier connection of the same generation.
-                let fenced_previous = bound.replace(state.connection_id).is_some();
+                // earlier connection of the same generation. A fenced connection can still read
+                // its own replies; what it cannot do is dispatch anything else.
+                let fenced_previous = authority.bound_connection.replace(state.connection_id);
+                drop(authority);
                 state.controller = true;
+                state.generation = Some(token.generation);
                 ControlMessage::GenerationAccepted(kr_protocol::worker::GenerationAccepted {
                     generation: token.generation,
-                    fenced_previous,
+                    fenced_previous: fenced_previous.is_some(),
                 })
             }
-            Err(error) => failure(
-                RequestId::new(0),
-                &ProtocolError::new(ErrorCode::PermissionDenied, error.to_string()),
-            ),
+            Err(error) => {
+                drop(authority);
+                failure(
+                    RequestId::new(0),
+                    &ProtocolError::new(ErrorCode::PermissionDenied, error.to_string()),
+                )
+            }
         }
+    }
+
+    /// Records the authority revision the controller now holds.
+    ///
+    /// Only the connection that holds current authority may announce one: an announcement is what
+    /// a revocation is waiting on, and a fenced controller must not be able to satisfy it.
+    fn acknowledge_revision(
+        &self,
+        state: &ConnectionState,
+        notice: &kr_protocol::worker::AuthorityRevisionNotice,
+    ) -> ControlMessage {
+        if let Err(error) = self.check_authority(state) {
+            return failure(RequestId::new(0), &error.to_protocol_error());
+        }
+        if notice.environment_id != self.environment_id {
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this worker belongs to another environment",
+                ),
+            );
+        }
+        let mut authority = self
+            .authority
+            .lock()
+            .expect("the authority lock is not poisoned");
+        // Revisions are ordered and only the host issues them, so an older one never replaces a
+        // newer one that has already been acknowledged.
+        if authority
+            .acknowledged_revision
+            .is_none_or(|held| held.get() < notice.revision.get())
+        {
+            authority.acknowledged_revision = Some(notice.revision);
+        }
+        let revision = authority.acknowledged_revision.unwrap_or(notice.revision);
+        drop(authority);
+        ControlMessage::AuthorityRevisionAck(kr_protocol::worker::AuthorityRevisionAck {
+            session_id: self.runtime.session().id(),
+            revision,
+        })
+    }
+
+    /// Refuses a request from a controller connection that does not hold current authority.
+    ///
+    /// A worker serves two kinds of caller. A local caller is authenticated by peer credentials and
+    /// acts under the worker's own authority over its session. A controller acts for a generation,
+    /// and a generation that has been superseded is exactly what fencing is for: the request is
+    /// refused here, on the dispatch path, before anything reads its parameters.
+    fn check_authority(&self, state: &ConnectionState) -> Result<()> {
+        if state.client_kind != LocalClientKind::Controller {
+            return Ok(());
+        }
+        if !state.controller {
+            return Err(WorkerError::GenerationFenced {
+                detail: "this connection has not proved which controller generation it speaks for"
+                    .to_owned(),
+            });
+        }
+        let authority = self
+            .authority
+            .lock()
+            .expect("the authority lock is not poisoned");
+        if authority.bound_connection != Some(state.connection_id) {
+            return Err(WorkerError::GenerationFenced {
+                detail: "a later controller connection holds this environment's authority"
+                    .to_owned(),
+            });
+        }
+        if authority.accepted_generation != state.generation {
+            return Err(WorkerError::GenerationFenced {
+                detail: format!(
+                    "this worker accepts generation {}",
+                    authority
+                        .accepted_generation
+                        .map_or_else(|| "none".to_owned(), |generation| generation.to_string())
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn request(&self, state: &mut ConnectionState, request: &Request) -> ControlMessage {
         if !state.negotiated {
             return failure(request.request_id, &not_negotiated());
         }
+        if let Err(error) = self.check_authority(state) {
+            return failure(request.request_id, &error.to_protocol_error());
+        }
         let Some(method) = request.method.method() else {
             return failure(request.request_id, &unlisted());
         };
-        if !self.reachable(method, request.method_version) {
+        if Self::entry(method, request.method_version).is_none() {
             return failure(request.request_id, &unlisted());
         }
         let outcome = match method {
@@ -418,7 +567,7 @@ impl WorkerService {
             Method::EventsSnapshot => self.events_snapshot(&request.params),
             Method::HistoryPage => self.history_page(&request.params),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params),
-            Method::AttachmentViewport => self.attachment_viewport(state, &request.params),
+            Method::ActionRead => self.action_read(state, &request.params),
             Method::InputWrite => self.input_write(state, &request.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
@@ -446,13 +595,16 @@ impl WorkerService {
         if !state.negotiated {
             return failure(mutation.request_id, &not_negotiated());
         }
+        if let Err(error) = self.check_authority(state) {
+            return failure(mutation.request_id, &error.to_protocol_error());
+        }
         let Some(method) = mutation.method.method() else {
             return failure(mutation.request_id, &unlisted());
         };
-        if !self.reachable(method, mutation.method_version) {
+        let Some(entry) = Self::entry(method, mutation.method_version) else {
             return failure(mutation.request_id, &unlisted());
-        }
-        match self.receipted(state, mutation, method) {
+        };
+        match self.receipted(state, mutation, method, entry) {
             Ok(value) => ControlMessage::Response(Response {
                 request_id: mutation.request_id,
                 outcome: Outcome::Ok(value),
@@ -466,9 +618,18 @@ impl WorkerService {
         state: &mut ConnectionState,
         mutation: &MutationRequest,
         method: Method,
+        entry: &'static kr_protocol::authority::MethodEntry,
     ) -> Result<ParamsValue> {
         let actor_id = state.actor_id.clone();
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
+            .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
+        // The envelope is checked before anything durable happens: the target this worker will
+        // act on, the grant the caller claims, the preconditions the subject must still satisfy
+        // and the freshness window that admits a first request. A duplicate is resolved after
+        // this, so a retained result is never handed back on authority the caller no longer has.
+        self.check_envelope(mutation, entry)?;
+        let window_remaining_ms = self.check_window(state, mutation)?;
+        let intent = kr_cbor::to_canonical_vec(mutation)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
         let submission = crate::journal::Submission {
             actor_id: actor_id.clone(),
@@ -476,7 +637,10 @@ impl WorkerService {
             method: mutation.method.clone(),
             method_version: mutation.method_version,
             payload_digest: digest,
-            accepted_deadline_ms: Some(state.accepted_deadline(mutation.requested_ttl_ms.get())),
+            intent,
+            accepted_deadline_ms: Some(
+                state.accepted_deadline(mutation.requested_ttl_ms.get(), window_remaining_ms),
+            ),
             now_ms: kr_ipc::now_ms(),
         };
 
@@ -513,12 +677,14 @@ impl WorkerService {
                     .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
                 return Ok(ParamsValue::new(value));
             }
-            // The action is known and its result is not available yet, which is the honest answer
-            // rather than performing it a second time.
-            return Err(WorkerError::InvalidArgument(format!(
-                "action {} is already {} and has no retained result",
-                mutation.action_id, admission.receipt.state
-            )));
+            // The action is known and it has no result to return. Section 9 answers that with the
+            // receipt as it stands rather than performing the effect a second time or refusing as
+            // though the request were malformed: the caller learns the action's real state and can
+            // read it again when it settles.
+            return encode(&kr_protocol::receipt::ReceiptResponse {
+                request_id: mutation.request_id,
+                receipt: admission.receipt.clone(),
+            });
         }
 
         // Revalidate before the marker. Anything that was true at acceptance may not be now.
@@ -538,12 +704,15 @@ impl WorkerService {
         let mut session = self.runtime.session();
         match (&outcome, session.journal_mut()) {
             (Ok(value), Some(journal)) => {
+                // The result, the receipt revision and the event record are one commit. A crash
+                // between them would leave a receipt that claims an outcome beside a result no
+                // reader can retrieve.
                 let bytes = kr_cbor::encode(value.as_value());
-                journal.record_result(&actor_id, mutation.action_id, &bytes)?;
-                journal.complete(
+                journal.settle(
                     actor_id,
                     mutation.action_id,
                     kr_protocol::receipt::ReceiptState::Applied,
+                    Some(&bytes),
                     None,
                     now,
                 )?;
@@ -551,10 +720,11 @@ impl WorkerService {
             (Err(error), Some(journal)) => {
                 // Past the marker there is no rejection. Whether the effect happened cannot be
                 // established from here, so the outcome is recorded as unknown.
-                journal.complete(
+                journal.settle(
                     actor_id,
                     mutation.action_id,
                     kr_protocol::receipt::ReceiptState::Unknown,
+                    None,
                     Some(error.to_protocol_error()),
                     now,
                 )?;
@@ -575,6 +745,140 @@ impl WorkerService {
                 kr_ipc::now_ms(),
             );
         }
+    }
+
+    /// Checks the mutation envelope before anything durable happens.
+    ///
+    /// The envelope is not decoration. Its target names what the effect is for, its grant names
+    /// the authority it is claimed under, and its preconditions name what the subject must still
+    /// be. A host that parses only the parameters is acting on a request it has not read.
+    fn check_envelope(
+        &self,
+        mutation: &MutationRequest,
+        entry: &'static kr_protocol::authority::MethodEntry,
+    ) -> Result<()> {
+        use kr_protocol::authority::ResourceSelectorKind;
+
+        mutation
+            .target
+            .validate()
+            .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
+        if mutation.target.environment_id != self.environment_id {
+            return Err(WorkerError::StaleTarget {
+                detail: format!("this worker belongs to environment {}", self.environment_id),
+            });
+        }
+        let session = self.runtime.session();
+        let owned = session.id();
+        let epoch = session.epoch();
+        drop(session);
+        // The registry says which resources a method names. A method whose selectors include a
+        // session must name one; a method that acts on a receipt need not.
+        let names_session = entry
+            .resource_selectors
+            .contains(&ResourceSelectorKind::Session);
+        match mutation.target.session_id.as_ref() {
+            Some(named) if *named != owned => {
+                return Err(WorkerError::StaleTarget {
+                    detail: format!("this endpoint serves session {owned}, not {named}"),
+                });
+            }
+            Some(_) => {}
+            None if names_session => {
+                return Err(WorkerError::InvalidArgument(format!(
+                    "{} names the session it acts on",
+                    entry.name
+                )));
+            }
+            None => {}
+        }
+        if let Some(named) = mutation.target.session_epoch.as_ref()
+            && *named != epoch
+        {
+            return Err(WorkerError::StaleTarget {
+                detail: format!("session {owned} is at epoch {epoch}"),
+            });
+        }
+        // A worker has no session-scoped application instance to act for, so naming one is a
+        // request this endpoint cannot serve rather than a field to ignore.
+        if mutation.target.application_instance_id.as_ref().is_some() {
+            return Err(WorkerError::InvalidArgument(
+                "this endpoint serves the session itself, not an application instance".to_owned(),
+            ));
+        }
+        // A local caller's authority is the operating-system caller the listener authenticated.
+        // Section 23 leaves the grant null for exactly that reason, and a grant identifier
+        // presented here would be a claim the worker cannot check.
+        if mutation.grant_id.as_ref().is_some() {
+            return Err(WorkerError::InvalidArgument(
+                "a local caller acts under its authenticated operating-system identity, not a \
+                 grant"
+                    .to_owned(),
+            ));
+        }
+        self.check_preconditions(mutation)
+    }
+
+    /// Checks the subject preconditions the mutation requires.
+    ///
+    /// `expected` is a closed map of the subject facts the caller believes. Anything it names that
+    /// is no longer true refuses the mutation before it is admitted, so a client acting on a stale
+    /// screen cannot resize, take input or close on facts that have moved.
+    fn check_preconditions(&self, mutation: &MutationRequest) -> Result<()> {
+        let expected: MutationPreconditions = mutation.expected.to_typed().map_err(|error| {
+            WorkerError::InvalidArgument(format!(
+                "the subject preconditions are not a precondition map: {error}"
+            ))
+        })?;
+        let session = self.runtime.session();
+        if let Some(state) = expected.session_state
+            && state != session.state()
+        {
+            return Err(WorkerError::PreconditionFailed {
+                detail: format!("the session is {}", session.state().as_str()),
+            });
+        }
+        if let Some(epoch) = expected.geometry_epoch
+            && epoch.get() != session.geometry().epoch.get()
+        {
+            return Err(WorkerError::PreconditionFailed {
+                detail: format!("the geometry epoch is {}", session.geometry().epoch),
+            });
+        }
+        if let Some(epoch) = expected.input_lease_epoch
+            && epoch.get() != session.lease().epoch.get()
+        {
+            return Err(WorkerError::PreconditionFailed {
+                detail: format!("the input lease is at epoch {}", session.lease().epoch),
+            });
+        }
+        if let Some(cursor) = expected.output_cursor
+            && cursor != session.output_cursor()
+        {
+            return Err(WorkerError::PreconditionFailed {
+                detail: format!("the output cursor is {}", session.output_cursor()),
+            });
+        }
+        drop(session);
+        Ok(())
+    }
+
+    /// Checks the freshness window a first admission is bound to.
+    ///
+    /// Returns how much of the window is left, which bounds the deadline the host accepts. An
+    /// expired or unknown window admits nothing: section 9 makes replacing a window a different
+    /// request, never an automatic retry of this one.
+    fn check_window(&self, state: &ConnectionState, mutation: &MutationRequest) -> Result<u64> {
+        state
+            .window
+            .admit(
+                &mutation.action_window_id,
+                &self.boot_identity,
+                kr_ipc::now_ms().get(),
+            )
+            .map_err(|refusal| WorkerError::WindowExpired {
+                detail: refusal.detail().to_owned(),
+            })
     }
 
     /// Checks a mutation's target, authority and preconditions without acting on it.
@@ -632,6 +936,16 @@ impl WorkerService {
                 Self::check_attachment(state, params.attachment_id)?;
                 self.check_capability(params.attachment_id, AttachmentCapability::Input)
             }
+            Method::AttachmentViewport => {
+                let params: AttachmentViewportParams = parse(&mutation.params)?;
+                Self::check_attachment(state, params.attachment_id)
+            }
+            // An action belongs to the actor that submitted it. Nothing else about the request
+            // decides whether it may be cancelled, because the receipt itself is the subject.
+            Method::ActionCancel => {
+                let _: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;
+                Ok(())
+            }
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a mutation this worker serves",
                 method.as_str()
@@ -655,6 +969,8 @@ impl WorkerService {
             Method::InputAcquire => self.input_acquire(state, &mutation.params),
             Method::InputRelease => self.input_release(state, &mutation.params),
             Method::InputInterrupt => self.input_interrupt(state, &mutation.params),
+            Method::AttachmentViewport => self.attachment_viewport(state, &mutation.params),
+            Method::ActionCancel => self.action_cancel(state, &mutation.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a mutation this worker serves",
                 method.as_str()
@@ -662,11 +978,18 @@ impl WorkerService {
         }
     }
 
-    fn reachable(&self, method: Method, version: MethodVersion) -> bool {
-        matches!(
-            kr_protocol::method::decide(method.as_str(), version, ActorIngress::LocalIpc),
-            kr_protocol::authority::AuthorityDecision::Listed(_)
-        )
+    /// Returns the registry entry that governs a request from a local caller.
+    ///
+    /// Anything unlisted, unreachable from this ingress or at an unsupported version has no entry,
+    /// and the request is refused before a parameter is parsed.
+    fn entry(
+        method: Method,
+        version: MethodVersion,
+    ) -> Option<&'static kr_protocol::authority::MethodEntry> {
+        match kr_protocol::method::decide(method.as_str(), version, ActorIngress::LocalIpc) {
+            kr_protocol::authority::AuthorityDecision::Listed(entry) => Some(entry),
+            kr_protocol::authority::AuthorityDecision::Denied(_) => None,
+        }
     }
 
     /// Refuses a request that names a session this worker does not own.
@@ -777,6 +1100,54 @@ impl WorkerService {
             oldest_retained_cursor: U64::new(oldest),
             gap: Nullable(gap),
         })
+    }
+
+    /// Returns a retained receipt and its result to the actor that owns it.
+    ///
+    /// The de-duplication key is the actor and the action together, so a lookup here can only ever
+    /// find this caller's own action. An identifier belonging to somebody else simply is not
+    /// present, which is what keeps an action identifier from being a way to read another actor's
+    /// result.
+    fn action_read(&self, state: &ConnectionState, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::receipt::ActionReadParams = parse(params)?;
+        let mut session = self.runtime.session();
+        let journal = session
+            .journal_mut()
+            .ok_or_else(|| WorkerError::JournalUnavailable {
+                detail: "this session retains no receipts, so none can be read".to_owned(),
+            })?;
+        let receipt = journal
+            .read(state.actor_id.clone(), params.action_id)?
+            .ok_or_else(|| {
+                WorkerError::InvalidArgument(format!("no receipt for action {}", params.action_id))
+            })?;
+        let retained = journal.read_result(&state.actor_id, params.action_id)?;
+        drop(session);
+        let result = retained
+            .map(|bytes| {
+                kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
+                    .map(ParamsValue::new)
+                    .map_err(|error| WorkerError::InvalidArgument(error.to_string()))
+            })
+            .transpose()?;
+        encode(&kr_protocol::receipt::ActionReadResult {
+            receipt,
+            result: Nullable(result),
+        })
+    }
+
+    /// Cancels an intent this actor submitted that has not been dispatched.
+    fn action_cancel(&self, state: &ConnectionState, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::receipt::ActionCancelParams = parse(params)?;
+        let mut session = self.runtime.session();
+        let journal = session
+            .journal_mut()
+            .ok_or_else(|| WorkerError::JournalUnavailable {
+                detail: "this session retains no receipts, so none can be cancelled".to_owned(),
+            })?;
+        let receipt = journal.cancel(state.actor_id.clone(), params.action_id, kr_ipc::now_ms())?;
+        drop(session);
+        encode(&kr_protocol::receipt::ActionCancelResult { receipt })
     }
 
     fn attachment_viewport(
@@ -975,6 +1346,29 @@ impl WorkerService {
     }
 }
 
+/// The subject facts a mutation requires to still be true.
+///
+/// A precondition map is not a closed object with nullable fields: a caller states what it depends
+/// on, and states nothing about the rest. Absence therefore means "no precondition", which is why
+/// these are `Option` and not `Nullable`. The map itself is closed, so a precondition this host
+/// does not implement is a refusal rather than a field that quietly has no effect.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutationPreconditions {
+    /// The lifecycle state the session must be in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_state: Option<kr_protocol::session::SessionState>,
+    /// The geometry epoch the session must be at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_epoch: Option<kr_protocol::ids::GeometryEpoch>,
+    /// The input lease epoch the session must be at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_lease_epoch: Option<kr_protocol::ids::InputLeaseEpoch>,
+    /// The output cursor the session must be at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cursor: Option<u64>,
+}
+
 /// What a worker was told about the host it belongs to.
 #[derive(Clone, Debug)]
 pub struct ServiceBinding {
@@ -999,8 +1393,12 @@ pub struct ConnectionState {
     pub negotiated: bool,
     /// True once a controller generation has been accepted on this connection.
     pub controller: bool,
-    /// The freshness window the host stamped.
-    pub action_window: ActionWindowId,
+    /// Which kind of client opened this connection, as it declared in its hello.
+    pub client_kind: LocalClientKind,
+    /// The generation this connection proved, when it is a controller.
+    pub generation: Option<ControllerGeneration>,
+    /// The freshness window the host stamped for this connection.
+    pub window: kr_ipc::freshness::FreshnessWindow,
     /// The event stream identifier notifications carry.
     pub stream_id: StreamId,
     /// The challenge this connection issued to a controller, consumed once.
@@ -1024,21 +1422,29 @@ pub struct ConnectionState {
     /// It is built from the authenticated operating-system caller. A local caller never asserts
     /// its own provenance and never borrows a device identity.
     pub actor_id: ActorId,
-    /// When this connection's freshness window expires.
-    pub window_expires_at_ms: u64,
     next_request: u64,
 }
 
 impl ConnectionState {
     /// Builds the state for a fresh connection.
     #[must_use]
-    pub fn new(connection_id: ConnectionId, peer: &PeerIdentity) -> Self {
+    pub fn new(
+        connection_id: ConnectionId,
+        peer: &PeerIdentity,
+        boot_identity: BootIdentity,
+    ) -> Self {
         Self {
             connection_id,
             negotiated: false,
             controller: false,
-            action_window: ActionWindowId::new(format!("local:{connection_id}"))
-                .unwrap_or_else(|_| ActionWindowId::new("local").expect("a valid window")),
+            client_kind: LocalClientKind::Cli,
+            generation: None,
+            window: kr_ipc::freshness::FreshnessWindow::issue(
+                connection_id,
+                boot_identity,
+                kr_ipc::now_ms().get(),
+                ACTION_WINDOW_MS,
+            ),
             stream_id: StreamId::new(OUTPUT_STREAM).expect("a valid stream name"),
             generation_nonce: None,
             attachments: Vec::new(),
@@ -1050,20 +1456,26 @@ impl ConnectionState {
             delivery: None,
             actor_id: ActorId::new(format!("local:{}", peer.uid))
                 .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal")),
-            window_expires_at_ms: kr_ipc::now_ms().get().saturating_add(ACTION_WINDOW_MS),
             next_request: 0,
         }
     }
 
     /// Returns the deadline the host derives for a mutation.
     ///
-    /// It is the earliest of the window's expiry and the receipt time plus the requested lifetime,
-    /// bounded by the protocol maximum. The client never supplies an authoritative deadline.
+    /// It is the earliest of what the window has left, the receipt time plus the requested
+    /// lifetime, and the protocol maximum. The client never supplies an authoritative deadline,
+    /// and the window's remainder is read from the continuous clock, so a deadline can never be
+    /// longer than the freshness that admitted it.
     #[must_use]
-    pub fn accepted_deadline(&self, requested_ttl_ms: u64) -> kr_protocol::scalars::TimestampMs {
-        let requested = requested_ttl_ms.min(kr_protocol::limits::MAX_MUTATION_TTL.get());
-        let from_ttl = kr_ipc::now_ms().get().saturating_add(requested);
-        kr_protocol::scalars::TimestampMs::new(from_ttl.min(self.window_expires_at_ms))
+    pub fn accepted_deadline(
+        &self,
+        requested_ttl_ms: u64,
+        window_remaining_ms: u64,
+    ) -> kr_protocol::scalars::TimestampMs {
+        let requested = requested_ttl_ms
+            .min(kr_protocol::limits::MAX_MUTATION_TTL.get())
+            .min(window_remaining_ms);
+        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get().saturating_add(requested))
     }
 
     fn next_request_id(&mut self) -> RequestId {

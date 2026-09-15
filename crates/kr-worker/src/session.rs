@@ -212,6 +212,12 @@ impl Session {
         self.state
     }
 
+    /// Returns the session epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> SessionEpoch {
+        self.config.session_epoch
+    }
+
     /// Returns the cursor after the last output byte.
     #[must_use]
     pub const fn output_cursor(&self) -> u64 {
