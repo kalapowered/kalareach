@@ -57,10 +57,12 @@ pub enum RequiredAuthority {
     /// grant it is delegating from, or issued the grant it is revoking. Holding a right that a
     /// grant happens to contain never implies authority over the grant itself.
     IssuerDelegation,
-    /// Present view authority over the subject the host resolves from the named resource, rather
+    /// Current read authority over the subject the host resolves from the named resource, rather
     /// than over a resource the request states. For a session subject that is `session.view` at
-    /// the session's current scope; for a host or environment subject it is the scope that permits
-    /// the effect the subject records. Holding a stale identifier is never enough.
+    /// the session's current scope; for a host or environment subject it is the actor's current
+    /// read scope over that environment. It is a read requirement: permission to have performed
+    /// the original effect is not required, and is not sufficient either. Holding a stale
+    /// identifier is never enough.
     PresentViewAuthority,
 }
 

@@ -63,10 +63,11 @@ impl StreamKind {
         }
     }
 
-    /// Returns the maximum frame payload this stream kind accepts, in bytes.
+    /// Returns the maximum size of a complete frame on this stream kind, in bytes.
     ///
-    /// The attachment bound is larger than the control bound and cannot be selected on a control
-    /// stream, which is why the bound is a property of the stream kind rather than of a frame.
+    /// This covers the four-byte length prefix as well as the payload. The attachment bound is
+    /// larger than the control bound and cannot be selected on a control stream, which is why the
+    /// bound is a property of the stream kind rather than of a frame.
     #[must_use]
     pub const fn max_frame_len(self) -> usize {
         match self {
@@ -76,10 +77,18 @@ impl StreamKind {
         }
     }
 
+    /// Returns the maximum payload this stream kind accepts, in bytes.
+    ///
+    /// The frame bound less its length prefix.
+    #[must_use]
+    pub const fn max_payload_len(self) -> usize {
+        self.max_frame_len() - FRAME_LENGTH_PREFIX_LEN
+    }
+
     /// Returns the KR-CBOR-1 decode limits for this stream kind.
     #[must_use]
     pub fn cbor_limits(self) -> CborLimits {
-        CborLimits::DEFAULT.with_max_message_len(self.max_frame_len())
+        CborLimits::DEFAULT.with_max_message_len(self.max_payload_len())
     }
 }
 
@@ -219,7 +228,7 @@ impl FrameCodec {
     /// Returns the maximum payload length for this stream kind.
     #[must_use]
     pub const fn max_payload_len(self) -> usize {
-        self.kind.max_frame_len()
+        self.kind.max_payload_len()
     }
 
     /// Frames one canonical payload.

@@ -15,7 +15,9 @@ import { bytesToHex, findCase, hexToBytes, loadFixture, parseValue } from './fix
 const frames = loadFixture('protocol', 'frames.json')
 const transcripts = loadFixture('protocol', 'transcripts.json')
 
-/** Frame payload bounds, matching kr_protocol::limits. */
+const FRAME_LENGTH_PREFIX_LEN = 4
+
+/** Complete frame bounds, prefix included, matching kr_protocol::limits. */
 const MAX_FRAME_LEN: Record<string, number> = {
   control: 1024 * 1024,
   terminal_output: 1024 * 1024,
@@ -26,19 +28,21 @@ const MAX_FRAME_LEN: Record<string, number> = {
 
 /** Frames one payload: a four-byte big-endian length followed by one KR-CBOR-1 object. */
 function frame (payload: Uint8Array, streamKind: string): Uint8Array {
-  const limit = MAX_FRAME_LEN[streamKind]
-  if (limit === undefined) {
+  const frameLimit = MAX_FRAME_LEN[streamKind]
+  if (frameLimit === undefined) {
     throw new Error(`unknown stream kind ${streamKind}`)
   }
+  // The stated bound covers the bytes that go on the wire, so the payload is that less its prefix.
+  const limit = frameLimit - FRAME_LENGTH_PREFIX_LEN
   if (payload.length === 0) {
     throw new Error('a frame payload cannot be empty')
   }
   if (payload.length > limit) {
     throw new Error(`frame of ${payload.length} bytes exceeds the ${limit}-byte limit`)
   }
-  const out = new Uint8Array(4 + payload.length)
+  const out = new Uint8Array(FRAME_LENGTH_PREFIX_LEN + payload.length)
   new DataView(out.buffer).setUint32(0, payload.length, false)
-  out.set(payload, 4)
+  out.set(payload, FRAME_LENGTH_PREFIX_LEN)
   return out
 }
 
@@ -61,7 +65,11 @@ describe('frames.json', () => {
   )
 
   it('rejects a frame above its stream bound before any payload is built', () => {
-    expect(() => frame(new Uint8Array(64 * 1024 + 1), 'terminal_input')).toThrowError(/exceeds/)
+    for (const [kind, frameLimit] of Object.entries(MAX_FRAME_LEN)) {
+      const payloadLimit = frameLimit - FRAME_LENGTH_PREFIX_LEN
+      expect(frame(new Uint8Array(payloadLimit), kind).length).toBe(frameLimit)
+      expect(() => frame(new Uint8Array(payloadLimit + 1), kind)).toThrowError(/exceeds/)
+    }
     expect(() => frame(new Uint8Array(0), 'control')).toThrowError(/cannot be empty/)
   })
 })

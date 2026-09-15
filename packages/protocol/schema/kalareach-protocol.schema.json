@@ -655,7 +655,7 @@
         },
         {
           "const": "PAIRING_AUTH_FAILED",
-          "description": "A pairing confirmation tag or proof did not verify. The cause stays ambiguous.",
+          "description": "A pairing confirmation tag or proof did not verify. An authentication failure needs a configuration or software change, and the cause stays ambiguous: a wrong secret, a wrong origin and a stale paired key are not distinguished. A failed key confirmation is never retried automatically.",
           "type": "string"
         },
         {
@@ -2691,7 +2691,7 @@
         },
         {
           "const": "present_view_authority",
-          "description": "Present view authority over the subject the host resolves from the named resource, rather\nthan over a resource the request states. For a session subject that is `session.view` at\nthe session's current scope; for a host or environment subject it is the scope that permits\nthe effect the subject records. Holding a stale identifier is never enough.",
+          "description": "Current read authority over the subject the host resolves from the named resource, rather\nthan over a resource the request states. For a session subject that is `session.view` at\nthe session's current scope; for a host or environment subject it is the actor's current\nread scope over that environment. It is a read requirement: permission to have performed\nthe original effect is not required, and is not sufficient either. Holding a stale\nidentifier is never enough.",
           "type": "string"
         }
       ]

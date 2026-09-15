@@ -12,10 +12,15 @@ use crate::scalars::DurationMs;
 /// resource. It is validated against the established control connection before any data frame.
 pub const MAX_STREAM_HEADER_LEN: usize = 1024;
 
-/// Maximum size of a control frame payload, in bytes.
+/// Maximum size of a complete control frame, in bytes.
+///
+/// Every frame bound below covers the complete frame, its four-byte length prefix included. The
+/// attachment allowance says so outright ("1 MiB of chunk data plus at most 4 KiB of encoded
+/// metadata/framing"), and counting the prefix everywhere keeps each payload inside the maximum
+/// message size as well.
 pub const MAX_CONTROL_FRAME_LEN: usize = 1024 * 1024;
 
-/// Maximum size of an input frame payload, in bytes.
+/// Maximum size of a complete input frame, in bytes.
 pub const MAX_INPUT_FRAME_LEN: usize = 64 * 1024;
 
 /// Maximum size of one attachment chunk, in bytes.
@@ -24,7 +29,7 @@ pub const MAX_ATTACHMENT_CHUNK_LEN: usize = 1024 * 1024;
 /// Maximum size of the encoded metadata and framing around an attachment chunk, in bytes.
 pub const MAX_ATTACHMENT_METADATA_LEN: usize = 4 * 1024;
 
-/// Maximum size of an attachment frame payload, in bytes.
+/// Maximum size of a complete attachment frame, in bytes.
 ///
 /// This larger bound cannot be selected on a control stream.
 pub const MAX_ATTACHMENT_FRAME_LEN: usize = MAX_ATTACHMENT_CHUNK_LEN + MAX_ATTACHMENT_METADATA_LEN;

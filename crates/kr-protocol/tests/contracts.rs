@@ -303,6 +303,7 @@ fn the_uncertain_and_resync_codes_have_their_required_retry_categories() {
         ErrorCode::UnsupportedCapability,
         ErrorCode::PermissionDenied,
         ErrorCode::InvalidArgument,
+        ErrorCode::PairingAuthFailed,
     ] {
         assert_eq!(
             code.retry_category(),
@@ -500,7 +501,9 @@ fn the_action_vocabulary_is_the_closed_section_10_set() {
 // ----- framing ---------------------------------------------------------------------------------
 
 #[test]
-fn frame_bounds_follow_the_stream_kind() {
+fn frame_bounds_cover_the_complete_frame() {
+    use kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN;
+
     assert_eq!(StreamKind::Control.max_frame_len(), MAX_CONTROL_FRAME_LEN);
     assert_eq!(
         StreamKind::TerminalInput.max_frame_len(),
@@ -512,17 +515,45 @@ fn frame_bounds_follow_the_stream_kind() {
     );
     // The larger attachment bound cannot be selected on a control stream.
     assert!(StreamKind::AttachmentChunks.max_frame_len() > StreamKind::Control.max_frame_len());
+
+    // The bound is on the bytes that go on the wire, length prefix included. A payload at the
+    // limit plus its prefix still fits inside the stated allowance, and one byte more does not.
+    for kind in StreamKind::ALL {
+        let codec = FrameCodec::new(*kind);
+        assert_eq!(
+            codec.max_payload_len() + FRAME_LENGTH_PREFIX_LEN,
+            kind.max_frame_len(),
+            "{kind:?}"
+        );
+        let largest = codec
+            .encode(&vec![0u8; codec.max_payload_len()])
+            .expect("a payload at the limit");
+        assert_eq!(largest.len(), kind.max_frame_len(), "{kind:?}");
+        assert!(
+            codec
+                .encode(&vec![0u8; codec.max_payload_len() + 1])
+                .is_err(),
+            "{kind:?}: one byte over must be rejected"
+        );
+    }
+
+    // An attachment frame carries a 1 MiB chunk plus at most 4 KiB of metadata and framing.
+    assert_eq!(
+        StreamKind::AttachmentChunks.max_frame_len(),
+        1024 * 1024 + 4 * 1024
+    );
 }
 
 #[test]
 fn a_declared_length_is_rejected_before_the_payload_is_allocated() {
     let codec = FrameCodec::new(StreamKind::TerminalInput);
-    let declared = u32::try_from(MAX_INPUT_FRAME_LEN + 1).expect("fits");
+    let limit = codec.max_payload_len();
+    let declared = u32::try_from(limit + 1).expect("fits");
     assert_eq!(
         codec.decode_length(declared.to_be_bytes()),
         Err(FrameError::PayloadTooLarge {
-            len: MAX_INPUT_FRAME_LEN + 1,
-            limit: MAX_INPUT_FRAME_LEN
+            len: limit + 1,
+            limit
         })
     );
     // The same length is accepted on an attachment stream.
@@ -536,7 +567,7 @@ fn a_declared_length_is_rejected_before_the_payload_is_allocated() {
         codec.decode_length(u32::MAX.to_be_bytes()),
         Err(FrameError::PayloadTooLarge {
             len: u32::MAX as usize,
-            limit: MAX_INPUT_FRAME_LEN
+            limit
         })
     );
     assert_eq!(

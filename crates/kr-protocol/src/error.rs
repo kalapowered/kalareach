@@ -104,8 +104,11 @@ error_codes! {
         "The invitation passed its deadline. A new invitation requires another owner action.";
     PairingRejected => "PAIRING_REJECTED", NoRetry,
         "The issuing owner denied or cancelled the pairing candidate.";
-    PairingAuthFailed => "PAIRING_AUTH_FAILED", NoRetry,
-        "A pairing confirmation tag or proof did not verify. The cause stays ambiguous.";
+    PairingAuthFailed => "PAIRING_AUTH_FAILED", ConfigurationChange,
+        "A pairing confirmation tag or proof did not verify. An authentication failure needs a \
+         configuration or software change, and the cause stays ambiguous: a wrong secret, a wrong \
+         origin and a stale paired key are not distinguished. A failed key confirmation is never \
+         retried automatically.";
     PairingAttemptsExhausted => "PAIRING_ATTEMPTS_EXHAUSTED", NoRetry,
         "The invitation consumed its failed-confirmation allowance.";
     RendezvousUnavailable => "RENDEZVOUS_UNAVAILABLE", Transient,
