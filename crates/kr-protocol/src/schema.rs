@@ -11,6 +11,7 @@
 use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings, json_schema};
 use serde_json::{Map, Value, json};
 
+use crate::account::{MembershipLease, PolicyAuthority};
 use crate::actor::ActorEnvelope;
 use crate::archive::{ArchiveDescriptor, RecoveryBundle, RecoveryKit, SignedArchiveManifest};
 use crate::authority::MethodEntry;
@@ -75,6 +76,7 @@ pub fn protocol_schema() -> Value {
         "grant" => Grant,
         "hello_reply" => HelloReply,
         "host_selection" => HostSelection,
+        "membership_lease" => MembershipLease,
         "method_entry" => MethodEntry,
         "mutation_request" => MutationRequest,
         "notification" => Notification,
@@ -82,6 +84,7 @@ pub fn protocol_schema() -> Value {
         "owner_confirmation_request" => OwnerConfirmationRequest,
         "pair_finish_request" => PairFinishRequest,
         "pair_status" => PairStatus,
+        "policy_authority" => PolicyAuthority,
         "proposed_grant" => ProposedGrant,
         "protocol_error" => ProtocolError,
         "receipt" => Receipt,
@@ -189,6 +192,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "pairing_sequence" => ids::PairingSequence,
         "payer_authorisation_id" => ids::PayerAuthorisationId,
         "plugin_id" => ids::PluginId,
+        "policy_key_revision" => ids::PolicyKeyRevision,
         "project_repository_id" => ids::ProjectRepositoryId,
         "question_id" => ids::QuestionId,
         "question_revision" => ids::QuestionRevision,

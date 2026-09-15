@@ -37,6 +37,7 @@
 //! | [`pairing`] | Pairing contexts, bundles, transcripts, QR payloads and owner confirmation |
 //! | [`mailbox`] | Stored mailbox envelopes and their size buckets |
 //! | [`archive`] | Backup key wraps, manifests, descriptors and recovery material |
+//! | [`account`] | Membership leases and the organisation policy-signing authority chain |
 //! | [`digest`] | The mutation payload digest |
 //! | [`limits`] | Protocol defaults |
 //! | [`schema`] | Deterministic JSON Schema and method-table generation |
@@ -73,6 +74,7 @@
 //! );
 //! ```
 
+pub mod account;
 pub mod actor;
 pub mod archive;
 pub mod authority;

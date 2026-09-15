@@ -456,6 +456,14 @@ counter_id!(
     DeviceKeyRevision,
     "The revision of a device's purpose-separated public keys."
 );
+counter_id!(
+    /// The revision of an organisation's policy-signing key.
+    ///
+    /// The policy-signing authority advances it on every rotation, and a host follows the signed
+    /// chain from the revision it pinned to the revision signing now.
+    PolicyKeyRevision,
+    "The revision of an organisation's policy-signing key, advanced on every rotation."
+);
 
 counter_id!(
     /// The backup generation an archive belongs to. Only its producer advances it.
