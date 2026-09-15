@@ -1026,10 +1026,9 @@ fn one_large_read_is_measured_before_the_next_one() {
         input.extend_from_slice(b"\r\n");
     }
     engine.feed(&input, 0);
-    assert_eq!(
-        engine.budget().usage().rows,
-        engine.grid().history_bytes(),
-        "the budget knows what the rows cost after the read that made them"
+    assert!(
+        engine.budget().usage().rows >= engine.grid().history_bytes(),
+        "the budget knows what the rows cost after the read that made them, and never less"
     );
     assert!(
         engine.budget().usage().rows <= kr_term::budget::BudgetLimits::DEFAULT.row_cache_bytes,
@@ -1135,15 +1134,18 @@ fn each_buffer_keeps_its_own_charge_across_a_switch() {
 #[test]
 fn a_link_costs_no_more_than_was_reserved_at_every_table_size() {
     for parameters in [1usize, 3, 4, 7, 8, 14, 15] {
-        let field: Vec<String> = (0..parameters)
+        let mut field: Vec<String> = (0..parameters)
             .map(|index| format!("k{index}=v{index}"))
             .collect();
+        // The last key again. A table grows before it looks for the key it is given, so a repeat
+        // leaves a table with more room in it than it has entries.
+        field.push(format!("k{}=again", parameters - 1));
         let field = field.join(":");
         let text = format!("{field};https://example.invalid/p");
         let mut engine = engine();
         engine.feed(format!("\x1b]8;{text}\x1b\\X").as_bytes(), 0);
         engine.quiesce(0);
-        let reserved = kr_term::grid::link_cost(&text, parameters);
+        let reserved = kr_term::grid::link_cost(&text, parameters + 1);
         let measured = engine.grid().screen_link_bytes();
         assert!(
             measured > 0,
@@ -1154,6 +1156,56 @@ fn a_link_costs_no_more_than_was_reserved_at_every_table_size() {
             "{parameters} parameters: measured {measured} against a reservation of {reserved}"
         );
     }
+}
+
+/// A row arriving while the library drops an older one to make room leaves the cache the same
+/// length and holding something else, so what is counted is arrivals rather than rows.
+#[test]
+fn rows_that_replace_older_ones_are_charged() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(2048, 3),
+        grid: kr_term::grid::GridConfig {
+            scrollback_rows: 8,
+            ..kr_term::grid::GridConfig::DEFAULT
+        },
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+
+    // Fill the cache to its row limit with rows that cost almost nothing.
+    for _ in 0..16 {
+        engine.feed(b"x\r\n", 0);
+    }
+    engine.quiesce(0);
+    let cheap = engine.budget().usage().rows;
+
+    // Two rows of links with long identifiers, then scroll them in. The cache holds the same
+    // number of rows afterwards and is holding far more.
+    let mut input = Vec::new();
+    for row in 0..2u32 {
+        for column in 0..512u32 {
+            input.extend_from_slice(b"\x1b]8;id=");
+            input.extend(std::iter::repeat_n(b'z', 1_900));
+            input.extend_from_slice(column.to_string().as_bytes());
+            input.extend_from_slice(b";u\x1b\\X\x1b]8;;\x1b\\");
+        }
+        if row == 0 {
+            input.extend_from_slice(b"\r\n");
+        }
+    }
+    engine.feed(&input, 0);
+    engine.quiesce(0);
+    engine.feed(b"\x1b[2S", 0);
+
+    assert!(
+        engine.budget().usage().rows > cheap,
+        "the rows that replaced the cheap ones are charged"
+    );
+    assert!(
+        engine.budget().usage().rows <= kr_term::budget::BudgetLimits::DEFAULT.row_cache_bytes,
+        "the cache is under its bound: {} bytes",
+        engine.budget().usage().rows
+    );
 }
 
 /// A hyperlink with parameters and no target is a close. The parameters are not kept, because a

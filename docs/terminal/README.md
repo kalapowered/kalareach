@@ -589,21 +589,22 @@ Growth is charged as it happens rather than noticed at the next measurement, bec
 carry a session's worth of links or fill a screen, and a bound that is only checked afterwards is
 not a bound.
 
-What section 8 asks to be *refused* before it is allocated is a geometry that cannot fit, and the
-metadata an application can grow without limit: per-cell content, and unique links and titles. Those
-are refused. A link's cost is reserved before it is applied, and one that will not fit is refused;
+What is refused before it is allocated: a geometry that cannot fit, and the metadata an application
+can grow without limit. A link's cost is reserved before it is applied, and one that will not fit is
+refused;
 refusing one ends the link that was open, because the text that belonged to the refused link must
 not end up inside the previous one. A link with parameters and no target is refused the same way:
 that is a close, and keeping its parameters would let an application hold a session's worth of
 identifiers in links nothing can follow. A cell that reaches its content bound drops the marks past
 it. The alert channel holds a bounded number of alerts, each cut to a bounded length.
 
-What the screens hold is bounded rather than refused, because a screen is a fixed number of cells:
-printing through the same cell a thousand times costs what one cell costs. Printing is charged as
-it is applied, held at what the buffer's cells can hold, so the running figure is never below what
+What the screens hold is charged rather than refused. Printing is charged as it is applied, held at
+what the buffer's cells can hold, and an erase or fill made with a pen that needs an allocation of
+its own is charged what those allocations can come to, so the running figure is never below what
 was allocated. Rows that scroll off the screen are charged where they join the historical cache,
-and the cache is brought back under its bound there rather than at the next measurement, because
-two rows can carry more than the whole of it.
+counted by where the history ends rather than by how many rows it holds, and the cache is brought
+back under its bound there rather than at the next measurement, because two rows can carry more
+than the whole of it.
 
 A reservation covers what the measurement will find. Both sides work a link's parameter table out
 from an entry count through the same rounding, and a string is reserved at twice what it holds,
@@ -616,11 +617,15 @@ list that the packed form on the cell cannot hold, counted for every column the 
 Counting only characters would report a screen of coloured, linked cells as costing what a screen of
 plain ones costs.
 
-Two bounds in section 8 meet awkwardly at the extremes. The largest grid it allows is 262,144 cells,
-each of which may hold 64 bytes of encoded content and an allocation of its own for attributes the
-packed form cannot hold; two buffers of those, filled, come to more than the 64 MiB session budget.
-A session there is reported as under resident pressure rather than refused, because refusing to
-print into a grid the same section says is valid would be worse than saying the session is large.
+One thing section 8 asks for is not here yet: it asks for rejection before a state allocation that
+cannot fit, and printing into a screen that has already been admitted is charged and reported
+rather than refused. The two bounds also meet awkwardly at the extremes. The largest grid section 8
+allows is 262,144 cells, each of which may hold 64 bytes of encoded content and an allocation of
+its own for attributes the packed form cannot hold; two buffers of those, filled, come to more than
+the 64 MiB session budget. Closing that means either reserving what a screen can hold when its
+geometry is admitted, which would refuse grids section 8 calls valid, or refusing text once a
+screen's own growth would pass the budget. Until one of those is chosen, such a session is reported
+as under resident pressure.
 
 What the budget records is what the rows actually cost, not what they are allowed to cost. Recording
 the bound instead would make a session that is over its cache look exactly like one that is at it,

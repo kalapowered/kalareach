@@ -108,7 +108,10 @@ const MAX_ALERTS: usize = 256;
 const MAX_ALERT_BYTES: usize = 1_024;
 
 /// Keeps the first `MAX_ALERT_BYTES` of `text`, cut at a scalar boundary.
-fn bounded_alert_text(mut text: String) -> String {
+///
+/// What is kept is a copy rather than the original cut short, because cutting a string short keeps
+/// the room it was holding: the point of the bound is the allocation, not the length.
+fn bounded_alert_text(text: String) -> String {
     if text.len() <= MAX_ALERT_BYTES {
         return text;
     }
@@ -116,8 +119,7 @@ fn bounded_alert_text(mut text: String) -> String {
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    text.truncate(end);
-    text
+    text[..end].to_owned()
 }
 
 #[derive(Debug, Default)]
@@ -156,7 +158,9 @@ impl AlertHandler for AlertCollector {
 /// measurement: it is what the session is charged for the channel, whether or not anything is on
 /// it at the moment.
 pub(crate) const ALERT_LIST_BYTES: u64 =
-    (MAX_ALERTS * (2 * MAX_ALERT_BYTES + 2 * size_of::<String>())) as u64;
+    // Twice, because the list grows by appending and can be holding twice the alerts it has. Each
+    // alert carries at most two strings, each cut to the bound.
+    (2 * MAX_ALERTS * (size_of::<GridAlert>() + 2 * MAX_ALERT_BYTES)) as u64;
 
 /// The configuration the grid library runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1241,6 +1245,16 @@ impl CanonicalGrid {
         attributes_are_allocated(&self.terminal.pen())
     }
 
+    /// The stable identifier the retained history ends at, which is the top visible row.
+    ///
+    /// It advances by one for every row that leaves the screen, whether or not the library dropped
+    /// an older row to make room, so it counts arrivals where a row count cannot.
+    #[must_use]
+    pub fn history_end(&self) -> i64 {
+        let screen = self.terminal.screen();
+        i64::try_from(screen.visible_row_to_stable_row(0)).unwrap_or(0)
+    }
+
     /// What the newest `rows` of the retained history cost.
     ///
     /// The rows that have just left the screen, so the cache can be charged where they join it
@@ -1364,7 +1378,10 @@ fn link_object_bytes(link: &Hyperlink) -> u64 {
     // is not using, and a session that filled one would be under-charged for every link in it.
     let mut bytes = LINK_OBJECT_BYTES
         .saturating_add(link.uri().len() as u64)
-        .saturating_add(table_bytes(params.len()));
+        // The room the table is holding rather than the entries in it: a table grows before it
+        // looks for the key it is given, so a parameter field that repeats a key leaves a table
+        // larger than its entries.
+        .saturating_add(table_bytes(params.capacity()));
     for (key, value) in params {
         bytes = bytes.saturating_add((key.capacity() + value.capacity()) as u64);
     }
@@ -1404,22 +1421,25 @@ pub(crate) const CELL_ATTRIBUTE_BYTES: u64 = {
 // both are built by appending, so a row can be holding twice the slots it is using. The per-cell
 // figure the budget charges has to cover the larger of the two, doubled.
 const _: () = assert!(CELL_OVERHEAD_BYTES >= 2 * size_of::<wezterm_term::Cell>() as u64);
-const _: () =
-    assert!(CELL_OVERHEAD_BYTES >= 2 * (size_of::<CellAttributes>() + size_of::<u16>()) as u64);
+const _: () = assert!(
+    CELL_OVERHEAD_BYTES
+        >= 2 * (size_of::<CellAttributes>() + size_of::<u16>()).next_multiple_of(size_of::<usize>())
+            as u64
+);
 
-/// What a hash table holding `entries` costs.
+/// What a hash table with room for `room` entries costs.
 ///
 /// The table keeps a power of two of slots, never fewer than four, and leaves an eighth of them
-/// free. Both the reservation made before a link is applied and the measurement taken afterwards
-/// go through here on an entry count, so the two cannot round differently: the reservation counts
-/// the separators the parameter field carries, which is never fewer than the entries the table
-/// ends up with.
-fn table_bytes(entries: usize) -> u64 {
-    let slots: u64 = match entries {
+/// free, so the room it reports and the entries it was built for round to the same number of
+/// slots. Both sides go through here: the reservation made before a link is applied passes the
+/// separators the parameter field carries, which is never fewer than the entries the table is
+/// built for, and the measurement passes the room the table ended up with.
+fn table_bytes(room: usize) -> u64 {
+    let slots: u64 = match room {
         0 => return 0,
         1..=3 => 4,
         4..=7 => 8,
-        _ => (entries.saturating_mul(8) / 7).next_power_of_two() as u64,
+        _ => (room.saturating_mul(8) / 7).next_power_of_two() as u64,
     };
     slots.saturating_mul(TABLE_SLOT_BYTES) + TABLE_GROUP_BYTES
 }

@@ -215,9 +215,18 @@ const EVICTION_PASSES: u32 = 4;
 /// for the pointer the node above keeps to it.
 const TABLE_ENTRY_BYTES: u64 = (2 * size_of::<String>() + 2 * size_of::<usize>()) as u64;
 
+/// What the first node of the link table costs.
+///
+/// A node holds several entries and is allocated whole, so the first target to arrive pays for a
+/// node that is almost all empty.
+const TABLE_NODE_BYTES: u64 = (11 * size_of::<String>() + 4 * size_of::<usize>()) as u64;
+
 /// What the link table costs for one target.
-fn link_table_entry_bytes(uri: &str) -> u64 {
-    crate::grid::STRING_HANDLE_BYTES + uri.len() as u64 + TABLE_ENTRY_BYTES
+///
+/// The string as it is held rather than as it reads: it is built by appending, so it can be
+/// holding twice the bytes of the target.
+fn link_table_entry_bytes(uri: &String) -> u64 {
+    crate::grid::STRING_HANDLE_BYTES + uri.capacity() as u64 + TABLE_ENTRY_BYTES
 }
 
 /// How many rows a history page builds at a time before checking its byte bound.
@@ -251,7 +260,7 @@ pub struct Engine {
     saved_revision: u64,
     measured_rows: usize,
     measure_now: bool,
-    history_rows_held: usize,
+    history_end_seen: i64,
     links_seen: u64,
     title_truncated: bool,
     dropped_marks: u64,
@@ -296,7 +305,7 @@ impl Engine {
             saved_revision: 0,
             measured_rows: 0,
             measure_now: false,
-            history_rows_held: 0,
+            history_end_seen: 0,
             links_seen: 0,
             title_truncated: false,
             dropped_marks: 0,
@@ -662,7 +671,9 @@ impl Engine {
             };
             let decision = self.policy.decide(&inner);
             if decision.apply_to_grid {
+                self.reserve_content(&inner);
                 self.grid.apply(&inner);
+                self.charge_rows_that_left_the_screen(now_ms);
                 self.revision = self.next_revision();
                 // A control can select a character set or move a margin as readily as a sequence
                 // can, and a delta has to carry that for a client to repaint from.
@@ -841,12 +852,19 @@ impl Engine {
     /// than the whole of it, so it is enforced where the rows arrive. Counting rows is cheap;
     /// measuring the ones that arrived is proportional to them rather than to the scrollback.
     fn charge_rows_that_left_the_screen(&mut self, now_ms: u64) {
-        let held = self.grid.scrollback_rows();
-        let Some(added) = held.checked_sub(self.history_rows_held) else {
-            self.history_rows_held = held;
+        if self.grid.alternate_active() {
+            // The alternate buffer keeps no history, and its rows are numbered separately.
+            return;
+        }
+        // Where the history ends rather than how many rows it holds: that is what catches a row
+        // arriving while the library drops an older one to make room, where the count would be the
+        // same afterwards and the cache would be holding something else.
+        let end = self.grid.history_end();
+        let added = end.saturating_sub(self.history_end_seen);
+        self.history_end_seen = end;
+        let Ok(added) = usize::try_from(added) else {
             return;
         };
-        self.history_rows_held = held;
         if added == 0 {
             return;
         }
@@ -874,7 +892,7 @@ impl Engine {
         }
         if evicted {
             self.measured_rows = self.grid.scrollback_rows();
-            self.history_rows_held = self.measured_rows;
+            self.history_end_seen = self.grid.history_end();
             self.diagnostics.record(
                 DiagnosticKind::ResidentStateTruncated,
                 self.lexer.offset(),
@@ -941,7 +959,7 @@ impl Engine {
             return;
         }
         self.evict_history(now_ms);
-        self.history_rows_held = self.grid.scrollback_rows();
+        self.history_end_seen = self.grid.history_end();
     }
 
     /// What the session's own tables hold.
@@ -950,11 +968,12 @@ impl Engine {
     /// characters as they carry: a table that has grown keeps room it is not using, and a session
     /// that filled one would otherwise be charged for the characters alone.
     fn metadata_bytes(&self) -> u64 {
-        let links: u64 = self
-            .links
-            .iter()
-            .map(|link| link_table_entry_bytes(link))
-            .sum();
+        let links: u64 = self.links.iter().map(link_table_entry_bytes).sum::<u64>()
+            + if self.links.is_empty() {
+                0
+            } else {
+                TABLE_NODE_BYTES
+            };
         let titles = crate::grid::STRING_HANDLE_BYTES * 2
             + 2 * self.titles.icon().len() as u64
             + 2 * self.titles.window().len() as u64;
