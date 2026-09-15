@@ -362,6 +362,10 @@ export type RelayReceiptSequence = string
  */
 export type RelayRegion = string
 /**
+ * The revision of one relay instance's registration. Only the instance advances it.
+ */
+export type RelayRegistrationRevision = string
+/**
  * One reserved block of relay bytes. Consumption receipts are keyed by it.
  */
 export type RelayReservationId = string
@@ -612,6 +616,7 @@ export interface KalaReachProtocol {
     relay_lease_revision?: RelayLeaseRevision
     relay_receipt_sequence?: RelayReceiptSequence
     relay_region?: RelayRegion
+    relay_registration_revision?: RelayRegistrationRevision
     relay_reservation_id?: RelayReservationId
     remote_dispatch_lease_id?: RemoteDispatchLeaseId
     repository_generation?: RepositoryGeneration
@@ -3131,6 +3136,12 @@ export interface RelayInstanceRegistration {
    * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
    */
   relay_url: string
+  /**
+   * The revision of this registration. Strictly increasing per instance, so a registration the
+   * instance has replaced cannot be replayed to undo the replacement. The same revision is
+   * accepted again only for a byte-identical retry.
+   */
+  revision: string
   /**
    * The successor key and its overlap window, or null when no rotation is announced.
    */

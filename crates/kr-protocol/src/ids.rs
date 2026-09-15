@@ -248,6 +248,11 @@ counter_id!(
     RelayReceiptSequence,
     "The position of one consumption receipt inside its reservation's sequence."
 );
+counter_id!(
+    /// The revision of one relay instance's registration. Only the instance advances it.
+    RelayRegistrationRevision,
+    "The revision of one relay instance's registration. Only the instance advances it."
+);
 
 uuid_id!(
     /// A random owner-approved logical grouping of environments. Not a hardware identity.

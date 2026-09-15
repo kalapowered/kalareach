@@ -4441,7 +4441,7 @@
     },
     "RelayInstanceRegistration": {
       "additionalProperties": false,
-      "description": "A relay instance's registration with the service.\n\nThe instance key is generated on the relay host and never leaves it, so the service learns the\npublic half here and verifies every later receipt against it.",
+      "description": "A relay instance's registration with the service.\n\nThe instance key is generated on the relay host and never leaves it, so the service learns the\npublic half here and verifies every later receipt against it.\n\nA registration is replaced rather than amended, and [`Self::replaces`] is the whole rule for\nwhen one may replace another. Two things make that rule necessary: a registration is a signed\ndocument, so without a revision an old one could be replayed to cancel a rotation, and a\nsuccessor that could install itself the moment its overlap opened would strand every receipt its\npredecessor had signed but not yet delivered.",
       "properties": {
         "instance_key": {
           "$ref": "#/$defs/RelayInstanceKey",
@@ -4458,6 +4458,10 @@
         "relay_url": {
           "$ref": "#/$defs/NetworkHint",
           "description": "The URL clients reach this instance at."
+        },
+        "revision": {
+          "$ref": "#/$defs/RelayRegistrationRevision",
+          "description": "The revision of this registration. Strictly increasing per instance, so a registration the\ninstance has replaced cannot be replayed to undo the replacement. The same revision is\naccepted again only for a byte-identical retry."
         },
         "successor": {
           "anyOf": [
@@ -4481,6 +4485,7 @@
       },
       "required": [
         "relay_instance_id",
+        "revision",
         "instance_key",
         "relay_url",
         "region",
@@ -4786,6 +4791,11 @@
       "description": "The deployment region one relay instance serves.",
       "maxLength": 256,
       "minLength": 1,
+      "type": "string"
+    },
+    "RelayRegistrationRevision": {
+      "description": "The revision of one relay instance's registration. Only the instance advances it.",
+      "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
     "RelayReservationId": {
@@ -6160,6 +6170,9 @@
         },
         "relay_region": {
           "$ref": "#/$defs/RelayRegion"
+        },
+        "relay_registration_revision": {
+          "$ref": "#/$defs/RelayRegistrationRevision"
         },
         "relay_reservation_id": {
           "$ref": "#/$defs/RelayReservationId"

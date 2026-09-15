@@ -197,6 +197,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "relay_lease_revision" => ids::RelayLeaseRevision,
         "relay_receipt_sequence" => ids::RelayReceiptSequence,
         "relay_region" => ids::RelayRegion,
+        "relay_registration_revision" => ids::RelayRegistrationRevision,
         "relay_reservation_id" => ids::RelayReservationId,
         "remote_dispatch_lease_id" => ids::RemoteDispatchLeaseId,
         "repository_generation" => ids::RepositoryGeneration,

@@ -312,7 +312,14 @@ encoding to keep in step.
   `bytes_consumed` is its cumulative spend, so the relay compares two figures on one scale. A refill
   raises the ceiling of the same reservation; a change to the payer, the pair, the route or the
   metering boundary takes a new reservation, because those are the facts the reservation was priced
-  against. `supersedes` enforces exactly that.
+  against. `supersedes` enforces exactly that. Section 17's 8 MiB aggregate bounds what is
+  *outstanding*, which is the ceiling less what has already been reported, so it is
+  `outstanding_bytes` rather than the ceiling itself that a relay checks against its running total.
+- **A registration is replaced, not amended.** It carries its own revision, so a registration an
+  instance has replaced cannot be replayed to cancel a rotation. `replaces` states the rest: the key
+  registered is either the one already registered or the successor that registration announced, and
+  the successor may name itself only once the predecessor's recorded retirement has passed, so
+  receipts the predecessor has signed but not yet delivered still verify.
 - **Grace raises the same ceiling.** The grace after exhaustion belongs to the principal, is shared
   across its connections and starts at the first exhaustion. A relay receives a slice of what is
   left as a raised cumulative ceiling and a deadline, so it cannot restart a grace, extend one or

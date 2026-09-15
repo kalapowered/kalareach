@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use kr_cbor::{CanonicalMap, CanonicalValue, encode, sha256, to_canonical_value};
 use kr_protocol::ids::{
     AccountId, InstallationId, PayerAuthorisationId, RelayInstanceId, RelayLeaseId,
-    RelayLeaseRevision, RelayReceiptSequence, RelayRegion, RelayReservationId,
+    RelayLeaseRevision, RelayReceiptSequence, RelayRegion, RelayRegistrationRevision,
+    RelayReservationId,
 };
 use kr_protocol::pairing::NetworkHint;
 use kr_protocol::relay::{
@@ -266,6 +267,7 @@ fn receipt(sequence: u64, bytes: u64, at_ms: u64) -> RelayConsumptionReceipt {
 fn registration() -> RelayInstanceRegistration {
     RelayInstanceRegistration {
         relay_instance_id: frankfurt(),
+        revision: RelayRegistrationRevision::new(1),
         instance_key: RelayInstanceKey::from_bytes([0x61; 32]),
         relay_url: NetworkHint::new("https://relay-1.reach.kala.to").expect("a relay URL"),
         region: RelayRegion::new("eu-central").expect("a region"),
@@ -277,6 +279,7 @@ fn registration() -> RelayInstanceRegistration {
 
 fn rotation() -> RelayInstanceRegistration {
     RelayInstanceRegistration {
+        revision: RelayRegistrationRevision::new(2),
         successor: Nullable::some(RelayKeySuccession {
             instance_key: RelayInstanceKey::from_bytes([0x62; 32]),
             overlap_from_ms: TimestampMs::new(1_815_000_000_000),
@@ -372,6 +375,7 @@ fn every_vector_is_a_well_formed_object() {
     assert!(grace_lease().is_well_formed());
     assert!(registration().is_well_formed());
     assert!(rotation().is_well_formed());
+    assert!(rotation().replaces(&registration(), 1_800_000_000_000));
     assert!(revocation().fences(&bidirectional_lease(), frankfurt()));
     assert!(bidirectional_lease().admits_payload(
         EndpointKey::from_bytes([0x21; 32]),

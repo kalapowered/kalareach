@@ -182,6 +182,7 @@ export function relayInstanceRegistrationValue (
 ): CanonicalValue {
   return krMap([
     ['relay_instance_id', uuid(registration.relay_instance_id)],
+    ['revision', counter(registration.revision)],
     ['instance_key', key(registration.instance_key)],
     ['relay_url', krText(registration.relay_url)],
     ['region', krText(registration.region)],

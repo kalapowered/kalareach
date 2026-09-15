@@ -66,7 +66,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{
     AccountId, InstallationId, PayerAuthorisationId, RelayInstanceId, RelayLeaseId,
-    RelayLeaseRevision, RelayReceiptSequence, RelayRegion, RelayReservationId,
+    RelayLeaseRevision, RelayReceiptSequence, RelayRegion, RelayRegistrationRevision,
+    RelayReservationId,
 };
 use crate::pairing::NetworkHint;
 use crate::scalars::{
@@ -87,9 +88,12 @@ pub const RELAY_INSTANCE_DOMAIN: &str = "kr-relay/instance/1";
 
 /// The largest aggregate of outstanding reserved bytes one principal may hold, in bytes.
 ///
-/// Section 17 sets 8 MiB, subdividable across any admitted relay instances. It is the bound on how
-/// much consumption can be unknown at once: a service that lost contact with every relay holding a
-/// principal's reservations can be wrong by at most this much.
+/// Section 17 sets 8 MiB, subdividable across any admitted relay instances. It bounds what is
+/// *outstanding*, not what a reservation may spend over its life: a refill raises the same
+/// reservation's cumulative ceiling, so the figure this caps is the ceiling minus what has already
+/// been reported. It is the bound on how much consumption can be unknown at once, so a service that
+/// lost contact with every relay holding a principal's reservations can be wrong by at most this
+/// much.
 pub const MAX_OUTSTANDING_RESERVED_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The longest bounded grace a principal gets after exhaustion, in milliseconds.
@@ -301,18 +305,32 @@ impl RelayLease {
     /// Returns true when the lease's own fields are consistent.
     ///
     /// This is what a receiver can check without any state: the endpoints differ, the metering
-    /// instance holds one of the two route positions, the reserved block is inside the aggregate
-    /// ceiling and any grace raises that block by an amount section 17 permits. A lease that fails
-    /// this is refused before its signature is worth checking.
+    /// instance holds one of the two route positions, and any grace raises the reservation's
+    /// ceiling by an amount section 17 permits. A lease that fails this is refused before its
+    /// signature is worth checking.
+    ///
+    /// The 8 MiB aggregate is deliberately not checked here. It bounds what is outstanding, which
+    /// is the ceiling minus what has already been reported, and a stateless check cannot know the
+    /// second half of that. [`Self::outstanding_bytes`] is the check a relay makes against its own
+    /// running total.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         self.source_endpoint_key != self.destination_endpoint_key
             && self.relay_scope.includes(self.metering_relay_instance_id)
-            && self.byte_ceiling.get() <= MAX_OUTSTANDING_RESERVED_BYTES
             && self
                 .grace
                 .0
                 .is_none_or(|grace| grace.is_bounded(self.byte_ceiling.get()))
+    }
+
+    /// The bytes this lease still has outstanding once `bytes_consumed` have been counted.
+    ///
+    /// This is the figure section 17's 8 MiB aggregate bounds, per principal across every relay it
+    /// is using. A relay checks its own share of it against what it has actually counted, because
+    /// that is the only side of the subtraction it holds.
+    #[must_use]
+    pub fn outstanding_bytes(&self, bytes_consumed: u64) -> u64 {
+        self.bytes_remaining(bytes_consumed)
     }
 
     /// Returns true when the lease permits a payload from `source` to `destination`.
@@ -792,11 +810,21 @@ impl RelayKeySuccession {
 ///
 /// The instance key is generated on the relay host and never leaves it, so the service learns the
 /// public half here and verifies every later receipt against it.
+///
+/// A registration is replaced rather than amended, and [`Self::replaces`] is the whole rule for
+/// when one may replace another. Two things make that rule necessary: a registration is a signed
+/// document, so without a revision an old one could be replayed to cancel a rotation, and a
+/// successor that could install itself the moment its overlap opened would strand every receipt its
+/// predecessor had signed but not yet delivered.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RelayInstanceRegistration {
     /// The instance identity. Stable across key rotation.
     pub relay_instance_id: RelayInstanceId,
+    /// The revision of this registration. Strictly increasing per instance, so a registration the
+    /// instance has replaced cannot be replayed to undo the replacement. The same revision is
+    /// accepted again only for a byte-identical retry.
+    pub revision: RelayRegistrationRevision,
     /// The public half of the key this instance signs receipts with.
     pub instance_key: RelayInstanceKey,
     /// The URL clients reach this instance at.
@@ -839,6 +867,47 @@ impl RelayInstanceRegistration {
                     && successor.overlap_from_ms.get() >= self.valid_from_ms.get()
                     && successor.predecessor_retires_at_ms.get() <= self.valid_until_ms.get()
             })
+    }
+
+    /// Returns true when `self` may replace `previous` at `now_ms`.
+    ///
+    /// Beyond the revision, two rules hold. The key being registered is either the one already
+    /// registered or the successor that registration announced, so a key nobody has announced never
+    /// becomes the key receipts are checked against. And the successor may name itself only once
+    /// the predecessor's recorded retirement has passed, so the overlap the predecessor announced
+    /// is the overlap it gets.
+    ///
+    /// The caller separately requires the submission to be signed by a key `previous` accepts at
+    /// `now_ms`: this states which registrations may follow which, not who may submit one.
+    #[must_use]
+    pub fn replaces(&self, previous: &Self, now_ms: u64) -> bool {
+        if self.relay_instance_id != previous.relay_instance_id
+            || self.revision.get() <= previous.revision.get()
+            || !self.takes_effect_at(now_ms)
+        {
+            return false;
+        }
+        match previous.successor.0 {
+            None => self.instance_key == previous.instance_key,
+            Some(successor) => {
+                if self.instance_key == previous.instance_key {
+                    true
+                } else if self.instance_key == successor.instance_key {
+                    now_ms >= successor.predecessor_retires_at_ms.get()
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Returns true when this registration is in force at `now_ms`.
+    ///
+    /// A registration takes effect when it is recorded, so one that starts in the future would
+    /// leave the instance with no accepted key at all between now and then.
+    #[must_use]
+    pub fn takes_effect_at(&self, now_ms: u64) -> bool {
+        self.valid_from_ms.get() <= now_ms && now_ms < self.valid_until_ms.get()
     }
 
     /// Returns true when `key` is accepted for this instance at `now_ms`.
@@ -1048,11 +1117,29 @@ mod tests {
     }
 
     #[test]
-    fn a_reservation_larger_than_the_aggregate_ceiling_is_malformed() {
+    fn what_is_outstanding_is_the_ceiling_less_what_has_been_reported() {
         let mut lease = lease();
-        lease.byte_ceiling = U64::new(MAX_OUTSTANDING_RESERVED_BYTES + 1);
+        lease.byte_ceiling = U64::new(MAX_OUTSTANDING_RESERVED_BYTES);
 
-        assert!(!lease.is_well_formed());
+        assert_eq!(lease.outstanding_bytes(0), MAX_OUTSTANDING_RESERVED_BYTES);
+        assert_eq!(
+            lease.outstanding_bytes(1024),
+            MAX_OUTSTANDING_RESERVED_BYTES - 1024
+        );
+
+        // A refill raises the same reservation's cumulative ceiling, so a lease may name a ceiling
+        // above the aggregate while holding no more than the aggregate outstanding. A stateless
+        // check on the ceiling alone would refuse a lawful refill.
+        lease.byte_ceiling = U64::new(MAX_OUTSTANDING_RESERVED_BYTES * 4);
+        assert!(lease.is_well_formed());
+        assert_eq!(
+            lease.outstanding_bytes(MAX_OUTSTANDING_RESERVED_BYTES * 3),
+            MAX_OUTSTANDING_RESERVED_BYTES
+        );
+        assert_eq!(
+            lease.outstanding_bytes(MAX_OUTSTANDING_RESERVED_BYTES * 5),
+            0
+        );
     }
 
     #[test]
@@ -1324,6 +1411,7 @@ mod tests {
     fn registration(successor: Nullable<RelayKeySuccession>) -> RelayInstanceRegistration {
         RelayInstanceRegistration {
             relay_instance_id: instance(FRANKFURT),
+            revision: RelayRegistrationRevision::new(1),
             instance_key: RelayInstanceKey::from_bytes([0x61; 32]),
             relay_url: NetworkHint::new("https://relay-1.reach.kala.to").expect("a relay URL"),
             region: RelayRegion::new("eu-central").expect("a region"),
@@ -1385,6 +1473,57 @@ mod tests {
             predecessor_retires_at_ms: TimestampMs::new(4_000),
         }));
         assert!(!inverted.is_well_formed());
+    }
+
+    #[test]
+    fn a_registration_is_replaced_only_by_a_higher_revision_that_is_in_force() {
+        let previous = registration(Nullable::null());
+        let mut next = registration(Nullable::null());
+        next.revision = RelayRegistrationRevision::new(2);
+
+        assert!(next.replaces(&previous, 5_000));
+        assert!(!previous.replaces(&previous, 5_000));
+        assert!(!previous.replaces(&next, 5_000));
+
+        // A replay of the registration already replaced cannot undo the replacement.
+        assert!(!previous.replaces(&next, 5_000));
+
+        // A registration that has not started, or has ended, leaves no accepted key at all.
+        let mut later = next.clone();
+        later.valid_from_ms = TimestampMs::new(6_000);
+        assert!(!later.replaces(&previous, 5_000));
+        assert!(later.replaces(&previous, 6_000));
+        assert!(!next.replaces(&previous, 9_000));
+    }
+
+    #[test]
+    fn only_an_announced_successor_becomes_the_registered_key() {
+        let successor = RelayInstanceKey::from_bytes([0x62; 32]);
+        let stranger = RelayInstanceKey::from_bytes([0x63; 32]);
+        let previous = registration(Nullable::some(RelayKeySuccession {
+            instance_key: successor,
+            overlap_from_ms: TimestampMs::new(4_000),
+            predecessor_retires_at_ms: TimestampMs::new(6_000),
+        }));
+
+        let mut promoted = registration(Nullable::null());
+        promoted.revision = RelayRegistrationRevision::new(2);
+        promoted.instance_key = successor;
+
+        // Inside the overlap the predecessor is still answering for receipts it has signed, so the
+        // successor may not install itself early.
+        assert!(!promoted.replaces(&previous, 5_000));
+        assert!(promoted.replaces(&previous, 6_000));
+
+        // A key nobody announced never becomes the key receipts are checked against.
+        let mut imposed = promoted.clone();
+        imposed.instance_key = stranger;
+        assert!(!imposed.replaces(&previous, 6_000));
+
+        // The registered key may always restate itself, which is how a rotation is cancelled.
+        let mut cancelled = registration(Nullable::null());
+        cancelled.revision = RelayRegistrationRevision::new(2);
+        assert!(cancelled.replaces(&previous, 5_000));
     }
 
     #[test]
