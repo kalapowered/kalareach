@@ -409,6 +409,8 @@ pub struct CanonicalGrid {
     unrecognised: u64,
     tail: Option<TailCell>,
     dropped_marks: u64,
+    /// Whether a resize left each buffer holding more than its geometry can, primary first.
+    stale: [bool; 2],
 }
 
 /// The cell a text run ended on, so a later combining mark can still join it.
@@ -491,6 +493,7 @@ impl CanonicalGrid {
             unrecognised: 0,
             tail: None,
             dropped_marks: 0,
+            stale: [false, false],
         })
     }
 
@@ -950,9 +953,23 @@ impl CanonicalGrid {
         self.tail = None;
         self.terminal.resize(to_library_size(size));
         self.size = size;
+        self.stale = [true, true];
         self.normalise_storage();
         budget.commit_geometry(footprint);
         Ok(())
+    }
+
+    /// Brings the buffer that is showing back to what its geometry can hold, if a resize left it
+    /// holding more.
+    ///
+    /// Returns whether there was anything to do. A resize can only settle the buffer that is
+    /// showing, so the other one is settled when it comes back.
+    pub fn settle_active_buffer(&mut self) -> bool {
+        if !self.stale[usize::from(self.alternate_active())] {
+            return false;
+        }
+        self.normalise_storage();
+        true
     }
 
     /// Brings the screen that is showing back to what its geometry can hold.
@@ -966,7 +983,8 @@ impl CanonicalGrid {
     ///
     /// Only the screen that is showing. Reaching into the other one is not something the library
     /// offers, so it is done again when that one comes back.
-    pub fn normalise_storage(&mut self) {
+    fn normalise_storage(&mut self) {
+        self.stale[usize::from(self.alternate_active())] = false;
         let cols = self.size.cols as usize;
         let seqno = self.terminal.current_seqno();
         let screen = self.terminal.screen_mut();

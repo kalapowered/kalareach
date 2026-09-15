@@ -807,8 +807,9 @@ impl Engine {
             return;
         }
         self.alternate_seen = alternate;
-        self.grid.normalise_storage();
-        self.measure_now = true;
+        if self.grid.settle_active_buffer() {
+            self.measure_now = true;
+        }
     }
 
     /// Charges the rows that have just left the screen, and evicts when they pass the bound.
