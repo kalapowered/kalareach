@@ -560,10 +560,15 @@ pub struct SessionCreateParams {
 pub struct SessionCreateResult {
     /// The created session.
     pub session: SessionSummary,
-    /// The endpoint the creator can attach to without another controller call.
-    pub endpoint: String,
+    /// The endpoint the creator can attach to without another controller call. Null when the
+    /// session has already closed, which a repeated create token can return.
+    pub endpoint: Nullable<String>,
     /// True when this result was replayed for a repeated create token rather than created now.
     pub deduplicated: bool,
+    /// The presentation failure, when the session was created and its terminal could not be
+    /// opened. The session above is real and usable; a failed presentation never retries
+    /// execution and never creates a second session.
+    pub presentation_error: Nullable<crate::error::ProtocolError>,
 }
 
 /// Parameters of `session.list`.

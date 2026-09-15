@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AttachmentId, AttachmentOrdinal, GeometryEpoch, SessionId};
-use crate::scalars::{Nullable, TimestampMs, U64};
+use crate::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 use crate::session::Dimensions;
 
 /// What an attachment observes.
@@ -56,6 +56,46 @@ pub enum TerminalPresentationMode {
     Viewport,
 }
 
+/// What an attachment asks to be able to do.
+///
+/// A request is not a grant. The host intersects these with the actor's rights, and an attachment
+/// identifier is never permission on its own.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentCapability {
+    /// Receive terminal output.
+    ObserveTerminal,
+    /// Receive structured application state.
+    ObserveSemantic,
+    /// Hold the input lease and write input.
+    Input,
+    /// Register a geometry claim and resize while owner.
+    Geometry,
+}
+
+impl AttachmentCapability {
+    /// Every capability, in declaration order.
+    pub const ALL: &'static [Self] = &[
+        Self::ObserveTerminal,
+        Self::ObserveSemantic,
+        Self::Input,
+        Self::Geometry,
+    ];
+
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObserveTerminal => "observe_terminal",
+            Self::ObserveSemantic => "observe_semantic",
+            Self::Input => "input",
+            Self::Geometry => "geometry",
+        }
+    }
+}
+
 /// Parameters of `session.attach`.
 ///
 /// The request does not bypass grants and does not acquire a remote input lease.
@@ -72,6 +112,8 @@ pub struct SessionAttachParams {
     pub dimensions: Nullable<Dimensions>,
     /// The terminal profile this attachment presents.
     pub terminal_profile_id: Nullable<String>,
+    /// The observation and input capabilities the attachment asks for.
+    pub requested: CanonicalSet<AttachmentCapability>,
 }
 
 /// Who owns the session's rows and columns.
@@ -104,6 +146,9 @@ pub struct AttachmentSummary {
     pub presentation: Nullable<TerminalPresentationMode>,
     /// The terminal profile it presents.
     pub terminal_profile_id: Nullable<String>,
+    /// The capabilities the host granted, which are the requested ones intersected with the
+    /// actor's rights.
+    pub granted: CanonicalSet<AttachmentCapability>,
     /// When it joined.
     pub attached_at_ms: TimestampMs,
 }

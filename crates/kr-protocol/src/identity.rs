@@ -54,8 +54,13 @@ pub enum ProcessStartSource {
     LinuxProcStat,
     /// macOS `proc_pidinfo(PROC_PIDTBSDINFO)`: start time in microseconds since the epoch.
     MacosProcBsdInfo,
-    /// Windows `GetProcessTimes`: creation time in 100-nanosecond intervals.
-    WindowsProcessTimes,
+    /// Windows: the process creation time in whole seconds since the epoch.
+    ///
+    /// The kernel records 100-nanosecond intervals, and the safe reader this host uses reports
+    /// whole seconds. Two processes that share an identifier within one second are therefore
+    /// indistinguishable by this value alone, which is why a Windows worker also owns a per-session
+    /// Job Object that a recycled identifier cannot join.
+    WindowsProcessStartSeconds,
 }
 
 /// A process and the kernel's record of when it started.

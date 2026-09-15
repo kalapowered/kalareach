@@ -10,11 +10,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::{MutationRequest, Notification, Request, Response};
-use crate::hello::ProtocolVersion;
+use crate::hello::{ProtocolVersion, ReceiveLimits};
 use crate::identity::BootIdentity;
-use crate::ids::{ActionWindowId, BuildId, ConnectionId, EnvironmentId};
+use crate::ids::{ActionWindowId, BuildId, CapabilityId, ConnectionId, EnvironmentId};
 use crate::receipt::ReceiptResponse;
-use crate::scalars::{Nullable, TimestampMs, U64};
+use crate::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 
 /// Which host process a local endpoint belongs to.
 #[derive(
@@ -81,8 +81,12 @@ pub struct LocalHello {
     pub offered_versions: Vec<ProtocolVersion>,
     /// The client build.
     pub build_id: BuildId,
-    /// What kind of client this is.
+    /// What kind of client this is. It says how to frame the conversation; it confers nothing.
     pub client: LocalClientKind,
+    /// The capabilities the client offers.
+    pub capabilities: CanonicalSet<CapabilityId>,
+    /// The client's own receive limits.
+    pub max_receive: ReceiveLimits,
 }
 
 /// The first frame the host sends back.
@@ -103,8 +107,13 @@ pub struct LocalHelloAck {
     pub peer: LocalPeer,
     /// The freshness window the host stamped for this connection.
     pub action_window_id: ActionWindowId,
-    /// When that window expires.
+    /// When that window expires by the wall clock, for display. Expiry itself is decided on the
+    /// host's suspend-aware continuous clock, so a wall clock that moves cannot extend it.
     pub action_window_expires_at_ms: TimestampMs,
+    /// The capabilities both sides will use.
+    pub capabilities: CanonicalSet<CapabilityId>,
+    /// The limits both sides will use.
+    pub max_receive: ReceiveLimits,
 }
 
 /// One message on a local control stream.

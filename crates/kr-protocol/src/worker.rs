@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::hello::ProtocolVersion;
 use crate::identity::{BootIdentity, ProcessStartIdentity, WorkerProfile};
 use crate::ids::{ControllerGeneration, EnvironmentId, SessionEpoch, SessionId};
-use crate::scalars::{AuthorisationKey, Nonce256, Signature64, TimestampMs, U64, Uuid};
+use crate::scalars::{AuthorisationKey, Nonce256, Nullable, Signature64, TimestampMs, U64, Uuid};
 use crate::session::DisplayNumber;
 
 /// The domain separating a worker's startup rendezvous.
@@ -295,8 +295,9 @@ pub struct WorkerBinding {
     pub profile: WorkerProfile,
     /// The boot the worker is bound to.
     pub boot_identity: BootIdentity,
-    /// The login-session generation a desktop-bound worker is bound to.
-    pub login_generation: U64,
+    /// The login-session generation a desktop-bound worker is bound to. A headless worker is not
+    /// bound to a login session, and states that with a null rather than a placeholder number.
+    pub login_generation: Nullable<U64>,
 }
 
 #[cfg(test)]
