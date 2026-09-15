@@ -71,6 +71,10 @@ pub struct ListenerConfig {
     pub handshake_deadline: Duration,
     /// How many connections may be mid-handshake or unpaired at once, across the whole host.
     pub max_unauthorised_connections: usize,
+    /// How many unauthorised connections the host admits in a burst, across every peer.
+    pub unauthorised_burst: u32,
+    /// How often one place in that burst is returned.
+    pub unauthorised_refill: Duration,
 }
 
 impl ListenerConfig {
@@ -92,6 +96,8 @@ impl ListenerConfig {
             keepalive: KEEPALIVE,
             handshake_deadline: DEFAULT_HANDSHAKE_DEADLINE,
             max_unauthorised_connections: DEFAULT_MAX_UNAUTHORISED_CONNECTIONS,
+            unauthorised_burst: DEFAULT_UNAUTHORISED_BURST,
+            unauthorised_refill: DEFAULT_UNAUTHORISED_REFILL,
         }
     }
 }
@@ -109,6 +115,64 @@ pub const DEFAULT_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
 /// anything, which is what a per-connection budget alone cannot do: reconnecting resets a
 /// per-connection budget, and this does not.
 pub const DEFAULT_MAX_UNAUTHORISED_CONNECTIONS: usize = 64;
+
+/// How many unauthorised connections the host admits in a burst.
+pub const DEFAULT_UNAUTHORISED_BURST: u32 = 32;
+
+/// How often one place in that burst is returned.
+///
+/// Concurrency alone does not bound a peer that connects, spends a small budget and reconnects. The
+/// bucket does: sustained admissions are one every interval, however many endpoints ask.
+pub const DEFAULT_UNAUTHORISED_REFILL: Duration = Duration::from_millis(250);
+
+/// A host-wide bucket of unauthorised admissions.
+#[derive(Debug)]
+struct AdmissionRate {
+    burst: u32,
+    refill: Duration,
+    state: std::sync::Mutex<AdmissionTokens>,
+}
+
+#[derive(Debug)]
+struct AdmissionTokens {
+    tokens: u32,
+    last_refill: std::time::Instant,
+}
+
+impl AdmissionRate {
+    fn new(burst: u32, refill: Duration) -> Self {
+        Self {
+            burst: burst.max(1),
+            refill,
+            state: std::sync::Mutex::new(AdmissionTokens {
+                tokens: burst.max(1),
+                last_refill: std::time::Instant::now(),
+            }),
+        }
+    }
+
+    /// Takes one admission, or returns false when the burst is spent.
+    fn take(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let elapsed = state.last_refill.elapsed();
+        if self.refill > Duration::ZERO {
+            let earned = u32::try_from(elapsed.as_nanos() / self.refill.as_nanos().max(1))
+                .unwrap_or(u32::MAX);
+            if earned > 0 {
+                state.tokens = state.tokens.saturating_add(earned).min(self.burst);
+                state.last_refill = std::time::Instant::now();
+            }
+        }
+        if state.tokens == 0 {
+            return false;
+        }
+        state.tokens -= 1;
+        true
+    }
+}
 
 /// What the host supplies.
 ///
@@ -305,6 +369,10 @@ pub async fn register_with_clock<H: HostHandler>(
     let admission = Arc::new(tokio::sync::Semaphore::new(
         config.max_unauthorised_connections.max(1),
     ));
+    let rate = Arc::new(AdmissionRate::new(
+        config.unauthorised_burst,
+        config.unauthorised_refill,
+    ));
     let accept_loop = tokio::spawn(accept_loop(AcceptLoop {
         endpoint: endpoint.clone(),
         config: Arc::new(config),
@@ -314,6 +382,7 @@ pub async fn register_with_clock<H: HostHandler>(
         windows: Arc::clone(&windows),
         challenges,
         admission,
+        rate,
     }));
 
     Ok(NetworkListener {
@@ -333,6 +402,8 @@ struct AcceptLoop<H: HostHandler> {
     challenges: Arc<std::sync::Mutex<ChallengeLedger>>,
     /// How many connections may be mid-handshake or unpaired at once, across the whole host.
     admission: Arc<tokio::sync::Semaphore>,
+    /// How fast unauthorised connections may be admitted, across the whole host.
+    rate: Arc<AdmissionRate>,
 }
 
 impl<H: HostHandler> AcceptLoop<H> {
@@ -346,12 +417,22 @@ impl<H: HostHandler> AcceptLoop<H> {
             windows: Arc::clone(&self.windows),
             challenges: Arc::clone(&self.challenges),
             admission: Arc::clone(&self.admission),
+            rate: Arc::clone(&self.rate),
         }
     }
 }
 
 async fn accept_loop<H: HostHandler>(loop_state: AcceptLoop<H>) {
     while let Some(incoming) = loop_state.endpoint.accept().await {
+        // Concurrency alone does not bound a peer that connects, spends a small budget and
+        // reconnects, so admissions are rate limited across the whole host as well.
+        if !loop_state.rate.take() {
+            tracing::debug!(
+                "an incoming connection was refused: the host is at its admission rate"
+            );
+            incoming.refuse();
+            continue;
+        }
         // An unauthorised connection holds one admission slot from the moment it is accepted until
         // it is either authorised or gone. Without that ceiling a peer could open connections until
         // the host ran out of tasks, and reconnecting would reset every per-connection budget.
@@ -478,17 +559,12 @@ async fn serve_authorised<H: HostHandler>(
     let hook: Arc<dyn RevocationHook> = Arc::new(HandlerHook {
         handler: Arc::clone(&state.handler) as Arc<dyn ControlLossListener>,
     });
-    let streams = Arc::new(StreamRegistry::new(
+    let streams = Arc::new(StreamRegistry::with_limits(
         connection_id,
         Arc::new(StreamBudget::new(state.config.bulk_limits)),
         Some(hook),
+        authorised.selection.limits,
     ));
-    let actor = ConnectionActor::network_device(
-        state.handler.principal_for(&authorised.peer_device_id),
-        authorised.peer_device_id,
-        state.config.controller_generation,
-        connection_id,
-    );
     let control = ControlChannel {
         writer: Arc::new(Mutex::new(authorised.control_writer)),
         reader: authorised.control_reader,
@@ -497,6 +573,22 @@ async fn serve_authorised<H: HostHandler>(
     // retires the connection, and the keepalive retires any window it issued after the flag was
     // cleared, so no window can outlive the connection whichever order the two run in.
     let issuing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // The guard exists before anything else can fail, so a panic in the host's own code — building
+    // a principal, say — still ends the connection's authority rather than leaving it recorded.
+    let cleanup = ConnectionCleanup {
+        streams: Arc::clone(&streams),
+        windows: Arc::clone(&state.windows),
+        connection_id,
+        keepalive: None,
+        issuing: Arc::clone(&issuing),
+        connection: connection.clone(),
+    };
+    let actor = ConnectionActor::network_device(
+        state.handler.principal_for(&authorised.peer_device_id),
+        authorised.peer_device_id,
+        state.config.controller_generation,
+        connection_id,
+    );
     let keepalive = tokio::spawn(keepalive_loop(Keepalive {
         sender: control.sender(),
         connection: connection.clone(),
@@ -508,17 +600,10 @@ async fn serve_authorised<H: HostHandler>(
         issuing: Arc::clone(&issuing),
     }));
 
-    // The guard runs on every way out of this function, including a panic in the host's handler and
-    // a cancellation of the task: the control stream is gone either way, and everything it
-    // authorised goes with it, the keepalive included.
-    let cleanup = ConnectionCleanup {
-        streams: Arc::clone(&streams),
-        windows: Arc::clone(&state.windows),
-        connection_id,
-        keepalive: Some(keepalive),
-        issuing,
-        connection: connection.clone(),
-    };
+    // The guard now owns the keepalive too, so every way out of this function stops it: a panic in
+    // the host's handler, a cancellation of this task, or the connection ending underneath it.
+    let mut cleanup = cleanup;
+    cleanup.keepalive = Some(keepalive);
 
     let session = AuthorisedSession {
         connection: connection.clone(),
@@ -535,7 +620,14 @@ async fn serve_authorised<H: HostHandler>(
         action_window: authorised.action_window,
         clock: Arc::clone(&state.clock),
     };
-    Arc::clone(&state.handler).serve(session).await;
+    // The handler is raced against the connection itself. A control stream that fails — because its
+    // writer failed, because the peer went away, or because anything else closed the connection —
+    // ends the session here rather than waiting for a handler that may be blocked on a worker.
+    let served = Arc::clone(&state.handler).serve(session);
+    tokio::select! {
+        () = served => {}
+        _ = connection.closed() => {}
+    }
     drop(cleanup);
     Ok(())
 }

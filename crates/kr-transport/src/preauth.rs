@@ -14,8 +14,12 @@
 //! * no mutation in 0-RTT, which [`crate::actor::ConnectionActor`] enforces, leaving only
 //!   `pair.status` reachable as early data.
 //!
-//! Pairing's own budgets, phase rules and proofs are not here. They belong to the pairing crate,
-//! which implements [`PairingSurface`]; this module is the door, not the ceremony behind it.
+//! Pairing's own budgets, phase rules and proofs are not here. They belong to `kr-pairing`, whose
+//! state machines a host drives from [`PairingSurface`]; this module is the door, not the ceremony
+//! behind it. What the transport owes that ceremony is one thing the state machines cannot see for
+//! themselves, and it is exactly the contract `kr-pairing` asks for: which endpoint is on the other
+//! end of this connection, and whether this step arrived as early data.
+//! [`ConnectionPeer`] is that answer.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -26,6 +30,8 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActorId, ConnectionId, ControllerGeneration};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::EndpointKey;
+
+use kr_pairing::platform::LivePeer;
 
 use crate::actor::ConnectionActor;
 use crate::clock::{ContinuousClock, ContinuousInstant};
@@ -90,11 +96,63 @@ impl PairingMethod {
     }
 }
 
+/// The transport peer one pairing step arrived on.
+///
+/// This is `kr-pairing`'s own [`LivePeer`] contract, answered from facts the connection
+/// established: the endpoint identity iroh authenticated, and whether the step arrived as early
+/// data. A pairing state machine checks the live peer against the authenticated bundle and refuses
+/// a mutation in 0-RTT using nothing but these two answers.
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectionPeer {
+    endpoint_id: EndpointKey,
+    early_data: bool,
+    connection_id: ConnectionId,
+}
+
+impl ConnectionPeer {
+    /// Describes the peer of one unpaired connection.
+    #[must_use]
+    pub const fn new(
+        endpoint_id: EndpointKey,
+        early_data: bool,
+        connection_id: ConnectionId,
+    ) -> Self {
+        Self {
+            endpoint_id,
+            early_data,
+            connection_id,
+        }
+    }
+
+    /// Returns the connection this step arrived on.
+    #[must_use]
+    pub const fn connection_id(&self) -> ConnectionId {
+        self.connection_id
+    }
+
+    /// Returns the authenticated endpoint identity.
+    #[must_use]
+    pub const fn endpoint_id(&self) -> &EndpointKey {
+        &self.endpoint_id
+    }
+}
+
+impl LivePeer for ConnectionPeer {
+    fn live_endpoint(&self) -> kr_pairing::Result<EndpointKey> {
+        Ok(self.endpoint_id)
+    }
+
+    fn arrived_in_early_data(&self) -> bool {
+        self.early_data
+    }
+}
+
 /// What the host's pairing implementation answers.
 ///
 /// The candidate is identified by the endpoint identity iroh authenticated, which is what makes
 /// `pair.status` candidate-authenticated rather than open: the answer is about the attempt that
-/// endpoint is party to, and the caller cannot name another.
+/// endpoint is party to, and the caller cannot name another. The host drives `kr-pairing`'s
+/// invitation state machines from here, passing the peer straight through as their [`LivePeer`].
 pub trait PairingSurface: Send + Sync + std::fmt::Debug {
     /// Handles one call on the pre-authorisation surface.
     ///
@@ -104,8 +162,7 @@ pub trait PairingSurface: Send + Sync + std::fmt::Debug {
     fn call(
         &self,
         method: PairingMethod,
-        candidate_endpoint_id: &EndpointKey,
-        connection_id: ConnectionId,
+        peer: &ConnectionPeer,
         params: &ParamsValue,
     ) -> std::result::Result<ParamsValue, ProtocolError>;
 }
@@ -199,6 +256,11 @@ pub async fn serve(
         connection.connection_id,
     )
     .in_early_data(connection.early_data);
+    let peer = ConnectionPeer::new(
+        connection.peer_endpoint_id,
+        connection.early_data,
+        connection.connection_id,
+    );
     let budget = RequestBudget::new(limits);
 
     loop {
@@ -210,7 +272,7 @@ pub async fn serve(
             Some(request) => request,
             None => return Ok(()),
         };
-        let (response, exhausted) = answer(&request, &actor, surface, &budget, clock, connection);
+        let (response, exhausted) = answer(&request, &actor, surface, &budget, clock, &peer);
         connection.control_writer.write_message(&response).await?;
         if exhausted {
             // The connection has used its whole budget. Reading further requests only to refuse
@@ -227,7 +289,7 @@ fn answer(
     surface: &dyn PairingSurface,
     budget: &RequestBudget,
     clock: &dyn ContinuousClock,
-    connection: &UnpairedConnection,
+    peer: &ConnectionPeer,
 ) -> (Response, bool) {
     let charged = budget.charge(clock.now());
     let exhausted = matches!(charged, Charge::Exhausted(_));
@@ -242,14 +304,7 @@ fn answer(
                 ProtocolError::new(ErrorCode::PermissionDenied, "the method is not available")
             })
         })
-        .and_then(|method| {
-            surface.call(
-                method,
-                &connection.peer_endpoint_id,
-                connection.connection_id,
-                &request.params,
-            )
-        });
+        .and_then(|method| surface.call(method, peer, &request.params));
     (
         Response {
             request_id: request.request_id,

@@ -40,10 +40,11 @@ impl ClientState {
     /// connection gets its own, and an acknowledgement position belongs to the connection that
     /// produced it.
     pub async fn from_session(session: &Session, interruption: Option<InputInterruption>) -> Self {
+        let (receipts, submitted) = session.outcomes().await;
         Self {
             cursors: session.cursors().await,
-            receipts: session.receipts().await,
-            submitted: session.submitted_actions().await,
+            receipts,
+            submitted,
             interruption,
         }
     }

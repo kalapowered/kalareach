@@ -141,9 +141,16 @@ candidate-authenticated `pair.status`, and nothing else. The surface is narrow o
   the attempt that endpoint is party to and a caller cannot name another;
 * no mutation is served as early data.
 
-Two host-wide bounds sit above the per-connection ones, because a per-connection budget resets when
-a peer reconnects and a host-wide one does not: at most 64 connections may be mid-handshake or
-unpaired at once, and an unauthorised connection has 60 seconds to finish. The deadline covers the
+What the transport hands the ceremony is `kr-pairing`'s own `LivePeer`: the endpoint identity iroh
+authenticated, and whether this step arrived as early data. Those are the two facts a pairing state
+machine cannot see for itself, and they are what it checks the authenticated bundle and the 0-RTT
+rule against. Everything else — the budgets, the phase rules, the PAKE, the transcripts and the
+owner confirmation — belongs to `kr-pairing`.
+
+Three host-wide bounds sit above the per-connection ones, because a per-connection budget resets
+when a peer reconnects and a host-wide one does not: at most 64 connections may be mid-handshake or
+unpaired at once, unauthorised connections are admitted at most 32 in a burst and one every 250 ms
+after that, and an unauthorised connection has 60 seconds to finish. The deadline covers the
 unauthorised phase only; an authorised session lasts as long as its peer keeps it. Every request is
 charged against the connection's budget, refused or not, and a connection that spends the whole
 budget is answered once and then ended.
@@ -197,10 +204,11 @@ another connection is refused, and so is one whose resource does not fit its kin
 stream without a session and attachment, a semantic stream without a session, an attachment stream
 without a transfer.
 
-Bulk streams are bounded twice: at most 4 concurrent bulk streams by default, and at most 8 MiB
-queued across them. The queue ceiling is charged where the bytes are handed to the connection, so a
-write that would exceed it is refused before it is sent and connection flow control cannot consume
-the whole send budget and leave a keystroke waiting.
+Bulk streams are bounded three times. The connection's own QUIC send window is 8 MiB, which is
+section 9's bounded send queue per peer enforced by the transport rather than only by the
+application's accounting. Within that, at most 4 bulk streams may be open and at most 7 MiB may be
+in flight across them, so a mebibyte of the send budget is never occupied by a transfer and a
+keystroke or a receipt always has somewhere to go.
 
 The negotiated limits are in force as well as the stream kind's ceilings. A peer that declared it
 could receive less than the kind allows is held to what it declared, in both directions, and a frame

@@ -425,7 +425,7 @@ impl StreamRegistry {
             _ => None,
         };
         let limit = effective_limit(header.kind, self.state.limits);
-        let (send, recv) = self.until_revoked(connection.open_bi()).await?;
+        let (send, recv) = self.quic_until_revoked(connection.open_bi()).await?;
         let mut writer = FrameWriter::new(send, header.kind).with_max_payload(limit);
         writer.set_priority(priority_of(header.kind));
         self.until_revoked(writer.write_header(&header)).await?;
@@ -452,7 +452,7 @@ impl StreamRegistry {
         if self.is_revoked() {
             return Err(TransportError::ControlLost);
         }
-        let (send, recv) = self.until_revoked(connection.accept_bi()).await?;
+        let (send, recv) = self.quic_until_revoked(connection.accept_bi()).await?;
         // The header is read on a control-bounded reader: the kind, and therefore the frame bound,
         // is not known until the header has been read, so it cannot decide how much to read.
         let mut reader = FrameReader::new(recv, StreamKind::Control);
@@ -535,19 +535,31 @@ impl StreamRegistry {
     }
 
     /// Runs one step of opening or accepting a stream, giving up if the control stream ends first.
-    async fn until_revoked<T, E: std::fmt::Display>(
-        &self,
-        step: impl Future<Output = std::result::Result<T, E>>,
-    ) -> Result<T> {
+    ///
+    /// The step's own error is preserved. A refused header is an `INVALID_ARGUMENT`, and turning it
+    /// into a connection failure here would change what a peer is told about its own mistake.
+    async fn until_revoked<T>(&self, step: impl Future<Output = Result<T>>) -> Result<T> {
         let ended = self.state.ended.notified();
         tokio::pin!(ended);
         if self.is_revoked() {
             return Err(TransportError::ControlLost);
         }
         tokio::select! {
-            outcome = step => outcome.map_err(|error| TransportError::Stream(error.to_string())),
+            outcome = step => outcome,
             () = &mut ended => Err(TransportError::ControlLost),
         }
+    }
+
+    /// Runs one QUIC step, giving up if the control stream ends first.
+    async fn quic_until_revoked<T, E: std::fmt::Display>(
+        &self,
+        step: impl Future<Output = std::result::Result<T, E>>,
+    ) -> Result<T> {
+        self.until_revoked(async move {
+            step.await
+                .map_err(|error| TransportError::Stream(error.to_string()))
+        })
+        .await
     }
 
     fn register(&self, kind: StreamKind) -> Result<(StreamHandle, Registration)> {

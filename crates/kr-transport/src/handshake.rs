@@ -353,12 +353,17 @@ pub async fn accept_on(
 
     match outcome {
         Ok((digest, accepted)) => {
+            let mut window_guard = WindowGuard {
+                windows,
+                action_window_id: Some(accepted.action_window.action_window_id.clone()),
+            };
             let negotiated = usize::try_from(selection.limits.max_control_frame_len.get())
                 .unwrap_or(usize::MAX)
                 .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN);
             writer
                 .write_message(&ConnectReply::Accepted(Box::new(accepted.clone())))
                 .await?;
+            window_guard.disarm();
             Ok(Admitted::Authorised(Box::new(AuthorisedConnection {
                 connection_id,
                 peer_device_id: paired.device_id,
@@ -521,6 +526,31 @@ async fn admit_paired_peer(
             action_window,
         },
     ))
+}
+
+/// Retires an issued window unless the connection that would own it is admitted.
+///
+/// A window exists from the moment it is issued, which is before the acceptance frame is written.
+/// A write that fails, or a cancellation between the two, would otherwise leave a window recorded
+/// for a connection that never existed.
+#[derive(Debug)]
+struct WindowGuard<'a> {
+    windows: &'a ActionWindowIssuer,
+    action_window_id: Option<kr_protocol::ids::ActionWindowId>,
+}
+
+impl WindowGuard<'_> {
+    fn disarm(&mut self) {
+        self.action_window_id = None;
+    }
+}
+
+impl Drop for WindowGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(action_window_id) = self.action_window_id.take() {
+            self.windows.retire(&action_window_id);
+        }
+    }
 }
 
 /// Runs the client side of the handshake on a connection it opened.

@@ -77,11 +77,18 @@ pub struct BulkLimits {
     pub max_queued_bytes: usize,
 }
 
+/// How much of the peer's send budget is kept back for control and input.
+///
+/// Section 23 requires that bulk streams cannot consume the entire send budget. The connection's
+/// own send window is that budget; this is the part of it a bulk transfer may never occupy, so a
+/// keystroke or a receipt always has somewhere to go.
+pub const CONTROL_RESERVE_BYTES: usize = 1024 * 1024;
+
 impl Default for BulkLimits {
     fn default() -> Self {
         Self {
             max_streams: DEFAULT_MAX_BULK_STREAMS,
-            max_queued_bytes: MAX_SEND_QUEUE_BYTES,
+            max_queued_bytes: MAX_SEND_QUEUE_BYTES - CONTROL_RESERVE_BYTES,
         }
     }
 }
@@ -280,7 +287,12 @@ mod tests {
     }
 
     #[test]
-    fn the_default_queue_ceiling_is_the_protocol_send_budget() {
-        assert_eq!(BulkLimits::default().max_queued_bytes, 8 * 1024 * 1024);
+    fn the_default_queue_ceiling_leaves_room_for_control_traffic() {
+        let limits = BulkLimits::default();
+        assert_eq!(limits.max_queued_bytes, 7 * 1024 * 1024);
+        assert!(
+            limits.max_queued_bytes + CONTROL_RESERVE_BYTES <= MAX_SEND_QUEUE_BYTES,
+            "bulk traffic never occupies the whole send budget"
+        );
     }
 }

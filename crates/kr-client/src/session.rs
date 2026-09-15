@@ -63,16 +63,24 @@ struct Waiters {
     ended: bool,
 }
 
+/// What this client knows about its own mutations.
+#[derive(Clone, Debug, Default)]
+struct Outcomes {
+    receipts: ReceiptTracker,
+    submitted: BTreeSet<ActionId>,
+}
+
 /// The shared state of one connection.
 #[derive(Debug)]
 struct SessionState {
     waiters: std::sync::Mutex<Waiters>,
     action_window: Mutex<ActionWindow>,
     cursors: Mutex<StreamCursors>,
-    receipts: Mutex<ReceiptTracker>,
-    /// Actions this client submitted. An entry stays until its outcome is settled, so a connection
-    /// that fails mid-flight leaves the uncertain action named rather than forgotten.
-    submitted: Mutex<BTreeSet<ActionId>>,
+    /// What each action's receipt last said, and which actions were sent without a settled outcome.
+    ///
+    /// One lock, because a reconnect copies both and a receipt moves an action from one to the
+    /// other. Two locks would let a snapshot fall between the two writes and carry neither.
+    outcomes: Mutex<Outcomes>,
     events: broadcast::Sender<Notification>,
     outstanding: AtomicU64,
     max_outstanding: u64,
@@ -130,8 +138,7 @@ impl Session {
             waiters: std::sync::Mutex::new(Waiters::default()),
             action_window: Mutex::new(transport.initial_action_window()),
             cursors: Mutex::new(StreamCursors::new()),
-            receipts: Mutex::new(ReceiptTracker::new()),
-            submitted: Mutex::new(BTreeSet::new()),
+            outcomes: Mutex::new(Outcomes::default()),
             events,
             outstanding: AtomicU64::new(0),
             max_outstanding: limits.max_outstanding_mutations.get(),
@@ -169,7 +176,7 @@ impl Session {
 
     /// Returns the receipts this session has seen.
     pub async fn receipts(&self) -> ReceiptTracker {
-        self.state.receipts.lock().await.clone()
+        self.state.outcomes.lock().await.receipts.clone()
     }
 
     /// Returns the actions this client submitted whose outcome it has not seen settled.
@@ -177,7 +184,26 @@ impl Session {
     /// A reconnecting client asks the host about these. It never resubmits one: section 9 forbids
     /// dispatching an identifier again because its receipt is incomplete.
     pub async fn submitted_actions(&self) -> Vec<ActionId> {
-        self.state.submitted.lock().await.iter().copied().collect()
+        self.state
+            .outcomes
+            .lock()
+            .await
+            .submitted
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Returns the receipts and the unsettled submissions together.
+    ///
+    /// A reconnect takes both in one step: a receipt that arrives between two separate reads would
+    /// be missing from one and already removed from the other.
+    pub async fn outcomes(&self) -> (ReceiptTracker, Vec<ActionId>) {
+        let outcomes = self.state.outcomes.lock().await;
+        (
+            outcomes.receipts.clone(),
+            outcomes.submitted.iter().copied().collect(),
+        )
     }
 
     /// Records that a consumer applied everything up to `sequence` on `stream_id`.
@@ -318,15 +344,22 @@ impl Session {
             params: ParamsValue::from_typed(params)?,
         };
 
+        // The frame is built and checked against the negotiated bound *before* the action is
+        // recorded. A frame that cannot be sent was never sent, so it is a definite failure rather
+        // than an unknown outcome.
+        let frame = ControlFrame::Mutation(Box::new(mutation));
+        let bound = usize::try_from(self.transport.limits().max_control_frame_len.get())
+            .unwrap_or(usize::MAX)
+            .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN);
+        kr_cbor::to_canonical_vec_within(
+            &frame,
+            &kr_cbor::Limits::DEFAULT.with_max_message_len(bound),
+        )?;
+
         // Recorded before the send: once the frame is on the wire the host may dispatch it, and a
         // client that cannot name the action cannot ask what happened to it.
-        self.state.submitted.lock().await.insert(action_id);
-        if self
-            .transport
-            .send(&ControlFrame::Mutation(Box::new(mutation)))
-            .await
-            .is_err()
-        {
+        self.state.outcomes.lock().await.submitted.insert(action_id);
+        if self.transport.send(&frame).await.is_err() {
             // The frame may or may not have reached the host, so the action stays on the pending
             // list and the caller is told the outcome is unknown.
             return Err(ClientError::SubmissionUncertain { action_id });
@@ -337,7 +370,12 @@ impl Session {
             Ok(Answer::Response(response)) => {
                 // A correlated answer is definite, whichever way it went: the host reached a
                 // decision about this action, so it is no longer an unknown outcome.
-                self.state.submitted.lock().await.remove(&action_id);
+                self.state
+                    .outcomes
+                    .lock()
+                    .await
+                    .submitted
+                    .remove(&action_id);
                 match response.outcome {
                     Outcome::Error(error) => Err(ClientError::from(error)),
                     Outcome::Ok(_) => {
@@ -384,6 +422,10 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // A dropped session ends its connection. Leaving it open would hold the transport, its
+        // streams and its queued traffic with nothing left to read or answer them.
+        self.transport.close();
+        self.state.end();
         self.reader.abort();
     }
 }
@@ -447,9 +489,10 @@ async fn read_loop(transport: Arc<dyn ControlTransport>, state: Arc<SessionState
         };
         route(&state, frame).await;
     }
-    // The control stream has ended, so every data stream it authorised goes with it and every
-    // waiter learns that its answer is not coming.
-    transport.revoke_streams();
+    // The control stream has ended, so the connection goes with it: closing revokes every data
+    // stream it authorised and releases the transport rather than leaving queued traffic on a
+    // connection nothing is reading. Every waiter learns that its answer is not coming.
+    transport.close();
     state.end();
 }
 
@@ -462,9 +505,12 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) {
         ControlFrame::Receipt(answer) => {
             let request_id = answer.request_id;
             let receipt = answer.receipt;
-            state.receipts.lock().await.record(receipt.clone());
-            if receipt.state.is_terminal() {
-                state.submitted.lock().await.remove(&receipt.action_id);
+            {
+                let mut outcomes = state.outcomes.lock().await;
+                outcomes.receipts.record(receipt.clone());
+                if receipt.state.is_terminal() {
+                    outcomes.submitted.remove(&receipt.action_id);
+                }
             }
             state.answer(request_id, Answer::Receipt(Box::new(receipt)));
         }

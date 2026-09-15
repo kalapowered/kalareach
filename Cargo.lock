@@ -2473,6 +2473,7 @@ dependencies = [
  "iroh-relay",
  "kr-cbor",
  "kr-crypto",
+ "kr-pairing",
  "kr-protocol",
  "rustls-pki-types",
  "serde",

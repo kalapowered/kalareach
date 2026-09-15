@@ -110,10 +110,22 @@ impl StreamCursors {
     }
 
     /// Records that a snapshot at `sequence` was installed, which makes the stream usable again.
+    ///
+    /// Events that arrived while the snapshot was being prepared are ahead of its base, and they
+    /// are still this stream's contiguous history: the received position therefore never moves
+    /// backwards here. Moving it back would make the next event look like a gap.
     pub fn installed_snapshot(&mut self, stream_id: &StreamId, sequence: EventSequence) {
         self.needs_snapshot.remove(stream_id);
-        self.received.insert(stream_id.clone(), sequence);
-        self.applied.insert(stream_id.clone(), sequence);
+        let received = self
+            .received
+            .get(stream_id)
+            .map_or(sequence, |held| held.max(&sequence).to_owned());
+        self.received.insert(stream_id.clone(), received);
+        let applied = self
+            .applied
+            .get(stream_id)
+            .map_or(sequence, |held| held.max(&sequence).to_owned());
+        self.applied.insert(stream_id.clone(), applied);
     }
 
     /// Discards a stream's state and marks it as needing a snapshot.

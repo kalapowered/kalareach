@@ -158,8 +158,12 @@ fn apply_discovery(mut builder: Builder, config: &EndpointConfig) -> Result<Buil
         );
     }
     if discovery.mainline_dht {
-        builder = builder
-            .address_lookup(DhtAddressLookup::builder().addr_filter(published_addresses(config)));
+        builder = builder.address_lookup(
+            DhtAddressLookup::builder()
+                .ttl(discovery.publisher.ttl_seconds)
+                .republish_delay(discovery.publisher.republish_interval)
+                .addr_filter(published_addresses(config)),
+        );
     }
     Ok(builder)
 }

@@ -1,11 +1,12 @@
 //! The suspend-aware continuous clock every deadline in this crate is measured on.
 //!
 //! Section 9 fixes one time contract: expiry is measured on a suspend-aware continuous elapsed-time
-//! anchor, and "a timer that excludes sleep cannot extend authority". Neither clock in the standard
-//! library is one. [`std::time::Instant`] stops while the machine is suspended, so a five-second
-//! lease would outlive a suspension of any length. [`std::time::SystemTime`] keeps running across a
-//! suspension but can be stepped in either direction, and a clock that can be stepped is a clock an
-//! attacker can stop.
+//! anchor, and "a timer that excludes sleep cannot extend authority". The standard library offers
+//! no clock that is one everywhere. [`std::time::Instant`] is whatever its platform's monotonic
+//! source is: on Linux it excludes suspended time, so a five-second lease would outlive a
+//! suspension of any length, and on other platforms the answer differs. [`std::time::SystemTime`]
+//! keeps running across a suspension but can be stepped in either direction, and a clock that can
+//! be stepped is a clock an attacker can stop.
 //!
 //! [`SystemContinuousClock`] therefore reads the operating system's own continuous clock through
 //! the `boot-time` crate: `CLOCK_BOOTTIME` on Linux, Android and OpenBSD, and `mach_continuous_time`
@@ -14,11 +15,11 @@
 //! kernel's answer and a deadline, because every composition of two imperfect clocks that we could
 //! write has a case where it stops.
 //!
-//! On other platforms the crate falls back to [`std::time::Instant`], whose behaviour across a
-//! suspension is the platform's, not this crate's: on Windows that is the performance counter. A
-//! host on such a platform supplies its own qualified platform time adapter through
-//! [`ContinuousClock`] rather than relying on the default; the trait exists for exactly that, and
-//! until it does, host expiry there rests on a clock this crate has not qualified.
+//! On platforms it does not name, the crate falls back to [`std::time::Instant`], and whether that
+//! includes suspended time is the platform's answer, not this crate's. A host on such a platform
+//! supplies its own qualified platform time adapter through [`ContinuousClock`] rather than relying
+//! on the default; the trait exists for exactly that, and until it does, host expiry there rests on
+//! a clock this crate has not qualified.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

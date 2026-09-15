@@ -308,14 +308,26 @@ async fn a_replayed_proof_is_refused_on_a_second_connection() {
 }
 
 /// A pairing surface that records what it was asked and answers nothing else.
+///
+/// A real host drives `kr-pairing`'s invitation state machines from here, passing the peer straight
+/// through as their `LivePeer`. This records what the transport handed it, which is the part the
+/// transport owes the ceremony.
 #[derive(Debug, Default)]
 struct RecordingSurface {
     calls: std::sync::Mutex<Vec<PairingMethod>>,
+    peers: std::sync::Mutex<Vec<(EndpointKey, bool)>>,
 }
 
 impl RecordingSurface {
     fn calls(&self) -> Vec<PairingMethod> {
         self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn peers(&self) -> Vec<(EndpointKey, bool)> {
+        self.peers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -326,14 +338,30 @@ impl PairingSurface for RecordingSurface {
     fn call(
         &self,
         method: PairingMethod,
-        _candidate_endpoint_id: &EndpointKey,
-        _connection_id: ConnectionId,
+        peer: &kr_transport::preauth::ConnectionPeer,
         _params: &ParamsValue,
     ) -> Result<ParamsValue, ProtocolError> {
+        // The pairing crate's own rule, applied through its own contract: no pairing mutation in
+        // early data. A real host passes the peer straight to its invitation state machine.
+        if kr_pairing::platform::require_completed_handshake(peer).is_err()
+            && method != PairingMethod::Status
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "no mutation is accepted in 0-RTT",
+            ));
+        }
         self.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(method);
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((
+                kr_pairing::platform::LivePeer::live_endpoint(peer).expect("an authenticated peer"),
+                kr_pairing::platform::LivePeer::arrived_in_early_data(peer),
+            ));
         Ok(ParamsValue::empty())
     }
 }
@@ -426,6 +454,14 @@ async fn an_unpaired_endpoint_reaches_only_the_pairing_surface() {
         surface.calls(),
         vec![PairingMethod::Status],
         "only the pairing read reached the surface"
+    );
+    // What the transport owes the pairing ceremony: the authenticated endpoint on the other end of
+    // this connection, and whether the step arrived as early data. The ceremony checks the live
+    // peer against the authenticated bundle and refuses a mutation in 0-RTT from these two answers.
+    assert_eq!(
+        surface.peers(),
+        vec![(client.record.endpoint_id, false)],
+        "the surface saw the authenticated peer this connection belongs to"
     );
 
     connection.close(0u32.into(), b"done");

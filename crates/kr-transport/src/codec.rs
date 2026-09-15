@@ -314,12 +314,17 @@ impl FrameReader {
         if self.interrupted {
             self.stop();
             return Err(TransportError::Stream(
-                "a cancelled read left this stream part way through a frame".to_owned(),
+                "this stream stopped part way through a frame".to_owned(),
             ));
         }
         self.interrupted = true;
         let outcome = self.read_one(limit).await;
-        self.interrupted = false;
+        // The flag is cleared only by a complete frame or a clean end of stream. An error can have
+        // consumed a length prefix without its body — a frame past the bound is the ordinary case —
+        // and the next read would treat that body as another prefix.
+        if outcome.is_ok() {
+            self.interrupted = false;
+        }
         outcome
     }
 

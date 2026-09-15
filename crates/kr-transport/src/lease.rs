@@ -114,8 +114,32 @@ struct WorkerState {
     lease: Option<DispatchLease>,
     ended: bool,
     /// Set when the worker's control path is lost. Renewal stops until the worker acknowledges the
-    /// current revision again over a live connection.
+    /// current revision again over a *current* binding.
     fenced: bool,
+    /// Which control path the worker is speaking over. Losing one advances it, so an
+    /// acknowledgement that was in flight over the lost path cannot lift the fence the loss set.
+    binding: WorkerBinding,
+}
+
+/// Identifies one worker control path.
+///
+/// Section 9 ties renewal to the live binding, not merely to a revision number: an acknowledgement
+/// that was queued on a path the host has already given up on says nothing about the path it has
+/// now. The binding advances whenever the path is replaced or lost, and an acknowledgement carries
+/// the binding it was made under.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkerBinding(u64);
+
+impl WorkerBinding {
+    /// Returns the raw value, for a host that records it.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
 }
 
 /// Everything the issuer decides, under one lock.
@@ -184,22 +208,58 @@ impl LeaseIssuer {
     /// Acknowledgement means the worker has installed the revision and fenced or rejected the
     /// undispatched actions it affects. Only then can the worker's lease carry that revision, and
     /// only then does a fence from a lost control path lift.
-    pub fn acknowledge(&self, session_id: SessionId, revision: AuthorityRevision) {
+    pub fn acknowledge(
+        &self,
+        session_id: SessionId,
+        binding: WorkerBinding,
+        revision: AuthorityRevision,
+    ) {
         let mut state = self.lock();
         let current = state.authority_revision;
         let worker = state.workers.entry(session_id).or_default();
+        if binding != worker.binding {
+            // The acknowledgement was made over a control path the host has given up on. It is not
+            // evidence about the path in force, so it changes nothing.
+            return;
+        }
         if worker
             .acknowledged_revision
             .is_none_or(|held| revision > held)
         {
             worker.acknowledged_revision = Some(revision);
         }
-        // Only an acknowledgement of the revision in force lifts a fence. A late acknowledgement of
-        // an older revision says nothing about the current one, and accepting it would let a stale
-        // message restore renewal for a worker whose control path was lost.
+        // Only an acknowledgement of the revision in force, over the binding in force, lifts a
+        // fence. Either condition alone would let a stale message restore renewal for a worker
+        // whose control path was lost.
         if revision == current {
             worker.fenced = false;
         }
+    }
+
+    /// Records that a worker's control path was established, returning its binding.
+    ///
+    /// A host calls this when the worker's connection comes up, and passes the binding with every
+    /// acknowledgement it forwards.
+    pub fn bind(&self, session_id: SessionId) -> WorkerBinding {
+        let mut state = self.lock();
+        let worker = state.workers.entry(session_id).or_default();
+        worker.binding = worker.binding.next();
+        // A new control path starts owing an acknowledgement. The fence belonged to the path that
+        // was lost, and clearing it here changes nothing on its own: renewal still waits for an
+        // acknowledgement of the revision in force, made over this binding.
+        worker.fenced = false;
+        worker.acknowledged_revision = None;
+        worker.lease = None;
+        worker.binding
+    }
+
+    /// Returns the binding in force for a worker.
+    #[must_use]
+    pub fn binding(&self, session_id: SessionId) -> WorkerBinding {
+        self.lock()
+            .workers
+            .get(&session_id)
+            .map_or(WorkerBinding::default(), |worker| worker.binding)
     }
 
     /// Records that a worker's execution has ended.
@@ -293,6 +353,9 @@ impl LeaseIssuer {
         let worker = state.workers.entry(session_id).or_default();
         worker.fenced = true;
         worker.lease = None;
+        // The binding advances, so an acknowledgement still travelling over the lost path arrives
+        // under a binding that is no longer current and lifts nothing.
+        worker.binding = worker.binding.next();
     }
 
     /// Returns true when renewal for this worker is fenced.
@@ -352,7 +415,8 @@ mod tests {
             AuthorityRevision::new(1),
             Duration::from_secs(60),
         );
-        issuer.acknowledge(session(1), AuthorityRevision::new(1));
+        let binding = issuer.bind(session(1));
+        issuer.acknowledge(session(1), binding, AuthorityRevision::new(1));
         let lease = issuer
             .renew(session(1), ControllerGeneration::new(1), &clock)
             .expect("a lease")
@@ -370,7 +434,8 @@ mod tests {
                 .expect("a decision"),
             Err(LeaseRefusal::RevisionNotAcknowledged)
         );
-        issuer.acknowledge(session(1), AuthorityRevision::new(3));
+        let binding = issuer.bind(session(1));
+        issuer.acknowledge(session(1), binding, AuthorityRevision::new(3));
         assert!(
             issuer
                 .renew(session(1), ControllerGeneration::new(7), &clock)
@@ -383,7 +448,8 @@ mod tests {
     fn a_replaced_generation_stops_renewal() {
         let clock = ManualClock::new();
         let issuer = issuer();
-        issuer.acknowledge(session(1), AuthorityRevision::new(3));
+        let binding = issuer.bind(session(1));
+        issuer.acknowledge(session(1), binding, AuthorityRevision::new(3));
         assert_eq!(
             issuer
                 .renew(session(1), ControllerGeneration::new(6), &clock)
@@ -396,7 +462,8 @@ mod tests {
     fn a_dispatch_checks_the_deadline_at_the_moment_it_runs() {
         let clock = ManualClock::new();
         let issuer = issuer();
-        issuer.acknowledge(session(1), AuthorityRevision::new(3));
+        let binding = issuer.bind(session(1));
+        issuer.acknowledge(session(1), binding, AuthorityRevision::new(3));
         let lease = issuer
             .renew(session(1), ControllerGeneration::new(7), &clock)
             .expect("a lease")
@@ -419,7 +486,8 @@ mod tests {
     fn a_lease_never_carries_another_generation_or_revision() {
         let clock = ManualClock::new();
         let issuer = issuer();
-        issuer.acknowledge(session(1), AuthorityRevision::new(3));
+        let binding = issuer.bind(session(1));
+        issuer.acknowledge(session(1), binding, AuthorityRevision::new(3));
         let lease = issuer
             .renew(session(1), ControllerGeneration::new(7), &clock)
             .expect("a lease")
@@ -441,7 +509,8 @@ mod tests {
         let clock = ManualClock::new();
         let issuer = issuer();
         for worker in [1u8, 2, 3] {
-            issuer.acknowledge(session(worker), AuthorityRevision::new(3));
+            let binding = issuer.bind(session(worker));
+            issuer.acknowledge(session(worker), binding, AuthorityRevision::new(3));
             issuer
                 .renew(session(worker), ControllerGeneration::new(7), &clock)
                 .expect("a lease")
@@ -452,12 +521,20 @@ mod tests {
         assert!(!status.is_complete());
         assert_eq!(status.pending.len(), 3);
 
-        issuer.acknowledge(session(1), AuthorityRevision::new(4));
+        issuer.acknowledge(
+            session(1),
+            issuer.binding(session(1)),
+            AuthorityRevision::new(4),
+        );
         issuer.worker_ended(session(2));
         let status = issuer.status(AuthorityRevision::new(4));
         assert_eq!(status.pending, vec![session(3)]);
 
-        issuer.acknowledge(session(3), AuthorityRevision::new(4));
+        issuer.acknowledge(
+            session(3),
+            issuer.binding(session(3)),
+            AuthorityRevision::new(4),
+        );
         assert!(issuer.status(AuthorityRevision::new(4)).is_complete());
     }
 
@@ -465,7 +542,8 @@ mod tests {
     fn losing_the_control_path_stops_renewal_until_the_worker_acknowledges_again() {
         let clock = ManualClock::new();
         let issuer = issuer();
-        issuer.acknowledge(session(1), AuthorityRevision::new(3));
+        let binding = issuer.bind(session(1));
+        issuer.acknowledge(session(1), binding, AuthorityRevision::new(3));
         let lease = issuer
             .renew(session(1), ControllerGeneration::new(7), &clock)
             .expect("a lease")
@@ -483,12 +561,10 @@ mod tests {
             "a fenced worker cannot renew"
         );
 
-        // A stale acknowledgement says nothing about the revision in force and lifts nothing.
-        issuer.acknowledge(session(1), AuthorityRevision::new(2));
-        assert!(
-            issuer.is_fenced(session(1)),
-            "a stale acknowledgement lifts nothing"
-        );
+        // An acknowledgement still travelling over the lost path arrives under a binding that is no
+        // longer current, so it lifts nothing.
+        issuer.acknowledge(session(1), binding, AuthorityRevision::new(3));
+        assert!(issuer.is_fenced(session(1)));
         assert_eq!(
             issuer
                 .renew(session(1), ControllerGeneration::new(7), &clock)
@@ -496,9 +572,29 @@ mod tests {
             Err(LeaseRefusal::RevisionNotAcknowledged)
         );
 
-        // A fresh acknowledgement of the revision in force lifts the fence.
-        issuer.acknowledge(session(1), AuthorityRevision::new(3));
+        // A new control path lifts the fence but starts owing an acknowledgement of its own.
+        let rebound = issuer.bind(session(1));
+        assert_ne!(rebound, binding);
         assert!(!issuer.is_fenced(session(1)));
+        assert_eq!(
+            issuer
+                .renew(session(1), ControllerGeneration::new(7), &clock)
+                .expect("a decision"),
+            Err(LeaseRefusal::RevisionNotAcknowledged),
+            "a new binding does not inherit the old one's acknowledgement"
+        );
+
+        // A stale revision over the current binding is not that acknowledgement either.
+        issuer.acknowledge(session(1), rebound, AuthorityRevision::new(2));
+        assert_eq!(
+            issuer
+                .renew(session(1), ControllerGeneration::new(7), &clock)
+                .expect("a decision"),
+            Err(LeaseRefusal::RevisionNotAcknowledged)
+        );
+
+        // The revision in force, over the binding in force, is.
+        issuer.acknowledge(session(1), rebound, AuthorityRevision::new(3));
         assert!(
             issuer
                 .renew(session(1), ControllerGeneration::new(7), &clock)
@@ -511,7 +607,8 @@ mod tests {
     fn an_outstanding_lease_cannot_dispatch_after_the_revision_advances() {
         let clock = ManualClock::new();
         let issuer = issuer();
-        issuer.acknowledge(session(1), AuthorityRevision::new(3));
+        let binding = issuer.bind(session(1));
+        issuer.acknowledge(session(1), binding, AuthorityRevision::new(3));
         let lease = issuer
             .renew(session(1), ControllerGeneration::new(7), &clock)
             .expect("a lease")
