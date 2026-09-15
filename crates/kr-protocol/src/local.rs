@@ -15,6 +15,10 @@ use crate::identity::BootIdentity;
 use crate::ids::{ActionWindowId, BuildId, CapabilityId, ConnectionId, EnvironmentId};
 use crate::receipt::ReceiptResponse;
 use crate::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
+use crate::worker::{
+    ControllerGenerationToken, GenerationAccepted, GenerationChallenge, WorkerLaunchSpec,
+    WorkerReady, WorkerRendezvous, WorkerVerifyChallenge, WorkerVerifyProof,
+};
 
 /// Which host process a local endpoint belongs to.
 #[derive(
@@ -137,6 +141,24 @@ pub enum ControlMessage {
     Receipt(ReceiptResponse),
     /// An event on a subscribed stream.
     Notification(Notification),
+    /// A worker's startup claim, presented on the controller's rendezvous socket.
+    Rendezvous(WorkerRendezvous),
+    /// What the controller tells an authenticated worker to become.
+    LaunchSpec(Box<WorkerLaunchSpec>),
+    /// A worker reporting that its root shell is running.
+    WorkerReady(WorkerReady),
+    /// A worker reporting that it could not start.
+    WorkerFailed(crate::error::ProtocolError),
+    /// A fresh challenge to the worker behind an endpoint.
+    VerifyChallenge(WorkerVerifyChallenge),
+    /// The worker's signed answer.
+    VerifyProof(WorkerVerifyProof),
+    /// A worker's challenge to a controller that wants to speak for a generation.
+    GenerationChallenge(GenerationChallenge),
+    /// A controller's signed generation token.
+    GenerationToken(Box<ControllerGenerationToken>),
+    /// The worker's acceptance of a generation.
+    GenerationAccepted(GenerationAccepted),
 }
 
 #[cfg(test)]

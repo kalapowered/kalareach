@@ -144,7 +144,7 @@ impl OutputHistory {
     /// Returns an error when a spool segment cannot be read.
     pub fn page(&self, from_cursor: u64, max_bytes: u64) -> Result<HistoryPageResult> {
         let oldest = self.oldest_retained_cursor();
-        let limit = max_bytes.min(MAX_HISTORY_PAGE_BYTES).max(1);
+        let limit = max_bytes.clamp(1, MAX_HISTORY_PAGE_BYTES);
         let (start, gap) = if from_cursor < oldest {
             (
                 oldest,

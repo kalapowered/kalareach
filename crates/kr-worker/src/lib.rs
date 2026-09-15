@@ -13,6 +13,9 @@
 //! | [`input`] | The single input lease, its epochs and paste-delimiter framing |
 //! | [`journal`] | The private receipt journal: acceptance, dispatch markers, de-duplication and retention |
 //! | [`output`] | Fan-out with bounded per-attachment queues and explicit resynchronisation |
+//! | [`pty`] | The pseudo-terminal, created before the root shell, and the shell it runs |
+//! | [`session`] | The session: lifecycle, the serial order every change shares, and closure |
+//! | [`runtime`] | The reader, the writer, the recogniser timer and the closure sequence |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
 pub mod attachments;
@@ -22,5 +25,8 @@ pub mod history;
 pub mod input;
 pub mod journal;
 pub mod output;
+pub mod pty;
+pub mod runtime;
+pub mod session;
 
 pub use crate::error::{Result, WorkerError};

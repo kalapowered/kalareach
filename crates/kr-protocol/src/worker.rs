@@ -287,6 +287,67 @@ impl GenerationRefusal {
     }
 }
 
+/// What the controller tells a worker to become, over the private rendezvous channel.
+///
+/// The job definition that started the worker carries only non-secret facts: the reservation, the
+/// rendezvous address and the runtime directory. Everything else arrives here, after the worker
+/// has proved which reservation it belongs to, so a creator's environment snapshot never sits in
+/// an argument vector or an environment variable where another process could read it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerLaunchSpec {
+    /// The session the worker will own.
+    pub session_id: SessionId,
+    /// The session epoch.
+    pub session_epoch: SessionEpoch,
+    /// The environment the session belongs to.
+    pub environment_id: EnvironmentId,
+    /// The local alias, which also names the worker's endpoint.
+    pub display_number: DisplayNumber,
+    /// The create request the controller admitted.
+    pub create: crate::session::SessionCreateParams,
+    /// The controller's public key, recorded so the worker can check generation tokens.
+    pub controller_public_key: AuthorisationKey,
+    /// The generation that spawned this worker.
+    pub controller_generation: ControllerGeneration,
+    /// The release string the session reports as its terminal program version.
+    pub release: String,
+}
+
+/// What a worker reports once its root shell is running.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReady {
+    /// The session the worker owns.
+    pub session_id: SessionId,
+    /// The worker's private endpoint.
+    pub endpoint: String,
+    /// The root shell's process identity.
+    pub root_process: ProcessStartIdentity,
+    /// The executable actually launched.
+    pub shell_path: String,
+    /// The geometry the shell started at.
+    pub dimensions: crate::session::Dimensions,
+}
+
+/// A worker's challenge to a controller that wants to speak for a generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationChallenge {
+    /// Thirty-two fresh random bytes, bound to this connection and consumed once.
+    pub nonce: Nonce256,
+}
+
+/// A worker's answer to a generation token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationAccepted {
+    /// The generation the worker now accepts.
+    pub generation: ControllerGeneration,
+    /// True when accepting this token fenced an earlier connection of the same generation.
+    pub fenced_previous: bool,
+}
+
 /// How a worker's execution context is bound, as recorded in the registry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

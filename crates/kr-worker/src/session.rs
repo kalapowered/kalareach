@@ -1,0 +1,803 @@
+//! The session: one pseudo-terminal, one root shell, and the state every attachment reads.
+//!
+//! Everything mutable about a session lives in [`Session`] and changes through its methods, one at
+//! a time. Ownership changes, resize operations and output cursors therefore share one order, which
+//! is what section 8 requires and what makes a cursor mean the same thing to every attachment.
+//!
+//! # Closure
+//!
+//! `session.close` is not a request to exit; it is a state. It sets `closing` atomically, stops
+//! accepting input, asks the owned process group to stop, and allows five seconds before forcing
+//! the remainder. Output drains for up to two more seconds so the last lines are not lost. The
+//! caller's acceptance is returned before any of that, because the caller may itself be inside the
+//! process group about to be signalled.
+//!
+//! Storage failure never blocks a stop. If the journal is unavailable the closure proceeds on the
+//! worker's current in-memory authority and identities, and the reply says `durability=volatile`
+//! rather than pretending it was recorded.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use kr_protocol::attachment::{
+    AttachmentCapability, AttachmentSummary, GeometryState, SessionAttachParams,
+    SessionAttachResult, SessionDetachResult, TerminalPresentationMode,
+};
+use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+use kr_protocol::ids::{
+    AttachmentId, ConnectionId, EnvironmentId, SessionEpoch, SessionId, StreamCursor,
+};
+use kr_protocol::input::{InputAcquireResult, InputLeaseState};
+use kr_protocol::recovery::{EventsSnapshotResult, HistoryPageResult, ResyncReason};
+use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
+use kr_protocol::session::{
+    ApplicationState, ClosureReason, ClosureRecord, Dimensions, Durability, OwnershipCoverage,
+    SessionState, SessionSummary, ShellMode, TerminatedProcess,
+};
+
+use crate::attachments::AttachmentTable;
+use crate::error::{Result, WorkerError};
+use crate::history::{OutputHistory, SpoolLayout};
+use crate::input::{InputLease, LeaseRefusal, PasteFramer};
+use crate::journal::Journal;
+use crate::output::{OutputHub, OutputStream};
+use crate::pty::{Pty, RootShell, ShellCommand, ShellExit};
+
+/// How long an owned process group has to stop before it is forced.
+pub const GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+/// How long output drains after the processes have stopped.
+pub const DRAIN_PERIOD: Duration = Duration::from_secs(2);
+
+/// Everything a worker needs to bring one session up.
+#[derive(Clone, Debug)]
+pub struct SessionConfig {
+    /// The session identity.
+    pub session_id: SessionId,
+    /// The epoch. Fixed at 1 in this version.
+    pub session_epoch: SessionEpoch,
+    /// The environment that owns it.
+    pub environment_id: EnvironmentId,
+    /// The local alias.
+    pub display_number: kr_protocol::session::DisplayNumber,
+    /// The root shell to launch.
+    pub shell: ShellCommand,
+    /// How the shell is integrated.
+    pub shell_mode: ShellMode,
+    /// How long the execution context lasts.
+    pub worker_profile: WorkerProfile,
+    /// The login session a desktop-bound worker is tied to.
+    pub desktop: DesktopBinding,
+    /// The starting geometry.
+    pub dimensions: Dimensions,
+    /// The private journal, or `None` for a session whose receipts are not retained on disk.
+    pub journal_path: Option<std::path::PathBuf>,
+    /// The output spool directory.
+    pub spool_directory: Option<std::path::PathBuf>,
+    /// The bound on one attachment's queued output.
+    pub send_queue_bytes: usize,
+    /// The resident output cache.
+    pub resident_bytes: usize,
+}
+
+/// What a close request produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseAcceptance {
+    /// The state at the moment of the reply.
+    pub state: SessionState,
+    /// Whether the closure is being recorded durably.
+    pub durability: Durability,
+    /// The final record, when closure has already finished.
+    pub closure: Option<ClosureRecord>,
+    /// True when this request began the closure rather than joining one already running.
+    pub initiated: bool,
+}
+
+/// One live session.
+pub struct Session {
+    config: SessionConfig,
+    state: SessionState,
+    pty: Pty,
+    shell: Option<RootShell>,
+    attachments: AttachmentTable,
+    lease: InputLease,
+    framer: PasteFramer,
+    history: OutputHistory,
+    hub: OutputHub,
+    journal: Option<Journal>,
+    journal_failure: Option<String>,
+    closure: Option<ClosureRecord>,
+    application_state: Option<ApplicationState>,
+    closing_reason: Option<ClosureReason>,
+    created_at_ms: TimestampMs,
+    pending_input: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Session")
+            .field("session_id", &self.config.session_id)
+            .field("state", &self.state)
+            .field("attachments", &self.attachments.len())
+            .field("cursor", &self.history.next_cursor())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Session {
+    /// Creates the pseudo-terminal and opens the durable stores, without starting a shell.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the terminal cannot be created. A journal that cannot be opened is
+    /// recorded rather than fatal: an authorised stop must still work without one.
+    pub fn open(config: SessionConfig) -> Result<Self> {
+        let pty = Pty::open(config.dimensions)?;
+        let history = match config.spool_directory.as_ref() {
+            Some(directory) => {
+                OutputHistory::with_spool(config.resident_bytes, directory, SpoolLayout::DEFAULT)?
+            }
+            None => OutputHistory::in_memory(config.resident_bytes),
+        };
+        let (journal, journal_failure) = match config.journal_path.as_ref() {
+            Some(path) => match Journal::open(path) {
+                Ok(mut journal) => {
+                    // A dispatch marker with no authoritative answer is unresolvable from here, so
+                    // it becomes unknown and is never dispatched again.
+                    let _ = journal.resolve_unfinished_dispatches(kr_ipc::now_ms());
+                    let _ = journal.prune(kr_ipc::now_ms());
+                    (Some(journal), None)
+                }
+                Err(error) => (None, Some(error.to_string())),
+            },
+            None => (Journal::in_memory().ok(), None),
+        };
+        Ok(Self {
+            attachments: AttachmentTable::new(config.dimensions),
+            state: SessionState::Creating,
+            pty,
+            shell: None,
+            lease: InputLease::new(),
+            framer: PasteFramer::new(),
+            history,
+            hub: OutputHub::new(),
+            journal,
+            journal_failure,
+            closure: None,
+            application_state: None,
+            closing_reason: None,
+            created_at_ms: kr_ipc::now_ms(),
+            pending_input: Vec::new(),
+            config,
+        })
+    }
+
+    /// Starts the root shell and moves the session to `live`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shell cannot be started. The session is closed with
+    /// `root_launch_failed` so a failed creation leaves a record rather than a stuck `creating`.
+    pub fn launch(&mut self) -> Result<()> {
+        if self.state != SessionState::Creating {
+            return Err(WorkerError::InvalidArgument(
+                "a root shell starts once, during creation".to_owned(),
+            ));
+        }
+        let command = self.config.shell.clone();
+        match self.pty.launch(&command) {
+            Ok(shell) => {
+                self.shell = Some(shell);
+                self.state = SessionState::Live;
+                self.application_state = Some(ApplicationState::ShellReady);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_closure(ClosureReason::RootLaunchFailed, None);
+                Err(error)
+            }
+        }
+    }
+
+    /// Returns the session's identity.
+    #[must_use]
+    pub const fn id(&self) -> SessionId {
+        self.config.session_id
+    }
+
+    /// Returns the lifecycle state.
+    #[must_use]
+    pub const fn state(&self) -> SessionState {
+        self.state
+    }
+
+    /// Returns the cursor after the last output byte.
+    #[must_use]
+    pub const fn output_cursor(&self) -> u64 {
+        self.history.next_cursor()
+    }
+
+    /// Returns the root shell's process identity while one is running.
+    #[must_use]
+    pub fn root_identity(&self) -> Option<kr_protocol::identity::ProcessStartIdentity> {
+        self.shell.as_ref().map(|shell| shell.identity().clone())
+    }
+
+    /// Returns a reader for the terminal's output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reader cannot be cloned.
+    pub fn output_reader(&self) -> Result<Box<dyn std::io::Read + Send>> {
+        self.pty.reader()
+    }
+
+    /// Returns the writer for terminal input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer has already been taken.
+    pub fn input_writer(&self) -> Result<Box<dyn std::io::Write + Send>> {
+        self.pty.writer()
+    }
+
+    /// Renders the session for the wire.
+    #[must_use]
+    pub fn summary(&self) -> SessionSummary {
+        SessionSummary {
+            session_id: self.config.session_id,
+            session_epoch: self.config.session_epoch,
+            environment_id: self.config.environment_id,
+            display_number: self.config.display_number,
+            state: self.state,
+            shell_mode: self.config.shell_mode,
+            shell_path: self.config.shell.program.clone(),
+            cwd: self.config.shell.cwd.clone(),
+            worker_profile: self.config.worker_profile,
+            desktop: self.config.desktop.clone(),
+            created_at_ms: self.created_at_ms,
+            dimensions: self.attachments.dimensions(),
+            attachment_count: U64::new(self.attachments.len() as u64),
+            application_state: Nullable(self.application_state),
+            root_process: Nullable(self.root_identity()),
+            closure: Nullable(self.closure.clone()),
+        }
+    }
+
+    /// Returns the geometry and its owner.
+    #[must_use]
+    pub fn geometry(&self) -> GeometryState {
+        self.attachments.geometry()
+    }
+
+    /// Returns the input lease.
+    #[must_use]
+    pub fn lease(&self) -> InputLeaseState {
+        self.lease.to_wire()
+    }
+
+    /// Adds an attachment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is closed or the request is not valid.
+    pub fn attach(
+        &mut self,
+        params: &SessionAttachParams,
+        granted: CanonicalSet<AttachmentCapability>,
+        attachment_id: AttachmentId,
+    ) -> Result<SessionAttachResult> {
+        self.require_running()?;
+        let (attachment, change) =
+            self.attachments
+                .attach(params, granted, attachment_id, kr_ipc::now_ms())?;
+        if change.resize_required {
+            self.pty.resize(change.state.dimensions)?;
+        }
+        Ok(SessionAttachResult {
+            attachment,
+            geometry: change.state,
+            output_cursor: U64::new(self.history.next_cursor()),
+        })
+    }
+
+    /// Removes an attachment, releasing whatever it held.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attachment is unknown.
+    pub fn detach(&mut self, attachment_id: AttachmentId) -> Result<SessionDetachResult> {
+        // Undelivered input from the removed attachment goes with it; nothing is replayed.
+        self.lease.release_attachment(attachment_id);
+        self.hub.unsubscribe(attachment_id);
+        let change = self.attachments.detach(attachment_id)?;
+        if change.resize_required && self.state.is_running() {
+            self.pty.resize(change.state.dimensions)?;
+        }
+        Ok(SessionDetachResult {
+            attachment_id,
+            geometry: change.state,
+            remaining: U64::new(self.attachments.len() as u64),
+        })
+    }
+
+    /// Records an attachment's own dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attachment is unknown or the dimensions are not valid.
+    pub fn viewport(
+        &mut self,
+        attachment_id: AttachmentId,
+        dimensions: Dimensions,
+    ) -> Result<TerminalPresentationMode> {
+        self.attachments.viewport(attachment_id, dimensions)
+    }
+
+    /// Adds or withdraws a geometry claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attachment is unknown or may not claim geometry.
+    pub fn configure(
+        &mut self,
+        attachment_id: AttachmentId,
+        claim_geometry: bool,
+    ) -> Result<GeometryState> {
+        let change = self.attachments.configure(attachment_id, claim_geometry)?;
+        if change.resize_required && self.state.is_running() {
+            self.pty.resize(change.state.dimensions)?;
+        }
+        Ok(change.state)
+    }
+
+    /// Changes the canonical geometry at the owner's request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller does not own the size, names a stale epoch, or asks for a
+    /// geometry that violates a constraint.
+    pub fn resize(
+        &mut self,
+        attachment_id: AttachmentId,
+        dimensions: Dimensions,
+        expected_epoch: u64,
+    ) -> Result<GeometryState> {
+        self.require_running()?;
+        let change = self
+            .attachments
+            .resize(attachment_id, dimensions, expected_epoch)?;
+        self.pty.resize(change.state.dimensions)?;
+        Ok(change.state)
+    }
+
+    /// Hands size ownership to another eligible attachment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is unknown or not eligible, or the epoch is stale.
+    pub fn transfer_geometry(
+        &mut self,
+        attachment_id: AttachmentId,
+        expected_epoch: u64,
+    ) -> Result<GeometryState> {
+        self.require_running()?;
+        let change = self.attachments.transfer(attachment_id, expected_epoch)?;
+        if change.resize_required {
+            self.pty.resize(change.state.dimensions)?;
+        }
+        Ok(change.state)
+    }
+
+    /// Takes the input lease for an attachment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is closed or the attachment is unknown.
+    pub fn acquire_input(
+        &mut self,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        expected_epoch: Option<u64>,
+    ) -> Result<InputAcquireResult> {
+        self.require_running()?;
+        if self.attachments.get(attachment_id).is_none() {
+            return Err(WorkerError::UnknownAttachment {
+                attachment: attachment_id.to_string(),
+            });
+        }
+        if let Some(expected) = expected_epoch
+            && expected != self.lease.epoch()
+        {
+            return Err(WorkerError::LeaseLost);
+        }
+        // An interrupted paste is closed before the new lease writes, so the application never
+        // sees a paste finished under a different actor.
+        let framing = self.framer.close_for_takeover();
+        let mut discarded = self.lease.acquire(attachment_id, connection_id);
+        discarded += framing.discarded_prefix.len() as u64;
+        let closed_open_paste = framing.terminator.is_some();
+        if let Some(terminator) = framing.terminator {
+            self.pending_input.push(terminator.to_vec());
+        }
+        Ok(InputAcquireResult {
+            lease: self.lease.to_wire(),
+            discarded_bytes: U64::new(discarded),
+            closed_open_paste,
+        })
+    }
+
+    /// Releases the lease held by this attachment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::LeaseLost`] when the caller does not hold it at that epoch.
+    pub fn release_input(
+        &mut self,
+        attachment_id: AttachmentId,
+        epoch: u64,
+    ) -> Result<InputLeaseState> {
+        self.lease
+            .release(attachment_id, epoch)
+            .ok_or(WorkerError::LeaseLost)?;
+        self.framer.close_for_takeover();
+        Ok(self.lease.to_wire())
+    }
+
+    /// Accepts ordered input for the pseudo-terminal.
+    ///
+    /// The bytes are forwarded unchanged. Nothing here decodes, re-encodes or normalises them; the
+    /// only thing the worker tracks is where a bracketed paste begins and ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::LeaseLost`] for a stale epoch or a caller that does not hold the
+    /// lease, and an invalid-argument failure when the sequence does not follow.
+    pub fn write_input(
+        &mut self,
+        attachment_id: AttachmentId,
+        epoch: u64,
+        sequence: u64,
+        bytes: &[u8],
+        now: Instant,
+    ) -> Result<InputAccepted> {
+        if !self.state.accepts_input() {
+            return Err(WorkerError::SessionClosed);
+        }
+        match self.lease.accept_write(attachment_id, epoch, sequence) {
+            Ok(()) => {}
+            Err(LeaseRefusal::LeaseLost) => return Err(WorkerError::LeaseLost),
+            Err(LeaseRefusal::OutOfOrder { expected, received }) => {
+                return Err(WorkerError::InvalidArgument(format!(
+                    "input sequence {received} does not follow {expected}"
+                )));
+            }
+        }
+        let outcome = self.framer.push(bytes, now);
+        if !outcome.forward.is_empty() {
+            self.pending_input.push(outcome.forward.clone());
+        }
+        Ok(InputAccepted {
+            forwarded_bytes: outcome.forward.len() as u64,
+            held_prefix_bytes: outcome.held as u64,
+            deadline: outcome.deadline,
+        })
+    }
+
+    /// Forwards a held delimiter prefix whose deadline has passed.
+    ///
+    /// The timer runs whether or not more input arrives, so a lone Escape is never waiting for
+    /// another keystroke.
+    pub fn expire_paste_prefix(&mut self, now: Instant) -> usize {
+        match self.framer.expire(now) {
+            Some(bytes) if !bytes.is_empty() => {
+                let len = bytes.len();
+                self.pending_input.push(bytes);
+                len
+            }
+            _ => 0,
+        }
+    }
+
+    /// Returns the deadline of a held delimiter prefix, if there is one.
+    #[must_use]
+    pub fn paste_deadline(&self) -> Option<Instant> {
+        self.framer.deadline()
+    }
+
+    /// Records that the application has enabled or disabled bracketed-paste mode.
+    pub const fn set_bracketed_paste(&mut self, enabled: bool) {
+        self.framer.set_bracketed_paste(enabled);
+    }
+
+    /// Sends the terminal's configured interrupt to the foreground process group.
+    ///
+    /// It takes the current lease and epoch, accepts no other action, and is not held behind a
+    /// reader transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::LeaseLost`] when the caller does not hold the lease.
+    pub fn interrupt(&mut self, attachment_id: AttachmentId, epoch: u64) -> Result<()> {
+        if self.lease.holder() != Some(attachment_id) || self.lease.epoch() != epoch {
+            return Err(WorkerError::LeaseLost);
+        }
+        let shell = self.shell.as_mut().ok_or(WorkerError::SessionClosed)?;
+        shell.interrupt()
+    }
+
+    /// Takes the bytes waiting to be written to the pseudo-terminal.
+    pub fn take_pending_input(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending_input)
+    }
+
+    /// Subscribes an attachment to output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attachment is unknown.
+    pub fn subscribe(&mut self, attachment_id: AttachmentId) -> Result<OutputStream> {
+        if self.attachments.get(attachment_id).is_none() {
+            return Err(WorkerError::UnknownAttachment {
+                attachment: attachment_id.to_string(),
+            });
+        }
+        Ok(self
+            .hub
+            .subscribe(attachment_id, self.config.send_queue_bytes))
+    }
+
+    /// Records output from the terminal and delivers it.
+    ///
+    /// This is the read loop's only entry point. It never waits for a client: a subscriber that
+    /// cannot keep up is told to resynchronise and the loop continues.
+    pub fn ingest_output(&mut self, bytes: &[u8]) -> Vec<AttachmentId> {
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        let cursor = self.history.append(bytes);
+        let shared = Arc::new(bytes.to_vec());
+        self.hub
+            .publish(cursor, &shared, self.history.oldest_retained_cursor())
+    }
+
+    /// Builds a snapshot of present state at the current cursor.
+    #[must_use]
+    pub fn snapshot(&self) -> EventsSnapshotResult {
+        EventsSnapshotResult {
+            cursor: U64::new(self.history.next_cursor()),
+            session: self.summary(),
+            geometry: self.attachments.geometry(),
+            lease: self.lease.to_wire(),
+            attachments: self.attachments.summaries(),
+            oldest_retained_cursor: U64::new(self.history.oldest_retained_cursor()),
+            taken_at_ms: kr_ipc::now_ms(),
+        }
+    }
+
+    /// Reads one page of retained output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the spool cannot be read.
+    pub fn history_page(&self, from_cursor: u64, max_bytes: u64) -> Result<HistoryPageResult> {
+        self.history.page(from_cursor, max_bytes)
+    }
+
+    /// Tells one attachment to install a fresh snapshot.
+    pub fn require_resync(&mut self, attachment_id: AttachmentId, reason: ResyncReason) {
+        self.hub.require_resync(
+            attachment_id,
+            reason,
+            self.history.next_cursor(),
+            self.history.oldest_retained_cursor(),
+        );
+    }
+
+    /// Returns every attachment, for diagnostics and snapshots.
+    #[must_use]
+    pub fn attachments(&self) -> Vec<AttachmentSummary> {
+        self.attachments.summaries()
+    }
+
+    /// Returns the private journal, when one is available.
+    pub fn journal_mut(&mut self) -> Option<&mut Journal> {
+        self.journal.as_mut()
+    }
+
+    /// Returns why the journal is unavailable, when it is.
+    #[must_use]
+    pub fn journal_failure(&self) -> Option<&str> {
+        self.journal_failure.as_deref()
+    }
+
+    /// Returns the final closure record once the session has closed.
+    #[must_use]
+    pub fn closure(&self) -> Option<&ClosureRecord> {
+        self.closure.as_ref()
+    }
+
+    /// Begins closure, or reports the closure already under way.
+    ///
+    /// The reply is built before any process is signalled, because the caller may be inside the
+    /// group about to be stopped.
+    pub fn begin_close(&mut self, reason: ClosureReason) -> CloseAcceptance {
+        match self.state {
+            SessionState::Closed => CloseAcceptance {
+                state: SessionState::Closed,
+                durability: self.durability(),
+                closure: self.closure.clone(),
+                initiated: false,
+            },
+            SessionState::Closing => CloseAcceptance {
+                state: SessionState::Closing,
+                durability: self.durability(),
+                closure: None,
+                initiated: false,
+            },
+            SessionState::Creating | SessionState::Live => {
+                // Atomic: the state changes before anything else, so no input is accepted from
+                // here on and a second request joins this closure instead of starting another.
+                self.state = SessionState::Closing;
+                self.closing_reason = Some(reason);
+                if let Some(shell) = self.shell.as_mut() {
+                    let _ = shell.request_stop();
+                }
+                CloseAcceptance {
+                    state: SessionState::Closing,
+                    durability: self.durability(),
+                    closure: None,
+                    initiated: true,
+                }
+            }
+        }
+    }
+
+    /// Forces whatever is left of the owned group to stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the signal cannot be sent.
+    pub fn force_close(&mut self) -> Result<bool> {
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
+        if shell.try_wait()?.is_some() {
+            return Ok(false);
+        }
+        shell.force_stop()?;
+        Ok(true)
+    }
+
+    /// Writes the final record and moves the session to `closed`.
+    pub fn finish_close(&mut self, forced: bool) -> ClosureRecord {
+        let exit = self
+            .shell
+            .as_mut()
+            .and_then(|shell| shell.try_wait().ok().flatten());
+        let reason = self.closing_reason.unwrap_or(ClosureReason::CloseRequested);
+        self.record_closure_with(reason, exit, forced)
+    }
+
+    /// Records that the pseudo-terminal closed, which means the root shell has ended.
+    ///
+    /// The shell's real status is read from the child rather than assumed, so a shell that was
+    /// signalled is recorded as signalled.
+    pub fn note_terminal_ended(&mut self) -> ClosureRecord {
+        let exit = self
+            .shell
+            .as_mut()
+            .and_then(|shell| shell.wait().ok())
+            .unwrap_or(ShellExit {
+                code: 0,
+                signalled: false,
+            });
+        self.note_shell_exit(exit)
+    }
+
+    /// Records that the root shell ended on its own.
+    ///
+    /// An explicit `exit`, an end of file at the root prompt or a crash all close the session.
+    /// KalaReach never restarts the shell.
+    pub fn note_shell_exit(&mut self, exit: ShellExit) -> ClosureRecord {
+        let reason = if exit.signalled {
+            ClosureReason::RootSignal
+        } else {
+            ClosureReason::RootExit
+        };
+        if self.state == SessionState::Live || self.state == SessionState::Creating {
+            self.state = SessionState::Closing;
+            self.closing_reason = Some(reason);
+        }
+        self.record_closure_with(self.closing_reason.unwrap_or(reason), Some(exit), false)
+    }
+
+    fn record_closure(&mut self, reason: ClosureReason, exit: Option<ShellExit>) -> ClosureRecord {
+        self.record_closure_with(reason, exit, false)
+    }
+
+    fn record_closure_with(
+        &mut self,
+        reason: ClosureReason,
+        exit: Option<ShellExit>,
+        forced: bool,
+    ) -> ClosureRecord {
+        if let Some(existing) = self.closure.clone() {
+            return existing;
+        }
+        let terminated = self
+            .shell
+            .as_ref()
+            .map(|shell| {
+                vec![TerminatedProcess {
+                    identity: shell.identity().clone(),
+                    name: Nullable::some(self.config.shell.program.clone()),
+                    forced,
+                }]
+            })
+            .unwrap_or_default();
+        // The worker knows the process group it owned. It does not claim to have discovered every
+        // application a session may have started, so coverage is complete only when the group is
+        // confirmed gone.
+        let coverage = match self.shell.as_mut().map(RootShell::try_wait) {
+            Some(Ok(Some(_))) | None => OwnershipCoverage::Complete,
+            _ => OwnershipCoverage::Incomplete,
+        };
+        let record = ClosureRecord {
+            session_id: self.config.session_id,
+            session_epoch: self.config.session_epoch,
+            reason,
+            root_exit_code: Nullable(
+                exit.filter(|exit| !exit.signalled)
+                    .map(|exit| U64::new(u64::from(exit.code))),
+            ),
+            root_signal: Nullable(
+                exit.filter(|exit| exit.signalled)
+                    .map(|exit| U64::new(u64::from(exit.code))),
+            ),
+            terminated,
+            surviving: Vec::new(),
+            ownership_coverage: coverage,
+            durability: self.durability(),
+            closed_at_ms: kr_ipc::now_ms(),
+        };
+        self.state = SessionState::Closed;
+        self.application_state = None;
+        self.closure = Some(record.clone());
+        record
+    }
+
+    const fn durability(&self) -> Durability {
+        if self.journal.is_some() {
+            Durability::Durable
+        } else {
+            Durability::Volatile
+        }
+    }
+
+    const fn require_running(&self) -> Result<()> {
+        if self.state.is_running() {
+            Ok(())
+        } else {
+            Err(WorkerError::SessionClosed)
+        }
+    }
+}
+
+/// What accepting input produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputAccepted {
+    /// Bytes forwarded to the pseudo-terminal now.
+    pub forwarded_bytes: u64,
+    /// Bytes held as an incomplete delimiter prefix.
+    pub held_prefix_bytes: u64,
+    /// When that prefix must be forwarded even if nothing else arrives.
+    pub deadline: Option<Instant>,
+}
+
+/// A cursor on the output stream.
+#[must_use]
+pub const fn cursor(value: u64) -> StreamCursor {
+    StreamCursor::new(value)
+}
