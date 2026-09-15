@@ -234,14 +234,18 @@ will not refuse a control write, not that the connection is holding space for on
 
 A charge covers the complete frame, its length prefix and its stream header included, and it is held
 for as long as the write is in progress, which is what bounds a connection whose writes are all
-blocked. A write the budget refuses is refused whole: nothing is charged, nothing is sent, and the
-caller retries. A message is encoded under the smaller of its stream kind's frame bound and the
-largest frame its class could ever be admitted with, so a frame the budget would always refuse is
-refused as too large rather than built and then rejected.
+blocked. A message's encoded payload is shrunk to its exact length before it is charged, so the
+charge covers what the blocked write actually holds rather than whatever capacity the encoder grew
+to. A write the budget refuses is refused whole: nothing is charged, nothing is sent, and the caller
+retries. A message is encoded under the smaller of its stream kind's frame bound and the largest
+frame its class could ever be admitted with, so a frame this connection could never queue is refused
+as too large before it costs a write.
 
-The encoding buffer itself is not charged. It exists for the length of a synchronous encode before
-the reservation is taken, so it cannot accumulate across blocked writes, and what it holds is a
-value this process already built rather than anything a peer supplied.
+What is not charged is the encoder's own working memory, including the buffer an oversized message
+is built in before its length is measured and it is refused. That memory is allocated and released
+inside one synchronous encode with nothing awaited in it, so it cannot accumulate across blocked
+writes. Making the encoder refuse an oversized message before it builds it is a change to the
+canonical CBOR encoder rather than to the transport.
 
 An empty frame is refused before the write, because a zero length is what the peer's decoder reads
 as a malformed frame. A caller's mistake stays a local error rather than becoming stream damage.
@@ -256,8 +260,14 @@ at the application's admission layer, not inside the window; closing the gap nee
 accounting the transport crate does not expose.
 
 The negotiated limits are in force as well as the stream kind's ceilings. A peer that declared it
-could receive less than the kind allows is held to what it declared, in both directions, and a frame
-that exceeds either bound is refused before its payload is allocated.
+could receive less than the kind allows is held to what it declared, in both directions: an arriving
+frame whose declared length exceeds either bound is refused before its payload is allocated, and an
+outgoing one is refused before anything is written.
+
+There is a floor under that negotiation. A peer has to declare a send queue of at least 2 MiB +
+4 KiB, which is one complete attachment frame plus the control reserve; below it no transfer could
+ever be admitted. A `hello` that negotiates less is refused with `INVALID_ARGUMENT` naming the
+value, on both sides, rather than producing a connection that silently cannot carry an attachment.
 
 ### Revocation
 

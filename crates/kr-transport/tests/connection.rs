@@ -190,6 +190,38 @@ async fn an_offer_with_no_shared_major_is_refused_as_an_unsupported_schema() {
 }
 
 #[tokio::test]
+async fn a_send_queue_too_small_for_a_transfer_is_refused_at_hello() {
+    // A connection that could never be handed an attachment frame is not established. Both sides
+    // reach that conclusion: the host refuses the offer and the client refuses the selection.
+    let (host, mut client) = paired_pair().await;
+    Arc::get_mut(&mut client.identity)
+        .expect("the identity is not shared yet")
+        .max_receive = ReceiveLimits {
+        max_send_queue_bytes: kr_protocol::scalars::U64::new(
+            kr_transport::scheduler::MIN_SEND_QUEUE_BYTES as u64 - 1,
+        ),
+        ..ReceiveLimits::default()
+    };
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let error = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect_err("a refusal");
+    let TransportError::Handshake(error) = error else {
+        panic!("an unusable send queue is a handshake refusal, not {error}");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+    let (_connection, admitted) = accepting.await.expect("the host task");
+    assert!(admitted.is_err(), "the host refused too");
+}
+
+#[tokio::test]
 async fn a_peer_that_cannot_prove_the_paired_key_is_refused() {
     let (host, client) = paired_pair().await;
     // The right endpoint, another device's authorisation key: a stale or substituted record.

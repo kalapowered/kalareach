@@ -25,17 +25,23 @@
 //!
 //! What the budget counts is what the application has handed the connection and the connection has
 //! not yet taken: each frame, its length prefix and its stream header included, for as long as its
-//! write is in progress. Two things it does not count. A message's encoding buffer exists for the
-//! length of a synchronous encode before the reservation is taken, so it cannot accumulate across
-//! blocked writes, and what it holds is a value this process already built rather than anything a
-//! peer supplied. And bytes the connection has accepted but the peer has not yet acknowledged sit
-//! in the QUIC send window, where nothing iroh exposes says when they leave. So this bounds what
-//! the application offers the connection; it reserves no capacity inside the window itself.
+//! write is in progress. A message's encoded payload is shrunk to its exact length before it is
+//! charged, so the charge covers what is actually retained while the write is blocked rather than
+//! whatever capacity the encoder happened to grow to.
+//!
+//! Two things it does not count. The encoder's own working memory, which is allocated and freed
+//! inside one synchronous encode with no await in it, so it cannot accumulate across blocked
+//! writes; that includes the buffer an oversized message is built in before its length is measured
+//! and it is refused. And bytes the connection has accepted but the peer has not yet acknowledged,
+//! which sit in the QUIC send window where nothing iroh exposes says when they leave. So this
+//! bounds what the application offers the connection; it reserves no capacity inside the window.
 
 use std::sync::{Arc, Mutex};
 
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
-use kr_protocol::limits::MAX_SEND_QUEUE_BYTES;
+use kr_protocol::hello::ReceiveLimits;
+use kr_protocol::limits::{MAX_ATTACHMENT_FRAME_LEN, MAX_SEND_QUEUE_BYTES};
 
 use crate::error::{Result, TransportError};
 
@@ -48,6 +54,33 @@ pub enum StreamClass {
     Live,
     /// Large and interruptible: attachment chunks.
     Bulk,
+}
+
+/// The smallest send queue a peer can declare and still hold a usable connection.
+///
+/// A connection has to be able to hand the peer one complete attachment frame without touching the
+/// control reserve. A peer that declares less than this could never be sent a transfer, so the
+/// handshake refuses it instead of establishing a connection that silently cannot carry one.
+pub const MIN_SEND_QUEUE_BYTES: usize = MAX_ATTACHMENT_FRAME_LEN + CONTROL_RESERVE_BYTES;
+
+/// Checks that negotiated limits leave a connection able to carry what the protocol requires.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::InvalidArgument`] when the negotiated send queue is below
+/// [`MIN_SEND_QUEUE_BYTES`]. The remedy is a configuration change on whichever side declared it.
+pub fn check_negotiated(limits: ReceiveLimits) -> core::result::Result<(), ProtocolError> {
+    let declared = usize::try_from(limits.max_send_queue_bytes.get()).unwrap_or(usize::MAX);
+    if declared < MIN_SEND_QUEUE_BYTES {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "a send queue of {declared} bytes cannot carry an attachment frame and the control \
+                 reserve; at least {MIN_SEND_QUEUE_BYTES} bytes are needed"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The send priority of an interactive stream.
@@ -142,7 +175,7 @@ impl SendLimits {
     /// declared, and bulk traffic is held to that less the control reserve, so a transfer never
     /// fills the budget that peer said it would accept.
     #[must_use]
-    pub fn negotiated(self, limits: kr_protocol::hello::ReceiveLimits) -> Self {
+    pub fn negotiated(self, limits: ReceiveLimits) -> Self {
         let declared = usize::try_from(limits.max_send_queue_bytes.get())
             .unwrap_or(usize::MAX)
             .max(1);
@@ -434,15 +467,14 @@ mod tests {
 
     #[test]
     fn a_smaller_negotiated_send_budget_lowers_both_ceilings() {
-        use kr_protocol::hello::ReceiveLimits;
         use kr_protocol::scalars::U64;
         let negotiated = ReceiveLimits {
-            max_send_queue_bytes: U64::new(2 * 1024 * 1024),
+            max_send_queue_bytes: U64::new(3 * 1024 * 1024),
             ..ReceiveLimits::default()
         };
         let limits = SendLimits::default().negotiated(negotiated);
-        assert_eq!(limits.max_queued_bytes, 2 * 1024 * 1024);
-        assert_eq!(limits.max_bulk_queued_bytes, 1024 * 1024);
+        assert_eq!(limits.max_queued_bytes, 3 * 1024 * 1024);
+        assert_eq!(limits.max_bulk_queued_bytes, 2 * 1024 * 1024);
         // A larger declaration never raises either ceiling above the protocol default.
         let generous = ReceiveLimits {
             max_send_queue_bytes: U64::new(64 * 1024 * 1024),
@@ -457,6 +489,31 @@ mod tests {
             raised.max_bulk_queued_bytes,
             SendLimits::default().max_bulk_queued_bytes
         );
+    }
+
+    #[test]
+    fn a_send_queue_too_small_for_an_attachment_frame_is_refused() {
+        use kr_protocol::scalars::U64;
+        let workable = SendLimits::default().negotiated(ReceiveLimits {
+            max_send_queue_bytes: U64::new(MIN_SEND_QUEUE_BYTES as u64),
+            ..ReceiveLimits::default()
+        });
+        assert!(
+            workable.ceiling_for(StreamClass::Bulk) >= MAX_ATTACHMENT_FRAME_LEN,
+            "the floor is exactly what one complete attachment frame needs"
+        );
+        check_negotiated(ReceiveLimits {
+            max_send_queue_bytes: U64::new(MIN_SEND_QUEUE_BYTES as u64),
+            ..ReceiveLimits::default()
+        })
+        .expect("the floor itself is workable");
+        let error = check_negotiated(ReceiveLimits {
+            max_send_queue_bytes: U64::new(MIN_SEND_QUEUE_BYTES as u64 - 1),
+            ..ReceiveLimits::default()
+        })
+        .expect_err("a queue one byte below the floor is refused");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        check_negotiated(ReceiveLimits::default()).expect("the protocol default is workable");
     }
 
     #[test]

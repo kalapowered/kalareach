@@ -131,7 +131,8 @@ impl DataStream {
     ///
     /// The message is encoded under the smaller of this stream kind's frame bound and the largest
     /// frame the connection's budget could ever admit, so a frame the budget would always refuse is
-    /// refused as too large instead of being built and then rejected.
+    /// refused as too large before it costs a write. The encoded payload is then shrunk to its
+    /// exact length, because what the reservation covers has to be what the write actually holds.
     ///
     /// # Errors
     ///
@@ -157,7 +158,8 @@ impl DataStream {
             message,
             &kr_cbor::Limits::DEFAULT.with_max_message_len(bound),
         )
-        .map_err(kr_protocol::frame::FrameError::Cbor)?;
+        .map_err(kr_protocol::frame::FrameError::Cbor)?
+        .into_boxed_slice();
         let reservation = self.budget.reserve(class, framed_len(payload.len()))?;
         self.write_reserved(&payload, reservation).await
     }

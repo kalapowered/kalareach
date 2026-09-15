@@ -295,6 +295,17 @@ pub async fn accept_on(
         clock_epoch: epochs.clock_epoch,
     };
 
+    // A peer that declared a send queue too small for an attachment frame gets a refusal rather
+    // than a connection that silently cannot carry a transfer. It is a configuration mistake on one
+    // of the two sides, and the reply says which value is too small.
+    if let Err(error) = crate::scheduler::check_negotiated(selection.limits) {
+        writer
+            .write_message(&HelloReply::Refused(error.clone()))
+            .await?;
+        writer.finish_and_flush(REFUSAL_FLUSH).await;
+        return Err(TransportError::Handshake(error));
+    }
+
     let paired = directory.paired_peer(&peer_endpoint_id);
 
     if early_data && paired.is_some() {
@@ -595,6 +606,9 @@ pub async fn connect(
         HelloReply::Selected(selection) => *selection,
         HelloReply::Refused(error) => return Err(TransportError::Handshake(error)),
     };
+    // The host is expected to have refused this itself; a client that took the selection anyway
+    // would hold a connection whose transfers could never be admitted.
+    crate::scheduler::check_negotiated(selection.limits).map_err(TransportError::Handshake)?;
 
     let client_signature = sign_connect(
         &identity.authorisation,
