@@ -262,6 +262,81 @@ check every pair of states.
 
 `applied` for a submitted prompt means upstream admission, not task completion.
 
+## Relay leases and receipts
+
+A relay forwards encrypted payloads between two authenticated endpoints. Admitting an endpoint to a
+relay says nothing about who agreed to pay for the traffic it then sends, so before a payload
+crosses a forwarding boundary the relay must already hold a lease that binds the pair, the route,
+the payer, a reserved block of bytes and a deadline. `crates/kr-protocol/src/relay.rs` holds those
+objects and `packages/protocol/src/relay.ts` rebuilds them from the managed JSON representation, so
+the service verifies exactly the bytes the relay signed.
+
+Three keys meet in these messages, and no message is trusted because of what it claims about
+itself:
+
+| Key | Held by | Signs | Checked against |
+| --- | --- | --- | --- |
+| Service admission key | the managed service | leases and revocations | the issuer keys the relay pins in its configuration |
+| Relay instance key | one relay host, generated there | consumption receipts and its own registration | the key recorded in the service's relay registry |
+| Endpoint keys | the two peers | nothing here | the relay's own authenticated handshake |
+
+| Object | Domain | What it settles |
+| --- | --- | --- |
+| `RelayLease` | `kr-relay/lease/1` | The pair, direction, payer, reservation, cumulative byte ceiling, expiry, route and metering boundary |
+| `RelayLeaseRevocation` | `kr-relay/revoke/1` | Stops forwarding at one named relay, at a higher revision than the lease it fences |
+| `RelayConsumptionReceipt` | `kr-relay/receipt/1` | What one reservation has spent so far |
+| `RelayInstanceRegistration` | `kr-relay/instance/1` | Which key the service accepts receipts from, and the overlap window of a rotation |
+
+Each signature covers `CBOR([domain, <the unsigned object as a map>])`. The objects are closed maps,
+so their canonical encoding follows from their field names and there is no second positional
+encoding to keep in step.
+
+### The rules the types carry
+
+- **A revision orders everything.** Installation and revocation carry the same `revision` scale per
+  lease identity, so a relay keeps the highest it has seen and a replayed older lease cannot restore
+  a spent ceiling or a passed deadline. A revocation also names the relay it is addressed to, so the
+  same signed bytes replayed at the other relay of a route fence nothing.
+- **The scope is a route, not a list.** A lease names an ingress position and an egress position,
+  the same instance twice for the ordinary single-relay route. A payload is admitted only when it
+  entered and leaves at those positions, swapping with the payload on the reverse direction of a
+  two-way lease. A set of permitted instances would not do: it says which relays may forward without
+  saying which route they forward on, so a pair could use a second relay of the set and never pass
+  the boundary that counts.
+- **One boundary counts.** `metering_relay_instance_id` and `metering_role` name one instance and
+  one of its two boundaries, so a two-relay route charges a payload once rather than at both ends.
+  Ingress counts a payload as it is read from the sender; egress counts it as it is written to the
+  receiver, which is the difference between charging for what was accepted and charging for what was
+  delivered.
+- **One reservation, one running total.** `byte_ceiling` is the reservation's cumulative limit and
+  `bytes_consumed` is its cumulative spend, so the relay compares two figures on one scale. A refill
+  raises the ceiling of the same reservation; a change to the payer, the pair, the route or the
+  metering boundary takes a new reservation, because those are the facts the reservation was priced
+  against. `supersedes` enforces exactly that.
+- **Grace raises the same ceiling.** The grace after exhaustion belongs to the principal, is shared
+  across its connections and starts at the first exhaustion. A relay receives a slice of what is
+  left as a raised cumulative ceiling and a deadline, so it cannot restart a grace, extend one or
+  hold two allowances at once. `effective_byte_ceiling` and `effective_deadline_ms` derive what the
+  relay actually enforces, and `grace_remaining_ms` counts down to that deadline rather than to the
+  end of the grace window, so a lease that expires first never advertises time it will not honour.
+
+### What the relay keeps, and what the service settles
+
+A signed lease and a set of pinned keys are not enough to forward safely. A relay also keeps
+durably: the highest revision it has seen per lease identity, whether that identity is revoked, the
+cumulative bytes counted per reservation, and the receipts it has not yet had acknowledged. Without
+the first two, a replayed older lease reopens a closed ceiling. Without the last two, a restart
+either loses consumption or invents it, and an exact retry of an installation would hand back a
+ceiling that was already spent.
+
+Reporting is idempotent by reservation and sequence, and the sequence is unbroken. A cumulative
+count means a duplicate delivery costs nothing and one lost message is repaired by replaying it, not
+by skipping it: the service records receipts in order and answers every report with the position it
+will accept next, which is where a restarted relay resumes from. It is not a licence to accept a
+gap. A relay that cannot supply the receipt in between has lost the evidence for that stretch, and
+the service settles the reservation conservatively instead of assuming it away. Section 17 forbids
+that settlement from minting a new grace period.
+
 ## Error codes
 
 An error carries a stable code, a plain message, a retry category and an optional opaque diagnostic
@@ -327,7 +402,8 @@ Reading the fields:
 
 ## Fixtures
 
-`fixtures/cbor/` and `fixtures/protocol/` hold the vectors both languages run against. The Rust
+`fixtures/cbor/`, `fixtures/protocol/` and `fixtures/relay/` hold the vectors both languages run
+against. The Rust
 tests read them from `crates/*/tests/`, and the vitest suites read the same files.
 
 Values use a small tagged grammar, so a fixture can express a byte string, a 64-bit integer and a
@@ -357,11 +433,21 @@ ordering cases test what they claim to test.
 | `cbor/digests.json` | A signed object with its digest, and a domain-separated signing input |
 | `protocol/frames.json` | Encoded `hello`, mutation, receipt, error, notification and stream header, with their frames |
 | `protocol/transcripts.json` | The `kr-connect/1` transcript and the mutation digest |
+| `relay/leases.json` | A two-way lease on a two-relay route, a sponsored single-relay lease inside its grace, and a revocation |
+| `relay/receipts.json` | Two consumption receipts of one reservation, showing the cumulative count |
+| `relay/instances.json` | A relay instance registration and an announced key rotation |
 
 An invalid case names its rule with the same string in both languages, for example
 `unsorted_map_keys` or `non_shortest_integer`. `CborError::rule` in Rust and `KrCborError.rule` in
 TypeScript return those strings. A case may carry a `limits` object, merged over the defaults, so a
 short vector can test a bound without a megabyte of input.
+
+A relay case states the same object four ways: `value` in the grammar above, `cbor_hex` for its
+canonical encoding, `signing_input_hex` with `sha256` for what a signature covers, and `json` for
+the managed HTTP representation. Each one catches a different mistake, and a change to the type
+fails the vector in whichever of the four it actually altered. Both languages also rebuild the
+object from `json` alone and check that it signs the same bytes, because that is the path the
+managed service takes with a receipt that arrives over HTTPS.
 
 These fixtures cover bytes, digests and signing input. Signature vectors need a signing
 implementation, which lives with the cryptography crate rather than here; that crate consumes
