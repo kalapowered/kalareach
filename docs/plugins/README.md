@@ -357,8 +357,10 @@ warning and follows the administrator's explicit disable policy; it does not cha
 request.
 
 The index renders as canonical JSON: entries sorted by publisher, plugin name and version, object
-keys sorted, indentation fixed, one trailing newline. The same inputs produce the same bytes, which
-is what lets a signature over an index mean "these packages" rather than "this run of the builder".
+keys sorted, no insignificant whitespace, one trailing newline. The same inputs produce the same
+bytes, which is what lets a signature over an index mean "these packages" rather than "this run of
+the builder". The rendering is compact because a host holds the whole index so that search works
+offline, and indentation would spend roughly half the metadata budget on whitespace nobody reads.
 
 ## Findings
 

@@ -194,9 +194,13 @@ impl CatalogueIndex {
 
     /// Renders the index as canonical JSON.
     ///
-    /// Entries and publishers are sorted, object keys are sorted and the indentation is fixed, so
-    /// the same inputs produce the same bytes. That is what makes a signature over an index mean
-    /// "these packages", rather than "this run of the builder".
+    /// Entries and publishers are sorted, object keys are sorted and the output carries no
+    /// insignificant whitespace, so the same inputs produce the same bytes. That is what makes a
+    /// signature over an index mean "these packages" rather than "this run of the builder".
+    ///
+    /// The rendering is compact because the index is measured against a byte budget: a host holds
+    /// the whole thing so that catalogue search works offline, and indentation would spend roughly
+    /// half that budget on whitespace nobody reads.
     ///
     /// # Errors
     ///
@@ -205,7 +209,7 @@ impl CatalogueIndex {
         let mut sorted = self.clone();
         sorted.sort();
         let value = serde_json::to_value(&sorted)?;
-        let mut text = serde_json::to_string_pretty(&sort_keys(value))?;
+        let mut text = serde_json::to_string(&sort_keys(value))?;
         text.push('\n');
         Ok(text)
     }
