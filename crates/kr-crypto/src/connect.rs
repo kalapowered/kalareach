@@ -217,6 +217,7 @@ pub fn verify_connect_once(
 pub struct ChallengeLedger {
     outstanding: BTreeSet<[u8; 32]>,
     consumed: BTreeSet<[u8; 32]>,
+    consumed_order: std::collections::VecDeque<[u8; 32]>,
     limit: usize,
 }
 
@@ -227,6 +228,7 @@ impl ChallengeLedger {
         Self {
             outstanding: BTreeSet::new(),
             consumed: BTreeSet::new(),
+            consumed_order: std::collections::VecDeque::new(),
             limit,
         }
     }
@@ -265,11 +267,7 @@ impl ChallengeLedger {
     /// been consumed.
     pub fn consume(&mut self, host_nonce: &Nonce256) -> Result<()> {
         if self.outstanding.remove(host_nonce.as_bytes()) {
-            // Remembering it stops the same nonce being issued again. For a 256-bit random value a
-            // repeat means a generator failure rather than an attack, and a host that has issued
-            // enough challenges to fill this set has restarted many times over; it is cleared with
-            // the ledger, which lives as long as one host process.
-            self.consumed.insert(*host_nonce.as_bytes());
+            self.record_consumed(*host_nonce.as_bytes());
             Ok(())
         } else {
             Err(CryptoError::BindingMismatch {
@@ -283,8 +281,25 @@ impl ChallengeLedger {
     /// Abandoning a challenge is not the same as consuming one: it frees the slot, and the nonce
     /// can never be presented afterwards because it is no longer outstanding either way.
     pub fn abandon(&mut self, host_nonce: &Nonce256) {
-        if self.outstanding.remove(host_nonce.as_bytes()) {
-            self.consumed.insert(*host_nonce.as_bytes());
+        // An abandoned challenge was never part of a verified proof, so it is simply forgotten.
+        // Recording it would make a host that opens and drops connections accumulate entries for
+        // nonces nothing ever signed.
+        self.outstanding.remove(host_nonce.as_bytes());
+    }
+
+    /// Remembers a consumed challenge, keeping at most `limit` of them.
+    ///
+    /// This guards against a generator that repeats, not against an attacker: the host chooses its
+    /// own 256-bit nonce, so nothing a peer sends can steer which value is issued next. The set is
+    /// bounded for the same reason the outstanding set is, and the oldest entry is dropped first.
+    fn record_consumed(&mut self, host_nonce: [u8; 32]) {
+        if self.consumed.insert(host_nonce) {
+            self.consumed_order.push_back(host_nonce);
+        }
+        while self.consumed_order.len() > self.limit {
+            if let Some(oldest) = self.consumed_order.pop_front() {
+                self.consumed.remove(&oldest);
+            }
         }
     }
 
@@ -298,6 +313,12 @@ impl ChallengeLedger {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.outstanding.is_empty()
+    }
+
+    /// Returns how many consumed challenges are still remembered.
+    #[must_use]
+    pub fn retained_consumed(&self) -> usize {
+        self.consumed.len()
     }
 }
 
@@ -516,12 +537,28 @@ mod tests {
             ledger.consume(&second),
             Err(CryptoError::BindingMismatch { .. })
         ));
-        assert!(matches!(
-            ledger.issue(&second),
-            Err(CryptoError::BindingMismatch { .. })
-        ));
         assert_eq!(ledger.len(), 1);
         assert!(!ledger.is_empty());
+    }
+
+    #[test]
+    fn the_ledger_stays_bounded_across_many_connections() {
+        let mut ledger = ChallengeLedger::with_limit(4);
+        for index in 0..1_000u32 {
+            let nonce = Nonce256::from_bytes({
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&index.to_be_bytes());
+                bytes
+            });
+            ledger.issue(&nonce).expect("issued");
+            if index % 2 == 0 {
+                ledger.consume(&nonce).expect("consumed");
+            } else {
+                ledger.abandon(&nonce);
+            }
+        }
+        assert_eq!(ledger.len(), 0);
+        assert!(ledger.retained_consumed() <= 4);
     }
 
     #[test]

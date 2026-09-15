@@ -379,6 +379,16 @@ fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), PairingTextEr
                 "an IPv6 origin uses the canonical spelling of its address",
             ));
         }
+        if parsed.to_ipv4_mapped().is_some()
+            || (parsed.to_ipv4().is_some() && !parsed.is_loopback() && !parsed.is_unspecified())
+        {
+            // An IPv4-mapped or IPv4-compatible address is one host with two spellings, and URL
+            // parsers do not agree on which to write. An IPv4 service is named by its IPv4
+            // literal. The loopback and unspecified addresses are not IPv4 addresses in disguise.
+            return Err(PairingTextError(
+                "an IPv4 address is written as an IPv4 origin, not as a mapped IPv6 literal",
+            ));
+        }
         return Ok(());
     }
     if host.contains(':') {
@@ -403,6 +413,17 @@ fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), PairingTextEr
             ));
         }
         return Ok(());
+    }
+    // A host whose last label is a number is an address, not a name: a URL parser reads
+    // `0xc0000201` as 192.0.2.1. An origin that two parsers read differently is two origins, so
+    // the last label must be a name.
+    let last = host.rsplit('.').next().unwrap_or(host);
+    if last.starts_with(|character: char| character.is_ascii_digit())
+        || !last.bytes().any(|byte| byte.is_ascii_lowercase())
+    {
+        return Err(PairingTextError(
+            "a rendezvous origin host ends in a name, not a number",
+        ));
     }
     for label in host.split('.') {
         if label.is_empty() || label.len() > 63 {
@@ -492,6 +513,17 @@ impl Drop for ShortCode {
         use zeroize::Zeroize as _;
 
         self.0.zeroize();
+    }
+}
+
+impl ShortCode {
+    /// Returns the canonical text, cleared when the caller drops it.
+    ///
+    /// A caller that needs the code as text, to render a QR payload or to display it, gets a
+    /// buffer that clears itself. [`Self::as_str`] borrows instead and copies nothing.
+    #[must_use]
+    pub fn to_secret_text(&self) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(self.0.clone())
     }
 }
 
@@ -2110,6 +2142,16 @@ mod tests {
         assert!(RendezvousOrigin::new("https://192.0.2.1").is_ok());
         assert!(RendezvousOrigin::new("https://192.0.02.1").is_err());
         assert!(RendezvousOrigin::new("https://192.0.2.1.5").is_err());
+        // One host, one spelling: a mapped address and a numeric last label are both refused.
+        assert!(RendezvousOrigin::new("https://[::ffff:192.0.2.1]").is_err());
+        assert!(RendezvousOrigin::new("https://[::ffff:c000:201]").is_err());
+        assert!(RendezvousOrigin::new("https://[::192.0.2.1]").is_err());
+        assert!(RendezvousOrigin::new("https://0xc0000201").is_err());
+        assert!(RendezvousOrigin::new("https://3221225985").is_err());
+        assert!(RendezvousOrigin::new("https://reach.kala.to").is_ok());
+        assert!(RendezvousOrigin::new("https://1password.example").is_ok());
+        // A punycode A-label is a name: it starts with a letter and carries one.
+        assert!(RendezvousOrigin::new("https://xn--p1ai.xn--p1ai").is_ok());
         assert!(RendezvousOrigin::new("https://reach.kala.to:8443").is_ok());
     }
 

@@ -26,6 +26,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::Zeroize as _;
 
 /// Length of a UUID in bytes.
 pub const UUID_LEN: usize = 16;
@@ -722,8 +723,6 @@ impl SecretBytes32 {
 
 impl Drop for SecretBytes32 {
     fn drop(&mut self) {
-        use zeroize::Zeroize as _;
-
         self.0.zeroize();
     }
 }
@@ -771,7 +770,7 @@ impl JsonSchema for SecretBytes32 {
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
         base64url_schema(
-            "Thirty-two secret bytes. They zeroise when dropped and never appear in debug output, a log or an analytics event.",
+            "Thirty-two secret bytes. The Rust representation clears them when it is dropped and redacts them in diagnostics; a consumer in another language must apply its own handling, because a JSON string carries no such guarantee.",
             Some(32),
         )
     }

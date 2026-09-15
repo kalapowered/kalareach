@@ -288,13 +288,40 @@ impl FileStore {
     }
 
     fn path(&self, name: &SecretName) -> PathBuf {
-        // The name is validated, so no segment traverses and none is empty. A '/' becomes a
-        // subdirectory, which keeps one scope's items together.
+        // The name is validated, so no segment is empty, traverses or starts with a dot. A '/'
+        // becomes a subdirectory, which keeps one scope's items together.
         let mut path = self.directory.clone();
         for part in name.as_str().split('/') {
             path.push(part);
         }
         path
+    }
+
+    /// Rejects a path whose own entry or any directory below the store root is a link.
+    ///
+    /// The root is checked when the store opens. Everything under it is checked on use, because a
+    /// link that appears afterwards would otherwise redirect a write, a read or a deletion out of
+    /// the directory whose mode is the only protection there is.
+    fn reject_links(&self, path: &Path) -> Result<()> {
+        let mut component = path;
+        loop {
+            if component == self.directory {
+                return Ok(());
+            }
+            if component.is_symlink() {
+                return Err(CryptoError::SecretStore {
+                    message: format!("{} is a symbolic link", component.display()),
+                });
+            }
+            match component.parent() {
+                Some(parent) if parent != component => component = parent,
+                _ => {
+                    return Err(CryptoError::SecretStore {
+                        message: format!("{} is outside the store", path.display()),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -309,6 +336,7 @@ impl SecretStore for FileStore {
         std::fs::create_dir_all(parent).map_err(|error| CryptoError::SecretStore {
             message: format!("create {}: {error}", parent.display()),
         })?;
+        self.reject_links(&path)?;
         set_mode(parent, 0o700)?;
 
         // The staging name starts with a dot, which no valid secret name can produce, and carries
@@ -334,7 +362,11 @@ impl SecretStore for FileStore {
     }
 
     fn get(&self, name: &SecretName) -> Result<Option<SecretVec>> {
-        match std::fs::read(self.path(name)) {
+        let path = self.path(name);
+        if path.exists() || path.is_symlink() {
+            self.reject_links(&path)?;
+        }
+        match std::fs::read(&path) {
             Ok(bytes) => Ok(Some(SecretVec::new(bytes))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(CryptoError::SecretStore {
@@ -345,6 +377,9 @@ impl SecretStore for FileStore {
 
     fn delete(&self, name: &SecretName) -> Result<()> {
         let path = self.path(name);
+        if path.exists() || path.is_symlink() {
+            self.reject_links(&path)?;
+        }
         // Overwrite before unlinking. On a journalling or copy-on-write filesystem this is not a
         // guarantee, which is why the fallback is documented as depending on disk encryption.
         if let Ok(metadata) = std::fs::metadata(&path) {
@@ -576,7 +611,13 @@ impl Drop for MemoryStore {
 /// Returns [`CryptoError::SecretStore`] when neither store can be opened.
 pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStore> {
     let platform = PlatformStore::open(service);
-    match read_recorded_kind(fallback_directory) {
+    let recorded = match read_recorded_kind(fallback_directory)? {
+        Some(kind) => Some(kind),
+        // No record, but secrets are already in the fallback: that is where they stay.
+        None if fallback_holds_secrets(fallback_directory) => Some(StoreKind::FileFallback),
+        None => None,
+    };
+    match recorded {
         Some(StoreKind::Platform) => {
             // The host's secrets are in the platform store. If it has gone away this is an error:
             // falling back would start from an empty store while the secrets still exist.
@@ -594,6 +635,7 @@ pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStor
         Some(StoreKind::FileFallback) => {
             // The host's secrets are in files and stay there, even when a secret service appears.
             let store = FileStore::open(fallback_directory)?;
+            record_kind(fallback_directory, StoreKind::FileFallback)?;
             Ok(OpenedStore {
                 store: Box::new(store),
                 kind: StoreKind::FileFallback,
@@ -634,35 +676,97 @@ pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStor
 /// stored secret. It carries no secret itself: it names a backend.
 const STORE_KIND_MARKER: &str = ".store-kind";
 
-/// Reads the recorded choice, or `None` when this host has not chosen yet.
-fn read_recorded_kind(directory: &Path) -> Option<StoreKind> {
-    match std::fs::read_to_string(directory.join(STORE_KIND_MARKER))
-        .ok()?
-        .trim()
-    {
-        "platform" => Some(StoreKind::Platform),
-        "file" => Some(StoreKind::FileFallback),
-        _ => None,
+/// The longest a valid marker is. Anything larger is a damaged or foreign file.
+const MAX_MARKER_LEN: u64 = 64;
+
+/// Reads the recorded choice.
+///
+/// `None` means this host has not chosen yet. A marker that cannot be read, is too large or holds
+/// anything but a known backend name is an error: it is the record of where a host's secrets live,
+/// and guessing would be guessing which store to start from.
+fn read_recorded_kind(directory: &Path) -> Result<Option<StoreKind>> {
+    let path = directory.join(STORE_KIND_MARKER);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CryptoError::SecretStore {
+                message: format!("read {}: {error}", path.display()),
+            });
+        }
+    };
+    if !metadata.is_file() {
+        return Err(CryptoError::SecretStore {
+            message: format!("{} is not a regular file", path.display()),
+        });
+    }
+    if metadata.len() > MAX_MARKER_LEN {
+        return Err(CryptoError::SecretStore {
+            message: format!(
+                "{} is {} bytes; it is damaged",
+                path.display(),
+                metadata.len()
+            ),
+        });
+    }
+    let text = std::fs::read_to_string(&path).map_err(|error| CryptoError::SecretStore {
+        message: format!("read {}: {error}", path.display()),
+    })?;
+    match text.trim() {
+        "platform" => Ok(Some(StoreKind::Platform)),
+        "file" => Ok(Some(StoreKind::FileFallback)),
+        other => Err(CryptoError::SecretStore {
+            message: format!("{} names an unknown store {other:?}", path.display()),
+        }),
     }
 }
 
 /// Records the choice so a later start does not silently pick the other backend.
+///
+/// The write goes through the same owner-only, exclusive, durable path a secret does, so a crash
+/// leaves either the old record or the new one, a link cannot redirect it, and two processes
+/// racing to record cannot interleave.
 fn record_kind(directory: &Path, kind: StoreKind) -> Result<()> {
     std::fs::create_dir_all(directory).map_err(|error| CryptoError::SecretStore {
         message: format!("create {}: {error}", directory.display()),
     })?;
+    set_mode(directory, 0o700)?;
+    check_owner_only(directory)?;
+
     let text = match kind {
         StoreKind::Platform => "platform",
         StoreKind::FileFallback => "file",
     };
-    std::fs::write(directory.join(STORE_KIND_MARKER), text).map_err(|error| {
-        CryptoError::SecretStore {
-            message: format!(
-                "record the store choice in {}: {error}",
-                directory.display()
-            ),
-        }
-    })
+    let staging = directory.join(format!(
+        ".{}.{}.store-kind.staging",
+        std::process::id(),
+        STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    write_owner_only(&staging, text.as_bytes())?;
+    let renamed = std::fs::rename(&staging, directory.join(STORE_KIND_MARKER));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    renamed.map_err(|error| CryptoError::SecretStore {
+        message: format!(
+            "record the store choice in {}: {error}",
+            directory.display()
+        ),
+    })?;
+    sync_directory(directory)
+}
+
+/// Returns true when the fallback directory holds anything but the store's own dotted files.
+///
+/// A host that predates the marker, or whose marker was removed, still has its secrets where it
+/// left them. That is what decides the backend when there is no record to read.
+fn fallback_holds_secrets(directory: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
 }
 
 /// The store a host opened and what it means.

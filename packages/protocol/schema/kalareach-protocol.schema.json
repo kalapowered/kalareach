@@ -4521,7 +4521,7 @@
     },
     "SecretBytes32": {
       "contentEncoding": "base64url",
-      "description": "Thirty-two secret bytes. They zeroise when dropped and never appear in debug output, a log or an analytics event.",
+      "description": "Thirty-two secret bytes. The Rust representation clears them when it is dropped and redacts them in diagnostics; a consumer in another language must apply its own handling, because a JSON string carries no such guarantee.",
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },

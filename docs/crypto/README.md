@@ -265,6 +265,25 @@ with the Node runtime's own SHA-256, HMAC-SHA256, HKDF-SHA256 and Ed25519 verifi
 this repository's own TypeScript codec for the encodings, so a value that drifts in one language
 fails in both.
 
+## Known limitations
+
+Two secret buffers in this path are not cleared, and neither is reachable from this wrapper.
+
+1. **An envelope payload passes through `serde` and `ciborium` value trees that do not zeroise.**
+   Encoding and decoding an `EnvelopePlaintext` builds an intermediate value tree whose byte and
+   text buffers this crate does not own and cannot reach. The buffers it does own are cleared: the
+   canonical encoding, the padded plaintext and the opened `SecretVec` all zeroise. The
+   key-carrying paths avoid the trees entirely: a key wrap is assembled and read by hand, and every
+   key lives in a `Secret`. Closing this means either a value tree whose temporaries clear
+   themselves or a hand-written encoding for each envelope schema; both belong with the crate that
+   owns the encoder.
+2. **`hkdf` 0.13.0 keeps its pseudorandom key and expansion buffers uncleared.** The crate has no
+   `zeroize` feature; `hmac` and `sha2` are built with theirs. Closing this means a maintained
+   release that clears them, or a reviewed patch. Section 20 requires a maintained implementation,
+   so a private fork is not the answer.
+
+Both are recorded for the external cryptographic review that section 10 makes a release gate.
+
 ## Release manifest
 
 Pin these in the release manifest, with their exact versions and the resolved dependency graph:
