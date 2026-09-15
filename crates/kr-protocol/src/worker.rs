@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hello::ProtocolVersion;
 use crate::identity::{BootIdentity, ProcessStartIdentity, WorkerProfile};
-use crate::ids::{ControllerGeneration, EnvironmentId, SessionEpoch, SessionId};
+use crate::ids::{AuthorityRevision, ControllerGeneration, EnvironmentId, SessionEpoch, SessionId};
 use crate::scalars::{AuthorisationKey, Nonce256, Nullable, Signature64, TimestampMs, U64, Uuid};
 use crate::session::DisplayNumber;
 
@@ -346,6 +346,32 @@ pub struct GenerationAccepted {
     pub generation: ControllerGeneration,
     /// True when accepting this token fenced an earlier connection of the same generation.
     pub fenced_previous: bool,
+}
+
+/// The host's current authority revision, announced to a worker by the controller that holds it.
+///
+/// Authority revisions are ordered and only the host issues them. A revocation is not complete
+/// when the controller records it: it is complete when every worker that could still act on the
+/// revoked authority has acknowledged the revision that removed it. Until then the revocation
+/// reports `pending` for that worker, or the worker is confirmed ended, which answers the same
+/// question a different way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityRevisionNotice {
+    /// The environment whose authority changed.
+    pub environment_id: EnvironmentId,
+    /// The revision now in force.
+    pub revision: AuthorityRevision,
+}
+
+/// A worker's acknowledgement that it is acting under an authority revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityRevisionAck {
+    /// The session that acknowledged it.
+    pub session_id: SessionId,
+    /// The revision the worker now holds.
+    pub revision: AuthorityRevision,
 }
 
 /// How a worker's execution context is bound, as recorded in the registry.

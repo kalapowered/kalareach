@@ -16,8 +16,9 @@ use crate::ids::{ActionWindowId, BuildId, CapabilityId, ConnectionId, Environmen
 use crate::receipt::ReceiptResponse;
 use crate::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 use crate::worker::{
-    ControllerGenerationToken, GenerationAccepted, GenerationChallenge, WorkerLaunchSpec,
-    WorkerReady, WorkerRendezvous, WorkerVerifyChallenge, WorkerVerifyProof,
+    AuthorityRevisionAck, AuthorityRevisionNotice, ControllerGenerationToken, GenerationAccepted,
+    GenerationChallenge, WorkerLaunchSpec, WorkerReady, WorkerRendezvous, WorkerVerifyChallenge,
+    WorkerVerifyProof,
 };
 
 /// Which host process a local endpoint belongs to.
@@ -120,6 +121,31 @@ pub struct LocalHelloAck {
     pub max_receive: ReceiveLimits,
 }
 
+/// A client's request for a fresh freshness window on this live connection.
+///
+/// Section 9 renews a window explicitly on a live authorised connection. Nothing extends the
+/// window a request already quoted: a renewal produces a new identifier, and a request that
+/// quoted the old one is not repaired by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionWindowRenew {
+    /// The connection asking, which is the connection the window belongs to.
+    pub connection_id: ConnectionId,
+}
+
+/// A freshly stamped freshness window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionWindowGrant {
+    /// The connection the window belongs to.
+    pub connection_id: ConnectionId,
+    /// The window identifier a first admission quotes.
+    pub action_window_id: ActionWindowId,
+    /// When it expires by the wall clock, for display. Expiry is decided on the host's continuous
+    /// clock, so a wall clock that moves cannot extend it.
+    pub action_window_expires_at_ms: TimestampMs,
+}
+
 /// One message on a local control stream.
 ///
 /// The union is closed. A receiver that cannot name the variant rejects the frame rather than
@@ -159,6 +185,14 @@ pub enum ControlMessage {
     GenerationToken(Box<ControllerGenerationToken>),
     /// The worker's acceptance of a generation.
     GenerationAccepted(GenerationAccepted),
+    /// The authority revision the controller now holds.
+    AuthorityRevision(AuthorityRevisionNotice),
+    /// The worker's acknowledgement of an authority revision.
+    AuthorityRevisionAck(AuthorityRevisionAck),
+    /// A client's request for a fresh freshness window.
+    ActionWindowRenew(ActionWindowRenew),
+    /// The host's freshly stamped freshness window.
+    ActionWindow(ActionWindowGrant),
 }
 
 #[cfg(test)]

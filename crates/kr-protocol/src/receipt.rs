@@ -289,3 +289,41 @@ pub struct ReceiptResponse {
     /// The current receipt.
     pub receipt: Receipt,
 }
+
+/// What `action.read` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionReadParams {
+    /// The action to read.
+    pub action_id: ActionId,
+}
+
+/// A retained receipt and the result it produced.
+///
+/// Owning an identifier is not authority: the host checks present view authority over the subject
+/// the receipt names before it returns either half, which is why a retained result is carried here
+/// rather than handed back from the action identifier alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionReadResult {
+    /// The receipt as it currently stands.
+    pub receipt: Receipt,
+    /// The result the action produced, when it produced one and it is still retained.
+    pub result: Nullable<crate::envelope::ParamsValue>,
+}
+
+/// What `action.cancel` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionCancelParams {
+    /// The action to cancel.
+    pub action_id: ActionId,
+}
+
+/// The receipt an undispatched action was cancelled into.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionCancelResult {
+    /// The receipt after the cancellation.
+    pub receipt: Receipt,
+}
