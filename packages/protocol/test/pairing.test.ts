@@ -1,0 +1,301 @@
+/**
+ * The pairing vectors under `fixtures/pairing/`, recomputed in TypeScript.
+ *
+ * Nothing here calls the Rust implementation. SHA-256, HMAC-SHA256 and HKDF-SHA256 come from the
+ * Node runtime, and the canonical encodings come from this package's own codec, so agreement with
+ * the Rust vectors is real cross-language agreement.
+ *
+ * This is the TypeScript half of KR-ACC-015: the ten-character entry rules, the PAKE derivations,
+ * the confirmation tags, the key-bundle and iroh binding, and both QR payload encodings.
+ */
+
+import { createHash, createHmac, hkdfSync } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { describe, expect, it } from 'vitest'
+
+import { decodeCanonical, encodeCanonical, krText } from '../src/index.js'
+
+import { bytesToHex, hexToBytes } from './fixtures.js'
+
+const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+
+function loadPairingFixture (name: string): Record<string, any> {
+  return JSON.parse(
+    readFileSync(join(repositoryRoot, 'fixtures', 'pairing', name), 'utf8')
+  ) as Record<string, any>
+}
+
+function sha256 (bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+function hmac (keyHex: string, message: Uint8Array): string {
+  return createHmac('sha256', Buffer.from(hexToBytes(keyHex))).update(message).digest('hex')
+}
+
+function hkdf (ikmHex: string, saltHex: string, info: string): string {
+  return bytesToHex(
+    new Uint8Array(
+      hkdfSync(
+        'sha256',
+        Buffer.from(hexToBytes(ikmHex)),
+        Buffer.from(hexToBytes(saltHex)),
+        Buffer.from(info, 'utf8'),
+        32
+      )
+    )
+  )
+}
+
+/** The Bitcoin Base58 alphabet, as section 10 gives it. */
+const BASE58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+
+/** Parses an entered code the way section 10 specifies: strip spaces and hyphens, keep case. */
+function parseCode (entered: string): string | undefined {
+  let normalised = ''
+  for (const character of entered) {
+    if (character === ' ' || character === '-') continue
+    if (!BASE58.includes(character)) return undefined
+    if (normalised.length === 10) return undefined
+    normalised += character
+  }
+  return normalised.length === 10 ? normalised : undefined
+}
+
+describe('short-code entry', () => {
+  const document = loadPairingFixture('codes.json')
+
+  it('uses the Bitcoin Base58 alphabet', () => {
+    expect(document.alphabet).toBe(BASE58)
+    expect(document.display_form).toBe('XXXX-XXX-XXX')
+    for (const excluded of ['0', 'O', 'I', 'l']) {
+      expect(BASE58.includes(excluded)).toBe(false)
+    }
+  })
+
+  it('accepts every spelling the vector accepts, with the same normalisation', () => {
+    for (const entry of document.parsing.accepted) {
+      expect(parseCode(entry.entered), entry.entered).toBe(entry.normalised)
+      expect(entry.normalised.slice(0, 4)).toBe(entry.locator)
+    }
+  })
+
+  it('rejects every case the vector rejects', () => {
+    for (const entry of document.parsing.rejected) {
+      expect(parseCode(entry.entered), entry.id).toBeUndefined()
+    }
+  })
+
+  it('preserves case, because folding it would throw away entropy', () => {
+    expect(parseCode('aB3x-Yz7-9Qw')).not.toBe(parseCode('Ab3x-Yz7-9Qw'))
+  })
+})
+
+describe('QR payloads', () => {
+  const document = loadPairingFixture('codes.json')
+
+  it('round-trips both published encodings', () => {
+    for (const mode of ['code', 'direct'] as const) {
+      const canonical = hexToBytes(document.qr[mode].canonical_hex)
+      const value = decodeCanonical(canonical)
+      expect(value.kind).toBe('map')
+      expect(bytesToHex(encodeCanonical(value))).toBe(document.qr[mode].canonical_hex)
+
+      const entries = value.kind === 'map' ? new Map(value.entries) : new Map()
+      expect(entries.get('mode')).toEqual(krText(mode))
+      expect(entries.get('version')).toEqual({ kind: 'int', value: BigInt(document.qr.version) })
+    }
+  })
+
+  it('requires an explicit supported mode', () => {
+    const direct = decodeCanonical(hexToBytes(document.qr.direct.canonical_hex))
+    const code = decodeCanonical(hexToBytes(document.qr.code.canonical_hex))
+    const modeOf = (value: ReturnType<typeof decodeCanonical>): unknown =>
+      value.kind === 'map' ? new Map(value.entries).get('mode') : undefined
+    expect(modeOf(direct)).not.toEqual(modeOf(code))
+    // A code payload has four members and a direct one has eight: a code QR carries no secret and
+    // no endpoint, so it is not an offline invitation.
+    expect(code.kind === 'map' ? code.entries.length : 0).toBe(4)
+    expect(direct.kind === 'map' ? direct.entries.length : 0).toBe(8)
+  })
+
+  it('matches the base64url text form of the same bytes', () => {
+    for (const mode of ['code', 'direct'] as const) {
+      const canonical = hexToBytes(document.qr[mode].canonical_hex)
+      expect(Buffer.from(canonical).toString('base64url')).toBe(document.qr[mode].text)
+    }
+  })
+})
+
+describe('short-code transcript', () => {
+  const document = loadPairingFixture('transcript.json')
+
+  it('builds C as the array section 10 writes', () => {
+    const canonical = hexToBytes(document.context.canonical_hex)
+    expect(sha256(canonical)).toBe(document.context.context_hash_hex)
+    const value = decodeCanonical(canonical)
+    expect(value.kind).toBe('array')
+    if (value.kind !== 'array') throw new Error('unreachable')
+    expect(value.items).toHaveLength(7)
+    expect(value.items[0]).toEqual(krText(document.domain))
+    expect(value.items[1]).toEqual(krText(document.context.rendezvous_origin))
+    expect(value.items[2]).toEqual(krText(document.context.locator))
+  })
+
+  it('builds the two role identities from CH', () => {
+    for (const [side, domainKey] of [
+      ['host', 'host_domain'],
+      ['client', 'client_domain']
+    ] as const) {
+      const identity = hexToBytes(document.identities[`${side}_hex`])
+      const value = decodeCanonical(identity)
+      expect(value.kind).toBe('array')
+      if (value.kind !== 'array') throw new Error('unreachable')
+      expect(value.items).toHaveLength(2)
+      expect(value.items[0]).toEqual(krText(document.identities[domainKey]))
+      const hash = value.items[1]
+      expect(hash.kind).toBe('bytes')
+      if (hash.kind !== 'bytes') throw new Error('unreachable')
+      expect(bytesToHex(hash.value)).toBe(document.context.context_hash_hex)
+    }
+    expect(document.identities.host_hex).not.toBe(document.identities.client_hex)
+  })
+
+  it('computes T over the context and both messages in order', () => {
+    const transcript = hexToBytes(document.exchange.transcript_hex)
+    expect(sha256(transcript)).toBe(document.exchange.transcript_sha256_hex)
+    const value = decodeCanonical(transcript)
+    if (value.kind !== 'array') throw new Error('unreachable')
+    expect(value.items).toHaveLength(3)
+    const [context, messageA, messageB] = value.items
+    expect(bytesToHex(encodeCanonical(context))).toBe(document.context.canonical_hex)
+    if (messageA.kind !== 'bytes' || messageB.kind !== 'bytes') throw new Error('unreachable')
+    expect(bytesToHex(messageA.value)).toBe(document.exchange.message_a_hex)
+    expect(bytesToHex(messageB.value)).toBe(document.exchange.message_b_hex)
+  })
+
+  it('derives the five keys with the five literal information strings', () => {
+    const salt = document.exchange.transcript_sha256_hex
+    const ikm = document.exchange.shared_key_hex
+    const expected: Array<[string, string]> = [
+      ['kr-pair/1/client-confirm', document.hkdf.client_confirm_key_hex],
+      ['kr-pair/1/host-confirm', document.hkdf.host_confirm_key_hex],
+      ['kr-pair/1/client-to-host', document.hkdf.client_to_host_key_hex],
+      ['kr-pair/1/host-to-client', document.hkdf.host_to_client_key_hex],
+      ['kr-pair/1/iroh-bind', document.hkdf.iroh_bind_key_hex]
+    ]
+    expect(document.hkdf.info_strings).toEqual(expected.map(([info]) => info))
+    for (const [info, key] of expected) {
+      expect(hkdf(ikm, salt, info), info).toBe(key)
+    }
+    expect(new Set(expected.map(([, key]) => key)).size).toBe(expected.length)
+  })
+
+  it('computes both confirmation tags over T', () => {
+    const transcript = hexToBytes(document.exchange.transcript_sha256_hex)
+    expect(hmac(document.hkdf.client_confirm_key_hex, transcript)).toBe(
+      document.confirmation.client_tag_hex
+    )
+    expect(hmac(document.hkdf.host_confirm_key_hex, transcript)).toBe(
+      document.confirmation.host_tag_hex
+    )
+    expect(document.confirmation.client_tag_hex).not.toBe(document.confirmation.host_tag_hex)
+  })
+
+  it('binds pair.finish to both endpoints and both bundle hashes', () => {
+    const message = hexToBytes(document.finish.message_hex)
+    expect(hmac(document.hkdf.iroh_bind_key_hex, message)).toBe(document.finish.tag_hex)
+
+    const value = decodeCanonical(message)
+    if (value.kind !== 'array') throw new Error('unreachable')
+    expect(value.items[0]).toEqual(krText('kr-pair/finish/1'))
+    const hexOf = (index: number): string => {
+      const item = value.items[index]
+      if (item.kind !== 'bytes') throw new Error('unreachable')
+      return bytesToHex(item.value)
+    }
+    expect(hexOf(3)).toBe(document.exchange.transcript_sha256_hex)
+    expect(hexOf(4)).toBe(document.finish.host_endpoint_hex)
+    expect(hexOf(5)).toBe(document.finish.client_endpoint_hex)
+    expect(hexOf(6)).toBe(document.finish.host_bundle_hash_hex)
+    expect(hexOf(7)).toBe(document.finish.client_bundle_hash_hex)
+  })
+
+  it('separates every bundle additional-data case', () => {
+    const seen = new Set<string>()
+    for (const entry of document.bundle_additional_data) {
+      expect(seen.has(entry.aad_hex)).toBe(false)
+      seen.add(entry.aad_hex)
+      const value = decodeCanonical(hexToBytes(entry.aad_hex))
+      if (value.kind !== 'array') throw new Error('unreachable')
+      expect(value.items).toHaveLength(5)
+      expect(value.items[0]).toEqual(krText(document.domain))
+      expect(value.items[2]).toEqual(krText(entry.direction))
+      expect(value.items[3]).toEqual({ kind: 'int', value: BigInt(entry.sequence) })
+      expect(value.items[4]).toEqual(krText(entry.message_type))
+    }
+    expect(seen.size).toBe(4)
+  })
+
+  it('takes the verification value from the first eight hexadecimal characters', () => {
+    const input = encodeCanonical({
+      kind: 'array',
+      items: [
+        krText(document.verification_value.domain),
+        { kind: 'bytes', value: hexToBytes(document.exchange.transcript_sha256_hex) },
+        { kind: 'bytes', value: hexToBytes(document.finish.host_bundle_hash_hex) },
+        { kind: 'bytes', value: hexToBytes(document.finish.client_bundle_hash_hex) }
+      ]
+    })
+    expect(sha256(input).slice(0, 8)).toBe(document.verification_value.value)
+  })
+})
+
+describe('direct transcript', () => {
+  const document = loadPairingFixture('direct.json')
+
+  it('builds D as the array section 10 writes', () => {
+    const canonical = hexToBytes(document.transcript.canonical_hex)
+    expect(sha256(canonical)).toBe(document.transcript.canonical_sha256_hex)
+    const value = decodeCanonical(canonical)
+    if (value.kind !== 'array') throw new Error('unreachable')
+    expect(value.items).toHaveLength(10)
+    expect(value.items[0]).toEqual(krText(document.domain))
+    const hexOf = (index: number): string => {
+      const item = value.items[index]
+      if (item.kind !== 'bytes') throw new Error('unreachable')
+      return bytesToHex(item.value)
+    }
+    expect(hexOf(1)).toBe(document.transcript.invitation_id_hex)
+    expect(hexOf(2)).toBe(document.transcript.host_endpoint_hex)
+    expect(hexOf(3)).toBe(document.transcript.client_endpoint_hex)
+    expect(hexOf(6)).toBe(document.transcript.proposed_grant_digest_hex)
+    expect(hexOf(7)).toBe(document.transcript.host_nonce_hex)
+    expect(hexOf(8)).toBe(document.transcript.client_nonce_hex)
+    expect(value.items[9]).toEqual({
+      kind: 'int',
+      value: BigInt(document.transcript.expires_at)
+    })
+  })
+
+  it('computes the secret proof over D', () => {
+    expect(
+      hmac(document.secret_proof.secret_hex, hexToBytes(document.transcript.canonical_hex))
+    ).toBe(document.secret_proof.tag_hex)
+  })
+
+  it('takes its verification value from its own domain', () => {
+    expect(document.domain).not.toBe('kr-pair/spake2-ed25519/1')
+    expect(document.verification_value.domain).toBe('kr-pair/direct-verify/1')
+    const input = encodeCanonical({
+      kind: 'array',
+      items: [
+        krText(document.verification_value.domain),
+        decodeCanonical(hexToBytes(document.transcript.canonical_hex))
+      ]
+    })
+    expect(sha256(input).slice(0, 8)).toBe(document.verification_value.value)
+  })
+})

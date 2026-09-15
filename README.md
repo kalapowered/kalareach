@@ -13,12 +13,14 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-cbor` | The KR-CBOR-1 codec: canonical encoding, strict decoding, digests and signing input |
 | `crates/kr-protocol` | Wire types, the method authority table, error codes and the JSON Schema generator |
 | `crates/kr-crypto` | Cryptography: a narrow libsodium wrapper, purpose-separated device keys, encrypted objects and secret storage |
+| `crates/kr-pairing` | Pairing: the short-code SPAKE2 and direct QR state machines, their budgets and their transcripts |
 | `crates/kr-plugin-sdk` | The plugin package contract: manifests, the WIT package, effect classes, the catalogue index and the package validator |
 | `packages/protocol` | The generated TypeScript package: types, a byte-compatible codec and the JSON adapter |
 | `packages/plugin-sdk` | The generated plugin SDK package: types, the package contract as data and the published WIT file |
 | `fixtures/` | Cross-language conformance vectors and fixture packages that both languages test against |
 | `docs/protocol/` | The protocol reference |
 | `docs/crypto/` | The cryptography reference |
+| `docs/pairing/` | The pairing reference |
 | `docs/plugins/` | The plugin reference |
 
 Rust is canonical. The JSON Schema in `packages/protocol/schema/` and `packages/plugin-sdk/schema/`
@@ -41,6 +43,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p kr-protocol --bin kr-protocol-gen -- --check
 cargo run -p kr-crypto --bin kr-crypto-vectors -- --check
+cargo run -p kr-pairing --bin kr-pairing-vectors -- --check
 cargo run -p kr-plugin-sdk --bin kr-plugin-sdk-gen -- --check
 cargo run -p kr-plugin-sdk --bin kr-plugin-sandbox -- fixtures/plugins/valid/example-declarative
 
@@ -59,6 +62,7 @@ After changing anything the cryptography vectors cover, regenerate them and comm
 
 ```bash
 cargo run -p kr-crypto --bin kr-crypto-vectors
+cargo run -p kr-pairing --bin kr-pairing-vectors
 ```
 
 After changing a manifest type, do the same for the plugin SDK:
@@ -72,5 +76,7 @@ pnpm -C packages/plugin-sdk generate
 envelopes, the receipt contract, the error codes and the authority table.
 [docs/crypto/README.md](docs/crypto/README.md) explains the cryptographic boundary: the key
 purposes, the domains, the encrypted object formats and the secret store.
+[docs/pairing/README.md](docs/pairing/README.md) explains the two pairing flows, their budgets, the
+PAKE profile and the review gate it carries.
 [docs/plugins/README.md](docs/plugins/README.md) explains the package contract, the manifests, the
 effect classes, the node union, the predicate grammar and the limits.

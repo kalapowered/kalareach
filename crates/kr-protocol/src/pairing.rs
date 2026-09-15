@@ -1944,6 +1944,52 @@ pub const REVOCATION_DOMAIN: &str = "kr-revocation/1";
 /// The domain a host authority revision record signature covers.
 pub const AUTHORITY_REVISION_DOMAIN: &str = "kr-authority/1";
 
+impl RevocationRequest {
+    /// Builds the canonical bytes this request's signature covers.
+    ///
+    /// The elements are every field except the signature, in declaration order. Signing the whole
+    /// struct would mean signing a field that does not exist yet, and leaving a field out would
+    /// let it be rewritten in transit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the target cannot be represented in KR-CBOR-1.
+    pub fn signing_input(&self) -> Result<Vec<u8>, CborError> {
+        Ok(kr_cbor::encode(&signing_value(
+            REVOCATION_DOMAIN,
+            vec![
+                CanonicalValue::bytes(self.request_id.get().as_bytes().as_slice()),
+                CanonicalValue::bytes(self.issuer_device_id.get().as_bytes().as_slice()),
+                CanonicalValue::bytes(self.host_device_id.get().as_bytes().as_slice()),
+                kr_cbor::to_canonical_value(&self.target)?,
+                CanonicalValue::Integer(self.issued_at_ms.get().into()),
+                CanonicalValue::bytes(self.issuer_key_id.as_bytes().as_slice()),
+            ],
+        )))
+    }
+}
+
+impl AuthorityRevisionRecord {
+    /// Builds the canonical bytes this record's signature covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the applied-request set cannot be represented in KR-CBOR-1.
+    pub fn signing_input(&self) -> Result<Vec<u8>, CborError> {
+        Ok(kr_cbor::encode(&signing_value(
+            AUTHORITY_REVISION_DOMAIN,
+            vec![
+                CanonicalValue::bytes(self.host_device_id.get().as_bytes().as_slice()),
+                CanonicalValue::Integer(self.authority_revision.get().into()),
+                CanonicalValue::Integer(self.previous_revision.get().into()),
+                kr_cbor::to_canonical_value(&self.applied_requests)?,
+                CanonicalValue::Integer(self.issued_at_ms.get().into()),
+                CanonicalValue::bytes(self.host_key_id.as_bytes().as_slice()),
+            ],
+        )))
+    }
+}
+
 /// One ordered authority revision, issued by the host and by nobody else.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

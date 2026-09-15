@@ -1,0 +1,83 @@
+{
+  "alphabet": "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz",
+  "description": "Short-code parsing and the two QR payload encodings.",
+  "display_form": "XXXX-XXX-XXX",
+  "name": "codes",
+  "parsing": {
+    "accepted": [
+      {
+        "entered": "aB3x-Yz7-9Qw",
+        "locator": "aB3x",
+        "normalised": "aB3xYz79Qw"
+      },
+      {
+        "entered": "aB3xYz79Qw",
+        "locator": "aB3x",
+        "normalised": "aB3xYz79Qw"
+      },
+      {
+        "entered": " aB3x Yz7 9Qw ",
+        "locator": "aB3x",
+        "normalised": "aB3xYz79Qw"
+      },
+      {
+        "entered": "aB3x--Yz7--9Qw",
+        "locator": "aB3x",
+        "normalised": "aB3xYz79Qw"
+      }
+    ],
+    "description": "Parsing removes ASCII spaces and hyphens, preserves case and requires exactly ten alphabet characters.",
+    "rejected": [
+      {
+        "entered": "aB3xYz79Q",
+        "id": "too_short"
+      },
+      {
+        "entered": "aB3xYz79QwX",
+        "id": "too_long"
+      },
+      {
+        "entered": "",
+        "id": "empty"
+      },
+      {
+        "entered": "0B3xYz79Qw",
+        "id": "zero_is_not_in_the_alphabet"
+      },
+      {
+        "entered": "OB3xYz79Qw",
+        "id": "capital_o_is_not_in_the_alphabet"
+      },
+      {
+        "entered": "IB3xYz79Qw",
+        "id": "capital_i_is_not_in_the_alphabet"
+      },
+      {
+        "entered": "lB3xYz79Qw",
+        "id": "lower_l_is_not_in_the_alphabet"
+      },
+      {
+        "entered": "aB3xYz79Q!",
+        "id": "punctuation"
+      },
+      {
+        "entered": "aB3xYz79Qé",
+        "id": "non_ascii"
+      }
+    ]
+  },
+  "qr": {
+    "code": {
+      "canonical_hex": "a464636f64656c614233782d597a372d395177646d6f646564636f64656776657273696f6e017172656e64657a766f75735f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f",
+      "mode": "code",
+      "text": "pGRjb2RlbGFCM3gtWXo3LTlRd2Rtb2RlZGNvZGVndmVyc2lvbgFxcmVuZGV6dm91c19vcmlnaW51aHR0cHM6Ly9yZWFjaC5rYWxhLnRv"
+    },
+    "description": "Both payload formats in their canonical KR-CBOR-1 encodings. A parser requires an explicit supported mode.",
+    "direct": {
+      "canonical_hex": "a8646d6f6465666469726563746673656372657458207b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b6776657273696f6e016a657870697265735f61741b0000019ab6a10fc06b656e64706f696e745f6964582060606060606060606060606060606060606060606060606060606060606060606d696e7669746174696f6e5f696450111111111111111111111111111111116e6e6574776f726b5f636f6e666967a36a72656c61795f75726c73817568747470733a2f2f72656c61792e6b616c612e746f706469726563745f616464726573736573816f3139322e302e322e313a343132333471646973636f766572795f6f726967696e73806e70726f706f7365645f6772616e74a766657870697279a1626174a16d657870697265735f61745f6d731b0000019ab6ced68067616374696f6e73816c73657373696f6e2e7669657767686973746f7279a46e6c6f7765725f626f756e645f6d73f66f6e616d65645f617070726f76616c73806f6e616d65645f7175657374696f6e738073696e636c7564655f6c6976655f73637265656ef46c6f7267616e69736174696f6ef66f706172656e745f6772616e745f6964f67073657373696f6e5f73656c6563746f7263616e7974656e7669726f6e6d656e745f73656c6563746f7263616e79",
+      "mode": "direct",
+      "text": "qGRtb2RlZmRpcmVjdGZzZWNyZXRYIHt7e3t7e3t7e3t7e3t7e3t7e3t7e3t7e3t7e3t7e3t7Z3ZlcnNpb24BamV4cGlyZXNfYXQbAAABmrahD8BrZW5kcG9pbnRfaWRYIGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgbWludml0YXRpb25faWRQEREREREREREREREREREREW5uZXR3b3JrX2NvbmZpZ6NqcmVsYXlfdXJsc4F1aHR0cHM6Ly9yZWxheS5rYWxhLnRvcGRpcmVjdF9hZGRyZXNzZXOBbzE5Mi4wLjIuMTo0MTIzNHFkaXNjb3Zlcnlfb3JpZ2luc4BucHJvcG9zZWRfZ3JhbnSnZmV4cGlyeaFiYXShbWV4cGlyZXNfYXRfbXMbAAABmrbO1oBnYWN0aW9uc4Fsc2Vzc2lvbi52aWV3Z2hpc3Rvcnmkbmxvd2VyX2JvdW5kX21z9m9uYW1lZF9hcHByb3ZhbHOAb25hbWVkX3F1ZXN0aW9uc4BzaW5jbHVkZV9saXZlX3NjcmVlbvRsb3JnYW5pc2F0aW9u9m9wYXJlbnRfZ3JhbnRfaWT2cHNlc3Npb25fc2VsZWN0b3JjYW55dGVudmlyb25tZW50X3NlbGVjdG9yY2FueQ"
+    },
+    "version": 1
+  }
+}

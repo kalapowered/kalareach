@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/kr-cbor", "crates/kr-crypto", "crates/kr-plugin-sdk", "crates/kr-protocol"]
+members = [
+    "crates/kr-cbor",
+    "crates/kr-crypto",
+    "crates/kr-pairing",
+    "crates/kr-plugin-sdk",
+    "crates/kr-protocol",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +27,7 @@ hmac = { version = "=0.13.0", features = ["zeroize"] }
 keyring = "=4.2.0"
 kr-cbor = { path = "crates/kr-cbor", version = "=0.1.0" }
 kr-crypto = { path = "crates/kr-crypto", version = "=0.1.0" }
+kr-pairing = { path = "crates/kr-pairing", version = "=0.1.0" }
 kr-protocol = { path = "crates/kr-protocol", version = "=0.1.0" }
 libc = "=0.2.189"
 libsodium-sys-stable = "=1.24.0"

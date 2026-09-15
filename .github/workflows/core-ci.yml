@@ -67,6 +67,9 @@ jobs:
             cargo run --locked -p kr-plugin-sdk --bin kr-plugin-sandbox -- "$package"
           done
 
+      - name: Pairing vectors are current
+        run: cargo run --locked -p kr-pairing --bin kr-pairing-vectors -- --check
+
   typescript:
     name: typescript
     runs-on: ubuntu-24.04

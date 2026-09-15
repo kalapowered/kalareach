@@ -1,0 +1,27 @@
+[package]
+name = "kr-pairing"
+description = "KalaReach pairing: the short-code SPAKE2 and direct QR state machines, their budgets and their transcripts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kr-pairing-vectors"
+path = "src/bin/kr-pairing-vectors.rs"
+
+[dependencies]
+hex.workspace = true
+kr-cbor.workspace = true
+kr-crypto.workspace = true
+kr-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+spake2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

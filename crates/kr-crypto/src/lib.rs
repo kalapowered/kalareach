@@ -119,3 +119,45 @@ pub use crate::error::{CryptoError, Result};
 pub fn initialise() -> Result<()> {
     sodium::initialise()
 }
+
+/// Fills `buffer` from libsodium's random generator.
+///
+/// This is the only randomness in the workspace. Every nonce, key, seed, identifier and code
+/// character comes from here, so a build has one generator to qualify rather than several.
+///
+/// # Errors
+///
+/// Returns an error when libsodium is unavailable.
+pub fn random_bytes(buffer: &mut [u8]) -> Result<()> {
+    sodium::random_bytes(buffer)
+}
+
+/// Returns one uniform random byte.
+///
+/// Rejection sampling needs single bytes; drawing them one at a time keeps the caller's loop
+/// obvious rather than hiding it behind a buffer and an index.
+///
+/// # Errors
+///
+/// Returns an error when libsodium is unavailable.
+pub fn random_byte() -> Result<u8> {
+    let mut byte = [0u8; 1];
+    sodium::random_bytes(&mut byte)?;
+    Ok(byte[0])
+}
+
+/// Overwrites `buffer` with zeroes through libsodium, which the compiler may not elide.
+///
+/// [`secret::Secret`] and [`secret::SecretVec`] do this when they are dropped. This is for the
+/// buffers a caller assembles itself, which the type system cannot see into.
+pub fn zeroise(buffer: &mut [u8]) {
+    sodium::memzero(buffer);
+}
+
+/// Compares two byte strings in constant time.
+///
+/// Different lengths return false without reading either buffer.
+#[must_use]
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    sodium::constant_time_eq(left, right)
+}
