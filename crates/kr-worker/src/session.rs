@@ -757,6 +757,12 @@ impl Session {
         self.framer.set_bracketed_paste(enabled);
     }
 
+    /// Returns whether a bracketed paste has been started and not yet ended.
+    #[must_use]
+    pub const fn paste_open(&self) -> bool {
+        self.framer.paste_open()
+    }
+
     /// Sends the terminal's configured interrupt to the foreground process group.
     ///
     /// It takes the current lease and epoch, accepts no other action, and is not held behind a
@@ -1281,16 +1287,15 @@ impl Session {
             return false;
         }
         // A root shell that ends on its own is a closure like any other: it goes through the same
-        // sequence, so descendants are still stopped and output is still drained. Committing the
-        // record here would skip both.
+        // admission, so the lease is released, a paste the old lease left open is closed and the
+        // input fence moves, and then through the same sequence, so descendants are still stopped
+        // and output is still drained. Committing the record here would skip all of it.
         let reason = if exit.signalled() {
             ClosureReason::RootSignal
         } else {
             ClosureReason::RootExit
         };
-        self.state = SessionState::Closing;
-        self.closing_reason = Some(reason);
-        true
+        self.begin_close(reason).initiated
     }
 
     /// Records that the pseudo-terminal closed, which means the root shell has ended.

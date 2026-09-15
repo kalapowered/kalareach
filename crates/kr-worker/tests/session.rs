@@ -281,3 +281,147 @@ async fn a_slow_attachment_is_resynchronised_and_the_others_keep_receiving() {
     let _ = runtime.state();
     let _ = EnvironmentId::new(Uuid::NIL);
 }
+
+/// Opens a live session with one attachment holding the lease inside an open bracketed paste.
+///
+/// This is the state every closure and detach path has to be able to end cleanly: the application
+/// has been given a paste start, so something has to give it the end, and bytes the previous lease
+/// handed to the writer must not reach the application after that lease is gone.
+async fn mid_paste(
+    host: &kr_ipc::testing::TempHost,
+    mut config: SessionConfig,
+) -> (std::sync::Arc<SessionRuntime>, AttachmentId, u64) {
+    let _ = host;
+    config.shell.arguments = vec!["-c".to_owned(), "exec cat".to_owned()];
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    requested.insert(AttachmentCapability::Geometry);
+    session
+        .attach(&terminal_attachment(session_id), requested, attachment_id)
+        .expect("attaches");
+    session
+        .acquire_input(attachment_id, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("takes the lease");
+    let epoch = session.lease().epoch.get();
+    // The application has turned bracketed paste on, and a paste has started.
+    session.set_bracketed_paste(true);
+    session
+        .write_input(
+            attachment_id,
+            epoch,
+            0,
+            b"\x1b[200~pasted",
+            std::time::Instant::now(),
+        )
+        .expect("writes the start of a paste");
+    assert!(session.paste_open(), "the application is inside a paste");
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    runtime.flush_input();
+    (runtime, attachment_id, epoch)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detaching_mid_paste_publishes_the_fence_and_closes_the_paste() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "exec cat");
+    let (runtime, attachment_id, epoch) = mid_paste(&host, config).await;
+
+    {
+        let mut session = runtime.session();
+        session.detach(attachment_id).expect("detaches");
+        runtime.flush_locked(&mut session);
+    }
+    let session = runtime.session();
+    assert!(!session.paste_open(), "the detach closed the open paste");
+    assert!(
+        session.input_fence() > epoch,
+        "and released the lease the attachment held"
+    );
+    assert_eq!(
+        runtime.input_fence(),
+        session.input_fence(),
+        "the writer is comparing against the fence the detach moved"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_root_shell_that_exits_mid_paste_publishes_the_fence_and_closes_the_paste() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "exec cat");
+    let (runtime, attachment_id, epoch) = mid_paste(&host, config).await;
+
+    // End of transmission at a `cat` reading a terminal ends the shell, which is the root-exit
+    // closure path: nothing asked for it, so nothing else is going to publish the fence.
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(
+                attachment_id,
+                epoch,
+                1,
+                b"\n\x04\x04",
+                std::time::Instant::now(),
+            )
+            .expect("writes end of transmission");
+        runtime.flush_locked(&mut session);
+    }
+    let record = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed())
+        .await
+        .expect("the session closes when its root shell exits");
+    assert!(matches!(
+        record.reason,
+        ClosureReason::RootExit | ClosureReason::RootSignal
+    ));
+    let session = runtime.session();
+    assert!(
+        !session.paste_open(),
+        "the root-exit closure closed the open paste"
+    );
+    assert!(
+        session.input_fence() > epoch,
+        "and released the lease the attachment held"
+    );
+    assert_eq!(
+        runtime.input_fence(),
+        session.input_fence(),
+        "the writer is comparing against the fence the closure moved"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_desktop_that_ends_mid_paste_publishes_the_fence_and_closes_the_paste() {
+    let host = kr_ipc::testing::TempHost::create();
+    let mut config = configuration(&host, "exec cat");
+    // A desktop-bound worker whose login is not the one this host is in. Section 7 ends such a
+    // session with `desktop_lost`, and nothing asked for that closure either.
+    config.worker_profile = WorkerProfile::DesktopBound;
+    config.desktop = DesktopBinding {
+        desktop_session_id: Nullable::null(),
+        login_generation: Nullable::some(kr_protocol::scalars::U64::new(u64::MAX)),
+    };
+    let (runtime, _attachment_id, epoch) = mid_paste(&host, config).await;
+
+    let record = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed())
+        .await
+        .expect("the session closes when its desktop ends");
+    assert_eq!(record.reason, ClosureReason::DesktopLost);
+    let session = runtime.session();
+    assert!(
+        !session.paste_open(),
+        "the desktop-loss closure closed the open paste"
+    );
+    assert!(
+        session.input_fence() > epoch,
+        "and released the lease the attachment held"
+    );
+    assert_eq!(
+        runtime.input_fence(),
+        session.input_fence(),
+        "the writer is comparing against the fence the closure moved"
+    );
+}

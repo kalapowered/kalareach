@@ -194,6 +194,18 @@ impl SessionRuntime {
         let monitor_wake = Arc::clone(&wake);
         let monitor_fence = Arc::clone(&fence);
         tokio::spawn(async move {
+            // The monitor holds a runtime of its own so a closure it begins publishes its fence and
+            // its paste terminator the same way a requested one does. Building it only once the
+            // closure had started would leave those inside the session until something else
+            // flushed, and a desktop that has gone or a shell that has exited is exactly when
+            // nothing else is going to.
+            let runtime = Arc::new(SessionRuntime {
+                session: Arc::clone(&monitor_session),
+                input: monitor_input.clone(),
+                wake: Arc::clone(&monitor_wake),
+                closed: Arc::clone(&monitor_closed),
+                fence: Arc::clone(&monitor_fence),
+            });
             let mut next_observation = Instant::now();
             loop {
                 tokio::time::sleep(CHILD_POLL_INTERVAL).await;
@@ -215,25 +227,24 @@ impl SessionRuntime {
                     }
                     // A desktop-bound session belongs to one login. When that login ends the
                     // session ends with it, with the reason that says so.
-                    if session.desktop_lost() {
+                    let initiated = if session.desktop_lost() {
                         session.begin_close(ClosureReason::DesktopLost).initiated
                     } else {
                         session.poll_root_exit()
+                    };
+                    if initiated {
+                        // Admission released the lease and may have produced a paste terminator.
+                        // Both reach the writer here, under the lock that admitted the closure.
+                        runtime.flush_locked(&mut session);
                     }
+                    initiated
                 };
                 if initiated {
                     // A root shell that ended on its own goes through the same sequence a
                     // requested close does, so descendants are still stopped and output is still
                     // drained before the record is written.
-                    let runtime = SessionRuntime {
-                        session: Arc::clone(&monitor_session),
-                        input: monitor_input.clone(),
-                        wake: Arc::clone(&monitor_wake),
-                        closed: Arc::clone(&monitor_closed),
-                        fence: Arc::clone(&monitor_fence),
-                    };
                     CloseGate {
-                        runtime: Arc::new(runtime),
+                        runtime: Arc::clone(&runtime),
                         initiated: true,
                     }
                     .release();
@@ -373,6 +384,15 @@ impl SessionRuntime {
     #[must_use]
     pub fn state(&self) -> SessionState {
         self.session().state()
+    }
+
+    /// Returns the lease epoch the writer is comparing every queued batch against.
+    ///
+    /// It is the published half of [`Session::input_fence`]: a lease change that has not reached
+    /// here is a change bytes already handed to the writer do not know about yet.
+    #[must_use]
+    pub fn input_fence(&self) -> u64 {
+        self.fence.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

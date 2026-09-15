@@ -1828,12 +1828,15 @@ impl WorkerService {
             }
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(params)?;
-                let result = session.detach(params.attachment_id)?;
+                let outcome = session.detach(params.attachment_id);
                 // Detaching releases the lease, which moves the input fence, and can produce the
-                // terminator of a paste the attachment had open. Both are published here: a fence
-                // that stayed in the session would let bytes already handed to the writer reach the
-                // application after the attachment that sent them had gone.
+                // terminator of a paste the attachment had open. Both are published here, *before*
+                // the result is looked at: the lease has already moved whether or not the geometry
+                // succession that follows it succeeded, and a fence that stayed in the session
+                // would let bytes already handed to the writer reach the application after the
+                // attachment that sent them had gone.
                 self.runtime.flush_locked(session);
+                let result = outcome?;
                 state.remove_attachment(params.attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
             }
