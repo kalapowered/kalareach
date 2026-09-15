@@ -552,6 +552,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-time"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30ea3c9d71d3a9c14cfc2b375747139549d6d9776cdd7b1e21aa088252941c9d"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2456,6 +2466,7 @@ dependencies = [
 name = "kr-transport"
 version = "0.1.0"
 dependencies = [
+ "boot-time",
  "iroh",
  "iroh-mainline-address-lookup",
  "iroh-mdns-address-lookup",

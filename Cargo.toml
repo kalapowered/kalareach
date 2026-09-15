@@ -20,6 +20,7 @@ publish = false
 
 [workspace.dependencies]
 base64 = "=0.23.1"
+boot-time = "=0.1.3"
 cap-fs-ext = "=4.0.3"
 cap-std = "=4.0.3"
 ciborium = "=0.2.2"

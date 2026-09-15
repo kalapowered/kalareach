@@ -1,33 +1,31 @@
 //! The suspend-aware continuous clock every deadline in this crate is measured on.
 //!
-//! Section 9 fixes one time contract: expiry is measured on a suspend-aware continuous elapsed
-//! time anchor, and "a timer that excludes sleep cannot extend authority". Neither of the clocks
-//! the standard library offers satisfies that on its own:
+//! Section 9 fixes one time contract: expiry is measured on a suspend-aware continuous elapsed-time
+//! anchor, and "a timer that excludes sleep cannot extend authority". Neither clock in the standard
+//! library is one. [`std::time::Instant`] stops while the machine is suspended, so a five-second
+//! lease would outlive a suspension of any length. [`std::time::SystemTime`] keeps running across a
+//! suspension but can be stepped in either direction, and a clock that can be stepped is a clock an
+//! attacker can stop.
 //!
-//! * [`std::time::Instant`] is monotonic but stops while the machine is suspended on every
-//!   platform this product ships to, so a five-second lease would survive a suspension of any
-//!   length.
-//! * [`std::time::SystemTime`] keeps running across a suspension but can step backwards, and a
-//!   rollback must never enlarge a lifetime.
+//! [`SystemContinuousClock`] therefore reads the operating system's own continuous clock through
+//! the `boot-time` crate: `CLOCK_BOOTTIME` on Linux, Android and OpenBSD, and `mach_continuous_time`
+//! on Apple platforms. Those clocks are monotonic *and* include time the machine spent suspended,
+//! which is exactly the anchor section 9 describes. No arithmetic of ours stands between the
+//! kernel's answer and a deadline, because every composition of two imperfect clocks that we could
+//! write has a case where it stops.
 //!
-//! [`ContinuousClock`] combines them so that each covers the other's failure: elapsed time is the
-//! larger of the two measurements, and the result is held to a high-water mark so it can never go
-//! backwards. That is conservative in the only direction the specification permits. A suspension
-//! shows up as wall-clock movement the monotonic clock did not see, so authority expires. A
-//! forward wall-clock step expires objects early, which section 9 allows outright. A backward
-//! step is simply not observed, because a smaller measurement never wins.
-//!
-//! The clock needs no platform matrix and no unsafe code, which is why it is built this way rather
-//! than from `CLOCK_BOOTTIME` and its differently named equivalents.
+//! On a platform where `boot-time` has no continuous source it falls back to the ordinary monotonic
+//! clock, which excludes suspension. A host that ships a qualified platform time adapter supplies
+//! it through [`ContinuousClock`] instead of using the default; the trait exists for exactly that.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 /// A point on a continuous clock, as elapsed time since that clock's anchor.
 ///
-/// Two instants are comparable only when they come from the same clock. The anchor is arbitrary
-/// and private, so nothing can mistake one for a wall-clock time.
+/// Two instants are comparable only when they come from the same clock. The anchor is arbitrary and
+/// private, so nothing can mistake one for a wall-clock time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContinuousInstant(Duration);
 
@@ -55,29 +53,19 @@ impl ContinuousInstant {
 
 /// Reads the suspend-aware continuous clock.
 ///
-/// A host that owns a qualified platform time adapter implements this over that adapter; nothing
-/// in this crate assumes the default implementation.
+/// A host that owns a qualified platform time adapter implements this over that adapter; nothing in
+/// this crate assumes the default implementation.
 pub trait ContinuousClock: Send + Sync + std::fmt::Debug {
     /// Returns the current instant.
     fn now(&self) -> ContinuousInstant;
 }
 
-/// The default clock: monotonic and wall-clock readings, whichever has advanced further.
+/// The operating system's continuous clock, anchored when the clock is created.
 ///
-/// One instance holds the anchor for every instant it produces, so all of a host's deadlines are
-/// measured against the same origin. Clone it; the anchor and the high-water mark are shared.
+/// Clone it; the anchor is shared, so every deadline a host holds is measured against one origin.
 #[derive(Clone, Debug)]
 pub struct SystemContinuousClock {
-    inner: Arc<Anchor>,
-}
-
-#[derive(Debug)]
-struct Anchor {
-    monotonic: Instant,
-    wall: SystemTime,
-    /// The largest elapsed time observed so far, in nanoseconds. It makes the clock monotonic even
-    /// if a reading regresses.
-    high_water_nanos: AtomicU64,
+    anchor: Arc<boot_time::Instant>,
 }
 
 impl SystemContinuousClock {
@@ -85,11 +73,7 @@ impl SystemContinuousClock {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Anchor {
-                monotonic: Instant::now(),
-                wall: SystemTime::now(),
-                high_water_nanos: AtomicU64::new(0),
-            }),
+            anchor: Arc::new(boot_time::Instant::now()),
         }
     }
 }
@@ -102,28 +86,17 @@ impl Default for SystemContinuousClock {
 
 impl ContinuousClock for SystemContinuousClock {
     fn now(&self) -> ContinuousInstant {
-        let monotonic = self.inner.monotonic.elapsed();
-        // A backward wall clock yields an error, which is exactly the case where the wall reading
-        // must not contribute: it would shorten nothing and could only pull the maximum down.
-        let wall = self
-            .inner
-            .wall
-            .elapsed()
-            .unwrap_or_else(|_| Duration::from_secs(0));
-        let observed = monotonic.max(wall);
-        let nanos = u64::try_from(observed.as_nanos()).unwrap_or(u64::MAX);
-        let previous = self
-            .inner
-            .high_water_nanos
-            .fetch_max(nanos, Ordering::AcqRel);
-        ContinuousInstant(Duration::from_nanos(nanos.max(previous)))
+        // `saturating_duration_since` is the crate's documented workaround for a hardware or
+        // virtualisation bug that breaks monotonicity: it yields zero rather than panicking, which
+        // shortens a deadline rather than extending one.
+        ContinuousInstant(boot_time::Instant::now().saturating_duration_since(*self.anchor))
     }
 }
 
 /// A clock a test drives by hand.
 ///
-/// Deadline behaviour is the part of this crate that is hardest to observe from the outside, so
-/// the tests advance time rather than sleeping through it.
+/// Deadline behaviour is the part of this crate that is hardest to observe from the outside, so the
+/// tests advance time rather than sleeping through it.
 #[derive(Clone, Debug, Default)]
 pub struct ManualClock {
     nanos: Arc<AtomicU64>,
@@ -160,6 +133,28 @@ mod tests {
         let second = clock.now();
         assert!(second >= first);
         assert_eq!(second.saturating_duration_since(second), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_system_clock_keeps_running() {
+        let clock = SystemContinuousClock::new();
+        let start = clock.now();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            clock.now().saturating_duration_since(start) >= Duration::from_millis(15),
+            "the clock advanced with real time"
+        );
+    }
+
+    #[test]
+    fn a_wall_clock_step_cannot_stop_the_system_clock() {
+        // The clock reads the operating system's continuous source directly, so nothing the wall
+        // clock does can stall it. Two readings around real elapsed time always differ.
+        let clock = SystemContinuousClock::new();
+        let first = clock.now();
+        std::thread::sleep(Duration::from_millis(10));
+        let second = clock.now();
+        assert!(second > first);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use kr_protocol::ids::InstallationId;
+use kr_protocol::scalars::EndpointKey;
 
 use crate::error::{ClientError, Result};
 
@@ -31,6 +32,36 @@ pub struct AccountSession {
     pub expires_in_seconds: u64,
 }
 
+/// Which way a relay lease permits traffic to flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayDirection {
+    /// From the source endpoint to the destination endpoint only.
+    SourceToDestination,
+    /// Both ways between the two endpoints.
+    Bidirectional,
+}
+
+/// What a client asks the service to lease.
+///
+/// Section 17: before forwarding a peer payload the relay must possess a current signed capability
+/// binding the source and destination endpoint keys, the direction, the payer principal and its
+/// authorisation, the lease and reservation identities, a byte ceiling, an expiry, the relay scope,
+/// the issuer key and a revision. The client's half of that is everything below; the signature and
+/// the revision are the service's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayLeaseRequest {
+    /// The endpoint the traffic comes from.
+    pub source: EndpointKey,
+    /// The endpoint the traffic goes to.
+    pub destination: EndpointKey,
+    /// Which way the lease permits traffic to flow.
+    pub direction: RelayDirection,
+    /// The bytes the payer is asking to reserve.
+    pub byte_ceiling: u64,
+    /// The relay scope the lease is for, as the service names it.
+    pub relay_scope: String,
+}
+
 /// A relay lease the payer installed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelayLeaseHandle {
@@ -39,8 +70,14 @@ pub struct RelayLeaseHandle {
     /// Opaque here on purpose: the signed lease object is the relay's contract with the service,
     /// and a client only has to name the lease it obtained.
     pub lease_id: String,
+    /// The reservation this lease draws its bytes from.
+    pub reservation_id: String,
     /// The byte ceiling the lease reserved.
     pub byte_ceiling: u64,
+    /// The relay scope the lease covers.
+    pub relay_scope: String,
+    /// When the lease stops being valid, in UTC milliseconds.
+    pub expires_at_ms: u64,
 }
 
 /// A push registration.
@@ -67,7 +104,7 @@ pub trait AccountService: Send + Sync + std::fmt::Debug {
 /// admission alone never authorises peer traffic or billing.
 pub trait RelayLeaseService: Send + Sync + std::fmt::Debug {
     /// Obtains a lease for a pair of endpoints.
-    fn issue(&self, requested_bytes: u64) -> ServiceFuture<'_, RelayLeaseHandle>;
+    fn issue<'a>(&'a self, request: &'a RelayLeaseRequest) -> ServiceFuture<'a, RelayLeaseHandle>;
 
     /// Releases a lease early.
     fn release<'a>(&'a self, lease_id: &'a str) -> ServiceFuture<'a, ()>;
@@ -172,7 +209,7 @@ impl AccountService for NullService {
 }
 
 impl RelayLeaseService for NullService {
-    fn issue(&self, _requested_bytes: u64) -> ServiceFuture<'_, RelayLeaseHandle> {
+    fn issue<'a>(&'a self, _request: &'a RelayLeaseRequest) -> ServiceFuture<'a, RelayLeaseHandle> {
         unconfigured("relay leases")
     }
 
@@ -230,8 +267,15 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::HostNotConfigured);
         assert!(error.to_string().contains("account login"));
 
+        let request = RelayLeaseRequest {
+            source: EndpointKey::from_bytes([1; 32]),
+            destination: EndpointKey::from_bytes([2; 32]),
+            direction: RelayDirection::Bidirectional,
+            byte_ceiling: 8 * 1024 * 1024,
+            relay_scope: "eu-west".to_owned(),
+        };
         let error = NullService
-            .issue(1024)
+            .issue(&request)
             .await
             .expect_err("nothing is configured");
         assert!(error.to_string().contains("relay leases"));

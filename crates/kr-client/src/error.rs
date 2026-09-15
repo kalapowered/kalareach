@@ -48,6 +48,16 @@ pub enum ClientError {
     /// The connection ended before the request was answered.
     #[error("the connection ended before the request was answered")]
     ConnectionEnded,
+    /// The connection ended after a mutation was sent, so its outcome is unknown.
+    ///
+    /// The action identifier is named because section 9 forbids dispatching it again: the client
+    /// asks the host what became of this action, and shows the user that the outcome is uncertain.
+    /// It never submits the same intent under a new identifier to find out.
+    #[error("the outcome of action {action_id} is unknown: the connection ended after it was sent")]
+    SubmissionUncertain {
+        /// The action whose outcome is unknown.
+        action_id: kr_protocol::ids::ActionId,
+    },
     /// The host requires a fresh snapshot before it will serve this stream again.
     #[error("the host requires a resynchronisation")]
     ResyncRequired,
@@ -69,6 +79,7 @@ impl ClientError {
                 ErrorCode::ResourceUnavailable
             }
             Self::ConnectionEnded => ErrorCode::ResourceUnavailable,
+            Self::SubmissionUncertain { .. } => ErrorCode::OutcomeUnknown,
             Self::ResyncRequired => ErrorCode::ResyncRequired,
             Self::ServiceNotConfigured(_) => ErrorCode::HostNotConfigured,
         }

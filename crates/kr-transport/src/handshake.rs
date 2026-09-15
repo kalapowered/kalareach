@@ -46,7 +46,7 @@ use kr_protocol::hello::{
 use kr_protocol::ids::{
     BootEpoch, BuildId, CapabilityId, ClockEpoch, ConnectionId, DeviceId, DeviceKeyRevision,
 };
-use kr_protocol::scalars::{CanonicalSet, Digest256, EndpointKey};
+use kr_protocol::scalars::{CanonicalSet, Digest256, EndpointKey, Nonce256};
 
 use crate::codec::{FrameReader, FrameWriter};
 use crate::error::{Result, TransportError};
@@ -225,15 +225,44 @@ pub async fn accept(
         .accept_bi()
         .await
         .map_err(|error| TransportError::Stream(error.to_string()))?;
+    let early_data = recv.is_0rtt();
+    accept_on(
+        connection, send, recv, early_data, identity, epochs, directory, challenges, windows,
+    )
+    .await
+}
+
+/// Runs the host side of the handshake on a stream the caller already accepted.
+///
+/// A host that wants an accurate `early_data` answer has to accept the first stream itself, because
+/// QUIC marks a stream as early data only when it is accepted while the handshake is still running.
+/// [`crate::listener`] does exactly that and passes the result here.
+///
+/// # Errors
+///
+/// As [`accept`].
+#[allow(clippy::too_many_arguments)]
+pub async fn accept_on(
+    connection: &Connection,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    early_data: bool,
+    identity: &LocalIdentity,
+    epochs: HostEpochs,
+    directory: &dyn PairedDirectory,
+    challenges: &Arc<tokio::sync::Mutex<ChallengeLedger>>,
+    windows: &ActionWindowIssuer,
+) -> Result<Admitted> {
     let mut writer = FrameWriter::new(send, StreamKind::Control);
     let mut reader = FrameReader::new(recv, StreamKind::Control);
-    let early_data = reader.is_zero_rtt();
     writer.set_priority(crate::scheduler::priority_of(StreamKind::Control));
 
     let peer_endpoint_id = remote_endpoint_key(connection)?;
 
+    // The offer is small and arrives before anything about the peer has been established, so it is
+    // read under a much tighter bound than the control stream's.
     let offer: ClientOffer = reader
-        .read_message()
+        .read_message_within(MAX_OFFER_LEN)
         .await?
         .ok_or_else(|| TransportError::handshake(ErrorCode::InvalidArgument, "no offer arrived"))?;
 
@@ -245,7 +274,7 @@ pub async fn accept(
                 writer
                     .write_message(&HelloReply::Refused(error.clone()))
                     .await?;
-                let _ = writer.finish();
+                writer.finish_and_flush(REFUSAL_FLUSH).await;
                 return Err(TransportError::Handshake(error));
             }
         };
@@ -266,11 +295,13 @@ pub async fn accept(
         clock_epoch: epochs.clock_epoch,
     };
 
-    if early_data && directory.paired_peer(&peer_endpoint_id).is_some() {
+    let paired = directory.paired_peer(&peer_endpoint_id);
+
+    if early_data && paired.is_some() {
         // Section 23: reject early data for everything except the bounded pre-authorisation
-        // pairing surface. An authorised connection is not that surface, so a handshake stream
-        // that carried early data never becomes one. Nothing is lost: this build's client opens
-        // its control stream after the handshake completes.
+        // pairing surface. An authorised connection is not that surface, so a handshake stream that
+        // carried early data never becomes one. Nothing is lost: this build's client cannot offer
+        // 0-RTT, because its endpoint keeps no session tickets.
         let error = ProtocolError::new(
             ErrorCode::PermissionDenied,
             "early data is not accepted on an authorised connection",
@@ -278,11 +309,11 @@ pub async fn accept(
         writer
             .write_message(&HelloReply::Refused(error.clone()))
             .await?;
-        let _ = writer.finish();
+        writer.finish_and_flush(REFUSAL_FLUSH).await;
         return Err(TransportError::Handshake(error));
     }
 
-    let Some(paired) = directory.paired_peer(&peer_endpoint_id) else {
+    let Some(paired) = paired else {
         // An unpaired endpoint still learns the framing and the selected version: without them it
         // could not speak to the pairing surface at all. It never sees a proof exchange, so it
         // never becomes an authorised connection by any path through this function.
@@ -299,7 +330,10 @@ pub async fn accept(
         })));
     };
 
-    challenges.lock().await.issue(&host_nonce)?;
+    // The challenge is held by a guard from here on. Every path out of this function that does not
+    // consume it abandons it, including one that never reaches the proof at all: a ledger that
+    // filled up with challenges nobody signed would stop the host accepting paired connections.
+    let mut challenge = Challenge::issue(Arc::clone(challenges), host_nonce).await?;
     writer
         .write_message(&HelloReply::Selected(Box::new(selection.clone())))
         .await?;
@@ -311,13 +345,17 @@ pub async fn accept(
         identity,
         &paired,
         &peer_endpoint_id,
-        challenges,
+        directory,
+        &mut challenge,
         windows,
     )
     .await;
 
     match outcome {
         Ok((digest, accepted)) => {
+            let negotiated = usize::try_from(selection.limits.max_control_frame_len.get())
+                .unwrap_or(usize::MAX)
+                .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN);
             writer
                 .write_message(&ConnectReply::Accepted(Box::new(accepted.clone())))
                 .await?;
@@ -329,17 +367,74 @@ pub async fn accept(
                 offer,
                 selection,
                 action_window: accepted.action_window,
-                control_writer: writer,
-                control_reader: reader,
+                // From here the negotiated bound applies in both directions, not just the stream
+                // kind's ceiling: a peer that said it could receive less is held to what it said.
+                control_writer: writer.with_max_payload(negotiated),
+                control_reader: reader.with_max_payload(negotiated),
             })))
         }
         Err(error) => {
-            challenges.lock().await.abandon(&host_nonce);
+            challenge.abandon().await;
             writer
                 .write_message(&ConnectReply::Refused(error.to_protocol_error()))
                 .await?;
-            let _ = writer.finish();
+            writer.finish_and_flush(REFUSAL_FLUSH).await;
             Err(error)
+        }
+    }
+}
+
+/// How long a refusal waits to be acknowledged before the connection is let go.
+const REFUSAL_FLUSH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The largest `hello` offer this host will read, in bytes.
+///
+/// An offer carries a version list, a build identity, two identifiers, a capability set, five
+/// limits and a nonce. Sixteen kibibytes is generous for that and far below the control bound,
+/// which matters because the offer arrives before anything about the peer is established.
+pub const MAX_OFFER_LEN: usize = 16 * 1024;
+
+/// One issued connection challenge, released on every path that does not consume it.
+#[derive(Debug)]
+struct Challenge {
+    ledger: Arc<tokio::sync::Mutex<ChallengeLedger>>,
+    nonce: Nonce256,
+    outstanding: bool,
+}
+
+impl Challenge {
+    async fn issue(
+        ledger: Arc<tokio::sync::Mutex<ChallengeLedger>>,
+        nonce: Nonce256,
+    ) -> Result<Self> {
+        ledger.lock().await.issue(&nonce)?;
+        Ok(Self {
+            ledger,
+            nonce,
+            outstanding: true,
+        })
+    }
+
+    /// Frees the challenge without recording it as used.
+    async fn abandon(&mut self) {
+        if self.outstanding {
+            self.outstanding = false;
+            self.ledger.lock().await.abandon(&self.nonce);
+        }
+    }
+}
+
+impl Drop for Challenge {
+    fn drop(&mut self) {
+        if self.outstanding {
+            // A cancelled handshake cannot await, so the entry is released without the lock's
+            // asynchronous path. `try_lock` fails only while another task holds the ledger, and
+            // that task is itself about to finish with it; a challenge that survives here is
+            // bounded by the ledger's own limit and can never be presented, because it was never
+            // sent to a peer that could sign it.
+            if let Ok(mut ledger) = self.ledger.try_lock() {
+                ledger.abandon(&self.nonce);
+            }
         }
     }
 }
@@ -352,12 +447,32 @@ async fn admit_paired_peer(
     identity: &LocalIdentity,
     paired: &PairedPeer,
     peer_endpoint_id: &EndpointKey,
-    challenges: &Arc<tokio::sync::Mutex<ChallengeLedger>>,
+    directory: &dyn PairedDirectory,
+    challenge: &mut Challenge,
     windows: &ActionWindowIssuer,
 ) -> Result<(Digest256, ConnectAccepted)> {
-    let client_proof: ConnectProof = reader.read_message().await?.ok_or_else(|| {
-        TransportError::handshake(ErrorCode::PermissionDenied, "no connection proof arrived")
+    let client_proof: ConnectProof = reader
+        .read_message_within(MAX_OFFER_LEN)
+        .await?
+        .ok_or_else(|| {
+            TransportError::handshake(ErrorCode::PermissionDenied, "no connection proof arrived")
+        })?;
+
+    // The paired record is read again now, not only before the wait. A device revoked, or a key
+    // rotated, while this handshake was waiting for its proof must not be admitted under the record
+    // that was current when the wait began.
+    let current = directory.paired_peer(peer_endpoint_id).ok_or_else(|| {
+        TransportError::handshake(
+            ErrorCode::PermissionDenied,
+            "the paired record was withdrawn during the handshake",
+        )
     })?;
+    if &current != paired {
+        return Err(TransportError::handshake(
+            ErrorCode::PermissionDenied,
+            "the paired record changed during the handshake",
+        ));
+    }
 
     // The host's own proof over the same transcript. It is produced before verification only
     // because both signatures are needed to check the pair; it is sent afterwards, and only if the
@@ -376,8 +491,8 @@ async fn admit_paired_peer(
     let local = identity.as_paired_peer();
 
     let digest = {
-        let mut ledger = challenges.lock().await;
-        kr_crypto::connect::verify_connect_once(
+        let mut ledger = challenge.ledger.lock().await;
+        let outcome = kr_crypto::connect::verify_connect_once(
             &mut ledger,
             &selection.host_nonce,
             offer,
@@ -387,7 +502,12 @@ async fn admit_paired_peer(
             peer_endpoint_id,
             &identity.endpoint_id,
             &proofs,
-        )?
+        );
+        if outcome.is_ok() {
+            // The ledger consumed it, so the guard has nothing left to release.
+            challenge.outstanding = false;
+        }
+        outcome?
     };
 
     let action_window = windows.issue(selection.connection_id, selection.boot_epoch)?;
@@ -434,9 +554,12 @@ pub async fn connect(
     };
     writer.write_message(&offer).await?;
 
-    let reply: HelloReply = reader.read_message().await?.ok_or_else(|| {
-        TransportError::handshake(ErrorCode::ResourceUnavailable, "the host sent no reply")
-    })?;
+    let reply: HelloReply = reader
+        .read_message_within(MAX_OFFER_LEN)
+        .await?
+        .ok_or_else(|| {
+            TransportError::handshake(ErrorCode::ResourceUnavailable, "the host sent no reply")
+        })?;
     let selection = match reply {
         HelloReply::Selected(selection) => *selection,
         HelloReply::Refused(error) => return Err(TransportError::Handshake(error)),
@@ -455,9 +578,12 @@ pub async fn connect(
         })
         .await?;
 
-    let reply: ConnectReply = reader.read_message().await?.ok_or_else(|| {
-        TransportError::handshake(ErrorCode::PermissionDenied, "the host sent no proof")
-    })?;
+    let reply: ConnectReply = reader
+        .read_message_within(MAX_OFFER_LEN)
+        .await?
+        .ok_or_else(|| {
+            TransportError::handshake(ErrorCode::PermissionDenied, "the host sent no proof")
+        })?;
     let accepted = match reply {
         ConnectReply::Accepted(accepted) => *accepted,
         ConnectReply::Refused(error) => return Err(TransportError::Handshake(error)),
@@ -487,6 +613,9 @@ pub async fn connect(
         ));
     }
 
+    let negotiated = usize::try_from(selection.limits.max_control_frame_len.get())
+        .unwrap_or(usize::MAX)
+        .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN);
     Ok(AuthorisedConnection {
         connection_id: selection.connection_id,
         peer_device_id: host_record.device_id,
@@ -495,8 +624,8 @@ pub async fn connect(
         offer,
         selection,
         action_window: accepted.action_window,
-        control_writer: writer,
-        control_reader: reader,
+        control_writer: writer.with_max_payload(negotiated),
+        control_reader: reader.with_max_payload(negotiated),
     })
 }
 

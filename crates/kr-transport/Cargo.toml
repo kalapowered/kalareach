@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+boot-time.workspace = true
 iroh.workspace = true
 iroh-mainline-address-lookup.workspace = true
 iroh-mdns-address-lookup.workspace = true

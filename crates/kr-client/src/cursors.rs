@@ -112,6 +112,14 @@ pub enum RestorationStep {
     Live,
 }
 
+/// A restoration step taken out of order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the stream is at {step:?} and cannot take that step")]
+pub struct OutOfOrder {
+    /// The step the stream is actually at.
+    pub step: RestorationStep,
+}
+
 /// Drives one stream through the restoration order.
 #[derive(Clone, Debug)]
 pub struct Restoration {
@@ -143,13 +151,34 @@ impl Restoration {
     }
 
     /// Records that the subscription succeeded.
-    pub fn subscribed(&mut self) {
-        self.step = RestorationStep::InstallSnapshot;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutOfOrder`] when the stream is not waiting to subscribe.
+    pub fn subscribed(&mut self) -> std::result::Result<(), OutOfOrder> {
+        match self.step {
+            RestorationStep::SubscribeFrom(_) | RestorationStep::SubscribeFromStart => {
+                self.step = RestorationStep::InstallSnapshot;
+                Ok(())
+            }
+            step => Err(OutOfOrder { step }),
+        }
     }
 
     /// Records that the snapshot was installed.
-    pub fn installed(&mut self) {
-        self.step = RestorationStep::Live;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutOfOrder`] when the stream has not subscribed yet. Section 8 requires the
+    /// subscription first: installing a snapshot before subscribing loses every event in between,
+    /// and the mistake is invisible until a user sees a stale screen.
+    pub fn installed(&mut self) -> std::result::Result<(), OutOfOrder> {
+        if self.step == RestorationStep::InstallSnapshot {
+            self.step = RestorationStep::Live;
+            Ok(())
+        } else {
+            Err(OutOfOrder { step: self.step })
+        }
     }
 
     /// Records that the host required a resynchronisation.
@@ -293,9 +322,15 @@ mod tests {
             restoration.step(),
             RestorationStep::SubscribeFrom(EventSequence::new(7))
         );
-        restoration.subscribed();
+        // A snapshot cannot be installed before the subscription: that order loses every event in
+        // between, so the type refuses it rather than leaving it to a comment.
+        assert!(restoration.installed().is_err());
+        restoration
+            .subscribed()
+            .expect("the subscription succeeded");
         assert_eq!(restoration.step(), RestorationStep::InstallSnapshot);
-        restoration.installed();
+        assert!(restoration.subscribed().is_err(), "and it subscribes once");
+        restoration.installed().expect("the snapshot was installed");
         assert!(restoration.is_live());
     }
 
@@ -312,7 +347,9 @@ mod tests {
         let stream_id = stream("session:1");
         cursors.accept(&event(&stream_id, 7));
         let mut restoration = Restoration::start(stream_id.clone(), &cursors);
-        restoration.subscribed();
+        restoration
+            .subscribed()
+            .expect("the subscription succeeded");
 
         restoration.resynchronise(&mut cursors);
         assert_eq!(restoration.step(), RestorationStep::SubscribeFromStart);

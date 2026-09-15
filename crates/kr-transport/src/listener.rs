@@ -30,7 +30,7 @@ use crate::clock::{ContinuousClock, SystemContinuousClock};
 use crate::codec::{FrameReader, FrameWriter};
 use crate::config::EndpointConfig;
 use crate::endpoint::{KEEPALIVE, bind_listener};
-use crate::error::Result;
+use crate::error::{Result, TransportError};
 use crate::handshake::{Admitted, HostEpochs, LocalIdentity, PairedDirectory};
 use crate::preauth::{PairingSurface, PreAuthLimits};
 use crate::scheduler::{BulkLimits, StreamBudget};
@@ -67,6 +67,10 @@ pub struct ListenerConfig {
     pub max_outstanding_challenges: usize,
     /// How often the host sends a control-stream keepalive.
     pub keepalive: Duration,
+    /// How long a connection has to finish its handshake and its pairing exchange.
+    pub handshake_deadline: Duration,
+    /// How many connections may be mid-handshake or unpaired at once, across the whole host.
+    pub max_unauthorised_connections: usize,
 }
 
 impl ListenerConfig {
@@ -86,9 +90,25 @@ impl ListenerConfig {
             action_window_validity: MAX_WINDOW_VALIDITY,
             max_outstanding_challenges: DEFAULT_MAX_OUTSTANDING_CHALLENGES,
             keepalive: KEEPALIVE,
+            handshake_deadline: DEFAULT_HANDSHAKE_DEADLINE,
+            max_unauthorised_connections: DEFAULT_MAX_UNAUTHORISED_CONNECTIONS,
         }
     }
 }
+
+/// How long an unauthorised connection may stay open.
+///
+/// A handshake is four frames and a pairing exchange is a handful more, so a minute is generous.
+/// The deadline exists because QUIC keepalives would otherwise hold an incomplete handshake open
+/// indefinitely, and an incomplete handshake costs the host a task and an admission slot.
+pub const DEFAULT_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How many connections may be mid-handshake or unpaired at once.
+///
+/// A configurable resource limit. It bounds what an endpoint can cost the host before it has proved
+/// anything, which is what a per-connection budget alone cannot do: reconnecting resets a
+/// per-connection budget, and this does not.
+pub const DEFAULT_MAX_UNAUTHORISED_CONNECTIONS: usize = 64;
 
 /// What the host supplies.
 ///
@@ -282,6 +302,9 @@ pub async fn register_with_clock<H: HostHandler>(
         config.max_outstanding_challenges,
     )));
 
+    let admission = Arc::new(tokio::sync::Semaphore::new(
+        config.max_unauthorised_connections.max(1),
+    ));
     let accept_loop = tokio::spawn(accept_loop(AcceptLoop {
         endpoint: endpoint.clone(),
         config: Arc::new(config),
@@ -290,6 +313,7 @@ pub async fn register_with_clock<H: HostHandler>(
         clock,
         windows: Arc::clone(&windows),
         challenges,
+        admission,
     }));
 
     Ok(NetworkListener {
@@ -307,10 +331,37 @@ struct AcceptLoop<H: HostHandler> {
     clock: Arc<dyn ContinuousClock>,
     windows: Arc<ActionWindowIssuer>,
     challenges: Arc<Mutex<ChallengeLedger>>,
+    /// How many connections may be mid-handshake or unpaired at once, across the whole host.
+    admission: Arc<tokio::sync::Semaphore>,
+}
+
+impl<H: HostHandler> AcceptLoop<H> {
+    fn clone_state(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            config: Arc::clone(&self.config),
+            identity: Arc::clone(&self.identity),
+            handler: Arc::clone(&self.handler),
+            clock: Arc::clone(&self.clock),
+            windows: Arc::clone(&self.windows),
+            challenges: Arc::clone(&self.challenges),
+            admission: Arc::clone(&self.admission),
+        }
+    }
 }
 
 async fn accept_loop<H: HostHandler>(loop_state: AcceptLoop<H>) {
     while let Some(incoming) = loop_state.endpoint.accept().await {
+        // An unauthorised connection holds one admission slot from the moment it is accepted until
+        // it is either authorised or gone. Without that ceiling a peer could open connections until
+        // the host ran out of tasks, and reconnecting would reset every per-connection budget.
+        let Ok(slot) = Arc::clone(&loop_state.admission).try_acquire_owned() else {
+            tracing::debug!(
+                "an incoming connection was refused: the host is at its admission bound"
+            );
+            incoming.refuse();
+            continue;
+        };
         let connecting = match incoming.accept() {
             Ok(connecting) => connecting,
             Err(error) => {
@@ -318,28 +369,13 @@ async fn accept_loop<H: HostHandler>(loop_state: AcceptLoop<H>) {
                 continue;
             }
         };
-        let state = AcceptLoop {
-            endpoint: loop_state.endpoint.clone(),
-            config: Arc::clone(&loop_state.config),
-            identity: Arc::clone(&loop_state.identity),
-            handler: Arc::clone(&loop_state.handler),
-            clock: Arc::clone(&loop_state.clock),
-            windows: Arc::clone(&loop_state.windows),
-            challenges: Arc::clone(&loop_state.challenges),
-        };
+        let state = loop_state.clone_state();
         tokio::spawn(async move {
-            // The connection is never turned into a 0-RTT connection here, so the authorised path
-            // accepts no early data at all. The pre-authorisation surface is the only place where
-            // early data could arrive, and it refuses every mutation in it.
-            let connection = match connecting.await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    tracing::debug!(%error, "a connection failed before the handshake");
-                    return;
-                }
-            };
-            if let Err(error) = serve_connection(state, connection).await {
-                tracing::debug!(%error, "a connection ended");
+            let deadline = state.config.handshake_deadline;
+            match tokio::time::timeout(deadline, serve_connection(state, connecting, slot)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::debug!(%error, "a connection ended"),
+                Err(_) => tracing::debug!("a connection exceeded its handshake deadline"),
             }
         });
     }
@@ -347,10 +383,30 @@ async fn accept_loop<H: HostHandler>(loop_state: AcceptLoop<H>) {
 
 async fn serve_connection<H: HostHandler>(
     state: AcceptLoop<H>,
-    connection: Connection,
+    connecting: iroh::endpoint::Accepting,
+    slot: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
-    let admitted = crate::handshake::accept(
+    // The first bidirectional stream is accepted from the 0-RTT connection, because QUIC marks a
+    // stream as early data only when it is accepted while the handshake is still running. Nothing
+    // is *read* from it here: the read happens after `handshake_completed`, so no frame is ever
+    // acted on before the peer's endpoint identity is authenticated. What this buys is an honest
+    // answer to "did this arrive as early data", which the 0-RTT rules below depend on.
+    let zero_rtt = connecting.into_0rtt();
+    let (send, recv) = zero_rtt
+        .accept_bi()
+        .await
+        .map_err(|error| TransportError::Stream(error.to_string()))?;
+    let early_data = recv.is_0rtt();
+    let connection = zero_rtt
+        .handshake_completed()
+        .await
+        .map_err(|error| TransportError::Connect(error.to_string()))?;
+
+    let admitted = crate::handshake::accept_on(
         &connection,
+        send,
+        recv,
+        early_data,
         &state.identity,
         state.config.epochs,
         state.handler.as_ref(),
@@ -365,68 +421,106 @@ async fn serve_connection<H: HostHandler>(
                 connection.close(REFUSED_UNPAIRED.into(), b"pairing is not open");
                 return Ok(());
             };
-            crate::preauth::serve(
+            let outcome = crate::preauth::serve(
                 &mut unpaired,
                 surface.as_ref(),
                 state.config.preauth_limits,
                 state.clock.as_ref(),
                 state.config.controller_generation,
             )
-            .await
+            .await;
+            connection.close(REFUSED_UNPAIRED.into(), b"the pairing exchange ended");
+            outcome
         }
         Admitted::Authorised(authorised) => {
-            let connection_id = authorised.connection_id;
-            let hook: Arc<dyn RevocationHook> = Arc::new(HandlerHook {
-                handler: Arc::clone(&state.handler) as Arc<dyn ControlLossListener>,
-            });
-            let streams = Arc::new(StreamRegistry::new(
-                connection_id,
-                Arc::new(StreamBudget::new(state.config.bulk_limits)),
-                Some(hook),
-            ));
-            let actor = ConnectionActor::network_device(
-                state.handler.principal_for(&authorised.peer_device_id),
-                authorised.peer_device_id,
-                state.config.controller_generation,
-                connection_id,
-            );
-            let control = ControlChannel {
-                writer: Arc::new(Mutex::new(authorised.control_writer)),
-                reader: authorised.control_reader,
-            };
-            let keepalive = tokio::spawn(keepalive_loop(
-                control.sender(),
-                Arc::clone(&state.windows),
-                connection_id,
-                state.config.epochs,
-                state.config.keepalive,
-                state.config.action_window_validity,
-            ));
-
-            let session = AuthorisedSession {
-                connection: connection.clone(),
-                connection_id,
-                peer_device_id: authorised.peer_device_id,
-                peer_endpoint_id: authorised.peer_endpoint_id,
-                transcript_digest: authorised.transcript_digest,
-                offer: authorised.offer,
-                selection: authorised.selection,
-                actor,
-                control,
-                streams: Arc::clone(&streams),
-                windows: Arc::clone(&state.windows),
-                action_window: authorised.action_window,
-                clock: Arc::clone(&state.clock),
-            };
-            Arc::clone(&state.handler).serve(session).await;
-
-            // The control stream has ended, whatever the reason. Everything it authorised goes
-            // with it, and the windows it could first-admit through are retired.
-            keepalive.abort();
-            streams.revoke_all();
-            state.windows.retire_connection(connection_id);
-            Ok(())
+            // An authorised connection is no longer unauthorised traffic, so it releases the
+            // admission slot it held; its own limits govern it from here.
+            drop(slot);
+            serve_authorised(state, connection, authorised).await
         }
+    }
+}
+
+async fn serve_authorised<H: HostHandler>(
+    state: AcceptLoop<H>,
+    connection: Connection,
+    authorised: Box<crate::handshake::AuthorisedConnection>,
+) -> Result<()> {
+    let connection_id = authorised.connection_id;
+    let hook: Arc<dyn RevocationHook> = Arc::new(HandlerHook {
+        handler: Arc::clone(&state.handler) as Arc<dyn ControlLossListener>,
+    });
+    let streams = Arc::new(StreamRegistry::new(
+        connection_id,
+        Arc::new(StreamBudget::new(state.config.bulk_limits)),
+        Some(hook),
+    ));
+    let actor = ConnectionActor::network_device(
+        state.handler.principal_for(&authorised.peer_device_id),
+        authorised.peer_device_id,
+        state.config.controller_generation,
+        connection_id,
+    );
+    let control = ControlChannel {
+        writer: Arc::new(Mutex::new(authorised.control_writer)),
+        reader: authorised.control_reader,
+    };
+    let keepalive = tokio::spawn(keepalive_loop(
+        control.sender(),
+        connection.clone(),
+        Arc::clone(&state.windows),
+        connection_id,
+        state.config.epochs,
+        state.config.keepalive,
+        state.config.action_window_validity,
+    ));
+
+    // The guard runs on every way out of this function, including a panic in the host's handler or
+    // a cancellation of the task: the control stream is gone either way, and everything it
+    // authorised goes with it.
+    let cleanup = ConnectionCleanup {
+        streams: Arc::clone(&streams),
+        windows: Arc::clone(&state.windows),
+        connection_id,
+    };
+
+    let session = AuthorisedSession {
+        connection: connection.clone(),
+        connection_id,
+        peer_device_id: authorised.peer_device_id,
+        peer_endpoint_id: authorised.peer_endpoint_id,
+        transcript_digest: authorised.transcript_digest,
+        offer: authorised.offer,
+        selection: authorised.selection,
+        actor,
+        control,
+        streams: Arc::clone(&streams),
+        windows: Arc::clone(&state.windows),
+        action_window: authorised.action_window,
+        clock: Arc::clone(&state.clock),
+    };
+    Arc::clone(&state.handler).serve(session).await;
+
+    // The keepalive is stopped and *awaited* before the guard runs, so no window it was issuing can
+    // land after the connection's windows have been retired.
+    keepalive.abort();
+    let _ = keepalive.await;
+    drop(cleanup);
+    Ok(())
+}
+
+/// Ends a connection's authority whatever way the connection ended.
+#[derive(Debug)]
+struct ConnectionCleanup {
+    streams: Arc<StreamRegistry>,
+    windows: Arc<ActionWindowIssuer>,
+    connection_id: ConnectionId,
+}
+
+impl Drop for ConnectionCleanup {
+    fn drop(&mut self) {
+        self.streams.revoke_all();
+        self.windows.retire_connection(self.connection_id);
     }
 }
 
@@ -462,6 +556,7 @@ impl RevocationHook for HandlerHook {
 /// it: the client never asks.
 async fn keepalive_loop(
     sender: ControlSender,
+    connection: Connection,
     windows: Arc<ActionWindowIssuer>,
     connection_id: ConnectionId,
     epochs: HostEpochs,
@@ -490,10 +585,17 @@ async fn keepalive_loop(
             }
         };
         if sender.send(&frame).await.is_err() {
+            // The host can no longer write to this connection, so its control stream has failed
+            // whatever the read side is doing. Closing the connection is what makes the handler
+            // notice, which is what runs the cleanup.
+            connection.close(CONTROL_LOST.into(), b"the control stream failed");
             return;
         }
     }
 }
+
+/// The QUIC application error code a connection is closed with when its control stream fails.
+pub const CONTROL_LOST: u32 = 3;
 
 /// Returns the principal a paired device acts under, derived from its device identity.
 ///

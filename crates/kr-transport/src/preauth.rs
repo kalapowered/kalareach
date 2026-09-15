@@ -132,13 +132,13 @@ impl RequestBudget {
     }
 
     /// Charges one request, or returns the refusal to send back.
-    fn charge(&self, now: ContinuousInstant) -> std::result::Result<(), ProtocolError> {
+    fn charge(&self, now: ContinuousInstant) -> Charge {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.total >= self.limits.max_requests {
-            return Err(ProtocolError::new(
+            return Charge::Exhausted(ProtocolError::new(
                 ErrorCode::RateLimited,
                 "this connection has used its pairing request budget",
             ));
@@ -151,15 +151,26 @@ impl RequestBudget {
             }
         }
         if state.recent.len() >= self.limits.max_requests_per_window {
-            return Err(ProtocolError::new(
+            return Charge::RateLimited(ProtocolError::new(
                 ErrorCode::RateLimited,
                 "too many pairing requests in a short interval",
             ));
         }
         state.total += 1;
         state.recent.push_back(now);
-        Ok(())
+        Charge::Accepted
     }
+}
+
+/// What charging one request to a connection's budget decided.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Charge {
+    /// The request is inside the budget.
+    Accepted,
+    /// Too many requests in a short interval. The connection stays open.
+    RateLimited(ProtocolError),
+    /// The connection has used its whole budget. It is answered once and then ends.
+    Exhausted(ProtocolError),
 }
 
 /// Serves the pre-authorisation surface on one unpaired connection until the peer stops.
@@ -196,8 +207,14 @@ pub async fn serve(
             Some(request) => request,
             None => return Ok(()),
         };
-        let response = answer(&request, &actor, surface, &budget, clock, connection);
+        let (response, exhausted) = answer(&request, &actor, surface, &budget, clock, connection);
         connection.control_writer.write_message(&response).await?;
+        if exhausted {
+            // The connection has used its whole budget. Reading further requests only to refuse
+            // them costs the host work for nothing, so the exchange ends here.
+            let _ = connection.control_writer.finish();
+            return Ok(());
+        }
     }
 }
 
@@ -208,9 +225,14 @@ fn answer(
     budget: &RequestBudget,
     clock: &dyn ContinuousClock,
     connection: &UnpairedConnection,
-) -> Response {
-    let outcome = budget
-        .charge(clock.now())
+) -> (Response, bool) {
+    let charged = budget.charge(clock.now());
+    let exhausted = matches!(charged, Charge::Exhausted(_));
+    let admitted = match charged {
+        Charge::Accepted => Ok(()),
+        Charge::RateLimited(error) | Charge::Exhausted(error) => Err(error),
+    };
+    let outcome = admitted
         .and_then(|()| {
             actor.admit(request.method.as_str(), request.method_version)?;
             PairingMethod::from_name(request.method.as_str()).ok_or_else(|| {
@@ -225,13 +247,16 @@ fn answer(
                 &request.params,
             )
         });
-    Response {
-        request_id: request.request_id,
-        outcome: match outcome {
-            Ok(result) => Outcome::Ok(result),
-            Err(error) => Outcome::Error(error),
+    (
+        Response {
+            request_id: request.request_id,
+            outcome: match outcome {
+                Ok(result) => Outcome::Ok(result),
+                Err(error) => Outcome::Error(error),
+            },
         },
-    }
+        exhausted,
+    )
 }
 
 /// Returns the principal a candidate endpoint acts under before it has a device record.
@@ -308,13 +333,15 @@ mod tests {
         };
         let budget = RequestBudget::new(limits);
         for _ in 0..3 {
-            budget.charge(clock.now()).expect("inside the budget");
+            assert_eq!(budget.charge(clock.now()), Charge::Accepted);
         }
-        let error = budget.charge(clock.now()).expect_err("a refusal");
+        let Charge::Exhausted(error) = budget.charge(clock.now()) else {
+            panic!("the fourth request is past the budget");
+        };
         assert_eq!(error.code, ErrorCode::RateLimited);
         // Waiting does not restore a spent total budget.
         clock.advance(Duration::from_secs(60));
-        assert!(budget.charge(clock.now()).is_err());
+        assert!(matches!(budget.charge(clock.now()), Charge::Exhausted(_)));
     }
 
     #[test]
@@ -327,11 +354,15 @@ mod tests {
             max_frame_len: MAX_PREAUTH_FRAME_LEN,
         };
         let budget = RequestBudget::new(limits);
-        budget.charge(clock.now()).expect("the first");
-        budget.charge(clock.now()).expect("the second");
-        assert!(budget.charge(clock.now()).is_err());
+        assert_eq!(budget.charge(clock.now()), Charge::Accepted);
+        assert_eq!(budget.charge(clock.now()), Charge::Accepted);
+        assert!(matches!(budget.charge(clock.now()), Charge::RateLimited(_)));
         clock.advance(Duration::from_secs(11));
-        budget.charge(clock.now()).expect("the window has slid");
+        assert_eq!(
+            budget.charge(clock.now()),
+            Charge::Accepted,
+            "the window has slid"
+        );
     }
 
     #[test]

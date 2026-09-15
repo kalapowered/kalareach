@@ -24,16 +24,40 @@ use crate::error::{Result, TransportError};
 pub struct FrameWriter {
     stream: SendStream,
     codec: FrameCodec,
+    /// The bound in force: the stream kind's ceiling, lowered to whatever the peer negotiated.
+    max_payload: usize,
+    /// Set while a write is in progress. A write that never completed left part of a frame on the
+    /// stream, so the stream can carry nothing more.
+    interrupted: bool,
 }
 
 impl FrameWriter {
     /// Wraps a send stream for one stream kind.
     #[must_use]
     pub fn new(stream: SendStream, kind: StreamKind) -> Self {
+        let codec = FrameCodec::new(kind);
         Self {
             stream,
-            codec: FrameCodec::new(kind),
+            codec,
+            max_payload: codec.max_payload_len(),
+            interrupted: false,
         }
+    }
+
+    /// Lowers the bound to what the peer said it could receive.
+    ///
+    /// The stream kind's ceiling still applies: a negotiated value above it is ignored, because
+    /// the kind's bound is part of the wire contract and not negotiable upwards.
+    #[must_use]
+    pub fn with_max_payload(mut self, negotiated: usize) -> Self {
+        self.max_payload = self.codec.max_payload_len().min(negotiated);
+        self
+    }
+
+    /// Returns the bound in force.
+    #[must_use]
+    pub const fn max_payload(&self) -> usize {
+        self.max_payload
     }
 
     /// Returns the stream kind.
@@ -75,8 +99,12 @@ impl FrameWriter {
     /// Returns a framing error when the message exceeds this stream kind's bound, and a stream
     /// error when the write fails.
     pub async fn write_message<T: Serialize + ?Sized>(&mut self, message: &T) -> Result<()> {
-        let framed = self.codec.encode_message(message)?;
-        self.write_all(&framed).await
+        let payload = kr_cbor::to_canonical_vec_within(
+            message,
+            &kr_cbor::Limits::DEFAULT.with_max_message_len(self.max_payload),
+        )
+        .map_err(FrameError::Cbor)?;
+        self.write_payload(&payload).await
     }
 
     /// Frames and writes one already-canonical payload.
@@ -89,15 +117,38 @@ impl FrameWriter {
     /// Returns a framing error when the payload is empty or exceeds this stream kind's bound, and
     /// a stream error when the write fails.
     pub async fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() > self.max_payload {
+            return Err(FrameError::PayloadTooLarge {
+                len: payload.len(),
+                limit: self.max_payload,
+            }
+            .into());
+        }
         let framed = self.codec.encode(payload)?;
         self.write_all(&framed).await
     }
 
+    /// Writes a complete frame, refusing to continue a stream a cancelled write left in pieces.
+    ///
+    /// `SendStream::write_all` is not cancellation safe: a caller that drops the future part way
+    /// through leaves a prefix of one frame on the stream, and the next frame written after it
+    /// would be read as the rest of that one. The flag below is set before the write and cleared
+    /// only when it finishes, so an interrupted stream is reset rather than silently corrupted.
     async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        self.stream
+        if self.interrupted {
+            self.reset();
+            return Err(TransportError::Stream(
+                "a cancelled write left this stream incomplete".to_owned(),
+            ));
+        }
+        self.interrupted = true;
+        let outcome = self
+            .stream
             .write_all(bytes)
             .await
-            .map_err(|error| TransportError::Stream(error.to_string()))
+            .map_err(|error| TransportError::Stream(error.to_string()));
+        self.interrupted = false;
+        outcome
     }
 
     /// Finishes the stream, telling the peer no more frames follow.
@@ -109,6 +160,18 @@ impl FrameWriter {
         self.stream
             .finish()
             .map_err(|error| TransportError::Stream(error.to_string()))
+    }
+
+    /// Finishes the stream and waits for the peer to acknowledge what was written.
+    ///
+    /// A refusal is the last thing a connection says before it goes away, and a connection that is
+    /// closed the instant after a write can discard that write. Waiting for the acknowledgement,
+    /// bounded so a silent peer cannot hold the host, is what makes the refusal arrive.
+    pub async fn finish_and_flush(&mut self, within: std::time::Duration) {
+        if self.stream.finish().is_err() {
+            return;
+        }
+        let _ = tokio::time::timeout(within, self.stream.stopped()).await;
     }
 
     /// Resets the stream, discarding anything still queued.
@@ -133,16 +196,36 @@ pub const STREAM_REVOKED: u32 = 1;
 pub struct FrameReader {
     stream: RecvStream,
     codec: FrameCodec,
+    /// The bound in force: the stream kind's ceiling, lowered to whatever this side declared.
+    max_payload: usize,
 }
 
 impl FrameReader {
     /// Wraps a receive stream for one stream kind.
     #[must_use]
     pub fn new(stream: RecvStream, kind: StreamKind) -> Self {
+        let codec = FrameCodec::new(kind);
         Self {
             stream,
-            codec: FrameCodec::new(kind),
+            codec,
+            max_payload: codec.max_payload_len(),
         }
+    }
+
+    /// Lowers the bound to what this side declared it could receive.
+    ///
+    /// The stream kind's ceiling still applies. A peer that declares a larger frame than the
+    /// negotiated limit is refused before the payload is allocated.
+    #[must_use]
+    pub fn with_max_payload(mut self, negotiated: usize) -> Self {
+        self.max_payload = self.codec.max_payload_len().min(negotiated);
+        self
+    }
+
+    /// Returns the bound in force.
+    #[must_use]
+    pub const fn max_payload(&self) -> usize {
+        self.max_payload
     }
 
     /// Returns the stream kind.
@@ -157,9 +240,11 @@ impl FrameReader {
     /// kind is known. The reader that read it is rebound here, once, to the kind it declared.
     #[must_use]
     pub fn for_kind(self, kind: StreamKind) -> Self {
+        let codec = FrameCodec::new(kind);
         Self {
             stream: self.stream,
-            codec: FrameCodec::new(kind),
+            codec,
+            max_payload: codec.max_payload_len(),
         }
     }
 
@@ -192,12 +277,7 @@ impl FrameReader {
     /// Returns a framing error when the declared length exceeds this stream kind's bound or the
     /// payload is not a canonical message of the expected shape.
     pub async fn read_message<T: DeserializeOwned + Serialize>(&mut self) -> Result<Option<T>> {
-        let Some(payload) = self.read_payload().await? else {
-            return Ok(None);
-        };
-        let limits = self.codec.kind().cbor_limits();
-        let message = kr_cbor::from_canonical_slice(&payload, &limits).map_err(FrameError::Cbor)?;
-        Ok(Some(message))
+        self.read_message_within(self.max_payload).await
     }
 
     /// Reads one frame's raw payload, or returns `None` when the peer ended the stream.
@@ -210,7 +290,7 @@ impl FrameReader {
     ///
     /// As [`FrameReader::read_message`], without the deserialisation step.
     pub async fn read_payload(&mut self) -> Result<Option<Vec<u8>>> {
-        self.read_payload_within(self.codec.max_payload_len()).await
+        self.read_payload_within(self.max_payload).await
     }
 
     /// Reads one frame's payload under a bound tighter than the stream kind's own.
@@ -229,6 +309,7 @@ impl FrameReader {
             Err(error) => return Err(TransportError::Stream(error.to_string())),
         }
         let declared = self.codec.decode_length(prefix)?;
+        let limit = limit.min(self.max_payload);
         if declared > limit {
             return Err(FrameError::PayloadTooLarge {
                 len: declared,

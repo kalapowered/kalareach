@@ -372,6 +372,9 @@ fn spawn_preauth(
             ControllerGeneration::new(1),
         )
         .await;
+        // The exchange is over, but the connection stays until the peer goes away: dropping it
+        // here would discard the answer the client has not read yet.
+        let _ = connection.closed().await;
     })
 }
 
@@ -508,18 +511,38 @@ async fn a_data_stream_does_not_survive_the_control_stream() {
     assert_eq!(host_stream.kind(), StreamKind::TerminalOutput);
     assert!(!host_stream.is_revoked());
 
-    // The control stream ends, and with it every data stream it authorised.
+    // A read that is already waiting on the host's side of the stream must wake as soon as the
+    // stream is revoked, not when a peer that will never send finally sends.
+    let waiting_handle = host_stream.handle();
+    let waiting = tokio::spawn(async move {
+        let outcome = host_stream.read_payload().await;
+        (host_stream, outcome)
+    });
+    tokio::task::yield_now().await;
+
+    // The control stream ends, and with it every data stream it authorised. Nothing else is done
+    // to the stream: revocation alone has to be enough.
     drop(host_side);
     host_registry.revoke_all();
-    assert!(host_stream.is_revoked());
-    assert!(host_registry.is_empty());
-    host_stream.writer().expect("a writer").reset();
+    assert!(waiting_handle.is_revoked());
 
-    let reader = client_stream.reader().expect("a reader");
-    match tokio::time::timeout(Duration::from_secs(10), reader.read_payload()).await {
+    let (host_stream, outcome) = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the waiting read woke")
+        .expect("the task finished");
+    assert!(
+        matches!(outcome, Err(TransportError::ControlLost)),
+        "a revoked stream stops carrying data"
+    );
+    // Dropping the revoked stream resets it, so the peer sees that it was taken away rather than a
+    // clean end of data.
+    drop(host_stream);
+    assert!(host_registry.is_empty());
+
+    match tokio::time::timeout(Duration::from_secs(10), client_stream.read_payload()).await {
         Ok(Ok(None)) | Ok(Err(_)) => {}
         Ok(Ok(Some(_))) => panic!("a revoked stream delivered a frame"),
-        Err(_) => panic!("a revoked stream left the reader waiting"),
+        Err(_) => panic!("a revoked stream left the peer waiting"),
     }
 }
 

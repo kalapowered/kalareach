@@ -113,15 +113,29 @@ struct WorkerState {
     acknowledged_revision: Option<AuthorityRevision>,
     lease: Option<DispatchLease>,
     ended: bool,
+    /// Set when the worker's control path is lost. Renewal stops until the worker acknowledges the
+    /// current revision again over a live connection.
+    fenced: bool,
+}
+
+/// Everything the issuer decides, under one lock.
+///
+/// The revision and the per-worker records are read and written together on every path, so they
+/// share a lock rather than two. With two, a revocation could advance the revision between a
+/// renewal reading it and that renewal issuing a lease, and the lease would carry a revision the
+/// worker has not acknowledged.
+#[derive(Debug)]
+struct IssuerState {
+    authority_revision: AuthorityRevision,
+    workers: HashMap<SessionId, WorkerState>,
 }
 
 /// The controller's half of the lease contract.
 #[derive(Debug)]
 pub struct LeaseIssuer {
     generation: ControllerGeneration,
-    authority_revision: Mutex<AuthorityRevision>,
     validity: Duration,
-    workers: Mutex<HashMap<SessionId, WorkerState>>,
+    state: Mutex<IssuerState>,
 }
 
 impl LeaseIssuer {
@@ -136,9 +150,11 @@ impl LeaseIssuer {
     ) -> Self {
         Self {
             generation,
-            authority_revision: Mutex::new(authority_revision),
             validity: validity.min(MAX_LEASE),
-            workers: Mutex::new(HashMap::new()),
+            state: Mutex::new(IssuerState {
+                authority_revision,
+                workers: HashMap::new(),
+            }),
         }
     }
 
@@ -160,22 +176,24 @@ impl LeaseIssuer {
     /// Returns the current authority revision.
     #[must_use]
     pub fn authority_revision(&self) -> AuthorityRevision {
-        *self.revision()
+        self.lock().authority_revision
     }
 
     /// Records that a worker acknowledged an authority revision.
     ///
     /// Acknowledgement means the worker has installed the revision and fenced or rejected the
-    /// undispatched actions it affects. Only then can the worker's lease carry that revision.
+    /// undispatched actions it affects. Only then can the worker's lease carry that revision, and
+    /// only then does a fence from a lost control path lift.
     pub fn acknowledge(&self, session_id: SessionId, revision: AuthorityRevision) {
-        let mut workers = self.workers();
-        let state = workers.entry(session_id).or_default();
-        if state
+        let mut state = self.lock();
+        let worker = state.workers.entry(session_id).or_default();
+        if worker
             .acknowledged_revision
             .is_none_or(|current| revision > current)
         {
-            state.acknowledged_revision = Some(revision);
+            worker.acknowledged_revision = Some(revision);
         }
+        worker.fenced = false;
     }
 
     /// Records that a worker's execution has ended.
@@ -183,10 +201,10 @@ impl LeaseIssuer {
     /// A worker that can no longer dispatch satisfies the barrier as surely as one that
     /// acknowledged, which is the other half of the section 9 rule.
     pub fn worker_ended(&self, session_id: SessionId) {
-        let mut workers = self.workers();
-        let state = workers.entry(session_id).or_default();
-        state.ended = true;
-        state.lease = None;
+        let mut state = self.lock();
+        let worker = state.workers.entry(session_id).or_default();
+        worker.ended = true;
+        worker.lease = None;
     }
 
     /// Issues or renews a worker's lease.
@@ -195,7 +213,7 @@ impl LeaseIssuer {
     ///
     /// Returns [`LeaseRefusal::GenerationReplaced`] when the caller presents a generation this
     /// issuer no longer holds, and [`LeaseRefusal::RevisionNotAcknowledged`] when the worker has
-    /// not acknowledged the current revision.
+    /// not acknowledged the current revision or its renewal has been fenced.
     pub fn renew(
         &self,
         session_id: SessionId,
@@ -205,26 +223,39 @@ impl LeaseIssuer {
         if generation != self.generation {
             return Ok(Err(LeaseRefusal::GenerationReplaced));
         }
-        let revision = *self.revision();
-        let mut workers = self.workers();
-        let state = workers.entry(session_id).or_default();
-        if state.ended || state.acknowledged_revision != Some(revision) {
-            return Ok(Err(LeaseRefusal::RevisionNotAcknowledged));
-        }
+        // The deadline is read outside the lock, because the clock is not part of this state and a
+        // reading taken a moment early can only shorten the lease.
         let deadline = clock.now().checked_add(self.validity).ok_or(
             crate::error::TransportError::LimitExceeded {
                 what: "the dispatch lease deadline",
                 limit: 0,
             },
         )?;
+        let lease_id = fresh_lease_id()?;
+
+        let mut state = self.lock();
+        let revision = state.authority_revision;
+        let worker = state.workers.entry(session_id).or_default();
+        if worker.ended || worker.fenced || worker.acknowledged_revision != Some(revision) {
+            return Ok(Err(LeaseRefusal::RevisionNotAcknowledged));
+        }
         let lease = DispatchLease {
-            lease_id: fresh_lease_id()?,
+            lease_id,
             generation,
             authority_revision: revision,
             deadline,
         };
-        state.lease = Some(lease);
+        worker.lease = Some(lease);
         Ok(Ok(lease))
+    }
+
+    /// Returns the lease a worker currently holds, if any.
+    #[must_use]
+    pub fn current_lease(&self, session_id: SessionId) -> Option<DispatchLease> {
+        self.lock()
+            .workers
+            .get(&session_id)
+            .and_then(|worker| worker.lease)
     }
 
     /// Advances the authority revision and reports the barrier's status.
@@ -233,23 +264,45 @@ impl LeaseIssuer {
     /// it was issued at. Workers that have not acknowledged the new revision are named as pending;
     /// none of them can renew until they do.
     pub fn revoke(&self, revision: AuthorityRevision) -> RevocationStatus {
-        {
-            let mut current = self.revision();
-            if revision > *current {
-                *current = revision;
-            }
+        let mut state = self.lock();
+        if revision > state.authority_revision {
+            state.authority_revision = revision;
         }
-        self.status(revision)
+        Self::status_of(&state, revision)
     }
 
     /// Reports which workers have acknowledged a revision and which are still pending.
     #[must_use]
     pub fn status(&self, revision: AuthorityRevision) -> RevocationStatus {
-        let workers = self.workers();
+        Self::status_of(&self.lock(), revision)
+    }
+
+    /// Stops renewal for one worker, which is what losing the control path does.
+    ///
+    /// The worker keeps whatever remains of its current lease and then stops dispatching; renewal
+    /// resumes only when it acknowledges the current revision again. Nothing here kills a healthy
+    /// shell.
+    pub fn stop_renewal(&self, session_id: SessionId) {
+        let mut state = self.lock();
+        let worker = state.workers.entry(session_id).or_default();
+        worker.fenced = true;
+        worker.lease = None;
+    }
+
+    /// Returns true when renewal for this worker is fenced.
+    #[must_use]
+    pub fn is_fenced(&self, session_id: SessionId) -> bool {
+        self.lock()
+            .workers
+            .get(&session_id)
+            .is_some_and(|worker| worker.fenced)
+    }
+
+    fn status_of(state: &IssuerState, revision: AuthorityRevision) -> RevocationStatus {
         let mut acknowledged = Vec::new();
         let mut pending = Vec::new();
-        for (session_id, state) in workers.iter() {
-            if state.ended || state.acknowledged_revision == Some(revision) {
+        for (session_id, worker) in &state.workers {
+            if worker.ended || worker.acknowledged_revision == Some(revision) {
                 acknowledged.push(*session_id);
             } else {
                 pending.push(*session_id);
@@ -264,25 +317,8 @@ impl LeaseIssuer {
         }
     }
 
-    /// Stops renewal for one worker, which is what losing the control stream does.
-    ///
-    /// The worker keeps whatever remains of its current lease and then stops dispatching. Nothing
-    /// here kills a healthy shell.
-    pub fn stop_renewal(&self, session_id: SessionId) {
-        let mut workers = self.workers();
-        if let Some(state) = workers.get_mut(&session_id) {
-            state.lease = None;
-        }
-    }
-
-    fn revision(&self) -> std::sync::MutexGuard<'_, AuthorityRevision> {
-        self.authority_revision
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn workers(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, WorkerState>> {
-        self.workers
+    fn lock(&self) -> std::sync::MutexGuard<'_, IssuerState> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -417,6 +453,39 @@ mod tests {
 
         issuer.acknowledge(session(3), AuthorityRevision::new(4));
         assert!(issuer.status(AuthorityRevision::new(4)).is_complete());
+    }
+
+    #[test]
+    fn losing_the_control_path_stops_renewal_until_the_worker_acknowledges_again() {
+        let clock = ManualClock::new();
+        let issuer = issuer();
+        issuer.acknowledge(session(1), AuthorityRevision::new(3));
+        let lease = issuer
+            .renew(session(1), ControllerGeneration::new(7), &clock)
+            .expect("a lease")
+            .expect("an issued lease");
+        assert_eq!(issuer.current_lease(session(1)), Some(lease));
+
+        issuer.stop_renewal(session(1));
+        assert!(issuer.is_fenced(session(1)));
+        assert_eq!(issuer.current_lease(session(1)), None);
+        assert_eq!(
+            issuer
+                .renew(session(1), ControllerGeneration::new(7), &clock)
+                .expect("a decision"),
+            Err(LeaseRefusal::RevisionNotAcknowledged),
+            "a fenced worker cannot renew"
+        );
+
+        // A fresh acknowledgement over a live connection lifts the fence.
+        issuer.acknowledge(session(1), AuthorityRevision::new(3));
+        assert!(!issuer.is_fenced(session(1)));
+        assert!(
+            issuer
+                .renew(session(1), ControllerGeneration::new(7), &clock)
+                .expect("a decision")
+                .is_ok()
+        );
     }
 
     #[test]

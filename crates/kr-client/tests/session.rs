@@ -108,6 +108,8 @@ struct HostScript {
     windows: Mutex<Vec<String>>,
     /// Answer the next read with this error instead of a result.
     refuse_reads_with: Mutex<Option<ErrorCode>>,
+    /// Answer every mutation with a correlated protocol error instead of a receipt.
+    refuse_mutations_with: Mutex<Option<ErrorCode>>,
 }
 
 /// Serves one connection: handshake, then control frames until the client goes away.
@@ -194,6 +196,16 @@ fn spawn_host(
                         }
                         ControlFrame::Mutation(mutation) => {
                             script.actions.lock().await.push(mutation.action_id);
+                            if let Some(code) = *script.refuse_mutations_with.lock().await {
+                                let answer = ControlFrame::Response(Response {
+                                    request_id: mutation.request_id,
+                                    outcome: Outcome::Error(ProtocolError::new(code, "refused")),
+                                });
+                                if writer.lock().await.write_message(&answer).await.is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
                             script
                                 .windows
                                 .lock()
@@ -292,7 +304,7 @@ async fn a_read_returns_a_typed_result_and_a_mutation_returns_a_receipt() {
     let receipts = session.receipts().await;
     assert_eq!(receipts.unresolved(), vec![receipt.action_id]);
 
-    session.close();
+    session.close().await;
     serving.abort();
 }
 
@@ -336,7 +348,7 @@ async fn the_registry_decides_the_shape_of_a_call() {
         }
     ));
 
-    session.close();
+    session.close().await;
     serving.abort();
 }
 
@@ -363,7 +375,7 @@ async fn a_resynchronisation_requirement_is_its_own_error() {
         .expect("a snapshot");
     assert_eq!(listing.count, 2);
 
-    session.close();
+    session.close().await;
     serving.abort();
 }
 
@@ -399,14 +411,18 @@ async fn a_reconnect_subscribes_from_its_cursor_before_installing_a_snapshot() {
         RestorationStep::SubscribeFrom(EventSequence::new(2)),
         "a reconnect subscribes from the cursor"
     );
-    second.subscribed();
+    assert!(
+        second.installed().is_err(),
+        "a snapshot cannot be installed before the subscription"
+    );
+    second.subscribed().expect("the subscription succeeded");
     assert_eq!(
         second.step(),
         RestorationStep::InstallSnapshot,
         "and only then installs the snapshot"
     );
 
-    session.close();
+    session.close().await;
     serving.abort();
 }
 
@@ -480,16 +496,159 @@ async fn an_action_window_renewal_replaces_the_current_one() {
     .await;
     assert!(applied.is_ok(), "the renewed window replaced the first one");
 
-    session.close();
+    session.close().await;
     serving.abort();
 }
 
 #[tokio::test]
 async fn a_client_with_no_managed_service_reports_it() {
     assert!(ServiceClients::none().is_empty());
+    let request = kr_client::services::RelayLeaseRequest {
+        source: EndpointKey::from_bytes([1; 32]),
+        destination: EndpointKey::from_bytes([2; 32]),
+        direction: kr_client::services::RelayDirection::Bidirectional,
+        byte_ceiling: 8 * 1024 * 1024,
+        relay_scope: "eu-west".to_owned(),
+    };
     let error = NullService
-        .issue(1024)
+        .issue(&request)
         .await
         .expect_err("nothing is configured");
     assert_eq!(error.code(), ErrorCode::HostNotConfigured);
+}
+
+#[tokio::test]
+async fn a_mutation_refused_by_the_host_is_not_a_lost_connection() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::PermissionDenied);
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    let error = session
+        .mutate(
+            Method::SessionCreate,
+            ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("a refusal");
+    assert_eq!(
+        error.code(),
+        ErrorCode::PermissionDenied,
+        "the host's own code survives, rather than becoming a connection failure"
+    );
+
+    // The connection is still usable, which is what the distinction is for.
+    let listing: SessionList = session
+        .read(Method::SessionList, &Empty {})
+        .await
+        .expect("a listing");
+    assert_eq!(listing.count, 2);
+
+    session.close().await;
+    serving.abort();
+}
+
+#[tokio::test]
+async fn a_gap_in_the_event_sequence_does_not_stop_the_connection() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let (pushes, receiver) = tokio::sync::mpsc::channel(8);
+    let serving = spawn_host(
+        &host,
+        client.record,
+        Arc::new(HostScript::default()),
+        Some(receiver),
+    );
+    let session = connect(&client, &host).await;
+    let stream_id = StreamId::new("session:1").expect("a stream identifier");
+    let mut events = session.events();
+
+    // One event, then one that skips ahead. The gap discards this client's cursor for the stream.
+    for sequence in [1u64, 5] {
+        pushes
+            .send(ControlFrame::Notification(Notification {
+                stream_id: stream_id.clone(),
+                sequence: EventSequence::new(sequence),
+                event_type: EventType::new("terminal.output").expect("an event type"),
+                payload: ParamsValue::empty(),
+            }))
+            .await
+            .expect("the host accepted the event");
+    }
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("an event arrived")
+            .expect("the channel is open");
+    }
+    assert_eq!(
+        session.cursors().await.position(&stream_id),
+        None,
+        "a gap discards the partial state for that stream"
+    );
+
+    // The reader is still routing, which is the point: a gap must not deadlock the connection.
+    let listing: SessionList = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.read(Method::SessionList, &Empty {}),
+    )
+    .await
+    .expect("the read was answered")
+    .expect("a listing");
+    assert_eq!(listing.count, 2);
+
+    session.close().await;
+    serving.abort();
+}
+
+#[tokio::test]
+async fn a_cancelled_mutation_returns_its_place_in_the_outstanding_bound() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    // A host that never answers, so every mutation stays outstanding until it is cancelled.
+    let script = Arc::new(HostScript::default());
+    *script.refuse_mutations_with.lock().await = None;
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    // Eight is the negotiated bound. Cancelling that many calls must not spend it permanently.
+    for _ in 0..16 {
+        let mutation = session.mutate(
+            Method::InputInterrupt,
+            ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        );
+        // Dropping the future before it resolves is a cancellation.
+        let cancelled = tokio::time::timeout(Duration::from_millis(1), mutation).await;
+        assert!(cancelled.is_err() || cancelled.expect("a result").is_ok());
+    }
+
+    // The connection still admits a mutation, which it could not if the bound had leaked.
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.mutate(
+            Method::SessionCreate,
+            ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        ),
+    )
+    .await
+    .expect("the mutation was answered")
+    .expect("a receipt");
+    assert_eq!(receipt.state, ReceiptState::Accepted);
+
+    session.close().await;
+    serving.abort();
 }

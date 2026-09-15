@@ -74,14 +74,22 @@ pub fn validate_header(
 }
 
 /// One open data stream.
+///
+/// Reads and writes go through this type rather than through the reader and writer directly,
+/// because revocation has to reach an operation that is already waiting. Each one races the
+/// revocation signal, so a stream that is revoked while a task is blocked on it returns
+/// [`TransportError::ControlLost`] at once rather than waiting for a peer that will never send.
 #[derive(Debug)]
 pub struct DataStream {
     header: StreamHeader,
     writer: Option<FrameWriter>,
     reader: Option<FrameReader>,
     handle: StreamHandle,
+    budget: Arc<StreamBudget>,
     /// The bulk slot this stream occupies, released when the stream is dropped.
     _bulk_slot: Option<BulkStreamSlot>,
+    /// Removes this stream from its registry when it ends.
+    _registration: Registration,
 }
 
 impl DataStream {
@@ -98,11 +106,16 @@ impl DataStream {
     }
 
     /// Returns the writer, if this side sends on the stream.
+    ///
+    /// Prefer [`DataStream::write_message`] and [`DataStream::write_payload`]: a write made through
+    /// the writer directly does not race revocation and does not reserve queue space.
     pub fn writer(&mut self) -> Option<&mut FrameWriter> {
         self.writer.as_mut()
     }
 
     /// Returns the reader, if this side receives on the stream.
+    ///
+    /// Prefer [`DataStream::read_message`] and [`DataStream::read_payload`].
     pub fn reader(&mut self) -> Option<&mut FrameReader> {
         self.reader.as_mut()
     }
@@ -118,29 +131,177 @@ impl DataStream {
     pub fn is_revoked(&self) -> bool {
         self.handle.is_revoked()
     }
+
+    /// Writes one message, reserving queue space on a bulk stream first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ControlLost`] when the stream has been revoked,
+    /// [`TransportError::LimitExceeded`] when a bulk write would exceed the connection's queued
+    /// bytes, and a framing or stream failure otherwise.
+    pub async fn write_message<T: serde::Serialize + ?Sized>(&mut self, message: &T) -> Result<()> {
+        let payload = kr_cbor::to_canonical_vec_within(
+            message,
+            &kr_cbor::Limits::DEFAULT.with_max_message_len(
+                self.writer
+                    .as_ref()
+                    .map_or(self.header.kind.max_payload_len(), FrameWriter::max_payload),
+            ),
+        )
+        .map_err(kr_protocol::frame::FrameError::Cbor)?;
+        self.write_payload(&payload).await
+    }
+
+    /// Writes one already-canonical payload, reserving queue space on a bulk stream first.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataStream::write_message`].
+    pub async fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if self.handle.is_revoked() {
+            return Err(TransportError::ControlLost);
+        }
+        // The queue ceiling exists so a transfer cannot consume the whole send budget and leave a
+        // keystroke waiting. It is charged here, where the bytes are actually handed to the
+        // connection, and released when the write completes.
+        let _reservation = match class_of(self.header.kind) {
+            StreamClass::Bulk => Some(self.budget.reserve(payload.len())?),
+            _ => None,
+        };
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| TransportError::Stream("this stream does not send".to_owned()))?;
+        let handle = self.handle.clone();
+        tokio::select! {
+            outcome = writer.write_payload(payload) => outcome,
+            () = handle.revoked() => Err(TransportError::ControlLost),
+        }
+    }
+
+    /// Reads one frame's payload, or `None` when the peer ended the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ControlLost`] when the stream is revoked while the read is
+    /// waiting, and a framing or stream failure otherwise.
+    pub async fn read_payload(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.handle.is_revoked() {
+            return Err(TransportError::ControlLost);
+        }
+        let handle = self.handle.clone();
+        let reader = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| TransportError::Stream("this stream does not receive".to_owned()))?;
+        tokio::select! {
+            outcome = reader.read_payload() => outcome,
+            () = handle.revoked() => Err(TransportError::ControlLost),
+        }
+    }
+
+    /// Reads one frame and deserialises it, or `None` when the peer ended the stream.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataStream::read_payload`].
+    pub async fn read_message<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &mut self,
+    ) -> Result<Option<T>> {
+        if self.handle.is_revoked() {
+            return Err(TransportError::ControlLost);
+        }
+        let handle = self.handle.clone();
+        let reader = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| TransportError::Stream("this stream does not receive".to_owned()))?;
+        tokio::select! {
+            outcome = reader.read_message() => outcome,
+            () = handle.revoked() => Err(TransportError::ControlLost),
+        }
+    }
+}
+
+impl Drop for DataStream {
+    fn drop(&mut self) {
+        // A revoked stream is reset, not finished: the peer has to see that the stream was taken
+        // away rather than a clean end of data it might read as completion.
+        if self.handle.is_revoked() {
+            if let Some(writer) = self.writer.as_mut() {
+                writer.reset();
+            }
+            if let Some(reader) = self.reader.as_mut() {
+                reader.stop();
+            }
+        }
+    }
 }
 
 /// A shared marker that revokes one stream.
 ///
-/// Revocation has to reach a stream that another task is reading or writing, so the flag is shared
-/// and the owner checks it. Resetting the QUIC stream is what the peer sees; the flag is what this
-/// side's loops see.
-#[derive(Clone, Debug, Default)]
+/// Revocation has to reach a stream that another task is already reading or writing, so the flag is
+/// shared and the waiters are woken. [`StreamHandle::revoked`] is what an operation races against;
+/// resetting the QUIC stream is what the peer sees.
+#[derive(Clone, Debug)]
 pub struct StreamHandle {
     revoked: Arc<std::sync::atomic::AtomicBool>,
+    woken: Arc<tokio::sync::Notify>,
+}
+
+impl Default for StreamHandle {
+    fn default() -> Self {
+        Self {
+            revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            woken: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
 }
 
 impl StreamHandle {
-    /// Marks the stream revoked.
+    /// Marks the stream revoked and wakes everything waiting on it.
     pub fn revoke(&self) {
         self.revoked
             .store(true, std::sync::atomic::Ordering::Release);
+        self.woken.notify_waiters();
     }
 
     /// Returns true once the stream has been revoked.
     #[must_use]
     pub fn is_revoked(&self) -> bool {
         self.revoked.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Resolves as soon as the stream is revoked.
+    pub async fn revoked(&self) {
+        loop {
+            let waiting = self.woken.notified();
+            if self.is_revoked() {
+                return;
+            }
+            waiting.await;
+            if self.is_revoked() {
+                return;
+            }
+        }
+    }
+}
+
+/// Removes one stream from its registry when the stream ends.
+///
+/// Without it a connection that runs many short transfers would accumulate an entry for each one,
+/// and a registry that grows without bound is a leak whatever else it gets right.
+#[derive(Debug)]
+struct Registration {
+    registry: std::sync::Weak<RegistryState>,
+    key: StreamKey,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if let Some(state) = self.registry.upgrade() {
+            state.remove(self.key);
+        }
     }
 }
 
@@ -160,17 +321,35 @@ pub trait RevocationHook: Send + Sync + std::fmt::Debug {
 /// Every data stream of one connection.
 #[derive(Debug)]
 pub struct StreamRegistry {
+    state: Arc<RegistryState>,
+}
+
+/// The shared half of a registry, so a stream can deregister itself when it ends.
+#[derive(Debug)]
+struct RegistryState {
     connection_id: ConnectionId,
     budget: Arc<StreamBudget>,
     hook: Option<Arc<dyn RevocationHook>>,
-    state: Mutex<RegistryState>,
+    streams: Mutex<RegistryStreams>,
 }
 
 #[derive(Debug, Default)]
-struct RegistryState {
+struct RegistryStreams {
     next_key: StreamKey,
-    streams: HashMap<StreamKey, (StreamKind, StreamHandle)>,
+    open: HashMap<StreamKey, (StreamKind, StreamHandle)>,
     revoked: bool,
+}
+
+impl RegistryState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegistryStreams> {
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn remove(&self, key: StreamKey) {
+        self.lock().open.remove(&key);
+    }
 }
 
 impl StreamRegistry {
@@ -182,26 +361,28 @@ impl StreamRegistry {
         hook: Option<Arc<dyn RevocationHook>>,
     ) -> Self {
         Self {
-            connection_id,
-            budget,
-            hook,
-            state: Mutex::new(RegistryState::default()),
+            state: Arc::new(RegistryState {
+                connection_id,
+                budget,
+                hook,
+                streams: Mutex::new(RegistryStreams::default()),
+            }),
         }
     }
 
     /// Returns the connection these streams belong to.
     #[must_use]
-    pub const fn connection_id(&self) -> ConnectionId {
-        self.connection_id
+    pub fn connection_id(&self) -> ConnectionId {
+        self.state.connection_id
     }
 
     /// Returns the shared bulk budget.
     #[must_use]
     pub fn budget(&self) -> &Arc<StreamBudget> {
-        &self.budget
+        &self.state.budget
     }
 
-    /// Opens a data stream to the peer, sending its header first.
+    /// Opens a data stream to the peer, sending its bounded header first.
     ///
     /// A bulk stream is admitted against the connection's bulk limits before the QUIC stream is
     /// opened, so a peer cannot hold open more transfers than the connection allows.
@@ -209,16 +390,16 @@ impl StreamRegistry {
     /// # Errors
     ///
     /// Returns [`TransportError::ControlLost`] once the control stream has ended,
-    /// [`TransportError::LimitExceeded`] when the bulk limits refuse the stream, and a stream
-    /// error when the peer refuses it.
+    /// [`TransportError::LimitExceeded`] when the bulk limits refuse the stream, and a stream error
+    /// when the peer refuses it.
     pub async fn open(&self, connection: &Connection, header: StreamHeader) -> Result<DataStream> {
-        validate_header(&header, self.connection_id)
+        validate_header(&header, self.state.connection_id)
             .map_err(|refusal| TransportError::Handshake(ProtocolError::from(refusal)))?;
         if self.is_revoked() {
             return Err(TransportError::ControlLost);
         }
         let bulk_slot = match class_of(header.kind) {
-            StreamClass::Bulk => Some(self.budget.open_bulk()?),
+            StreamClass::Bulk => Some(self.state.budget.open_bulk()?),
             _ => None,
         };
         let (send, recv) = connection
@@ -229,13 +410,15 @@ impl StreamRegistry {
         writer.set_priority(priority_of(header.kind));
         writer.write_header(&header).await?;
         let reader = FrameReader::new(recv, header.kind);
-        let handle = self.register(header.kind)?;
+        let (handle, registration) = self.register(header.kind)?;
         Ok(DataStream {
             header,
             writer: Some(writer),
             reader: Some(reader),
             handle,
+            budget: Arc::clone(&self.state.budget),
             _bulk_slot: bulk_slot,
+            _registration: registration,
         })
     }
 
@@ -244,7 +427,7 @@ impl StreamRegistry {
     /// # Errors
     ///
     /// Returns [`TransportError::ControlLost`] once the control stream has ended, and a handshake
-    /// failure when the header does not belong to this connection.
+    /// failure when the header does not belong to this connection or the stream carried early data.
     pub async fn accept(&self, connection: &Connection) -> Result<DataStream> {
         if self.is_revoked() {
             return Err(TransportError::ControlLost);
@@ -266,37 +449,40 @@ impl StreamRegistry {
             )));
         }
         let header = reader.read_header().await?;
-        validate_header(&header, self.connection_id)
+        validate_header(&header, self.state.connection_id)
             .map_err(|refusal| TransportError::Handshake(ProtocolError::from(refusal)))?;
         let bulk_slot = match class_of(header.kind) {
-            StreamClass::Bulk => Some(self.budget.open_bulk()?),
+            StreamClass::Bulk => Some(self.state.budget.open_bulk()?),
             _ => None,
         };
         let writer = FrameWriter::new(send, header.kind);
         writer.set_priority(priority_of(header.kind));
         let reader = reader.for_kind(header.kind);
-        let handle = self.register(header.kind)?;
+        let (handle, registration) = self.register(header.kind)?;
         Ok(DataStream {
             header,
             writer: Some(writer),
             reader: Some(reader),
             handle,
+            budget: Arc::clone(&self.state.budget),
             _bulk_slot: bulk_slot,
+            _registration: registration,
         })
     }
 
     /// Revokes every data stream and stops remote lease renewal.
     ///
-    /// Calling it twice is harmless; the hook runs once.
+    /// Calling it twice is harmless; the hook runs once. A stream opened after this point is
+    /// refused, so nothing can slip in behind the revocation.
     pub fn revoke_all(&self) {
         let handles = {
-            let mut state = self.lock();
+            let mut state = self.state.lock();
             if state.revoked {
                 return;
             }
             state.revoked = true;
             state
-                .streams
+                .open
                 .drain()
                 .map(|(_, (_, handle))| handle)
                 .collect::<Vec<_>>()
@@ -304,45 +490,45 @@ impl StreamRegistry {
         for handle in handles {
             handle.revoke();
         }
-        if let Some(hook) = &self.hook {
-            hook.control_stream_lost(self.connection_id);
+        if let Some(hook) = &self.state.hook {
+            hook.control_stream_lost(self.state.connection_id);
         }
     }
 
     /// Returns true once the control stream has ended.
     #[must_use]
     pub fn is_revoked(&self) -> bool {
-        self.lock().revoked
+        self.state.lock().revoked
     }
 
-    /// Returns how many data streams are registered.
+    /// Returns how many data streams are open.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lock().streams.len()
+        self.state.lock().open.len()
     }
 
-    /// Returns true when no data stream is registered.
+    /// Returns true when no data stream is open.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    fn register(&self, kind: StreamKind) -> Result<StreamHandle> {
-        let mut state = self.lock();
+    fn register(&self, kind: StreamKind) -> Result<(StreamHandle, Registration)> {
+        let mut state = self.state.lock();
         if state.revoked {
             return Err(TransportError::ControlLost);
         }
         let handle = StreamHandle::default();
         let key = state.next_key;
         state.next_key = state.next_key.wrapping_add(1);
-        state.streams.insert(key, (kind, handle.clone()));
-        Ok(handle)
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        state.open.insert(key, (kind, handle.clone()));
+        Ok((
+            handle,
+            Registration {
+                registry: Arc::downgrade(&self.state),
+                key,
+            },
+        ))
     }
 }
 
@@ -424,10 +610,10 @@ mod tests {
             Arc::new(StreamBudget::new(crate::scheduler::BulkLimits::default())),
             Some(hook.clone()),
         );
-        let first = registry
+        let (first, first_registration) = registry
             .register(StreamKind::TerminalOutput)
             .expect("a handle");
-        let second = registry
+        let (second, second_registration) = registry
             .register(StreamKind::AttachmentChunks)
             .expect("a handle");
         assert_eq!(registry.len(), 2);
@@ -437,6 +623,7 @@ mod tests {
         assert!(second.is_revoked());
         assert!(registry.is_empty());
         assert_eq!(hook.0.load(Ordering::Acquire), 1);
+        drop((first_registration, second_registration));
 
         registry.revoke_all();
         assert_eq!(hook.0.load(Ordering::Acquire), 1, "the hook runs once");
@@ -444,5 +631,38 @@ mod tests {
             registry.register(StreamKind::TerminalInput),
             Err(TransportError::ControlLost)
         ));
+    }
+
+    #[test]
+    fn a_stream_that_ends_normally_leaves_the_registry() {
+        let registry = StreamRegistry::new(
+            connection_id(1),
+            Arc::new(StreamBudget::new(crate::scheduler::BulkLimits::default())),
+            None,
+        );
+        for _ in 0..1_000 {
+            let (_handle, registration) = registry
+                .register(StreamKind::AttachmentChunks)
+                .expect("a handle");
+            assert_eq!(registry.len(), 1);
+            drop(registration);
+            assert!(registry.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_waiting_operation_wakes_the_moment_its_stream_is_revoked() {
+        let handle = StreamHandle::default();
+        let waiting = handle.clone();
+        let waiter = tokio::spawn(async move { waiting.revoked().await });
+        // Give the waiter a moment to park before the revocation arrives.
+        tokio::task::yield_now().await;
+        handle.revoke();
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter woke")
+            .expect("the task finished");
+        // A handle that is already revoked resolves without waiting at all.
+        handle.revoked().await;
     }
 }

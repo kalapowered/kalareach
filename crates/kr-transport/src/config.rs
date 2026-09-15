@@ -18,8 +18,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use iroh::{RelayMap, RelayUrl};
+use iroh::{EndpointAddr, PublicKey, RelayMap, RelayUrl};
 use kr_protocol::pairing::{MAX_NETWORK_HINTS, NetworkConfig, NetworkHint};
+use kr_protocol::scalars::EndpointKey;
 use kr_protocol::scalars::Nullable;
 use url::Url;
 
@@ -135,6 +136,26 @@ pub struct EndpointConfig {
 }
 
 impl EndpointConfig {
+    /// Returns the address to dial a peer at, from this configuration's hints.
+    ///
+    /// The relay and the direct addresses in a pairing invitation describe where the *peer* is, not
+    /// where this endpoint is reachable, so they belong on the address that is dialled rather than
+    /// on the local endpoint. A hint is only a hint: the endpoint identity is what authenticates,
+    /// and after a failure or a network change the identity is resolved again.
+    #[must_use]
+    pub fn peer_addr(&self, endpoint_id: &EndpointKey) -> EndpointAddr {
+        let mut addr = EndpointAddr::new(
+            PublicKey::from_bytes(endpoint_id.as_bytes()).expect("a 32-byte endpoint identity"),
+        );
+        if let Some(relay) = self.relay_urls.first() {
+            addr = addr.with_relay_url(relay.clone());
+        }
+        for direct in &self.direct_addresses {
+            addr = addr.with_ip_addr(*direct);
+        }
+        addr
+    }
+
     /// Returns the relay map iroh is configured with.
     #[must_use]
     pub fn relay_map(&self) -> RelayMap {

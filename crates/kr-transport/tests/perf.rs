@@ -148,15 +148,14 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
             tokio::spawn(async move {
                 let kind = stream.kind();
                 loop {
-                    let echoed = match stream.reader().expect("a reader").read_payload().await {
+                    let echoed = match stream.read_payload().await {
                         Ok(Some(frame)) => frame,
                         _ => return,
                     };
-                    if kind == StreamKind::TerminalInput {
-                        let writer = stream.writer().expect("a writer");
-                        if writer.write_payload(&echoed).await.is_err() {
-                            return;
-                        }
+                    if kind == StreamKind::TerminalInput
+                        && stream.write_payload(&echoed).await.is_err()
+                    {
+                        return;
                     }
                 }
             });
@@ -193,8 +192,9 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
             .expect("a bulk stream");
         let chunk = payload(&vec![0u8; 512 * 1024]);
         loop {
-            let writer = stream.writer().expect("a writer");
-            if writer.write_message(&chunk).await.is_err() {
+            // The bulk write goes through the data stream, so every chunk is charged against the
+            // connection's queued-bytes ceiling before it is handed to the connection.
+            if stream.write_message(&chunk).await.is_err() {
                 return;
             }
         }
@@ -230,14 +230,10 @@ async fn round_trips(
     for _ in 0..samples {
         let started = Instant::now();
         stream
-            .writer()
-            .expect("a writer")
             .write_message(&payload(INPUT_PAYLOAD))
             .await
             .expect("the keystroke was sent");
         let echoed = stream
-            .reader()
-            .expect("a reader")
             .read_message::<ParamsValue>()
             .await
             .expect("an echo")
@@ -288,11 +284,9 @@ async fn a_reconnect_reaches_usable_state_within_two_seconds() {
                 let Ok(mut stream) = streams.accept(&connection).await else {
                     return;
                 };
-                let _ = stream.reader().expect("a reader").read_payload().await;
+                let _ = stream.read_payload().await;
                 let snapshot = payload(&vec![0u8; SCREEN_BYTES]);
                 stream
-                    .writer()
-                    .expect("a writer")
                     .write_message(&snapshot)
                     .await
                     .expect("the snapshot was sent");
@@ -341,14 +335,10 @@ async fn a_reconnect_reaches_usable_state_within_two_seconds() {
         .await
         .expect("a semantic stream");
     stream
-        .writer()
-        .expect("a writer")
         .write_message(&payload(b"subscribe"))
         .await
         .expect("the subscription was sent");
     let snapshot = stream
-        .reader()
-        .expect("a reader")
         .read_message::<ParamsValue>()
         .await
         .expect("a snapshot")

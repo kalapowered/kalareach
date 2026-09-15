@@ -26,6 +26,7 @@ versions this build links, and the versions the relay and DNS deployments instal
 | `iroh-relay` | 1.2.0 |
 | `iroh-mdns-address-lookup` | 0.5.0 |
 | `iroh-mainline-address-lookup` | 0.5.0 |
+| `boot-time` | 0.1.3 |
 
 `iroh-dns-server` 1.2.0 is the matching discovery server release. Client, relay and discovery
 compatibility is explicit in the signed release matrix: deploy a backward-compatible network tier
@@ -50,7 +51,7 @@ used:
 | `discovery.local_discovery` | Local network discovery. Disabled unless selected. |
 | `discovery.mainline_dht` | The public Mainline DHT. Disabled unless selected. |
 | `discovery.publisher` | The republish rules below. |
-| `direct_addresses` | Address hints for peers this endpoint dials. |
+| `direct_addresses` | Address hints for the peer this configuration describes. |
 | `relay_ca_roots` | Extra trust anchors for a relay whose certificate comes from a private authority. |
 | `bind_addr` | The local socket. |
 
@@ -64,8 +65,15 @@ Publication rules, which are the defaults of `PublisherPolicy`:
   protected pairing exchange and authenticated peer updates instead. `PublishedAddresses::RelayAndDirect`
   is for a deployment whose addresses are already public.
 
-Cached hints are not permanent routes. After a failure or a network change, resolve the pinned
-endpoint identity again rather than reusing an address that worked before.
+`direct_addresses` and `relay_urls` describe where the *peer* is, not where this endpoint is
+reachable, because that is what a pairing invitation carries. `EndpointConfig::peer_addr` turns them
+into the address that is dialled; nothing in the configuration advertises them as this endpoint's
+own. Cached hints are not permanent routes either: after a failure or a network change, resolve the
+pinned endpoint identity again rather than reusing an address that worked before.
+
+The publication filter applies to the publisher, not to the endpoint. An endpoint-wide filter would
+also strip the direct addresses that local network discovery exists to advertise, so the public
+record stays relay-only while a selected mDNS service publishes what a local network needs.
 
 ### Self-hosting
 
@@ -112,8 +120,14 @@ key revision, a mismatched endpoint identity, a live endpoint that is not the pa
 finally either signature. The host's nonce is drawn per connection and consumed once, so a replayed
 transcript names a challenge that is no longer outstanding.
 
+The paired record is read again after the proof arrives, not only before the wait. A device revoked,
+or a key rotated, while the handshake was waiting is refused rather than admitted under the record
+that was current when the wait began. The offer itself is read under a 16 KiB bound rather than the
+control stream's, because it arrives before anything about the peer has been established.
+
 Negotiated limits are the smaller of the two declarations, and the transcript covers them, so a
-downgrade after `hello` breaks both signatures.
+downgrade after `hello` breaks both signatures. From the moment the connection is authorised those
+limits are what the control stream enforces, in both directions.
 
 ### Unpaired connections
 
@@ -127,21 +141,34 @@ candidate-authenticated `pair.status`, and nothing else. The surface is narrow o
   the attempt that endpoint is party to and a caller cannot name another;
 * no mutation is served as early data.
 
+Two host-wide bounds sit above the per-connection ones, because a per-connection budget resets when
+a peer reconnects and a host-wide one does not: at most 64 connections may be mid-handshake or
+unpaired at once, and an unauthorised connection has 60 seconds to finish. A connection that spends
+its whole request budget is answered once and then ended.
+
 Pairing's own budgets, phase rules and proofs belong to the pairing crate, which implements the
 surface's trait. The transport is the door, not the ceremony behind it.
 
 ### 0-RTT
 
-Version 1 accepts no application mutation in QUIC 0-RTT — not just no pairing mutation. Two rules
-enforce it:
+Version 1 accepts no application mutation in QUIC 0-RTT — not just no pairing mutation. Three rules
+enforce it, and the order matters because the first one is what makes the others truthful.
 
-* The listener never enters iroh's 0-RTT acceptance path. Nothing a client sends as early data
-  reaches the application until the QUIC handshake has completed and the peer's endpoint identity is
-  authenticated. A handshake stream or data stream that did carry early data is refused outright.
-* A request that arrives as early data is classified before admission: a method the registry marks
-  as a write is refused with `PERMISSION_DENIED`, including the pairing surface's own mutations.
+* **The host knows whether a stream carried early data.** QUIC marks a stream as early data only
+  when it is accepted while the handshake is still running, so the listener accepts the first
+  bidirectional stream from the 0-RTT connection and only then waits for the handshake to complete.
+  Nothing is *read* before that wait, so no frame is ever acted on before the peer's endpoint
+  identity is authenticated; what the early accept buys is an honest answer to "did this arrive as
+  early data".
+* **An authorised connection never carries early data.** A handshake stream that arrived as early
+  data is refused with `PERMISSION_DENIED` before the proof exchange, and so is a data stream. This
+  costs nothing: a KalaReach endpoint keeps no TLS session tickets, so this product's own client
+  cannot offer 0-RTT to anyone.
+* **The pairing surface refuses its own mutations in early data.** `pair.status` is a read and is
+  served; `pair.redeem` and `pair.finish` are writes and are refused. That is the one exception
+  section 23 allows, and it is closed to everything that changes state.
 
-Authorisation cannot complete in 0-RTT in any case: the proof covers the host's fresh challenge,
+Authorisation could not complete in 0-RTT in any case: the proof covers the host's fresh challenge,
 which the client learns only after the handshake.
 
 ## Streams
@@ -169,16 +196,27 @@ stream without a session and attachment, a semantic stream without a session, an
 without a transfer.
 
 Bulk streams are bounded twice: at most 4 concurrent bulk streams by default, and at most 8 MiB
-queued across them. A write that would exceed either is refused before it is sent, so connection
-flow control cannot consume the whole send budget and leave a keystroke waiting.
+queued across them. The queue ceiling is charged where the bytes are handed to the connection, so a
+write that would exceed it is refused before it is sent and connection flow control cannot consume
+the whole send budget and leave a keystroke waiting.
+
+The negotiated limits are in force as well as the stream kind's ceilings. A peer that declared it
+could receive less than the kind allows is held to what it declared, in both directions, and a frame
+that exceeds either bound is refused before its payload is allocated.
 
 ### Revocation
 
 Closing or failing the control stream revokes every data stream it authorised and stops remote lease
-renewal. Revoked streams are reset rather than finished, so a peer sees that the stream was taken
-away instead of a clean end it might read as completion. The connection's action windows are retired
-at the same moment, so none of them can first-admit a request through a connection that no longer
-exists. Nothing kills a healthy worker to force this through.
+renewal. Revocation reaches an operation that is already waiting: a read or write on a revoked
+stream returns at once rather than waiting for a peer that will never send, and the stream is reset
+rather than finished, so the peer sees that it was taken away instead of a clean end it might read
+as completion. The connection's action windows are retired at the same moment, so none of them can
+first-admit a request through a connection that no longer exists.
+
+The cleanup runs on every way a connection can end, including a failed keepalive write, a panic in
+the host's handler and a cancelled task. The keepalive is stopped and awaited before the windows are
+retired, so a renewal cannot land after the retirement. Nothing kills a healthy worker to force any
+of this through.
 
 ## Keepalive and reconnect
 
@@ -244,13 +282,16 @@ window changes the payload digest, so it is never an automatic retry.
 ### The continuous clock
 
 Every deadline in the transport is measured on a suspend-aware continuous clock. Neither standard
-clock is one on its own: the monotonic clock stops while the machine is suspended, and the wall
-clock can step backwards. The default implementation takes the larger of the two elapsed
-measurements and holds the result to a high-water mark. A suspension shows up as wall-clock movement
-the monotonic clock did not see, so authority expires; a forward wall-clock step expires objects
-early, which the time contract allows; a backward step is never observed, because a smaller
-measurement never wins. A host with a qualified platform time adapter supplies its own
-implementation of the `ContinuousClock` trait.
+clock is one: the monotonic clock stops while the machine is suspended, so a five-second lease would
+outlive a suspension of any length, and the wall clock can be stepped in either direction, so it can
+be stopped by anything that can step it.
+
+The default implementation therefore reads the operating system's own continuous clock —
+`CLOCK_BOOTTIME` on Linux, Android and OpenBSD, and `mach_continuous_time` on Apple platforms —
+which is monotonic *and* includes suspended time. No arithmetic of ours stands between the kernel's
+answer and a deadline. On a platform with no continuous source the crate falls back to the ordinary
+monotonic clock, which excludes suspension; a host that ships a qualified platform time adapter
+supplies it through the `ContinuousClock` trait instead of using the default.
 
 ## The remote dispatch lease
 

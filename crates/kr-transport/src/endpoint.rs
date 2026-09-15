@@ -75,7 +75,10 @@ async fn bind(
         .secret_key(secret_key)
         .transport_config(transport_config())
         .relay_mode(relay_mode(config))
-        .addr_filter(address_filter(config));
+        // This endpoint keeps no TLS session tickets, so it never offers QUIC 0-RTT to anyone.
+        // Version 1 accepts no application mutation in 0-RTT, and the simplest way not to send
+        // early data is to have nothing to resume from.
+        .max_tls_tickets(0);
 
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
@@ -98,10 +101,6 @@ async fn bind(
                 reason: error.to_string(),
             })?;
     }
-    for addr in &config.direct_addresses {
-        builder = builder.external_addr(*addr);
-    }
-
     builder
         .bind()
         .await
@@ -120,8 +119,11 @@ fn relay_mode(config: &EndpointConfig) -> RelayMode {
     }
 }
 
-/// Returns the filter that decides which of this endpoint's own addresses are published.
-fn address_filter(config: &EndpointConfig) -> iroh::address_lookup::AddrFilter {
+/// Returns the filter that decides what goes into this endpoint's public discovery record.
+///
+/// It is applied to the publisher rather than to the endpoint, because an endpoint-wide filter
+/// would also strip the direct addresses that local network discovery exists to advertise.
+fn published_addresses(config: &EndpointConfig) -> iroh::address_lookup::AddrFilter {
     use iroh::address_lookup::AddrFilter;
     match config.discovery.publisher.published_addresses {
         PublishedAddresses::RelayOnly => AddrFilter::relay_only(),
@@ -135,7 +137,8 @@ fn apply_discovery(mut builder: Builder, config: &EndpointConfig) -> Result<Buil
     if let Some(url) = &discovery.pkarr_publisher_url {
         let publisher = iroh::address_lookup::PkarrPublisher::builder(url.clone())
             .ttl(discovery.publisher.ttl_seconds)
-            .republish_interval(discovery.publisher.republish_interval);
+            .republish_interval(discovery.publisher.republish_interval)
+            .addr_filter(published_addresses(config));
         builder = builder.address_lookup(publisher);
     }
     if let Some(url) = &discovery.pkarr_resolver_url {
@@ -147,10 +150,16 @@ fn apply_discovery(mut builder: Builder, config: &EndpointConfig) -> Result<Buil
         ));
     }
     if discovery.local_discovery {
-        builder = builder.address_lookup(MdnsAddressLookup::builder());
+        // A local network advertisement is direct addresses by definition, and the local network is
+        // not the public record the relay-only default protects.
+        builder = builder.address_lookup(
+            MdnsAddressLookup::builder()
+                .addr_filter(iroh::address_lookup::AddrFilter::unfiltered()),
+        );
     }
     if discovery.mainline_dht {
-        builder = builder.address_lookup(DhtAddressLookup::builder());
+        builder = builder
+            .address_lookup(DhtAddressLookup::builder().addr_filter(published_addresses(config)));
     }
     Ok(builder)
 }
