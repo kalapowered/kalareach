@@ -137,7 +137,7 @@ fn next_record(
     };
     // A record from an earlier boot is anchored to this one the first time it is seen: the reboot
     // ended its window, and from here its retention runs on a clock a wall-clock jump cannot move.
-    let record = record.anchored(now, boot, wall);
+    let record = record.anchored(now, boot);
     if record.exhausted {
         // Spent. Another advertised expiry does not reset the counter, and neither does anything
         // else: an exhausted entry needs a newly issued code.

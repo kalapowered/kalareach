@@ -706,7 +706,7 @@ fn a_candidate_sees_only_its_own_status_and_no_secret() {
     let peer = harness.client_peer();
     let status = invitation
         .status(DirectStatusViewer::Candidate {
-            attempt_id: candidate.attempt_id,
+            attempt_id: Some(candidate.attempt_id),
             live_peer: &peer,
         })
         .expect("a status");
@@ -716,7 +716,7 @@ fn a_candidate_sees_only_its_own_status_and_no_secret() {
     let stranger = kr_pairing::host::new_attempt_id().expect("an attempt");
     assert!(matches!(
         invitation.status(DirectStatusViewer::Candidate {
-            attempt_id: stranger,
+            attempt_id: Some(stranger),
             live_peer: &peer,
         }),
         Err(PairingError::NotIssuingOwner)
@@ -725,7 +725,7 @@ fn a_candidate_sees_only_its_own_status_and_no_secret() {
     let impostor = TestLivePeer::new(EndpointKey::from_bytes([0x77; 32]));
     assert!(matches!(
         invitation.status(DirectStatusViewer::Candidate {
-            attempt_id: candidate.attempt_id,
+            attempt_id: Some(candidate.attempt_id),
             live_peer: &impostor,
         }),
         Err(PairingError::NotIssuingOwner)
@@ -742,7 +742,7 @@ fn a_candidate_sees_only_its_own_status_and_no_secret() {
         .expect("a commitment");
     assert!(matches!(
         invitation.status(DirectStatusViewer::Candidate {
-            attempt_id: candidate.attempt_id,
+            attempt_id: Some(candidate.attempt_id),
             live_peer: &peer,
         }),
         Ok(PairStatus::Committed { .. })
@@ -891,6 +891,60 @@ fn a_lost_response_does_not_strand_the_candidate() {
         Err(PairingError::Consumed {
             reason: PairingConsumedReason::Cancelled
         })
+    ));
+}
+
+#[test]
+fn a_candidate_that_never_learnt_its_attempt_is_still_told_it_is_paired() {
+    let harness = Harness::new();
+    let mut invitation = harness.issue();
+    let payload = harness.scan(&invitation);
+    let challenge = invitation
+        .issue_challenge(&harness.client_peer())
+        .expect("a challenge");
+    let (proof, _) = redeem_proof(
+        &payload,
+        &challenge,
+        &harness.client_keys.authorisation,
+        &candidate_identity(&harness),
+        &harness.host_peer(),
+    )
+    .expect("a proof");
+    let peer = harness.client_peer();
+    let candidate = invitation
+        .redeem(&proof, harness.client_keys.transport.public(), &peer)
+        .expect("a redemption");
+
+    // The response was lost and the owner approved in the meantime. The candidate knows only that
+    // it redeemed; the endpoint it authenticated with is what identifies it.
+    let keys_digest = client_keys_digest(&harness.client_keys.public_keys()).expect("a digest");
+    harness
+        .confirm(&mut invitation, candidate.transcript_digest, keys_digest)
+        .expect("a commitment");
+    assert!(matches!(
+        invitation.status(DirectStatusViewer::Candidate {
+            attempt_id: None,
+            live_peer: &peer,
+        }),
+        Ok(PairStatus::Committed { .. })
+    ));
+    // The retry still works too, so the device can learn its attempt identity.
+    let retried = invitation
+        .redeem(&proof, harness.client_keys.transport.public(), &peer)
+        .expect("the same candidate");
+    assert_eq!(retried, candidate);
+
+    // After a restart the store answers, still only for that endpoint.
+    let invitation_id = invitation.invitation_id();
+    drop(invitation);
+    assert!(matches!(
+        kr_pairing::host::recover_candidate_status(&&harness.store, invitation_id, None, &peer),
+        Ok(PairStatus::Committed { .. })
+    ));
+    let impostor = TestLivePeer::new(EndpointKey::from_bytes([0x88; 32]));
+    assert!(matches!(
+        kr_pairing::host::recover_candidate_status(&&harness.store, invitation_id, None, &impostor),
+        Err(PairingError::NotIssuingOwner)
     ));
 }
 

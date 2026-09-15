@@ -171,7 +171,12 @@ impl PairingError {
             | Self::ReplayedSequence { .. }
             | Self::EarlyData
             | Self::WrongPhase { .. } => ErrorCode::PairingAuthFailed,
-            Self::Expired => ErrorCode::PairingExpired,
+            // An invitation consumed *because* it ran out reports as expired, not as rejected:
+            // the caller's retry deadline is what that distinction drives.
+            Self::Expired
+            | Self::Consumed {
+                reason: kr_protocol::pairing::PairingConsumedReason::Expired,
+            } => ErrorCode::PairingExpired,
             Self::Consumed { .. } | Self::CandidateLocked | Self::AlreadyCommitted => {
                 ErrorCode::PairingRejected
             }
@@ -209,6 +214,34 @@ mod tests {
             PairingError::EarlyData,
         ] {
             assert_eq!(error.code(), ErrorCode::PairingAuthFailed, "{error}");
+        }
+    }
+
+    #[test]
+    fn a_deadline_reports_as_expired_however_it_was_reached() {
+        use kr_protocol::pairing::PairingConsumedReason;
+
+        // A caller distinguishes "it ran out" from "it was refused", and an invitation consumed
+        // because it ran out is the first of those whichever step noticed.
+        assert_eq!(PairingError::Expired.code(), ErrorCode::PairingExpired);
+        assert_eq!(
+            PairingError::Consumed {
+                reason: PairingConsumedReason::Expired
+            }
+            .code(),
+            ErrorCode::PairingExpired
+        );
+        for reason in [
+            PairingConsumedReason::Denied,
+            PairingConsumedReason::Cancelled,
+            PairingConsumedReason::AttemptsExhausted,
+            PairingConsumedReason::HostRestarted,
+        ] {
+            assert_eq!(
+                PairingError::Consumed { reason }.code(),
+                ErrorCode::PairingRejected,
+                "{reason:?}"
+            );
         }
     }
 

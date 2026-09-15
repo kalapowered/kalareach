@@ -494,18 +494,22 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
                 live_peer,
             } => {
                 let endpoint = live_peer.live_endpoint()?;
+                // The authenticated endpoint identifies the candidate; the attempt identity is
+                // checked when the asker has one. A candidate whose redemption response was lost
+                // never learnt it and is still the device that redeemed.
+                let names =
+                    |candidate: AttemptId| attempt_id.is_none_or(|asked| asked == candidate);
                 committed.as_ref().map_or_else(
                     || {
                         // The candidate's identity outlives its lock, so a denied, cancelled or
                         // expired invitation still answers the device that redeemed it.
                         self.candidate.as_ref().is_some_and(|candidate| {
-                            candidate.attempt_id == attempt_id
+                            names(candidate.attempt_id)
                                 && candidate.transcript.client_endpoint_id == endpoint
                         })
                     },
                     |committed| {
-                        committed.attempt_id == attempt_id
-                            && committed.client_keys.transport == endpoint
+                        names(committed.attempt_id) && committed.client_keys.transport == endpoint
                     },
                 )
             }
@@ -630,9 +634,17 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         {
             return Ok(None);
         }
-        // The invitation still has to be servable: a cancelled or committed one answers through
-        // `status`, not by handing a candidate back.
-        self.require_open()?;
+        // A cancelled or expired invitation hands nothing back. A committed one does: the device
+        // is paired, and the attempt identity it is retrying for is how it asks about that.
+        self.require_not_fenced()?;
+        self.reload()?;
+        if let InvitationState::Consumed { reason } = self.record.state {
+            return Err(PairingError::Consumed { reason });
+        }
+        if self.record.state != InvitationState::Committed && self.is_expired() {
+            self.consume(PairingConsumedReason::Expired)?;
+            return Err(PairingError::Expired);
+        }
         let bytes = transcript.to_canonical_bytes();
         let secret_key = kr_crypto::secret::SymmetricKey::from_bytes(*self.secret.expose());
         kdf::verify_hmac_sha256(&secret_key, &bytes, &proof.secret_proof)
@@ -709,8 +721,9 @@ pub enum DirectStatusViewer<'a> {
     IssuingOwner(&'a OwnerContext),
     /// The candidate, which must ask from the endpoint its redemption declared.
     Candidate {
-        /// Its attempt.
-        attempt_id: AttemptId,
+        /// Its attempt, when it learnt one. A candidate whose response was lost has none, and the
+        /// endpoint it authenticated with is what identifies it either way.
+        attempt_id: Option<AttemptId>,
         /// The live connection it is asking over.
         live_peer: &'a dyn LivePeer,
     },

@@ -78,10 +78,12 @@ than allowed to undo the faster one's lock, spent guess or consumption.
 
 A restart loses the invitation object but not a completed pairing. The device record, the grant
 and the owner's proof are in the store under the invitation identity, so a host that comes back
-answers the retry and tells that candidate, on its own endpoint, that it is paired. It answers
-nothing else: the endpoint a candidate authenticated with lives in the object the restart lost, so
-a host with no way to tell one authenticated asker from another says nothing rather than telling a
-stranger that somebody's pairing was denied.
+answers the retry and tells that candidate, on its own endpoint, that it is paired. The endpoint is
+what identifies a candidate throughout; the attempt identity is checked when the asker has one and
+is never required, because a device whose response was lost never learnt it. A host answers nothing
+short of a commitment that way: the endpoint a candidate authenticated with lives in the object the
+restart lost, so a host with no way to tell one authenticated asker from another says nothing
+rather than telling a stranger that somebody's pairing was denied.
 
 **The candidate** permits five attempts per entered code, and never retries a failed key
 confirmation automatically. The counter is keyed by an HMAC of the configured origin and the
@@ -94,12 +96,14 @@ device cannot buy five more guesses by restarting and another advertised expiry 
 counter. The tombstone's retention is on the wall clock, because a monotonic deadline from the
 previous boot means nothing after one.
 
-Retention is kept on both clocks. Within the boot that wrote the record the monotonic deadline
-governs, so moving the wall clock forward cannot delete a tombstone or an open window. A record
-from an earlier boot is *anchored* the first time it is seen: the remaining retention is read off
-the wall clock once, the record becomes a tombstone, and from then on this boot's monotonic clock
-is what protects it. Without that step a record would stay on wall-clock retention indefinitely,
-and a jump forward would delete a live tombstone and hand back five attempts.
+Retention is kept on both clocks, and a record is forgotten only when **both** say it may be.
+Within the boot that wrote it the monotonic deadline holds it however the wall clock moves; a wall
+clock that runs backwards holds it longer still. A record from an earlier boot is *anchored* the
+first time it is seen: it becomes a tombstone and gets a full fresh 24 hours on this boot's
+monotonic clock. Reading the remaining time off the wall clock instead would hand an attacker the
+answer, because jumping the clock forward before the first sweep after a reboot would make that
+remainder zero. Repeated reboots therefore keep a tombstone alive longer than the required day,
+which is the safe direction: a spent code stays spent, and the owner issues a new one.
 
 The whole rule is one pure function applied inside the store's own lock, so the read, the decision
 and the write are one transition: two entries of the same code cannot both see four attempts and
@@ -116,7 +120,9 @@ The user interface distinguishes a known local configuration error, an unreachab
 expired invitation, a denied approval and exhausted attempts. An ambiguous authentication failure
 stays ambiguous: `PairingError::AuthenticationFailed` carries no reason, because a host cannot
 establish whether the code or the origin was wrong, and saying more would be guessing on the user's
-behalf. There is no cheap locator-existence answer either.
+behalf. There is no cheap locator-existence answer either. An invitation consumed *because* it ran
+out reports as expired rather than refused, whichever step noticed, because that is the difference
+a caller acts on.
 
 ## Direct QR
 
@@ -136,8 +142,9 @@ challenge and accepts no further redemption, by this route or the other. The one
 candidate's own retry: the attempt identity is the host's, so a device whose response was lost has
 no other way to learn it. An identical proof, over the same authenticated connection, with every
 member of the transcript matching and both proofs verifying again, retrieves the candidate the
-first redemption produced. Nothing is written and no challenge is spent, and a cancelled or
-committed invitation hands nothing back. The transcript `D` is
+first redemption produced. Nothing is written and no challenge is spent. A cancelled or expired
+invitation hands nothing back; a committed one does, because that device is paired and asking
+about its own pairing. The transcript `D` is
 `CBOR(["kr-pair/direct/1", invitation_id, host_endpoint, client_endpoint, host_keys, client_keys,
 proposed_grant_digest, host_nonce, client_nonce, expires_at])`. The candidate supplies
 `HMAC-SHA256(invitation_secret, D)` **and** an Ed25519 signature over `D`: the tag proves possession

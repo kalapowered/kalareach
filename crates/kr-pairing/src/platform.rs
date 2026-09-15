@@ -26,8 +26,8 @@ use kr_crypto::secret::SymmetricKey;
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{AttemptId, DeviceId, InvitationId};
 use kr_protocol::pairing::{
-    ClientBundle, DevicePublicKeys, Locator, OwnerConfirmationProof, OwnerConfirmationRequest,
-    ProposedGrant, RendezvousOrigin,
+    CLIENT_TOMBSTONE_MS, ClientBundle, DevicePublicKeys, Locator, OwnerConfirmationProof,
+    OwnerConfirmationRequest, ProposedGrant, RendezvousOrigin,
 };
 use kr_protocol::scalars::{Digest256, EndpointKey, Mac256, TimestampMs};
 
@@ -383,40 +383,43 @@ pub struct ClientAttemptRecord {
 impl ClientAttemptRecord {
     /// Returns this record anchored to the current boot, which is what a reboot does to it.
     ///
-    /// A monotonic deadline from an earlier boot means nothing, so the remaining retention is read
-    /// off the wall clock **once**, at the first sight of the record under the new boot, and from
-    /// then on the monotonic clock of this boot is what protects it. Without that step a record
-    /// would stay on wall-clock retention indefinitely, and moving the wall clock forward would
-    /// delete a live tombstone and hand back five attempts.
+    /// A monotonic deadline from an earlier boot means nothing, so the record is given a full
+    /// fresh tombstone period on *this* boot's monotonic clock. Reading the remaining time off the
+    /// wall clock instead would hand an attacker the answer: jump the clock forward before the
+    /// first sweep after a reboot and the remaining time is zero. The wall deadline is kept
+    /// unchanged beside it, and [`Self::is_expired`] needs both, so a reboot and a forward jump
+    /// can only ever lengthen retention.
+    ///
+    /// Repeated reboots therefore keep a tombstone alive longer than the required 24 hours. That
+    /// is the safe direction: the entry refuses a code that is already spent, and the owner issues
+    /// a new one rather than reusing it.
     ///
     /// Anchoring also ends the window, because section 10 says a reboot expires an unfinished
     /// entry: what survives the reboot is a tombstone, not a fresh five minutes.
     #[must_use]
-    pub fn anchored(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> Self {
+    pub fn anchored(&self, now_monotonic_ms: u64, boot: BootIdentity) -> Self {
         if self.boot_identity == boot {
             return self.clone();
         }
-        let remaining = self.retain_until_wall_ms.saturating_sub(now_wall_ms);
         Self {
             boot_identity: boot,
             first_entry_monotonic_ms: now_monotonic_ms,
             exhausted: true,
-            retain_until_monotonic_ms: now_monotonic_ms.saturating_add(remaining),
+            retain_until_monotonic_ms: now_monotonic_ms.saturating_add(CLIENT_TOMBSTONE_MS),
             ..self.clone()
         }
     }
 
     /// Returns true when this record may be forgotten.
     ///
-    /// Within the boot that wrote it, the monotonic deadline decides: a wall-clock jump forwards
-    /// must not delete a record whose retention is still running. A record from another boot has
-    /// not been anchored yet, and the wall clock is all there is until it is.
+    /// Both clocks have to agree that the retention is over, and the record has to belong to this
+    /// boot. A forward wall-clock jump is held by the monotonic deadline, a backward one lengthens
+    /// retention, and a record from another boot is never dropped at all until it is anchored.
     #[must_use]
     pub fn is_expired(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> bool {
-        if self.boot_identity == boot {
-            return now_monotonic_ms >= self.retain_until_monotonic_ms;
-        }
-        now_wall_ms >= self.retain_until_wall_ms
+        self.boot_identity == boot
+            && now_monotonic_ms >= self.retain_until_monotonic_ms
+            && now_wall_ms >= self.retain_until_wall_ms
     }
 }
 
@@ -848,7 +851,7 @@ impl ClientBudgetStore for TestClientBudgetStore {
             .lock()
             .expect("a test store")
             .retain(|_, record| {
-                *record = record.anchored(now_monotonic_ms, boot, now_wall_ms);
+                *record = record.anchored(now_monotonic_ms, boot);
                 !record.is_expired(now_monotonic_ms, boot, now_wall_ms)
             });
         Ok(())
@@ -1068,24 +1071,44 @@ mod tests {
         let store = TestClientBudgetStore::new().expect("a store");
         let key = Mac256::from_bytes([1; 32]);
         tombstone(&store, key);
-        // Another boot: the monotonic deadline means nothing, so the remaining retention is read
-        // off the wall clock once and anchored to this boot.
+        // Another boot. The monotonic deadline from the old one means nothing, so the record gets
+        // a full fresh period on this boot's clock rather than whatever the wall clock suggests.
         let rebooted = BootIdentity([9; 32]);
         store.expire(0, rebooted, 900_000).expect("an expiry sweep");
         assert_eq!(store.len(), 1);
         let anchored = store.load(&key).expect("a read").expect("a record");
         assert_eq!(anchored.boot_identity, rebooted);
-        assert_eq!(anchored.retain_until_monotonic_ms, 100_000);
+        assert_eq!(anchored.retain_until_monotonic_ms, CLIENT_TOMBSTONE_MS);
+        assert!(anchored.exhausted);
 
-        // From here the wall clock cannot touch it: a jump forward deletes nothing.
+        // A wall clock jumped years forward deletes nothing: both deadlines have to pass.
         store
-            .expire(99_999, rebooted, 9_000_000)
+            .expire(CLIENT_TOMBSTONE_MS - 1, rebooted, u64::MAX)
             .expect("an expiry sweep");
         assert_eq!(store.len(), 1);
         store
-            .expire(100_000, rebooted, 9_000_000)
+            .expire(CLIENT_TOMBSTONE_MS, rebooted, u64::MAX)
             .expect("an expiry sweep");
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_clock_jumped_forward_before_the_first_sweep_deletes_nothing() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let key = Mac256::from_bytes([1; 32]);
+        tombstone(&store, key);
+        // The wall clock is jumped past the record's retention and *then* the machine reboots, so
+        // the very first sweep of the new boot sees a deadline that has already passed.
+        let rebooted = BootIdentity([9; 32]);
+        store
+            .expire(0, rebooted, u64::MAX)
+            .expect("an expiry sweep");
+        assert_eq!(store.len(), 1, "the code is still spent");
+
+        // And another reboot does not help either.
+        let again = BootIdentity([10; 32]);
+        store.expire(0, again, u64::MAX).expect("an expiry sweep");
+        assert_eq!(store.len(), 1);
     }
 
     #[test]
@@ -1109,6 +1132,19 @@ mod tests {
         let anchored = store.load(&key).expect("a read").expect("a record");
         assert!(anchored.exhausted, "a reboot expires an unfinished entry");
         assert_eq!(anchored.attempts, 2, "and it does not hand attempts back");
+    }
+
+    #[test]
+    fn a_backward_wall_clock_only_lengthens_retention() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let key = Mac256::from_bytes([1; 32]);
+        tombstone(&store, key);
+        let boot = BootIdentity([0; 32]);
+        // The monotonic deadline has passed; the wall one has not, because the clock went back.
+        store.expire(500, boot, 0).expect("an expiry sweep");
+        assert_eq!(store.len(), 1);
+        store.expire(500, boot, 1_000_000).expect("an expiry sweep");
+        assert!(store.is_empty());
     }
 
     #[test]

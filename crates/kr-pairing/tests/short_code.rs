@@ -357,7 +357,12 @@ fn a_complete_pairing_commits_the_device_and_the_proposed_grant() {
     assert_eq!(stored, committed);
     let peer = harness.client_peer();
     assert!(matches!(
-        recover_candidate_status(&&harness.store, invitation_id, committed.attempt_id, &peer),
+        recover_candidate_status(
+            &&harness.store,
+            invitation_id,
+            Some(committed.attempt_id),
+            &peer
+        ),
         Ok(PairStatus::Committed { .. })
     ));
     // And only for that candidate, on its own endpoint.
@@ -366,7 +371,7 @@ fn a_complete_pairing_commits_the_device_and_the_proposed_grant() {
         recover_candidate_status(
             &&harness.store,
             invitation_id,
-            committed.attempt_id,
+            Some(committed.attempt_id),
             &impostor
         ),
         Err(PairingError::NotIssuingOwner)
@@ -708,7 +713,7 @@ fn a_denied_candidate_is_still_told_what_happened() {
     let peer = harness.client_peer();
     assert!(matches!(
         host.status(StatusViewer::Candidate {
-            attempt_id,
+            attempt_id: Some(attempt_id),
             live_peer: &peer,
         }),
         Ok(PairStatus::Consumed {
@@ -718,7 +723,7 @@ fn a_denied_candidate_is_still_told_what_happened() {
     let impostor = TestLivePeer::new(EndpointKey::from_bytes([0x77; 32]));
     assert!(matches!(
         host.status(StatusViewer::Candidate {
-            attempt_id,
+            attempt_id: Some(attempt_id),
             live_peer: &impostor,
         }),
         Err(PairingError::NotIssuingOwner)
@@ -743,7 +748,7 @@ fn a_fenced_invitation_reports_nothing_and_consumes_nothing() {
     for outcome in [
         host.status(StatusViewer::IssuingOwner(&harness.issuing_owner)),
         host.status(StatusViewer::Candidate {
-            attempt_id: kr_pairing::host::new_attempt_id().expect("an attempt"),
+            attempt_id: Some(kr_pairing::host::new_attempt_id().expect("an attempt")),
             live_peer: &peer,
         }),
     ] {
@@ -1476,7 +1481,7 @@ fn a_candidate_sees_only_its_own_status_from_its_own_endpoint() {
     let peer = harness.client_peer();
     let status = host
         .status(StatusViewer::Candidate {
-            attempt_id,
+            attempt_id: Some(attempt_id),
             live_peer: &peer,
         })
         .expect("a status");
@@ -1488,7 +1493,7 @@ fn a_candidate_sees_only_its_own_status_from_its_own_endpoint() {
     let impostor = TestLivePeer::new(EndpointKey::from_bytes([0x77; 32]));
     assert!(matches!(
         host.status(StatusViewer::Candidate {
-            attempt_id,
+            attempt_id: Some(attempt_id),
             live_peer: &impostor,
         }),
         Err(PairingError::NotIssuingOwner)
@@ -1497,7 +1502,7 @@ fn a_candidate_sees_only_its_own_status_from_its_own_endpoint() {
     let stranger = kr_pairing::host::new_attempt_id().expect("an attempt");
     assert!(matches!(
         host.status(StatusViewer::Candidate {
-            attempt_id: stranger,
+            attempt_id: Some(stranger),
             live_peer: &peer,
         }),
         Err(PairingError::NotIssuingOwner)
@@ -1508,14 +1513,14 @@ fn a_candidate_sees_only_its_own_status_from_its_own_endpoint() {
     approve(&harness, &mut host).expect("a commitment");
     assert!(matches!(
         host.status(StatusViewer::Candidate {
-            attempt_id,
+            attempt_id: Some(attempt_id),
             live_peer: &peer,
         }),
         Ok(PairStatus::Committed { .. })
     ));
     assert!(matches!(
         host.status(StatusViewer::Candidate {
-            attempt_id,
+            attempt_id: Some(attempt_id),
             live_peer: &impostor,
         }),
         Err(PairingError::NotIssuingOwner)

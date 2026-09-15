@@ -1131,17 +1131,20 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
     }
 
     /// Decides whether a candidate may read this invitation's status.
+    ///
+    /// The authenticated endpoint is what identifies a candidate. The attempt identity is checked
+    /// when the asker has one and is not required, because a candidate whose response was lost
+    /// never learnt it.
     fn candidate_may_view(
         &self,
-        attempt_id: AttemptId,
+        attempt_id: Option<AttemptId>,
         live_peer: &dyn LivePeer,
         committed: Option<&PairingCommitment>,
     ) -> Result<bool> {
         let endpoint = live_peer.live_endpoint()?;
+        let names = |candidate: AttemptId| attempt_id.is_none_or(|asked| asked == candidate);
         if let Some(committed) = committed {
-            return Ok(
-                committed.attempt_id == attempt_id && committed.client_keys.transport == endpoint
-            );
+            return Ok(names(committed.attempt_id) && committed.client_keys.transport == endpoint);
         }
         // The live attempt first, then the identity kept from it. The second is what answers a
         // candidate after a denial, a cancellation or an expiry has cleared the attempts: the
@@ -1150,13 +1153,14 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         // answer is the ambiguous refusal.
         if let Some(signed) = self
             .attempts
-            .get(&attempt_id)
-            .and_then(|attempt| attempt.client_bundle.as_ref())
+            .iter()
+            .filter(|(id, _)| names(**id))
+            .find_map(|(_, attempt)| attempt.client_bundle.as_ref())
         {
             return Ok(signed.bundle.endpoint_id == endpoint);
         }
         Ok(self.last_candidate.is_some_and(|candidate| {
-            candidate.attempt_id == attempt_id && candidate.endpoint_id == endpoint
+            names(candidate.attempt_id) && candidate.endpoint_id == endpoint
         }))
     }
 
@@ -1338,8 +1342,9 @@ pub enum StatusViewer<'a> {
     IssuingOwner(&'a OwnerContext),
     /// One candidate, which must ask from the endpoint its own bundle declared.
     Candidate {
-        /// Its attempt.
-        attempt_id: AttemptId,
+        /// Its attempt, when it learnt one. A candidate whose response was lost has none, and the
+        /// endpoint it authenticated with is what identifies it either way.
+        attempt_id: Option<AttemptId>,
         /// The live connection it is asking over.
         live_peer: &'a dyn LivePeer,
     },
@@ -1398,37 +1403,41 @@ pub fn recover_commitment(
 
 /// Answers a candidate that asks what became of a pairing, after the host restarted.
 ///
-/// The candidate proves the same endpoint its bundle declared and names its own attempt, so this
-/// tells nobody else anything. It reports a committed pairing from the commitment and everything
-/// else from the record.
+/// The candidate proves the endpoint its own bundle declared, which is what identifies it: the
+/// commitment records that key, so the answer reaches the paired device and nobody else. The
+/// attempt identity is checked when the candidate has one and is not required, because a candidate
+/// whose `pair.finish` response was lost never learnt it and is still the device that paired.
+///
+/// Only a committed pairing is recoverable this way. The endpoint a candidate authenticated with
+/// lives in the invitation object the restart lost, so for anything else there is nothing to tell
+/// one authenticated asker from another, and "somebody's pairing was denied" is not something to
+/// tell a stranger. A host that still holds the invitation answers through
+/// [`HostInvitation::status`], which does have that identity.
 ///
 /// # Errors
 ///
 /// Returns [`PairingError::EarlyData`] in 0-RTT, [`PairingError::NotIssuingOwner`] when the asker
-/// is not that candidate, and [`PairingError::Store`].
+/// is not the paired candidate, and [`PairingError::Store`].
 pub fn recover_candidate_status(
     store: &dyn InvitationStore,
     invitation_id: InvitationId,
-    attempt_id: AttemptId,
+    attempt_id: Option<AttemptId>,
     live_peer: &dyn LivePeer,
 ) -> Result<PairStatus> {
     require_completed_handshake(live_peer)?;
     let endpoint = live_peer.live_endpoint()?;
-    if let Some(committed) = store.commitment(invitation_id)? {
-        if committed.attempt_id != attempt_id || committed.client_keys.transport != endpoint {
-            return Err(PairingError::NotIssuingOwner);
-        }
-        return Ok(PairStatus::Committed {
-            device_id: committed.device_id,
-            grant_id: committed.grant.grant_id,
-        });
+    let Some(committed) = store.commitment(invitation_id)? else {
+        return Err(PairingError::NotIssuingOwner);
+    };
+    if committed.client_keys.transport != endpoint
+        || attempt_id.is_some_and(|attempt_id| committed.attempt_id != attempt_id)
+    {
+        return Err(PairingError::NotIssuingOwner);
     }
-    // Anything short of a commitment is refused. The endpoint a candidate authenticated with lives
-    // in the invitation object the restart lost, so nothing persisted can tell this asker apart
-    // from any other authenticated endpoint, and "your pairing was denied" is not something to
-    // tell a stranger. A host that still holds the invitation answers through
-    // [`HostInvitation::status`], which does have that identity.
-    Err(PairingError::NotIssuingOwner)
+    Ok(PairStatus::Committed {
+        device_id: committed.device_id,
+        grant_id: committed.grant.grant_id,
+    })
 }
 
 /// Returns 128 random bits.
