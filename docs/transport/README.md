@@ -277,8 +277,8 @@ establishing one that silently cannot carry something the protocol defines:
 | `max_send_queue_bytes` | 2 MiB + 4 KiB | One complete attachment frame beside the control reserve |
 
 Section 9 calls these configurable resource limits, and they are: a peer that wants smaller frames
-than the protocol defaults gets them, and is held to what it declared. Each floor is only what the
-connection itself could not work below. A declaration above a floor is always accepted and then
+than the protocol defaults gets them, and is held to what it declared. Each floor is a conservative
+minimum for what the connection itself must carry, not a mathematically minimal bound. A declaration above a floor is always accepted and then
 clamped to this build's own codec maxima, which is how a later version raises a bound without
 breaking this one. Below the send-queue floor a connection could still carry smaller frames; what it
 could never carry is the full chunk size a transfer needs, which is why the floor is there.

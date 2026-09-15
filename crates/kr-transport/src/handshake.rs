@@ -295,9 +295,10 @@ pub async fn accept_on(
         clock_epoch: epochs.clock_epoch,
     };
 
-    // A peer that declared a send queue too small for an attachment frame gets a refusal rather
-    // than a connection that silently cannot carry a transfer. It is a configuration mistake on one
-    // of the two sides, and the reply says which value is too small.
+    // A peer that declared limits the connection could not work within gets a refusal rather than a
+    // connection that silently cannot carry the full attachment allowance beside the control
+    // reserve. It is a configuration mistake on one of the two sides, and the reply says which
+    // value is too small.
     if let Err(error) = crate::scheduler::check_negotiated(selection.limits) {
         writer
             .write_message(&HelloReply::Refused(error.clone()))

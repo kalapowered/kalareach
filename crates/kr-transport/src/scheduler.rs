@@ -74,19 +74,20 @@ pub const MIN_CONTROL_FRAME_LEN: usize = crate::handshake::MAX_OFFER_LEN;
 
 /// The smallest input frame bound a peer can negotiate.
 ///
-/// An input frame is an actor envelope around a batch of keystrokes. The envelope alone is a few
-/// hundred bytes of identity, lease epoch and sequence, so a kibibyte is the smallest bound that
-/// still leaves room for the keystrokes the frame exists to carry.
+/// A kibibyte is a conservative minimum rather than a derived one: an input frame carries an actor
+/// envelope, which is a few hundred bytes of identity at its largest, and this leaves the rest for
+/// the keystrokes the frame exists to carry. A peer that wants smaller input frames than the
+/// protocol default gets them; one that asks for less than this has left no room for the payload.
 pub const MIN_INPUT_FRAME_LEN: usize = 1024;
 
 /// Checks that negotiated limits leave a connection able to carry what the protocol requires.
 ///
 /// Section 9 calls these configurable resource limits, so a peer is free to declare less than the
 /// protocol default and this build holds it to what it declared. Each floor here is what the
-/// connection itself could not work below: the control and input bounds are what the transport's
-/// own frames and one envelope of keystrokes need, the attachment bound is the complete chunk
-/// allowance sections 14 and 23 define, and the send queue has to fit one such chunk beside the
-/// control reserve. A declaration above a floor is always accepted; this build clamps it to its own
+/// connection itself could not work below, and each is conservative rather than minimal: the
+/// control and input bounds leave room for the transport's own frames and for one envelope with
+/// its keystrokes, the attachment bound is the complete chunk allowance sections 14 and 23 define,
+/// and the send queue has to fit one such chunk beside the control reserve. A declaration above a floor is always accepted; this build clamps it to its own
 /// codec maxima, which is how a later version raises a bound without breaking this one.
 ///
 /// # Errors
