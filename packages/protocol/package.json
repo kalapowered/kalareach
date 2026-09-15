@@ -5,16 +5,24 @@
   "license": "BSD-3-Clause",
   "type": "module",
   "main": "./src/index.ts",
-  "types": "./src/index.ts",
+  "types": "./types/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./schema/*": "./schema/*"
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.ts"
+    },
+    "./schema/*": "./schema/*",
+    "./fixtures/*": "./fixtures/*"
   },
   "files": [
     "src",
-    "schema"
+    "schema",
+    "types",
+    "fixtures",
+    "provenance.json"
   ],
   "scripts": {
+    "prepack": "node scripts/prepack.mjs",
     "generate": "node scripts/generate-types.mjs",
     "generate:check": "node scripts/generate-types.mjs --check",
     "typecheck": "tsc --noEmit",
