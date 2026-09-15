@@ -104,6 +104,20 @@ describe('membership leases', () => {
     }
   })
 
+  it('refuses an identifier the host would refuse', () => {
+    const lease = findCase('membership_lease').json as MembershipLease
+    // `kr_protocol::ids` bounds an opaque identifier and rejects every control
+    // character, in both blocks. An identifier one side admits and the other
+    // refuses is an identifier the two disagree about.
+    for (const account of ['', 'a\u0000b', 'a\u001fb', 'a\u007fb', 'a\u0085b', 'a\u009fb', 'a'.repeat(257)]) {
+      expect(() => membershipLeaseSigningInput({ ...lease.payload, account_id: account }))
+        .toThrow(AccountSchemaError)
+    }
+
+    expect(() => membershipLeaseSigningInput({ ...lease.payload, account_id: 'a'.repeat(256) }))
+      .not.toThrow()
+  })
+
   it('refuses a payload that is not the closed schema', () => {
     const lease = findCase('membership_lease').json as MembershipLease
     expect(() => membershipLeaseSigningInput({ ...lease.payload, scope: 'everything' } as never))

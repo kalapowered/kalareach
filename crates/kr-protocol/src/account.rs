@@ -414,16 +414,22 @@ impl PolicyAuthority {
     ///
     /// 1. runs this check, which is what a complete published chain must satisfy: it starts at the
     ///    revision that signs itself and runs to the revision the head names;
-    /// 2. verifies the link of the revision it pinned against the public key it pinned, then each
-    ///    later link under the key of the revision it names as its predecessor;
-    /// 3. verifies the head under the key of the revision the head names;
-    /// 4. requires [`PolicyAuthorityHeadPayload::is_valid_at`] for the current time, because a
+    /// 2. matches the link of the revision it pinned against the pin itself — the same
+    ///    organisation, the same revision and the same public key — rather than verifying that
+    ///    link's signature, which is the predecessor's at every revision after the first;
+    /// 3. verifies each later link under the public key of the revision it names as its
+    ///    predecessor, from the pinned revision forward;
+    /// 4. verifies the head under the public key of the revision the head names;
+    /// 5. requires [`PolicyAuthorityHeadPayload::is_valid_at`] for the current time, because a
     ///    correctly signed head that has expired says nothing about now;
-    /// 5. refuses a head below the highest revision it has already accepted, and only then records
+    /// 6. refuses a head below the highest revision it has already accepted, and only then records
     ///    the new highest revision.
     ///
-    /// A lease is checked separately, against the key of the revision the lease names: its own
-    /// window, its lifetime, and that its ceiling stays inside its role.
+    /// A lease is checked separately, against the public key of the revision the lease names: its
+    /// signature, its own window, its lifetime, that its ceiling stays inside its role, and that
+    /// the revision that signed it was the signing revision when the lease was issued — its
+    /// `not_before_ms` is at or before the lease's `issued_at_ms`, and its successor's, where the
+    /// chain has one, is after.
     ///
     /// # Errors
     ///

@@ -143,8 +143,11 @@ function opaqueIdentifier (what: string, value: unknown): CanonicalValue {
   if (new TextEncoder().encode(value).length > MAX_OPAQUE_ID_BYTES) {
     refuse(`${what} is at most ${String(MAX_OPAQUE_ID_BYTES)} bytes`)
   }
+  // Both blocks of control characters, because the host rejects both: a value
+  // one side admits and the other refuses is an identifier the two disagree
+  // about, which is the one thing a shared encoder exists to prevent.
   // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f]/.test(value)) {
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(value)) {
     refuse(`${what} carries no control characters`)
   }
   return krText(value)
