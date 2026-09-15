@@ -1,0 +1,33 @@
+{
+  "name": "@kalareach/protocol",
+  "version": "0.1.0",
+  "description": "KalaReach protocol types, KR-CBOR-1 codec and conformance fixtures",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema/*": "./schema/*"
+  },
+  "files": [
+    "src",
+    "schema"
+  ],
+  "scripts": {
+    "generate": "node scripts/generate-types.mjs",
+    "generate:check": "node scripts/generate-types.mjs --check",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && vitest run"
+  },
+  "dependencies": {
+    "cborg": "6.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.2",
+    "json-schema-to-typescript": "16.0.0",
+    "typescript": "5.9.3",
+    "vite": "8.3.0",
+    "vitest": "5.0.1"
+  }
+}
