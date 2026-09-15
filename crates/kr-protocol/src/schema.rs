@@ -14,11 +14,11 @@ use serde_json::{Map, Value, json};
 use crate::actor::ActorEnvelope;
 use crate::archive::{ArchiveDescriptor, RecoveryBundle, RecoveryKit, SignedArchiveManifest};
 use crate::authority::MethodEntry;
-use crate::envelope::{MutationRequest, Notification, Request, Response};
+use crate::envelope::{ControlFrame, MutationRequest, Notification, Request, Response};
 use crate::error::ProtocolError;
 use crate::frame::StreamHeader;
 use crate::grant::Grant;
-use crate::hello::{ActionWindow, ClientOffer, ConnectReply, ControlEvent, HelloReply, HostSelection};
+use crate::hello::{ActionWindow, ClientOffer, ConnectReply, HelloReply, HostSelection};
 use crate::ids;
 use crate::ids::SessionRef;
 use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
@@ -63,7 +63,7 @@ pub fn protocol_schema() -> Value {
         "authority_revision_record" => AuthorityRevisionRecord,
         "client_offer" => ClientOffer,
         "connect_reply" => ConnectReply,
-        "control_event" => ControlEvent,
+        "control_frame" => ControlFrame,
         "direct_challenge" => DirectChallenge,
         "direct_redeem_proof" => DirectRedeemProof,
         "envelope_plaintext" => EnvelopePlaintext,

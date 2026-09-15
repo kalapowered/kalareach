@@ -41,12 +41,69 @@ export type ConnectReply =
  */
 export type DiagnosticId = string
 /**
- * What the host sends on the control stream outside a response.
+ * One frame on an authorised control stream.
  *
- * The control stream carries ordinary [`crate::envelope::Notification`] events once the
- * connection is authorised. These two messages are the connection's own, not an application
- * event: they exist because the freshness resource and the transport's liveness belong to the
- * connection rather than to any session.
+ * The union is closed. A receiver that cannot name the variant rejects the frame rather than
+ * guessing, which is what keeps an unknown method a correlated error instead of a parse failure.
+ *
+ * Both transports carry these frames: section 23 says local Unix sockets and Windows named pipes
+ * carry the same typed frames with local peer authentication. What differs is how the connection
+ * is authenticated before the first frame, not what travels afterwards.
+ */
+export type ControlFrame =
+  | {
+      request: Request
+    }
+  | {
+      mutation: MutationRequest
+    }
+  | {
+      response: Response
+    }
+  | {
+      receipt: ReceiptResponse
+    }
+  | {
+      notification: Notification
+    }
+  | {
+      event: ControlEvent
+    }
+/**
+ * Changes when the active upstream execution owner or selected thread changes.
+ */
+export type AgentBindingRevision = string
+/**
+ * One foreground application within a terminal session.
+ */
+export type ApplicationInstanceId = string
+/**
+ * The session epoch, fixed at 1 in protocol version 1.
+ */
+export type SessionEpoch = string
+/**
+ * One KalaReach terminal session.
+ */
+export type SessionId = string
+/**
+ * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+ */
+export type ParamsValue = unknown
+/**
+ * A UTC timestamp in milliseconds, as a decimal string in JSON.
+ */
+export type TimestampMs = string
+/**
+ * Why an action was rejected before dispatch.
+ */
+export type RejectionReason =
+  'admission_failed' | 'expired' | 'cancelled' | 'revoked' | 'stale_preconditions'
+/**
+ * What the host sends on an authorised control stream outside a response.
+ *
+ * The control stream carries ordinary [`Notification`] events once the connection is authorised.
+ * These two messages are the connection's own, not an application event: the freshness resource
+ * and the transport's liveness belong to the connection rather than to any session.
  */
 export type ControlEvent =
   | {
@@ -57,14 +114,6 @@ export type ControlEvent =
  * One installed OS, distribution or container environment and OS user.
  */
 export type EnvironmentId = string
-/**
- * The session epoch, fixed at 1 in protocol version 1.
- */
-export type SessionEpoch = string
-/**
- * One KalaReach terminal session.
- */
-export type SessionId = string
 /**
  * One permitted action in a grant.
  */
@@ -90,10 +139,6 @@ export type ActionRight =
   | 'session.share'
   | 'automation.manage'
   | 'host.manage'
-/**
- * A UTC timestamp in milliseconds, as a decimal string in JSON.
- */
-export type TimestampMs = string
 /**
  * An upstream approval request identifier. Opaque to KalaReach.
  */
@@ -129,10 +174,6 @@ export type ActionWindowId = string
  */
 export type ActorId = string
 /**
- * Changes when the active upstream execution owner or selected thread changes.
- */
-export type AgentBindingRevision = string
-/**
  * The upstream agent's conversation identifier, where available. Correlation data, not authority.
  */
 export type AgentThreadId = string
@@ -140,10 +181,6 @@ export type AgentThreadId = string
  * The upstream agent's current turn identifier, where available.
  */
 export type AgentTurnId = string
-/**
- * One foreground application within a terminal session.
- */
-export type ApplicationInstanceId = string
 /**
  * One backup archive. The service sees only this opaque identifier.
  */
@@ -442,15 +479,6 @@ export type PairStatus =
       }
     }
 /**
- * Why an action was rejected before dispatch.
- */
-export type RejectionReason =
-  'admission_failed' | 'expired' | 'cancelled' | 'revoked' | 'stale_preconditions'
-/**
- * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
- */
-export type ParamsValue = unknown
-/**
  * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
  */
 export type NetworkHint = string
@@ -465,7 +493,7 @@ export interface KalaReachProtocol {
   authority_revision_record?: AuthorityRevisionRecord
   client_offer?: ClientOffer
   connect_reply?: ConnectReply
-  control_event?: ControlEvent
+  control_frame?: ControlFrame
   direct_challenge?: DirectChallenge
   direct_redeem_proof?: DirectRedeemProof
   envelope_plaintext?: EnvelopePlaintext
@@ -554,7 +582,7 @@ export interface KalaReachProtocol {
   pair_status?: PairStatus
   proposed_grant?: ProposedGrant
   protocol_error?: ProtocolError
-  receipt?: Receipt
+  receipt?: Receipt1
   receipt_response?: ReceiptResponse
   recovery_bundle?: RecoveryBundle
   recovery_kit?: RecoveryKit
@@ -952,6 +980,208 @@ export interface ProtocolError {
   retry: 'no_retry' | 'transient' | 'resync' | 'configuration_change' | 'outcome_unknown'
 }
 /**
+ * A read request.
+ */
+export interface Request {
+  /**
+   * The method name. A name that is not in the registry is denied.
+   */
+  method: string
+  /**
+   * The method version. Schemas are closed for the negotiated version.
+   */
+  method_version: number
+  /**
+   * The method's parameters.
+   */
+  params: unknown
+  /**
+   * Correlates the response. Unique for the lifetime of one connection.
+   */
+  request_id: string
+}
+/**
+ * A mutation request.
+ *
+ * The payload digest covers the method and version, the actor and grant, the complete target, the
+ * preconditions, the action identifier, the freshness window and time to live, and the
+ * parameters. Replacing the window changes the digest, so it is never an automatic retry.
+ */
+export interface MutationRequest {
+  /**
+   * The durable operation identity, a cryptographically generated UUIDv4.
+   */
+  action_id: string
+  /**
+   * The host-issued action window this first admission is bound to.
+   */
+  action_window_id: string
+  /**
+   * The subject preconditions this mutation requires.
+   */
+  expected: unknown
+  /**
+   * The grant this mutation is claimed under. A local caller's host-stamped context leaves this
+   * null and the host resolves its own owner authority.
+   */
+  grant_id: GrantId | null
+  /**
+   * The method name.
+   */
+  method: string
+  /**
+   * The method version.
+   */
+  method_version: number
+  /**
+   * The method's parameters.
+   */
+  params: unknown
+  /**
+   * Correlates the response. Durable operation identity is `action_id`, not this.
+   */
+  request_id: string
+  /**
+   * The requested lifetime. The host derives the accepted deadline and may shorten it. This is
+   * a duration, not permission to refresh a replay.
+   */
+  requested_ttl_ms: string
+  target: ActionTarget
+}
+/**
+ * The exact subject.
+ */
+export interface ActionTarget {
+  /**
+   * The agent binding revision, present exactly when `application_instance_id` is.
+   */
+  agent_binding_revision: AgentBindingRevision | null
+  /**
+   * The foreground application instance, when the effect has one.
+   */
+  application_instance_id: ApplicationInstanceId | null
+  /**
+   * The environment that owns the effect.
+   */
+  environment_id: string
+  /**
+   * The session epoch, present exactly when `session_id` is.
+   */
+  session_epoch: SessionEpoch | null
+  /**
+   * The session, when the effect has one.
+   */
+  session_id: SessionId | null
+}
+/**
+ * A response correlated to one request.
+ */
+export interface Response {
+  /**
+   * The result.
+   */
+  outcome:
+    | {
+        ok: ParamsValue
+      }
+    | {
+        error: ProtocolError
+      }
+  /**
+   * The request this response answers.
+   */
+  request_id: string
+}
+/**
+ * The response to a mutation request.
+ *
+ * A duplicate request from a still-authorised actor returns the retained receipt without
+ * dispatch. The host checks current authority before returning it, so a revoked device cannot use
+ * an old action identifier to retrieve protected information.
+ */
+export interface ReceiptResponse {
+  receipt: Receipt
+  /**
+   * The request this response correlates with.
+   */
+  request_id: string
+}
+/**
+ * The current receipt.
+ */
+export interface Receipt {
+  /**
+   * The deadline the host derived at acceptance: the earliest of window expiry, receipt time
+   * plus the requested time to live, and any applicable authority or subject deadline. An exact
+   * retry never receives a new deadline.
+   */
+  accepted_deadline_ms: TimestampMs | null
+  /**
+   * The durable operation identity.
+   */
+  action_id: string
+  /**
+   * The verified actor that submitted it.
+   */
+  actor_id: string
+  /**
+   * The failure recorded with a refusal, rejection or unknown outcome.
+   */
+  error: ProtocolError | null
+  /**
+   * The method and version the digest covers.
+   */
+  method: string
+  /**
+   * The method version the digest covers.
+   */
+  method_version: number
+  /**
+   * The digest of the submitted payload, used to detect a reused identifier.
+   */
+  payload_digest: string
+  /**
+   * Why the action was rejected, when the state is `rejected`.
+   */
+  reason: RejectionReason | null
+  /**
+   * A monotonically increasing revision.
+   */
+  revision: string
+  /**
+   * The current state.
+   */
+  state: 'received' | 'accepted' | 'dispatching' | 'applied' | 'refused' | 'rejected' | 'unknown'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  updated_at_ms: string
+}
+/**
+ * One event on a subscribed stream.
+ *
+ * Stream sequences are application sequence numbers. Transport streams do not replace them, and a
+ * client that falls behind receives `RESYNC_REQUIRED` rather than holding the read loop.
+ */
+export interface Notification {
+  /**
+   * What happened.
+   */
+  event_type: string
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  payload: unknown
+  /**
+   * The position of this event in that stream.
+   */
+  sequence: string
+  /**
+   * Which stream the event belongs to.
+   */
+  stream_id: string
+}
+/**
  * The host challenge a direct redemption starts from. Single use, and it expires with the
  * invitation.
  */
@@ -965,7 +1195,7 @@ export interface DirectChallenge {
    */
   endpoint_id: string
   /**
-   * The invitation's original expiry.
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   expires_at_ms: string
   host_keys: DevicePublicKeys
@@ -1067,7 +1297,7 @@ export interface DevicePublicKeys1 {
  */
 export interface EnvelopePlaintext {
   /**
-   * When the sender created it, in UTC milliseconds.
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   created_at_ms: string
   /**
@@ -1079,7 +1309,7 @@ export interface EnvelopePlaintext {
    */
   environment_id: EnvironmentId | null
   /**
-   * When it expires, in UTC milliseconds.
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   expires_at_ms: string
   /**
@@ -1136,7 +1366,7 @@ export interface GenerationCheckpoint {
    */
   encrypted_manifest_hash: string
   /**
-   * When the sending device observed it, in UTC milliseconds.
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   observed_at_ms: string
 }
@@ -1173,7 +1403,7 @@ export interface Grant {
     | {
         at: {
           /**
-           * The deadline in UTC milliseconds.
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
            */
           expires_at_ms: string
         }
@@ -1657,103 +1887,6 @@ export interface RequiredRight {
     | 'issuing_owner'
 }
 /**
- * A mutation request.
- *
- * The payload digest covers the method and version, the actor and grant, the complete target, the
- * preconditions, the action identifier, the freshness window and time to live, and the
- * parameters. Replacing the window changes the digest, so it is never an automatic retry.
- */
-export interface MutationRequest {
-  /**
-   * The durable operation identity, a cryptographically generated UUIDv4.
-   */
-  action_id: string
-  /**
-   * The host-issued action window this first admission is bound to.
-   */
-  action_window_id: string
-  /**
-   * The subject preconditions this mutation requires.
-   */
-  expected: unknown
-  /**
-   * The grant this mutation is claimed under. A local caller's host-stamped context leaves this
-   * null and the host resolves its own owner authority.
-   */
-  grant_id: GrantId | null
-  /**
-   * The method name.
-   */
-  method: string
-  /**
-   * The method version.
-   */
-  method_version: number
-  /**
-   * The method's parameters.
-   */
-  params: unknown
-  /**
-   * Correlates the response. Durable operation identity is `action_id`, not this.
-   */
-  request_id: string
-  /**
-   * The requested lifetime. The host derives the accepted deadline and may shorten it. This is
-   * a duration, not permission to refresh a replay.
-   */
-  requested_ttl_ms: string
-  target: ActionTarget
-}
-/**
- * The exact subject.
- */
-export interface ActionTarget {
-  /**
-   * The agent binding revision, present exactly when `application_instance_id` is.
-   */
-  agent_binding_revision: AgentBindingRevision | null
-  /**
-   * The foreground application instance, when the effect has one.
-   */
-  application_instance_id: ApplicationInstanceId | null
-  /**
-   * The environment that owns the effect.
-   */
-  environment_id: string
-  /**
-   * The session epoch, present exactly when `session_id` is.
-   */
-  session_epoch: SessionEpoch | null
-  /**
-   * The session, when the effect has one.
-   */
-  session_id: SessionId | null
-}
-/**
- * One event on a subscribed stream.
- *
- * Stream sequences are application sequence numbers. Transport streams do not replace them, and a
- * client that falls behind receives `RESYNC_REQUIRED` rather than holding the read loop.
- */
-export interface Notification {
-  /**
-   * What happened.
-   */
-  event_type: string
-  /**
-   * The event payload.
-   */
-  payload: unknown
-  /**
-   * The position of this event in that stream.
-   */
-  sequence: string
-  /**
-   * Which stream the event belongs to.
-   */
-  stream_id: string
-}
-/**
  * An owner's answer to a confirmation challenge.
  *
  * The verification ceremony itself is platform code; this object records its result and binds it
@@ -1961,7 +2094,7 @@ export interface ProposedGrant {
     | {
         at: {
           /**
-           * The deadline in UTC milliseconds.
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
            */
           expires_at_ms: string
         }
@@ -2017,71 +2150,6 @@ export interface HistoryScope1 {
  *
  * The de-duplication key is `(actor_id, action_id)`. An exact duplicate returns the stored
  * receipt; a reused identifier with a different payload digest is an `ID_CONFLICT`.
- */
-export interface Receipt {
-  /**
-   * The deadline the host derived at acceptance: the earliest of window expiry, receipt time
-   * plus the requested time to live, and any applicable authority or subject deadline. An exact
-   * retry never receives a new deadline.
-   */
-  accepted_deadline_ms: TimestampMs | null
-  /**
-   * The durable operation identity.
-   */
-  action_id: string
-  /**
-   * The verified actor that submitted it.
-   */
-  actor_id: string
-  /**
-   * The failure recorded with a refusal, rejection or unknown outcome.
-   */
-  error: ProtocolError | null
-  /**
-   * The method and version the digest covers.
-   */
-  method: string
-  /**
-   * The method version the digest covers.
-   */
-  method_version: number
-  /**
-   * The digest of the submitted payload, used to detect a reused identifier.
-   */
-  payload_digest: string
-  /**
-   * Why the action was rejected, when the state is `rejected`.
-   */
-  reason: RejectionReason | null
-  /**
-   * A monotonically increasing revision.
-   */
-  revision: string
-  /**
-   * The current state.
-   */
-  state: 'received' | 'accepted' | 'dispatching' | 'applied' | 'refused' | 'rejected' | 'unknown'
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  updated_at_ms: string
-}
-/**
- * The response to a mutation request.
- *
- * A duplicate request from a still-authorised actor returns the retained receipt without
- * dispatch. The host checks current authority before returning it, so a revoked device cannot use
- * an old action identifier to retrieve protected information.
- */
-export interface ReceiptResponse {
-  receipt: Receipt1
-  /**
-   * The request this response correlates with.
-   */
-  request_id: string
-}
-/**
- * The current receipt.
  */
 export interface Receipt1 {
   /**
@@ -2254,46 +2322,6 @@ export interface RecoveryKit {
   service_origins: string[]
 }
 /**
- * A read request.
- */
-export interface Request {
-  /**
-   * The method name. A name that is not in the registry is denied.
-   */
-  method: string
-  /**
-   * The method version. Schemas are closed for the negotiated version.
-   */
-  method_version: number
-  /**
-   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
-   */
-  params: unknown
-  /**
-   * Correlates the response. Unique for the lifetime of one connection.
-   */
-  request_id: string
-}
-/**
- * A response correlated to one request.
- */
-export interface Response {
-  /**
-   * The result.
-   */
-  outcome:
-    | {
-        ok: ParamsValue
-      }
-    | {
-        error: ProtocolError
-      }
-  /**
-   * The request this response answers.
-   */
-  request_id: string
-}
-/**
  * The host's acknowledgement of one revocation request.
  */
 export interface RevocationAcknowledgement {
@@ -2402,7 +2430,7 @@ export interface EnvelopeRouting {
    */
   envelope_id: string
   /**
-   * When the service may delete the item, in UTC milliseconds.
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   expires_at_ms: string
   /**
@@ -2677,7 +2705,7 @@ export interface ProposedGrant1 {
     | {
         at: {
           /**
-           * The deadline in UTC milliseconds.
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
            */
           expires_at_ms: string
         }

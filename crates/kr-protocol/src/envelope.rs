@@ -17,11 +17,13 @@ use serde::de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::ProtocolError;
+use crate::hello::ActionWindow;
 use crate::ids::{
     ActionId, ActionWindowId, AgentBindingRevision, ApplicationInstanceId, EnvironmentId,
     EventSequence, EventType, GrantId, RequestId, SessionEpoch, SessionId, StreamId,
 };
 use crate::method::{MethodName, MethodVersion};
+use crate::receipt::ReceiptResponse;
 use crate::scalars::{DurationMs, Nullable, to_base64url};
 
 /// An opaque KR-CBOR-1 value carried in an envelope.
@@ -410,4 +412,51 @@ pub struct Notification {
     pub event_type: EventType,
     /// The event payload.
     pub payload: ParamsValue,
+}
+
+/// What the host sends on an authorised control stream outside a response.
+///
+/// The control stream carries ordinary [`Notification`] events once the connection is authorised.
+/// These two messages are the connection's own, not an application event: the freshness resource
+/// and the transport's liveness belong to the connection rather than to any session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlEvent {
+    /// The host renewed this connection's action window.
+    ///
+    /// Section 9: windows are short-lived freshness resources, renewed explicitly on a live
+    /// authorised connection. The host renews on its own schedule, so a client never has to ask
+    /// for one and never has to guess how long it has.
+    ActionWindowRenewed(ActionWindow),
+    /// A keepalive. It carries nothing; its arrival is the whole message.
+    ///
+    /// Section 23 puts the keepalive at ten seconds while active and the inactivity threshold at
+    /// 30. The transport's own keepalive covers a network connection; this one also covers a local
+    /// socket, which carries the same typed frames and has no equivalent underneath it.
+    Keepalive,
+}
+
+/// One frame on an authorised control stream.
+///
+/// The union is closed. A receiver that cannot name the variant rejects the frame rather than
+/// guessing, which is what keeps an unknown method a correlated error instead of a parse failure.
+///
+/// Both transports carry these frames: section 23 says local Unix sockets and Windows named pipes
+/// carry the same typed frames with local peer authentication. What differs is how the connection
+/// is authenticated before the first frame, not what travels afterwards.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlFrame {
+    /// A read request.
+    Request(Request),
+    /// A mutation request.
+    Mutation(Box<MutationRequest>),
+    /// A response correlated to a request.
+    Response(Response),
+    /// The receipt of a mutation.
+    Receipt(Box<ReceiptResponse>),
+    /// An event on a subscribed stream.
+    Notification(Notification),
+    /// An event about the connection itself.
+    Event(ControlEvent),
 }

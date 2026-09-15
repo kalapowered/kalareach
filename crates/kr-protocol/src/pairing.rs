@@ -2247,9 +2247,7 @@ mod tests {
                 pkarr_resolver_url: Nullable::some(
                     NetworkHint::new("https://discovery.kala.to/pkarr").expect("a hint"),
                 ),
-                dns_origin: Nullable::some(
-                    NetworkHint::new("discovery.kala.to").expect("a hint"),
-                ),
+                dns_origin: Nullable::some(NetworkHint::new("discovery.kala.to").expect("a hint")),
                 direct_addresses: vec![NetworkHint::new("192.0.2.1:41234").expect("a hint")],
             },
             secret: SecretBytes32::from_bytes([3; 32]),

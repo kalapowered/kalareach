@@ -23,7 +23,9 @@ use crate::limits::{
     MAX_ATTACHMENT_FRAME_LEN, MAX_CONTROL_FRAME_LEN, MAX_INPUT_FRAME_LEN,
     MAX_OUTSTANDING_MUTATIONS, MAX_SEND_QUEUE_BYTES,
 };
-use crate::scalars::{CanonicalSet, Digest256, DurationMs, EndpointKey, Nonce256, Signature64, TimestampMs, U64};
+use crate::scalars::{
+    CanonicalSet, Digest256, DurationMs, EndpointKey, Nonce256, Signature64, TimestampMs, U64,
+};
 
 /// The stable transport ALPN.
 ///
@@ -216,21 +218,6 @@ pub enum ConnectReply {
     Accepted(Box<ConnectAccepted>),
     /// Authorisation failed. No authorised stream is ever enabled on this connection.
     Refused(ProtocolError),
-}
-
-/// What the host sends on the control stream outside a response.
-///
-/// The control stream carries ordinary [`crate::envelope::Notification`] events once the
-/// connection is authorised. These two messages are the connection's own, not an application
-/// event: they exist because the freshness resource and the transport's liveness belong to the
-/// connection rather than to any session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlEvent {
-    /// The host renewed this connection's action window.
-    ActionWindowRenewed(ActionWindow),
-    /// A keepalive. It carries nothing; its arrival is the whole message.
-    Keepalive,
 }
 
 /// Selects the highest version both sides listed.

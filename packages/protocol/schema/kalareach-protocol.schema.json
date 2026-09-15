@@ -888,11 +888,11 @@
       "type": "string"
     },
     "ControlEvent": {
-      "description": "What the host sends on the control stream outside a response.\n\nThe control stream carries ordinary [`crate::envelope::Notification`] events once the\nconnection is authorised. These two messages are the connection's own, not an application\nevent: they exist because the freshness resource and the transport's liveness belong to the\nconnection rather than to any session.",
+      "description": "What the host sends on an authorised control stream outside a response.\n\nThe control stream carries ordinary [`Notification`] events once the connection is authorised.\nThese two messages are the connection's own, not an application event: the freshness resource\nand the transport's liveness belong to the connection rather than to any session.",
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "The host renewed this connection's action window.",
+          "description": "The host renewed this connection's action window.\n\nSection 9: windows are short-lived freshness resources, renewed explicitly on a live\nauthorised connection. The host renews on its own schedule, so a client never has to ask\nfor one and never has to guess how long it has.",
           "properties": {
             "action_window_renewed": {
               "$ref": "#/$defs/ActionWindow"
@@ -905,8 +905,91 @@
         },
         {
           "const": "keepalive",
-          "description": "A keepalive. It carries nothing; its arrival is the whole message.",
+          "description": "A keepalive. It carries nothing; its arrival is the whole message.\n\nSection 23 puts the keepalive at ten seconds while active and the inactivity threshold at\n30. The transport's own keepalive covers a network connection; this one also covers a local\nsocket, which carries the same typed frames and has no equivalent underneath it.",
           "type": "string"
+        }
+      ]
+    },
+    "ControlFrame": {
+      "description": "One frame on an authorised control stream.\n\nThe union is closed. A receiver that cannot name the variant rejects the frame rather than\nguessing, which is what keeps an unknown method a correlated error instead of a parse failure.\n\nBoth transports carry these frames: section 23 says local Unix sockets and Windows named pipes\ncarry the same typed frames with local peer authentication. What differs is how the connection\nis authenticated before the first frame, not what travels afterwards.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A read request.",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/Request"
+            }
+          },
+          "required": [
+            "request"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A mutation request.",
+          "properties": {
+            "mutation": {
+              "$ref": "#/$defs/MutationRequest"
+            }
+          },
+          "required": [
+            "mutation"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A response correlated to a request.",
+          "properties": {
+            "response": {
+              "$ref": "#/$defs/Response"
+            }
+          },
+          "required": [
+            "response"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The receipt of a mutation.",
+          "properties": {
+            "receipt": {
+              "$ref": "#/$defs/ReceiptResponse"
+            }
+          },
+          "required": [
+            "receipt"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An event on a subscribed stream.",
+          "properties": {
+            "notification": {
+              "$ref": "#/$defs/Notification"
+            }
+          },
+          "required": [
+            "notification"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An event about the connection itself.",
+          "properties": {
+            "event": {
+              "$ref": "#/$defs/ControlEvent"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -5143,8 +5226,8 @@
     "connect_reply": {
       "$ref": "#/$defs/ConnectReply"
     },
-    "control_event": {
-      "$ref": "#/$defs/ControlEvent"
+    "control_frame": {
+      "$ref": "#/$defs/ControlFrame"
     },
     "direct_challenge": {
       "$ref": "#/$defs/DirectChallenge"
