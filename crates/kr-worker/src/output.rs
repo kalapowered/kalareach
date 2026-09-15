@@ -39,11 +39,19 @@ pub enum OutputDelivery {
 }
 
 impl OutputDelivery {
-    fn len(&self) -> usize {
+    /// Returns how many bytes this delivery accounts for against a subscriber's bound.
+    #[must_use]
+    pub fn len(&self) -> usize {
         match self {
             Self::Bytes { bytes, .. } => bytes.len(),
             Self::Resync(_) | Self::Detached => 0,
         }
+    }
+
+    /// Returns whether this delivery carries no bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -55,11 +63,28 @@ pub struct OutputStream {
 }
 
 impl OutputStream {
-    /// Takes the next delivery, releasing the bytes it accounted for.
+    /// Takes the next delivery.
+    ///
+    /// Taking a delivery does **not** release the bytes it accounted for. The bound section 9 puts
+    /// on a subscriber is on what is queued *for that peer*, and a delivery that has been taken
+    /// off this channel and is waiting on a socket the peer is not reading is still queued for it.
+    /// Releasing here would mean a client that never reads is never found to be behind: the
+    /// backlog would sit in the sender instead, unaccounted for and unbounded.
+    ///
+    /// The consumer calls [`OutputStream::written`] once the bytes have reached the peer.
     pub async fn recv(&mut self) -> Option<OutputDelivery> {
-        let delivery = self.receiver.recv().await?;
-        self.queued.fetch_sub(delivery.len(), Ordering::AcqRel);
-        Some(delivery)
+        self.receiver.recv().await
+    }
+
+    /// Releases the bytes of a delivery that has reached the peer.
+    pub fn written(&self, delivery_len: usize) {
+        // Saturating, because a resynchronisation can discard deliveries this subscriber will
+        // never report as written.
+        let _ = self
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                Some(queued.saturating_sub(delivery_len))
+            });
     }
 
     /// Returns the bytes currently waiting for this subscriber.

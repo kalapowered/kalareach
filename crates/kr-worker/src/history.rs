@@ -205,6 +205,12 @@ struct Spool {
     layout: SpoolLayout,
     segments: VecDeque<Segment>,
     total_bytes: u64,
+    /// The segment being written, held open.
+    ///
+    /// Terminal output arrives in small batches — often one line at a time — and opening and
+    /// closing a file for each of them makes the session's own output path the slowest thing in
+    /// the host. The handle is kept for as long as the segment is the one being appended to.
+    open_segment: Option<(PathBuf, std::fs::File)>,
 }
 
 #[derive(Clone, Debug)]
@@ -249,6 +255,7 @@ impl Spool {
             layout,
             segments: segments.into(),
             total_bytes,
+            open_segment: None,
         })
     }
 
@@ -281,7 +288,24 @@ impl Spool {
             let segment = self.segments.back_mut().expect("a segment exists");
             let room = usize::try_from(segment_bytes - segment.len).unwrap_or(usize::MAX);
             let take = room.min(bytes.len() - written);
-            append_file(&segment.path, &bytes[written..written + take])?;
+            let path = segment.path.clone();
+            let segment_len = take;
+            // Borrowed separately from the segment, because the handle lives beside the index
+            // rather than inside it: a segment that is evicted takes its entry, not this handle.
+            let handle = match self.open_segment.as_mut() {
+                Some((open, file)) if *open == path => file,
+                _ => {
+                    let file = open_segment(&path)?;
+                    self.open_segment = Some((path.clone(), file));
+                    &mut self
+                        .open_segment
+                        .as_mut()
+                        .expect("the handle was just installed")
+                        .1
+                }
+            };
+            append_open(handle, &bytes[written..written + segment_len])?;
+            let segment = self.segments.back_mut().expect("a segment exists");
             segment.len += take as u64;
             self.total_bytes += take as u64;
             written += take;
@@ -296,6 +320,15 @@ impl Spool {
                 break;
             };
             self.total_bytes -= segment.len;
+            // A segment that is evicted while it is the one being written cannot happen — the
+            // newest segment is never the first — but its handle is dropped with it if it ever is.
+            if self
+                .open_segment
+                .as_ref()
+                .is_some_and(|(path, _)| *path == segment.path)
+            {
+                self.open_segment = None;
+            }
             let _ = std::fs::remove_file(&segment.path);
         }
     }
@@ -324,14 +357,17 @@ impl Spool {
     }
 }
 
-fn append_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-
-    let mut file = std::fs::OpenOptions::new()
+fn open_segment(path: &Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|error| WorkerError::storage("open an output spool segment", error))?;
+        .map_err(|error| WorkerError::storage("open an output spool segment", error))
+}
+
+fn append_open(file: &mut std::fs::File, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
     file.write_all(bytes)
         .map_err(|error| WorkerError::storage("write an output spool segment", error))
 }

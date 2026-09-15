@@ -336,6 +336,7 @@ impl WorkerService {
                         }
                     }
                     while let Some(delivery) = stream.recv().await {
+                        let delivered = delivery.len();
                         let notification = match delivery {
                             OutputDelivery::Bytes { cursor, bytes } => {
                                 // Anything the replay already covered is dropped here rather than
@@ -386,6 +387,10 @@ impl WorkerService {
                         if sender.write_message(&notification).await.is_err() {
                             break;
                         }
+                        drop(sender);
+                        // Released only now. Until the bytes have reached the peer they are still
+                        // queued for it, which is what the bound is about.
+                        stream.written(delivered);
                     }
                     let _ = attachment_id;
                 });
