@@ -1,121 +1,446 @@
-//! The boundary between the raw byte stream and what a terminal of another size is shown.
+//! The canonical grid, the filtered stream and the presentation each terminal is served.
 //!
-//! A worker owns the raw side: the bytes the application wrote, in order, with a cursor. It does
-//! not own the *interpretation* of those bytes. Column counts decide where lines wrap and where
-//! the cursor is, so a terminal of a different width cannot be sent the same bytes and be right.
+//! A worker owns the raw byte stream: what the application wrote, in order, with a cursor. Section
+//! 8 is explicit that it must own the *interpretation* as well, because the moment two terminals
+//! can see one session the ordinary assumption that the terminal in front of you is the terminal
+//! stops being true. Column counts decide where lines wrap and where the cursor is; a query has
+//! exactly one correct answer and exactly one place to come from; a bell, a clipboard write and a
+//! notification happen once, to one destination.
 //!
-//! Section 8 names two presentations for a terminal attachment:
+//! This module is where a session holds [`kr_term::Engine`] and where every consequence of holding
+//! it is decided.
 //!
-//! | Presentation | What it receives | What it needs |
+//! # What passing the stream through the engine changes
+//!
+//! | | Before | Through the engine |
 //! | --- | --- | --- |
-//! | `direct` | the raw stream, unchanged | a terminal of exactly the canonical size |
-//! | `viewport` | a rendering of the canonical grid, clipped to its own size | a terminal engine |
+//! | A query the application sends | reaches every attached terminal, and each answers | consumed; the broker answers once, into the application's own input |
+//! | A bell, clipboard write or notification | reaches every attached terminal | routed to the one attachment holding the input lease |
+//! | A sequence the profile does not name | forwarded and hoped to be harmless | consumed, with a rate-limited diagnostic |
+//! | A terminal of another size | sent bytes that assume the session's width | shown the canonical grid, clipped to the size it has |
+//! | A terminal that reconnects | replayed the raw history it missed | given a side-effect-free restoration of the screen as it is now |
 //!
-//! Direct mode needs nothing but the raw stream, and this crate serves it. Viewport mode needs a
-//! parser that holds the canonical grid, a renderer that projects it, and a restoration that puts a
-//! reconnecting terminal into that state without the side effects the original bytes carried: no
-//! replayed clipboard write, no replayed bell, no replayed query whose answer would arrive at the
-//! wrong moment. That is the terminal engine, and it is a separate component.
+//! # The two presentations
 //!
-//! # What this module is
+//! | Presentation | What it receives | When it applies |
+//! | --- | --- | --- |
+//! | `direct` | the spans of the raw stream the engine says a terminal may take unchanged | the terminal is exactly the canonical size and the stream is still carryable |
+//! | `viewport` | a rendering of the canonical grid, clipped to the terminal's own size | every other case |
 //!
-//! The interface point. A session holds an optional [`TerminalProjection`]; when one is installed,
-//! a viewport attachment is served through it. When none is installed, a viewport attachment is
-//! **refused with an explicit reason** rather than being sent raw bytes that assume another width.
-//! Refusing is the honest answer: sending them would produce wrapped lines and a cursor in the
-//! wrong place, and the client would have no way to know.
-//!
-//! # What installing the engine adds
-//!
-//! Exactly three calls, all defined here: [`TerminalProjection::snapshot`] for an attachment that
-//! is joining, [`TerminalProjection::project`] for each range of raw output it is shown, and
-//! [`TerminalProjection::restore`] for a terminal that is reconnecting. Nothing else in this crate
-//! changes: the raw stream, the cursor, the history and the input path are the same either way.
+//! Direct mode is *qualified*, not assumed: the engine reports the point at which the stream stops
+//! being something a physical terminal can be handed, and an attachment moves to a projection
+//! there rather than being sent bytes that would leave its screen wrong. Coming back the other way
+//! waits for a parser-ground boundary, because starting a byte stream anywhere else would hand a
+//! terminal the middle of an escape sequence; [`kr_term::snapshot::LiveForwardingHandoff`] holds
+//! that rule and this module applies it.
 
+use kr_protocol::ids::{AttachmentId, InputLeaseEpoch};
 use kr_protocol::session::Dimensions;
+use kr_term::budget::GridSize;
+use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
+use kr_term::lane::LaneGate;
+use kr_term::sideeffect::{LeaseHolder, SideEffect, SideEffectKind};
+use kr_term::snapshot::{HandoffOutcome, LiveForwardingHandoff, Viewport, restoration_operations};
 
-use crate::error::Result;
+use crate::error::{Result, WorkerError};
+use crate::render::{Restoration, render};
 
-/// A screen projected for one attachment.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProjectedScreen {
-    /// The cursor this projection was taken at.
-    pub cursor: u64,
-    /// The size it was projected for.
-    pub dimensions: Dimensions,
-    /// The bytes that draw it, with no side effect the original stream carried.
-    pub bytes: Vec<u8>,
-}
-
-/// What a terminal engine provides so a session can serve a terminal of another size.
+/// How many recent raw bytes are kept so a span released later can still be resolved.
 ///
-/// Every method takes the size it is projecting for, because the same session is shown to
-/// attachments of different sizes at the same time and each one sees its own projection.
-pub trait TerminalProjection: Send + Sync + std::fmt::Debug {
-    /// Returns the screen an attachment joining at this cursor should be shown.
-    ///
-    /// This replaces replaying raw history into the attachment's terminal, which would replay
-    /// whatever that history contained.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the projection cannot be produced.
-    fn snapshot(&self, cursor: u64, dimensions: Dimensions) -> Result<ProjectedScreen>;
+/// The engine holds the last scalar of a run back in case a combining mark follows it, so a span
+/// it clears when the stream goes quiet names bytes that arrived in an earlier call. A grapheme
+/// cluster is far smaller than this; the margin is there so nothing depends on exactly how much
+/// the engine chooses to hold.
+const HELD_TAIL_BYTES: usize = 1024;
 
-    /// Returns the bytes an attachment of this size should receive for a range of raw output.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the range cannot be projected.
-    fn project(&self, from: u64, raw: &[u8], dimensions: Dimensions) -> Result<Vec<u8>>;
+/// The largest batch of query answers written into the application in one go.
+///
+/// The lane is already bounded by its own limits; this bounds what one read of the terminal can
+/// turn into in one write, so a burst of queries cannot become one enormous write.
+pub const MAX_REPLY_BYTES: usize = 4 * 1024;
 
-    /// Returns the bytes that put a reconnecting terminal into the session's current state.
+/// What one batch of raw output became.
+#[derive(Clone, Debug, Default)]
+pub struct Filtered {
+    /// Spans of the raw stream a direct attachment may be shown, each with its own cursor.
     ///
-    /// Side-effect-free: a clipboard write, a bell, a notification or a query that the original
-    /// stream carried is not reissued, because the terminal has already had it once or must never
-    /// have it at all.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the state cannot be rendered.
-    fn restore(&self, cursor: u64, dimensions: Dimensions) -> Result<ProjectedScreen>;
+    /// The cursors are positions in the raw stream, so they stay comparable with the session's
+    /// history and with a snapshot's own cursor. They are not contiguous: what the engine withheld
+    /// leaves a gap, which is the point.
+    pub direct: Vec<(u64, Vec<u8>)>,
+    /// Bytes that belong to the one attachment holding the input lease.
+    pub effects: Vec<(u64, Vec<u8>)>,
+    /// What the host owes the application, to be written into its terminal input.
+    pub replies: Vec<Vec<u8>>,
+    /// Where the stream stopped being something a direct attachment can take unchanged.
+    pub projection_required_at: Option<u64>,
+    /// Whether the projection generation advanced, which invalidates every client's screen.
+    pub projection_reset: bool,
+    /// Side effects that had no attachment to go to and became host events.
+    pub host_events: Vec<SideEffect>,
 }
 
-/// Why a presentation cannot be served.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PresentationRefusal {
-    /// A terminal of another size asked for a rendering and no engine is installed.
-    NoProjection,
+/// The canonical grid of one session.
+pub struct TerminalEngine {
+    engine: Engine,
+    canonical: Dimensions,
+    /// Set when the engine says a direct attachment can no longer take the stream unchanged.
+    ///
+    /// It is cleared by a projection reset, because a reset is the engine starting the projection
+    /// again from a screen it fully describes.
+    projection_required: bool,
+    /// The handoff waiting for a parser-ground boundary before byte forwarding may resume.
+    handoff: Option<LiveForwardingHandoff>,
+    /// The most recent raw bytes, so a span the engine clears later can still be resolved.
+    tail: Vec<u8>,
+    /// The raw cursor `tail` starts at.
+    tail_cursor: u64,
 }
 
-impl PresentationRefusal {
-    /// Returns the sentence the caller is given.
+impl std::fmt::Debug for TerminalEngine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TerminalEngine")
+            .field("canonical", &self.canonical)
+            .field("projection_required", &self.projection_required)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TerminalEngine {
+    /// Builds the canonical grid of a session of these dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the dimensions are outside what a canonical grid may be.
+    pub fn new(canonical: Dimensions) -> Result<Self> {
+        let size = grid_size(canonical)?;
+        let engine = Engine::new(EngineConfig {
+            size,
+            ..EngineConfig::DEFAULT
+        })
+        .map_err(term_failure)?;
+        Ok(Self {
+            engine,
+            canonical,
+            projection_required: false,
+            handoff: None,
+            tail: Vec::new(),
+            tail_cursor: 0,
+        })
+    }
+
+    /// Returns the session's canonical dimensions.
     #[must_use]
-    pub const fn detail(self) -> &'static str {
-        match self {
-            Self::NoProjection => {
-                "this terminal is not the session's size, so it needs a rendering of the session's \
-                 screen rather than the raw stream; this host has no terminal engine installed. \
-                 Attach at the session's size, or claim its geometry."
-            }
+    pub const fn canonical(&self) -> Dimensions {
+        self.canonical
+    }
+
+    /// Returns the raw cursor the engine has *committed* to.
+    ///
+    /// It lags what has been read by whatever the parser is still collecting, which is what stops a
+    /// client holding a cursor for output it has not been given.
+    #[must_use]
+    pub fn output_cursor(&self) -> u64 {
+        self.engine.output_cursor()
+    }
+
+    /// Returns whether a direct attachment can still be handed the raw stream.
+    #[must_use]
+    pub const fn direct_is_carryable(&self) -> bool {
+        !self.projection_required
+    }
+
+    /// Follows the session's canonical geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the grid cannot be that size.
+    pub fn resize(&mut self, canonical: Dimensions) -> Result<()> {
+        let size = grid_size(canonical)?;
+        self.engine.resize(size).map_err(term_failure)?;
+        self.canonical = canonical;
+        self.tail.clear();
+        self.tail_cursor = self.engine.read_offset();
+        // A resize advances the projection, so every client's screen is described again from a
+        // snapshot rather than continued from one taken at another size.
+        self.projection_required = false;
+        self.handoff = None;
+        Ok(())
+    }
+
+    /// Records who holds the input lease, which is where a side effect goes.
+    pub const fn set_lease_holder(&mut self, holder: Option<AttachmentId>, epoch: InputLeaseEpoch) {
+        let lease = match holder {
+            Some(attachment) => LeaseHolder::new(attachment, epoch),
+            None => LeaseHolder::none(),
+        };
+        self.engine.set_lease_holder(lease);
+    }
+
+    /// Feeds one batch of raw output through the canonical grid.
+    ///
+    /// `cursor` is where the batch starts in the raw stream, which must be where the engine has
+    /// consumed to: the grid and the history are two views of one stream, and a disagreement about
+    /// where a byte is would put a snapshot's cursor somewhere the history does not have.
+    pub fn feed(&mut self, cursor: u64, bytes: &[u8], gate: LaneGate, now_ms: u64) -> Filtered {
+        debug_assert_eq!(
+            self.engine.read_offset(),
+            cursor,
+            "the canonical grid and the retained history are two views of one stream"
+        );
+        let outcome = self.engine.feed(bytes, now_ms);
+        self.tail.extend_from_slice(bytes);
+        self.collect(&outcome, gate, now_ms)
+    }
+
+    /// Settles the screen when the stream goes quiet.
+    ///
+    /// The last scalar of a run waits to see whether a combining mark follows it, so a screen that
+    /// has stopped changing is only final once this has run.
+    pub fn quiesce(&mut self, gate: LaneGate, now_ms: u64) -> Filtered {
+        let outcome = self.engine.quiesce(now_ms);
+        self.collect(&outcome, gate, now_ms)
+    }
+
+    /// Returns the window a terminal of these dimensions looks at.
+    ///
+    /// The window is anchored at the left of the grid and at the top of the visible page: nothing
+    /// is reflowed, so a terminal narrower than the session sees the left of each line rather than
+    /// a rewrapped approximation of all of it. The top row is filled in when the snapshot is taken,
+    /// because it is the snapshot that says which canonical rows the page currently holds.
+    #[must_use]
+    pub fn viewport_for(&self, dimensions: Dimensions) -> Viewport {
+        let rows = u32::try_from(dimensions.rows.get()).unwrap_or(u32::MAX);
+        let cols = u32::try_from(dimensions.columns.get()).unwrap_or(u32::MAX);
+        let canonical = grid_size(self.canonical).unwrap_or(GridSize::new(1, 1));
+        Viewport {
+            top_row: 0,
+            rows: rows.min(canonical.rows),
+            left_col: 0,
+            cols: cols.min(canonical.cols),
         }
     }
+
+    /// Returns the bytes that put a terminal into the session's current screen.
+    ///
+    /// This is what an attachment is given instead of replayed history. Nothing in it can ring,
+    /// copy, notify, download, launch or ask anything, because the operations it is built from
+    /// have no member that can.
+    pub fn restoration(&mut self, dimensions: Dimensions, now_ms: u64) -> (u64, Restoration) {
+        let mut viewport = self.viewport_for(dimensions);
+        let (mut snapshot, _settled) = self.engine.snapshot(viewport, now_ms);
+        // The page's own first row is what the window is anchored to. It is read from the snapshot
+        // rather than guessed at, because eviction and scrolling both move it.
+        if let Some(first) = snapshot.rows.first() {
+            viewport.top_row = first.stable_id;
+        }
+        snapshot.viewport = viewport;
+        let operations = restoration_operations(&snapshot);
+        (snapshot.output_cursor, render(&operations, viewport))
+    }
+
+    /// Decides whether byte forwarding may resume for a direct attachment.
+    ///
+    /// Forwarding may only start where the parser stands on ground. Output does not stop for the
+    /// handoff, so this waits, and a window without a boundary leaves the attachment projected and
+    /// tries again later.
+    pub fn poll_handoff(&mut self, now_ms: u64) -> HandoffOutcome {
+        if self.projection_required {
+            return HandoffOutcome::StayProjected;
+        }
+        let handoff = *self
+            .handoff
+            .get_or_insert_with(|| LiveForwardingHandoff::start(now_ms));
+        let outcome = handoff.poll(now_ms, self.engine.ground_boundary());
+        match outcome {
+            HandoffOutcome::Waiting => {}
+            HandoffOutcome::Ready { .. } | HandoffOutcome::StayProjected => self.handoff = None,
+        }
+        outcome
+    }
+
+    fn collect(&mut self, outcome: &FeedOutcome, gate: LaneGate, now_ms: u64) -> Filtered {
+        let mut filtered = Filtered {
+            projection_required_at: outcome.projection_required_at,
+            projection_reset: outcome.projection_reset,
+            ..Filtered::default()
+        };
+        if outcome.projection_required_at.is_some() {
+            self.projection_required = true;
+        }
+        if outcome.projection_reset {
+            // A reset describes the screen again from a snapshot, so whatever made the stream
+            // uncarryable is behind every client rather than in front of it.
+            self.projection_required = false;
+        }
+        for span in &outcome.forward {
+            let start = span.start();
+            let Some(offset) = start.checked_sub(self.tail_cursor) else {
+                continue;
+            };
+            let Ok(offset) = usize::try_from(offset) else {
+                continue;
+            };
+            let Ok(len) = usize::try_from(span.len()) else {
+                continue;
+            };
+            let end = offset.saturating_add(len).min(self.tail.len());
+            if offset >= end {
+                continue;
+            }
+            filtered
+                .direct
+                .push((start, self.tail[offset..end].to_vec()));
+        }
+        // Everything older than the margin is behind whatever the engine can still be holding.
+        if self.tail.len() > HELD_TAIL_BYTES {
+            let surplus = self.tail.len() - HELD_TAIL_BYTES;
+            self.tail.drain(..surplus);
+            self.tail_cursor = self.tail_cursor.saturating_add(surplus as u64);
+        }
+        for effect in &outcome.side_effects {
+            match effect.destination {
+                kr_term::sideeffect::SideEffectDestination::Attachment { .. } => {
+                    if let Some(rendered) = crate::render::side_effect(&effect.kind) {
+                        filtered.effects.push((effect.at, rendered));
+                    }
+                }
+                // Nothing holds the lease, so there is no terminal this belongs to. It is reported
+                // rather than sent to whoever happens to be watching.
+                kr_term::sideeffect::SideEffectDestination::HostEvent => {
+                    filtered.host_events.push(effect.clone());
+                }
+            }
+        }
+        for reply in self.engine.lane_mut().drain(gate, MAX_REPLY_BYTES, now_ms) {
+            filtered.replies.push(reply.bytes().to_vec());
+        }
+        filtered
+    }
 }
 
-impl core::fmt::Display for PresentationRefusal {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str(self.detail())
-    }
+/// Returns the canonical grid size of a session's dimensions.
+fn grid_size(dimensions: Dimensions) -> Result<GridSize> {
+    let cols = u32::try_from(dimensions.columns.get()).map_err(|_| {
+        WorkerError::InvalidArgument("the session is too wide for a grid".to_owned())
+    })?;
+    let rows = u32::try_from(dimensions.rows.get()).map_err(|_| {
+        WorkerError::InvalidArgument("the session is too tall for a grid".to_owned())
+    })?;
+    GridSize::new(cols, rows).validate().map_err(term_failure)
+}
+
+/// Renders a terminal-engine failure as a worker failure.
+fn term_failure(error: kr_term::TermError) -> WorkerError {
+    WorkerError::InvalidArgument(error.to_string())
+}
+
+/// Returns whether a side effect is one a terminal is shown at all.
+#[must_use]
+pub const fn is_displayable(kind: &SideEffectKind) -> bool {
+    !matches!(kind, SideEffectKind::ClipboardRead { .. })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::scalars::U64;
+
+    fn dimensions(columns: u64, rows: u64) -> Dimensions {
+        Dimensions {
+            columns: U64::new(columns),
+            rows: U64::new(rows),
+        }
+    }
+
+    fn engine() -> TerminalEngine {
+        TerminalEngine::new(dimensions(80, 24)).expect("a canonical grid")
+    }
 
     #[test]
-    fn a_refusal_says_what_would_make_it_work() {
-        let detail = PresentationRefusal::NoProjection.detail();
-        assert!(detail.contains("claim its geometry"));
-        assert!(detail.contains("terminal engine"));
+    fn ordinary_output_reaches_a_direct_attachment_unchanged() {
+        let mut engine = engine();
+        let filtered = engine.feed(0, b"hello", LaneGate::default(), 0);
+        let forwarded: Vec<u8> = filtered
+            .direct
+            .iter()
+            .flat_map(|(_, bytes)| bytes.clone())
+            .collect();
+        // The last scalar waits for a combining mark, so a settled screen needs the quiesce the
+        // session loop performs when the read goes quiet.
+        let settled = engine.quiesce(LaneGate::default(), 0);
+        let tail: Vec<u8> = settled
+            .direct
+            .iter()
+            .flat_map(|(_, bytes)| bytes.clone())
+            .collect();
+        assert_eq!([forwarded, tail].concat(), b"hello".to_vec());
+    }
+
+    #[test]
+    fn a_query_is_answered_into_the_application_and_reaches_no_terminal() {
+        let mut engine = engine();
+        let filtered = engine.feed(0, b"\x1b[c", LaneGate::default(), 0);
+        assert!(
+            filtered.direct.is_empty(),
+            "no attached terminal is asked the question"
+        );
+        assert_eq!(
+            filtered.replies,
+            vec![b"\x1b[?62;22c".to_vec()],
+            "the host answers it once, into the application's own input"
+        );
+    }
+
+    #[test]
+    fn a_bell_goes_to_the_lease_holder_alone() {
+        let mut engine = engine();
+        let attachment = AttachmentId::new(kr_ipc::new_uuid());
+        engine.set_lease_holder(Some(attachment), InputLeaseEpoch::new(1));
+        let filtered = engine.feed(0, b"\x07", LaneGate::default(), 0);
+        assert!(filtered.direct.is_empty(), "nothing is broadcast");
+        assert_eq!(filtered.effects.len(), 1);
+        assert_eq!(filtered.effects[0].1, vec![0x07]);
+        assert!(filtered.host_events.is_empty());
+    }
+
+    #[test]
+    fn a_bell_with_no_lease_holder_becomes_a_host_event() {
+        let mut engine = engine();
+        let filtered = engine.feed(0, b"\x07", LaneGate::default(), 0);
+        assert!(filtered.effects.is_empty());
+        assert_eq!(filtered.host_events.len(), 1);
+    }
+
+    #[test]
+    fn a_restoration_describes_the_screen_rather_than_the_bytes_that_made_it() {
+        let mut engine = engine();
+        engine.feed(0, b"\x07before\x1b[c after", LaneGate::default(), 0);
+        let (cursor, restoration) = engine.restoration(dimensions(80, 24), 0);
+        assert!(cursor > 0);
+        let text = String::from_utf8_lossy(&restoration.bytes).into_owned();
+        assert!(text.contains("before"), "the screen's text is drawn");
+        assert!(
+            !restoration.bytes.contains(&0x07),
+            "the bell is not rung again"
+        );
+        assert!(!text.contains("\x1b[c"), "the query is not asked again");
+    }
+
+    #[test]
+    fn a_smaller_terminal_is_shown_the_part_of_the_grid_it_has_room_for() {
+        let engine = engine();
+        let viewport = engine.viewport_for(dimensions(40, 10));
+        assert_eq!(viewport.cols, 40);
+        assert_eq!(viewport.rows, 10);
+    }
+
+    #[test]
+    fn a_larger_terminal_is_never_shown_more_grid_than_there_is() {
+        let engine = engine();
+        let viewport = engine.viewport_for(dimensions(200, 60));
+        assert_eq!(viewport.cols, 80);
+        assert_eq!(viewport.rows, 24);
     }
 }

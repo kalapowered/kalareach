@@ -56,29 +56,45 @@ impl Attachment {
             && self.dimensions.is_some()
     }
 
-    fn to_wire(&self, geometry: Dimensions) -> AttachmentSummary {
+    fn to_wire(&self, geometry: Dimensions, carryable: bool) -> AttachmentSummary {
         AttachmentSummary {
             attachment_id: self.id,
             ordinal: AttachmentOrdinal::new(self.ordinal),
             mode: self.mode,
             claim_geometry: self.claim_geometry,
             dimensions: Nullable(self.dimensions),
-            presentation: Nullable(self.presentation(geometry)),
+            presentation: Nullable(self.presentation(geometry, carryable)),
             terminal_profile_id: Nullable(self.terminal_profile_id.clone()),
             granted: self.granted.clone(),
             attached_at_ms: self.attached_at_ms,
         }
     }
 
-    fn presentation(&self, geometry: Dimensions) -> Option<TerminalPresentationMode> {
+    /// Returns how this attachment is shown the session.
+    ///
+    /// Direct mode is qualified on three things together, and each one alone is not enough:
+    ///
+    /// * **The size.** Wrapping and cursor coordinates depend on the column count, so only a
+    ///   terminal of exactly the canonical size can take the byte stream unchanged.
+    /// * **The profile.** A client declares which terminal it is after probing it. Without that
+    ///   declaration the host does not know what the bytes would do there, and `--no-probe` is
+    ///   exactly the case where the client has chosen not to find out.
+    /// * **The stream.** The engine reports when the output stops being something a physical
+    ///   terminal can be handed at all, and `carryable` is that answer.
+    ///
+    /// Everything else displays a clipped viewport of the canonical grid; nothing is reflowed.
+    fn presentation(
+        &self,
+        geometry: Dimensions,
+        carryable: bool,
+    ) -> Option<TerminalPresentationMode> {
         if self.mode != AttachMode::Terminal {
             return None;
         }
-        // Terminal wrapping and cursor coordinates depend on the number of columns, so only a
-        // terminal of exactly the canonical size can take the live byte stream unchanged. Anything
-        // else displays a clipped viewport of the canonical grid; nothing is reflowed.
         match self.dimensions {
-            Some(own) if own == geometry => Some(TerminalPresentationMode::Direct),
+            Some(own) if carryable && own == geometry && self.terminal_profile_id.is_some() => {
+                Some(TerminalPresentationMode::Direct)
+            }
             Some(_) => Some(TerminalPresentationMode::Viewport),
             None => None,
         }
@@ -94,6 +110,11 @@ pub struct AttachmentTable {
     owner: Option<AttachmentId>,
     epoch: u64,
     dimensions: Dimensions,
+    /// Whether the output stream is still something a physical terminal can be handed.
+    ///
+    /// The terminal engine decides it; the table holds the answer because every presentation
+    /// depends on it and a summary has to report the same thing the delivery path does.
+    carryable: bool,
 }
 
 /// What changed when an attachment joined, left or was reconfigured.
@@ -116,7 +137,18 @@ impl AttachmentTable {
             owner: None,
             epoch: 0,
             dimensions,
+            carryable: true,
         }
+    }
+
+    /// Records whether the output stream is still one a physical terminal can be handed.
+    ///
+    /// Returns whether the answer changed, which is what tells the caller that every attachment's
+    /// presentation has to be looked at again.
+    pub fn set_carryable(&mut self, carryable: bool) -> bool {
+        let changed = self.carryable != carryable;
+        self.carryable = carryable;
+        changed
     }
 
     /// Returns the current geometry and its owner.
@@ -176,7 +208,7 @@ impl AttachmentTable {
     pub fn summaries(&self) -> Vec<AttachmentSummary> {
         self.attachments
             .values()
-            .map(|attachment| attachment.to_wire(self.dimensions))
+            .map(|attachment| attachment.to_wire(self.dimensions, self.carryable))
             .collect()
     }
 
@@ -246,7 +278,7 @@ impl AttachmentTable {
         let summary = self
             .get(id)
             .expect("the attachment was just inserted")
-            .to_wire(self.dimensions);
+            .to_wire(self.dimensions, self.carryable);
         Ok((summary, change))
     }
 
@@ -323,16 +355,54 @@ impl AttachmentTable {
         dimensions.validate()?;
         let ordinal = *self.by_id.get(&id).ok_or_else(|| unknown(id))?;
         let canonical = self.dimensions;
+        {
+            let attachment = self
+                .attachments
+                .get_mut(&ordinal)
+                .ok_or_else(|| unknown(id))?;
+            attachment.dimensions = Some(dimensions);
+        }
+        let carryable = self.carryable;
         let attachment = self
             .attachments
             .get_mut(&ordinal)
             .ok_or_else(|| unknown(id))?;
-        attachment.dimensions = Some(dimensions);
-        attachment.presentation(canonical).ok_or_else(|| {
-            WorkerError::InvalidArgument(
-                "a semantic attachment has no terminal presentation".to_owned(),
-            )
-        })
+        attachment
+            .presentation(canonical, carryable)
+            .ok_or_else(|| {
+                WorkerError::InvalidArgument(
+                    "a semantic attachment has no terminal presentation".to_owned(),
+                )
+            })
+    }
+
+    /// Returns every terminal attachment being shown a rendering rather than the raw stream.
+    #[must_use]
+    pub fn projected(&self) -> Vec<(AttachmentId, Dimensions)> {
+        let canonical = self.dimensions;
+        self.attachments
+            .values()
+            .filter_map(|attachment| {
+                let own = attachment.dimensions?;
+                match attachment.presentation(canonical, self.carryable) {
+                    Some(TerminalPresentationMode::Viewport) => Some((attachment.id, own)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Returns an attachment's own physical dimensions, when it has reported them.
+    ///
+    /// The outer `Option` says whether the attachment exists; the inner one says whether it has
+    /// reported a size. A semantic attachment never does, and a terminal attachment reports one
+    /// when it joins.
+    #[must_use]
+    pub fn own_dimensions(&self, id: AttachmentId) -> Option<Option<Dimensions>> {
+        let ordinal = self.by_id.get(&id)?;
+        self.attachments
+            .get(ordinal)
+            .map(|attachment| attachment.dimensions)
     }
 
     /// Checks a resize without changing anything.
@@ -464,7 +534,9 @@ mod tests {
             mode: AttachMode::Terminal,
             claim_geometry: claim,
             dimensions: Nullable::some(Dimensions::new(columns, rows)),
-            terminal_profile_id: Nullable::null(),
+            // A client that probed its terminal declares what it found. Direct mode needs that
+            // declaration, so the tests that are about direct mode carry one.
+            terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
             requested: capabilities(&[
                 AttachmentCapability::ObserveTerminal,
                 AttachmentCapability::Geometry,
@@ -643,6 +715,38 @@ mod tests {
                 .expect("reports"),
             TerminalPresentationMode::Direct
         );
+    }
+
+    #[test]
+    fn a_terminal_that_was_not_probed_is_projected_whatever_size_it_is() {
+        // `--no-probe` withholds the declaration, and a host that does not know what terminal it is
+        // talking to does not hand it a byte stream and hope.
+        let mut table = AttachmentTable::new(Dimensions::new(120, 40));
+        let unprobed = SessionAttachParams {
+            terminal_profile_id: Nullable::null(),
+            ..terminal(120, 40, true)
+        };
+        attach(&mut table, 1, &unprobed);
+        assert_eq!(
+            table
+                .viewport(identifier(1), Dimensions::new(120, 40))
+                .expect("reports"),
+            TerminalPresentationMode::Viewport
+        );
+    }
+
+    #[test]
+    fn a_stream_the_engine_cannot_carry_projects_every_terminal() {
+        let mut table = AttachmentTable::new(Dimensions::new(120, 40));
+        attach(&mut table, 1, &terminal(120, 40, true));
+        assert!(table.set_carryable(false), "the answer changed");
+        assert_eq!(
+            table
+                .viewport(identifier(1), Dimensions::new(120, 40))
+                .expect("reports"),
+            TerminalPresentationMode::Viewport
+        );
+        assert_eq!(table.projected().len(), 1);
     }
 
     #[test]

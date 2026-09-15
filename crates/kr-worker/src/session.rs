@@ -114,7 +114,8 @@ pub struct Session {
     pending_input: Vec<InputBatch>,
     owned: Option<OwnedProcesses>,
     root_exit: Option<ShellExit>,
-    projection: Option<Arc<dyn crate::projection::TerminalProjection>>,
+    /// The canonical grid. Every byte the terminal produces passes through it.
+    engine: crate::projection::TerminalEngine,
 }
 
 impl std::fmt::Debug for Session {
@@ -138,6 +139,7 @@ impl Session {
     /// recorded rather than fatal: an authorised stop must still work without one.
     pub fn open(config: SessionConfig) -> Result<Self> {
         let pty = Pty::open(config.dimensions)?;
+        let engine = crate::projection::TerminalEngine::new(config.dimensions)?;
         let history = match config.spool_directory.as_ref() {
             Some(directory) => {
                 OutputHistory::with_spool(config.resident_bytes, directory, SpoolLayout::DEFAULT)?
@@ -175,7 +177,7 @@ impl Session {
             pending_input: Vec::new(),
             owned: None,
             root_exit: None,
-            projection: None,
+            engine,
             config,
         })
     }
@@ -344,22 +346,52 @@ impl Session {
         self.lease.to_wire()
     }
 
-    /// Installs the terminal engine this session projects its screen through.
+    /// Moves the session's canonical size, in the kernel and in the grid together.
     ///
-    /// Without one, a terminal of the session's own size is served the raw stream and a terminal of
-    /// any other size is refused: the raw stream assumes a column count, and sending it to a
-    /// terminal of another width produces wrapped lines and a cursor in the wrong place.
-    pub fn install_projection(
-        &mut self,
-        projection: Arc<dyn crate::projection::TerminalProjection>,
-    ) {
-        self.projection = Some(projection);
+    /// They are one size. A terminal whose kernel size and canonical grid disagreed would place
+    /// its cursor by one and wrap by the other, so neither is moved without the other.
+    fn resize_canonical(&mut self, dimensions: Dimensions) -> Result<()> {
+        self.pty.resize(dimensions)?;
+        self.engine.resize(dimensions)
     }
 
-    /// Returns the engine this session projects through, when one is installed.
+    /// Tells the canonical grid where a side effect currently goes.
+    ///
+    /// A bell, a clipboard write or a notification leaves the terminal, so it goes to exactly one
+    /// place: the attachment holding the input lease. Every path that moves the lease passes
+    /// through here, so the destination can never be an attachment that stopped holding it.
+    fn note_lease_holder(&mut self) {
+        let epoch = kr_protocol::ids::InputLeaseEpoch::new(self.lease.epoch());
+        self.engine.set_lease_holder(self.lease.holder(), epoch);
+    }
+
+    /// Returns the canonical grid this session's screen lives on.
     #[must_use]
-    pub fn projection(&self) -> Option<&Arc<dyn crate::projection::TerminalProjection>> {
-        self.projection.as_ref()
+    pub const fn engine(&self) -> &crate::projection::TerminalEngine {
+        &self.engine
+    }
+
+    /// Returns the bytes that put one attachment's terminal into the session's current screen.
+    ///
+    /// This is what an attachment is given in place of replayed history. It carries no sequence
+    /// that can ring, copy, notify, download, launch or ask anything, because the operations it is
+    /// built from have no member that can: a terminal that was not there when the history happened
+    /// does not have the history happen to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::UnknownAttachment`] when the identifier names no attachment of this
+    /// session.
+    pub fn restoration(&mut self, attachment_id: AttachmentId) -> Result<(u64, Vec<u8>)> {
+        let dimensions = self
+            .attachments
+            .own_dimensions(attachment_id)
+            .ok_or_else(|| WorkerError::UnknownAttachment {
+                attachment: attachment_id.to_string(),
+            })?
+            .unwrap_or_else(|| self.attachments.geometry().dimensions);
+        let (cursor, restoration) = self.engine.restoration(dimensions, kr_ipc::now_ms().get());
+        Ok((cursor, restoration.bytes))
     }
 
     /// Adds an attachment.
@@ -379,7 +411,7 @@ impl Session {
             self.attachments
                 .attach(params, granted, attachment_id, kr_ipc::now_ms())?;
         if change.resize_required
-            && let Err(error) = self.pty.resize(change.state.dimensions)
+            && let Err(error) = self.resize_canonical(change.state.dimensions)
         {
             // The kernel refused the size, so the attachment never happened. The table and the
             // geometry both go back to exactly what they were, epoch included: a refused change
@@ -388,18 +420,6 @@ impl Session {
             let _ = self.attachments.detach(attachment_id);
             self.attachments.restore_geometry(&previous);
             return Err(error);
-        }
-        // A presentation this host cannot serve is refused here rather than served wrongly. The
-        // attachment is undone first, so a refusal leaves nothing behind.
-        if attachment.presentation.as_ref() == Some(&TerminalPresentationMode::Viewport)
-            && self.projection.is_none()
-        {
-            let _ = self.attachments.detach(attachment_id);
-            return Err(WorkerError::PresentationUnsupported {
-                detail: crate::projection::PresentationRefusal::NoProjection
-                    .detail()
-                    .to_owned(),
-            });
         }
         Ok(SessionAttachResult {
             attachment,
@@ -424,17 +444,18 @@ impl Session {
             let framing = self.framer.close_for_takeover();
             if let Some(terminator) = framing.terminator {
                 self.pending_input.push(InputBatch {
-                    epoch,
+                    origin: InputOrigin::Lease(epoch),
                     bytes: terminator.to_vec(),
                 });
             }
         }
+        self.note_lease_holder();
         self.hub.detached(attachment_id);
         let previous = self.attachments.geometry();
         let change = self.attachments.detach(attachment_id)?;
         if change.resize_required
             && self.state.is_running()
-            && let Err(error) = self.pty.resize(change.state.dimensions)
+            && let Err(error) = self.resize_canonical(change.state.dimensions)
         {
             // The attachment is gone either way — it asked to leave — but the geometry it would
             // have handed on is not moved when the kernel refuses the size.
@@ -475,7 +496,7 @@ impl Session {
         let change = self.attachments.configure(attachment_id, claim_geometry)?;
         if change.resize_required
             && self.state.is_running()
-            && let Err(error) = self.pty.resize(change.state.dimensions)
+            && let Err(error) = self.resize_canonical(change.state.dimensions)
         {
             self.attachments.restore_geometry(&previous);
             return Err(error);
@@ -500,7 +521,7 @@ impl Session {
         // every attachment drawing at a geometry the application does not have.
         self.attachments
             .check_resize(attachment_id, dimensions, expected_epoch)?;
-        self.pty.resize(dimensions)?;
+        self.resize_canonical(dimensions)?;
         let change = self
             .attachments
             .resize(attachment_id, dimensions, expected_epoch)?;
@@ -521,7 +542,7 @@ impl Session {
         let previous = self.attachments.geometry();
         let change = self.attachments.transfer(attachment_id, expected_epoch)?;
         if change.resize_required
-            && let Err(error) = self.pty.resize(change.state.dimensions)
+            && let Err(error) = self.resize_canonical(change.state.dimensions)
         {
             // The transfer is undone, owner and epoch together: a half-completed handover would
             // leave the session with an owner whose size it never took.
@@ -564,10 +585,11 @@ impl Session {
             // The terminator belongs to the paste the previous lease opened, so it is written
             // under the epoch that opened it rather than the one taking over.
             self.pending_input.push(InputBatch {
-                epoch: previous_epoch,
+                origin: InputOrigin::Lease(previous_epoch),
                 bytes: terminator.to_vec(),
             });
         }
+        self.note_lease_holder();
         Ok(InputAcquireResult {
             lease: self.lease.to_wire(),
             discarded_bytes: U64::new(discarded),
@@ -594,10 +616,11 @@ impl Session {
         let framing = self.framer.close_for_takeover();
         if let Some(terminator) = framing.terminator {
             self.pending_input.push(InputBatch {
-                epoch,
+                origin: InputOrigin::Lease(epoch),
                 bytes: terminator.to_vec(),
             });
         }
+        self.note_lease_holder();
         Ok(self.lease.to_wire())
     }
 
@@ -633,7 +656,7 @@ impl Session {
         let outcome = self.framer.push(bytes, now);
         if !outcome.forward.is_empty() {
             self.pending_input.push(InputBatch {
-                epoch,
+                origin: InputOrigin::Lease(epoch),
                 bytes: outcome.forward.clone(),
             });
         }
@@ -653,7 +676,10 @@ impl Session {
         match self.framer.expire(now) {
             Some(bytes) if !bytes.is_empty() => {
                 let len = bytes.len();
-                self.pending_input.push(InputBatch { epoch, bytes });
+                self.pending_input.push(InputBatch {
+                    origin: InputOrigin::Lease(epoch),
+                    bytes,
+                });
                 len
             }
             _ => 0,
@@ -734,13 +760,43 @@ impl Session {
             });
         }
         let limit = send_queue_bytes.clamp(1, self.config.send_queue_bytes);
-        Ok(self.hub.subscribe(attachment_id, limit))
+        let presentation = self.presentation_of(attachment_id);
+        Ok(self.hub.subscribe(attachment_id, limit, presentation))
     }
 
-    /// Records output from the terminal and delivers it.
+    /// Returns how one attachment is served: the raw stream, or a rendering of the screen.
+    fn presentation_of(&mut self, attachment_id: AttachmentId) -> crate::output::Presentation {
+        self.attachments
+            .set_carryable(self.engine.direct_is_carryable());
+        let projected = self
+            .attachments
+            .projected()
+            .into_iter()
+            .any(|(id, _)| id == attachment_id);
+        if projected {
+            crate::output::Presentation::Projected
+        } else {
+            crate::output::Presentation::Direct
+        }
+    }
+
+    /// Records output from the terminal, interprets it and delivers what each attachment may see.
     ///
     /// This is the read loop's only entry point. It never waits for a client: a subscriber that
     /// cannot keep up is told to resynchronise and the loop continues.
+    ///
+    /// Three things happen to every batch, in this order:
+    ///
+    /// 1. **The raw stream is retained.** The history is the durable record of what the
+    ///    application wrote, and the cursor every other part of the host quotes is a position in
+    ///    it. Nothing the engine decides changes what is kept.
+    /// 2. **The canonical grid consumes it.** A query is answered here and travels no further; a
+    ///    bell, a clipboard write or a notification is routed to the one attachment holding the
+    ///    input lease; a sequence the profile does not name is consumed rather than forwarded in
+    ///    the hope that it is harmless.
+    /// 3. **Each attachment is given what it can take.** A terminal of the session's own size is
+    ///    handed the spans the engine says a terminal may take unchanged; a terminal of any other
+    ///    size is drawn the canonical screen clipped to the size it has.
     pub fn ingest_output(&mut self, bytes: &[u8]) -> Vec<AttachmentId> {
         if bytes.is_empty() {
             return Vec::new();
@@ -753,9 +809,115 @@ impl Session {
             self.framer.set_bracketed_paste(enabled);
         }
         let cursor = self.history.append(bytes);
-        let shared = Arc::new(bytes.to_vec());
-        self.hub
-            .publish(cursor, &shared, self.history.oldest_retained_cursor())
+        let filtered = self
+            .engine
+            .feed(cursor, bytes, self.lane_gate(), kr_ipc::now_ms().get());
+        self.deliver(filtered)
+    }
+
+    /// Settles the screen when the terminal's output goes quiet.
+    ///
+    /// The engine holds the last scalar of a run back in case a combining mark follows it, so a
+    /// screen that has stopped changing is only final once this has run. The read loop calls it
+    /// when a read finds nothing waiting.
+    pub fn quiesce_output(&mut self) -> Vec<AttachmentId> {
+        let filtered = self
+            .engine
+            .quiesce(self.lane_gate(), kr_ipc::now_ms().get());
+        self.deliver(filtered)
+    }
+
+    /// Returns what the response lane is allowed to write right now.
+    ///
+    /// A reply must not land in the middle of a bracketed paste or a recognised human input frame,
+    /// because the application would read it as part of what the person was typing.
+    fn lane_gate(&self) -> kr_term::lane::LaneGate {
+        kr_term::lane::LaneGate {
+            paste_open: self.framer.paste_open(),
+            // No backend this host drives is qualified to take a reply inside an open paste.
+            backend_handles_paste_interleave: false,
+            // A delimiter this framer is still holding is the first bytes of a frame the person is
+            // part way through sending. A reply written in the middle of it would arrive inside
+            // what the application reads as one key.
+            human_frame_open: self.framer.held_len() > 0,
+        }
+    }
+
+    /// Delivers one interpreted batch to the attachments and the application.
+    fn deliver(&mut self, filtered: crate::projection::Filtered) -> Vec<AttachmentId> {
+        // What the host owes the application goes into its terminal input, ahead of anything a
+        // person may be typing: the application asked for it and is waiting.
+        for reply in filtered.replies {
+            self.pending_input.push(InputBatch {
+                origin: InputOrigin::Host,
+                bytes: reply,
+            });
+        }
+        let oldest = self.history.oldest_retained_cursor();
+        let mut resynchronised = Vec::new();
+        // A terminal of the session's own size takes the spans the engine cleared. The cursors are
+        // positions in the raw stream, so what the engine withheld leaves a gap rather than
+        // shifting everything after it.
+        for (cursor, span) in filtered.direct {
+            let shared = Arc::new(span);
+            resynchronised.extend(self.hub.publish_direct(cursor, &shared, oldest));
+        }
+        // A side effect has one destination. It goes to the attachment holding the input lease and
+        // to nothing else, which is what stops one person's clipboard reaching every device that
+        // happens to be watching.
+        if let Some(holder) = self.lease.holder() {
+            for (cursor, bytes) in filtered.effects {
+                let shared = Arc::new(bytes);
+                if self.hub.publish_to(holder, cursor, &shared, oldest) {
+                    resynchronised.push(holder);
+                }
+            }
+        }
+        // Every terminal of another size is drawn the canonical screen it can see. The repaint is
+        // taken once per attachment because each one is looking at its own window.
+        // The engine's answer is recorded first, so a summary and a delivery cannot disagree about
+        // how an attachment is being served.
+        self.attachments
+            .set_carryable(self.engine.direct_is_carryable());
+        let projected = self.attachments.projected();
+        // A terminal that has just moved between the two presentations cannot continue from what
+        // it holds: the bytes it was receiving and the screen it is about to be drawn are not two
+        // parts of one picture. It installs a fresh one instead.
+        let projecting: std::collections::BTreeSet<AttachmentId> =
+            projected.iter().map(|(id, _)| *id).collect();
+        for attachment_id in self.hub.subscribers() {
+            let presentation = if projecting.contains(&attachment_id) {
+                crate::output::Presentation::Projected
+            } else {
+                crate::output::Presentation::Direct
+            };
+            if self.hub.set_presentation(attachment_id, presentation) {
+                let next = self.history.next_cursor();
+                self.hub
+                    .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
+                resynchronised.push(attachment_id);
+            }
+        }
+        for (attachment_id, dimensions) in projected {
+            let (cursor, restoration) = self.engine.restoration(dimensions, kr_ipc::now_ms().get());
+            let shared = Arc::new(restoration.bytes);
+            if self.hub.publish_to(attachment_id, cursor, &shared, oldest) {
+                resynchronised.push(attachment_id);
+            }
+        }
+        // A projection reset means no client's screen continues from the one it holds. Every
+        // subscriber installs a fresh one rather than drawing on top of a screen that is gone.
+        if filtered.projection_reset {
+            let next = self.history.next_cursor();
+            for attachment_id in self.hub.subscribers() {
+                self.hub
+                    .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
+                resynchronised.push(attachment_id);
+            }
+        }
+        resynchronised.sort_unstable();
+        resynchronised.dedup();
+        resynchronised
     }
 
     /// Builds a snapshot of present state at the current cursor.
@@ -1086,15 +1248,26 @@ impl Session {
     }
 }
 
-/// One ordered batch of input, and the lease epoch it was accepted under.
+/// Where one batch of terminal input came from.
 ///
-/// The epoch is what makes a takeover able to discard bytes it has already handed to the writer: a
-/// batch whose epoch is behind the session's fence belongs to a lease that no longer holds input,
-/// and writing it would put one actor's keystrokes into another's command line.
+/// The two are fenced differently, which is the whole reason the distinction exists. A person's
+/// keystrokes belong to a lease, and a takeover discards the ones the previous holder had already
+/// handed over. The host's own answer to a query the application asked belongs to the application:
+/// it was asked for, nothing else can supply it, and dropping it because the lease happened to
+/// move would leave the application waiting for a reply that will never come.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputOrigin {
+    /// An attachment's input, accepted under one lease epoch.
+    Lease(u64),
+    /// The host answering the application, on the response lane.
+    Host,
+}
+
+/// One ordered batch of input, and what it came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputBatch {
-    /// The lease epoch this batch was accepted under.
-    pub epoch: u64,
+    /// Where the batch came from, which decides whether a moved lease discards it.
+    pub origin: InputOrigin,
     /// The bytes, exactly as they arrived.
     pub bytes: Vec<u8>,
 }

@@ -100,6 +100,22 @@ struct Subscriber {
     queued: Arc<AtomicUsize>,
     limit: usize,
     resynchronising: bool,
+    /// Whether this subscriber takes the raw stream or a rendering of the canonical screen.
+    ///
+    /// A broadcast reaches only the subscribers that take the raw stream. A terminal of another
+    /// size is looking at its own window of the grid, so what it is sent is computed for it and
+    /// delivered to it alone.
+    presentation: Presentation,
+}
+
+/// How one subscriber is being served.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Presentation {
+    /// The spans of the raw stream a terminal may take unchanged.
+    #[default]
+    Direct,
+    /// A rendering of the canonical screen, clipped to this subscriber's own size.
+    Projected,
 }
 
 /// Every attachment currently receiving output.
@@ -119,7 +135,12 @@ impl OutputHub {
     ///
     /// Resubscribing clears a previous resynchronisation: the client has just installed a fresh
     /// snapshot, which is exactly what the marker asked it to do.
-    pub fn subscribe(&mut self, attachment_id: AttachmentId, limit: usize) -> OutputStream {
+    pub fn subscribe(
+        &mut self,
+        attachment_id: AttachmentId,
+        limit: usize,
+        presentation: Presentation,
+    ) -> OutputStream {
         let (sender, receiver) = mpsc::unbounded_channel();
         let queued = Arc::new(AtomicUsize::new(0));
         self.subscribers.insert(
@@ -129,9 +150,35 @@ impl OutputHub {
                 queued: Arc::clone(&queued),
                 limit,
                 resynchronising: false,
+                presentation,
             },
         );
         OutputStream { receiver, queued }
+    }
+
+    /// Records how one subscriber is being served.
+    ///
+    /// A terminal moves between the two when the stream stops being something it can take
+    /// unchanged, or when it becomes one again. The caller resynchronises it around the change, so
+    /// nothing it holds is continued into a form it does not match.
+    /// Returns whether this changed how the subscriber is being served.
+    pub fn set_presentation(
+        &mut self,
+        attachment_id: AttachmentId,
+        presentation: Presentation,
+    ) -> bool {
+        let Some(subscriber) = self.subscribers.get_mut(&attachment_id) else {
+            return false;
+        };
+        let changed = subscriber.presentation != presentation;
+        subscriber.presentation = presentation;
+        changed
+    }
+
+    /// Returns every attachment currently subscribed.
+    #[must_use]
+    pub fn subscribers(&self) -> Vec<AttachmentId> {
+        self.subscribers.keys().copied().collect()
     }
 
     /// Tells a subscriber its attachment has been detached, then removes it.
@@ -175,7 +222,7 @@ impl OutputHub {
     ///
     /// Returns the subscribers that were told to resynchronise. This call never awaits and never
     /// fails: the read loop that produced these bytes continues whatever any client is doing.
-    pub fn publish(
+    pub fn publish_direct(
         &mut self,
         cursor: u64,
         bytes: &Arc<Vec<u8>>,
@@ -184,7 +231,7 @@ impl OutputHub {
         let mut resynchronised = Vec::new();
         let mut gone = Vec::new();
         for (id, subscriber) in &mut self.subscribers {
-            if subscriber.resynchronising {
+            if subscriber.resynchronising || subscriber.presentation != Presentation::Direct {
                 continue;
             }
             let queued = subscriber.queued.load(Ordering::Acquire);
@@ -226,6 +273,56 @@ impl OutputHub {
         resynchronised
     }
 
+    /// Delivers bytes to one subscriber.
+    ///
+    /// This is how anything computed for a single attachment reaches it: the rendering of the
+    /// canonical screen a terminal of another size is shown, and the side effects that belong to
+    /// the one attachment holding the input lease. Returns whether the subscriber was told to
+    /// resynchronise.
+    pub fn publish_to(
+        &mut self,
+        attachment_id: AttachmentId,
+        cursor: u64,
+        bytes: &Arc<Vec<u8>>,
+        oldest_retained_cursor: u64,
+    ) -> bool {
+        let Some(subscriber) = self.subscribers.get_mut(&attachment_id) else {
+            return false;
+        };
+        if subscriber.resynchronising {
+            return false;
+        }
+        let queued = subscriber.queued.load(Ordering::Acquire);
+        if queued.saturating_add(bytes.len()) > subscriber.limit {
+            subscriber.resynchronising = true;
+            let marker = ResyncRequired {
+                reason: ResyncReason::SendQueueFull,
+                cursor: U64::new(cursor),
+                oldest_retained_cursor: U64::new(oldest_retained_cursor),
+            };
+            if subscriber
+                .sender
+                .send(OutputDelivery::Resync(marker))
+                .is_err()
+            {
+                self.subscribers.remove(&attachment_id);
+            }
+            return true;
+        }
+        subscriber.queued.fetch_add(bytes.len(), Ordering::AcqRel);
+        if subscriber
+            .sender
+            .send(OutputDelivery::Bytes {
+                cursor,
+                bytes: Arc::clone(bytes),
+            })
+            .is_err()
+        {
+            self.subscribers.remove(&attachment_id);
+        }
+        false
+    }
+
     /// Tells one subscriber to resynchronise for a reason other than its queue.
     pub fn require_resync(
         &mut self,
@@ -263,9 +360,12 @@ mod tests {
     #[tokio::test]
     async fn every_subscriber_receives_the_same_bytes() {
         let mut hub = OutputHub::new();
-        let mut first = hub.subscribe(identifier(1), 1024);
-        let mut second = hub.subscribe(identifier(2), 1024);
-        assert!(hub.publish(0, &Arc::new(b"hello".to_vec()), 0).is_empty());
+        let mut first = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        let mut second = hub.subscribe(identifier(2), 1024, Presentation::Direct);
+        assert!(
+            hub.publish_direct(0, &Arc::new(b"hello".to_vec()), 0)
+                .is_empty()
+        );
         for stream in [&mut first, &mut second] {
             match stream.recv().await.expect("a delivery") {
                 OutputDelivery::Bytes { cursor, bytes } => {
@@ -280,12 +380,12 @@ mod tests {
     #[tokio::test]
     async fn a_slow_subscriber_is_resynchronised_and_the_others_are_not_held_up() {
         let mut hub = OutputHub::new();
-        let mut slow = hub.subscribe(identifier(1), 8);
-        let mut quick = hub.subscribe(identifier(2), 1024);
+        let mut slow = hub.subscribe(identifier(1), 8, Presentation::Direct);
+        let mut quick = hub.subscribe(identifier(2), 1024, Presentation::Direct);
         // The quick subscriber drains; the slow one does not.
-        hub.publish(0, &Arc::new(vec![b'a'; 8]), 0);
+        hub.publish_direct(0, &Arc::new(vec![b'a'; 8]), 0);
         let _ = quick.recv().await.expect("a delivery");
-        let resynchronised = hub.publish(8, &Arc::new(vec![b'b'; 8]), 0);
+        let resynchronised = hub.publish_direct(8, &Arc::new(vec![b'b'; 8]), 0);
         assert_eq!(resynchronised, vec![identifier(1)]);
         assert!(hub.is_resynchronising(identifier(1)));
 
@@ -308,7 +408,7 @@ mod tests {
             }
             other => panic!("the slow subscriber was resynchronised: {other:?}"),
         }
-        hub.publish(16, &Arc::new(vec![b'c'; 8]), 0);
+        hub.publish_direct(16, &Arc::new(vec![b'c'; 8]), 0);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), slow.recv())
                 .await
@@ -320,13 +420,13 @@ mod tests {
     #[tokio::test]
     async fn resubscribing_clears_the_resynchronisation() {
         let mut hub = OutputHub::new();
-        let _slow = hub.subscribe(identifier(1), 4);
-        hub.publish(0, &Arc::new(vec![b'a'; 4]), 0);
-        hub.publish(4, &Arc::new(vec![b'b'; 4]), 0);
+        let _slow = hub.subscribe(identifier(1), 4, Presentation::Direct);
+        hub.publish_direct(0, &Arc::new(vec![b'a'; 4]), 0);
+        hub.publish_direct(4, &Arc::new(vec![b'b'; 4]), 0);
         assert!(hub.is_resynchronising(identifier(1)));
-        let mut fresh = hub.subscribe(identifier(1), 4);
+        let mut fresh = hub.subscribe(identifier(1), 4, Presentation::Direct);
         assert!(!hub.is_resynchronising(identifier(1)));
-        hub.publish(8, &Arc::new(b"ok".to_vec()), 8);
+        hub.publish_direct(8, &Arc::new(b"ok".to_vec()), 8);
         assert!(matches!(
             fresh.recv().await.expect("a delivery"),
             OutputDelivery::Bytes { cursor: 8, .. }
@@ -336,10 +436,10 @@ mod tests {
     #[tokio::test]
     async fn a_departed_subscriber_is_dropped_without_affecting_the_others() {
         let mut hub = OutputHub::new();
-        let departed = hub.subscribe(identifier(1), 1024);
-        let mut staying = hub.subscribe(identifier(2), 1024);
+        let departed = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        let mut staying = hub.subscribe(identifier(2), 1024, Presentation::Direct);
         drop(departed);
-        hub.publish(0, &Arc::new(b"x".to_vec()), 0);
+        hub.publish_direct(0, &Arc::new(b"x".to_vec()), 0);
         assert_eq!(hub.len(), 1);
         assert!(matches!(
             staying.recv().await.expect("a delivery"),

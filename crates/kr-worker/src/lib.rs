@@ -14,7 +14,8 @@
 //! | [`journal`] | The private receipt journal: acceptance, dispatch markers, de-duplication and retention |
 //! | [`output`] | Fan-out with bounded per-attachment queues and explicit resynchronisation |
 //! | [`ownership`] | Which processes a session owns, and how much of that the host can account for |
-//! | [`projection`] | The boundary a terminal of another size is served through |
+//! | [`projection`] | The canonical grid, the filtered stream and the presentation a terminal is served |
+//! | [`render`] | Turning a side-effect-free restoration into terminal bytes |
 //! | [`pty`] | The pseudo-terminal, created before the root shell, and the shell it runs |
 //! | [`session`] | The session: lifecycle, the serial order every change shares, and closure |
 //! | [`runtime`] | The reader, the writer, the recogniser timer and the closure sequence |
@@ -31,6 +32,7 @@ pub mod output;
 pub mod ownership;
 pub mod projection;
 pub mod pty;
+pub mod render;
 pub mod runtime;
 pub mod service;
 pub mod session;

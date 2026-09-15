@@ -213,7 +213,8 @@ async fn attached(
                 mode: AttachMode::Terminal,
                 claim_geometry: false,
                 dimensions: Nullable::some(Dimensions::new(80, 24)),
-                terminal_profile_id: Nullable::null(),
+                // A client declares the terminal it probed. Direct mode needs it.
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
                 requested,
             },
         )

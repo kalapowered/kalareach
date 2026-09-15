@@ -16,7 +16,9 @@ use kr_protocol::session::{ClosureReason, ClosureRecord, SessionState};
 use tokio::sync::{Notify, mpsc};
 
 use crate::error::{Result, WorkerError};
-use crate::session::{CloseAcceptance, DRAIN_PERIOD, GRACE_PERIOD, InputBatch, Session};
+use crate::session::{
+    CloseAcceptance, DRAIN_PERIOD, GRACE_PERIOD, InputBatch, InputOrigin, Session,
+};
 
 /// How many read batches may wait for ingestion before the read loop slows down.
 pub const READ_QUEUE_DEPTH: usize = 64;
@@ -94,10 +96,13 @@ impl SessionRuntime {
         let writer_fence = Arc::clone(&fence);
         std::thread::spawn(move || {
             while let Some(batch) = input_receiver.blocking_recv() {
-                // Stale bytes are dropped here rather than written. A takeover that only stopped
-                // *new* input would still let the previous holder's last keystrokes land in the
-                // new holder's command line.
-                if batch.epoch < writer_fence.load(std::sync::atomic::Ordering::Acquire) {
+                // Stale keystrokes are dropped here rather than written. A takeover that only
+                // stopped *new* input would still let the previous holder's last keystrokes land in
+                // the new holder's command line. The host's own answer to a query the application
+                // asked is not a keystroke and is never dropped: nothing else can supply it.
+                if let InputOrigin::Lease(epoch) = batch.origin
+                    && epoch < writer_fence.load(std::sync::atomic::Ordering::Acquire)
+                {
                     continue;
                 }
                 if std::io::Write::write_all(&mut writer, &batch.bytes).is_err() {
@@ -117,12 +122,25 @@ impl SessionRuntime {
 
         let ingest_session = Arc::clone(&session);
         let ingest_closed = Arc::clone(&closed);
+        let ingest_input = input_sender.clone();
         tokio::spawn(async move {
             while let Some(event) = output_receiver.recv().await {
                 match event {
                     ReadEvent::Bytes(bytes) => {
                         if let Ok(mut session) = ingest_session.lock() {
                             session.ingest_output(&bytes);
+                            // Nothing else is waiting, so the terminal has gone quiet and the
+                            // screen is settled. The engine holds the last scalar of a run back in
+                            // case a combining mark follows it, and this is what releases it.
+                            if output_receiver.is_empty() {
+                                session.quiesce_output();
+                            }
+                            // What the host owes the application goes back into its terminal
+                            // input. An application that asked the terminal a question is waiting
+                            // for the answer, and nothing else can supply it.
+                            for batch in session.take_pending_input() {
+                                let _ = ingest_input.send(batch);
+                            }
                         }
                     }
                     ReadEvent::Ended => {

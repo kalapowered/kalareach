@@ -336,61 +336,41 @@ impl WorkerService {
                 }
                 let sender = Arc::clone(&writer);
                 let stream_id = state.stream_id.clone();
-                let replay = state.replay.take();
-                let runtime = Arc::clone(self.runtime());
+                let restoration = state.restoration.take();
                 let task = tokio::spawn(async move {
                     let mut sequence = 0_u64;
-                    // The retained range is replayed up to the cursor the subscription was taken
-                    // at, and no further. Reading to a moving end would send bytes that the live
-                    // queue is also about to send, so the client would see them twice and its
-                    // cursor would move backwards at the handover.
-                    let live_from = replay.map_or(0, |replay| replay.to);
-                    if let Some(replay) = replay {
-                        let mut cursor = replay.from;
-                        while cursor < replay.to {
-                            let page = {
-                                let session = runtime.session();
-                                session.history_page(cursor, MAX_REPLAY_PAGE_BYTES)
-                            };
-                            let Ok(page) = page else { break };
-                            // A gap in the retained range is part of the stream, not a detail to
-                            // drop: the client has to know its view is not continuous.
-                            if let Some(gap) = page.gap.as_ref()
-                                && let Some(notification) =
-                                    notification(&stream_id, sequence, "session.gap", gap)
-                            {
-                                sequence += 1;
-                                let mut sender = sender.lock().await;
-                                if sender.write_message(&notification).await.is_err() {
-                                    return;
-                                }
+                    // The screen this attachment joins on is the canonical screen as it is now,
+                    // drawn from the terminal engine's own state. It is not the raw history.
+                    // Replaying that would replay whatever it contained — a clipboard write, a
+                    // bell, a query whose answer would arrive at the wrong moment — into a terminal
+                    // that was not there when any of it happened.
+                    let live_from = restoration.as_ref().map_or(0, |joined| joined.cursor);
+                    if let Some(joined) = restoration {
+                        if let Some(gap) = joined.gap.as_ref()
+                            && let Some(notification) =
+                                notification(&stream_id, sequence, "session.gap", gap)
+                        {
+                            sequence += 1;
+                            let mut sender = sender.lock().await;
+                            if sender.write_message(&notification).await.is_err() {
+                                return;
                             }
-                            if page.bytes.is_empty() {
-                                break;
-                            }
-                            let start = page.from_cursor.get();
-                            let available = page.bytes.as_slice();
-                            // The last page is trimmed at the boundary, so replay ends exactly
-                            // where the live queue begins.
-                            let keep = usize::try_from(replay.to.saturating_sub(start))
-                                .unwrap_or(available.len())
-                                .min(available.len());
+                        }
+                        if !joined.bytes.is_empty() {
                             let event = OutputEvent {
-                                cursor: U64::new(start),
-                                bytes: kr_protocol::scalars::Bytes::new(available[..keep].to_vec()),
+                                cursor: U64::new(joined.cursor),
+                                bytes: kr_protocol::scalars::Bytes::new(joined.bytes),
                             };
                             let Some(notification) =
                                 notification(&stream_id, sequence, "session.output", &event)
                             else {
-                                break;
+                                return;
                             };
                             sequence += 1;
                             let mut sender = sender.lock().await;
                             if sender.write_message(&notification).await.is_err() {
                                 return;
                             }
-                            drop(sender);
-                            cursor = page.next_cursor.get().max(start + keep as u64);
                         }
                     }
                     while let Some(delivery) = stream.recv().await {
@@ -1513,24 +1493,24 @@ impl WorkerService {
             .from_cursor
             .as_ref()
             .map_or_else(|| session.output_cursor(), |cursor| cursor.get());
-        // The cursor the subscription was taken at, read under the same lock that started the
-        // live queue. Replay ends here and the live queue begins here, so the two meet exactly.
-        let live_from = session.output_cursor();
+        // The screen, taken under the same lock that started the live queue. The restoration ends
+        // at the cursor it names and the live queue begins there, so the two meet exactly and
+        // nothing arrives twice or goes missing at the handover.
+        let (cursor, bytes) = session.restoration(params.attachment_id)?;
         let oldest = session.snapshot().oldest_retained_cursor.get();
+        // A client whose position has fallen out of the retained window is told so. The screen it
+        // is about to be drawn is current either way; the gap says that what happened in between is
+        // no longer readable through `history.page`.
         let gap = (from < oldest).then_some(kr_protocol::recovery::HistoryGap {
             from_cursor: U64::new(from),
             to_cursor: U64::new(oldest),
         });
-        let replay_from = from.max(oldest);
         drop(session);
         state.subscribed = Some((params.attachment_id, stream));
-        state.replay = Some(ReplayRange {
-            from: replay_from,
-            to: live_from,
-        });
+        state.restoration = Some(JoinedScreen { cursor, bytes, gap });
         encode(&EventsSubscribeResult {
             stream_id: state.stream_id.clone(),
-            from_cursor: U64::new(from.max(oldest)),
+            from_cursor: U64::new(cursor),
             oldest_retained_cursor: U64::new(oldest),
             gap: Nullable(gap),
         })
@@ -1747,13 +1727,19 @@ impl WorkerService {
     }
 }
 
-/// The retained range one subscription replays before its live output begins.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplayRange {
-    /// The first cursor to send.
-    pub from: u64,
-    /// The cursor the subscription was taken at. Replay stops here and live output starts here.
-    pub to: u64,
+/// The screen one subscription is drawn before its live output begins.
+///
+/// It is the canonical screen as the terminal engine holds it, rendered side-effect free, not the
+/// bytes that produced it. A terminal that joins mid-session therefore sees what is on the screen
+/// without anything that was an event when it happened happening again.
+#[derive(Clone, Debug)]
+pub struct JoinedScreen {
+    /// The cursor the screen was taken at. Live output continues from here.
+    pub cursor: u64,
+    /// The bytes that draw it.
+    pub bytes: Vec<u8>,
+    /// The part of the stream that is no longer readable, when the client had fallen behind it.
+    pub gap: Option<kr_protocol::recovery::HistoryGap>,
 }
 
 /// What decides whether a mutation may be admitted for the first time.
@@ -1895,8 +1881,8 @@ pub struct ConnectionState {
     pub pending_delivery: Option<(kr_protocol::ids::ActionId, crate::runtime::PendingDelivery)>,
     /// A generation challenge waiting to be sent after the current reply.
     pub pending_challenge: Option<ControlFrame>,
-    /// The retained range a new subscription replays before live output resumes.
-    pub replay: Option<ReplayRange>,
+    /// The screen a new subscription is drawn before live output resumes.
+    pub restoration: Option<JoinedScreen>,
     /// The delivery task this connection owns, cancelled when the connection goes.
     pub delivery: Option<tokio::task::JoinHandle<()>>,
     /// The host-issued principal this connection acts under.
@@ -1926,7 +1912,7 @@ impl ConnectionState {
             close_gate: None,
             pending_delivery: None,
             pending_challenge: None,
-            replay: None,
+            restoration: None,
             delivery: None,
             actor_id: ActorId::new(format!("local:{}", peer.uid))
                 .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal")),

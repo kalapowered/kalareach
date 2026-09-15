@@ -385,10 +385,11 @@ async fn observer(
                 session_id,
                 mode: AttachMode::Terminal,
                 claim_geometry: false,
-                // The session's own size, so the attachment is served directly: a different size
-                // needs a projection this build does not have.
+                // The session's own size, with the terminal this client probed declared, so the
+                // attachment is served the stream directly. A different size, or no declaration,
+                // is served a rendering of the canonical screen instead.
                 dimensions: Nullable::some(kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS),
-                terminal_profile_id: Nullable::null(),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
                 requested,
             },
         )
