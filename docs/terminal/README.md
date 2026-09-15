@@ -41,15 +41,17 @@ Every sequence gets exactly one class. There is no sixth class for "probably har
 | `S` | Side effect. Consumed here and routed to one named destination under policy |
 | `X` | Extension. Consumed, with a rate-limited diagnostic |
 
-`X` is the default. An unrecognised CSI final, an unknown OSC selector, a sequence from a protocol
-this profile has never heard of: all consumed, none forwarded. Adding one needs a profile revision
-and an explicit class, which is the whole reason the profile has a revision number.
+`X` is the default, and it is the default twice over. An unrecognised CSI final or an unknown OSC
+selector is `X`. So is a *recognised* sequence in a form the profile has not qualified: an
+unsupported parameter, subcommand, resource or flag falls through to `X` rather than travelling on
+inside a sequence that looks familiar. Recognising the final byte is not the same as supporting
+what the sequence says.
 
 `classify.rs` implements the table in the order the rows appear in the specification, and
 `fixtures/terminal/classes.json` holds one case per row with the classes, the spans and the exact
 bytes.
 
-A few rows are worth spelling out.
+Some rows are worth spelling out.
 
 **Named C0 exceptions.** NUL and DEL are `D`. Both are stream padding that every terminal discards,
 they appear constantly, and classifying them as `X` would produce a diagnostic per occurrence
@@ -59,6 +61,11 @@ without telling anyone anything. Every other C0 control the table does not name 
 request and replies with nothing. That is the sequence's own defined behaviour for a terminal
 without one, and it is better than letting the request travel on to a terminal that does.
 
+**A colon sublist belongs to SGR.** `CSI ? 3 : 7 h` is not a request to set mode 7. The leading
+value of a slot is the one the table names, and a sublist anywhere but SGR makes the whole sequence
+an extension. So does a sequence the parser could not keep whole: the part it dropped could have
+carried a mode the profile refuses.
+
 **SD shares a final byte.** `CSI Ps T` is scroll-down. `CSI Ps ; Ps ; Ps ; Ps ; Ps T` is xterm's
 highlight mouse tracking, which the profile does not advertise. One parameter is the scroll; more
 than one is the tracking request, which is `X`.
@@ -67,9 +74,17 @@ than one is the tracking request, which is `X`.
 `14`, `15`, `16`, `18`, `19`) are `Q`. The title stack (`22`, `23`) is `M`. Everything else asks for
 a physical window change and is `X`, because rows and columns belong to the size owner.
 
+**Keyboard negotiation is checked before it travels.** Only `modifyOtherKeys` resource 4 at level 0,
+1 or 2 is qualified, and only the Kitty keyboard flags in the profile's subset. `CSI > 16 u` asks
+for text association, which the input encoders cannot produce, so it is `X` rather than a flag the
+application believes it got.
+
 **DECSCA is not classified as display.** Nothing in the profile implements selective erase, so the
 attribute is `X` and DA1 does not claim `6`. Advertising a capability and then dropping it is worse
 than not advertising it.
+
+**Only qualified colour selectors are colours.** The Tektronix colours (OSC 15, 16, 18 and their
+resets) have no canonical state here, so asking about one or setting one is `X`.
 
 ## The byte policy
 
@@ -78,7 +93,7 @@ nothing above U+10FFFF. Malformed input becomes U+FFFD with a named cause, and t
 pinned in `fixtures/terminal/byte-policy.json` rather than left to whatever the decoder happened to
 do.
 
-Four rules are easy to get wrong, and each one has a fixture.
+Five rules are easy to get wrong, and each one has a fixture.
 
 **A scalar's continuation bytes are never C1.** `Ü` is `0xC3 0x9C`, and `0x9C` is the eight-bit
 string terminator. Inside a scalar it is a continuation byte and nothing else. On ground, where no
@@ -94,26 +109,45 @@ operating system command) there. A title containing `Über` survives intact.
 U+009B, the CSI control. It arrived inside a scalar, so it is never executed; it becomes U+FFFD and
 what follows is ordinary text.
 
-**Nothing that is not valid UTF-8 reaches a physical terminal.** A raw eight-bit introducer is
-classified like its seven-bit form so the canonical grid still gets it right, but its bytes are
-never forwarded. The attachment moves to projected mode at the preceding safe cursor and the engine
-renders the result instead. `DirectDisposition` carries this decision on every event:
+**Escape doubling belongs to tmux.** `ESC ESC` is one escape of payload only inside a recognised
+tmux passthrough envelope, which doubles escapes for exactly that reason. Anywhere else an `ESC`
+that is not followed by `\` abandons the string and starts a new sequence, which is what a physical
+terminal does. A general doubling rule would let a title hide a clipboard write: the engine would
+frame the whole thing as one title and forward its bytes, and the terminal on the other side would
+end the title at the escape and run the clipboard write.
+
+**Nothing that is not plain text reaches a physical terminal.** That covers a raw eight-bit
+introducer, and it covers a control-string payload carrying invalid UTF-8 or a control scalar. Such
+a sequence is still classified normally and still reaches the canonical grid, with its payload
+sanitised into U+FFFD and printable text on the way; its original bytes are never forwarded, because
+a terminal would frame them somewhere other than where this engine framed them.
+`DirectDisposition` carries the decision on every event:
 
 - `Forward`: the original bytes go to the attachment unchanged.
 - `RequireProjection`: the bytes cannot go to a physical terminal, so the attachment projects.
-- `Withhold`: the bytes stop here, because the engine answered, routed or dropped them.
+- `Withhold`: the bytes stop here, because the engine answered, routed or consumed them.
+
+The engine withholds in two more cases the class table cannot see: a sequence the canonical grid
+does not implement, and a hyperlink that would pass the session's bound. Both are consumed with a
+diagnostic, so `FeedOutcome::forward` is what a direct attachment actually sends.
 
 ### Bounds
 
 A control string is bounded at 64 KiB, except OSC 52 which has its own 1 MiB bound. Past the bound
-the lexer stops collecting and starts discarding, and while discarding, `ESC` no longer ends the
-string and starts a new sequence. That is the point: the suffix of an oversized payload must never
-execute. The string ends at a real terminator, at CAN or SUB, or when the 64 KiB resynchronisation
-window runs out, and then the parser is back on ground and reading ordinary output. The discarded
-payload is never re-injected.
+the lexer stops collecting and starts discarding in constant memory, and while discarding, `ESC` no
+longer ends the string and starts a fresh sequence. The string ends at a real terminator, at CAN or
+SUB, or at the end of the stream. It never ends on an elapsed byte count, because a byte count does
+not establish a sequence boundary: inventing one is exactly how the suffix of an oversized payload
+gets executed.
 
-`ESC ESC` inside a control string is one escape of payload, not a terminator and not an abort. A
-tmux passthrough envelope doubles every escape for exactly this reason.
+A sequence prelude is bounded too. Past 256 retained bytes the parser keeps its framing state and
+the span length and stops retaining bytes, so `CSI` followed by two megabytes of digits costs
+nothing, and the sequence becomes an extension.
+
+A control byte inside a prelude is consumed and ignored rather than abandoning the sequence, so
+`CSI 5 NUL ; 3 H` still moves the cursor to row 5, column 3. kr-vt/1 does not execute the embedded
+control where a VT terminal would; the parameters are what matter, and losing them to a stray NUL
+would be worse.
 
 ### tmux passthrough
 
@@ -124,6 +158,18 @@ of four. Beyond four the envelope is discarded with a diagnostic.
 Nothing changes inside an envelope. A query at depth three is still answered by the broker and still
 never forwarded. What does change is the disposition: an envelope is consumed, so its decoded
 display and mode events require projection rather than forwarding.
+
+### Reads and clusters
+
+A text run holds back its final grapheme cluster until the next read. Without that, `e` and its
+combining acute would land in different calls when the kernel split the read between them, and the
+mark would be lost; identical bytes would produce different screens depending on how the output
+arrived. `Engine::quiesce` releases the held cluster, and the session loop calls it when a read
+returns nothing. A snapshot calls it itself, so a settled screen is always what a snapshot
+describes.
+
+A cluster is bounded at 64 bytes, which is the per-cell content bound: past it the cluster ends and
+the next scalar starts a new one, so a run of combining marks cannot become one unbounded cell.
 
 ## The canonical grid
 
@@ -138,22 +184,27 @@ parse rather than reconciling it. The engine frames and classifies a sequence on
 library never sees a byte of the output stream, so it cannot frame anything differently, and it
 never sees a sequence the policy layer withheld.
 
-What remains is the mapping, and that is qualified by measurement rather than by argument. The
-library marks a sequence it does not understand as unspecified. When the engine classifies
-something as display or mode and the library shrugs, the adapter records it, and every fixture
-asserts the count is zero. The two halves have to agree about every sequence in the corpus.
+What remains is the mapping, and it is qualified by measurement rather than by argument. The library
+marks a sequence it does not understand as unspecified, at any nesting, and the adapter looks for
+that inside mode and colour containers as well as at the top level. When the class table approves
+something and the library shrugs, the engine consumes it: the grid does not apply it and the bytes
+are not forwarded. Half-understanding a sequence is worse than refusing it, because the canonical
+screen and the physical terminal would then disagree about what happened. Every fixture asserts the
+count of such sequences is zero for the supported corpus.
 
-Two sequences are exempt, because the profile owns them outright: the virtualised title stack
-(`CSI 22 t` and `CSI 23 t`) and OSC 633. Handing either to the library would produce an
-unrecognised action and look like a disagreement where there is none.
+Three kinds of sequence never reach the library, because the profile owns them outright:
+
+- the virtualised title stack (`CSI 22 t` and `CSI 23 t`),
+- OSC 633, which the library does not model, and
+- DEC modes 66, 67, 1007 and 1034, which change what a keyboard or mouse encoder produces and
+  nothing about the screen.
 
 ### The library qualification record
 
 Repository: `https://github.com/wezterm/wezterm`
 Revision: `699fd77b44641c43476c945054cfae6518dbd632`
-Patch required: none.
 
-The revision serves kr-vt/1 as it stands, for four reasons.
+The revision serves kr-vt/1 for these reasons.
 
 1. It accepts already-parsed actions, which is what makes the second parse unnecessary rather than
    merely discouraged.
@@ -166,32 +217,45 @@ The revision serves kr-vt/1 as it stands, for four reasons.
    of the profile.
 4. It is constructed with a writer that accepts bytes and delivers none, and counts them. Every
    reply comes from the broker, and every fixture fails if that count is not zero.
+5. It clusters the text of one call to its action interface, which is why the engine holds a text
+   run's final cluster until it knows what follows.
 
-Two behaviours of the pinned revision are recorded here because they constrain the *direct*
-compatibility profile, which is qualified per physical terminal rather than here.
+The Unicode data behind the width model is pinned by the same revision: `emoji-data.txt` dated
+2020-01-28 and `emoji-variation-sequences-14.0.0.txt` dated 2021-06-08.
 
-- **Grapheme clusters take one cell.** A ZWJ emoji sequence such as U+1F469 U+200D U+1F4BB occupies
-  two cells in the canonical grid, even though the profile does not advertise mode 2027 and a
-  terminal without it would draw four. `fixtures/terminal/width.json` pins both margins of this
-  case. A physical profile qualified for direct mode has to cluster the same way.
+#### What the revision needs before the profile is complete
+
+Two pieces of state section 8 lists among what a snapshot restores are not reachable from the pinned
+revision. Both need the same narrow published patch: a public accessor.
+
+| State | Why the profile needs it | What happens until then |
+| --- | --- | --- |
+| `TerminalState::pending_wrap()` | Section 8 lists pending wrap among the restored state | The snapshot carries `None`; a reconnecting client re-derives it from the next character it places, which costs that character's position and nothing else |
+| `TerminalState::saved_cursor()` as a shared reference with public fields | Section 8 lists saved cursors among the restored state | The snapshot carries `None`; a restored session behaves as though nothing was saved until the application saves again |
+
+#### What constrains the direct compatibility profile
+
+Two behaviours differ from xterm. Neither is a defect in the canonical state, and both mean a
+physical terminal has to be qualified against them before direct mode is offered.
+
+- **A grapheme cluster takes one cell.** A ZWJ emoji sequence such as U+1F469 U+200D U+1F4BB
+  occupies two cells even though the profile does not advertise mode 2027, and a terminal without it
+  would draw four. `fixtures/terminal/width.json` pins both margins of this case.
 - **A wide cell may overhang the right margin.** Writing a two-cell character in the last column of
   a five-column grid leaves a six-cell row and sets the pending wrap, where xterm blanks the last
   column and wraps the character. The fixture records the canonical result, and a projected renderer
   clips or safely replaces the overhanging cell.
 
-The Unicode data behind the width model is pinned by the same revision: `emoji-data.txt` dated
-2020-01-28 and `emoji-variation-sequences-14.0.0.txt` dated 2021-06-08.
-
 ## The query broker
 
 The worker is the only responder. No query is forwarded to an attached terminal, no attached
 terminal is asked what it can do on the application's behalf, and no answer describes anything
-except the virtual profile and the session's own state. Every reply is built in seven-bit form, so a
-reply is always valid UTF-8.
+except the virtual profile and the session's own state. Every reply is built by the broker, in
+seven-bit form, out of the profile's own bytes: nothing from a request is ever copied into a reply.
 
 | Query | Answer |
 | --- | --- |
-| DA1 (`CSI c`, `ESC Z`) | `CSI ? 62 ; 1 ; 22 c` |
+| DA1 (`CSI c`, `ESC Z`) | `CSI ? 62 ; 22 c` |
 | DA2 (`CSI > c`) | `CSI > 41 ; 1 ; 0 c` |
 | DA3 (`CSI = c`) | `DCS ! \| 4B520001 ST` |
 | DSR status (`CSI 5 n`) | `CSI 0 n` |
@@ -217,6 +281,10 @@ so a VT420-class answer is the useful one; the identity lives in XTVERSION, whic
 outright. `no_reply_carries_a_physical_terminal_identity` in `tests/broker.rs` asserts that no reply
 contains a terminal's name.
 
+A cursor report follows origin mode. With DECOM set the application is working in a coordinate space
+that starts at the margins, so a report in absolute screen coordinates would send it to the wrong
+place.
+
 The mode reports are where honesty matters most. Mode 2027 and mode 2048 report status `0`, not
 recognised, so an application can fall back instead of assuming. DECCOLM reports status `4`,
 permanently reset, because the geometry owner decides the column count and nothing the application
@@ -225,27 +293,45 @@ sends will change it.
 Pixel geometry is reported as zero. Raster graphics are disabled, so nothing needs a pixel size, and
 inventing one would be worse than reporting none.
 
+A colour request may mix mutations with questions: `OSC 4 ; 1 ; #ff0000 ; 2 ; ?` sets one colour and
+asks about another. Both halves happen. A dynamic-colour request addresses consecutive selectors, so
+`OSC 10 ; fg ; bg` sets both.
+
+XTGETTCAP repeats the name it was asked about, so a name is validated before it is repeated: hex
+only, bounded length, and printable. Anything else gets the bare failure reply. An application must
+not be able to choose the bytes that travel on the trusted lane.
+
 ### The response lane
 
 A reply is not input. It needs no human lease, it never acquires one, and it never looks like a
-device, a paste or a root command. Only the broker can put anything on the lane, and the lane keeps
-replies in the order their queries arrived.
+device, a paste or a root command. Replies are built inside the crate by the broker; anything outside
+it can read a reply and write it, and cannot invent one.
 
-Three bounds apply at once, because a query flood is an ordinary thing for a misbehaving program to
+Four bounds apply at once, because a query flood is an ordinary thing for a misbehaving program to
 do:
 
 - one reply is at most 8 KiB,
-- the queue is at most 128 KiB, and
-- the budget is 256 replies per second, which is also the burst size.
+- the queue is at most 128 KiB,
+- the budget is 256 replies per second, which is also the burst size, and
+- a reply that has waited two seconds is dropped rather than written into a conversation that has
+  moved on.
 
 When a bound binds, the lane records explicit degraded status and sheds load in a stated order:
-refuse over budget first, then collapse an earlier pending reply of the same kind when the queue is
-full, and drop only when neither is possible. A cursor report is never collapsed, because two cursor
-reports are a sequence rather than two copies of the same fact.
+refuse over budget first, then collapse an earlier pending reply *about the same subject* when the
+queue is full, and drop only when neither is possible. The subject is part of the reply's kind, so a
+report about mode 25 can never stand in for a report about mode 7. A cursor report is never
+collapsed, because two cursor reports are a sequence rather than two copies of the same fact.
 
-The caller passes its own byte budget to `drain`, so draining the lane can never crowd out the human
-input the same loop is delivering. While a bracketed paste is open and the backend is not qualified
-to interleave, nothing is taken at all.
+The lane holds replies; the session loop delivers them. `LaneGate` carries what the loop knows about
+the write it is about to make, and nothing is taken while a bracketed paste is open on a backend
+that cannot interleave, or while a recognised human input frame is part way through being delivered.
+The caller also passes its own byte budget, so draining the lane can never crowd out the human input
+the same loop is delivering; a reply that does not fit stays where it is, including the first one.
+
+The serial write loop itself belongs to the worker, which owns the pseudo-terminal: ordering a reply
+after its query event, closing paste framing on source loss, invalidating an editor fence, and
+accounting for every delivered byte are its work. This crate supplies the bounds, the ordering
+information (`Response::query_at`) and the gate it needs to do that.
 
 Nothing on the lane is history. `reset` drops everything pending, and a reconnecting client is never
 sent a reply or a probe answer from before it arrived.
@@ -267,20 +353,35 @@ event that a person can see later. There is no broadcast.
 | OSC 52 read | Empty response by default, sent without consulting any client |
 
 Subcommands are recognised explicitly. An OSC 9 with an unrecognised numeric subcommand, an OSC 777
-that is not `notify`, an OSC 99 without a payload: all `X`.
+that is not `notify`, an OSC 99 without a payload, an OSC 9 progress report with a state outside
+0 to 4: all `X`.
 
 OSC 52 has two bounds. The encoded string is bounded at 1 MiB in the lexer, so a larger one is
 discarded as an oversized control string and never becomes a clipboard operation at all. Inside that
 bound, the policy layer applies its own limit and rejects an oversized write *whole*, because a
 truncated secret is still a secret.
 
+## Observations
+
+OSC 7, 133, 633 and 1337 carry what an application says about itself: a working directory, a prompt
+boundary, a shell-integration property. `FeedOutcome::observations` carries them, bounded and
+labelled with their source.
+
+They are observations and nothing more. A working directory an application printed cannot establish
+a filesystem grant, and a prompt marker cannot stand in for an authenticated editor event. They are
+carried because a projection and a person find them useful.
+
 ## Snapshots and reconnection
 
 A snapshot is presentation state. It is not a serialised process and not a durable parser
 checkpoint. It carries the projection generation, the active buffer, the canonical dimensions, the
-viewport, the cursor and saved cursors, the margins, the rendition, the tab stops, the character
-sets, every tracked mode, the keypad mode, the titles and the virtual title stack, the hyperlink
-ranges, the palette with its source, and paged rows with stable identifiers and wrap markers.
+viewport, the cursor, the margins, the current rendition, the tab stops, the character sets, every
+tracked mode, the keypad mode, the keyboard protocol an input encoder has to reproduce, the titles
+and the virtual title stack, the hyperlink ranges, the whole palette with its source, and paged rows
+with stable identifiers and wrap markers.
+
+Pending wrap and the saved cursor are the two fields the pinned library does not expose; see the
+narrow patch above.
 
 ### Restoration cannot do anything twice
 
@@ -305,13 +406,18 @@ checkpoint.
 
 ### Deltas and history
 
-Each delta names the cursor it continues from. A delta that does not match the cursor a client holds
-is not applied; the client asks for a fresh snapshot instead, which is cheaper than reasoning about
-what it might have missed. A buffer switch advances the projection generation, which resets the
-client's projection.
+A delta names the cursor it continues from, and the engine keeps a window of the last 64 such
+points. A base outside the window, or a base from before the projection was reset, is refused and
+the client takes a fresh snapshot instead, which is cheaper than reasoning about what it might have
+missed. Inside the window, the delta carries the rows that actually changed since that point, the
+modes and title that changed with them, and the palette or dimensions when either moved.
+`Engine::acknowledge` tells the engine a client has caught up, so a change is carried once rather
+than in every delta until the next snapshot.
 
 A history page carries at most 1,000 rows and at most 1 MiB, whichever binds first, and states its
-oldest retained row and whether anything below it has been evicted.
+oldest retained row and whether anything below it has been evicted. The size counts everything the
+page carries, including hyperlink targets and per-run bookkeeping, because a page of short heavily
+linked rows would otherwise pass the bound several times over.
 
 ### Bounds
 
@@ -320,7 +426,10 @@ oldest retained row and whether anything below it has been evicted.
 | Columns | 1 to 2,048 |
 | Rows | 1 to 1,024 |
 | Cells | 1 to 262,144 |
+| One control sequence's retained bytes | 256 |
+| One grapheme cluster, which is one cell's content | 64 bytes |
 | In-memory historical rows | 8 MiB per session |
+| Distinct hyperlink targets | 4,096 per session |
 | Canonical screens, metadata and per-cell storage | 64 MiB per session |
 | History page | 1,000 rows and 1 MiB |
 
@@ -329,6 +438,17 @@ together: 2,048 columns is allowed, 1,024 rows is allowed, and 2,048 by 1,024 is
 is refused. Validation uses checked multiplication and happens before any allocation, and a refusal
 names the constraint it hit. The same is true of the session budget: a geometry change that would
 not fit is refused before the grid is touched, and the current grid is unchanged.
+
+The historical-row bound is enforced rather than reported. The engine measures the retained rows
+periodically, and when they pass the bound it lowers the library's scrollback row count so older
+rows are evicted as new ones arrive. Measuring means walking the scrollback, so doing it on every
+read would cost more than the bound saves; every 64 reads keeps the overshoot to a fraction of the
+cache.
+
+A control-sequence parameter is clamped to 65,535 before it reaches the grid. A parameter is a
+repeat count, a column or a tab stop, and the grid is at most 2,048 by 1,024, so a larger value
+cannot mean more work anyone wants done. A reducer that loops once per unit would happily try:
+`CSI 4294967295 I` is five bytes of input and billions of iterations.
 
 ## The pinned terminfo database
 
@@ -342,19 +462,29 @@ The database is the ncurses `xterm-256color` entry with these deliberate differe
 | --- | --- | --- |
 | Removed | `mc5i`, `mc0`, `mc4`, `mc5` | kr-vt/1 has no printer |
 | Removed | `meml`, `memu` | Memory lock has no class in this profile |
+| Removed | `Setulc` | The underline colour uses an SGR 58 sublist the canonical grid does not implement |
 | Rewritten | `is2`, `rs2` | The reset strings no longer touch DEC private modes 3 or 4; neither is tracked |
 | Rewritten | `u8` | States the DA1 reply the broker actually sends |
 | Added | `Tc`, `RGB`, `setrgbf`, `setrgbb` | The profile declares truecolour |
 | Added | `BE`, `BD`, `PS`, `PE` | The profile supports bracketed paste |
 
-Every advertised output capability is lexed and must land in a class the profile supports. That is
+Every advertised output capability is lexed, and it has to land in a class the profile supports *and*
+produce actions the canonical grid recognises. The second half is what makes this a check rather
+than a formality: a capability can lex into a perfectly ordinary control sequence that the grid then
+does not understand, and advertising that is the same inconsistency as advertising an `X`. That is
 the `coverage` section of `fixtures/terminal/terminfo-xterm-256color.json` and the test
-`every_advertised_capability_has_a_class`. A capability whose sequence would be consumed with a
-diagnostic is not advertised, which is why this is not the stock entry.
+`every_advertised_capability_has_a_class`.
+
+Input and report capabilities are not checked there, and the `checked` field says so. A key encoding
+and the documented shape of a reply do not appear in the application's output stream, so there is
+nothing for the class table to say about them.
 
 Features negotiated outside terminfo, such as synchronised output through DEC mode 2026, still need
 their own profile capability. There is no terminfo capability for them, and there is no implicit
 support either.
+
+Installing and selecting the compiled database on a host is packaging work, not this crate's: what
+lives here is the pinned data and the responder that answers from it.
 
 ## Probes
 
@@ -367,7 +497,12 @@ output, and then primary device attributes. DA1 is last because every qualified 
 and answers it last, which makes it the terminator: once it arrives, every earlier answer has either
 arrived or is never coming.
 
-The whole exchange has one second. A missing answer or a missing terminator fails the attach with
+That is why DA1 is the only required answer. Silence to any of the others is itself an answer,
+namely that the terminal does not have the feature, and `ProbeOutcome::unanswered` names them so the
+saved profile does not claim them. Requiring an answer to a question a qualified terminal may
+legitimately ignore would fail the attach for having asked.
+
+The whole exchange has one second. A missing terminator fails the attach with
 `TERMINAL_PROBE_FAILED`, restores the outer terminal's modes and reports the failure. It never gives
 up quietly and starts forwarding on the same stream, because a late answer on that stream would
 reach the application as keystrokes.
@@ -401,16 +536,17 @@ interesting part.
 
 ## Fixtures
 
-`fixtures/terminal/` holds seven files, generated from the corpus in `crates/kr-term/src/conformance.rs`.
+`fixtures/terminal/` holds seven files, generated from the corpus in
+`crates/kr-term/src/conformance.rs`.
 
 | File | What it pins | Requirements |
 | --- | --- | --- |
-| `classes.json` | One case per class-table row | KR-REQ-08.15 to 08.39 |
-| `byte-policy.json` | Raw C1, malformed UTF-8, nested passthrough, oversized strings | KR-ACC-024, KR-REQ-08.45 to 08.47 |
+| `classes.json` | One case per class-table row, and the unqualified forms of those rows | KR-REQ-08.15 to 08.39 |
+| `byte-policy.json` | Raw C1, malformed UTF-8, nested passthrough, oversized strings and preludes, escape doubling | KR-ACC-024, KR-REQ-08.45 to 08.47 |
 | `broker.json` | Every query and the exact reply bytes | KR-ACC-001, KR-REQ-08.05 |
 | `width.json` | CJK, combining marks, emoji at both margins, delayed wrap, bottom-row scrolling | KR-REQ-08.39 |
 | `snapshot.json` | Snapshots mid-output and at alternate-screen transitions | KR-REQ-08.40 |
-| `profile.json` | What kr-vt/1 advertises, what it refuses, and the identity bytes | KR-REQ-08.10, KR-REQ-04.02 |
+| `profile.json` | What kr-vt/1 advertises, what it refuses, the identity bytes, and the library record | KR-REQ-08.10, KR-REQ-04.02, KR-REQ-04.24 |
 | `terminfo-xterm-256color.json` | The pinned database and the class of every advertised capability | KR-REQ-08.11, KR-REQ-08.35 |
 
 Every case records the classes, the dispositions, the spans, the forwarded byte ranges, the replies,
