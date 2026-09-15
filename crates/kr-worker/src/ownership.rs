@@ -27,10 +27,17 @@ use kr_protocol::session::{OwnershipCoverage, SurvivingResource, TerminatedProce
 /// What tells this host which processes a session owns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnershipBoundary {
-    /// The terminal's process group. Partial by construction.
+    /// The session's controlling terminal. Partial by construction.
+    ///
+    /// Every job an interactive shell starts keeps the terminal, whatever process group the shell
+    /// puts it in, so this is the boundary a terminal session actually has. The process group is
+    /// kept beside it because a signal is sent to a group, and because it is what the boundary
+    /// falls back to where the kernel will not name the terminal.
     TerminalGroup {
         /// The group the root shell leads.
         group: u32,
+        /// The controlling terminal every job of this session holds, when the kernel names it.
+        terminal: Option<u32>,
     },
     /// A control group this worker created and every descendant is placed in.
     ControlGroup {
@@ -55,7 +62,14 @@ impl OwnershipBoundary {
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
-            Self::TerminalGroup { group } => {
+            Self::TerminalGroup {
+                group,
+                terminal: Some(terminal),
+            } => format!(
+                "the session's controlling terminal {terminal} and process group {group}, which a \
+                 descendant can leave by giving the terminal up"
+            ),
+            Self::TerminalGroup { group, .. } => {
                 format!("the terminal's process group {group}, which a descendant can leave")
             }
             Self::ControlGroup { path } => {
@@ -111,10 +125,17 @@ impl OwnedProcesses {
     /// and is gone by the next look is still recorded, because it was this session's; a process
     /// that never appears was never seen and is never claimed.
     pub fn observe(&mut self) {
-        let OwnershipBoundary::TerminalGroup { group } = self.boundary else {
+        let OwnershipBoundary::TerminalGroup { group, terminal } = self.boundary else {
             return;
         };
-        let Ok(members) = kr_ipc::identity::processes_in_group(group) else {
+        // The terminal, where the kernel names it: an interactive shell puts each job in its own
+        // process group, so the group finds the shell and nothing it started, while every one of
+        // those jobs keeps the terminal.
+        let members = match terminal {
+            Some(terminal) => kr_ipc::identity::processes_on_terminal(terminal),
+            None => kr_ipc::identity::processes_in_group(group),
+        };
+        let Ok(members) = members else {
             return;
         };
         for pid in members {
@@ -262,7 +283,11 @@ pub fn boundary_for(group: Option<i32>, root: &ProcessStartIdentity) -> Ownershi
     let group = group
         .and_then(|group| u32::try_from(group).ok())
         .unwrap_or_else(|| u32::try_from(root.pid.get()).unwrap_or_default());
-    OwnershipBoundary::TerminalGroup { group }
+    let terminal = u32::try_from(root.pid.get())
+        .ok()
+        .and_then(|pid| kr_ipc::identity::controlling_terminal(pid).ok())
+        .flatten();
+    OwnershipBoundary::TerminalGroup { group, terminal }
 }
 
 /// Asks every process the boundary holds to stop.
@@ -327,7 +352,10 @@ mod tests {
         // Every recorded process has ended, and the answer is still incomplete: the boundary
         // itself cannot see a descendant that left the group.
         let owned = OwnedProcesses::establish(
-            OwnershipBoundary::TerminalGroup { group: 4242 },
+            OwnershipBoundary::TerminalGroup {
+                group: 4242,
+                terminal: None,
+            },
             identity(u64::from(u32::MAX) + 1),
         );
         assert_eq!(owned.coverage(), OwnershipCoverage::Incomplete);
@@ -336,7 +364,10 @@ mod tests {
     #[test]
     fn a_running_process_is_never_listed_as_terminated() {
         let mut owned = OwnedProcesses::establish(
-            OwnershipBoundary::TerminalGroup { group: 1 },
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
             kr_ipc::identity::current_process_start_identity().expect("this process"),
         );
         owned.observe();
@@ -359,9 +390,12 @@ mod tests {
     #[test]
     fn a_boundary_describes_what_it_can_account_for() {
         assert!(
-            OwnershipBoundary::TerminalGroup { group: 7 }
-                .describe()
-                .contains("can leave")
+            OwnershipBoundary::TerminalGroup {
+                group: 7,
+                terminal: None,
+            }
+            .describe()
+            .contains("can leave")
         );
         assert!(OwnershipBoundary::JobObject.is_complete_boundary());
     }

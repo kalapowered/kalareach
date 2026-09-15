@@ -118,6 +118,13 @@ pub struct Session {
     engine: crate::projection::TerminalEngine,
     /// What the renderings this session has produced could not carry.
     restoration_losses: crate::render::Carried,
+    /// The host's own answers that have been queued for the application and not yet written.
+    ///
+    /// The response lane bounds what it holds; this bounds what has left the lane. Counting only
+    /// what is in `pending_input` would count nothing, because every flush hands that vector to
+    /// the writer, so the counter is shared with the writer and comes down as each batch is
+    /// written.
+    host_reply_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for Session {
@@ -181,6 +188,7 @@ impl Session {
             root_exit: None,
             engine,
             restoration_losses: crate::render::Carried::default(),
+            host_reply_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             config,
         })
     }
@@ -427,6 +435,7 @@ impl Session {
         self.restoration_losses.clipped_rows += carried.clipped_rows;
         self.restoration_losses.soft_wraps += carried.soft_wraps;
         self.restoration_losses.other_keyboard |= carried.other_keyboard;
+        self.restoration_losses.pending_wrap |= carried.pending_wrap;
     }
 
     /// Returns what the renderings this session has produced could not carry.
@@ -907,25 +916,27 @@ impl Session {
     /// for an application that has stopped reading its input. One that asks questions and never
     /// reads the answers stops being answered here rather than growing this queue without limit.
     fn queue_replies(&mut self, replies: Vec<Vec<u8>>) {
-        if replies.is_empty() {
-            return;
-        }
-        let mut held: usize = self
-            .pending_input
-            .iter()
-            .filter(|batch| batch.origin == InputOrigin::Host)
-            .map(|batch| batch.bytes.len())
-            .sum();
         for reply in replies {
-            if held >= MAX_PENDING_REPLY_BYTES {
+            if self
+                .host_reply_bytes
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= MAX_PENDING_REPLY_BYTES
+            {
                 return;
             }
-            held += reply.len();
+            self.host_reply_bytes
+                .fetch_add(reply.len(), std::sync::atomic::Ordering::AcqRel);
             self.pending_input.push(InputBatch {
                 origin: InputOrigin::Host,
                 bytes: reply,
             });
         }
+    }
+
+    /// Returns the counter the writer releases as it writes the host's own answers.
+    #[must_use]
+    pub fn host_reply_bytes(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.host_reply_bytes)
     }
 
     /// Returns what the response lane is allowed to write right now.
@@ -1224,15 +1235,17 @@ impl Session {
             .owned
             .as_ref()
             .is_some_and(|owned| !owned.surviving().is_empty());
+        // Recorded before any signal, while the kernel still names the processes force is being
+        // used on. Afterwards there would be nothing left to mark.
+        if let Some(owned) = self.owned.as_mut() {
+            owned.note_forced_now();
+        }
         if let Some(shell) = self.shell.as_mut()
             && shell.try_wait()?.is_none()
         {
             shell.force_stop()?;
         }
-        if let Some(owned) = self.owned.as_mut() {
-            // Recorded before the signal, while the kernel still names the processes force is being
-            // used on. Afterwards there would be nothing left to mark.
-            owned.note_forced_now();
+        if let Some(owned) = self.owned.as_ref() {
             crate::ownership::force_stop(owned);
         }
         Ok(remaining)

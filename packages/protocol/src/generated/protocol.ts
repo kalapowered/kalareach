@@ -2263,11 +2263,15 @@ export interface ForwardedMutation {
    * continuous clocks and neither clock's origin means anything to the other. A wall-clock
    * instant would be comparable and would also be steppable, which is the one property a
    * deadline cannot have. The receiving process anchors this on its own clock when it reads the
-   * frame, so the only slack is the local socket's transit, and nothing downstream lengthens it
-   * further: the subject applies its own bounds on top.
+   * frame and subtracts whatever the transit cost, so nothing downstream lengthens it: the
+   * subject applies its own bounds on top.
    */
   accepted_ttl_ms: string
   actor: ActorEnvelope1
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  forwarded_at_ms: string
   mutation: MutationRequest1
 }
 /**

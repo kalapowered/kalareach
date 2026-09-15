@@ -326,22 +326,29 @@ impl WorkerService {
             };
             let reply = self.handle(&mut state, &peer, message).await;
             if let Some(reply) = reply {
+                // A close that was admitted happens, whether or not its acceptance can be written.
+                // Its bounded owner is armed *before* the write, because the write itself can wait
+                // for a socket nobody is reading: a gate that was only released afterwards would
+                // leave the session closing for exactly as long as that peer stayed away.
+                let armed = state.close_gate.take().map(|(action_id, gate)| {
+                    (
+                        action_id,
+                        gate.release_on_delivery(crate::runtime::ACCEPTANCE_DELIVERY_TIMEOUT),
+                    )
+                });
                 let mut sender = writer.lock().await;
                 let written = sender.write_message(&reply).await.is_ok();
                 drop(sender);
-                // A close that was admitted happens, whether or not its acceptance could be
-                // written. The session is already `closing`; leaving the gate unreleased because
-                // the peer went away would leave it closing and never closed.
-                if let Some((action_id, gate)) = state.close_gate.take() {
+                if let Some((action_id, delivery)) = armed {
                     if written && state.client_kind == LocalClientKind::Controller {
                         // The requester is not the peer that was just written to: the daemon still
-                        // has to pass the acceptance on. Termination waits for it to say so.
-                        state.pending_delivery = Some((
-                            action_id,
-                            gate.release_on_delivery(crate::runtime::ACCEPTANCE_DELIVERY_TIMEOUT),
-                        ));
+                        // has to pass the acceptance on. Termination waits for it to say so, or for
+                        // the bound this owner already holds.
+                        state.pending_delivery = Some((action_id, delivery));
                     } else {
-                        gate.release();
+                        // Either the acceptance reached its own requester, or it reached nobody and
+                        // never will. Both end the wait now.
+                        delivery.confirm();
                     }
                 }
                 if !written {
@@ -1036,14 +1043,19 @@ impl WorkerService {
             );
         }
         // Anchored here, before the dispatch barrier and before anything else this worker waits
-        // for. The daemon's remaining lifetime is bounded by the protocol maximum on the way in, so
-        // a daemon cannot hand a worker a longer life than the protocol allows.
-        let remaining = std::time::Duration::from_millis(
-            forwarded
-                .accepted_ttl_ms
-                .get()
-                .min(kr_protocol::limits::MAX_MUTATION_TTL.get()),
-        );
+        // for. What the journey cost is subtracted rather than given back: the two processes stamp
+        // their own wall clocks, and only a positive difference is taken off, so a clock stepped in
+        // either direction can shorten this and neither can lengthen it. The daemon's remaining
+        // lifetime is bounded by the protocol maximum on the way in as well, so a daemon cannot
+        // hand a worker a longer life than the protocol allows.
+        let granted = forwarded
+            .accepted_ttl_ms
+            .get()
+            .min(kr_protocol::limits::MAX_MUTATION_TTL.get());
+        let transit = kr_ipc::now_ms()
+            .get()
+            .saturating_sub(forwarded.forwarded_at_ms.get());
+        let remaining = std::time::Duration::from_millis(granted.saturating_sub(transit));
         let Some(deadline) = self.clock.now().checked_add(remaining) else {
             return failure(
                 forwarded.mutation.request_id,
@@ -1086,8 +1098,19 @@ impl WorkerService {
         // freshness window and the subject preconditions decide whether a *new* action is
         // admitted, and applying them here would refuse a caller its own completed result because
         // its own effect moved the subject on.
-        if let Some(retained) = self.retained(&actor_id, mutation, digest)? {
-            return Ok(retained);
+        let stopping = method == Method::SessionClose;
+        match self.retained(&actor_id, mutation, digest) {
+            Ok(Some(retained)) => return Ok(retained),
+            Ok(None) => {}
+            // A journal this host cannot read has no retained action to give back. For an ordinary
+            // mutation that is a storage failure and the request stops here; for an authorised stop
+            // it is the same condition section 7 names, so the close proceeds and says volatile.
+            Err(error) if stopping => {
+                self.runtime
+                    .session()
+                    .note_journal_failure(error.to_string());
+            }
+            Err(error) => return Err(error),
         }
 
         // The envelope is checked before anything durable happens: the target this worker will
@@ -1138,7 +1161,6 @@ impl WorkerService {
         // and failing* is the same condition as one that is absent — a full disk refusing a write
         // is exactly when a person most needs to be able to stop a session — so the exception
         // covers the write failing as well as the journal being missing.
-        let stopping = method == Method::SessionClose;
         let admitted = match session.journal_mut() {
             Some(journal) => match journal.accept(&submission) {
                 Ok(_) => true,

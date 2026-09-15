@@ -2781,11 +2781,15 @@
       "properties": {
         "accepted_ttl_ms": {
           "$ref": "#/$defs/DurationMs",
-          "description": "What remains of the deadline the host derived at first admission, at the moment it forwarded\nthis mutation.\n\nA *duration*, not an instant, because the two processes measure on their own suspend-aware\ncontinuous clocks and neither clock's origin means anything to the other. A wall-clock\ninstant would be comparable and would also be steppable, which is the one property a\ndeadline cannot have. The receiving process anchors this on its own clock when it reads the\nframe, so the only slack is the local socket's transit, and nothing downstream lengthens it\nfurther: the subject applies its own bounds on top."
+          "description": "What remains of the deadline the host derived at first admission, at the moment it forwarded\nthis mutation.\n\nA *duration*, not an instant, because the two processes measure on their own suspend-aware\ncontinuous clocks and neither clock's origin means anything to the other. A wall-clock\ninstant would be comparable and would also be steppable, which is the one property a\ndeadline cannot have. The receiving process anchors this on its own clock when it reads the\nframe and subtracts whatever the transit cost, so nothing downstream lengthens it: the\nsubject applies its own bounds on top."
         },
         "actor": {
           "$ref": "#/$defs/ActorEnvelope",
           "description": "The actor the host verified, with the ingress it arrived on."
+        },
+        "forwarded_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The sender's wall clock as it wrote this frame, so the receiver can subtract the transit.\n\nIt is a *correction*, not an authority: the receiver subtracts what the two wall clocks\ndiffer by and never adds, so a clock step in either direction can only shorten the deadline.\nA wall clock stepped forward spends more of the lifetime, and one stepped backwards spends\nnone of it. Neither can give an action time it did not have."
         },
         "mutation": {
           "$ref": "#/$defs/MutationRequest",
@@ -2795,7 +2799,8 @@
       "required": [
         "mutation",
         "actor",
-        "accepted_ttl_ms"
+        "accepted_ttl_ms",
+        "forwarded_at_ms"
       ],
       "type": "object"
     },

@@ -18,8 +18,7 @@
 //!
 //! The buffer that is not showing is painted by switching to it with `?47` and back before the
 //! active buffer is drawn: `?47` moves between the two without clearing either, which `?1047` and
-//! `?1049` do not. A pending wrap is reproduced by drawing the cursor's own row again, because
-//! addressing the cursor clears one and printing into the last column is what sets one.
+//! `?1049` do not.
 //!
 //! What a byte stream still cannot carry is named here rather than approximated, and every one of
 //! them is counted in [`Restoration::carried`] rather than left for a caller to discover:
@@ -34,7 +33,11 @@
 //!   concerned, so a line the application wrapped is copied as two lines rather than one.
 //! * **The right-hand side of a row wider than the window.** A terminal narrower than the session
 //!   is shown the part it has room for; nothing is reflowed and nothing wraps into the next row.
-//! * **A pending wrap on a row outside the window**, which has no row to draw again.
+//! * **A pending wrap.** Every cursor movement clears one and only printing into the last column
+//!   sets one, so putting a terminal back into it would mean drawing that cell through whatever
+//!   pen, character set, margin and origin the restoration has installed. The cost is one
+//!   character: the next one the application prints lands beside the last column instead of
+//!   wrapping to the next row.
 
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
 use kr_term::modes::ALTERNATE_BUFFER_MODES;
@@ -132,8 +135,6 @@ struct Writer {
     charsets: Option<Charsets>,
     /// The rows of the buffer that is not showing, held back until the switch can be made.
     inactive: Vec<GridRow>,
-    /// Every row painted for the active buffer, so the cursor's own row can be drawn again.
-    painted: Vec<GridRow>,
     /// The scroll region, held back until the rows have been painted.
     ///
     /// Every row is addressed absolutely, and an absolute address means something different once
@@ -157,7 +158,6 @@ impl Writer {
             link_is_the_snapshots: false,
             charsets: None,
             inactive: Vec::new(),
-            painted: Vec::new(),
             margins: None,
             origin_mode: false,
             carried: Carried::default(),
@@ -252,9 +252,6 @@ impl Writer {
             RestoreOp::PaintInactiveRow { row } => self.inactive.push(row.clone()),
             RestoreOp::PaintRow { row } => {
                 self.paint_inactive_buffer();
-                // Every painted row is kept until the cursor names one, because a pending wrap is
-                // reproduced by drawing the cursor's own row again rather than by addressing it.
-                self.painted.push(row.clone());
                 self.paint(row);
             }
             // Inert metadata. The runs of each row carry the link they belong to, and this writer
@@ -628,17 +625,14 @@ impl Writer {
                 // A pending wrap cannot be addressed: every cursor movement clears it. What sets it
                 // is printing into the last column, so the cursor's own row is drawn again and the
                 // cursor is left where that drawing ended.
+                // A pending wrap is not reproducible here. Every cursor movement clears one, and
+                // the only thing that sets one is printing into the last column — which would have
+                // to happen after the pen, the character sets, the margins and the origin were
+                // installed, and would then draw that cell through all of them. Drawing it before
+                // they are installed does not work either, because installing the margins and the
+                // origin moves the cursor. So it is reported rather than approximated: the next
+                // character an application prints lands one cell along instead of wrapping.
                 if cursor.pending_wrap {
-                    let own = self
-                        .painted
-                        .iter()
-                        .find(|row| self.line_of(row.stable_id) == Some(line))
-                        .cloned();
-                    if let Some(row) = own {
-                        self.paint(&row);
-                        self.csi(if cursor.visible { b"?25h" } else { b"?25l" });
-                        return;
-                    }
                     self.carried.pending_wrap = true;
                 }
                 let (line, column) = if self.origin_mode {
@@ -674,7 +668,10 @@ impl Writer {
         }
         let rows = std::mem::take(&mut self.inactive);
         let active = self.active;
-        // Into the other buffer.
+        let window = self.viewport;
+        // Into the other buffer. Switching resets the pen on the terminals this profile is written
+        // against, so this writer's idea of what the terminal is in goes with it, in both
+        // directions.
         self.csi(match active {
             ActiveBuffer::Primary => b"?47h",
             ActiveBuffer::Alternate => b"?47l",
@@ -683,16 +680,31 @@ impl Writer {
             ActiveBuffer::Primary => ActiveBuffer::Alternate,
             ActiveBuffer::Alternate => ActiveBuffer::Primary,
         };
+        self.pen = None;
+        self.link = None;
+        self.csi(b"H");
         self.csi(b"2J");
+        // The other buffer's rows have their own stable identifiers, which are not the active
+        // buffer's: anchoring them on the active window's top row would place them somewhere else
+        // entirely, or nowhere at all.
+        if let Some(first) = rows.first() {
+            self.viewport = Viewport {
+                top_row: first.stable_id,
+                ..window
+            };
+        }
         for row in &rows {
             self.paint(row);
         }
+        self.viewport = window;
         // And back, before anything of the active buffer is drawn.
         self.csi(match active {
             ActiveBuffer::Primary => b"?47l",
             ActiveBuffer::Alternate => b"?47h",
         });
         self.active = active;
+        self.pen = None;
+        self.link = None;
     }
 
     fn install_margins(&mut self, margins: Margins) {
@@ -865,18 +877,13 @@ pub fn side_effect(kind: &SideEffectKind) -> Option<Vec<u8>> {
             );
             let common = metadata.join(":");
             let mut out = Vec::new();
-            // A title and a body are two payloads of one notification: the title comes first, the
-            // body second, and only the last one is marked complete.
+            // A title and a body are two payloads of one notification, and a payload longer than
+            // the protocol's own bound is sent in parts. Only the very last one is marked complete,
+            // because that is what tells the terminal the notification is whole.
             if let Some(title) = title {
-                let mut heading = common.clone().into_bytes();
-                heading.extend_from_slice(b":p=title:d=0;");
-                heading.extend_from_slice(title.as_bytes());
-                osc_into(&mut out, b"99", &heading);
+                notification_payload(&mut out, &common, "title", title, false);
             }
-            let mut rest = common.into_bytes();
-            rest.extend_from_slice(b":p=body:d=1;");
-            rest.extend_from_slice(body.as_bytes());
-            osc_into(&mut out, b"99", &rest);
+            notification_payload(&mut out, &common, "body", body, true);
             Some(out)
         }
         SideEffectKind::Progress { progress } => {
@@ -896,6 +903,27 @@ pub fn side_effect(kind: &SideEffectKind) -> Option<Vec<u8>> {
             Some(out)
         }
         SideEffectKind::ClipboardRead { .. } => None,
+    }
+}
+
+/// The largest payload one OSC 99 message carries.
+const MAX_NOTIFICATION_PAYLOAD: usize = 2048;
+
+/// Writes one notification payload, in as many messages as its length needs.
+fn notification_payload(out: &mut Vec<u8>, common: &str, kind: &str, text: &str, last: bool) {
+    let mut chunks = text.as_bytes().chunks(MAX_NOTIFICATION_PAYLOAD).peekable();
+    if chunks.peek().is_none() {
+        let mut only = common.as_bytes().to_vec();
+        only.extend_from_slice(format!(":p={kind}:d={};", u8::from(last)).as_bytes());
+        osc_into(out, b"99", &only);
+        return;
+    }
+    while let Some(chunk) = chunks.next() {
+        let done = last && chunks.peek().is_none();
+        let mut payload = common.as_bytes().to_vec();
+        payload.extend_from_slice(format!(":p={kind}:d={};", u8::from(done)).as_bytes());
+        payload.extend_from_slice(chunk);
+        osc_into(out, b"99", &payload);
     }
 }
 
@@ -1265,9 +1293,11 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_wrap_is_reproduced_by_drawing_its_row_again() {
-        // Addressing the cursor clears a pending wrap; printing into the last column is what sets
-        // one, so the row the cursor is on is drawn again and the cursor is left where it ended.
+    fn a_pending_wrap_is_reported_rather_than_approximated() {
+        // Every cursor movement clears a pending wrap and only printing into the last column sets
+        // one, so a byte stream cannot put a terminal back into it without drawing a cell through
+        // whatever pen, character set, margin and origin the restoration has installed. It is
+        // counted instead, and the cost is that the next character lands one cell along.
         let operations = vec![
             RestoreOp::PaintRow {
                 row: row(0, 0, "abcd"),
@@ -1284,9 +1314,9 @@ mod tests {
         ];
         let rendered = render(&operations, viewport(24, 4));
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
-        assert_eq!(text.matches("abcd").count(), 2, "{text:?}");
-        assert!(text.ends_with("\x1b[?25h"), "{text:?}");
-        assert!(!rendered.carried.pending_wrap);
+        assert_eq!(text.matches("abcd").count(), 1, "{text:?}");
+        assert!(rendered.carried.pending_wrap);
+        assert!(!rendered.carried.complete());
     }
 
     #[test]

@@ -63,6 +63,9 @@ impl SessionRuntime {
     pub fn start(session: Session) -> Result<Self> {
         let reader = session.output_reader()?;
         let mut writer = session.input_writer()?;
+        // What the host owes the application is bounded by what has been *written*, not by what is
+        // waiting in the session, because the session hands its queue over on every flush.
+        let host_replies = session.host_reply_bytes();
         let session = Arc::new(Mutex::new(session));
         let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<InputBatch>();
         // What the writer compares every batch against. A takeover, a release, a detach or a close
@@ -109,8 +112,13 @@ impl SessionRuntime {
         });
 
         let writer_fence = Arc::clone(&fence);
+        let writer_replies = Arc::clone(&host_replies);
         std::thread::spawn(move || {
             while let Some(batch) = input_receiver.blocking_recv() {
+                let released = match batch.origin {
+                    InputOrigin::Host => batch.bytes.len(),
+                    InputOrigin::Lease(_) => 0,
+                };
                 // Stale keystrokes are dropped here rather than written. A takeover that only
                 // stopped *new* input would still let the previous holder's last keystrokes land in
                 // the new holder's command line. The host's own answer to a query the application
@@ -124,6 +132,14 @@ impl SessionRuntime {
                     break;
                 }
                 let _ = std::io::Write::flush(&mut writer);
+                // Released only once the application has it. Until then it is still owed.
+                if released > 0 {
+                    let _ = writer_replies.fetch_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |held| Some(held.saturating_sub(released)),
+                    );
+                }
             }
         });
 
@@ -329,6 +345,10 @@ impl SessionRuntime {
         reason: ClosureReason,
     ) -> (CloseAcceptance, CloseGate) {
         let acceptance = session.begin_close(reason);
+        // Admission moved the input fence and may have produced a paste terminator. Publishing both
+        // here is what makes "input is rejected from this moment" true of bytes that were already
+        // handed to the writer, rather than only of bytes not yet accepted.
+        self.flush_locked(session);
         let gate = CloseGate {
             runtime: Arc::clone(self),
             initiated: acceptance.initiated,

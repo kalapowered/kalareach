@@ -13,7 +13,7 @@ use crate::envelope::MutationRequest;
 use crate::hello::{ActionWindow, ProtocolVersion, ReceiveLimits};
 use crate::identity::BootIdentity;
 use crate::ids::{BuildId, CapabilityId, ConnectionId, EnvironmentId};
-use crate::scalars::{CanonicalSet, DurationMs, Nullable, U64};
+use crate::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs, U64};
 
 /// Which host process a local endpoint belongs to.
 #[derive(
@@ -142,9 +142,16 @@ pub struct ForwardedMutation {
     /// continuous clocks and neither clock's origin means anything to the other. A wall-clock
     /// instant would be comparable and would also be steppable, which is the one property a
     /// deadline cannot have. The receiving process anchors this on its own clock when it reads the
-    /// frame, so the only slack is the local socket's transit, and nothing downstream lengthens it
-    /// further: the subject applies its own bounds on top.
+    /// frame and subtracts whatever the transit cost, so nothing downstream lengthens it: the
+    /// subject applies its own bounds on top.
     pub accepted_ttl_ms: DurationMs,
+    /// The sender's wall clock as it wrote this frame, so the receiver can subtract the transit.
+    ///
+    /// It is a *correction*, not an authority: the receiver subtracts what the two wall clocks
+    /// differ by and never adds, so a clock step in either direction can only shorten the deadline.
+    /// A wall clock stepped forward spends more of the lifetime, and one stepped backwards spends
+    /// none of it. Neither can give an action time it did not have.
+    pub forwarded_at_ms: TimestampMs,
 }
 
 #[cfg(test)]

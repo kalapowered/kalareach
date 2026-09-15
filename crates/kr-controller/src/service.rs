@@ -223,12 +223,16 @@ impl Controller {
                             registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
                         }
                     }
-                    // Spawned with no launcher recorded: the daemon died between handing the
-                    // launch to the service manager and writing down what it returned. Something
-                    // may be running, so it is recovered the way a consumed claim is — by
-                    // challenge where it answers, and by a recorded abnormal closure where its
-                    // endpoint is confirmed gone. Leaving it here would hold a slot for ever.
-                    None => self.recover_claim(&reservation).await?,
+                    // Spawned with no launcher recorded: the daemon died between handing the launch
+                    // to the service manager and writing down what it returned. A process may be
+                    // running, but it cannot have started a shell: a worker starts one only after
+                    // the rendezvous hands it a launch specification, and this reservation's claim
+                    // was never consumed. Resolving it as failed both frees the slot and fences it,
+                    // because a claim is admitted only against a reservation that is still spawned.
+                    None => {
+                        let mut registry = self.registry.lock().await;
+                        registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                    }
                 },
                 // Claimed. This worker received its launch specification, so it may have started a
                 // shell. It is recovered by challenge where it still answers, and recorded as an

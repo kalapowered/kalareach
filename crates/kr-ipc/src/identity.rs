@@ -81,6 +81,29 @@ pub fn processes_in_group(group: u32) -> Result<Vec<u32>> {
     platform::processes_in_group(group)
 }
 
+/// Returns the processes attached to one controlling terminal.
+///
+/// This is the boundary a terminal session actually has. An interactive shell puts each job in its
+/// own process group, so enumerating the shell's group finds the shell and nothing it started;
+/// every one of those jobs keeps the terminal. A process that calls `setsid` gives the terminal up
+/// and leaves this set, which is why a host built on it never claims complete coverage.
+///
+/// # Errors
+///
+/// Returns an error when the platform will not enumerate processes.
+pub fn processes_on_terminal(terminal: u32) -> Result<Vec<u32>> {
+    platform::processes_on_terminal(terminal)
+}
+
+/// Returns the controlling terminal of one process, when it has one.
+///
+/// # Errors
+///
+/// Returns [`IpcError::IdentityUnavailable`] when the operating system does not answer.
+pub fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
+    platform::controlling_terminal(pid)
+}
+
 /// Reads this process's own start identity.
 ///
 /// # Errors
@@ -143,6 +166,46 @@ mod platform {
     };
 
     const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+
+    pub(super) fn processes_on_terminal(terminal: u32) -> Result<Vec<u32>> {
+        // Field seven of the statistics line is the controlling terminal's device number.
+        stat_field_matches(6, terminal, "controlling terminal")
+    }
+
+    pub(super) fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|error| {
+            unavailable("controlling terminal", format!("/proc/{pid}/stat: {error}"))
+        })?;
+        Ok(stat_field(&text, 6))
+    }
+
+    /// Returns one numeric field of a `/proc/<pid>/stat` line, counted after the command name.
+    fn stat_field(text: &str, index: usize) -> Option<u32> {
+        let tail = text.rfind(')').map(|end| &text[end + 1..])?;
+        tail.split_whitespace().nth(index)?.parse::<u32>().ok()
+    }
+
+    fn stat_field_matches(index: usize, wanted: u32, what: &'static str) -> Result<Vec<u32>> {
+        let entries = std::fs::read_dir("/proc")
+            .map_err(|error| unavailable(what, format!("/proc: {error}")))?;
+        let mut members = Vec::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            if stat_field(&text, index) == Some(wanted) {
+                members.push(pid);
+            }
+        }
+        Ok(members)
+    }
 
     pub(super) fn processes_in_group(group: u32) -> Result<Vec<u32>> {
         let entries = std::fs::read_dir("/proc")
@@ -247,6 +310,28 @@ mod platform {
             .map_err(|error| super::unavailable("process group", format!("group {group}: {error}")))
     }
 
+    pub(super) fn processes_on_terminal(terminal: u32) -> super::Result<Vec<u32>> {
+        pids_by_type(ProcFilter::ByTTY { tty: terminal }).map_err(|error| {
+            super::unavailable(
+                "controlling terminal",
+                format!("terminal {terminal}: {error}"),
+            )
+        })
+    }
+
+    pub(super) fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
+        let pid = i32::try_from(pid).map_err(|_| {
+            unavailable(
+                "controlling terminal",
+                format!("{pid} is not a process identifier"),
+            )
+        })?;
+        let info: BSDInfo = pidinfo(pid, 0)
+            .map_err(|error| unavailable("controlling terminal", format!("pid {pid}: {error}")))?;
+        // `NODEV` on a process with no controlling terminal.
+        Ok((info.e_tdev != u32::MAX).then_some(info.e_tdev))
+    }
+
     use super::{
         BootIdentity, BootIdentitySource, ProcessStartIdentity, ProcessStartSource, Result,
         unavailable,
@@ -327,6 +412,15 @@ mod platform {
         // object instead, which is a complete boundary rather than a partial one, so nothing here
         // needs to guess at group membership.
         Ok(Vec::new())
+    }
+
+    pub(super) fn processes_on_terminal(_terminal: u32) -> Result<Vec<u32>> {
+        // Nor a controlling terminal; the job object is the boundary here.
+        Ok(Vec::new())
+    }
+
+    pub(super) fn controlling_terminal(_pid: u32) -> Result<Option<u32>> {
+        Ok(None)
     }
 
     pub(super) fn boot_identity() -> Result<BootIdentity> {

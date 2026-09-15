@@ -370,6 +370,9 @@ impl LocalClient {
                     mutation: mutation.clone(),
                     actor: actor.clone(),
                     accepted_ttl_ms,
+                    // Stamped as the frame is written, so the receiver can subtract what the
+                    // journey cost rather than starting the lifetime again on arrival.
+                    forwarded_at_ms: crate::now_ms(),
                 },
             )))
             .await?;

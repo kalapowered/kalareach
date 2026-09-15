@@ -198,6 +198,8 @@ enum Outstanding {
     Input(u64),
     /// A size change this terminal reported.
     Geometry,
+    /// A fresh screen this terminal asked for after a resynchronisation marker.
+    Resubscribe,
 }
 
 /// Runs the attachment's input, output and connection in one loop.
@@ -242,10 +244,17 @@ async fn drive(
                             let _ = handle.flush();
                         }
                         // A resynchronisation marker means this terminal's view of the session is
-                        // no longer continuous. The attachment ends rather than drawing bytes that
-                        // do not follow the ones before them.
+                        // no longer continuous: its size changed, its presentation changed, or it
+                        // fell behind. It is not a reason to end the attachment — a person resizing
+                        // a window would lose their session — so the marker is answered by asking
+                        // for the screen again, which is what the marker is for.
                         if notification.event_type.as_str() == "session.resync" {
-                            return AttachOutcome::Disconnected;
+                            let request_id = kr_protocol::ids::RequestId::new(next_request);
+                            next_request += 1;
+                            if !resubscribe(client, descriptor, request_id, attachment_id).await {
+                                return AttachOutcome::Disconnected;
+                            }
+                            outstanding.insert(request_id, Outstanding::Resubscribe);
                         }
                         // This attachment was ended somewhere else, which is what `kr detach` from
                         // another window does. The terminal comes back and the command finishes.
@@ -285,6 +294,16 @@ async fn drive(
                                 };
                             }
                             (Outstanding::Input(_), kr_protocol::envelope::Outcome::Ok(_)) => {}
+                            // The screen follows as ordinary output. A refusal means the session no
+                            // longer has this attachment, which is the end of it.
+                            (Outstanding::Resubscribe, outcome) => {
+                                if let kr_protocol::envelope::Outcome::Error(error) = outcome {
+                                    return match error.code {
+                                        ErrorCode::SessionClosed => AttachOutcome::SessionClosed,
+                                        _ => AttachOutcome::Disconnected,
+                                    };
+                                }
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -366,6 +385,40 @@ async fn drive(
             }
         }
     }
+}
+
+/// Asks for the session's screen again, on this loop's own connection.
+///
+/// A resynchronisation marker says the view is no longer continuous; this is how the view is made
+/// continuous again. The screen arrives as ordinary output on the same stream.
+async fn resubscribe(
+    client: &mut LocalClient,
+    descriptor: &WorkerDescriptor,
+    request_id: kr_protocol::ids::RequestId,
+    attachment_id: kr_protocol::ids::AttachmentId,
+) -> bool {
+    let mut streams = kr_protocol::scalars::CanonicalSet::new();
+    streams.insert(kr_protocol::recovery::EventStream::Output);
+    let params = kr_protocol::recovery::EventsSubscribeParams {
+        session_id: descriptor.session_id,
+        attachment_id,
+        streams,
+        from_cursor: kr_protocol::scalars::Nullable::null(),
+    };
+    let Ok(params) = kr_protocol::envelope::ParamsValue::from_typed(&params) else {
+        return false;
+    };
+    let request = kr_protocol::envelope::Request {
+        request_id,
+        method: Method::EventsSubscribe.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        params,
+    };
+    client
+        .writer()
+        .write_message(&ControlFrame::Request(request))
+        .await
+        .is_ok()
 }
 
 /// Writes one size report on this loop's own connection.
