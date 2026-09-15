@@ -40,6 +40,13 @@
 //! | [`account`] | Membership leases and the organisation policy-signing authority chain |
 //! | [`digest`] | The mutation payload digest |
 //! | [`limits`] | Protocol defaults |
+//! | [`local`] | The local IPC handshake and the control-stream message union |
+//! | [`identity`] | Boot, process-start and worker-profile identities |
+//! | [`session`] | The session lifecycle, closure records and the session method group |
+//! | [`attachment`] | Attachments, geometry ownership and the attachment method group |
+//! | [`input`] | The single input lease and the input method group |
+//! | [`recovery`] | Subscriptions, snapshots, history pages and resynchronisation |
+//! | [`hostinfo`] | Host and environment reads, and read-only diagnostics |
 //! | [`schema`] | Deterministic JSON Schema and method-table generation |
 //!
 //! # What this crate does not do
@@ -77,6 +84,7 @@
 pub mod account;
 pub mod actor;
 pub mod archive;
+pub mod attachment;
 pub mod authority;
 pub mod digest;
 pub mod envelope;
@@ -84,13 +92,19 @@ pub mod error;
 pub mod frame;
 pub mod grant;
 pub mod hello;
+pub mod hostinfo;
+pub mod identity;
 pub mod ids;
+pub mod input;
 pub mod limits;
+pub mod local;
 pub mod mailbox;
 pub mod method;
 pub mod pairing;
 pub mod receipt;
+pub mod recovery;
 pub mod relay;
 pub mod rights;
 pub mod scalars;
 pub mod schema;
+pub mod session;

@@ -1,0 +1,695 @@
+//! Session lifecycle types and the parameters of the session method group.
+//!
+//! Section 7 fixes the lifecycle as `creating -> live -> closing -> closed`. A live session may
+//! have no attachments at all; presentation is not existence. Closure is a state with a durable
+//! record, not the absence of a row: a closed session still answers `session.read` with its
+//! closure record rather than starting anything.
+
+use core::fmt;
+use core::str::FromStr;
+
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Deserialize, Serialize};
+
+use crate::identity::{DesktopBinding, ProcessStartIdentity, WorkerProfile};
+use crate::ids::{EnvironmentId, SessionEpoch, SessionId};
+use crate::scalars::{Nullable, TimestampMs, U64};
+
+/// The local alias a person types instead of a session UUID.
+///
+/// Display numbers are allocated in increasing order within one environment and are never reused,
+/// so a number that named a closed session never names a different one later. The protocol
+/// identity remains the UUID; the same number in two environments is ambiguous and the CLI refuses
+/// to guess.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct DisplayNumber(pub U64);
+
+impl DisplayNumber {
+    /// Wraps a raw number.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(U64::new(value))
+    }
+
+    /// Returns the raw number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for DisplayNumber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl FromStr for DisplayNumber {
+    type Err = core::num::ParseIntError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        text.parse::<u64>().map(Self::new)
+    }
+}
+
+impl JsonSchema for DisplayNumber {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "DisplayNumber".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        "kalareach::DisplayNumber".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let mut schema = U64::json_schema(generator);
+        schema.insert(
+            "description".to_owned(),
+            "A local session alias, allocated in increasing order per environment and never reused."
+                .into(),
+        );
+        schema
+    }
+}
+
+/// The session lifecycle of section 7.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// The controller has reserved the session and the worker has not yet reported a live shell.
+    Creating,
+    /// The root shell is running. The session may have no attachments.
+    Live,
+    /// Closure has begun: input is rejected and owned processes are being stopped.
+    Closing,
+    /// Closure has finished and the closure record is final.
+    Closed,
+}
+
+impl SessionState {
+    /// Every state, in lifecycle order.
+    pub const ALL: &'static [Self] = &[Self::Creating, Self::Live, Self::Closing, Self::Closed];
+
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Live => "live",
+            Self::Closing => "closing",
+            Self::Closed => "closed",
+        }
+    }
+
+    /// Returns the states this state may move to.
+    #[must_use]
+    pub const fn permitted_transitions(self) -> &'static [Self] {
+        match self {
+            Self::Creating => &[Self::Live, Self::Closing, Self::Closed],
+            Self::Live => &[Self::Closing],
+            Self::Closing => &[Self::Closed],
+            Self::Closed => &[],
+        }
+    }
+
+    /// Returns true when moving from this state to `next` is permitted.
+    #[must_use]
+    pub fn can_transition_to(self, next: Self) -> bool {
+        self.permitted_transitions().contains(&next)
+    }
+
+    /// Returns true when the session still owns a running worker.
+    #[must_use]
+    pub const fn is_running(self) -> bool {
+        matches!(self, Self::Creating | Self::Live | Self::Closing)
+    }
+
+    /// Returns true when the session accepts input.
+    #[must_use]
+    pub const fn accepts_input(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+impl fmt::Display for SessionState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// How the root shell is integrated.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellMode {
+    /// A KalaReach-qualified shell package with the reader mailbox, the pre-EOF hook and the
+    /// fenced launch transaction.
+    Managed,
+    /// An explicitly selected stock shell. Create, attach, detach, close, transfer and terminal
+    /// presentation all work. Empty-prompt Ctrl-D, fenced `shell.launch` and authoritative
+    /// editor-buffer observation do not: Ctrl-D follows the shell's own behaviour and can close
+    /// the session, and `kr detach` remains available.
+    NativeCompat,
+}
+
+impl ShellMode {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::NativeCompat => "native_compat",
+        }
+    }
+
+    /// Returns true when the mode claims the managed empty-prompt Ctrl-D and fenced launch.
+    #[must_use]
+    pub const fn claims_managed_editor(self) -> bool {
+        matches!(self, Self::Managed)
+    }
+}
+
+impl fmt::Display for ShellMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// How a new session is presented locally.
+///
+/// The three are mutually exclusive. `attach` is the default when standard input and output are
+/// terminals; otherwise the caller states one.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Presentation {
+    /// Create and attach in the calling terminal.
+    Attach,
+    /// Create and open an installed terminal application running `kr attach`.
+    Terminal,
+    /// Create without any local terminal attachment.
+    Invisible,
+}
+
+impl Presentation {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attach => "attach",
+            Self::Terminal => "terminal",
+            Self::Invisible => "invisible",
+        }
+    }
+}
+
+/// What the foreground of a session is doing.
+///
+/// Application state is reported separately from the lifecycle state and from transport
+/// reachability; a busy agent and an unreachable client are different facts.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationState {
+    /// The root shell is at a prompt.
+    ShellReady,
+    /// An agent is working.
+    AgentBusy,
+    /// A foreground application is waiting for input.
+    AwaitingInput,
+    /// A pending approval is waiting for a decision.
+    AwaitingApproval,
+}
+
+/// Why a session closed.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosureReason {
+    /// An authorised `session.close`.
+    CloseRequested,
+    /// The root shell exited normally, including through its own end-of-file behaviour.
+    RootExit,
+    /// The root shell was terminated by a signal.
+    RootSignal,
+    /// The root shell never started.
+    RootLaunchFailed,
+    /// The worker process ended without completing closure; the controller recorded the closure.
+    WorkerCrash,
+    /// The login session a desktop-bound worker was bound to ended.
+    DesktopLost,
+    /// The host is shutting down.
+    HostShutdown,
+}
+
+impl ClosureReason {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CloseRequested => "close_requested",
+            Self::RootExit => "root_exit",
+            Self::RootSignal => "root_signal",
+            Self::RootLaunchFailed => "root_launch_failed",
+            Self::WorkerCrash => "worker_crash",
+            Self::DesktopLost => "desktop_lost",
+            Self::HostShutdown => "host_shutdown",
+        }
+    }
+}
+
+/// How completely the closure covered the session's owned processes.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipCoverage {
+    /// Every process the worker owned was accounted for.
+    Complete,
+    /// One or more owned processes could not be confirmed. The record never claims that every
+    /// possible application was discovered.
+    Incomplete,
+}
+
+/// Whether a result was recorded durably.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Durability {
+    /// The result is committed to the durable journal.
+    Durable,
+    /// The journal was unavailable, so the result used current in-memory authority and identities.
+    /// Storage failure must not prevent an authorised stop; the response says so outright.
+    Volatile,
+}
+
+/// One process the closure terminated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TerminatedProcess {
+    /// The process and its start identity, so a reused identifier is not mistaken for it.
+    pub identity: ProcessStartIdentity,
+    /// The executable name, for diagnostics.
+    pub name: Nullable<String>,
+    /// True when the process needed forced termination after the grace period.
+    pub forced: bool,
+}
+
+/// A resource that intentionally outlives the session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SurvivingResource {
+    /// What kind of resource it is.
+    pub kind: String,
+    /// A description for the user.
+    pub detail: String,
+}
+
+/// The final record of one closed session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClosureRecord {
+    /// The session that closed.
+    pub session_id: SessionId,
+    /// The epoch that closed.
+    pub session_epoch: SessionEpoch,
+    /// Why it closed.
+    pub reason: ClosureReason,
+    /// The root shell's exit status, when it exited normally.
+    pub root_exit_code: Nullable<U64>,
+    /// The signal that terminated the root shell, when one did.
+    pub root_signal: Nullable<U64>,
+    /// The owned processes the closure terminated, with their start identities.
+    pub terminated: Vec<TerminatedProcess>,
+    /// Resources known to survive, such as an explicitly brokered desktop resource.
+    pub surviving: Vec<SurvivingResource>,
+    /// Whether every owned process was accounted for.
+    pub ownership_coverage: OwnershipCoverage,
+    /// Whether the record was written durably.
+    pub durability: Durability,
+    /// When the session finished closing.
+    pub closed_at_ms: TimestampMs,
+}
+
+/// One environment variable in a create request's snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentVariable {
+    /// The name.
+    pub name: String,
+    /// The value.
+    pub value: String,
+}
+
+/// A terminal geometry in columns and rows.
+///
+/// Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
+/// allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Dimensions {
+    /// Columns, from 1 to 2,048.
+    pub columns: U64,
+    /// Rows, from 1 to 1,024.
+    pub rows: U64,
+}
+
+/// Maximum columns a session may have.
+pub const MAX_COLUMNS: u64 = 2_048;
+
+/// Maximum rows a session may have.
+pub const MAX_ROWS: u64 = 1_024;
+
+/// Maximum cells a session may have.
+///
+/// The independent maxima need not be valid together; all three constraints apply at once.
+pub const MAX_CELLS: u64 = 262_144;
+
+/// The default geometry of a session created without a terminal attachment.
+pub const INVISIBLE_DEFAULT_DIMENSIONS: Dimensions = Dimensions::new(120, 40);
+
+/// A dimension constraint that a requested geometry violated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DimensionsError {
+    /// Columns were zero or above the maximum.
+    Columns {
+        /// The requested columns.
+        requested: u64,
+        /// The maximum permitted.
+        limit: u64,
+    },
+    /// Rows were zero or above the maximum.
+    Rows {
+        /// The requested rows.
+        requested: u64,
+        /// The maximum permitted.
+        limit: u64,
+    },
+    /// The product of columns and rows exceeded the cell maximum.
+    Cells {
+        /// The requested cells, computed with checked multiplication.
+        requested: u64,
+        /// The maximum permitted.
+        limit: u64,
+    },
+}
+
+impl fmt::Display for DimensionsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Columns { requested, limit } => {
+                write!(
+                    formatter,
+                    "columns {requested} must be between 1 and {limit}"
+                )
+            }
+            Self::Rows { requested, limit } => {
+                write!(formatter, "rows {requested} must be between 1 and {limit}")
+            }
+            Self::Cells { requested, limit } => {
+                write!(formatter, "cells {requested} must not exceed {limit}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DimensionsError {}
+
+impl Dimensions {
+    /// Builds a geometry without checking it.
+    #[must_use]
+    pub const fn new(columns: u64, rows: u64) -> Self {
+        Self {
+            columns: U64::new(columns),
+            rows: U64::new(rows),
+        }
+    }
+
+    /// Returns the columns.
+    #[must_use]
+    pub const fn columns(self) -> u64 {
+        self.columns.get()
+    }
+
+    /// Returns the rows.
+    #[must_use]
+    pub const fn rows(self) -> u64 {
+        self.rows.get()
+    }
+
+    /// Checks the three constraints of section 8 before anything is allocated.
+    ///
+    /// All three apply at once and the cell count uses checked multiplication, so a geometry that
+    /// satisfies the independent maxima can still be rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first violated constraint with its limit.
+    pub const fn validate(self) -> Result<(), DimensionsError> {
+        let columns = self.columns.get();
+        let rows = self.rows.get();
+        if columns == 0 || columns > MAX_COLUMNS {
+            return Err(DimensionsError::Columns {
+                requested: columns,
+                limit: MAX_COLUMNS,
+            });
+        }
+        if rows == 0 || rows > MAX_ROWS {
+            return Err(DimensionsError::Rows {
+                requested: rows,
+                limit: MAX_ROWS,
+            });
+        }
+        let Some(cells) = columns.checked_mul(rows) else {
+            return Err(DimensionsError::Cells {
+                requested: u64::MAX,
+                limit: MAX_CELLS,
+            });
+        };
+        if cells > MAX_CELLS {
+            return Err(DimensionsError::Cells {
+                requested: cells,
+                limit: MAX_CELLS,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Dimensions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}x{}", self.columns, self.rows)
+    }
+}
+
+/// What a client knows about one session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSummary {
+    /// The session identity.
+    pub session_id: SessionId,
+    /// The epoch. Fixed at 1 in this version.
+    pub session_epoch: SessionEpoch,
+    /// The environment that owns it.
+    pub environment_id: EnvironmentId,
+    /// The local alias.
+    pub display_number: DisplayNumber,
+    /// The lifecycle state.
+    pub state: SessionState,
+    /// How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+    /// reported.
+    pub shell_mode: ShellMode,
+    /// The executable actually launched as the root shell.
+    pub shell_path: String,
+    /// The working directory the root shell started in.
+    pub cwd: String,
+    /// How long the worker's execution context lasts.
+    pub worker_profile: WorkerProfile,
+    /// The login session a desktop-bound worker is tied to.
+    pub desktop: DesktopBinding,
+    /// When the session was created.
+    pub created_at_ms: TimestampMs,
+    /// The current canonical geometry.
+    pub dimensions: Dimensions,
+    /// How many attachments the session currently has. A live session may have none.
+    pub attachment_count: U64,
+    /// What the foreground is doing, where the host knows.
+    pub application_state: Nullable<ApplicationState>,
+    /// The root shell's process identity while the session is running.
+    pub root_process: Nullable<ProcessStartIdentity>,
+    /// The final record, once the session has closed.
+    pub closure: Nullable<ClosureRecord>,
+}
+
+/// Parameters of `session.create`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCreateParams {
+    /// The environment to create in.
+    pub environment_id: EnvironmentId,
+    /// How the session is presented locally.
+    pub presentation: Presentation,
+    /// The shell to launch. Null selects the environment's configured default.
+    pub shell: Nullable<String>,
+    /// The shell integration mode.
+    pub shell_mode: ShellMode,
+    /// The working directory. Null selects the caller's directory from the snapshot.
+    pub cwd: Nullable<String>,
+    /// The starting geometry. Null uses the invisible default of 120x40.
+    pub dimensions: Nullable<Dimensions>,
+    /// How long the worker's execution context should last.
+    pub worker_profile: WorkerProfile,
+    /// The creator's environment snapshot. The host filters terminal identity and reserved
+    /// KalaReach variables out of it, and execution-context values take precedence over it.
+    pub environment_snapshot: Vec<EnvironmentVariable>,
+}
+
+/// The result of `session.create`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCreateResult {
+    /// The created session.
+    pub session: SessionSummary,
+    /// The endpoint the creator can attach to without another controller call.
+    pub endpoint: String,
+    /// True when this result was replayed for a repeated create token rather than created now.
+    pub deduplicated: bool,
+}
+
+/// Parameters of `session.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionListParams {
+    /// Restrict to one environment. Null lists every environment the caller may see.
+    pub environment_id: Nullable<EnvironmentId>,
+    /// Include sessions that have already closed.
+    pub include_closed: bool,
+}
+
+/// The result of `session.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionListResult {
+    /// The sessions, in display-number order.
+    pub sessions: Vec<SessionSummary>,
+}
+
+/// Parameters of `session.read`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReadParams {
+    /// The session to read.
+    pub session_id: SessionId,
+}
+
+/// The result of `session.read`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReadResult {
+    /// The session.
+    pub session: SessionSummary,
+    /// The endpoint a local client can attach to, while the session is running.
+    pub endpoint: Nullable<String>,
+}
+
+/// Parameters of `session.close`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCloseParams {
+    /// The session to close.
+    pub session_id: SessionId,
+}
+
+/// The result of `session.close`.
+///
+/// The initiating request receives this acceptance before the worker's own process can end.
+/// Duplicate requests return the existing state rather than a second closure.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCloseResult {
+    /// The session that is closing or has closed.
+    pub session_id: SessionId,
+    /// The state at the moment of the reply.
+    pub state: SessionState,
+    /// Whether the closure was recorded durably.
+    pub durability: Durability,
+    /// The final record, once closure has finished.
+    pub closure: Nullable<ClosureRecord>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_lifecycle_runs_forward_only() {
+        assert!(SessionState::Creating.can_transition_to(SessionState::Live));
+        assert!(SessionState::Live.can_transition_to(SessionState::Closing));
+        assert!(SessionState::Closing.can_transition_to(SessionState::Closed));
+        assert!(!SessionState::Closed.can_transition_to(SessionState::Live));
+        assert!(!SessionState::Live.can_transition_to(SessionState::Creating));
+        assert!(!SessionState::Live.can_transition_to(SessionState::Closed));
+    }
+
+    #[test]
+    fn all_three_dimension_constraints_apply_at_once() {
+        assert!(Dimensions::new(120, 40).validate().is_ok());
+        assert!(Dimensions::new(2_048, 1_024).validate().is_err());
+        assert_eq!(
+            Dimensions::new(0, 40).validate(),
+            Err(DimensionsError::Columns {
+                requested: 0,
+                limit: MAX_COLUMNS
+            })
+        );
+        assert_eq!(
+            Dimensions::new(2_049, 40).validate(),
+            Err(DimensionsError::Columns {
+                requested: 2_049,
+                limit: MAX_COLUMNS
+            })
+        );
+        assert_eq!(
+            Dimensions::new(120, 1_025).validate(),
+            Err(DimensionsError::Rows {
+                requested: 1_025,
+                limit: MAX_ROWS
+            })
+        );
+        // Both maxima are individually valid and the product is not.
+        assert_eq!(
+            Dimensions::new(2_048, 1_024).validate(),
+            Err(DimensionsError::Cells {
+                requested: 2_097_152,
+                limit: MAX_CELLS
+            })
+        );
+    }
+
+    #[test]
+    fn the_cell_count_cannot_overflow() {
+        assert_eq!(
+            Dimensions::new(u64::MAX, u64::MAX).validate(),
+            Err(DimensionsError::Columns {
+                requested: u64::MAX,
+                limit: MAX_COLUMNS
+            })
+        );
+    }
+
+    #[test]
+    fn native_compat_does_not_claim_the_managed_editor() {
+        assert!(!ShellMode::NativeCompat.claims_managed_editor());
+        assert!(ShellMode::Managed.claims_managed_editor());
+    }
+}

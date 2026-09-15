@@ -1,0 +1,223 @@
+//! Attachments, geometry ownership and the attachment method group.
+//!
+//! Section 8 separates three things a client might think of as one: observing a session, owning
+//! its size and holding its input. An attachment observes. A geometry claim, ranked by join order,
+//! owns rows and columns. The input lease, in [`crate::input`], owns what the application reads.
+//! Opening a view therefore resizes nothing and steals nothing.
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::ids::{AttachmentId, AttachmentOrdinal, GeometryEpoch, SessionId};
+use crate::scalars::{Nullable, TimestampMs, U64};
+use crate::session::Dimensions;
+
+/// What an attachment observes.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachMode {
+    /// Structured application state rather than terminal cells. A semantic attachment never
+    /// claims geometry.
+    Semantic,
+    /// Terminal output, either as raw bytes in direct mode or as a projection.
+    Terminal,
+}
+
+impl AttachMode {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    /// Returns true when an attachment in this mode may claim geometry.
+    #[must_use]
+    pub const fn may_claim_geometry(self) -> bool {
+        matches!(self, Self::Terminal)
+    }
+}
+
+/// How a terminal attachment displays the canonical grid.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalPresentationMode {
+    /// The attachment's own size matches the canonical grid and it receives the filtered live byte
+    /// stream unchanged.
+    Direct,
+    /// The attachment displays a clipped viewport of the canonical grid. A smaller display pans;
+    /// a larger one leaves the unused area blank. Nothing is reflowed.
+    Viewport,
+}
+
+/// Parameters of `session.attach`.
+///
+/// The request does not bypass grants and does not acquire a remote input lease.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAttachParams {
+    /// The session to attach to.
+    pub session_id: SessionId,
+    /// What this attachment observes.
+    pub mode: AttachMode,
+    /// Whether this attachment registers a geometry claim. Semantic mode requires false.
+    pub claim_geometry: bool,
+    /// The attachment's physical dimensions, required in terminal mode.
+    pub dimensions: Nullable<Dimensions>,
+    /// The terminal profile this attachment presents.
+    pub terminal_profile_id: Nullable<String>,
+}
+
+/// Who owns the session's rows and columns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GeometryState {
+    /// The current owner. Null when no eligible claim exists and the last geometry is retained.
+    pub owner: Nullable<AttachmentId>,
+    /// The epoch, advanced by every ownership change and explicit transfer.
+    pub epoch: GeometryEpoch,
+    /// The canonical geometry the pseudo-terminal is currently set to.
+    pub dimensions: Dimensions,
+}
+
+/// One attachment of a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentSummary {
+    /// The attachment identity, independent of the device behind it.
+    pub attachment_id: AttachmentId,
+    /// The monotonic join order that decides size-owner succession.
+    pub ordinal: AttachmentOrdinal,
+    /// What this attachment observes.
+    pub mode: AttachMode,
+    /// Whether this attachment holds an eligible geometry claim.
+    pub claim_geometry: bool,
+    /// The attachment's own physical dimensions, reported even when it is not the owner.
+    pub dimensions: Nullable<Dimensions>,
+    /// How the attachment displays the canonical grid.
+    pub presentation: Nullable<TerminalPresentationMode>,
+    /// The terminal profile it presents.
+    pub terminal_profile_id: Nullable<String>,
+    /// When it joined.
+    pub attached_at_ms: TimestampMs,
+}
+
+/// The result of `session.attach`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAttachResult {
+    /// The new attachment.
+    pub attachment: AttachmentSummary,
+    /// Who owns the geometry after this attachment joined.
+    pub geometry: GeometryState,
+    /// The output cursor this attachment's stream starts from. A client subscribes from a cursor
+    /// before it installs a snapshot.
+    pub output_cursor: U64,
+}
+
+/// Parameters of `session.detach`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDetachParams {
+    /// The attachment to remove.
+    pub attachment_id: AttachmentId,
+}
+
+/// The result of `session.detach`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDetachResult {
+    /// The attachment that was removed.
+    pub attachment_id: AttachmentId,
+    /// Who owns the geometry after succession.
+    pub geometry: GeometryState,
+    /// How many attachments remain. A live session may have none.
+    pub remaining: U64,
+}
+
+/// Parameters of `attachment.viewport`.
+///
+/// Every terminal attachment reports its own physical dimensions, whether or not it owns the size.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentViewportParams {
+    /// The reporting attachment.
+    pub attachment_id: AttachmentId,
+    /// Its current physical dimensions.
+    pub dimensions: Dimensions,
+}
+
+/// The result of `attachment.viewport`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentViewportResult {
+    /// The canonical geometry, which a viewport report never changes.
+    pub geometry: GeometryState,
+    /// How this attachment now displays the canonical grid.
+    pub presentation: TerminalPresentationMode,
+}
+
+/// Parameters of `attachment.configure`.
+///
+/// Withdrawing or adding an authorised claim does not change the session identity and cannot
+/// displace an existing owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentConfigureParams {
+    /// The attachment to reconfigure.
+    pub attachment_id: AttachmentId,
+    /// Whether it holds a geometry claim after this call.
+    pub claim_geometry: bool,
+}
+
+/// Parameters of `terminal.resize`.
+///
+/// Only the current geometry owner changes the pseudo-terminal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalResizeParams {
+    /// The attachment asking for the resize.
+    pub attachment_id: AttachmentId,
+    /// The new canonical geometry.
+    pub dimensions: Dimensions,
+    /// The geometry epoch the caller believes is current.
+    pub expected_geometry_epoch: GeometryEpoch,
+}
+
+/// Parameters of `terminal.geometry.transfer`.
+///
+/// This is the deliberate "use this terminal's size" action. Ordinary attach and input takeover
+/// never move size ownership.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalGeometryTransferParams {
+    /// The eligible attachment that should own the size.
+    pub attachment_id: AttachmentId,
+    /// The geometry epoch the caller believes is current.
+    pub expected_geometry_epoch: GeometryEpoch,
+}
+
+/// The result of any operation that can change geometry ownership.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GeometryResult {
+    /// The geometry after the operation.
+    pub geometry: GeometryState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_attachments_cannot_claim_geometry() {
+        assert!(!AttachMode::Semantic.may_claim_geometry());
+        assert!(AttachMode::Terminal.may_claim_geometry());
+    }
+}
