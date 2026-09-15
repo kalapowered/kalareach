@@ -637,8 +637,13 @@ What a row gave up is given back; what the arrays behind them were holding is no
 shortened keeps the room it grew to, and the library offers no way to ask for that room back or to
 read how much of it there is, so a session that reflowed into one column keeps an array sized for
 the rows that reflow produced until the next reflow builds a new one. That room is bounded by the
-geometry the session was admitted at and the rows its cache may hold, and it is the one thing the
-figures below cannot see.
+geometry the session was admitted at and the rows its cache may hold.
+
+Two things the figures below cannot see, then. That room is one. The other is a cell a wide cell
+covers: a row is read through the cells it shows, and a column a wide cell covers is not one of
+them, so a cell left under a wide one by a scroll that copied it there keeps whatever it held and
+no measurement finds it. Both are properties of how the grid library stores a row rather than of
+what the session is doing, and both are bounded by a geometry that was admitted.
 
 A cursor restore is a case of its own. The pinned revision clears newline mode and the shift-out
 selection when it restores a cursor, which a terminal does not: DECRC restores the cursor, the
