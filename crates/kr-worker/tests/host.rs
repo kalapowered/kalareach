@@ -316,24 +316,39 @@ async fn a_closed_session_answers_with_the_record_its_worker_wrote() {
     assert_eq!(closed.session_id, session_id);
 
     // The worker's own record, not a reconstruction: the shell it ran survives the session.
-    let listed: SessionListResult = client
-        .request(
-            Method::SessionList,
-            &SessionListParams {
-                environment_id: Nullable::null(),
-                include_closed: true,
-            },
-        )
-        .await
-        .expect("the call reaches the daemon")
-        .expect("the list succeeds")
-        .to_typed()
-        .expect("decodes");
-    let summary = listed
-        .sessions
-        .iter()
-        .find(|summary| summary.session_id == session_id)
-        .expect("the closed session is listed");
+    //
+    // A close is accepted before anything is signalled, so the tombstone appears once the daemon
+    // has seen the worker end. The list is asked until it does, rather than once and immediately:
+    // asking once would be a test of how busy the machine is.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let summary = loop {
+        let listed: SessionListResult = client
+            .request(
+                Method::SessionList,
+                &SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed: true,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the list succeeds")
+            .to_typed()
+            .expect("decodes");
+        let found = listed
+            .sessions
+            .iter()
+            .find(|summary| summary.session_id == session_id)
+            .cloned();
+        if let Some(summary) = found {
+            break summary;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the closed session is listed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     assert_eq!(summary.state, SessionState::Closed);
     assert_eq!(
         summary.shell_path, shell,

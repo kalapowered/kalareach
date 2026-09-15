@@ -57,10 +57,22 @@ substituted.
 Attaching reads the published descriptor and challenges the worker itself, so it works while the
 control daemon is restarting.
 
-Direct mode puts the outer terminal into raw mode and forwards its bytes in order, unchanged.
+Direct mode puts the outer terminal into raw mode and writes what the host sends it, in order.
 Nothing is decoded into text and re-encoded, nothing is normalised and no status bar is installed.
 When an application turns mouse reporting on, the outer terminal produces those events and they are
 forwarded; when it turns it off, the terminal's scrollback behaves normally again.
+
+What the host sends is not always every byte the application wrote. The session's canonical grid
+answers the application's queries itself and routes a bell, a clipboard write or a notification to
+the one attachment holding the input lease, so two attached terminals can never both answer a
+question and a secret can never land on every device that happens to be watching.
+
+`--no-probe` withholds this terminal's own declaration of what it is. The host then serves this
+attachment a rendering of the session's screen rather than the byte stream, because it has not been
+told what those bytes would do here. It is the conservative choice, not a faster one.
+
+Attaching shows the session's screen immediately, drawn from the host's canonical grid. It is never
+the replayed history: replaying those bytes would replay whatever they contained.
 
 `--take-geometry` makes this terminal the size owner. Ordinary attach never moves size ownership,
 and taking input never moves it either.

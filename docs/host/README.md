@@ -141,6 +141,66 @@ The create token is the request's action identifier. A retry with the same paylo
 same reservation; the same token with a different payload is refused rather than becoming a second
 session. A lost reply never causes a second launch.
 
+## The terminal
+
+The host is the terminal, not whatever is attached to it. Every byte the shell writes passes
+through the worker's canonical grid (`kr-term`) before any attachment sees it, and the retained
+history keeps the raw stream underneath.
+
+| What arrives | What an attached terminal gets |
+| --- | --- |
+| Ordinary output | the same bytes, forwarded unchanged, in direct mode |
+| A query | nothing; the host answers it once, into the application's own input |
+| A bell, clipboard write, notification or progress report | delivered to the one attachment holding the input lease, and to nobody else |
+| A sequence the profile does not name | nothing; it is consumed with a rate-limited diagnostic |
+
+Two presentations, and the choice is the host's:
+
+| Presentation | What it receives | When it applies |
+| --- | --- | --- |
+| `direct` | the spans of the raw stream the engine cleared | the terminal is exactly the canonical size, has declared the terminal it probed, and the stream is still carryable |
+| `viewport` | a rendering of the canonical grid, clipped to the terminal's own size | every other case |
+
+`kr attach --no-probe` withholds the declaration, so that attachment is projected: a host that has
+not been told which terminal it is talking to does not hand it a byte stream and hope.
+
+An attachment never receives replayed history. What it is given when it joins, and again whenever
+it resynchronises, is the screen as it is now, rendered from a closed set of operations with no
+member that can ring, copy, notify, download, launch or ask anything. A terminal that was not there
+when the history happened does not have the history happen to it.
+
+## Action windows and the dispatch lease
+
+Both are the transport's own components (`kr_transport::window`, `kr_transport::lease`), used
+directly rather than reimplemented for the local path, and both are measured on the transport's
+suspend-aware continuous clock (`kr_transport::clock`).
+
+* The daemon and each worker issue one action window per authenticated connection, bound to that
+  connection and to the host's boot. A window is replaced on the live connection at half its
+  validity, without being asked for, and arrives as `ControlEvent::ActionWindowRenewed`. A window
+  from another connection, or from before a restart, first-admits nothing.
+* The accepted deadline of a mutation is the earliest of the window's expiry, receipt time plus the
+  requested lifetime, and any applicable authority deadline. What one host process forwards to
+  another is what *remains* of it, as a duration: two processes measure on their own continuous
+  clocks and neither clock's origin means anything to the other.
+* Remote dispatch additionally needs a live lease from the current generation and revision. The
+  daemon takes it at the moment it forwards, not when the request arrived, and the lease's own
+  remaining time bounds the deadline the worker is given.
+
+## What the host owes the transport
+
+Two contracts `docs/transport/README.md` names, and where they are kept:
+
+* **Admission and revocation.** The daemon validates the caller's record and registers the
+  connection in one critical section, in one lock order that a revocation also takes, so nothing
+  can be admitted against authority that has already been replaced. Withdrawing a registration
+  fences that connection's reads. At a worker, binding a newer controller generation withdraws the
+  previous connection's registration, which stops the subscription it had already started; the
+  connection stays open so its next request can say why it was refused.
+* **Work that must complete.** A mutation's effect runs on a task that outlives the connection, so
+  a durable commit is never left half done because the caller went away. The worker's own dispatch
+  path holds no await between the marker and the outcome, so it cannot be cancelled part way.
+
 ## Journals and the receipt contract
 
 Each worker has its own SQLite journal in write-ahead-logging mode with full synchronisation.

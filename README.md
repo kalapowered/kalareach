@@ -13,7 +13,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-cbor` | The KR-CBOR-1 codec: canonical encoding, strict decoding, digests and signing input |
 | `crates/kr-protocol` | Wire types, the method authority table, error codes and the JSON Schema generator |
 | `crates/kr-ipc` | Local typed-frame inter-process communication: directories, peer credentials, descriptors and identity proofs |
-| `crates/kr-worker` | The session worker: pseudo-terminal, lifecycle, attachments, input lease and receipt journal |
+| `crates/kr-worker` | The session worker: pseudo-terminal, canonical grid, lifecycle, attachments, input lease and receipt journal |
 | `crates/kr-controller` | The control daemon: registry, create admission, worker supervision and the local service |
 | `crates/kr-cli` | The `kr` command line and its terminal restoration guard |
 | `crates/kr-crypto` | Cryptography: a narrow libsodium wrapper, purpose-separated device keys, encrypted objects and secret storage |
@@ -26,7 +26,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `packages/plugin-sdk` | The generated plugin SDK package: types, the package contract as data and the published WIT file |
 | `fixtures/` | Cross-language conformance vectors and fixture packages that both languages test against |
 | `docs/protocol/` | The protocol reference |
-| `docs/host/` | The host: process topology, directories, descriptors, supervision, journals and recovery |
+| `docs/host/` | The host: process topology, directories, descriptors, supervision, the terminal, action windows, journals and recovery |
 | `docs/cli/` | The command line: commands, exit codes and the `--json` shapes |
 | `docs/crypto/` | The cryptography reference |
 | `docs/pairing/` | The pairing reference |
@@ -61,6 +61,18 @@ cargo run -p kr-term --bin kr-term-fixtures -- --check
 
 pnpm install --frozen-lockfile
 pnpm -r test
+```
+
+Two suites are separate because of what they cost. `scripts/end-to-end.sh` runs the host's
+end-to-end demonstrations one at a time, with real daemons, workers, shells and terminals, and
+takes about a minute. `scripts/performance.sh` builds a release profile and takes the two
+measurements the requirements name; one of them is a five-minute average, so it takes five minutes.
+Both take an optional log path and both exit non-zero when anything they were meant to demonstrate
+did not happen.
+
+```bash
+bash scripts/end-to-end.sh /tmp/kalareach-end-to-end.log
+bash scripts/performance.sh /tmp/kalareach-performance.log
 ```
 
 After changing a wire type, regenerate both artefacts and commit them with the change:

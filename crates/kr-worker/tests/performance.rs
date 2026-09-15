@@ -228,8 +228,13 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
         workers.iter().map(|pid| resident_kib(*pid)).sum::<u64>() + resident_kib(daemon);
 
     println!("KR-PERF-003 measurement");
+    let grid = kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS;
     println!(
-        "  conditions: {IDLE_SESSIONS} idle sessions, {ATTACHED_VIEWS} attached views, a release build, no application running"
+        "  conditions: {IDLE_SESSIONS} idle sessions, {ATTACHED_VIEWS} attached views, a release \
+         build, no application running; each session holds an allocated canonical grid of {}x{} \
+         with its scrollback cache",
+        grid.columns.get(),
+        grid.rows.get()
     );
     println!(
         "  processor: {cores:.5} of one core averaged over {:.0} seconds",
@@ -240,7 +245,8 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
         workers.len()
     );
     println!(
-        "  not measured: allocated terminal grids and their caches, because the terminal engine is a separate component and no grid is allocated by this build; and the whole-product figure with adapters and a model active"
+        "  not measured: the whole-product figure with adapters and a model active, which belongs \
+         to the tasks that add them"
     );
 
     assert!(
@@ -260,15 +266,63 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
 async fn attach_to_a_usable_screen() {
     let host = host().await;
     let created = create(&host).await;
+
+    // Both presentations are measured. A terminal of the session's own size is handed the stream
+    // directly; one of any other size is drawn a rendering of the canonical grid, and a person
+    // waits for the screen either way.
+    let direct = attach_samples(&host, &created, Dimensions::new(120, 40)).await;
+    let projected = attach_samples(&host, &created, Dimensions::new(80, 24)).await;
+
+    println!("KR-PERF-004 measurement");
+    println!(
+        "  conditions: a local attachment to a live session at 120x40, a release build, measured \
+         from the connection to the screen the terminal draws, which is the last thing the person \
+         waits for"
+    );
+    println!(
+        "  direct, a terminal of the session's own size: {}",
+        report(&direct)
+    );
+    println!(
+        "  projected, a terminal of 80x24 onto the same session: {}",
+        report(&projected)
+    );
+    let worst = direct
+        .iter()
+        .chain(projected.iter())
+        .max()
+        .copied()
+        .expect("samples");
+    assert!(
+        worst < ATTACH_BOUND,
+        "the slowest attach reached a usable screen within {ATTACH_BOUND:?}: {worst:?}"
+    );
+    let _ = host.controller;
+}
+
+/// Renders a set of samples for the measurement's own output.
+fn report(samples: &[Duration]) -> String {
+    samples
+        .iter()
+        .map(|sample| format!("{:.3} ms", sample.as_secs_f64() * 1000.0))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Times five attachments of one size, from the connection to the screen.
+async fn attach_samples(
+    host: &Host,
+    created: &SessionCreateResult,
+    dimensions: Dimensions,
+) -> Vec<Duration> {
     let endpoint =
         kr_ipc::paths::Endpoint::from_path(created.endpoint.as_ref().expect("a live session"))
             .expect("an endpoint");
-
     let mut samples = Vec::new();
     for _ in 0..5 {
         let started = Instant::now();
         // A usable screen is the whole sequence a person waits for: the connection, the worker's
-        // proof, the attachment, the input lease and the subscription that carries the screen. A
+        // proof, the attachment, the input lease, the subscription, and the screen arriving. A
         // measurement that stopped at the first byte would be measuring the transport.
         let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
             .await
@@ -276,7 +330,6 @@ async fn attach_to_a_usable_screen() {
         let mut requested = CanonicalSet::new();
         requested.insert(AttachmentCapability::ObserveTerminal);
         requested.insert(AttachmentCapability::Input);
-        requested.insert(AttachmentCapability::Geometry);
         let attached: kr_protocol::attachment::SessionAttachResult = client
             .mutate(
                 Method::SessionAttach,
@@ -291,8 +344,8 @@ async fn attach_to_a_usable_screen() {
                 &SessionAttachParams {
                     session_id: created.session.session_id,
                     mode: AttachMode::Terminal,
-                    claim_geometry: true,
-                    dimensions: Nullable::some(Dimensions::new(120, 40)),
+                    claim_geometry: false,
+                    dimensions: Nullable::some(dimensions),
                     terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
                     requested,
                 },
@@ -311,52 +364,31 @@ async fn attach_to_a_usable_screen() {
                     session_id: created.session.session_id,
                     attachment_id: attached.attachment.attachment_id,
                     streams,
-                    from_cursor: Nullable::some(kr_protocol::scalars::U64::new(
-                        attached.output_cursor.get(),
-                    )),
+                    from_cursor: Nullable::null(),
                 },
             )
             .await
             .expect("the call reaches the worker")
             .expect("the subscription succeeds");
-        // The screen this terminal will draw from: the snapshot the session is at, taken at the
-        // cursor the subscription starts from.
-        let _: kr_protocol::recovery::EventsSnapshotResult = client
-            .request(
-                Method::EventsSnapshot,
-                &kr_protocol::recovery::EventsSnapshotParams {
-                    session_id: created.session.session_id,
-                },
-            )
-            .await
-            .expect("the call reaches the worker")
-            .expect("the snapshot succeeds")
-            .to_typed()
-            .expect("decodes");
+        // The screen itself. This is what the person sees, and it is where the clock stops.
+        let screen = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let Ok(frame) = client.recv().await else {
+                    return false;
+                };
+                if let kr_protocol::envelope::ControlFrame::Notification(notification) = frame
+                    && notification.event_type.as_str() == "session.output"
+                {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(screen, "the attachment was drawn a screen");
         samples.push(started.elapsed());
     }
-
-    let worst = samples.iter().max().copied().expect("five samples");
-    println!("KR-PERF-004 measurement");
-    println!(
-        "  conditions: a local attachment at 120x40 to a live session, a release build, measured from the connection to a screen the terminal can draw"
-    );
-    println!(
-        "  samples: {}",
-        samples
-            .iter()
-            .map(|sample| format!("{:.3} ms", sample.as_secs_f64() * 1000.0))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    println!(
-        "  not measured: the projected screen of a terminal whose size differs from the session's, because that projection is the terminal engine's and this build serves such an attachment no screen at all rather than the wrong one"
-    );
-    assert!(
-        worst < ATTACH_BOUND,
-        "the slowest attach reached a usable screen within {ATTACH_BOUND:?}: {worst:?}"
-    );
-    let _ = host.controller;
+    samples
 }
 
 /// Attaches an observing view and subscribes it to output.
