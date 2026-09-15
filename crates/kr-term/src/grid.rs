@@ -162,11 +162,28 @@ pub const ALERT_LIST_BYTES: u64 =
     // alert carries at most two strings, each cut to the bound.
     (2 * MAX_ALERTS * (size_of::<GridAlert>() + 2 * MAX_ALERT_BYTES)) as u64;
 
+/// What the rows of both screens come to, gathered as they are walked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RowsBytes {
+    cell_slots: u64,
+    records: u64,
+    history: u64,
+}
+
 /// What the grid is holding, measured in one pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BufferBytes {
     /// What each buffer's rows that are showing hold beyond their cell slots, primary first.
     pub content: [u64; 2],
+    /// What the cells of those rows cost in the slots they take.
+    ///
+    /// Every row of the alternate buffer is counted, including any the library is still holding
+    /// from a taller geometry; the primary buffer's retained rows are counted against the
+    /// historical cache instead, where the rest of what they hold is counted.
+    pub cell_slots: u64,
+    /// What every row record of both buffers costs in the array it sits in, retained rows
+    /// included.
+    pub row_records: u64,
     /// What every hyperlink object the grid holds costs: the objects on the rows of both buffers,
     /// the objects on the retained rows, the link the pen is inside and the links the saved
     /// cursors carry.
@@ -1349,20 +1366,20 @@ impl CanonicalGrid {
             }
         }
         let alternate = self.alternate_active();
-        let mut history = 0u64;
+        let mut rows = RowsBytes::default();
         let active = self.content_of(
             self.terminal.screen(),
             !alternate,
             &mut seen,
             &mut links,
-            &mut history,
+            &mut rows,
         );
         let inactive = self.content_of(
             self.terminal.inactive_screen(),
             alternate,
             &mut seen,
             &mut links,
-            &mut history,
+            &mut rows,
         );
         let content = if alternate {
             [inactive, active]
@@ -1371,8 +1388,10 @@ impl CanonicalGrid {
         };
         BufferBytes {
             content,
+            cell_slots: rows.cell_slots,
+            row_records: rows.records,
             links,
-            history,
+            history: rows.history,
         }
     }
 
@@ -1403,7 +1422,7 @@ impl CanonicalGrid {
         keeps_history: bool,
         seen: &mut BTreeSet<*const Hyperlink>,
         links: &mut u64,
-        history: &mut u64,
+        rows: &mut RowsBytes,
     ) -> u64 {
         let retained = if keeps_history {
             screen
@@ -1417,12 +1436,20 @@ impl CanonicalGrid {
         screen.for_each_phys_line(|_, line| {
             let showing = index >= retained;
             index += 1;
+            // Every row record, showing or retained: the record is a slot in the array its screen
+            // keeps, and a screen holding more rows than its geometry has is holding more slots.
+            rows.records = rows.records.saturating_add(ROW_SLOT_BYTES);
             // Every link object once, wherever the row it is on sits: a row that scrolls off takes
             // no object with it and gives none up, so both measurements read them the same way.
             if showing {
                 content = content.saturating_add(row_content_bytes(line, seen, links));
+                rows.cell_slots = rows
+                    .cell_slots
+                    .saturating_add((line.len() as u64).saturating_mul(CELL_OVERHEAD_BYTES));
             } else {
-                *history = history.saturating_add(history_row_bytes(line, seen, links));
+                rows.history = rows
+                    .history
+                    .saturating_add(history_row_bytes(line, seen, links));
             }
         });
         content

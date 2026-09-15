@@ -628,12 +628,17 @@ width the screen has. Such a row is blank, so rebuilding it loses nothing that w
 shown, and rebuilding rather than shortening gives back the room it was holding. The buffer that is
 not showing cannot be reached that way, so the same is done for it when the buffers swap.
 
+Until the buffers swap, the rows the buffer that is not showing is still holding are counted where
+they are: every row record and every cell slot of both buffers is measured, so a screen holding
+more rows than its geometry has, or rows wider than its columns, is reported as holding them rather
+than reported as if the geometry had already taken effect.
+
 What a row gave up is given back; what the arrays behind them were holding is not. A vector that is
 shortened keeps the room it grew to, and the library offers no way to ask for that room back or to
 read how much of it there is, so a session that reflowed into one column keeps an array sized for
 the rows that reflow produced until the next reflow builds a new one. That room is bounded by the
-geometry the session was admitted at and the rows its cache may hold, and it is not in the figures
-below.
+geometry the session was admitted at and the rows its cache may hold, and it is the one thing the
+figures below cannot see.
 
 A cursor restore is a case of its own. The pinned revision clears newline mode and the shift-out
 selection when it restores a cursor, which a terminal does not: DECRC restores the cursor, the

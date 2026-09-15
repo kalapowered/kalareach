@@ -918,6 +918,8 @@ impl Engine {
         self.budget.set_screen_content(false, buffers.content[0]);
         self.budget.set_screen_content(true, buffers.content[1]);
         self.budget
+            .set_row_storage(buffers.cell_slots, buffers.row_records);
+        self.budget
             .set_links(buffers.links.saturating_add(self.link_table_bytes()));
         self.budget
             .set_titles(self.titles.resident_bytes() + crate::grid::GRID_TITLE_BYTES);

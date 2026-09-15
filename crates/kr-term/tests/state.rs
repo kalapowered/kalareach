@@ -2279,3 +2279,91 @@ fn a_rebuilt_row_still_shows_the_links_its_cells_hold() {
     );
     assert_eq!(engine.budget().excess(), 0);
 }
+
+/// The rows a shorter geometry leaves the buffer that is not showing are reported where they are,
+/// slots and records included, and they are gone when that buffer comes back.
+#[test]
+fn rows_the_inactive_buffer_still_holds_are_reported_and_then_released() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(256, 24),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // Every row of the alternate buffer filled, so none of them is blank and the library's own
+    // pruning cannot drop it.
+    engine.feed(b"\x1b[?1049h", 0);
+    for row in 0..24u32 {
+        engine.feed(format!("\x1b[{};1H", row + 1).as_bytes(), 0);
+        engine.feed("x".repeat(256).as_bytes(), 0);
+    }
+    engine.feed(b"\x1b[?1049l", 0);
+    engine.quiesce(0);
+    assert_eq!(engine.budget().excess(), 0, "nothing is out of place yet");
+
+    engine.resize(GridSize::new(256, 1), 0).expect("admitted");
+    engine.quiesce(0);
+    let held = engine.budget().usage().cell_slots;
+    assert!(
+        held > engine.budget().reserved().cell_slots,
+        "the rows the alternate buffer still holds are counted where they are: {held} bytes of \
+         slots against a reservation of {}",
+        engine.budget().reserved().cell_slots
+    );
+    assert!(
+        engine.budget().excess() > 0 && engine.budget().committed() > held,
+        "what the session reports is not below what its measurements found"
+    );
+
+    // Showing that buffer again settles it, and the rows its geometry cannot hold are gone.
+    engine.feed(b"\x1b[?1049h", 0);
+    engine.quiesce(0);
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "the rows were released when the buffer came back"
+    );
+}
+
+/// Reflowing into fewer columns builds as many rows as the text needs. When the buffer it reflowed
+/// is not the one showing, the rows it built are reported until it comes back.
+#[test]
+fn rows_a_reflow_builds_behind_the_alternate_buffer_are_reported() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(2_048, 8),
+        grid: kr_term::grid::GridConfig {
+            scrollback_rows: 64,
+            ..kr_term::grid::GridConfig::DEFAULT
+        },
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let mut input = String::new();
+    for _ in 0..8 {
+        for _ in 0..2_047 {
+            input.push('x');
+        }
+        input.push_str("\r\n");
+    }
+    engine.feed(input.as_bytes(), 0);
+    engine.feed(b"\x1b[?1049h", 0);
+    engine.quiesce(0);
+
+    engine.resize(GridSize::new(1, 8), 0).expect("admitted");
+    engine.quiesce(0);
+    let records = engine.budget().usage().row_records;
+    assert!(
+        records > engine.budget().reserved().row_arrays,
+        "the rows the reflow built are counted: {records} bytes of records against a reservation \
+         of {}",
+        engine.budget().reserved().row_arrays
+    );
+    assert!(engine.budget().committed() > engine.budget().reserved().total());
+
+    engine.feed(b"\x1b[?1049l", 0);
+    engine.quiesce(0);
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "the rows past what the geometry keeps were dropped when the buffer came back"
+    );
+}

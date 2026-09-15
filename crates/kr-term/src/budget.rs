@@ -202,6 +202,10 @@ pub struct BudgetUsage {
     ///
     /// Both, because the buffer that is not showing still holds its own.
     pub screen_content: [u64; 2],
+    /// Bytes the cells of those rows take in the slots they sit in.
+    pub cell_slots: u64,
+    /// Bytes every row record of both buffers takes in the array it sits in.
+    pub row_records: u64,
     /// Bytes the hyperlink state holds: the objects the rows of both buffers keep, the link the
     /// pen is inside, the links the saved cursors carry, and the table of distinct targets.
     pub links: u64,
@@ -250,6 +254,8 @@ impl SessionBudget {
             },
             usage: BudgetUsage {
                 screen_content: [0, 0],
+                cell_slots: 0,
+                row_records: 0,
                 links: 0,
                 titles: 0,
                 rows: 0,
@@ -377,6 +383,8 @@ impl SessionBudget {
     #[must_use]
     pub const fn excess(&self) -> u64 {
         over(self.usage.screens(), self.reserved.cell_content)
+            .saturating_add(over(self.usage.cell_slots, self.reserved.cell_slots))
+            .saturating_add(over(self.usage.row_records, self.reserved.row_arrays))
             .saturating_add(over(self.usage.links, self.reserved.links))
             .saturating_add(over(self.usage.titles, self.reserved.titles))
     }
@@ -418,6 +426,13 @@ impl SessionBudget {
         self.usage.screen_content[alternate as usize] = bytes;
     }
 
+    /// Records what the cells of the rows that are showing take in slots, and what every row
+    /// record of both buffers takes in the array it sits in.
+    pub const fn set_row_storage(&mut self, cell_slots: u64, row_records: u64) {
+        self.usage.cell_slots = cell_slots;
+        self.usage.row_records = row_records;
+    }
+
     /// Records what the titles and the virtual stack hold.
     pub const fn set_titles(&mut self, bytes: u64) {
         self.usage.titles = bytes;
@@ -450,6 +465,8 @@ impl SessionBudget {
     /// Clears the measurements a reset made stale, after it emptied both buffers.
     pub const fn clear_measurements(&mut self) {
         self.usage.screen_content = [0, 0];
+        self.usage.cell_slots = 0;
+        self.usage.row_records = 0;
         self.usage.links = 0;
         self.usage.titles = 0;
     }
