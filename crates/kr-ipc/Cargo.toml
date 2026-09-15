@@ -1,0 +1,36 @@
+[package]
+name = "kr-ipc"
+description = "KalaReach local typed-frame IPC: runtime directories, peer credentials, host identities and worker descriptors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kr-cbor.workspace = true
+kr-protocol.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc.workspace = true
+sysctl.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+sysinfo.workspace = true
+
+[features]
+# A disposable owner-only host tree for the other host crates' tests.
+testing = []
+
+[dev-dependencies]
+kr-ipc = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true
