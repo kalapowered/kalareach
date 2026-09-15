@@ -41,7 +41,10 @@ fn main() -> ExitCode {
         }
     };
     match runtime.block_on(run(cli)) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Completion::Done) => ExitCode::SUCCESS,
+        // The command has already written its own result, which named the failure. Printing a
+        // second document here would give a reader two to reconcile.
+        Ok(Completion::Reported(error)) => ExitCode::from(error.exit_code()),
         Err(error) => {
             if json {
                 print_json(&report::failure(&error));
@@ -51,6 +54,17 @@ fn main() -> ExitCode {
             ExitCode::from(error.exit_code())
         }
     }
+}
+
+/// How a command finished.
+///
+/// A command whose own result describes the failure reports it here rather than returning it, so
+/// exactly one result reaches the caller and the exit status still says what happened.
+enum Completion {
+    /// The command succeeded.
+    Done,
+    /// The command failed and has already written the result that says so.
+    Reported(CliError),
 }
 
 /// Reports a usage mistake, in the form the caller asked for.
@@ -69,7 +83,7 @@ fn usage(error: &clap::Error, json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(cli: Cli) -> Result<Completion> {
     let paths = HostPaths::discover()?;
     match cli.command {
         Command::New(arguments) => {
@@ -155,7 +169,7 @@ async fn run(cli: Cli) -> Result<()> {
                     eprintln!("kr: the session was created; its terminal was not opened: {error}");
                 }
             }
-            presented
+            Ok(presented.map_or_else(Completion::Reported, |()| Completion::Done))
         }
         Command::Attach(arguments) => {
             let selector = SessionSelector::parse(&arguments.session)?;
@@ -178,7 +192,9 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 println!("{}", outcome.detail());
             }
-            outcome.into_error().map_or(Ok(()), Err)
+            Ok(outcome
+                .into_error()
+                .map_or(Completion::Done, Completion::Reported))
         }
         Command::Detach(arguments) => {
             let selector = session_selector(arguments.session.as_deref())?;
@@ -208,7 +224,7 @@ async fn run(cli: Cli) -> Result<()> {
                     result.remaining
                 );
             }
-            Ok(())
+            Ok(Completion::Done)
         }
         Command::Close(arguments) => {
             let selector = session_selector(arguments.session.as_deref())?;
@@ -290,7 +306,7 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("this closure was not recorded durably");
                 }
             }
-            Ok(())
+            Ok(Completion::Done)
         }
         Command::List(arguments) => {
             let environment = kr_cli::resolve::select(&paths, arguments.environment.as_deref())?;
@@ -316,7 +332,7 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("{}", report::session_line(summary));
                 }
             }
-            Ok(())
+            Ok(Completion::Done)
         }
         Command::Status(arguments) => {
             let selector = session_selector(arguments.session.as_deref())?;
@@ -355,7 +371,7 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
-            Ok(())
+            Ok(Completion::Done)
         }
         Command::Doctor(arguments) => {
             let environment = kr_cli::resolve::select(&paths, None)?;
@@ -387,12 +403,14 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            if checks.healthy || cli.json {
-                Ok(())
+            if checks.healthy {
+                Ok(Completion::Done)
             } else {
-                Err(CliError::Other(
+                // The one document above already says which diagnostics failed, so the failure is
+                // reported rather than returned and the exit status carries it.
+                Ok(Completion::Reported(CliError::Other(
                     "one or more diagnostics did not pass".to_owned(),
-                ))
+                )))
             }
         }
     }
@@ -519,7 +537,7 @@ fn open_terminal_application(display_number: u64) -> Result<()> {
             .stderr(std::process::Stdio::null())
             .spawn();
         if started.is_ok() {
-            return Ok(());
+            return Ok(Completion::Done);
         }
     }
     Err(CliError::TerminalUnavailable(

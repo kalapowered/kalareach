@@ -421,14 +421,16 @@ impl CloseGate {
                 }
                 tokio::time::sleep(STOP_POLL_INTERVAL).await;
             }
-            let forced = {
+            {
+                // Whatever is left is forced. Which processes that reached is recorded there, while
+                // the kernel still names them.
                 let mut session = runtime.session();
-                session.force_close().unwrap_or(false)
-            };
+                let _ = session.force_close();
+            }
             tokio::time::sleep(DRAIN_PERIOD).await;
             {
                 let mut session = runtime.session();
-                session.finish_close(forced);
+                session.finish_close();
             }
             runtime.closed.notify_waiters();
         });

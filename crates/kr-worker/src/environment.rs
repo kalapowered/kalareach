@@ -193,6 +193,14 @@ pub fn build(
             removed.push(variable.name.clone());
             continue;
         }
+        if DESKTOP_VARIABLES.contains(&variable.name.as_str()) {
+            // The desktop belongs to the execution context, not to whoever asked for the session.
+            // A headless worker supplies none of these on purpose, and letting the creator's copy
+            // survive would give it a display, a message bus and a runtime directory belonging to a
+            // login it is not in and that may already have ended.
+            removed.push(variable.name.clone());
+            continue;
+        }
         if variable.name == "PATH" {
             path_from_snapshot = true;
         }

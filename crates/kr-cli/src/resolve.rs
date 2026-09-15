@@ -119,10 +119,19 @@ pub fn environments(paths: &HostPaths) -> Result<Vec<KnownEnvironment>> {
 pub fn select(paths: &HostPaths, named: Option<&str>) -> Result<KnownEnvironment> {
     let known = environments(paths)?;
     let Some(text) = named else {
+        // This installation's own environment, not whichever identifier happens to sort first. A
+        // host can have several — a test tree, a second account's tree left behind — and answering
+        // `kr new` with one of those would create a session somewhere the person never named.
+        let installation = paths.open_environment_id()?;
         return known
             .into_iter()
-            .next()
-            .ok_or_else(|| CliError::HostUnavailable("this host has no environment".to_owned()));
+            .find(|known| known.environment_id == installation)
+            .ok_or_else(|| {
+                CliError::HostUnavailable(format!(
+                    "this host's environment {installation} has no runtime directory; start the \
+                     control daemon, or name an environment"
+                ))
+            });
     };
     let wanted: EnvironmentId = text
         .parse()

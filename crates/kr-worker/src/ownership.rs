@@ -142,9 +142,14 @@ impl OwnedProcesses {
         }
     }
 
-    /// Records that every remaining process was forced.
-    pub fn note_all_forced(&mut self) {
-        let remaining: Vec<u64> = self
+    /// Records that force was used on every process that was still running.
+    ///
+    /// This runs at the moment force is applied, not afterwards. Marking the survivors of a
+    /// successful forced stop would mark nothing at all: the processes that force actually ended
+    /// are exactly the ones no longer running by the time the record is written, and the record
+    /// would then say every one of them stopped when it was asked.
+    pub fn note_forced_now(&mut self) {
+        let running: Vec<u64> = self
             .seen
             .iter()
             .filter(|(_, recorded)| {
@@ -155,7 +160,7 @@ impl OwnedProcesses {
             })
             .map(|(pid, _)| *pid)
             .collect();
-        for pid in remaining {
+        for pid in running {
             self.note_forced(pid);
         }
     }

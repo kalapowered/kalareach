@@ -1229,21 +1229,27 @@ impl Session {
         {
             shell.force_stop()?;
         }
-        if let Some(owned) = self.owned.as_ref() {
+        if let Some(owned) = self.owned.as_mut() {
+            // Recorded before the signal, while the kernel still names the processes force is being
+            // used on. Afterwards there would be nothing left to mark.
+            owned.note_forced_now();
             crate::ownership::force_stop(owned);
         }
         Ok(remaining)
     }
 
     /// Writes the final record and moves the session to `closed`.
-    pub fn finish_close(&mut self, forced: bool) -> ClosureRecord {
+    ///
+    /// Which processes were forced is recorded where force was applied, not here: by the time this
+    /// runs, the ones force actually ended are gone and there is nothing left to mark.
+    pub fn finish_close(&mut self) -> ClosureRecord {
         let exit = self.root_exit.clone().or_else(|| {
             self.shell
                 .as_mut()
                 .and_then(|shell| shell.try_wait().ok().flatten())
         });
         let reason = self.closing_reason.unwrap_or(ClosureReason::CloseRequested);
-        self.record_closure_with(reason, exit, forced)
+        self.record_closure_with(reason, exit)
     }
 
     /// Checks whether the root shell has ended, and records the closure if it has.
@@ -1308,18 +1314,17 @@ impl Session {
             self.state = SessionState::Closing;
             self.closing_reason = Some(reason);
         }
-        self.record_closure_with(self.closing_reason.unwrap_or(reason), Some(exit), false)
+        self.record_closure_with(self.closing_reason.unwrap_or(reason), Some(exit))
     }
 
     fn record_closure(&mut self, reason: ClosureReason, exit: Option<ShellExit>) -> ClosureRecord {
-        self.record_closure_with(reason, exit, false)
+        self.record_closure_with(reason, exit)
     }
 
     fn record_closure_with(
         &mut self,
         reason: ClosureReason,
         exit: Option<ShellExit>,
-        forced: bool,
     ) -> ClosureRecord {
         if let Some(existing) = self.closure.clone() {
             return existing;
@@ -1328,9 +1333,6 @@ impl Session {
         // accounted for.
         if let Some(owned) = self.owned.as_mut() {
             owned.observe();
-            if forced {
-                owned.note_all_forced();
-            }
         }
         // Only confirmed terminations are listed, and coverage follows the boundary this host
         // actually has rather than the outcome it would prefer. A terminal process group cannot
