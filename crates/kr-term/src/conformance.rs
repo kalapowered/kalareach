@@ -8,7 +8,7 @@
 
 use serde_json::{Value, json};
 
-use crate::budget::GridSize;
+use crate::budget::{GridSize, SessionBudget};
 use crate::engine::{Engine, EngineConfig};
 use crate::event::{Event, EventKind};
 use crate::lane::LaneGate;
@@ -667,31 +667,55 @@ pub const ADMISSION_CASES: &[AdmissionCase] = &[
         resize: None,
     },
     AdmissionCase {
+        id: "full_width_terminal",
+        covers: "KR-REQ-08.79 a geometry that fits",
+        // The widest grid section 8 allows, at an ordinary height.
+        cols: 2_048,
+        rows: 24,
+        resize: None,
+    },
+    AdmissionCase {
         id: "largest_square_that_fits",
-        covers: "KR-REQ-08.79 the largest grid that fits",
-        cols: 272,
-        rows: 272,
+        covers: "KR-REQ-08.79 the largest square that fits",
+        cols: 249,
+        rows: 249,
         resize: None,
     },
     AdmissionCase {
         id: "smallest_square_that_does_not",
         covers: "KR-REQ-08.79 rejection before allocation",
-        cols: 273,
-        rows: 273,
+        cols: 250,
+        rows: 250,
         resize: None,
     },
     AdmissionCase {
-        id: "widest_grid_that_fits",
-        covers: "KR-REQ-08.79 the largest grid that fits",
-        cols: 2_048,
-        rows: 36,
+        id: "widest_grid_that_fits_at_forty_rows",
+        covers: "KR-REQ-08.79 the widest grid that fits at a height",
+        cols: 1_556,
+        rows: 40,
         resize: None,
     },
     AdmissionCase {
-        id: "widest_grid_that_does_not",
+        id: "widest_grid_that_does_not_at_forty_rows",
         covers: "KR-REQ-08.79 rejection before allocation",
-        cols: 2_048,
-        rows: 37,
+        cols: 1_557,
+        rows: 40,
+        resize: None,
+    },
+    AdmissionCase {
+        id: "most_cells_admitted",
+        covers: "KR-REQ-08.79 the largest cell count any shape is admitted at",
+        cols: 2_008,
+        rows: 31,
+        resize: None,
+    },
+    AdmissionCase {
+        id: "fewest_cells_refused",
+        covers: "KR-REQ-08.79 a smaller grid of a costlier shape is refused",
+        // Fewer cells than the case above and refused all the same: a tall grid keeps more rows,
+        // and rows cost something of their own.
+        cols: 60,
+        rows: 1_020,
         resize: None,
     },
     AdmissionCase {
@@ -726,6 +750,71 @@ pub const ADMISSION_CASES: &[AdmissionCase] = &[
         resize: Some((2_048, 128)),
     },
 ];
+
+/// The admission boundary, found by trying every geometry the dimension bounds allow.
+///
+/// There is no single boundary by cell count: a row costs something of its own, so a tall grid of
+/// few columns is refused where a wide grid of more cells is admitted. What is recorded is the
+/// widest grid admitted at a set of heights, the largest cell count any shape is admitted at, and
+/// the smallest cell count any shape is refused at.
+#[must_use]
+pub fn admission_boundary() -> Value {
+    let budget = SessionBudget::new();
+    let grid = crate::grid::GridConfig::DEFAULT;
+    let cell_bytes = grid.cell_bytes as u64;
+    let limit = budget.limits().session_bytes;
+    let fits = |cols: u32, rows: u32| {
+        let size = GridSize::new(cols, rows);
+        size.validate().is_ok()
+            && budget
+                .footprint(size, grid.scrollback_rows, cell_bytes)
+                .total()
+                <= limit
+    };
+    let mut most = None;
+    let mut fewest = None;
+    for cols in 1..=crate::budget::MAX_COLS {
+        for rows in 1..=crate::budget::MAX_ROWS {
+            let cells = u64::from(cols) * u64::from(rows);
+            if cells > u64::from(crate::budget::MAX_CELLS) {
+                break;
+            }
+            if fits(cols, rows) {
+                if most.is_none_or(|(_, _, best)| cells > best) {
+                    most = Some((cols, rows, cells));
+                }
+            } else if fewest.is_none_or(|(_, _, worst)| cells < worst) {
+                fewest = Some((cols, rows, cells));
+            }
+        }
+    }
+    let by_rows: Vec<Value> = [24u32, 40, 50, 128, 249, 512, 1_024]
+        .into_iter()
+        .map(|rows| {
+            json!({
+                "rows": rows,
+                "widest_admitted_cols": (1..=crate::budget::MAX_COLS)
+                    .filter(|cols| fits(*cols, rows))
+                    .max(),
+                "narrowest_refused_cols": (1..=crate::budget::MAX_COLS)
+                    .find(|cols| GridSize::new(*cols, rows).validate().is_ok() && !fits(*cols, rows)),
+            })
+        })
+        .collect();
+    json!({
+        "most_cells_admitted": most.map(|(cols, rows, cells)| json!({
+            "cols": cols,
+            "rows": rows,
+            "cells": cells,
+        })),
+        "fewest_cells_refused": fewest.map(|(cols, rows, cells)| json!({
+            "cols": cols,
+            "rows": rows,
+            "cells": cells,
+        })),
+        "by_rows": by_rows,
+    })
+}
 
 /// Admits one case and records which bound answered.
 #[must_use]

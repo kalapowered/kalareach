@@ -154,7 +154,8 @@ pub fn adapt(event: &Event, context: AdaptContext) -> Adapted {
             // becomes U+FFFD and a control scalar is dropped. The original bytes are still never
             // forwarded, because a terminal would frame them differently than this engine did.
             let parts = regroup(*selector, parts);
-            let sanitised: Vec<Vec<u8>> = parts.iter().map(|part| sanitise(part)).collect();
+            let mut sanitised: Vec<Vec<u8>> = parts.iter().map(|part| sanitise(part)).collect();
+            bound_title(*selector, &mut sanitised);
             let borrowed: Vec<&[u8]> = sanitised.iter().map(Vec::as_slice).collect();
             let osc = OperatingSystemCommand::parse(&borrowed);
             let unrecognised = matches!(osc, OperatingSystemCommand::Unspecified(_));
@@ -258,6 +259,26 @@ fn regroup(selector: Option<u32>, parts: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = parts[..2].to_vec();
     out.push(parts[2..].join(&b';'));
     out
+}
+
+/// Cuts a title payload to the length a session holds, before the grid sees it.
+///
+/// The grid keeps its own copy of the window title and the icon title, and it keeps whatever it is
+/// given: without this it would hold as much as a control string may carry, which is far more than
+/// a title may be, and the session and the grid would disagree about what the window is called. A
+/// title may contain the separator, so everything after the selector is the title and it becomes
+/// one part, which is the same string the session keeps.
+fn bound_title(selector: Option<u32>, parts: &mut Vec<Vec<u8>>) {
+    if !matches!(selector, Some(0..=2)) || parts.len() < 2 {
+        return;
+    }
+    let title: String = parts[1..]
+        .iter()
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect::<Vec<_>>()
+        .join(";");
+    parts.truncate(1);
+    parts.push(crate::title::truncated(&title).into_bytes());
 }
 
 /// Makes a control-string payload safe to render.

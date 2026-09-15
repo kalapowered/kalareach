@@ -181,10 +181,12 @@ fn admission() -> Value {
             "cell_text_heap_bytes": kr_term::grid::CELL_TEXT_HEAP_BYTES,
             "row_slot_bytes": kr_term::grid::ROW_SLOT_BYTES,
             "scrollback_rows": grid.scrollback_rows,
+            "row_storage_bytes": kr_term::grid::ROW_STORAGE_BYTES,
             "link_envelope_bytes": limits.link_envelope(),
-            "title_bytes": kr_term::title::MAX_RESIDENT_BYTES,
+            "title_bytes": kr_term::title::MAX_RESIDENT_BYTES + kr_term::grid::GRID_TITLE_BYTES,
             "alert_bytes": kr_term::grid::ALERT_LIST_BYTES,
         },
+        "boundary": kr_term::conformance::admission_boundary(),
         "cases": ADMISSION_CASES.iter().map(admission_entry).collect::<Vec<_>>(),
     })
 }

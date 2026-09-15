@@ -236,6 +236,7 @@ pub struct Engine {
     saved_revision: u64,
     measured_rows: usize,
     measure_now: bool,
+    alternate_seen: bool,
     history_end_seen: i64,
     links_seen: u64,
     title_truncated: bool,
@@ -282,6 +283,7 @@ impl Engine {
             saved_revision: 0,
             measured_rows: 0,
             measure_now: false,
+            alternate_seen: false,
             history_end_seen: 0,
             links_seen: 0,
             title_truncated: false,
@@ -499,6 +501,7 @@ impl Engine {
                     disposition = DirectDisposition::Withhold;
                 } else {
                     let adapted = self.grid.apply(event);
+                    self.note_buffer_switch();
                     self.charge_rows_that_left_the_screen(now_ms);
                     if adapted.clamped {
                         // The grid did what it could rather than what the sequence said, so the
@@ -648,6 +651,7 @@ impl Engine {
             let decision = self.policy.decide(&inner);
             if decision.apply_to_grid {
                 self.grid.apply(&inner);
+                self.note_buffer_switch();
                 self.charge_rows_that_left_the_screen(now_ms);
                 self.revision = self.next_revision();
                 // A control can select a character set or move a margin as readily as a sequence
@@ -792,6 +796,21 @@ impl Engine {
         None
     }
 
+    /// Notices that the buffers have swapped, and settles the one that has come back.
+    ///
+    /// A resize reflows both buffers, and only the one that is showing can be brought back to what
+    /// its geometry holds; the other keeps what the reflow left it until it returns. So it is
+    /// settled here, and measured, rather than waiting for a read to notice.
+    fn note_buffer_switch(&mut self) {
+        let alternate = self.grid.alternate_active();
+        if alternate == self.alternate_seen {
+            return;
+        }
+        self.alternate_seen = alternate;
+        self.grid.normalise_storage();
+        self.measure_now = true;
+    }
+
     /// Charges the rows that have just left the screen, and evicts when they pass the bound.
     ///
     /// The historical cache is a byte bound rather than a row count, and two rows can carry more
@@ -900,7 +919,8 @@ impl Engine {
         self.budget.set_screen_content(true, buffers.content[1]);
         self.budget
             .set_links(buffers.links.saturating_add(self.link_table_bytes()));
-        self.budget.set_titles(self.titles.resident_bytes());
+        self.budget
+            .set_titles(self.titles.resident_bytes() + crate::grid::GRID_TITLE_BYTES);
         if self.grid.alternate_active() {
             // Nothing appends to the primary buffer while the alternate one is showing, so its
             // history cannot grow here; a resize can still move rows into it, so what it costs is

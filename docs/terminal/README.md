@@ -574,37 +574,58 @@ refused with `RESOURCE_UNAVAILABLE`, naming the cells that were asked for, what 
 the budget. The reservation is the whole point of the rule: once a geometry is admitted, text
 arriving for its screens is never refused, because the room it needs is already held.
 
-One cell of one buffer, with the figures the model uses on a 64-bit target:
+One cell of one buffer, in reserved bytes on a 64-bit target:
 
 | Part | Bytes | Why |
 | --- | --- | --- |
-| The slot the cell takes in its row | 64 | Twice the larger of the two forms a row is held in |
+| The slot the cell takes in its row | 128 | A row holds its cells in one of two forms and changes between them while it is written, so both can be alive at once, each at twice the cells it holds, beside the offset and the wide-cell bit the compact form keeps for each cell |
 | Its text | 128 | 64 bytes of content, at twice what it holds, because a row appends to its string |
 | Its attributes | 96 | The allocation a cell keeps for colours, underline colour, link handle and image list |
-| Its text's heap header | 32 | A cell's text leaves the cell once it is longer than a machine word |
-| | **320** | per cell, per buffer; **640** for both |
+| Its text's heap header | 32 | A cell's text leaves the cell once it reaches the length of a machine word |
+| | **384** | per cell, per buffer; **768** for both |
 
-And the parts that do not depend on the geometry:
+The rest of the reservation:
 
 | Part | Bytes | Why |
 | --- | --- | --- |
+| Row arrays | 288 a row | The array slot of every row of both buffers, the primary buffer's 3,500 scrollback slots included, at twice the rows they hold |
+| Row storage | 136 a screen row | What a row allocates for itself before anything is on it: eighty bytes of room for its text, and a header each for the cell offsets and the wide-cell bits. A retained row's own storage is the row cache's to carry |
 | Hyperlink envelope | 17,137,960 | 4,096 targets of 2,048 bytes, at twice what they hold, with the table slots and the first node |
-| Row arrays | 288 per row | Both buffers' rows, the primary buffer's 3,500 scrollback slots included, at twice the rows they hold |
-| Titles and the virtual stack | 46,064 | Ten entries of two 1,024-byte titles, at twice what they hold, plus the current pair |
+| Titles and the virtual stack | 50,208 | Ten entries of two 1,024-byte titles, at twice what they hold, the current pair, and the copy of each title the grid keeps |
 | Alert channel | 1,073,152 | 256 alerts of two 1,024-byte strings, at twice what the list holds |
 
-So an 80 by 24 session reserves 20,507,800 bytes of its 67,108,864, and the default invisible
-120 by 40 reserves 22,360,216. The boundary falls at about 74,000 cells: 272 by 272 is admitted at
-66,771,608 bytes and 273 by 273 is refused; 2,048 by 36 is admitted and 2,048 by 37 is refused. The
-largest grid the dimensions allow, 2,048 by 128, would need 187,111,064 bytes, so it is refused
-before anything is allocated for it. `fixtures/terminal/admission.json` records each of those.
+So an 80 by 24 session reserves 20,764,232 bytes of its 67,108,864, and the default invisible
+120 by 40 reserves 22,989,640. A full-width 2,048 by 24 terminal is admitted; so is every grid at
+that height, because 2,048 columns is the widest section 8 allows. The largest grid the dimensions
+allow, 2,048 by 128, would need 220,704,456 bytes, so it is refused before anything is allocated
+for it.
+
+There is no single boundary in cells, because a row costs something of its own: the largest cell
+count any shape is admitted at is 2,008 by 31, or 62,248 cells, and 60 by 1,020 is refused at
+61,200. The boundary by height is what a client cares about, and
+`fixtures/terminal/admission.json` records it: 1,556 columns are admitted at 40 rows and 1,557 are
+not; 485 at 128 rows and 486 are not; 249 by 249 is the largest square and 250 by 250 is refused;
+59 columns are admitted at the full 1,024 rows.
 
 The historical row cache is not in that figure. Section 8 gives it its own 8 MiB bound beside the
 64 MiB session budget, so a session's resident state is bounded by the two together and each is
-enforced where it belongs.
+enforced where it belongs. A title is in the figure twice, because it is held twice: the session
+keeps it and so does the grid. Both hold the same string, cut to the same length before the grid
+sees it.
 
 A resize goes through the same admission. One that does not fit is refused before the grid is
 touched, and the geometry, the reservation and the projection are all unchanged.
+
+A resize that does fit has work to do afterwards. Reflowing into fewer columns builds as many rows
+as the text needs, which can be many times the rows the new geometry keeps, and it hands a row of
+blanks back whole rather than cutting it to the new width. Neither is undone until something
+scrolls, so the buffer that is showing is brought back to what its geometry holds as part of the
+resize: the row count returns to the screen and its scrollback, and a row still holding more
+columns than the screen has is cut to the columns it has. Such a row is blank, so cutting it loses
+nothing that was ever going to be shown. The buffer that is not showing cannot be reached that way,
+so it is done again when the buffers swap. Until then its rows are measured where they are, which
+is why the figure a session reports can be above what its current geometry reserved: what it is
+holding was reserved by the geometry it had before.
 
 A cursor restore is a case of its own. The pinned revision clears newline mode and the shift-out
 selection when it restores a cursor, which a terminal does not: DECRC restores the cursor, the
@@ -647,6 +668,8 @@ that is a close, and keeping its parameters would let an application hold a sess
 identifiers in links nothing can follow. A cell that reaches its content bound drops the marks past
 it. The alert channel holds a bounded number of alerts, each cut to a bounded length.
 
+A resize can move link objects the other way, from the history back onto a screen, and a screen
+that takes back more links than the envelope holds refuses the next one until it is under again.
 Nothing else is refused. Text, titles and the rows that scroll off all draw on room the geometry
 already reserved, so an admitted session can fill its screens, set a title as often as it likes and
 push its stack to the bound without meeting a refusal. Rows that scroll off the screen are charged
@@ -670,10 +693,12 @@ for every column the cell covers, the header a cell's text keeps once it has lef
 room the title stack grew to rather than the entries left on it. Counting only characters would
 report a screen of coloured, linked cells as costing what a screen of plain ones costs.
 
-Every measurement is compared with the reservation made for it, and `SessionBudget::excess` is what
-the measurements found beyond their reservations. It is zero, and the tests assert so across a
-screen filled with the most expensive cell there is. A figure above zero would mean the model had
-reserved less than the truth, which is why it is reported rather than assumed away.
+Every measurement is compared with the reservation made for it. `SessionBudget::excess` is what the
+measurements found beyond their reservations, and `SessionBudget::committed` is the reservation
+plus that, so the figure a session reports is never below what it is holding. At a settled geometry
+the excess is zero, including on a screen filled with the most expensive cell there is. It is above
+zero only while a session is holding storage a geometry it has left reserved and the library has
+not released, which the resize rule above describes.
 
 What the budget records for the row cache is what the rows actually cost, not what they are allowed
 to cost. Recording the bound instead would make a session that is over its cache look exactly like

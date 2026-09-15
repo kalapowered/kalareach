@@ -1811,9 +1811,10 @@ fn the_row_arrays_are_reserved_with_their_scrollback() {
     let footprint = budget.footprint(GridSize::new(80, 24), grid.scrollback_rows, 64);
     assert_eq!(
         footprint.row_arrays,
-        (24 + grid.scrollback_rows as u64 + 24) * kr_term::grid::ROW_SLOT_BYTES,
-        "the primary buffer's array holds the screen and the scrollback; the alternate keeps no \
-         history"
+        (24 + grid.scrollback_rows as u64 + 24) * kr_term::grid::ROW_SLOT_BYTES
+            + 48 * kr_term::grid::ROW_STORAGE_BYTES,
+        "the primary buffer's array holds the screen and the scrollback, the alternate keeps no \
+         history, and every row of a screen allocates for itself"
     );
     let taller = budget.footprint(GridSize::new(80, 48), grid.scrollback_rows, 64);
     assert!(
@@ -1858,9 +1859,12 @@ fn the_title_stack_is_charged_for_the_room_it_grew_to() {
     engine.feed(popping.as_bytes(), 0);
     engine.quiesce(0);
     assert_eq!(engine.budget().excess(), 0);
+    let slots = kr_term::title::MAX_DEPTH as u64 * size_of::<kr_term::title::SavedTitle>() as u64;
     assert!(
-        engine.budget().usage().titles >= kr_term::title::MAX_DEPTH as u64,
-        "the stack still holds the room it grew to"
+        engine.budget().usage().titles >= slots,
+        "the stack still holds the room for {} entries it grew to; the measurement says {}",
+        kr_term::title::MAX_DEPTH,
+        engine.budget().usage().titles
     );
 }
 
@@ -1983,11 +1987,19 @@ fn a_screen_of_known_cells_measures_what_those_cells_cost() {
         ..EngineConfig::DEFAULT
     })
     .expect("engine");
-    // One cell: an 'e' with four combining marks, in true colour. Nine bytes of text, which is
-    // past a machine word, so the text is on the heap behind a header; and a colour the packed
-    // form on the cell cannot hold, so the cell keeps an allocation for its attributes.
-    let cell = "e\u{301}\u{302}\u{303}\u{304}";
-    assert_eq!(cell.len(), 9);
+    // One cell, as expensive as a cell is allowed to be: an 'e' with combining marks up to the
+    // per-cell content bound, which is far past a machine word, so its text is on the heap behind
+    // a header; and a colour the packed form on the cell cannot hold, so the cell keeps an
+    // allocation of its own for its attributes.
+    let mut cell = String::from("e");
+    while cell.len() + 2 <= kr_term::grid::GridConfig::DEFAULT.cell_bytes {
+        cell.push('\u{301}');
+    }
+    let cell = cell.as_str();
+    assert_eq!(
+        cell.len(),
+        kr_term::grid::GridConfig::DEFAULT.cell_bytes - 1
+    );
     let mut input = String::from("\x1b[38;2;10;20;30m");
     for _ in 0..(size.cols * size.rows) {
         input.push_str(cell);
@@ -1996,15 +2008,16 @@ fn a_screen_of_known_cells_measures_what_those_cells_cost() {
     engine.quiesce(0);
 
     let cells = u64::from(size.cols * size.rows);
-    let expected = cells
-        * (2 * cell.len() as u64
-            + kr_term::grid::CELL_ATTRIBUTE_BYTES
-            + kr_term::grid::CELL_TEXT_HEAP_BYTES);
+    let expected = u64::from(size.rows) * kr_term::grid::ROW_STORAGE_BYTES
+        + cells
+            * (2 * cell.len() as u64
+                + kr_term::grid::CELL_ATTRIBUTE_BYTES
+                + kr_term::grid::CELL_TEXT_HEAP_BYTES);
     assert_eq!(
         engine.grid().buffer_bytes().content[0],
         expected,
-        "the text at twice what it holds, the attribute allocation of every cell, and the header \
-         each cell's text keeps on the heap"
+        "what each row allocates for itself, the text at twice what it holds, the attribute \
+         allocation of every cell, and the header each cell's text keeps on the heap"
     );
     assert_eq!(engine.budget().usage().screen_content[0], expected);
     assert!(
@@ -2043,4 +2056,134 @@ fn a_resize_behind_the_alternate_buffer_still_charges_the_history() {
         engine.budget().usage().rows > before,
         "the rows the primary screen gave up are charged to the cache"
     );
+}
+
+/// A narrower geometry brings the rows back to what it can hold: the reflow builds as many rows as
+/// the text needs, and a row of blanks comes back from it at its old width.
+#[test]
+fn a_narrower_geometry_releases_what_it_cannot_hold() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(2_048, 8),
+        grid: kr_term::grid::GridConfig {
+            scrollback_rows: 64,
+            ..kr_term::grid::GridConfig::DEFAULT
+        },
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // Every row full, so reflowing into one column has 16,000 rows of text to place.
+    let mut input = String::from("\x1b[38;2;10;20;30m");
+    for _ in 0..8 {
+        for _ in 0..2_047 {
+            input.push('x');
+        }
+        input.push_str("\r\n");
+    }
+    engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+
+    engine.resize(GridSize::new(1, 8), 0).expect("admitted");
+    engine.quiesce(0);
+    let rows = engine.grid().scrollback_rows();
+    assert!(
+        rows <= 64,
+        "the reflow left {rows} rows of history against a 64-row scrollback"
+    );
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "the rows a narrower screen cannot hold are gone rather than charged"
+    );
+
+    // A screen of blanks with a background colour is whitespace to the reflow, which hands such a
+    // row back whole rather than cutting it to the new width.
+    let mut wide = Engine::new(EngineConfig {
+        size: GridSize::new(2_048, 8),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    wide.feed(b"\x1b[48;2;10;20;30m\x1b[2J\x1b[8;1H", 0);
+    wide.quiesce(0);
+    wide.resize(GridSize::new(1, 8), 0).expect("admitted");
+    wide.quiesce(0);
+    assert_eq!(
+        wide.budget().excess(),
+        0,
+        "a row of coloured blanks is cut to the columns the screen has"
+    );
+}
+
+/// The alternate buffer keeps no history, so every row the library is still holding for it is its
+/// own and is measured, including the rows a shorter geometry left behind.
+#[test]
+fn the_alternate_buffer_measures_every_row_it_holds() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(64, 16),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    engine.feed(b"\x1b[?1049h\x1b[48;2;10;20;30m", 0);
+    for row in 0..16u32 {
+        engine.feed(
+            format!("\x1b[{};1Halternate row {row}", row + 1).as_bytes(),
+            0,
+        );
+    }
+    engine.quiesce(0);
+    let full = engine.budget().usage().screen_content[1];
+    assert!(full > 0, "the alternate buffer holds its rows");
+
+    engine.resize(GridSize::new(64, 1), 0).expect("admitted");
+    engine.quiesce(0);
+    assert!(
+        engine.budget().usage().screen_content[1] >= 16 * kr_term::grid::ROW_STORAGE_BYTES,
+        "every row the library is still holding for the alternate buffer is counted, not only the \
+         one the new geometry shows"
+    );
+}
+
+/// A title is held by the session and by the grid, and both hold the same bounded string.
+#[test]
+fn the_grid_holds_no_more_of_a_title_than_the_session_does() {
+    let mut engine = engine();
+    let long = "t".repeat(60_000);
+    engine.feed(format!("\x1b]2;{long}\x07").as_bytes(), 0);
+    engine.quiesce(0);
+    assert_eq!(
+        engine.grid().title().len(),
+        kr_term::title::MAX_TITLE_BYTES,
+        "the grid keeps what a session keeps, not what arrived"
+    );
+    let snapshot = engine.snapshot(viewport(&engine), 0).0;
+    assert_eq!(snapshot.title.window, engine.grid().title());
+    assert_eq!(engine.budget().excess(), 0);
+}
+
+/// A restored title stack is rebuilt rather than adopted, so a snapshot cannot bring room with it.
+#[test]
+fn a_restored_title_stack_keeps_no_more_room_than_it_may() {
+    let mut titles = kr_term::title::TitleState::new();
+    let mut stack = Vec::with_capacity(1_000);
+    for _ in 0..64 {
+        stack.push(kr_term::title::SavedTitle {
+            icon: Some("i".repeat(8_000)),
+            window: Some("w".repeat(8_000)),
+        });
+    }
+    titles.restore(
+        kr_term::title::TitleEntry {
+            icon: "i".repeat(8_000),
+            window: "w".repeat(8_000),
+        },
+        stack,
+        0,
+    );
+    assert_eq!(titles.depth(), kr_term::title::MAX_DEPTH);
+    assert!(
+        titles.resident_bytes() <= kr_term::title::MAX_RESIDENT_BYTES,
+        "a restored stack holds {} bytes against a bound of {}",
+        titles.resident_bytes(),
+        kr_term::title::MAX_RESIDENT_BYTES
+    );
+    assert_eq!(titles.window().len(), kr_term::title::MAX_TITLE_BYTES);
 }

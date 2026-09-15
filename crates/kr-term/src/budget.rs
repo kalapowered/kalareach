@@ -11,8 +11,9 @@
 
 use crate::error::{Result, TermError};
 use crate::grid::{
-    ALERT_LIST_BYTES, CELL_ATTRIBUTE_BYTES, CELL_TEXT_HEAP_BYTES, LINK_TABLE_ENTRY_BYTES,
-    LINK_TABLE_NODE_BYTES, ROW_SLOT_BYTES, STRING_HANDLE_BYTES,
+    ALERT_LIST_BYTES, CELL_ATTRIBUTE_BYTES, CELL_TEXT_HEAP_BYTES, GRID_TITLE_BYTES,
+    LINK_TABLE_ENTRY_BYTES, LINK_TABLE_NODE_BYTES, ROW_SLOT_BYTES, ROW_STORAGE_BYTES,
+    STRING_HANDLE_BYTES,
 };
 
 /// The maximum number of columns.
@@ -141,9 +142,13 @@ impl Default for BudgetLimits {
 
 /// Bytes one cell of one screen buffer costs in the row it sits in.
 ///
-/// The row holds either a vector of cells or a string with a run of attributes beside it, and both
-/// are built by appending, so the figure covers twice the larger of the two.
-pub const CELL_OVERHEAD_BYTES: u64 = 64;
+/// A row holds its cells either as a vector of them or as a string with a run of attributes beside
+/// it, and it changes from one form to the other while it is being written, so both can be alive
+/// at once. Each is built by appending, so each can be holding twice the cells it is using. Beside
+/// the compact form a row keeps an offset for each cell, where its text is not its own record of
+/// where the cells are, and a bit for each cell that is two columns wide. This covers all of that
+/// together; `crates/kr-term/src/grid.rs` asserts it against the library's own types.
+pub const CELL_OVERHEAD_BYTES: u64 = 128;
 
 /// What one cell of one buffer can hold beyond its slot in the row.
 ///
@@ -305,13 +310,16 @@ impl SessionBudget {
                 .saturating_mul(cells)
                 .saturating_mul(cell_content_bytes(cell_bytes)),
             // The primary buffer's array holds the screen and the history; the alternate buffer
-            // keeps no history.
+            // keeps no history. Each row of a screen also allocates for itself, whether or not
+            // anything is on it; what a retained row allocates is the row cache's to carry.
             row_arrays: rows
                 .saturating_add(scrollback_rows as u64)
                 .saturating_add(rows)
-                .saturating_mul(ROW_SLOT_BYTES),
+                .saturating_mul(ROW_SLOT_BYTES)
+                .saturating_add(2u64.saturating_mul(rows).saturating_mul(ROW_STORAGE_BYTES)),
             links: self.limits.link_envelope(),
-            titles: crate::title::MAX_RESIDENT_BYTES,
+            // The session's own titles and stack, and the copy the grid keeps of each title.
+            titles: crate::title::MAX_RESIDENT_BYTES.saturating_add(GRID_TITLE_BYTES),
             alerts: ALERT_LIST_BYTES,
         }
     }

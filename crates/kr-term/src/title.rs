@@ -124,7 +124,7 @@ impl TitleState {
     /// whether it was, because a terminal reading the same bytes would have kept the whole thing
     /// and the two would then disagree about what the window is called.
     pub fn set(&mut self, target: TitleTarget, title: &str) -> bool {
-        let value = truncate(title);
+        let value = truncated(title);
         let truncated = value.len() < title.len();
         match target {
             TitleTarget::Icon => self.current.icon = value,
@@ -234,20 +234,29 @@ impl TitleState {
     /// it at its word could put back more than a session is allowed to hold.
     pub fn restore(&mut self, current: TitleEntry, stack: Vec<SavedTitle>, underflows: u32) {
         self.current = TitleEntry {
-            icon: truncate(&current.icon),
-            window: truncate(&current.window),
+            icon: truncated(&current.icon),
+            window: truncated(&current.window),
         };
-        self.stack = stack;
-        self.stack.truncate(MAX_DEPTH);
-        for entry in &mut self.stack {
-            entry.icon = entry.icon.as_deref().map(truncate);
-            entry.window = entry.window.as_deref().map(truncate);
-        }
+        // Into an array of exactly the entries kept, not the one that arrived: a vector carries
+        // the room it was built with, and a snapshot could have been built with a great deal of it.
+        self.stack = stack
+            .into_iter()
+            .take(MAX_DEPTH)
+            .map(|entry| SavedTitle {
+                icon: entry.icon.as_deref().map(truncated),
+                window: entry.window.as_deref().map(truncated),
+            })
+            .collect();
+        self.stack.shrink_to_fit();
         self.underflows = underflows;
     }
 }
 
-fn truncate(title: &str) -> String {
+/// Cuts a title to what a session holds resident, on a character boundary.
+///
+/// Both owners of a title use this, so the session and the grid hold the same string.
+#[must_use]
+pub fn truncated(title: &str) -> String {
     if title.len() <= MAX_TITLE_BYTES {
         return title.to_owned();
     }

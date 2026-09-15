@@ -917,6 +917,15 @@ impl CanonicalGrid {
             .scroll_up(&(0..rows), 0, seqno, CellAttributes::blank(), bidi);
     }
 
+    /// The title the grid is holding.
+    ///
+    /// The grid keeps its own copy of what an OSC title set, and it is cut to the length a session
+    /// holds before it arrives, so the two owners hold the same string.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        self.terminal.get_title()
+    }
+
     /// The current size.
     #[must_use]
     pub const fn size(&self) -> GridSize {
@@ -940,9 +949,33 @@ impl CanonicalGrid {
         // The rows reflow, so the cell a mark would have joined is no longer where it was.
         self.tail = None;
         self.terminal.resize(to_library_size(size));
-        budget.commit_geometry(footprint);
         self.size = size;
+        self.normalise_storage();
+        budget.commit_geometry(footprint);
         Ok(())
+    }
+
+    /// Brings the screen that is showing back to what its geometry can hold.
+    ///
+    /// Reflowing a narrower screen builds as many rows as the text needs, which can be many times
+    /// the rows the geometry keeps, and it hands back a row of blanks whole rather than cutting it
+    /// to the new width. Neither is undone until something scrolls. So the row count is brought
+    /// back to the screen and its scrollback, and a row still holding more columns than the screen
+    /// has is cut to the columns it has. A row that survived reflow at its old width is blank, so
+    /// cutting it loses nothing: the columns beyond the screen were never going to be shown.
+    ///
+    /// Only the screen that is showing. Reaching into the other one is not something the library
+    /// offers, so it is done again when that one comes back.
+    pub fn normalise_storage(&mut self) {
+        let cols = self.size.cols as usize;
+        let seqno = self.terminal.current_seqno();
+        let screen = self.terminal.screen_mut();
+        screen.for_each_phys_line_mut(|_, line| {
+            if line.len() > cols {
+                line.resize(cols, seqno);
+            }
+        });
+        self.trim_scrollback();
     }
 
     /// Ends the hyperlink the pen is inside, if it is inside one.
@@ -1257,9 +1290,16 @@ impl CanonicalGrid {
                 add_link_object(link, &mut seen, &mut links);
             }
         }
-        let active = self.content_showing(self.terminal.screen(), &mut seen, &mut links);
-        let inactive = self.content_showing(self.terminal.inactive_screen(), &mut seen, &mut links);
-        let content = if self.alternate_active() {
+        let alternate = self.alternate_active();
+        let active =
+            self.content_showing(self.terminal.screen(), !alternate, &mut seen, &mut links);
+        let inactive = self.content_showing(
+            self.terminal.inactive_screen(),
+            alternate,
+            &mut seen,
+            &mut links,
+        );
+        let content = if alternate {
             [inactive, active]
         } else {
             [active, inactive]
@@ -1281,18 +1321,26 @@ impl CanonicalGrid {
         }
     }
 
-    /// What one screen's rows that are showing hold, adding their links to a running total.
+    /// What one screen's rows hold, adding their links to a running total.
     ///
-    /// The rows above the screen are the historical cache's, which has a bound of its own.
+    /// `keeps_history` says whether the rows above the screen belong to the historical cache,
+    /// which has a bound of its own. Only the primary buffer keeps one. The alternate buffer's
+    /// rows are all its own, including any the library is still holding from a taller geometry, so
+    /// treating the oldest of them as somebody else's would leave them in no account at all.
     fn content_showing(
         &self,
         screen: &wezterm_term::screen::Screen,
+        keeps_history: bool,
         seen: &mut BTreeSet<*const Hyperlink>,
         links: &mut u64,
     ) -> u64 {
-        let history = screen
-            .scrollback_rows()
-            .saturating_sub(self.size.rows as usize);
+        let history = if keeps_history {
+            screen
+                .scrollback_rows()
+                .saturating_sub(self.size.rows as usize)
+        } else {
+            0
+        };
         let mut content = 0u64;
         let mut index = 0usize;
         screen.for_each_phys_line(|_, line| {
@@ -1477,6 +1525,32 @@ pub fn link_table_entry_bytes(target: &String) -> u64 {
 /// occupies its slot, and a screen of them is not free.
 pub const ROW_SLOT_BYTES: u64 = 2 * size_of::<wezterm_term::Line>() as u64;
 
+/// What one row allocates for itself before anything is on it.
+///
+/// The compact form a row is usually held in starts with room for eighty bytes of text, and it
+/// keeps two further allocations beside that text: the offsets of its cells, where the text is not
+/// its own record of where they are, and a bit for each cell that is two columns wide. Both are
+/// reached through a pointer, so each costs a header of its own whatever it holds. An empty row is
+/// not free, which is the whole reason to count it.
+pub const ROW_STORAGE_BYTES: u64 =
+    (CLUSTERED_TEXT_CAPACITY + size_of::<Vec<usize>>() + FIXED_BITSET_HEADER_BYTES) as u64;
+
+/// The room the compact form of a row asks for when it is built.
+const CLUSTERED_TEXT_CAPACITY: usize = 80;
+
+/// What the bit-per-cell record of the wide cells costs before its bits.
+///
+/// A vector of blocks and the length beside it, which is what the set is.
+const FIXED_BITSET_HEADER_BYTES: usize = size_of::<Vec<u32>>() + size_of::<usize>();
+
+/// What the grid keeps for the titles it is told about.
+///
+/// The grid holds its own copy of the window title and the icon title. Both are cut to the length
+/// a session holds before they reach it, so this is a figure rather than a measurement: room for
+/// two titles, each at twice what one may hold.
+pub const GRID_TITLE_BYTES: u64 =
+    2 * (STRING_HANDLE_BYTES + 2 * crate::title::MAX_TITLE_BYTES as u64);
+
 /// What a cell's text costs beyond its bytes once it no longer fits inside the cell.
 ///
 /// A cell holds its text in the cell itself while that text is shorter than a machine word and
@@ -1518,15 +1592,23 @@ pub const CELL_ATTRIBUTE_BYTES: u64 = {
     (fields.next_multiple_of(size_of::<usize>())) as u64
 };
 
-// A row is held either as a vector of cells or as a string with a run of attributes beside it, and
-// both are built by appending, so a row can be holding twice the slots it is using. The per-cell
-// figure the budget charges has to cover the larger of the two, doubled.
-const _: () = assert!(CELL_OVERHEAD_BYTES >= 2 * size_of::<wezterm_term::Cell>() as u64);
-const _: () = assert!(
-    CELL_OVERHEAD_BYTES
-        >= 2 * (size_of::<CellAttributes>() + size_of::<u16>()).next_multiple_of(size_of::<usize>())
-            as u64
-);
+// A row is held either as a vector of cells or as a string with a run of attributes beside it,
+// and it changes from one to the other while it is being written, so both can be alive at once.
+// Each is built by appending, so each can be holding twice the slots it is using. Beside the
+// compact form a row keeps one offset per cell, where its text is not its own record of where the
+// cells are, and one bit per cell for the cells that are two columns wide. The per-cell figure the
+// budget charges covers all of that together.
+/// What one cell of a row costs in the storage the library keeps for it.
+///
+/// The vector of cells and the run of attributes beside the text, each at twice the cells it
+/// holds; the offset the compact form records for the cell, at twice the offsets it holds; and the
+/// bit that says whether the cell is two columns wide, charged as a byte.
+const CELL_STORAGE_BYTES: u64 = 2 * size_of::<wezterm_term::Cell>() as u64
+    + 2 * (size_of::<CellAttributes>() + size_of::<u16>()).next_multiple_of(size_of::<usize>())
+        as u64
+    + 2 * size_of::<usize>() as u64
+    + size_of::<u8>() as u64;
+const _: () = assert!(CELL_OVERHEAD_BYTES >= CELL_STORAGE_BYTES);
 
 /// What a hash table with room for `room` entries costs.
 ///
@@ -1559,9 +1641,11 @@ fn attributes_are_allocated(attrs: &CellAttributes) -> bool {
 /// and the header a cell keeps once its text is too big to live inside the cell. Counting the text
 /// alone would report a screen of coloured cells as costing what a screen of plain ones costs.
 fn row_content_bytes(line: &wezterm_term::Line) -> u64 {
-    // The text as the row is holding it rather than as it reads: a row grows its string by
-    // appending, so it can be holding twice what it shows.
-    let mut bytes = 2 * line.as_str().len() as u64;
+    // What the row allocates for itself before anything is on it, and then the text as the row is
+    // holding it rather than as it reads: a row grows its string by appending, so it can be
+    // holding twice what it shows. Nothing here asks a row for the semantic zones it can cache, so
+    // the vector it would cache them in stays empty.
+    let mut bytes = ROW_STORAGE_BYTES + 2 * line.as_str().len() as u64;
     for cell in line.visible_cells() {
         let width = cell.width().max(1);
         if attributes_are_allocated(cell.attrs()) {
