@@ -28,10 +28,11 @@ versions this build links, and the versions the relay and DNS deployments instal
 | `iroh-mainline-address-lookup` | 0.5.0 |
 | `boot-time` | 0.1.3 |
 
-`iroh-dns-server` 1.2.0 is the matching discovery server release. Client, relay and discovery
-compatibility is explicit in the signed release matrix: deploy a backward-compatible network tier
-before a client that needs its new behaviour, and retain the compatible tier for the documented
-installed-client window.
+`iroh-dns-server` 1.2.0 is the matching discovery server release. The relay and discovery hosts run
+`iroh-relay` 1.2.0 and `iroh-dns-server` 1.2.0 on Hetzner. Client, relay and discovery compatibility
+is explicit in the signed release matrix: deploy a backward-compatible network tier before a client
+that needs its new behaviour, and retain the compatible tier for the documented installed-client
+window.
 
 ## Endpoint configuration
 
@@ -169,9 +170,11 @@ enforce it, and the order matters because the first one is what makes the others
   Nothing is *read* before that wait, so no frame is ever acted on before the peer's endpoint
   identity is authenticated. The answer is not certain, though: if the connection's driver finishes
   the handshake before the listener's task accepts the buffered stream, early data arrives marked as
-  ordinary. Closing that window needs an upstream change — the relay-and-transport dependency sets
-  the server's TLS early-data size to its maximum and exposes no way to refuse it — so a host that
-  requires the guarantee absolutely pins a build that sets it to zero.
+  ordinary. Closing that window needs an upstream change: iroh 1.2.0 fixes the server's TLS
+  early-data size at its maximum and exposes no way to refuse it. That fixed value stays as it is
+  and this build does not fork iroh to change it. The residual case is covered by the layer above:
+  the only surface reachable in early data is pairing, and pairing consumes an invitation once, so a
+  replayed early-data frame redeems nothing a second time.
 * **An authorised connection never carries early data.** A handshake stream that arrived as early
   data is refused with `PERMISSION_DENIED` before the proof exchange, and so is a data stream. This
   costs nothing: a KalaReach endpoint keeps no TLS session tickets, so this product's own client
