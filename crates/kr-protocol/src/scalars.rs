@@ -26,7 +26,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// Length of a UUID in bytes.
 pub const UUID_LEN: usize = 16;
@@ -736,7 +736,10 @@ impl fmt::Debug for SecretBytes32 {
 impl Serialize for SecretBytes32 {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
-            serializer.serialize_str(&to_base64url(&self.0))
+            // The base64url rendering is a second copy of the secret. It is cleared as soon as the
+            // serializer has read it, rather than left for the allocator.
+            let text = Zeroizing::new(to_base64url(&self.0));
+            serializer.serialize_str(&text)
         } else {
             serializer.serialize_bytes(&self.0)
         }
@@ -746,16 +749,52 @@ impl Serialize for SecretBytes32 {
 impl<'de> Deserialize<'de> for SecretBytes32 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
-            let text = String::deserialize(deserializer)?;
-            let bytes = from_base64url(&text).map_err(de::Error::custom)?;
+            let text = Zeroizing::new(String::deserialize(deserializer)?);
+            let bytes = Zeroizing::new(from_base64url(&text).map_err(de::Error::custom)?);
             <[u8; 32]>::try_from(bytes.as_slice())
                 .map(Self)
                 .map_err(|_| de::Error::invalid_length(bytes.len(), &"32 bytes"))
         } else {
-            deserializer
-                .deserialize_bytes(FixedBytesVisitor::<32>)
-                .map(Self)
+            deserializer.deserialize_bytes(SecretBytesVisitor)
         }
+    }
+}
+
+/// Reads 32 secret bytes, clearing every buffer it is handed on the way.
+///
+/// [`FixedBytesVisitor`] would do the same work and drop its owned `Vec` uncleared, which for a
+/// secret is a copy nothing else will ever wipe.
+struct SecretBytesVisitor;
+
+impl<'de> Visitor<'de> for SecretBytesVisitor {
+    type Value = SecretBytes32;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a byte string of exactly 32 secret bytes")
+    }
+
+    fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+        <[u8; 32]>::try_from(value)
+            .map(SecretBytes32)
+            .map_err(|_| E::invalid_length(value.len(), &"32 bytes"))
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+        let value = Zeroizing::new(value);
+        self.visit_bytes(&value)
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        let mut out = Zeroizing::new([0u8; 32]);
+        for slot in out.iter_mut() {
+            *slot = sequence
+                .next_element::<u8>()?
+                .ok_or_else(|| de::Error::invalid_length(32, &self))?;
+        }
+        if sequence.next_element::<u8>()?.is_some() {
+            return Err(de::Error::invalid_length(33, &self));
+        }
+        Ok(SecretBytes32(*out))
     }
 }
 

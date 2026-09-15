@@ -247,37 +247,7 @@ impl FileStore {
             });
         }
         let directory = directory.into();
-        if directory.is_symlink() {
-            return Err(CryptoError::SecretStore {
-                message: format!("{} is a symbolic link", directory.display()),
-            });
-        }
-        let existed = directory.exists();
-        std::fs::create_dir_all(&directory).map_err(|error| CryptoError::SecretStore {
-            message: format!("create {}: {error}", directory.display()),
-        })?;
-        // No component of the path may be a link, so the mode this store sets is the mode of the
-        // directory it believes it is writing to.
-        let resolved =
-            std::fs::canonicalize(&directory).map_err(|error| CryptoError::SecretStore {
-                message: format!("resolve {}: {error}", directory.display()),
-            })?;
-        if resolved != directory {
-            return Err(CryptoError::SecretStore {
-                message: format!(
-                    "{} resolves to {}; the fallback store follows no links",
-                    directory.display(),
-                    resolved.display()
-                ),
-            });
-        }
-        if existed {
-            // A directory this store did not create is checked before its mode is changed, so it
-            // never relaxes or tightens something that belongs to another account.
-            check_owner_only(&directory)?;
-        }
-        set_mode(&directory, 0o700)?;
-        check_owner_only(&directory)?;
+        prepare_private_directory(&directory)?;
         Ok(Self { directory })
     }
 
@@ -303,6 +273,8 @@ impl FileStore {
     /// link that appears afterwards would otherwise redirect a write, a read or a deletion out of
     /// the directory whose mode is the only protection there is.
     fn reject_links(&self, path: &Path) -> Result<()> {
+        // A component that does not exist yet is not a link, and `is_symlink` says so, so this
+        // walk works before a scope directory has been created as well as after.
         let mut component = path;
         loop {
             if component == self.directory {
@@ -333,6 +305,9 @@ impl SecretStore for FileStore {
                 message: "a secret path has a parent directory".to_owned(),
             });
         };
+        // Nothing is created until the path is known to be inside the store: a link left where a
+        // scope directory would go must not cause a directory to appear on the other side of it.
+        self.reject_links(&path)?;
         std::fs::create_dir_all(parent).map_err(|error| CryptoError::SecretStore {
             message: format!("create {}: {error}", parent.display()),
         })?;
@@ -417,6 +392,46 @@ pub const FILE_FALLBACK_SUPPORTED: bool = cfg!(all(
         target_os = "android"
     ))
 ));
+
+/// Creates or validates one owner-only directory, without following a link anywhere in its path.
+///
+/// An existing directory is validated before its mode is changed, so this never relaxes or
+/// tightens something that belongs to another account, and the mode it sets is the mode of the
+/// directory it believes it is writing to.
+fn prepare_private_directory(directory: &Path) -> Result<()> {
+    if directory.is_symlink() {
+        return Err(CryptoError::SecretStore {
+            message: format!("{} is a symbolic link", directory.display()),
+        });
+    }
+    if directory.exists() {
+        check_path_is_unresolved(directory)?;
+        check_owner_only(directory)?;
+    }
+    std::fs::create_dir_all(directory).map_err(|error| CryptoError::SecretStore {
+        message: format!("create {}: {error}", directory.display()),
+    })?;
+    check_path_is_unresolved(directory)?;
+    set_mode(directory, 0o700)?;
+    check_owner_only(directory)
+}
+
+/// Rejects a path any component of which is a link.
+fn check_path_is_unresolved(directory: &Path) -> Result<()> {
+    let resolved = std::fs::canonicalize(directory).map_err(|error| CryptoError::SecretStore {
+        message: format!("resolve {}: {error}", directory.display()),
+    })?;
+    if resolved != directory {
+        return Err(CryptoError::SecretStore {
+            message: format!(
+                "{} resolves to {}; the store follows no links",
+                directory.display(),
+                resolved.display()
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Distinguishes the staging files of concurrent writers in one process.
 static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -610,11 +625,21 @@ impl Drop for MemoryStore {
 ///
 /// Returns [`CryptoError::SecretStore`] when neither store can be opened.
 pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStore> {
+    if !FILE_FALLBACK_SUPPORTED {
+        // There is no fallback on this platform, so there is nothing to record and nothing to
+        // choose between: the protected store is the only store.
+        let store = PlatformStore::open(service)?;
+        return Ok(OpenedStore {
+            store: Box::new(store),
+            kind: StoreKind::Platform,
+            migration_available: false,
+        });
+    }
     let platform = PlatformStore::open(service);
     let recorded = match read_recorded_kind(fallback_directory)? {
         Some(kind) => Some(kind),
         // No record, but secrets are already in the fallback: that is where they stay.
-        None if fallback_holds_secrets(fallback_directory) => Some(StoreKind::FileFallback),
+        None if fallback_holds_secrets(fallback_directory)? => Some(StoreKind::FileFallback),
         None => None,
     };
     match recorded {
@@ -727,11 +752,7 @@ fn read_recorded_kind(directory: &Path) -> Result<Option<StoreKind>> {
 /// leaves either the old record or the new one, a link cannot redirect it, and two processes
 /// racing to record cannot interleave.
 fn record_kind(directory: &Path, kind: StoreKind) -> Result<()> {
-    std::fs::create_dir_all(directory).map_err(|error| CryptoError::SecretStore {
-        message: format!("create {}: {error}", directory.display()),
-    })?;
-    set_mode(directory, 0o700)?;
-    check_owner_only(directory)?;
+    prepare_private_directory(directory)?;
 
     let text = match kind {
         StoreKind::Platform => "platform",
@@ -760,13 +781,27 @@ fn record_kind(directory: &Path, kind: StoreKind) -> Result<()> {
 ///
 /// A host that predates the marker, or whose marker was removed, still has its secrets where it
 /// left them. That is what decides the backend when there is no record to read.
-fn fallback_holds_secrets(directory: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return false;
+fn fallback_holds_secrets(directory: &Path) -> Result<bool> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        // A directory that cannot be read might hold this host's secrets. Reporting "no secrets"
+        // would send the host to another backend and start it from nothing.
+        Err(error) => {
+            return Err(CryptoError::SecretStore {
+                message: format!("read {}: {error}", directory.display()),
+            });
+        }
     };
-    entries
-        .flatten()
-        .any(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+    for entry in entries {
+        let entry = entry.map_err(|error| CryptoError::SecretStore {
+            message: format!("read an entry of {}: {error}", directory.display()),
+        })?;
+        if !entry.file_name().to_string_lossy().starts_with('.') {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The store a host opened and what it means.

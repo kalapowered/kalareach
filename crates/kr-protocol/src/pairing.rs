@@ -1415,8 +1415,13 @@ impl QrPayload {
     /// # Errors
     ///
     /// Returns a CBOR error when the payload cannot be represented in KR-CBOR-1.
-    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, CborError> {
-        Ok(kr_cbor::encode(&self.to_canonical_value()?))
+    pub fn to_canonical_bytes(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, CborError> {
+        // A direct payload's bytes carry the invitation secret, so the caller is handed a buffer
+        // that clears itself, and the value tree this built is cleared before it is dropped.
+        let mut value = self.to_canonical_value()?;
+        let bytes = kr_cbor::encode(&value);
+        zeroise_value(&mut value);
+        Ok(zeroize::Zeroizing::new(bytes))
     }
 
     /// Decodes and validates a payload from canonical bytes.
@@ -1433,8 +1438,10 @@ impl QrPayload {
                 limit: MAX_QR_PAYLOAD_LEN,
             });
         }
-        let value = kr_cbor::decode(bytes, &kr_cbor::Limits::DEFAULT)?;
-        Self::from_canonical_value(&value)
+        let mut value = kr_cbor::decode(bytes, &kr_cbor::Limits::DEFAULT)?;
+        let payload = Self::from_canonical_value(&value);
+        zeroise_value(&mut value);
+        payload
     }
 
     /// Reads a payload from a decoded canonical value.
@@ -1529,8 +1536,10 @@ impl QrPayload {
     /// # Errors
     ///
     /// Returns a CBOR error when the payload cannot be represented in KR-CBOR-1.
-    pub fn to_text(&self) -> Result<String, CborError> {
-        Ok(crate::scalars::to_base64url(&self.to_canonical_bytes()?))
+    pub fn to_text(&self) -> Result<zeroize::Zeroizing<String>, CborError> {
+        Ok(zeroize::Zeroizing::new(crate::scalars::to_base64url(
+            &self.to_canonical_bytes()?,
+        )))
     }
 
     /// Reads a payload from its unpadded base64url text.
@@ -1549,13 +1558,36 @@ impl QrPayload {
                 limit,
             });
         }
-        let bytes = crate::scalars::from_base64url(text).map_err(|reason| {
-            QrPayloadError::InvalidMember {
-                member: "payload text",
-                reason,
-            }
-        })?;
+        let bytes =
+            zeroize::Zeroizing::new(crate::scalars::from_base64url(text).map_err(|reason| {
+                QrPayloadError::InvalidMember {
+                    member: "payload text",
+                    reason,
+                }
+            })?);
         Self::from_canonical_bytes(&bytes)
+    }
+}
+
+/// Clears every byte string and text buffer in a value tree that carried a secret.
+///
+/// `CanonicalValue` is an ordinary wire value and does not clear itself, so a tree built around a
+/// pairing secret is wiped here before it is dropped.
+fn zeroise_value(value: &mut CanonicalValue) {
+    use zeroize::Zeroize as _;
+
+    match value {
+        CanonicalValue::Bytes(bytes) => bytes.zeroize(),
+        CanonicalValue::Text(text) => text.zeroize(),
+        CanonicalValue::Array(items) => items.iter_mut().for_each(zeroise_value),
+        CanonicalValue::Map(map) => {
+            let mut entries = std::mem::take(map).into_entries();
+            for (key, value) in &mut entries {
+                key.zeroize();
+                zeroise_value(value);
+            }
+        }
+        CanonicalValue::Null | CanonicalValue::Bool(_) | CanonicalValue::Integer(_) => {}
     }
 }
 
