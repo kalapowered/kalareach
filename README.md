@@ -12,6 +12,10 @@ A Cargo workspace and a pnpm workspace share one tree.
 | --- | --- |
 | `crates/kr-cbor` | The KR-CBOR-1 codec: canonical encoding, strict decoding, digests and signing input |
 | `crates/kr-protocol` | Wire types, the method authority table, error codes and the JSON Schema generator |
+| `crates/kr-ipc` | Local typed-frame inter-process communication: directories, peer credentials, descriptors and identity proofs |
+| `crates/kr-worker` | The session worker: pseudo-terminal, lifecycle, attachments, input lease and receipt journal |
+| `crates/kr-controller` | The control daemon: registry, create admission, worker supervision and the local service |
+| `crates/kr-cli` | The `kr` command line and its terminal restoration guard |
 | `crates/kr-crypto` | Cryptography: a narrow libsodium wrapper, purpose-separated device keys, encrypted objects and secret storage |
 | `crates/kr-pairing` | Pairing: the short-code SPAKE2 and direct QR state machines, their budgets and their transcripts |
 | `crates/kr-transport` | Transport: iroh endpoints, the connection handshake, stream kinds, actor envelopes, action windows and dispatch leases |
@@ -22,6 +26,8 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `packages/plugin-sdk` | The generated plugin SDK package: types, the package contract as data and the published WIT file |
 | `fixtures/` | Cross-language conformance vectors and fixture packages that both languages test against |
 | `docs/protocol/` | The protocol reference |
+| `docs/host/` | The host: process topology, directories, descriptors, supervision, journals and recovery |
+| `docs/cli/` | The command line: commands, exit codes and the `--json` shapes |
 | `docs/crypto/` | The cryptography reference |
 | `docs/pairing/` | The pairing reference |
 | `docs/transport/` | The transport reference |
@@ -82,6 +88,8 @@ cargo run -p kr-term --bin kr-term-fixtures
 
 [docs/protocol/README.md](docs/protocol/README.md) explains the encoding, the framing, the
 envelopes, the receipt contract, the error codes and the authority table.
+[docs/host/README.md](docs/host/README.md) explains how the host runs sessions, and
+[docs/cli/README.md](docs/cli/README.md) is the command-line reference.
 [docs/crypto/README.md](docs/crypto/README.md) explains the cryptographic boundary: the key
 purposes, the domains, the encrypted object formats and the secret store.
 [docs/pairing/README.md](docs/pairing/README.md) explains the two pairing flows, their budgets, the
