@@ -911,7 +911,24 @@ const MAX_NOTIFICATION_PAYLOAD: usize = 2048;
 
 /// Writes one notification payload, in as many messages as its length needs.
 fn notification_payload(out: &mut Vec<u8>, common: &str, kind: &str, text: &str, last: bool) {
-    let mut chunks = text.as_bytes().chunks(MAX_NOTIFICATION_PAYLOAD).peekable();
+    // Split on character boundaries, not on bytes: half of a character is not a shorter payload,
+    // it is an invalid one, and a terminal decoding it shows a replacement where the application
+    // wrote a letter.
+    let mut pieces: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = MAX_NOTIFICATION_PAYLOAD.min(rest.len());
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            // One character wider than the whole payload bound. Nothing can carry it.
+            break;
+        }
+        pieces.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    let mut chunks = pieces.into_iter().peekable();
     if chunks.peek().is_none() {
         let mut only = common.as_bytes().to_vec();
         only.extend_from_slice(format!(":p={kind}:d={};", u8::from(last)).as_bytes());
@@ -922,7 +939,7 @@ fn notification_payload(out: &mut Vec<u8>, common: &str, kind: &str, text: &str,
         let done = last && chunks.peek().is_none();
         let mut payload = common.as_bytes().to_vec();
         payload.extend_from_slice(format!(":p={kind}:d={};", u8::from(done)).as_bytes());
-        payload.extend_from_slice(chunk);
+        payload.extend_from_slice(chunk.as_bytes());
         osc_into(out, b"99", &payload);
     }
 }

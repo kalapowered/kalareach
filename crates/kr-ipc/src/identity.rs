@@ -167,22 +167,39 @@ mod platform {
 
     const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 
+    /// Where each field of `/proc/<pid>/stat` sits *after* the command name.
+    ///
+    /// The line begins `pid (comm) state ...` and the command name can contain spaces and brackets,
+    /// so the fields are counted from after its closing bracket. Counting from there, index 0 is
+    /// the state, which is field 3 of the line: a field's index here is its number minus three.
+    const STAT_PROCESS_GROUP: usize = 2;
+    /// The controlling terminal's device number, field 7 of the line.
+    const STAT_TERMINAL: usize = 4;
+
     pub(super) fn processes_on_terminal(terminal: u32) -> Result<Vec<u32>> {
-        // Field seven of the statistics line is the controlling terminal's device number.
-        stat_field_matches(6, terminal, "controlling terminal")
+        stat_field_matches(STAT_TERMINAL, terminal, "controlling terminal")
     }
 
     pub(super) fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
         let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|error| {
             unavailable("controlling terminal", format!("/proc/{pid}/stat: {error}"))
         })?;
-        Ok(stat_field(&text, 6))
+        // Zero is no controlling terminal at all, which is not a terminal to enumerate by.
+        Ok(stat_field(&text, STAT_TERMINAL).filter(|terminal| *terminal != 0))
     }
 
     /// Returns one numeric field of a `/proc/<pid>/stat` line, counted after the command name.
+    ///
+    /// The kernel prints `tty_nr` as a signed value, so it is read as one and kept as the same bit
+    /// pattern: comparing two of these is comparing the kernel's own device number with itself.
     fn stat_field(text: &str, index: usize) -> Option<u32> {
         let tail = text.rfind(')').map(|end| &text[end + 1..])?;
-        tail.split_whitespace().nth(index)?.parse::<u32>().ok()
+        let field = tail.split_whitespace().nth(index)?;
+        field
+            .parse::<i32>()
+            .ok()
+            .map(i32::cast_unsigned)
+            .or_else(|| field.parse::<u32>().ok())
     }
 
     fn stat_field_matches(index: usize, wanted: u32, what: &'static str) -> Result<Vec<u32>> {
@@ -219,21 +236,10 @@ mod platform {
             else {
                 continue;
             };
-            // Field five of the statistics line is the process group. The command name before it
-            // can contain spaces and brackets, so the fields are counted from after its closing
-            // bracket rather than from the start of the line.
             let Ok(line) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
                 continue;
             };
-            let Some(rest) = line.rsplit_once(')').map(|(_, rest)| rest) else {
-                continue;
-            };
-            if rest
-                .split_whitespace()
-                .nth(3)
-                .and_then(|field| field.parse::<u32>().ok())
-                == Some(group)
-            {
+            if stat_field(&line, STAT_PROCESS_GROUP) == Some(group) {
                 members.push(pid);
             }
         }

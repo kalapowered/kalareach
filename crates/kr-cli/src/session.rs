@@ -104,15 +104,21 @@ pub async fn run(
     // claim from whoever holds it.
     let attachment: Attachment =
         crate::attach::attach(&mut client, descriptor, dimensions, true, !options.no_probe).await?;
-    if options.take_geometry {
+    // The transfer's own answer is what the loop starts from. Starting from the attach result
+    // instead would leave it quoting an epoch the transfer has already moved, and believing
+    // somebody else still owns the size it has just taken.
+    let geometry = if options.take_geometry {
         crate::attach::take_geometry(
             &mut client,
             descriptor,
             attachment.attachment_id,
             attachment.result.geometry.epoch,
         )
-        .await?;
-    }
+        .await?
+        .geometry
+    } else {
+        attachment.result.geometry.clone()
+    };
     let epoch = attachment
         .lease
         .as_ref()
@@ -161,9 +167,8 @@ pub async fn run(
         Attached {
             attachment_id: attachment.attachment_id,
             lease_epoch: epoch,
-            geometry_epoch: attachment.result.geometry.epoch,
-            owns_geometry: attachment.result.geometry.owner.as_ref()
-                == Some(&attachment.attachment_id),
+            geometry_epoch: geometry.epoch,
+            owns_geometry: geometry.owner.as_ref() == Some(&attachment.attachment_id),
         },
         &mut input,
         &handle,
@@ -196,8 +201,10 @@ struct Attached {
 enum Outstanding {
     /// Input at this sequence number.
     Input(u64),
-    /// A size change this terminal reported.
-    Geometry,
+    /// A size change this terminal made as the size owner.
+    Resize,
+    /// A size this terminal reported while somebody else owns the size.
+    Viewport,
     /// A fresh screen this terminal asked for after a resynchronisation marker.
     Resubscribe,
 }
@@ -270,14 +277,27 @@ async fn drive(
                             // A size report is a report, not an insistence. Another attachment may
                             // own the size, and the answer then says so; the terminal is shown that
                             // size rather than taking it, and the attachment carries on.
-                            (Outstanding::Geometry, outcome) => {
+                            (Outstanding::Resize, outcome) => {
                                 if let kr_protocol::envelope::Outcome::Ok(value) = outcome
                                     && let Ok(result) = value
                                         .to_typed::<kr_protocol::attachment::GeometryResult>()
                                 {
                                     geometry_epoch = result.geometry.epoch;
-                                    owns_geometry = result.geometry.owner.as_ref()
-                                        == Some(&attachment_id);
+                                    owns_geometry =
+                                        result.geometry.owner.as_ref() == Some(&attachment_id);
+                                }
+                            }
+                            // A viewport report answers with the presentation it produced as well
+                            // as the geometry, so it has its own result type and its own decoder.
+                            (Outstanding::Viewport, outcome) => {
+                                if let kr_protocol::envelope::Outcome::Ok(value) = outcome
+                                    && let Ok(result) = value.to_typed::<
+                                        kr_protocol::attachment::AttachmentViewportResult,
+                                    >()
+                                {
+                                    geometry_epoch = result.geometry.epoch;
+                                    owns_geometry =
+                                        result.geometry.owner.as_ref() == Some(&attachment_id);
                                 }
                             }
                             (
@@ -327,26 +347,44 @@ async fn drive(
                 next_request += 1;
                 // The owner moves the session's size; anybody else reports the size it is
                 // looking at, which changes which presentation it is served and nothing else.
-                let sent = if owns_geometry {
+                let (sent, what) = if owns_geometry {
                     let params = kr_protocol::attachment::TerminalResizeParams {
                         attachment_id,
                         dimensions,
                         expected_geometry_epoch: geometry_epoch,
                     };
-                    send_geometry(client, descriptor, request_id, Method::TerminalResize, &params)
-                        .await
+                    (
+                        send_geometry(
+                            client,
+                            descriptor,
+                            request_id,
+                            Method::TerminalResize,
+                            &params,
+                        )
+                        .await,
+                        Outstanding::Resize,
+                    )
                 } else {
                     let params = kr_protocol::attachment::AttachmentViewportParams {
                         attachment_id,
                         dimensions,
                     };
-                    send_geometry(client, descriptor, request_id, Method::AttachmentViewport, &params)
-                        .await
+                    (
+                        send_geometry(
+                            client,
+                            descriptor,
+                            request_id,
+                            Method::AttachmentViewport,
+                            &params,
+                        )
+                        .await,
+                        Outstanding::Viewport,
+                    )
                 };
                 if !sent {
                     return AttachOutcome::Disconnected;
                 }
-                outstanding.insert(request_id, Outstanding::Geometry);
+                outstanding.insert(request_id, what);
             }
             bytes = input.recv() => {
                 let Some(bytes) = bytes else {

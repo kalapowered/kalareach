@@ -498,10 +498,7 @@ impl Session {
         if held {
             let framing = self.framer.close_for_takeover();
             if let Some(terminator) = framing.terminator {
-                self.pending_input.push(InputBatch {
-                    origin: InputOrigin::Host,
-                    bytes: terminator.to_vec(),
-                });
+                self.queue_host(terminator.to_vec());
             }
         }
         self.note_lease_holder();
@@ -643,10 +640,7 @@ impl Session {
             // application inside a bracketed paste that nothing was ever going to end, which is
             // exactly the failure closing it exists to prevent.
             let _ = previous_epoch;
-            self.pending_input.push(InputBatch {
-                origin: InputOrigin::Host,
-                bytes: terminator.to_vec(),
-            });
+            self.queue_host(terminator.to_vec());
         }
         self.note_lease_holder();
         self.pump_replies();
@@ -675,10 +669,7 @@ impl Session {
         // keystroke would arrive inside somebody else's paste.
         let framing = self.framer.close_for_takeover();
         if let Some(terminator) = framing.terminator {
-            self.pending_input.push(InputBatch {
-                origin: InputOrigin::Host,
-                bytes: terminator.to_vec(),
-            });
+            self.queue_host(terminator.to_vec());
         }
         self.note_lease_holder();
         self.pump_replies();
@@ -917,20 +908,28 @@ impl Session {
     /// reads the answers stops being answered here rather than growing this queue without limit.
     fn queue_replies(&mut self, replies: Vec<Vec<u8>>) {
         for reply in replies {
-            if self
+            let held = self
                 .host_reply_bytes
-                .load(std::sync::atomic::Ordering::Acquire)
-                >= MAX_PENDING_REPLY_BYTES
-            {
+                .load(std::sync::atomic::Ordering::Acquire);
+            if held.saturating_add(reply.len()) > MAX_PENDING_REPLY_BYTES {
                 return;
             }
-            self.host_reply_bytes
-                .fetch_add(reply.len(), std::sync::atomic::Ordering::AcqRel);
-            self.pending_input.push(InputBatch {
-                origin: InputOrigin::Host,
-                bytes: reply,
-            });
+            self.queue_host(reply);
         }
+    }
+
+    /// Queues bytes the host owes the application, counted against what the writer has not sent.
+    ///
+    /// Every batch of this origin goes through here, because the writer releases every batch of
+    /// this origin: charging only some of them would make the count drift down until it stopped
+    /// bounding anything.
+    fn queue_host(&mut self, bytes: Vec<u8>) {
+        self.host_reply_bytes
+            .fetch_add(bytes.len(), std::sync::atomic::Ordering::AcqRel);
+        self.pending_input.push(InputBatch {
+            origin: InputOrigin::Host,
+            bytes,
+        });
     }
 
     /// Returns the counter the writer releases as it writes the host's own answers.
@@ -1181,10 +1180,7 @@ impl Session {
                 }
                 let framing = self.framer.close_for_takeover();
                 if let Some(terminator) = framing.terminator {
-                    self.pending_input.push(InputBatch {
-                        origin: InputOrigin::Host,
-                        bytes: terminator.to_vec(),
-                    });
+                    self.queue_host(terminator.to_vec());
                 }
                 self.note_lease_holder();
                 CloseAcceptance {

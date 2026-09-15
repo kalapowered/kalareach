@@ -45,15 +45,17 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// like somebody else's.
 ///
 /// The order matters, and the keyboard protocols are why. Each buffer has its own Kitty stack and
-/// its own `modifyOtherKeys` level, so they are cleared in the buffer the session was using, then
-/// again in the one it is left in. Leaving a terminal in an enhanced key encoding is the failure a
+/// its own `modifyOtherKeys` level, and a terminal can be left in either buffer, so both are
+/// visited: cleared where the terminal is, then in the alternate buffer, then in the primary one it
+/// is left in. Entering and leaving the alternate buffer through `?1049` saves and restores the
+/// cursor, so the primary screen is not disturbed by the visit. Leaving a terminal in an enhanced key encoding is the failure a
 /// person cannot work around: their shell receives escape sequences where it expects characters.
 ///
 /// What this cannot do is *restore* what the outer terminal had before the attachment: termios is
 /// the only state the guard is given, and the outer terminal's own keyboard negotiation is not
 /// something a host can read without asking. Clearing is therefore the answer, and a person whose
 /// own shell had negotiated an enhanced encoding has it cleared rather than restored.
-pub const RESET_SEQUENCES: &[u8] = b"\x1b[<65535u\x1b[>4;0m\x1b[?1049l\x1b[<65535u\x1b[>4;0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
+pub const RESET_SEQUENCES: &[u8] = b"\x1b[<65535u\x1b[>4;0m\x1b[?1049h\x1b[<65535u\x1b[>4;0m\x1b[?1049l\x1b[<65535u\x1b[>4;0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
 
 /// The size of a terminal, in character cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

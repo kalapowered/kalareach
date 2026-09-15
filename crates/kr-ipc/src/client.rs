@@ -351,8 +351,9 @@ impl LocalClient {
     /// Passes a mutation the host admitted to the component that owns its subject.
     ///
     /// The mutation travels unchanged, because it is what the payload digest covers and what the
-    /// caller will retry with. Only the actor the host verified and what remains of the deadline it
-    /// accepted travel beside it.
+    /// caller will retry with. Only the actor the host verified and the deadline it accepted travel
+    /// beside it, and the deadline is on the machine's own continuous clock so both processes read
+    /// the same instant.
     ///
     /// # Errors
     ///
@@ -361,7 +362,7 @@ impl LocalClient {
         &mut self,
         mutation: &MutationRequest,
         actor: &kr_protocol::actor::ActorEnvelope,
-        accepted_ttl_ms: kr_protocol::scalars::DurationMs,
+        accepted_deadline_boot_ms: kr_protocol::scalars::U64,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         let request_id = mutation.request_id;
         self.writer
@@ -369,10 +370,7 @@ impl LocalClient {
                 kr_protocol::local::ForwardedMutation {
                     mutation: mutation.clone(),
                     actor: actor.clone(),
-                    accepted_ttl_ms,
-                    // Stamped as the frame is written, so the receiver can subtract what the
-                    // journey cost rather than starting the lifetime again on arrival.
-                    forwarded_at_ms: crate::now_ms(),
+                    accepted_deadline_boot_ms,
                 },
             )))
             .await?;

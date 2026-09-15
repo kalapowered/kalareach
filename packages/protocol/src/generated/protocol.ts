@@ -2251,27 +2251,14 @@ export interface GenerationAccepted {
  * worker a different action from the one the caller asked for.
  *
  * What travels beside it is what the worker cannot establish for itself: which principal the host
- * verified, and how long the deadline the host accepted still has to run. The worker performs the
- * action under both.
+ * verified, and the deadline the host accepted. The worker performs the action under both.
  */
 export interface ForwardedMutation {
   /**
-   * What remains of the deadline the host derived at first admission, at the moment it forwarded
-   * this mutation.
-   *
-   * A *duration*, not an instant, because the two processes measure on their own suspend-aware
-   * continuous clocks and neither clock's origin means anything to the other. A wall-clock
-   * instant would be comparable and would also be steppable, which is the one property a
-   * deadline cannot have. The receiving process anchors this on its own clock when it reads the
-   * frame and subtracts whatever the transit cost, so nothing downstream lengthens it: the
-   * subject applies its own bounds on top.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
-  accepted_ttl_ms: string
+  accepted_deadline_boot_ms: string
   actor: ActorEnvelope1
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  forwarded_at_ms: string
   mutation: MutationRequest1
 }
 /**

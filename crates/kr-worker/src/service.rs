@@ -299,6 +299,7 @@ impl WorkerService {
                     for attachment_id in state.attachments.drain(..) {
                         let mut session = self.runtime.session();
                         let _ = session.detach(attachment_id);
+                        self.runtime.flush_locked(&mut session);
                     }
                     continue;
                 }
@@ -372,6 +373,16 @@ impl WorkerService {
                 // same connection.
                 if let Some(previous) = state.delivery.take() {
                     previous.abort();
+                }
+                // And a withdrawn connection starts none at all. The check is made again once the
+                // task exists, because a withdrawal can land between the two.
+                if !self
+                    .admitted
+                    .lock()
+                    .expect("the connection registry is not poisoned")
+                    .contains_key(&connection_id)
+                {
+                    continue;
                 }
                 let sender = Arc::clone(&writer);
                 let stream_id = state.stream_id.clone();
@@ -515,6 +526,8 @@ impl WorkerService {
         for attachment_id in state.attachments.drain(..) {
             let mut session = self.runtime.session();
             let _ = session.detach(attachment_id);
+            // The fence this detach moved, and any terminator it produced, reach the writer here.
+            self.runtime.flush_locked(&mut session);
         }
         // A window that outlived its connection could first-admit a request through a connection
         // that no longer exists, so the connection's windows go when it does, and so does its
@@ -1042,21 +1055,22 @@ impl WorkerService {
                 ),
             );
         }
-        // Anchored here, before the dispatch barrier and before anything else this worker waits
-        // for. What the journey cost is subtracted rather than given back: the two processes stamp
-        // their own wall clocks, and only a positive difference is taken off, so a clock stepped in
-        // either direction can shorten this and neither can lengthen it. The daemon's remaining
-        // lifetime is bounded by the protocol maximum on the way in as well, so a daemon cannot
-        // hand a worker a longer life than the protocol allows.
-        let granted = forwarded
-            .accepted_ttl_ms
+        // The daemon's deadline is on the machine's own continuous clock, which this worker reads
+        // too, so what is left of it is a subtraction rather than a guess: the journey cost
+        // whatever it cost, and the deadline does not restart on arrival. It is then anchored on
+        // this worker's own clock, here, before the dispatch barrier and before anything else this
+        // worker waits for, and bounded by the protocol maximum so a daemon cannot hand a worker a
+        // longer life than the protocol allows.
+        let remaining = forwarded
+            .accepted_deadline_boot_ms
             .get()
+            .saturating_sub(kr_ipc::clock::boot_elapsed_ms())
             .min(kr_protocol::limits::MAX_MUTATION_TTL.get());
-        let transit = kr_ipc::now_ms()
-            .get()
-            .saturating_sub(forwarded.forwarded_at_ms.get());
-        let remaining = std::time::Duration::from_millis(granted.saturating_sub(transit));
-        let Some(deadline) = self.clock.now().checked_add(remaining) else {
+        let Some(deadline) = self
+            .clock
+            .now()
+            .checked_add(std::time::Duration::from_millis(remaining))
+        else {
             return failure(
                 forwarded.mutation.request_id,
                 &ProtocolError::new(
@@ -1164,7 +1178,7 @@ impl WorkerService {
         let admitted = match session.journal_mut() {
             Some(journal) => match journal.accept(&submission) {
                 Ok(_) => true,
-                Err(error) if stopping => {
+                Err(error) if stopping && is_storage_failure(&error) => {
                     session.note_journal_failure(error.to_string());
                     false
                 }
@@ -1797,6 +1811,11 @@ impl WorkerService {
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(params)?;
                 let result = session.detach(params.attachment_id)?;
+                // Detaching releases the lease, which moves the input fence, and can produce the
+                // terminator of a paste the attachment had open. Both are published here: a fence
+                // that stayed in the session would let bytes already handed to the writer reach the
+                // application after the attachment that sent them had gone.
+                self.runtime.flush_locked(session);
                 state
                     .attachments
                     .retain(|attachment| *attachment != params.attachment_id);
@@ -2185,6 +2204,18 @@ async fn send_screen(
         }
     }
     true
+}
+
+/// Returns whether a failure is the journal being unable to do its job.
+///
+/// Section 7's exception for an authorised stop is about storage: a full disk, a read-only tree, a
+/// database that will not open. It is not about anything the journal *decided*, and a reused action
+/// identifier is a decision.
+const fn is_storage_failure(error: &WorkerError) -> bool {
+    matches!(
+        error,
+        WorkerError::Storage { .. } | WorkerError::JournalUnavailable { .. }
+    )
 }
 
 /// Returns the sentence a caller is given when a window cannot first-admit a request.

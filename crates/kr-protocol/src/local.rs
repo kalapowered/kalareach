@@ -13,7 +13,7 @@ use crate::envelope::MutationRequest;
 use crate::hello::{ActionWindow, ProtocolVersion, ReceiveLimits};
 use crate::identity::BootIdentity;
 use crate::ids::{BuildId, CapabilityId, ConnectionId, EnvironmentId};
-use crate::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs, U64};
+use crate::scalars::{CanonicalSet, Nullable, U64};
 
 /// Which host process a local endpoint belongs to.
 #[derive(
@@ -126,8 +126,7 @@ pub struct LocalHelloAck {
 /// worker a different action from the one the caller asked for.
 ///
 /// What travels beside it is what the worker cannot establish for itself: which principal the host
-/// verified, and how long the deadline the host accepted still has to run. The worker performs the
-/// action under both.
+/// verified, and the deadline the host accepted. The worker performs the action under both.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardedMutation {
@@ -135,23 +134,19 @@ pub struct ForwardedMutation {
     pub mutation: MutationRequest,
     /// The actor the host verified, with the ingress it arrived on.
     pub actor: crate::actor::ActorEnvelope,
-    /// What remains of the deadline the host derived at first admission, at the moment it forwarded
-    /// this mutation.
+    /// The deadline the host derived at first admission, on the machine's own continuous clock.
     ///
-    /// A *duration*, not an instant, because the two processes measure on their own suspend-aware
-    /// continuous clocks and neither clock's origin means anything to the other. A wall-clock
-    /// instant would be comparable and would also be steppable, which is the one property a
-    /// deadline cannot have. The receiving process anchors this on its own clock when it reads the
-    /// frame and subtracts whatever the transit cost, so nothing downstream lengthens it: the
-    /// subject applies its own bounds on top.
-    pub accepted_ttl_ms: DurationMs,
-    /// The sender's wall clock as it wrote this frame, so the receiver can subtract the transit.
+    /// Milliseconds since this boot, from the clock the operating system keeps for the whole
+    /// machine: `CLOCK_BOOTTIME` on Linux and `CLOCK_MONOTONIC` on Apple. Two processes on one boot
+    /// read the same clock, so this is the same instant on both sides of the socket and nothing has
+    /// to guess at what the journey cost.
     ///
-    /// It is a *correction*, not an authority: the receiver subtracts what the two wall clocks
-    /// differ by and never adds, so a clock step in either direction can only shorten the deadline.
-    /// A wall clock stepped forward spends more of the lifetime, and one stepped backwards spends
-    /// none of it. Neither can give an action time it did not have.
-    pub forwarded_at_ms: TimestampMs,
+    /// Not a wall-clock time and not a process-anchored one. A wall-clock instant would be
+    /// comparable and also steppable, which is the one property a deadline cannot have; a
+    /// process-anchored instant is not comparable at all. A deadline from a previous boot reads as
+    /// long past, because the clock restarts at the boot, so a stale one expires rather than being
+    /// honoured.
+    pub accepted_deadline_boot_ms: U64,
 }
 
 #[cfg(test)]

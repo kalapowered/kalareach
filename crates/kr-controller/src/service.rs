@@ -33,7 +33,7 @@ use kr_protocol::ids::{
 };
 use kr_protocol::local::{LocalClientKind, LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs, U64};
+use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 use kr_protocol::session::{
     ClosureReason, ClosureRecord, SessionCloseParams, SessionCloseResult, SessionCreateParams,
     SessionCreateResult, SessionListParams, SessionListResult, SessionReadParams,
@@ -1594,29 +1594,29 @@ impl Controller {
             .await
             .insert(reservation.reservation_id, PendingCreate { ready: sender });
 
-        // The deadline the host accepted, checked at the moment the launch runs rather than when
-        // the request arrived. Reserving takes a lock and a durable write, and an action whose life
-        // ran out while it waited for those does not then start a shell.
-        if self.clock.now() >= accepted.deadline {
-            let mut registry = self.registry.lock().await;
-            registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
-            drop(registry);
-            self.pending
-                .lock()
-                .await
-                .remove(&reservation.reservation_id);
-            return Err(ControllerError::WindowExpired {
-                detail: "the deadline this create was admitted under passed before it could start"
-                    .to_owned(),
-            });
-        }
         // The reservation moves to `spawned` before anything is started. A worker can reach the
         // rendezvous socket the instant the service manager starts it, which is sooner than the
-        // launcher returns, and a reservation still recorded as merely reserved would fence its
-        // own worker.
+        // launcher returns, and a reservation still recorded as merely reserved would fence its own
+        // worker. The deadline the host accepted is checked in the same critical section, and after
+        // the durable write rather than before it: everything from there to the launch runs without
+        // waiting for anything, so an action whose life ran out queueing for this lock does not go
+        // on to start a shell.
         {
             let mut registry = self.registry.lock().await;
             registry.set_phase(reservation.reservation_id, LaunchPhase::Spawned)?;
+            if self.clock.now() >= accepted.deadline {
+                registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                drop(registry);
+                self.pending
+                    .lock()
+                    .await
+                    .remove(&reservation.reservation_id);
+                return Err(ControllerError::WindowExpired {
+                    detail:
+                        "the deadline this create was admitted under passed before it could start"
+                            .to_owned(),
+                });
+            }
         }
         let launch = WorkerLaunch {
             reservation_id: reservation.reservation_id,
@@ -1781,15 +1781,21 @@ impl Controller {
             // runs rather than one that was valid when the request arrived. Its own remaining time
             // then bounds the deadline the worker is given.
             let lease_deadline = self.dispatch_lease(params.session_id, actor).await?;
-            // What the worker is told is what remains of the accepted deadline at the instant it is
-            // forwarded, measured on this daemon's continuous clock. A deadline already spent is
-            // never forwarded as though it had time left.
-            let accepted_ttl_ms = remaining_ttl(&*self.clock, accepted.deadline, lease_deadline)
-                .ok_or_else(|| ControllerError::WindowExpired {
-                    detail: "the deadline this action was admitted under has passed".to_owned(),
-                })?;
+            // What the worker is told is the accepted deadline itself, on the machine's own
+            // continuous clock: the same clock the worker reads, so the deadline does not restart
+            // on arrival and nothing has to guess at what the journey cost. A deadline already
+            // spent is never forwarded as though it had time left.
+            let accepted_deadline_boot_ms =
+                remaining_deadline(&*self.clock, accepted.deadline, lease_deadline).ok_or_else(
+                    || ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under has passed".to_owned(),
+                    },
+                )?;
             let client = held.as_mut().expect("the connection is open");
-            match client.forward(mutation, actor, accepted_ttl_ms).await {
+            match client
+                .forward(mutation, actor, accepted_deadline_boot_ms)
+                .await
+            {
                 Ok(result) => result,
                 Err(error) => {
                     *held = None;
@@ -2144,24 +2150,26 @@ fn closed_summary(
     }
 }
 
-/// Returns what remains of an accepted deadline, bounded by any lease that also applies.
+/// Returns the accepted deadline on the machine's own continuous clock, bounded by any lease.
 ///
-/// `None` means the deadline has already passed, which is never forwarded as though it had time
-/// left. The reading is taken at the moment of the call, so nothing between admission and dispatch
-/// can lengthen it.
-fn remaining_ttl(
+/// The daemon decides deadlines on its own anchored clock, which nothing outside this process can
+/// read. This converts one of those into the shared reading a worker can compare against: what is
+/// left of it, from the machine's clock as it stands now. `None` means the deadline has already
+/// passed, which is never forwarded as though it had time left.
+fn remaining_deadline(
     clock: &dyn ContinuousClock,
     accepted: kr_transport::clock::ContinuousInstant,
     lease: Option<kr_transport::clock::ContinuousInstant>,
-) -> Option<DurationMs> {
+) -> Option<U64> {
     let now = clock.now();
     let deadline = lease.map_or(accepted, |lease| lease.min(accepted));
     let remaining = deadline.saturating_duration_since(now);
     if remaining.is_zero() {
         return None;
     }
-    Some(DurationMs::new(
-        u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+    let remaining = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+    Some(U64::new(
+        kr_ipc::clock::boot_elapsed_ms().saturating_add(remaining),
     ))
 }
 
