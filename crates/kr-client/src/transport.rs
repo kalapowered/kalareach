@@ -102,6 +102,7 @@ impl NetworkTransport {
         host_record: &PairedPeer,
         send_limits: SendLimits,
     ) -> Result<Self> {
+        send_limits.check()?;
         let connection = endpoint
             .connect(host_addr, ALPN)
             .await

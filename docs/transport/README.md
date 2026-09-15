@@ -264,10 +264,27 @@ could receive less than the kind allows is held to what it declared, in both dir
 frame whose declared length exceeds either bound is refused before its payload is allocated, and an
 outgoing one is refused before anything is written.
 
-There is a floor under that negotiation. A peer has to declare a send queue of at least 2 MiB +
-4 KiB, which is one complete attachment frame plus the control reserve; below it no transfer could
-ever be admitted. A `hello` that negotiates less is refused with `INVALID_ARGUMENT` naming the
-value, on both sides, rather than producing a connection that silently cannot carry an attachment.
+There is a floor under that negotiation, and `hello` is where it is applied. Both sides check the
+negotiated result and refuse the connection with `INVALID_ARGUMENT` naming the field, rather than
+establishing one that silently cannot carry something the protocol defines:
+
+| Negotiated field | Floor |
+| --- | --- |
+| `max_control_frame_len` | 1 MiB |
+| `max_input_frame_len` | 64 KiB |
+| `max_attachment_frame_len` | 1 MiB + 4 KiB |
+| `max_outstanding_mutations` | 1 |
+| `max_send_queue_bytes` | 2 MiB + 4 KiB |
+
+The frame bounds are floors rather than preferences: a peer may declare more, which is how a later
+version raises them, but a peer that declares less has agreed to a connection on which a message
+this version defines could never be sent. The send queue is the one genuine policy knob — a peer
+with less memory may declare less — and its floor is one complete attachment frame beside the
+control reserve. Below that, the full chunk size sections 14 and 23 require could never be admitted,
+even though smaller frames still would be.
+
+The same check is applied to a host's or client's own configured budget when it starts, so limits
+that could never carry a transfer are refused at registration rather than at the first attachment.
 
 ### Revocation
 

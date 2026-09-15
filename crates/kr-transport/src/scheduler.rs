@@ -41,7 +41,9 @@ use std::sync::{Arc, Mutex};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::ReceiveLimits;
-use kr_protocol::limits::{MAX_ATTACHMENT_FRAME_LEN, MAX_SEND_QUEUE_BYTES};
+use kr_protocol::limits::{
+    MAX_ATTACHMENT_FRAME_LEN, MAX_CONTROL_FRAME_LEN, MAX_INPUT_FRAME_LEN, MAX_SEND_QUEUE_BYTES,
+};
 
 use crate::error::{Result, TransportError};
 
@@ -65,20 +67,54 @@ pub const MIN_SEND_QUEUE_BYTES: usize = MAX_ATTACHMENT_FRAME_LEN + CONTROL_RESER
 
 /// Checks that negotiated limits leave a connection able to carry what the protocol requires.
 ///
+/// The frame bounds are floors, not preferences. A peer may declare more than this version uses,
+/// which is how a later version raises them, but a peer that declares less has agreed to a
+/// connection on which some message the protocol requires could never be sent. The send queue is
+/// the one genuine policy knob: a peer with less memory may declare less, as long as one complete
+/// attachment frame still fits beside the control reserve.
+///
 /// # Errors
 ///
-/// Returns [`ErrorCode::InvalidArgument`] when the negotiated send queue is below
-/// [`MIN_SEND_QUEUE_BYTES`]. The remedy is a configuration change on whichever side declared it.
+/// Returns [`ErrorCode::InvalidArgument`] naming the field and the value that is too small. The
+/// remedy is a configuration change on whichever side declared it.
 pub fn check_negotiated(limits: ReceiveLimits) -> core::result::Result<(), ProtocolError> {
-    let declared = usize::try_from(limits.max_send_queue_bytes.get()).unwrap_or(usize::MAX);
-    if declared < MIN_SEND_QUEUE_BYTES {
-        return Err(ProtocolError::new(
-            ErrorCode::InvalidArgument,
-            format!(
-                "a send queue of {declared} bytes cannot carry an attachment frame and the control \
-                 reserve; at least {MIN_SEND_QUEUE_BYTES} bytes are needed"
-            ),
-        ));
+    let floors: [(&str, u64, u64); 5] = [
+        (
+            "max_control_frame_len",
+            limits.max_control_frame_len.get(),
+            MAX_CONTROL_FRAME_LEN as u64,
+        ),
+        (
+            "max_input_frame_len",
+            limits.max_input_frame_len.get(),
+            MAX_INPUT_FRAME_LEN as u64,
+        ),
+        (
+            "max_attachment_frame_len",
+            limits.max_attachment_frame_len.get(),
+            MAX_ATTACHMENT_FRAME_LEN as u64,
+        ),
+        (
+            "max_outstanding_mutations",
+            limits.max_outstanding_mutations.get(),
+            1,
+        ),
+        (
+            "max_send_queue_bytes",
+            limits.max_send_queue_bytes.get(),
+            MIN_SEND_QUEUE_BYTES as u64,
+        ),
+    ];
+    for (field, declared, floor) in floors {
+        if declared < floor {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "a negotiated {field} of {declared} is below the {floor} this protocol version \
+                     requires; some message it defines could never be sent"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -156,9 +192,10 @@ impl Default for SendLimits {
 impl SendLimits {
     /// Returns the largest complete frame a write of `class` can ever be admitted with.
     ///
-    /// A message is encoded under this as well as under its stream kind's bound, so a frame the
-    /// budget would refuse however idle the connection is refused as too large instead of being
-    /// built first and rejected after.
+    /// A message is encoded under this as well as under its stream kind's bound, so a message that
+    /// this connection could never queue is refused as too large before it costs a write. The
+    /// encoder still builds the encoding before it measures it; what this saves is the write and
+    /// the charge, not the work.
     #[must_use]
     pub const fn ceiling_for(&self, class: StreamClass) -> usize {
         match class {
@@ -169,11 +206,57 @@ impl SendLimits {
         }
     }
 
+    /// Checks that these limits leave a connection able to carry what the protocol requires.
+    ///
+    /// Configuration is checked where it is supplied rather than where it is used, so a host or
+    /// client that was given limits it could not work within says so at startup instead of
+    /// refusing a transfer later. [`StreamBudget::new`] itself stays unchecked, which is what lets
+    /// a test drive admission with a few hundred bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Configuration`] naming the field that is too small.
+    pub fn check(&self) -> Result<()> {
+        let refuse = |reason: String| {
+            Err(TransportError::Configuration {
+                what: format!("{self:?}"),
+                kind: "send budget",
+                reason,
+            })
+        };
+        if self.max_bulk_streams == 0 {
+            return refuse("max_bulk_streams is zero, so no transfer could ever open".to_owned());
+        }
+        if self.max_queued_bytes < MIN_SEND_QUEUE_BYTES {
+            return refuse(format!(
+                "max_queued_bytes is {}, below the {MIN_SEND_QUEUE_BYTES} an attachment frame and \
+                 the control reserve need",
+                self.max_queued_bytes
+            ));
+        }
+        if self.max_bulk_queued_bytes < MAX_ATTACHMENT_FRAME_LEN {
+            return refuse(format!(
+                "max_bulk_queued_bytes is {}, below the {MAX_ATTACHMENT_FRAME_LEN} one complete \
+                 attachment frame needs",
+                self.max_bulk_queued_bytes
+            ));
+        }
+        if self.max_bulk_queued_bytes + CONTROL_RESERVE_BYTES > self.max_queued_bytes {
+            return refuse(format!(
+                "max_bulk_queued_bytes is {}, which leaves less than the {CONTROL_RESERVE_BYTES} \
+                 control reserve inside a {} budget",
+                self.max_bulk_queued_bytes, self.max_queued_bytes
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns these limits held to what the connection negotiated.
     ///
     /// A peer that declared a smaller send queue than the protocol default is held to what it
     /// declared, and bulk traffic is held to that less the control reserve, so a transfer never
-    /// fills the budget that peer said it would accept.
+    /// fills the budget that peer said it would accept. Limits that passed [`SendLimits::check`]
+    /// still pass it after this, because the declaration passed [`check_negotiated`] first.
     #[must_use]
     pub fn negotiated(self, limits: ReceiveLimits) -> Self {
         let declared = usize::try_from(limits.max_send_queue_bytes.get())
@@ -502,6 +585,9 @@ mod tests {
             workable.ceiling_for(StreamClass::Bulk) >= MAX_ATTACHMENT_FRAME_LEN,
             "the floor is exactly what one complete attachment frame needs"
         );
+        workable
+            .check()
+            .expect("negotiating down to the floor leaves workable limits");
         check_negotiated(ReceiveLimits {
             max_send_queue_bytes: U64::new(MIN_SEND_QUEUE_BYTES as u64),
             ..ReceiveLimits::default()
@@ -514,6 +600,91 @@ mod tests {
         .expect_err("a queue one byte below the floor is refused");
         assert_eq!(error.code, ErrorCode::InvalidArgument);
         check_negotiated(ReceiveLimits::default()).expect("the protocol default is workable");
+    }
+
+    #[test]
+    fn a_frame_bound_below_what_this_version_defines_is_refused() {
+        use kr_protocol::scalars::U64;
+        // Every frame bound is a floor: a peer may declare more, which is how a later version
+        // raises them, but never less than a message this version defines.
+        for (name, smaller) in [
+            (
+                "control",
+                ReceiveLimits {
+                    max_control_frame_len: U64::new(MAX_CONTROL_FRAME_LEN as u64 - 1),
+                    ..ReceiveLimits::default()
+                },
+            ),
+            (
+                "input",
+                ReceiveLimits {
+                    max_input_frame_len: U64::new(4),
+                    ..ReceiveLimits::default()
+                },
+            ),
+            (
+                "attachment",
+                ReceiveLimits {
+                    max_attachment_frame_len: U64::new(MAX_ATTACHMENT_FRAME_LEN as u64 - 1),
+                    ..ReceiveLimits::default()
+                },
+            ),
+            (
+                "mutations",
+                ReceiveLimits {
+                    max_outstanding_mutations: U64::new(0),
+                    ..ReceiveLimits::default()
+                },
+            ),
+        ] {
+            let error = check_negotiated(smaller)
+                .expect_err("a bound below what this version defines is refused");
+            assert_eq!(error.code, ErrorCode::InvalidArgument, "the {name} bound");
+        }
+    }
+
+    #[test]
+    fn local_limits_that_could_never_carry_a_transfer_are_refused() {
+        let default = SendLimits::default();
+        default.check().expect("the defaults are workable");
+        assert!(
+            SendLimits {
+                max_bulk_streams: 0,
+                ..default
+            }
+            .check()
+            .is_err(),
+            "no bulk stream means no transfer"
+        );
+        assert!(
+            SendLimits {
+                max_queued_bytes: MIN_SEND_QUEUE_BYTES - 1,
+                max_bulk_queued_bytes: MAX_ATTACHMENT_FRAME_LEN,
+                ..default
+            }
+            .check()
+            .is_err(),
+            "a budget below the floor could never carry a transfer"
+        );
+        assert!(
+            SendLimits {
+                max_bulk_queued_bytes: MAX_ATTACHMENT_FRAME_LEN - 1,
+                ..default
+            }
+            .check()
+            .is_err(),
+            "a bulk ceiling below one attachment frame could never carry a chunk"
+        );
+        assert!(
+            SendLimits {
+                max_queued_bytes: 2 * 1024 * 1024,
+                max_bulk_queued_bytes: 2 * 1024 * 1024,
+                ..default
+            }
+            .check()
+            .is_err(),
+            "a bulk ceiling equal to the budget leaves nothing for control"
+        );
     }
 
     #[test]

@@ -385,6 +385,7 @@ pub async fn register_with_clock<H: HostHandler>(
     handler: Arc<H>,
     clock: Arc<dyn ContinuousClock>,
 ) -> Result<NetworkListener> {
+    config.send_limits.check()?;
     let endpoint = bind_listener(&config.endpoint, transport_key).await?;
     let windows = Arc::new(ActionWindowIssuer::new(
         Arc::clone(&clock),
