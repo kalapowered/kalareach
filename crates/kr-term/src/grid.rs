@@ -902,13 +902,17 @@ impl CanonicalGrid {
         let mut remaining = total;
         let mut dropped = 0usize;
         let mut index = 0usize;
+        // The links are not wanted here, only the size, so they are counted into a total nothing
+        // reads.
+        let mut seen = BTreeSet::new();
+        let mut links = 0u64;
         screen.for_each_phys_line(|_, line| {
             let oldest = index < history;
             index += 1;
             if !oldest || remaining <= limit {
                 return;
             }
-            remaining = remaining.saturating_sub(history_row_bytes(line));
+            remaining = remaining.saturating_sub(history_row_bytes(line, &mut seen, &mut links));
             dropped += 1;
         });
         history.saturating_sub(dropped)
@@ -1413,13 +1417,12 @@ impl CanonicalGrid {
         screen.for_each_phys_line(|_, line| {
             let showing = index >= retained;
             index += 1;
-            // Every link object once, wherever the row it is on sits. A row that scrolls off takes
-            // no object with it and gives none up.
-            add_row_links(line, seen, links);
+            // Every link object once, wherever the row it is on sits: a row that scrolls off takes
+            // no object with it and gives none up, so both measurements read them the same way.
             if showing {
-                content = content.saturating_add(row_content_bytes(line));
+                content = content.saturating_add(row_content_bytes(line, seen, links));
             } else {
-                *history = history.saturating_add(history_row_bytes(line));
+                *history = history.saturating_add(history_row_bytes(line, seen, links));
             }
         });
         content
@@ -1448,11 +1451,15 @@ impl CanonicalGrid {
         let first = history.saturating_sub(rows);
         let mut bytes = 0u64;
         let mut index = 0usize;
+        // The links are not wanted here, only the size: they are charged to the session's one
+        // hyperlink envelope wherever they are, and a row joining the cache moves none of them.
+        let mut seen = BTreeSet::new();
+        let mut links = 0u64;
         screen.for_each_phys_line(|_, line| {
             let counted = index >= first && index < history;
             index += 1;
             if counted {
-                bytes = bytes.saturating_add(history_row_bytes(line));
+                bytes = bytes.saturating_add(history_row_bytes(line, &mut seen, &mut links));
             }
         });
         bytes
@@ -1473,11 +1480,14 @@ impl CanonicalGrid {
             .saturating_sub(self.size.rows as usize);
         let mut bytes = 0u64;
         let mut index = 0usize;
+        // The links are not wanted here, only the size.
+        let mut seen = BTreeSet::new();
+        let mut links = 0u64;
         screen.for_each_phys_line(|_, line| {
             let counted = index < history;
             index += 1;
             if counted {
-                bytes = bytes.saturating_add(history_row_bytes(line));
+                bytes = bytes.saturating_add(history_row_bytes(line, &mut seen, &mut links));
             }
         });
         bytes
@@ -1491,35 +1501,21 @@ impl CanonicalGrid {
 /// admitted, scrollback slots included, so charging it again would count it twice. And the
 /// hyperlink objects on it are charged to the session's one hyperlink envelope wherever they are,
 /// so that a row scrolling off the screen moves no charge from one account to another.
-fn history_row_bytes(line: &wezterm_term::Line) -> u64 {
-    let cells = line.len() as u64;
-    row_content_bytes(line).saturating_add(cells.saturating_mul(CELL_OVERHEAD_BYTES))
-}
-
-/// Adds the link objects of one row that `seen` has not already counted.
-///
-/// A cell inside a hyperlink holds a reference to the whole link, and a row of them costs far more
-/// than its text. Each distinct link object is counted once: the cells of one link share it, and
-/// two links that happen to have the same target do not share anything.
-fn add_row_links(
+fn history_row_bytes(
     line: &wezterm_term::Line,
     seen: &mut BTreeSet<*const Hyperlink>,
-    bytes: &mut u64,
-) {
-    if !line.has_hyperlink() {
-        return;
-    }
-    // Every distinct object, not every run of them: one link can be opened once and used in cells
-    // that are not next to each other, and charging it again each time would report a row as
-    // costing a thousand times what it does.
-    for cell in line.visible_cells() {
-        if let Some(link) = cell.attrs().hyperlink() {
-            add_link_object(link, seen, bytes);
-        }
-    }
+    links: &mut u64,
+) -> u64 {
+    let cells = line.len() as u64;
+    row_content_bytes(line, seen, links).saturating_add(cells.saturating_mul(CELL_OVERHEAD_BYTES))
 }
 
 /// Adds one link object, if it has not been counted already.
+///
+/// A cell inside a hyperlink holds a reference to the whole link, and a row of them costs far more
+/// than its text. Each distinct object is counted once and no more: the cells of one link share
+/// it, one link can be used in cells that are not next to each other and on rows that are not next
+/// to each other, and two links that happen to have the same target share nothing.
 fn add_link_object(link: &Arc<Hyperlink>, seen: &mut BTreeSet<*const Hyperlink>, bytes: &mut u64) {
     if seen.insert(Arc::as_ptr(link)) {
         *bytes = bytes.saturating_add(link_object_bytes(link));
@@ -1703,7 +1699,11 @@ fn attributes_are_allocated(attrs: &CellAttributes) -> bool {
 /// The text as it is encoded, the allocation each cell that needs one keeps for its attributes,
 /// and the header a cell keeps once its text is too big to live inside the cell. Counting the text
 /// alone would report a screen of coloured cells as costing what a screen of plain ones costs.
-fn row_content_bytes(line: &wezterm_term::Line) -> u64 {
+fn row_content_bytes(
+    line: &wezterm_term::Line,
+    seen: &mut BTreeSet<*const Hyperlink>,
+    links: &mut u64,
+) -> u64 {
     // What the row allocates for itself before anything is on it, and then the text as the row is
     // holding it rather than as it reads: a row grows its string by appending, so it can be
     // holding twice what it shows. Nothing here asks a row for the semantic zones it can cache, so
@@ -1718,6 +1718,13 @@ fn row_content_bytes(line: &wezterm_term::Line) -> u64 {
         }
         if cell_text_is_on_the_heap(cell.str(), width) {
             bytes = bytes.saturating_add(CELL_TEXT_HEAP_BYTES);
+        }
+        // The links are read from the same cells, in the same walk. A row carries a flag saying
+        // whether any of its cells is inside a link, and it is the row's flag rather than the
+        // cells', so a row built from cells that hold links does not have it set. Reading the
+        // cells is the answer that cannot be wrong.
+        if let Some(link) = cell.attrs().hyperlink() {
+            add_link_object(link, seen, links);
         }
     }
     bytes

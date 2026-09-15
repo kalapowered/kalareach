@@ -1747,11 +1747,12 @@ fn text_for_an_admitted_screen_is_never_refused() {
     })
     .expect("engine");
     // The worst case a cell can reach: true colour, so the cell keeps an allocation of its own,
-    // and a cluster long enough to reach the per-cell content bound, so its text is on the heap.
-    let mut cell = String::from("e");
-    for _ in 0..24 {
+    // and a cluster at the per-cell content bound, so its text is on the heap.
+    let mut cell = String::from("\u{e9}");
+    while cell.len() + 2 <= kr_term::grid::GridConfig::DEFAULT.cell_bytes {
         cell.push('\u{301}');
     }
+    assert_eq!(cell.len(), kr_term::grid::GridConfig::DEFAULT.cell_bytes);
     let mut input = String::from("\x1b[38;2;10;20;30m");
     for _ in 0..(size.cols * size.rows) {
         input.push_str(&cell);
@@ -1834,40 +1835,51 @@ fn the_row_arrays_are_reserved_with_their_scrollback() {
     assert!(engine.budget().reserved().row_arrays > 0);
 }
 
-/// A title is applied inside room the geometry already reserved, and the stack is charged for the
-/// room it grew to rather than for the entries left on it.
+/// A title is applied inside room the geometry already reserved, the stack is charged for the room
+/// it is holding, and popping an entry gives that room back.
 #[test]
-fn the_title_stack_is_charged_for_the_room_it_grew_to() {
-    let mut engine = engine();
+fn the_title_stack_is_charged_for_the_room_it_holds() {
+    let mut pushed = engine();
     let long = "t".repeat(kr_term::title::MAX_TITLE_BYTES);
     let mut input = String::new();
     for _ in 0..kr_term::title::MAX_DEPTH {
         input.push_str(&format!("\x1b]0;{long}\x07\x1b[22t"));
     }
-    engine.feed(input.as_bytes(), 0);
-    engine.quiesce(0);
-    let full = engine.budget().usage().titles;
+    pushed.feed(input.as_bytes(), 0);
+    pushed.quiesce(0);
+    let full = pushed.budget().usage().titles;
     assert!(full > 0, "the titles and the stack are resident state");
     assert!(
-        full <= engine.budget().reserved().titles,
+        full <= pushed.budget().reserved().titles,
         "a full stack of the longest titles measured {full} against a reservation of {}",
-        engine.budget().reserved().titles
+        pushed.budget().reserved().titles
+    );
+    let slots = kr_term::title::MAX_DEPTH as u64 * size_of::<kr_term::title::SavedTitle>() as u64;
+    assert!(
+        full >= slots + 2 * kr_term::title::MAX_DEPTH as u64 * long.len() as u64,
+        "the stack is charged for the entries it is holding as well as for the room they sit in"
     );
 
-    // Popping every entry leaves the array it grew to, so the charge does not fall back to nothing.
     let mut popping = String::new();
     for _ in 0..kr_term::title::MAX_DEPTH {
         popping.push_str("\x1b[23t");
     }
-    engine.feed(popping.as_bytes(), 0);
-    engine.quiesce(0);
-    assert_eq!(engine.budget().excess(), 0);
-    let slots = kr_term::title::MAX_DEPTH as u64 * size_of::<kr_term::title::SavedTitle>() as u64;
+    pushed.feed(popping.as_bytes(), 0);
+    pushed.quiesce(0);
+    assert_eq!(pushed.budget().excess(), 0);
+    // The room the stack gave back is the room its entries took, and nothing more: the titles the
+    // entries held are gone with them, and the array is no bigger than it needs to be.
+    let mut fresh = engine();
+    fresh.feed(format!("\x1b]0;{long}\x07").as_bytes(), 0);
+    fresh.quiesce(0);
+    assert_eq!(
+        pushed.budget().usage().titles,
+        fresh.budget().usage().titles,
+        "an emptied stack keeps no more than one that was never pushed"
+    );
     assert!(
-        engine.budget().usage().titles >= slots,
-        "the stack still holds the room for {} entries it grew to; the measurement says {}",
-        kr_term::title::MAX_DEPTH,
-        engine.budget().usage().titles
+        pushed.budget().usage().titles < full,
+        "the entries the stack held are gone with it"
     );
 }
 
@@ -2004,6 +2016,9 @@ fn a_screen_of_known_cells_measures_what_those_cells_cost() {
     for _ in 0..(size.cols * size.rows) {
         input.push_str(cell);
     }
+    // Both buffers, because the reservation covers both.
+    engine.feed(input.as_bytes(), 0);
+    engine.feed(b"\x1b[?1049h", 0);
     engine.feed(input.as_bytes(), 0);
     engine.quiesce(0);
 
@@ -2014,16 +2029,17 @@ fn a_screen_of_known_cells_measures_what_those_cells_cost() {
                 + kr_term::grid::CELL_ATTRIBUTE_BYTES
                 + kr_term::grid::CELL_TEXT_HEAP_BYTES);
     assert_eq!(
-        engine.grid().buffer_bytes().content[0],
-        expected,
-        "what each row allocates for itself, the text at twice what it holds, the attribute \
-         allocation of every cell, and the header each cell's text keeps on the heap"
+        engine.grid().buffer_bytes().content,
+        [expected, expected],
+        "in both buffers: what each row allocates for itself, the text at twice what it holds, \
+         the attribute allocation of every cell, and the header each cell's text keeps on the heap"
     );
-    assert_eq!(engine.budget().usage().screen_content[0], expected);
+    assert_eq!(engine.budget().usage().screen_content, [expected, expected]);
     assert!(
-        expected <= engine.budget().reserved().cell_content,
-        "a full screen of the most expensive cell there is fits what its geometry reserved"
+        2 * expected <= engine.budget().reserved().cell_content,
+        "two full screens of the most expensive cell there is fit what the geometry reserved"
     );
+    assert_eq!(engine.budget().excess(), 0);
 }
 
 /// A resize while the alternate buffer is showing still moves rows into the primary buffer's
@@ -2230,6 +2246,36 @@ fn a_row_scrolling_off_moves_no_hyperlink_charge() {
         engine.budget().usage().links,
         on_screen,
         "the objects are where they were; only the rows moved"
+    );
+    assert_eq!(engine.budget().excess(), 0);
+}
+
+/// A row rebuilt at a narrower width keeps the hyperlinks its cells hold. The library records on
+/// the row whether any of its cells is inside a link, and a row built from cells does not carry
+/// that record, so the measurement reads the cells rather than the record.
+#[test]
+fn a_rebuilt_row_still_shows_the_links_its_cells_hold() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(4, 2),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // Four spaces inside a link: a row that is whitespace and holds a link object all the same.
+    engine.feed(
+        b"\x1b]8;;https://example.invalid/blank\x1b\\    \x1b]8;;\x1b\\",
+        0,
+    );
+    engine.feed(b"\x1b[2;1H", 0);
+    engine.quiesce(0);
+    let before = engine.budget().usage().links;
+    assert!(before > 0, "the link the row holds is resident state");
+
+    engine.resize(GridSize::new(2, 2), 0).expect("admitted");
+    engine.quiesce(0);
+    assert_eq!(
+        engine.budget().usage().links,
+        before,
+        "the row was rebuilt at the new width and its link is still held by its cells"
     );
     assert_eq!(engine.budget().excess(), 0);
 }

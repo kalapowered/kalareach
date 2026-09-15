@@ -649,6 +649,14 @@ rows have grown, when the stream goes quiet, when something asks, and every 64 r
 between two of them the charge is what the rows that scrolled off cost, which is taken where they
 arrive.
 
+Enforcing it needs the primary buffer to be the one showing, because the library drops the rows it
+is told to drop as it appends to them and it appends only to the buffer that is showing. Rows can
+only join the retained ones by scrolling off the primary screen, which needs it to be showing, with
+one exception: a resize taken while the alternate buffer shows reflows the primary buffer too and
+can push rows into its history. The measurement follows the primary buffer wherever it is, so the
+figure is right and the pressure is reported at once; the rows come back under the bound when the
+primary buffer is next shown, which is done at the swap itself rather than at the read after it.
+
 Eviction is one pass and lands under the bound rather than converging towards it. The row count to
 keep is read off the rows themselves: the oldest rows are dropped one at a time until the rows still
 ahead cost no more than the bound, and that count becomes the library's scrollback size. Each row is
@@ -701,10 +709,11 @@ report a screen of coloured, linked cells as costing what a screen of plain ones
 
 Every measurement is compared with the reservation made for it. `SessionBudget::excess` is what the
 measurements found beyond their reservations, and `SessionBudget::committed` is the reservation
-plus that, so what a session reports is never below what its measurements found. The excess is
-zero, including on both buffers filled with the most expensive cell there is, and the tests assert
-so where each rule is proved. What the measurements cannot see is the room a shortened vector keeps,
-described above.
+plus that, so what a session reports is never below what its measurements found. At a settled
+geometry the excess is zero, including on both buffers filled with the most expensive cell there
+is, and the tests assert so where each rule is proved. It goes above zero while the buffer that is
+not showing is still holding rows a shorter geometry left it, which lasts until the buffers swap.
+What the measurements cannot see at all is the room a shortened vector keeps, described above.
 
 What the budget records for the row cache is what the rows actually cost, not what they are allowed
 to cost. Recording the bound instead would make a session that is over its cache look exactly like
