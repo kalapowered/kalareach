@@ -287,14 +287,18 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
     pub fn read_intent(&self, actor_id: &ActorId, action_id: ActionId) -> Result<Option<Vec<u8>>> {
-        self.connection
+        // Two absences, one answer: there is no such receipt, or it is one an earlier schema wrote
+        // without recording what the action was. Neither is a failure to read the journal.
+        Ok(self
+            .connection
             .query_row(
                 "SELECT intent FROM receipts WHERE actor_id = ?1 AND action_id = ?2",
                 params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| row.get::<_, Option<Vec<u8>>>(0),
             )
             .optional()
-            .map_err(unavailable)
+            .map_err(unavailable)?
+            .flatten())
     }
 
     /// Cancels an intent that has not been dispatched.

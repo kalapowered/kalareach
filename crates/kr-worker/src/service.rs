@@ -59,6 +59,7 @@ use kr_protocol::worker::GenerationChallenge;
 use crate::error::{Result, WorkerError};
 use crate::output::OutputDelivery;
 use crate::runtime::SessionRuntime;
+use crate::session::Session;
 
 /// How long a local connection's freshness window lasts.
 pub const ACTION_WINDOW_MS: u64 = 5 * 60 * 1000;
@@ -340,7 +341,10 @@ impl WorkerService {
                 Some(self.acknowledge_revision(state, &notice))
             }
             ControlMessage::Request(request) => Some(self.request(state, &request)),
-            ControlMessage::Mutation(mutation) => Some(self.mutation(state, &mutation)),
+            ControlMessage::Mutation(mutation) => {
+                Some(self.mutation(state, &mutation, state.actor_id.clone(), Freshness::Window))
+            }
+            ControlMessage::Forwarded(forwarded) => Some(self.forwarded(state, &forwarded)),
             _ => Some(failure(
                 RequestId::new(0),
                 &ProtocolError::new(
@@ -671,7 +675,13 @@ impl WorkerService {
     ///    the dispatch marker. Durable acceptance does not preserve authority that has since gone.
     /// 4. The dispatch marker is committed **before** the effect. A failure after it is `unknown`,
     ///    never `rejected`: nothing here can prove the effect did not happen.
-    fn mutation(&self, state: &mut ConnectionState, mutation: &MutationRequest) -> ControlMessage {
+    fn mutation(
+        &self,
+        state: &mut ConnectionState,
+        mutation: &MutationRequest,
+        actor_id: ActorId,
+        freshness: Freshness,
+    ) -> ControlMessage {
         if !state.negotiated {
             return failure(mutation.request_id, &not_negotiated());
         }
@@ -684,7 +694,7 @@ impl WorkerService {
         let Some(entry) = Self::entry(method, mutation.method_version) else {
             return failure(mutation.request_id, &unlisted());
         };
-        match self.receipted(state, mutation, method, entry) {
+        match self.receipted(state, mutation, method, entry, actor_id, freshness) {
             Ok(value) => ControlMessage::Response(Response {
                 request_id: mutation.request_id,
                 outcome: Outcome::Ok(value),
@@ -693,12 +703,51 @@ impl WorkerService {
         }
     }
 
+    /// Performs a mutation the control daemon admitted for somebody else.
+    ///
+    /// The mutation arrives unchanged, so its digest is the caller's, and it is recorded under the
+    /// caller's own principal rather than the daemon's: a retry that reaches this worker by either
+    /// route finds the same action. What the daemon vouches for is the part the worker cannot
+    /// check — who the caller was, and the deadline the daemon accepted.
+    fn forwarded(
+        &self,
+        state: &mut ConnectionState,
+        forwarded: &kr_protocol::local::ForwardedMutation,
+    ) -> ControlMessage {
+        if state.client_kind != LocalClientKind::Controller {
+            return failure(
+                forwarded.mutation.request_id,
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "only the control daemon forwards an admitted mutation",
+                ),
+            );
+        }
+        if forwarded.actor.ingress != ActorIngress::LocalIpc {
+            return failure(
+                forwarded.mutation.request_id,
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this endpoint serves the local ingress",
+                ),
+            );
+        }
+        self.mutation(
+            state,
+            &forwarded.mutation,
+            forwarded.actor.actor_id.clone(),
+            Freshness::Vouched(forwarded.accepted_deadline_ms),
+        )
+    }
+
     fn receipted(
         &self,
         state: &mut ConnectionState,
         mutation: &MutationRequest,
         method: Method,
         entry: &'static kr_protocol::authority::MethodEntry,
+        actor_id: ActorId,
+        freshness: Freshness,
     ) -> Result<ParamsValue> {
         // Everything from here to the recorded outcome happens inside the barrier. The authority
         // this request was admitted under cannot change underneath it, and two mutations cannot
@@ -708,7 +757,6 @@ impl WorkerService {
             .lock()
             .expect("the dispatch barrier is not poisoned");
         self.check_authority(state)?;
-        let actor_id = state.actor_id.clone();
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
 
@@ -725,11 +773,25 @@ impl WorkerService {
         // act on, the grant the caller claims, the preconditions the subject must still satisfy
         // and the freshness window that admits a first request.
         self.check_envelope(mutation, entry)?;
-        let window_remaining_ms = self.check_window(state, mutation)?;
+        let accepted_deadline = match freshness {
+            Freshness::Window => {
+                let remaining = self.check_window(state, mutation)?;
+                state.accepted_deadline(mutation.requested_ttl_ms.get(), remaining)
+            }
+            // The daemon derived this deadline at first admission. It is used as it is: the worker
+            // never lengthens a deadline somebody else already shortened.
+            Freshness::Vouched(deadline) => deadline,
+        };
+        // The receipt carries the wall-clock deadline, because that is what a person and a wire
+        // format read. What the host decides with is the continuous reading, so a wall clock that
+        // moves cannot lengthen or shorten an action's remaining life.
+        let continuous_deadline_ms = kr_ipc::freshness::continuous_ms().saturating_add(
+            accepted_deadline
+                .get()
+                .saturating_sub(kr_ipc::now_ms().get()),
+        );
         let intent = kr_cbor::to_canonical_vec(mutation)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
-        let accepted_deadline =
-            state.accepted_deadline(mutation.requested_ttl_ms.get(), window_remaining_ms);
         let submission = crate::journal::Submission {
             actor_id: actor_id.clone(),
             action_id: mutation.action_id,
@@ -741,54 +803,72 @@ impl WorkerService {
             now_ms: kr_ipc::now_ms(),
         };
 
+        // From here the session is locked and stays locked. Admission, the final revalidation, the
+        // dispatch marker, the effect and the recorded outcome are one serial boundary: nothing
+        // the mutation was validated against — the geometry, the lease, the output cursor, the
+        // lifecycle state — can move between the check and the effect.
+        let mut session = self.runtime.session();
+
         // Storage failure stops an ordinary typed mutation before dispatch. An authorised stop is
-        // the named exception: section 7 requires `session.close` to proceed on current in-memory
-        // authority and report `durability=volatile`.
-        let admitted = {
-            let mut session = self.runtime.session();
-            match session.journal_mut() {
-                Some(journal) => {
-                    journal.accept(&submission)?;
-                    true
-                }
-                None if method == Method::SessionClose => false,
-                None => {
-                    return Err(WorkerError::JournalUnavailable {
-                        detail:
-                            "the session journal is unavailable, so no durable mutation is accepted"
-                                .to_owned(),
-                    });
-                }
+        // the named exception: section 7 requires `session.close` to proceed on the worker's
+        // current in-memory authority and report `durability=volatile`.
+        let admitted = match session.journal_mut() {
+            Some(journal) => {
+                journal.accept(&submission)?;
+                true
+            }
+            None if method == Method::SessionClose => false,
+            None => {
+                return Err(WorkerError::JournalUnavailable {
+                    detail:
+                        "the session journal is unavailable, so no durable mutation is accepted"
+                            .to_owned(),
+                });
             }
         };
 
-        // Revalidate before the marker. Anything that was true at acceptance may not be now.
-        if let Err(error) = self.validate(state, mutation, method) {
-            self.reject(&actor_id, mutation, &error);
-            return Err(error);
-        }
-        // The deadline the host derived is the deadline it keeps. A request whose accepted
-        // lifetime is already spent is rejected rather than dispatched, which is also what makes a
-        // zero requested lifetime mean what it says.
-        if accepted_deadline.get() <= kr_ipc::now_ms().get() {
-            let error = WorkerError::WindowExpired {
-                detail: "the accepted deadline for this action has passed".to_owned(),
-            };
-            self.expire(&actor_id, mutation, &error);
-            return Err(error);
-        }
-        if admitted {
-            let mut session = self.runtime.session();
+        // Revalidate inside the boundary. Anything that was true at acceptance may not be now, and
+        // this is the last moment at which checking it still means something.
+        let revalidated = self
+            .validate(&session, state, mutation, method)
+            .and_then(|()| Self::check_preconditions(&session, mutation))
+            .and_then(|()| {
+                // The deadline the host derived is the deadline it keeps, measured on the
+                // continuous clock so a wall clock that moves cannot extend it. This is also what
+                // makes a zero requested lifetime mean what it says.
+                if continuous_deadline_ms <= kr_ipc::freshness::continuous_ms() {
+                    Err(WorkerError::WindowExpired {
+                        detail: "the accepted deadline for this action has passed".to_owned(),
+                    })
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = revalidated {
             if let Some(journal) = session.journal_mut() {
-                journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())?;
+                let reason = if matches!(error, WorkerError::WindowExpired { .. }) {
+                    kr_protocol::receipt::RejectionReason::Expired
+                } else {
+                    kr_protocol::receipt::RejectionReason::StalePreconditions
+                };
+                let _ = journal.reject(
+                    actor_id,
+                    mutation.action_id,
+                    reason,
+                    Some(error.to_protocol_error()),
+                    kr_ipc::now_ms(),
+                );
             }
+            return Err(error);
+        }
+        if admitted && let Some(journal) = session.journal_mut() {
+            journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())?;
         }
 
-        let outcome = self.apply(state, mutation, method);
+        let outcome = self.apply(&mut session, state, mutation, method);
         let now = kr_ipc::now_ms();
-        let mut session = self.runtime.session();
         match (&outcome, session.journal_mut()) {
-            (Ok(value), Some(journal)) => {
+            (Ok((value, _)), Some(journal)) => {
                 // The result, the receipt revision and the event record are one commit. A crash
                 // between them would leave a receipt that claims an outcome beside a result no
                 // reader can retrieve.
@@ -816,7 +896,18 @@ impl WorkerService {
             }
             (_, None) => {}
         }
-        outcome
+        drop(session);
+
+        // The boundary is over. What the mutation left behind happens now: input reaches the
+        // terminal, and a close that was admitted waits for its acceptance to be written before
+        // anything is signalled.
+        let (value, after) = outcome?;
+        match after {
+            AfterEffect::None => {}
+            AfterEffect::Input(pending) => self.runtime.send_input(pending),
+            AfterEffect::Close(gate) => state.close_gate = Some(gate),
+        }
+        Ok(value)
     }
 
     /// Returns the answer a retained action is owed, when this caller has one.
@@ -860,32 +951,6 @@ impl WorkerService {
             receipt,
         })
         .map(Some)
-    }
-
-    fn expire(&self, actor_id: &ActorId, mutation: &MutationRequest, error: &WorkerError) {
-        let mut session = self.runtime.session();
-        if let Some(journal) = session.journal_mut() {
-            let _ = journal.reject(
-                actor_id.clone(),
-                mutation.action_id,
-                kr_protocol::receipt::RejectionReason::Expired,
-                Some(error.to_protocol_error()),
-                kr_ipc::now_ms(),
-            );
-        }
-    }
-
-    fn reject(&self, actor_id: &ActorId, mutation: &MutationRequest, error: &WorkerError) {
-        let mut session = self.runtime.session();
-        if let Some(journal) = session.journal_mut() {
-            let _ = journal.reject(
-                actor_id.clone(),
-                mutation.action_id,
-                kr_protocol::receipt::RejectionReason::AdmissionFailed,
-                Some(error.to_protocol_error()),
-                kr_ipc::now_ms(),
-            );
-        }
     }
 
     /// Checks the mutation envelope before anything durable happens.
@@ -957,7 +1022,7 @@ impl WorkerService {
                     .to_owned(),
             ));
         }
-        self.check_preconditions(mutation)
+        Ok(())
     }
 
     /// Checks the subject preconditions the mutation requires.
@@ -965,9 +1030,8 @@ impl WorkerService {
     /// `expected` is a closed map of the subject facts the caller believes. Anything it names that
     /// is no longer true refuses the mutation before it is admitted, so a client acting on a stale
     /// screen cannot resize, take input or close on facts that have moved.
-    fn check_preconditions(&self, mutation: &MutationRequest) -> Result<()> {
+    fn check_preconditions(session: &Session, mutation: &MutationRequest) -> Result<()> {
         let expected = MutationPreconditions::parse(&mutation.expected)?;
-        let session = self.runtime.session();
         if let Some(state) = expected.session_state
             && state != session.state()
         {
@@ -996,7 +1060,6 @@ impl WorkerService {
                 detail: format!("the output cursor is {}", session.output_cursor()),
             });
         }
-        drop(session);
         Ok(())
     }
 
@@ -1021,6 +1084,7 @@ impl WorkerService {
     /// Checks a mutation's target, authority and preconditions without acting on it.
     fn validate(
         &self,
+        session: &Session,
         state: &ConnectionState,
         mutation: &MutationRequest,
         method: Method,
@@ -1028,7 +1092,7 @@ impl WorkerService {
         match method {
             Method::SessionAttach => {
                 let params: SessionAttachParams = parse(&mutation.params)?;
-                self.check_session(params.session_id)
+                Self::check_session(session, params.session_id)
             }
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(&mutation.params)?;
@@ -1036,42 +1100,54 @@ impl WorkerService {
             }
             Method::SessionClose => {
                 let params: kr_protocol::session::SessionCloseParams = parse(&mutation.params)?;
-                self.check_session(params.session_id)
+                Self::check_session(session, params.session_id)
             }
             Method::AttachmentConfigure => {
                 let params: AttachmentConfigureParams = parse(&mutation.params)?;
                 Self::check_attachment(state, params.attachment_id)?;
                 if params.claim_geometry {
-                    self.check_capability(params.attachment_id, AttachmentCapability::Geometry)?;
+                    Self::check_capability(
+                        session,
+                        params.attachment_id,
+                        AttachmentCapability::Geometry,
+                    )?;
                 }
                 Ok(())
             }
             Method::TerminalResize => {
                 let params: TerminalResizeParams = parse(&mutation.params)?;
                 Self::check_attachment(state, params.attachment_id)?;
-                self.check_capability(params.attachment_id, AttachmentCapability::Geometry)
+                Self::check_capability(
+                    session,
+                    params.attachment_id,
+                    AttachmentCapability::Geometry,
+                )
             }
             Method::TerminalGeometryTransfer => {
                 let params: TerminalGeometryTransferParams = parse(&mutation.params)?;
                 Self::check_attachment(state, params.attachment_id)?;
-                self.check_capability(params.attachment_id, AttachmentCapability::Geometry)
+                Self::check_capability(
+                    session,
+                    params.attachment_id,
+                    AttachmentCapability::Geometry,
+                )
             }
             Method::InputAcquire => {
                 let params: InputAcquireParams = parse(&mutation.params)?;
-                self.check_session(params.session_id)?;
+                Self::check_session(session, params.session_id)?;
                 Self::check_attachment(state, params.attachment_id)?;
-                self.check_capability(params.attachment_id, AttachmentCapability::Input)
+                Self::check_capability(session, params.attachment_id, AttachmentCapability::Input)
             }
             Method::InputRelease => {
                 let params: InputReleaseParams = parse(&mutation.params)?;
-                self.check_session(params.session_id)?;
+                Self::check_session(session, params.session_id)?;
                 Self::check_attachment(state, params.attachment_id)
             }
             Method::InputInterrupt => {
                 let params: InputInterruptParams = parse(&mutation.params)?;
-                self.check_session(params.session_id)?;
+                Self::check_session(session, params.session_id)?;
                 Self::check_attachment(state, params.attachment_id)?;
-                self.check_capability(params.attachment_id, AttachmentCapability::Input)
+                Self::check_capability(session, params.attachment_id, AttachmentCapability::Input)
             }
             Method::AttachmentViewport => {
                 let params: AttachmentViewportParams = parse(&mutation.params)?;
@@ -1083,31 +1159,6 @@ impl WorkerService {
                 let _: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;
                 Ok(())
             }
-            _ => Err(WorkerError::InvalidArgument(format!(
-                "{} is not a mutation this worker serves",
-                method.as_str()
-            ))),
-        }
-    }
-
-    fn apply(
-        &self,
-        state: &mut ConnectionState,
-        mutation: &MutationRequest,
-        method: Method,
-    ) -> Result<ParamsValue> {
-        match method {
-            Method::SessionAttach => self.session_attach(state, &mutation.params),
-            Method::SessionDetach => self.session_detach(state, &mutation.params),
-            Method::SessionClose => self.session_close(state, &mutation.params),
-            Method::AttachmentConfigure => self.attachment_configure(state, &mutation.params),
-            Method::TerminalResize => self.terminal_resize(state, &mutation.params),
-            Method::TerminalGeometryTransfer => self.geometry_transfer(state, &mutation.params),
-            Method::InputAcquire => self.input_acquire(state, &mutation.params),
-            Method::InputRelease => self.input_release(state, &mutation.params),
-            Method::InputInterrupt => self.input_interrupt(state, &mutation.params),
-            Method::AttachmentViewport => self.attachment_viewport(state, &mutation.params),
-            Method::ActionCancel => self.action_cancel(state, &mutation.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a mutation this worker serves",
                 method.as_str()
@@ -1134,8 +1185,8 @@ impl WorkerService {
     /// A worker owns exactly one session. A request that arrives on this endpoint naming another
     /// session is not a request for this session with a typo in it; acting on it would let a
     /// caller close one session by addressing another.
-    fn check_session(&self, named: SessionId) -> Result<()> {
-        let owned = self.runtime.session().id();
+    fn check_session(session: &Session, named: SessionId) -> Result<()> {
+        let owned = session.id();
         if named == owned {
             Ok(())
         } else {
@@ -1161,11 +1212,10 @@ impl WorkerService {
 
     /// Refuses an operation the attachment was not granted.
     fn check_capability(
-        &self,
+        session: &Session,
         attachment_id: AttachmentId,
         capability: AttachmentCapability,
     ) -> Result<()> {
-        let session = self.runtime.session();
         let granted = session
             .attachment_capabilities(attachment_id)
             .ok_or_else(|| WorkerError::UnknownAttachment {
@@ -1183,8 +1233,8 @@ impl WorkerService {
 
     fn session_read(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let params: SessionReadParams = parse(params)?;
-        self.check_session(params.session_id)?;
         let session = self.runtime.session();
+        Self::check_session(&session, params.session_id)?;
         let running = session.state().is_running();
         encode(&SessionReadResult {
             session: session.summary(),
@@ -1194,17 +1244,16 @@ impl WorkerService {
 
     fn events_snapshot(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let params: EventsSnapshotParams = parse(params)?;
-        self.check_session(params.session_id)?;
-        encode(&self.runtime.session().snapshot())
+        let session = self.runtime.session();
+        Self::check_session(&session, params.session_id)?;
+        encode(&session.snapshot())
     }
 
     fn history_page(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let params: HistoryPageParams = parse(params)?;
-        self.check_session(params.session_id)?;
-        let page = self
-            .runtime
-            .session()
-            .history_page(params.from_cursor.get(), params.max_bytes.get())?;
+        let session = self.runtime.session();
+        Self::check_session(&session, params.session_id)?;
+        let page = session.history_page(params.from_cursor.get(), params.max_bytes.get())?;
         encode(&page)
     }
 
@@ -1214,9 +1263,9 @@ impl WorkerService {
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
         let params: EventsSubscribeParams = parse(params)?;
-        self.check_session(params.session_id)?;
         Self::check_attachment(state, params.attachment_id)?;
         let mut session = self.runtime.session();
+        Self::check_session(&session, params.session_id)?;
         let stream = session.subscribe(params.attachment_id)?;
         let from = params
             .from_cursor
@@ -1273,55 +1322,28 @@ impl WorkerService {
         })
     }
 
-    /// Cancels an intent this actor submitted that has not been dispatched.
-    fn action_cancel(&self, state: &ConnectionState, params: &ParamsValue) -> Result<ParamsValue> {
-        let params: kr_protocol::receipt::ActionCancelParams = parse(params)?;
-        let mut session = self.runtime.session();
-        let journal = session
-            .journal_mut()
-            .ok_or_else(|| WorkerError::JournalUnavailable {
-                detail: "this session retains no receipts, so none can be cancelled".to_owned(),
-            })?;
-        let receipt = journal.cancel(state.actor_id.clone(), params.action_id, kr_ipc::now_ms())?;
-        drop(session);
-        encode(&kr_protocol::receipt::ActionCancelResult { receipt })
-    }
-
-    fn attachment_viewport(
-        &self,
-        state: &ConnectionState,
-        params: &ParamsValue,
-    ) -> Result<ParamsValue> {
-        let params: AttachmentViewportParams = parse(params)?;
-        Self::check_attachment(state, params.attachment_id)?;
-        let mut session = self.runtime.session();
-        let presentation = session.viewport(params.attachment_id, params.dimensions)?;
-        encode(&AttachmentViewportResult {
-            geometry: session.geometry(),
-            presentation,
-        })
-    }
-
     fn input_write(
         &self,
         state: &mut ConnectionState,
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
         let params: InputWriteParams = parse(params)?;
-        self.check_session(params.session_id)?;
         Self::check_attachment(state, params.attachment_id)?;
-        self.check_capability(params.attachment_id, AttachmentCapability::Input)?;
-        let accepted = {
+        let (accepted, pending) = {
             let mut session = self.runtime.session();
-            session.write_input(
+            Self::check_session(&session, params.session_id)?;
+            Self::check_capability(&session, params.attachment_id, AttachmentCapability::Input)?;
+            let accepted = session.write_input(
                 params.attachment_id,
                 params.epoch.get(),
                 params.sequence.get(),
                 params.bytes.as_slice(),
                 std::time::Instant::now(),
-            )?
+            )?;
+            let pending = session.take_pending_input();
+            (accepted, pending)
         };
-        self.runtime.flush_input();
+        self.runtime.send_input(pending);
         state.input_sequence = params.sequence.get();
         encode(&InputWriteResult {
             sequence: params.sequence,
@@ -1330,157 +1352,154 @@ impl WorkerService {
         })
     }
 
-    fn session_attach(
+    /// Performs one mutation on the session boundary the caller is already holding.
+    ///
+    /// Everything that happens here happens between the dispatch marker and the recorded outcome,
+    /// with the session locked throughout, so nothing the mutation was validated against can move
+    /// underneath it. What cannot be done under the lock — writing input to the terminal, starting
+    /// a termination sequence — is handed back to the caller as an after-effect.
+    fn apply(
         &self,
+        session: &mut Session,
         state: &mut ConnectionState,
-        params: &ParamsValue,
-    ) -> Result<ParamsValue> {
-        let params: SessionAttachParams = parse(params)?;
-        self.check_session(params.session_id)?;
-        let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
-        // A local owner attachment receives what it asked for: peer credentials already proved the
-        // caller is this user, and the worker's own authority covers its session.
-        let granted = params.requested.clone();
-        let result = {
-            let mut session = self.runtime.session();
-            session.attach(&params, granted, attachment_id)?
-        };
-        state.attachments.push(attachment_id);
-        encode(&result)
-    }
-
-    fn session_detach(
-        &self,
-        state: &mut ConnectionState,
-        params: &ParamsValue,
-    ) -> Result<ParamsValue> {
-        let params: SessionDetachParams = parse(params)?;
-        Self::check_attachment(state, params.attachment_id)?;
-        let result = {
-            let mut session = self.runtime.session();
-            session.detach(params.attachment_id)?
-        };
-        state
-            .attachments
-            .retain(|attachment| *attachment != params.attachment_id);
-        encode(&result)
-    }
-
-    fn session_close(
-        &self,
-        state: &mut ConnectionState,
-        params: &ParamsValue,
-    ) -> Result<ParamsValue> {
-        let params: kr_protocol::session::SessionCloseParams = parse(params)?;
-        self.check_session(params.session_id)?;
-        let (acceptance, gate) = self.runtime.close(ClosureReason::CloseRequested);
-        // The gate is held until the acceptance has been written. The requester is often a command
-        // running inside the process group this closure is about to stop.
-        state.close_gate = Some(gate);
-        encode(&SessionCloseResult {
-            session_id: params.session_id,
-            state: acceptance.state,
-            durability: acceptance.durability,
-            closure: Nullable(acceptance.closure),
-        })
-    }
-
-    fn attachment_configure(
-        &self,
-        state: &ConnectionState,
-        params: &ParamsValue,
-    ) -> Result<ParamsValue> {
-        let params: AttachmentConfigureParams = parse(params)?;
-        Self::check_attachment(state, params.attachment_id)?;
-        if params.claim_geometry {
-            self.check_capability(params.attachment_id, AttachmentCapability::Geometry)?;
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<(ParamsValue, AfterEffect)> {
+        let params = &mutation.params;
+        match method {
+            Method::SessionAttach => {
+                let params: SessionAttachParams = parse(params)?;
+                let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+                // A local owner attachment receives what it asked for: peer credentials already
+                // proved the caller is this user, and the worker's own authority covers its
+                // session.
+                let granted = params.requested.clone();
+                let result = session.attach(&params, granted, attachment_id)?;
+                state.attachments.push(attachment_id);
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::SessionDetach => {
+                let params: SessionDetachParams = parse(params)?;
+                let result = session.detach(params.attachment_id)?;
+                state
+                    .attachments
+                    .retain(|attachment| *attachment != params.attachment_id);
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::SessionClose => {
+                let params: kr_protocol::session::SessionCloseParams = parse(params)?;
+                let (acceptance, gate) = self
+                    .runtime
+                    .close_locked(session, ClosureReason::CloseRequested);
+                let reply = encode(&SessionCloseResult {
+                    session_id: params.session_id,
+                    state: acceptance.state,
+                    durability: acceptance.durability,
+                    closure: Nullable(acceptance.closure),
+                })?;
+                // The gate is held until the acceptance has been written. The requester is often a
+                // command running inside the process group this closure is about to stop.
+                Ok((reply, AfterEffect::Close(gate)))
+            }
+            Method::AttachmentConfigure => {
+                let params: AttachmentConfigureParams = parse(params)?;
+                let geometry = session.configure(params.attachment_id, params.claim_geometry)?;
+                Ok((encode(&GeometryResult { geometry })?, AfterEffect::None))
+            }
+            Method::TerminalResize => {
+                let params: TerminalResizeParams = parse(params)?;
+                let geometry = session.resize(
+                    params.attachment_id,
+                    params.dimensions,
+                    params.expected_geometry_epoch.get(),
+                )?;
+                Ok((encode(&GeometryResult { geometry })?, AfterEffect::None))
+            }
+            Method::TerminalGeometryTransfer => {
+                let params: TerminalGeometryTransferParams = parse(params)?;
+                let geometry = session.transfer_geometry(
+                    params.attachment_id,
+                    params.expected_geometry_epoch.get(),
+                )?;
+                Ok((encode(&GeometryResult { geometry })?, AfterEffect::None))
+            }
+            Method::InputAcquire => {
+                let params: InputAcquireParams = parse(params)?;
+                let result = session.acquire_input(
+                    params.attachment_id,
+                    state.connection_id,
+                    params.expected_epoch.as_ref().map(|epoch| epoch.get()),
+                )?;
+                let pending = session.take_pending_input();
+                Ok((encode(&result)?, AfterEffect::Input(pending)))
+            }
+            Method::InputRelease => {
+                let params: InputReleaseParams = parse(params)?;
+                let lease = session.release_input(params.attachment_id, params.epoch.get())?;
+                let pending = session.take_pending_input();
+                Ok((
+                    encode(&InputLeaseResult { lease })?,
+                    AfterEffect::Input(pending),
+                ))
+            }
+            Method::InputInterrupt => {
+                let params: InputInterruptParams = parse(params)?;
+                if params.action != InterruptAction::NativeInterrupt {
+                    return Err(WorkerError::InvalidArgument(
+                        "the interrupt method accepts only the configured native interrupt"
+                            .to_owned(),
+                    ));
+                }
+                session.interrupt(params.attachment_id, params.epoch.get())?;
+                Ok((
+                    encode(&InputLeaseResult {
+                        lease: session.lease(),
+                    })?,
+                    AfterEffect::None,
+                ))
+            }
+            Method::AttachmentViewport => {
+                let params: AttachmentViewportParams = parse(params)?;
+                let presentation = session.viewport(params.attachment_id, params.dimensions)?;
+                Ok((
+                    encode(&AttachmentViewportResult {
+                        geometry: session.geometry(),
+                        presentation,
+                    })?,
+                    AfterEffect::None,
+                ))
+            }
+            Method::ActionCancel => {
+                let params: kr_protocol::receipt::ActionCancelParams = parse(params)?;
+                let journal =
+                    session
+                        .journal_mut()
+                        .ok_or_else(|| WorkerError::JournalUnavailable {
+                            detail: "this session retains no receipts, so none can be cancelled"
+                                .to_owned(),
+                        })?;
+                let receipt =
+                    journal.cancel(state.actor_id.clone(), params.action_id, kr_ipc::now_ms())?;
+                Ok((
+                    encode(&kr_protocol::receipt::ActionCancelResult { receipt })?,
+                    AfterEffect::None,
+                ))
+            }
+            _ => Err(WorkerError::InvalidArgument(format!(
+                "{} is not a mutation this worker serves",
+                method.as_str()
+            ))),
         }
-        let mut session = self.runtime.session();
-        let geometry = session.configure(params.attachment_id, params.claim_geometry)?;
-        encode(&GeometryResult { geometry })
     }
+}
 
-    fn terminal_resize(
-        &self,
-        state: &ConnectionState,
-        params: &ParamsValue,
-    ) -> Result<ParamsValue> {
-        let params: TerminalResizeParams = parse(params)?;
-        Self::check_attachment(state, params.attachment_id)?;
-        self.check_capability(params.attachment_id, AttachmentCapability::Geometry)?;
-        let mut session = self.runtime.session();
-        let geometry = session.resize(
-            params.attachment_id,
-            params.dimensions,
-            params.expected_geometry_epoch.get(),
-        )?;
-        encode(&GeometryResult { geometry })
-    }
-
-    fn geometry_transfer(
-        &self,
-        state: &ConnectionState,
-        params: &ParamsValue,
-    ) -> Result<ParamsValue> {
-        let params: TerminalGeometryTransferParams = parse(params)?;
-        Self::check_attachment(state, params.attachment_id)?;
-        self.check_capability(params.attachment_id, AttachmentCapability::Geometry)?;
-        let mut session = self.runtime.session();
-        let geometry = session
-            .transfer_geometry(params.attachment_id, params.expected_geometry_epoch.get())?;
-        encode(&GeometryResult { geometry })
-    }
-
-    fn input_acquire(
-        &self,
-        state: &mut ConnectionState,
-        params: &ParamsValue,
-    ) -> Result<ParamsValue> {
-        let params: InputAcquireParams = parse(params)?;
-        self.check_session(params.session_id)?;
-        Self::check_attachment(state, params.attachment_id)?;
-        self.check_capability(params.attachment_id, AttachmentCapability::Input)?;
-        let result = {
-            let mut session = self.runtime.session();
-            session.acquire_input(
-                params.attachment_id,
-                state.connection_id,
-                params.expected_epoch.as_ref().map(|epoch| epoch.get()),
-            )?
-        };
-        self.runtime.flush_input();
-        encode(&result)
-    }
-
-    fn input_release(&self, state: &ConnectionState, params: &ParamsValue) -> Result<ParamsValue> {
-        let params: InputReleaseParams = parse(params)?;
-        self.check_session(params.session_id)?;
-        Self::check_attachment(state, params.attachment_id)?;
-        let mut session = self.runtime.session();
-        let lease = session.release_input(params.attachment_id, params.epoch.get())?;
-        encode(&InputLeaseResult { lease })
-    }
-
-    fn input_interrupt(
-        &self,
-        state: &ConnectionState,
-        params: &ParamsValue,
-    ) -> Result<ParamsValue> {
-        let params: InputInterruptParams = parse(params)?;
-        self.check_session(params.session_id)?;
-        Self::check_attachment(state, params.attachment_id)?;
-        self.check_capability(params.attachment_id, AttachmentCapability::Input)?;
-        if params.action != InterruptAction::NativeInterrupt {
-            return Err(WorkerError::InvalidArgument(
-                "the interrupt method accepts only the configured native interrupt".to_owned(),
-            ));
-        }
-        let mut session = self.runtime.session();
-        session.interrupt(params.attachment_id, params.epoch.get())?;
-        encode(&InputLeaseResult {
-            lease: session.lease(),
-        })
-    }
+/// What decides whether a mutation may be admitted for the first time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    /// The freshness window this connection holds.
+    Window,
+    /// A deadline the control daemon derived when it admitted the action for its caller.
+    Vouched(kr_protocol::scalars::TimestampMs),
 }
 
 /// The subject facts a mutation requires to still be true.
@@ -1704,6 +1723,16 @@ fn failure(request_id: RequestId, error: &ProtocolError) -> ControlMessage {
     })
 }
 
+/// What a mutation left for the caller to do once the session boundary is over.
+#[derive(Debug)]
+pub enum AfterEffect {
+    /// Nothing.
+    None,
+    /// Bytes to write to the pseudo-terminal.
+    Input(Vec<Vec<u8>>),
+    /// A termination sequence to start once the acceptance has reached the requester.
+    Close(crate::runtime::CloseGate),
+}
 fn not_negotiated() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::UnsupportedSchema,

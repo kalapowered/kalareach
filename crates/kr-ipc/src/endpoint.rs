@@ -288,6 +288,12 @@ mod platform {
         _file: std::fs::File,
     }
 
+    /// How long a guard waits for the other holder to finish its change.
+    ///
+    /// The work under the guard is three filesystem calls. A holder that takes longer than this is
+    /// not making progress, and waiting further would turn a busy address into a hang.
+    const GUARD_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
     impl EndpointGuard {
         fn take(path: &std::path::Path) -> Result<Self> {
             use rustix::fs::{FlockOperation, flock};
@@ -299,13 +305,26 @@ mod platform {
                 .write(true)
                 .open(&lock_path)
                 .map_err(|error| IpcError::io("open the endpoint lock", &lock_path, error))?;
-            // Blocking, deliberately: a bind that loses the race should wait for the other
-            // process to finish its three steps and then discover the address is in use, not
-            // decide the address is free because it arrived at an awkward moment.
-            flock(&file, FlockOperation::LockExclusive).map_err(|error| {
-                IpcError::io("lock the endpoint", &lock_path, std::io::Error::from(error))
-            })?;
-            Ok(Self { _file: file })
+            // Bounded, because the guard protects three filesystem calls. A bind that loses the
+            // race waits for the other process to finish them and then discovers the address is in
+            // use; a bind that waits on a process which has stopped making progress is told so
+            // instead of hanging.
+            let deadline = std::time::Instant::now() + GUARD_WAIT;
+            loop {
+                match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+                    Ok(()) => return Ok(Self { _file: file }),
+                    Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => {
+                        return Err(IpcError::io(
+                            "lock the endpoint",
+                            &lock_path,
+                            std::io::Error::from(error),
+                        ));
+                    }
+                }
+            }
         }
     }
 

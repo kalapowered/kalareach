@@ -15,7 +15,9 @@
 //!   sent to an endpoint that might start something.
 
 use kr_protocol::identity::{ProcessStartIdentity, WorkerProfile};
-use kr_protocol::ids::{ActorId, ControllerGeneration, EnvironmentId, SessionId};
+use kr_protocol::ids::{
+    ActorId, AuthorityRevision, ControllerGeneration, EnvironmentId, SessionId,
+};
 use kr_protocol::scalars::{AuthorisationKey, Digest256, TimestampMs, Uuid};
 use kr_protocol::session::{ClosureRecord, DisplayNumber, SessionState};
 use kr_protocol::worker::ReservationId;
@@ -126,6 +128,8 @@ pub struct WorkerRecord {
     pub profile: WorkerProfile,
     /// The lifecycle state as the registry knows it.
     pub state: SessionState,
+    /// The authority revision this worker has acknowledged.
+    pub acknowledged_revision: AuthorityRevision,
 }
 
 /// The environment registry.
@@ -179,10 +183,11 @@ impl Registry {
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
                  CREATE TABLE IF NOT EXISTS environment (
-                     environment_id BLOB PRIMARY KEY,
-                     generation     INTEGER NOT NULL,
-                     next_display   INTEGER NOT NULL,
-                     session_limit  INTEGER NOT NULL
+                     environment_id     BLOB PRIMARY KEY,
+                     generation         INTEGER NOT NULL,
+                     next_display       INTEGER NOT NULL,
+                     session_limit      INTEGER NOT NULL,
+                     authority_revision INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE TABLE IF NOT EXISTS reservations (
                      reservation_id    BLOB PRIMARY KEY,
@@ -209,7 +214,8 @@ impl Registry {
                      process_start    INTEGER NOT NULL,
                      endpoint         TEXT NOT NULL,
                      profile          TEXT NOT NULL,
-                     state            TEXT NOT NULL
+                     state            TEXT NOT NULL,
+                     acknowledged_revision INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE TABLE IF NOT EXISTS tombstones (
                      session_id BLOB PRIMARY KEY,
@@ -264,6 +270,10 @@ impl Registry {
     /// version 1 genuinely has no recorded request, and recovery treats a missing one as a launch
     /// it cannot resume rather than inventing a session to start.
     ///
+    /// Version 1 had no `claimed` phase, so its `spawned` rows cover both "the worker never
+    /// reached the rendezvous" and "it did, and may have started a shell". They become `claimed`,
+    /// which is the one this host can resolve without assuming the more convenient of the two.
+    ///
     /// This migration goes when there can no longer be a version 1 registry to read, which is the
     /// first release: nothing before it is installed anywhere it has to be read from again.
     fn migrate_1_to_2(&self) -> Result<()> {
@@ -272,6 +282,7 @@ impl Registry {
                 "BEGIN;
                  ALTER TABLE reservations ADD COLUMN create_intent BLOB;
                  ALTER TABLE reservations ADD COLUMN claimed_key BLOB;
+                 UPDATE reservations SET phase = 'claimed' WHERE phase = 'spawned';
                  UPDATE schema_version SET version = 2;
                  COMMIT;",
             )
@@ -321,6 +332,68 @@ impl Registry {
         Ok(ControllerGeneration::new(
             u64::try_from(value).unwrap_or_default(),
         ))
+    }
+
+    /// Returns the environment's current authority revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
+    pub fn authority_revision(&self) -> Result<AuthorityRevision> {
+        let value: i64 = self
+            .connection
+            .query_row(
+                "SELECT authority_revision FROM environment WHERE environment_id = ?1",
+                params![self.environment_id.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(AuthorityRevision::new(
+            u64::try_from(value).unwrap_or_default(),
+        ))
+    }
+
+    /// Advances and returns the environment's authority revision.
+    ///
+    /// Only the host issues revisions, and they only ever increase. A revocation advances this and
+    /// is then pending at every worker until each has acknowledged the new number or is confirmed
+    /// ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn advance_authority_revision(&mut self) -> Result<AuthorityRevision> {
+        self.connection
+            .execute(
+                "UPDATE environment SET authority_revision = authority_revision + 1
+                 WHERE environment_id = ?1",
+                params![self.environment_id.get().as_bytes().as_slice()],
+            )
+            .map_err(ControllerError::registry)?;
+        self.authority_revision()
+    }
+
+    /// Records the authority revision one worker has acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn record_acknowledged_revision(
+        &mut self,
+        session_id: SessionId,
+        revision: AuthorityRevision,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE workers SET acknowledged_revision = ?2
+                 WHERE session_id = ?1 AND acknowledged_revision < ?2",
+                params![
+                    session_id.get().as_bytes().as_slice(),
+                    i64::try_from(revision.get()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
     }
 
     /// Returns the configured admission limit.
@@ -873,7 +946,7 @@ impl Registry {
             .connection
             .prepare(
                 "SELECT session_id, display_number, public_key, process_pid, process_source,
-                        process_start, endpoint, profile, state
+                        process_start, endpoint, profile, state, acknowledged_revision
                  FROM workers ORDER BY display_number",
             )
             .map_err(ControllerError::registry)?;
@@ -889,12 +962,13 @@ impl Registry {
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             })
             .map_err(ControllerError::registry)?;
         let mut workers = Vec::new();
         for row in rows {
-            let (session, display, key, pid, source, start, endpoint, profile, state) =
+            let (session, display, key, pid, source, start, endpoint, profile, state, revision) =
                 row.map_err(ControllerError::registry)?;
             workers.push(WorkerRecord {
                 session_id: SessionId::new(uuid_from(&session)?),
@@ -910,6 +984,9 @@ impl Registry {
                 endpoint,
                 profile: profile_from(&profile)?,
                 state: state_from(&state)?,
+                acknowledged_revision: AuthorityRevision::new(
+                    u64::try_from(revision).unwrap_or_default(),
+                ),
             });
         }
         Ok(workers)

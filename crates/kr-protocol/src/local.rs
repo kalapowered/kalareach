@@ -146,6 +146,27 @@ pub struct ActionWindowGrant {
     pub action_window_expires_at_ms: TimestampMs,
 }
 
+/// A mutation the host admitted for a caller, passed to the component that owns its subject.
+///
+/// The control daemon owns admission: it authenticates the caller, stamps the freshness window,
+/// checks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding
+/// carries the caller's mutation to the worker **unchanged**, because the mutation is what the
+/// payload digest covers and what the caller will retry with: rewriting any of it would give the
+/// worker a different action from the one the caller asked for.
+///
+/// What travels beside it is what the worker cannot establish for itself: which principal the host
+/// verified, and the deadline the host accepted. The worker performs the action under both.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardedMutation {
+    /// The caller's mutation, exactly as it arrived at the host.
+    pub mutation: MutationRequest,
+    /// The actor the host verified, with the ingress it arrived on.
+    pub actor: crate::actor::ActorEnvelope,
+    /// The deadline the host derived at first admission. It is never extended downstream.
+    pub accepted_deadline_ms: TimestampMs,
+}
+
 /// One message on a local control stream.
 ///
 /// The union is closed. A receiver that cannot name the variant rejects the frame rather than
@@ -193,6 +214,8 @@ pub enum ControlMessage {
     ActionWindowRenew(ActionWindowRenew),
     /// The host's freshly stamped freshness window.
     ActionWindow(ActionWindowGrant),
+    /// A mutation the control daemon admitted, passed to the worker that owns its subject.
+    Forwarded(Box<ForwardedMutation>),
 }
 
 #[cfg(test)]

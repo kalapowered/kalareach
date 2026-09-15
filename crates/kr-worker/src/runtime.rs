@@ -198,7 +198,15 @@ impl SessionRuntime {
             let mut session = self.session();
             session.take_pending_input()
         };
-        for bytes in pending {
+        self.send_input(pending);
+    }
+
+    /// Writes batches an operation produced while the session was already locked.
+    ///
+    /// A mutation runs inside the session's serial boundary, so it cannot take the lock again to
+    /// flush. It hands the batches out instead, and this sends them once the boundary is over.
+    pub fn send_input(&self, batches: Vec<Vec<u8>>) {
+        for bytes in batches {
             let _ = self.input.send(bytes);
         }
         // A new held prefix needs the timer to look again.
@@ -211,10 +219,22 @@ impl SessionRuntime {
     /// acceptance has reached the requester, because the requester is often a command running
     /// inside the process group that is about to be stopped.
     pub fn close(self: &Arc<Self>, reason: ClosureReason) -> (CloseAcceptance, CloseGate) {
-        let acceptance = {
-            let mut session = self.session();
-            session.begin_close(reason)
-        };
+        let mut session = self.session();
+        let outcome = self.close_locked(&mut session, reason);
+        drop(session);
+        outcome
+    }
+
+    /// Admits a close on a session this caller already holds.
+    ///
+    /// A mutation runs inside the session's serial boundary and cannot take the lock again, so the
+    /// admission happens on the guard it is already holding.
+    pub fn close_locked(
+        self: &Arc<Self>,
+        session: &mut Session,
+        reason: ClosureReason,
+    ) -> (CloseAcceptance, CloseGate) {
+        let acceptance = session.begin_close(reason);
         let gate = CloseGate {
             runtime: Arc::clone(self),
             initiated: acceptance.initiated,

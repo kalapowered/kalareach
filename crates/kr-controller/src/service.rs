@@ -253,6 +253,18 @@ impl Controller {
             if self.directory.lock().await.get(row.session_id).is_some() {
                 continue;
             }
+            // A fenced reservation is one the host stopped trusting. Publishing its worker again
+            // because a descriptor happened to be missing would undo the fence through the back
+            // door, so recovery leaves it alone and it stays out of the directory.
+            let fenced = {
+                let registry = self.registry.lock().await;
+                registry
+                    .reservation_for_session(row.session_id)?
+                    .is_none_or(|reservation| reservation.phase == LaunchPhase::Fenced)
+            };
+            if fenced {
+                continue;
+            }
             let Ok(endpoint) = Endpoint::from_path(&row.endpoint) else {
                 continue;
             };
@@ -328,6 +340,9 @@ impl Controller {
             endpoint: proof.endpoint.clone(),
             profile: WorkerProfile::HeadlessUser,
             state: SessionState::Live,
+            // A worker starts having acknowledged nothing. The first announcement it receives is
+            // what moves this.
+            acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
         };
         {
             let mut registry = self.registry.lock().await;
@@ -358,6 +373,96 @@ impl Controller {
     #[must_use]
     pub const fn generation(&self) -> ControllerGeneration {
         self.generation
+    }
+
+    /// Announces the environment's current authority revision to every worker it knows about.
+    ///
+    /// A revocation is not complete when the daemon records it. It is complete for a worker when
+    /// that worker has acknowledged the revision that removed the authority, or when the worker is
+    /// confirmed ended. Anything else is pending, and this reports which.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written.
+    pub async fn announce_authority_revision(&self) -> Result<RevisionProgress> {
+        let revision = {
+            let registry = self.registry.lock().await;
+            registry.authority_revision()?
+        };
+        let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
+        let mut progress = RevisionProgress {
+            revision,
+            acknowledged: Vec::new(),
+            pending: Vec::new(),
+        };
+        for worker in workers {
+            let session_id = worker.descriptor.session_id;
+            let outcome = {
+                match self.worker_client(&worker).await {
+                    Ok(mut held) => {
+                        let client = held.as_mut().expect("the connection is open");
+                        let answered = client
+                            .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
+                                environment_id: self.paths.environment_id(),
+                                revision,
+                            })
+                            .await;
+                        if answered.is_err() {
+                            *held = None;
+                        }
+                        answered.ok()
+                    }
+                    Err(_) => None,
+                }
+            };
+            match outcome {
+                Some(ack) if ack.revision.get() >= revision.get() => {
+                    let mut registry = self.registry.lock().await;
+                    registry.record_acknowledged_revision(session_id, ack.revision)?;
+                    drop(registry);
+                    progress.acknowledged.push(session_id);
+                }
+                // A worker that is confirmed gone answers the question a different way: it can no
+                // longer act under anything.
+                _ => {
+                    if self.reconcile(session_id).await?.is_some() {
+                        progress.acknowledged.push(session_id);
+                    } else {
+                        progress.pending.push(session_id);
+                    }
+                }
+            }
+        }
+        Ok(progress)
+    }
+
+    /// Advances the environment's authority revision and announces it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be written.
+    pub async fn revoke_authority(&self) -> Result<RevisionProgress> {
+        {
+            let mut registry = self.registry.lock().await;
+            registry.advance_authority_revision()?;
+        }
+        self.announce_authority_revision().await
+    }
+
+    /// Returns which workers have not yet acknowledged the environment's authority revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub async fn revision_pending(&self) -> Result<Vec<SessionId>> {
+        let registry = self.registry.lock().await;
+        let revision = registry.authority_revision()?;
+        Ok(registry
+            .workers()?
+            .into_iter()
+            .filter(|worker| worker.acknowledged_revision.get() < revision.get())
+            .map(|worker| worker.session_id)
+            .collect())
     }
 
     /// Returns what a worker needs to accept this daemon's authority.
@@ -593,6 +698,9 @@ impl Controller {
             endpoint: ready.endpoint.clone(),
             profile: WorkerProfile::HeadlessUser,
             state: SessionState::Live,
+            // A worker starts having acknowledged nothing. The first announcement it receives is
+            // what moves this.
+            acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
         };
         // The key and the live phase are committed together: a registry that says a session is
         // live always knows which key answers for it.
@@ -670,8 +778,13 @@ impl Controller {
     /// The target says which environment the effect belongs to, and the window says whether this
     /// is a first admission the host will accept at all. Both are checked before the create token
     /// reaches the registry, so an expired window never reserves a session.
-    fn check_envelope(&self, window: &FreshnessWindow, mutation: &MutationRequest) -> Result<()> {
-        use kr_protocol::authority::{AuthorityDecision, ResourceSelectorKind};
+    fn check_envelope(
+        &self,
+        window: &FreshnessWindow,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<TimestampMs> {
+        use kr_protocol::authority::AuthorityDecision;
 
         // The registry decides first: an unlisted name, a version this build does not implement
         // and an ingress that may not reach the method are all refused before a parameter is read.
@@ -704,29 +817,51 @@ impl Controller {
                 self.paths.environment_id()
             )));
         }
-        // A method whose registry entry names a session acts on one, and the session its
-        // parameters name is the session its target names. A close that pointed at one session and
-        // carried another in its parameters would close the one nobody addressed.
-        if entry
-            .resource_selectors
-            .contains(&ResourceSelectorKind::Session)
-        {
-            let named = mutation
-                .target
-                .session_id
-                .as_ref()
-                .copied()
-                .ok_or_else(|| {
-                    ControllerError::InvalidArgument(format!(
-                        "{} names the session it acts on",
-                        entry.name
-                    ))
-                })?;
-            let params: SessionCloseParams = parse(&mutation.params)?;
-            if params.session_id != named {
-                return Err(ControllerError::InvalidArgument(
-                    "the request's target and its parameters name different sessions".to_owned(),
-                ));
+        // The target and the parameters have to name the same subject. A close that pointed at
+        // one session and carried another in its parameters would close the one nobody addressed.
+        // Creation is where the selector table and the envelope differ for a good reason:
+        // `session.create` selects a session because it allocates one, and no request can name a
+        // session that does not exist yet, so its subject is the environment.
+        match method {
+            Method::SessionClose => {
+                let named = mutation
+                    .target
+                    .session_id
+                    .as_ref()
+                    .copied()
+                    .ok_or_else(|| {
+                        ControllerError::InvalidArgument(format!(
+                            "{} names the session it acts on",
+                            entry.name
+                        ))
+                    })?;
+                let params: SessionCloseParams = parse(&mutation.params)?;
+                if params.session_id != named {
+                    return Err(ControllerError::InvalidArgument(
+                        "the request's target and its parameters name different sessions"
+                            .to_owned(),
+                    ));
+                }
+            }
+            Method::SessionCreate => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "a create allocates the session it is for, so it names none".to_owned(),
+                    ));
+                }
+                let params: SessionCreateParams = parse(&mutation.params)?;
+                if params.environment_id != mutation.target.environment_id {
+                    return Err(ControllerError::InvalidArgument(
+                        "the request's target and its parameters name different environments"
+                            .to_owned(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "{} is not a mutation this daemon serves",
+                    entry.name
+                )));
             }
         }
         // A local caller's authority is the operating-system caller the listener authenticated.
@@ -756,16 +891,26 @@ impl Controller {
                 "the subject preconditions are a map of the facts the caller depends on".to_owned(),
             ));
         }
-        window
+        let remaining = window
             .admit(
                 &mutation.action_window_id,
                 &self.boot_identity,
                 kr_ipc::now_ms().get(),
             )
-            .map(|_| ())
             .map_err(|refusal| ControllerError::WindowExpired {
                 detail: refusal.detail().to_owned(),
-            })
+            })?;
+        // The accepted deadline is the earliest of what the window has left, the requested
+        // lifetime and the protocol maximum. The caller never supplies an authoritative deadline,
+        // and nothing downstream lengthens this one.
+        let accepted = mutation
+            .requested_ttl_ms
+            .get()
+            .min(kr_protocol::limits::MAX_MUTATION_TTL.get())
+            .min(remaining);
+        Ok(TimestampMs::new(
+            kr_ipc::now_ms().get().saturating_add(accepted),
+        ))
     }
 
     async fn client(self: &Arc<Self>, connection: Connection, peer: PeerIdentity) -> Result<()> {
@@ -814,12 +959,28 @@ impl Controller {
                 }
                 ControlMessage::Request(request) if negotiated => self.read_method(&request).await,
                 ControlMessage::Mutation(mutation) if negotiated => {
-                    match self.check_envelope(&window, &mutation) {
-                        Ok(()) => self.write_method(&actor_id, &mutation).await,
-                        Err(error) => ControlMessage::Response(Response {
-                            request_id: mutation.request_id,
-                            outcome: Outcome::Error(error.to_protocol_error()),
-                        }),
+                    match mutation.method.method() {
+                        Some(method) => match self.check_envelope(&window, &mutation, method) {
+                            Ok(deadline) => {
+                                self.write_method(
+                                    &actor_id,
+                                    &mutation,
+                                    method,
+                                    connection_id,
+                                    deadline,
+                                )
+                                .await
+                            }
+                            Err(error) => ControlMessage::Response(Response {
+                                request_id: mutation.request_id,
+                                outcome: Outcome::Error(error.to_protocol_error()),
+                            }),
+                        },
+                        None => error_reply(
+                            mutation.request_id,
+                            ErrorCode::PermissionDenied,
+                            "the method is not in the registry",
+                        ),
                     }
                 }
                 _ => error_reply(
@@ -861,17 +1022,17 @@ impl Controller {
         self: &Arc<Self>,
         actor_id: &ActorId,
         mutation: &MutationRequest,
+        method: Method,
+        connection_id: ConnectionId,
+        accepted_deadline_ms: TimestampMs,
     ) -> ControlMessage {
-        let Some(method) = mutation.method.method() else {
-            return error_reply(
-                mutation.request_id,
-                ErrorCode::PermissionDenied,
-                "the method is not in the registry",
-            );
-        };
         let outcome = match method {
             Method::SessionCreate => self.session_create(actor_id, mutation).await,
-            Method::SessionClose => self.session_close(mutation).await,
+            Method::SessionClose => {
+                let actor = local_actor(actor_id.clone(), connection_id, self.generation);
+                self.session_close(mutation, &actor, accepted_deadline_ms)
+                    .await
+            }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
                 method.as_str()
@@ -952,12 +1113,31 @@ impl Controller {
                 }),
             ),
         });
+        let pending = self.revision_pending().await?;
+        checks.push(DoctorCheck {
+            id: "authority-revision".to_owned(),
+            title: "Every worker holds this environment's authority revision".to_owned(),
+            status: if pending.is_empty() {
+                DoctorStatus::Ok
+            } else {
+                DoctorStatus::Warning
+            },
+            detail: format!("{} of {} pending", pending.len(), verified),
+            remedy: Nullable((!pending.is_empty()).then(|| {
+                "A revocation is complete for a worker once it acknowledges the revision or is \
+                 confirmed ended."
+                    .to_owned()
+            })),
+        });
         let healthy = checks.iter().all(|check| !check.status.is_failure());
         encode(&HostDoctorResult { checks, healthy })
     }
 
     async fn session_list(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
         let params: SessionListParams = parse(params)?;
+        // Any worker that has started answering since the last attempt rejoins the directory here,
+        // so a list is the current picture rather than the picture at startup.
+        let _ = self.recover_workers().await;
         let mut sessions = Vec::new();
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         for worker in workers {
@@ -986,6 +1166,11 @@ impl Controller {
 
     async fn session_read(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
         let params: SessionReadParams = parse(params)?;
+        // A worker that did not answer at startup is not gone; it was busy, or it started slowly.
+        // Trying again here is what keeps a session readable without another daemon restart.
+        if self.directory.lock().await.get(params.session_id).is_none() {
+            let _ = self.recover_workers().await;
+        }
         let worker = self.directory.lock().await.get(params.session_id).cloned();
         if let Some(worker) = worker {
             match self.read_from_worker(&worker).await {
@@ -1202,7 +1387,12 @@ impl Controller {
     /// identity of the caller's action, and rewriting it here would give the worker a different
     /// action from the one the caller asked for: a retry would then find no receipt, and the
     /// caller's own identifier would name nothing.
-    async fn session_close(self: &Arc<Self>, mutation: &MutationRequest) -> Result<ParamsValue> {
+    async fn session_close(
+        self: &Arc<Self>,
+        mutation: &MutationRequest,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        accepted_deadline_ms: TimestampMs,
+    ) -> Result<ParamsValue> {
         let params: SessionCloseParams = parse(&mutation.params)?;
         let worker = self.directory.lock().await.get(params.session_id).cloned();
         let Some(worker) = worker else {
@@ -1225,7 +1415,7 @@ impl Controller {
         let result = {
             let mut held = self.worker_client(&worker).await?;
             let client = held.as_mut().expect("the connection is open");
-            match client.forward(mutation).await {
+            match client.forward(mutation, actor, accepted_deadline_ms).await {
                 Ok(result) => result,
                 Err(error) => {
                     *held = None;
@@ -1448,6 +1638,38 @@ impl Controller {
             .await?;
         Ok(client)
     }
+}
+
+/// Builds the actor envelope a local caller acts under.
+///
+/// Ingress is recorded as the local operating-system path, never as a paired device. A local
+/// caller cannot relabel itself, because the host constructs this rather than accepting it.
+#[must_use]
+pub fn local_actor(
+    actor_id: ActorId,
+    connection_id: ConnectionId,
+    generation: ControllerGeneration,
+) -> kr_protocol::actor::ActorEnvelope {
+    kr_protocol::actor::ActorEnvelope {
+        actor_id,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: Nullable::null(),
+        grant_id: Nullable::null(),
+        grant_revision: Nullable::null(),
+        controller_generation: generation,
+        connection_id,
+    }
+}
+
+/// How far an authority revision has reached the workers it applies to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevisionProgress {
+    /// The revision being announced.
+    pub revision: kr_protocol::ids::AuthorityRevision,
+    /// The sessions that have installed it, or that are confirmed ended.
+    pub acknowledged: Vec<SessionId>,
+    /// The sessions it has not reached, where the revocation is still pending.
+    pub pending: Vec<SessionId>,
 }
 
 /// What a controller needs before it starts.

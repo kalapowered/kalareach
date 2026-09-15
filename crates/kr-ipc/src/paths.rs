@@ -609,11 +609,13 @@ pub fn current_uid() -> u32 {
 ///
 /// Returns an error when the file exists and cannot be read, or does not hold an identity.
 fn read_environment_id(path: &Path) -> Result<Option<EnvironmentId>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(IpcError::io("read", path, error)),
+    let Some(bytes) = read_owner_only_file(path, MAX_ENVIRONMENT_ID_LEN)? else {
+        return Ok(None);
     };
+    let text = String::from_utf8(bytes).map_err(|_| IpcError::IdentityUnavailable {
+        what: "environment identity",
+        detail: format!("{}: the file is not text", path.display()),
+    })?;
     text.trim()
         .parse::<Uuid>()
         .map(|value| Some(EnvironmentId::new(value)))
@@ -621,6 +623,98 @@ fn read_environment_id(path: &Path) -> Result<Option<EnvironmentId>> {
             what: "environment identity",
             detail: format!("{}: {error}", path.display()),
         })
+}
+
+/// The largest recorded environment identity this host will read.
+const MAX_ENVIRONMENT_ID_LEN: u64 = 128;
+
+/// Reads a small file this user owns, without following a link or waiting for a writer.
+///
+/// A path check followed by a read checks one file and reads whatever the name points at by then.
+/// One handle, checked and read, cannot be swapped underneath. The non-blocking open is what stops
+/// a named pipe with the right name from holding a host's startup open indefinitely.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but is not one this host wrote.
+#[cfg(unix)]
+pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+
+    use rustix::fs::{Mode, OFlags};
+
+    let file = match rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(file) => std::fs::File::from(file),
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::MLINK) => {
+            return Err(IpcError::UntrustedFile {
+                path: path.to_path_buf(),
+                reason: "this file must not be a symbolic link",
+            });
+        }
+        Err(error) => return Err(IpcError::io("open", path, std::io::Error::from(error))),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| IpcError::io("inspect", path, error))?;
+    if !metadata.is_file() {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "this file must be a regular file",
+        });
+    }
+    check_owner_only(path, &metadata)?;
+    if metadata.len() > limit {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "this file is larger than anything this host writes here",
+        });
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| IpcError::io("read", path, error))?;
+    if bytes.len() as u64 > limit {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "this file is larger than anything this host writes here",
+        });
+    }
+    Ok(Some(bytes))
+}
+
+/// Reads a small file this user owns.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but is not one this host wrote.
+#[cfg(not(unix))]
+pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(IpcError::io("inspect", path, error)),
+    };
+    if !metadata.is_file() {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "this file must be a regular file",
+        });
+    }
+    if metadata.len() > limit {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "this file is larger than anything this host writes here",
+        });
+    }
+    std::fs::read(path)
+        .map(Some)
+        .map_err(|error| IpcError::io("read", path, error))
 }
 
 /// Writes a file owner-only, replacing any previous contents atomically.

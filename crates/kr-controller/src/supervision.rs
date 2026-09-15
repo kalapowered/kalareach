@@ -241,12 +241,14 @@ impl WorkerSupervisor for LaunchdSupervisor {
                 };
             }
         };
+        // Loading the job starts nothing: `RunAtLoad` is false. A bootstrap that fails therefore
+        // leaves nothing running, however it failed.
         if let Err(error) = run(
             "/bin/launchctl",
             &["bootstrap", &domain, &job.display().to_string()],
         ) {
             return LaunchOutcome::NotStarted {
-                detail: error.to_string(),
+                detail: error.detail(),
             };
         }
         // `-p` starts a job that is not running and prints the process identifier. `-k` would kill
@@ -261,7 +263,7 @@ impl WorkerSupervisor for LaunchdSupervisor {
             Ok(output) => output,
             Err(error) => {
                 return LaunchOutcome::Uncertain {
-                    detail: error.to_string(),
+                    detail: error.detail(),
                     pid: None,
                 };
             }
@@ -328,10 +330,15 @@ impl WorkerSupervisor for SystemdSupervisor {
         ];
         arguments.extend(launch.arguments());
         let borrowed: Vec<&str> = arguments.iter().map(String::as_str).collect();
-        if let Err(error) = run("systemd-run", &borrowed) {
-            return LaunchOutcome::NotStarted {
-                detail: error.to_string(),
-            };
+        match run("systemd-run", &borrowed) {
+            Ok(_) => {}
+            // The command never ran, so the manager was never asked.
+            Err(RunFailure::NotRun(detail)) => return LaunchOutcome::NotStarted { detail },
+            // The command ran and failed. It may have reached the manager before it did, so what
+            // happened to the unit is not settled from here.
+            Err(RunFailure::Failed(detail)) => {
+                return LaunchOutcome::Uncertain { detail, pid: None };
+            }
         }
         // The unit exists from here on, so anything that goes wrong afterwards leaves a process
         // that may be running.
@@ -342,7 +349,7 @@ impl WorkerSupervisor for SystemdSupervisor {
             Ok(output) => output,
             Err(error) => {
                 return LaunchOutcome::Uncertain {
-                    detail: error.to_string(),
+                    detail: error.detail(),
                     pid: None,
                 };
             }
@@ -474,13 +481,34 @@ pub fn identity_when_available(pid: u32) -> Result<ProcessStartIdentity> {
     }
 }
 
-fn run(program: &str, arguments: &[&str]) -> Result<String> {
+/// Why a launcher command did not produce an answer.
+///
+/// The two are not the same. A command that never ran started nothing. A command that ran and
+/// failed part way through may have reached the service manager first, and treating that as
+/// "nothing started" would free a slot something may still be occupying.
+#[derive(Clone, Debug)]
+enum RunFailure {
+    /// The command could not be started at all.
+    NotRun(String),
+    /// The command ran and reported a failure.
+    Failed(String),
+}
+
+impl RunFailure {
+    fn detail(&self) -> String {
+        match self {
+            Self::NotRun(detail) | Self::Failed(detail) => detail.clone(),
+        }
+    }
+}
+
+fn run(program: &str, arguments: &[&str]) -> std::result::Result<String, RunFailure> {
     let output = std::process::Command::new(program)
         .args(arguments)
         .output()
-        .map_err(|error| ControllerError::supervision(format!("{program}: {error}")))?;
+        .map_err(|error| RunFailure::NotRun(format!("{program}: {error}")))?;
     if !output.status.success() {
-        return Err(ControllerError::supervision(format!(
+        return Err(RunFailure::Failed(format!(
             "{program} {}: {}",
             arguments.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()

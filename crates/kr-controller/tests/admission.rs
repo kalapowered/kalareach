@@ -303,6 +303,7 @@ fn a_ready_report_cannot_revive_a_fenced_reservation() {
         endpoint: "/tmp/kr-test.sock".to_owned(),
         profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         state: kr_protocol::session::SessionState::Live,
+        acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
     };
     assert!(
         registry

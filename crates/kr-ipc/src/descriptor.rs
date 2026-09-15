@@ -108,15 +108,12 @@ pub fn read_all(paths: &EnvironmentPaths) -> Result<Vec<DescriptorEntry>> {
     let Some(handle) = DescriptorDirectory::open(&directory)? else {
         return Ok(Vec::new());
     };
-    let entries = match std::fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(IpcError::io("list", directory, error)),
-    };
+    // Listed through the same handle the files are opened through. Listing by pathname and then
+    // opening by pathname can address two different directories if the name is replaced in
+    // between.
     let mut found = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| IpcError::io("list", &directory, error))?;
-        let path = entry.path();
+    for name in handle.entries()? {
+        let path = directory.join(&name);
         if path.extension().is_none_or(|extension| extension != "kr") {
             continue;
         }
@@ -266,6 +263,52 @@ impl DescriptorDirectory {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Lists the names inside this directory, through the handle itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be read.
+    #[cfg(unix)]
+    pub fn entries(&self) -> Result<Vec<std::ffi::OsString>> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let listing = rustix::fs::Dir::read_from(&self.handle)
+            .map_err(|error| IpcError::io("list", &self.path, std::io::Error::from(error)))?;
+        let mut names = Vec::new();
+        for entry in listing {
+            let entry = entry
+                .map_err(|error| IpcError::io("list", &self.path, std::io::Error::from(error)))?;
+            let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+            if name == "." || name == ".." {
+                continue;
+            }
+            names.push(name.to_os_string());
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Lists the names inside this directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be read.
+    #[cfg(not(unix))]
+    pub fn entries(&self) -> Result<Vec<std::ffi::OsString>> {
+        let listing = match std::fs::read_dir(&self.path) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(IpcError::io("list", &self.path, error)),
+        };
+        let mut names = Vec::new();
+        for entry in listing {
+            let entry = entry.map_err(|error| IpcError::io("list", &self.path, error))?;
+            names.push(entry.file_name());
+        }
+        names.sort();
+        Ok(names)
     }
 
     /// Reads one descriptor from inside this directory.

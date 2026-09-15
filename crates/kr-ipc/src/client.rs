@@ -346,12 +346,48 @@ impl LocalClient {
         self.await_response(request_id).await
     }
 
-    /// Forwards a caller's mutation unchanged except for what belongs to this connection.
+    /// Announces the host's current authority revision and waits for the worker to install it.
     ///
-    /// The action identifier, the target, the preconditions and the requested lifetime are the
-    /// caller's and stay exactly as they arrived, so the receipt the host writes is the receipt the
-    /// caller asked for. Only the request identifier and the freshness window change, because both
-    /// name this connection rather than the caller's.
+    /// The acknowledgement is what makes a revocation complete for that worker: until it arrives,
+    /// or the worker is confirmed ended, the revocation is still pending there.
+    ///
+    /// # Errors
+    ///
+    /// Returns the worker's refusal, or a transport failure.
+    pub async fn announce_revision(
+        &mut self,
+        notice: kr_protocol::worker::AuthorityRevisionNotice,
+    ) -> Result<kr_protocol::worker::AuthorityRevisionAck> {
+        self.writer
+            .write_message(&ControlMessage::AuthorityRevision(notice))
+            .await?;
+        loop {
+            match self.reader.read_message().await? {
+                ControlMessage::AuthorityRevisionAck(ack) => return Ok(ack),
+                ControlMessage::Notification(_) => {}
+                ControlMessage::Response(Response {
+                    outcome: Outcome::Error(error),
+                    ..
+                }) => {
+                    return Err(IpcError::IdentityUnavailable {
+                        what: "the worker refused the authority revision",
+                        detail: error.to_string(),
+                    });
+                }
+                _ => {
+                    return Err(IpcError::UnexpectedMessage(
+                        "the worker answered something other than an acknowledgement",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Passes a mutation the host admitted to the component that owns its subject.
+    ///
+    /// The mutation travels unchanged, because it is what the payload digest covers and what the
+    /// caller will retry with. Only the actor the host verified and the deadline it accepted
+    /// travel beside it.
     ///
     /// # Errors
     ///
@@ -359,13 +395,18 @@ impl LocalClient {
     pub async fn forward(
         &mut self,
         mutation: &MutationRequest,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        accepted_deadline_ms: kr_protocol::scalars::TimestampMs,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
-        let request_id = self.next_id();
-        let mut forwarded = mutation.clone();
-        forwarded.request_id = request_id;
-        forwarded.action_window_id = self.acknowledgement.action_window_id.clone();
+        let request_id = mutation.request_id;
         self.writer
-            .write_message(&ControlMessage::Mutation(forwarded))
+            .write_message(&ControlMessage::Forwarded(Box::new(
+                kr_protocol::local::ForwardedMutation {
+                    mutation: mutation.clone(),
+                    actor: actor.clone(),
+                    accepted_deadline_ms,
+                },
+            )))
             .await?;
         self.await_response(request_id).await
     }
