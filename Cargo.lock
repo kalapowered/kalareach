@@ -2370,6 +2370,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-client"
+version = "0.1.0"
+dependencies = [
+ "iroh",
+ "kr-cbor",
+ "kr-crypto",
+ "kr-protocol",
+ "kr-transport",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kr-crypto"
 version = "0.1.0"
 dependencies = [

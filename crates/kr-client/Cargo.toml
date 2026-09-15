@@ -1,0 +1,27 @@
+[package]
+name = "kr-client"
+description = "KalaReach native client library: local IPC and iroh connections, typed methods, cursors and replaceable service clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+iroh.workspace = true
+kr-cbor.workspace = true
+kr-crypto.workspace = true
+kr-protocol.workspace = true
+kr-transport.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+iroh = { workspace = true, features = ["test-utils"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true
