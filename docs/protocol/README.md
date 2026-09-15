@@ -317,7 +317,8 @@ encoding to keep in step.
   `outstanding_bytes` rather than the ceiling itself that a relay checks against its running total.
 - **A registration is replaced, not amended.** It carries its own revision, so a registration an
   instance has replaced cannot be replayed to cancel a rotation. `replaces` states the rest: the key
-  registered is one the current registration still accepts, so a retired key is never restored; the
+  registered is one the current registration still accepts, so a retired key cannot put itself back;
+  the
   announced successor may name itself only once the recorded retirement has passed, so receipts the
   predecessor signed but has not yet delivered still verify; a live succession cannot be dropped,
   only withdrawn before its overlap opens; and a succession a replacement announces retires in the
@@ -325,8 +326,10 @@ encoding to keep in step.
   single submission can hand an instance to a key that has proved nothing.
 - **A grace survives a replacement.** Section 17 gives a principal one grace, starting at its first
   exhaustion, that reconnects cannot restart. `supersedes` therefore refuses a replacement that
-  moves either end of a window still in force; it may be cut short, and leaving grace entirely is
-  the allowance being restored.
+  moves either end of a window still in force; it may be cut short. Leaving grace means the
+  allowance was restored, which as a figure means a ceiling above what the grace itself permitted:
+  without that rule a revision could drop the grace while restoring nothing, and the revision after
+  it would be free to open a second window.
 - **Grace raises the same ceiling.** The grace after exhaustion belongs to the principal, is shared
   across its connections and starts at the first exhaustion. A relay receives a slice of what is
   left as a raised cumulative ceiling and a deadline, so it cannot restart a grace, extend one or

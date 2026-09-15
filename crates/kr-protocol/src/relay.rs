@@ -487,14 +487,21 @@ impl RelayLease {
             && self.effective_byte_ceiling() >= previous.effective_byte_ceiling()
     }
 
-    /// Returns true when `self` carries `previous`'s grace window unchanged, or none at all.
+    /// Returns true when `self` carries `previous`'s grace window unchanged, or leaves grace on
+    /// terms that mean the allowance was actually restored.
     ///
-    /// Leaving grace is allowed: the service restored the allowance, and the next exhaustion is a
-    /// new event with a new window. Moving the window of a grace that is still in force is not.
+    /// Two rules, and the second is the one that matters. A grace still in force keeps its start
+    /// and may only end sooner: moving either end would be the restart section 17 forbids. And a
+    /// replacement may drop the grace only by raising the reservation's ceiling above what the
+    /// grace itself permitted, because that is what "the allowance was restored" means as a figure.
+    /// Without that rule, a revision that dropped the grace while restoring nothing would leave the
+    /// next revision free to open a second window, and one exhaustion event would become as many
+    /// graces as the service cared to issue.
     #[must_use]
     pub fn continues_grace_of(&self, previous: &Self) -> bool {
         match (self.grace.0, previous.grace.0) {
-            (_, None) | (None, Some(_)) => true,
+            (_, None) => true,
+            (None, Some(current)) => self.byte_ceiling.get() > current.byte_ceiling.get(),
             (Some(next), Some(current)) => {
                 next.started_at_ms == current.started_at_ms
                     && next.ends_at_ms.get() <= current.ends_at_ms.get()
@@ -897,8 +904,9 @@ impl RelayInstanceRegistration {
     /// Beyond the revision, four rules hold, and each one closes a way of taking an instance over:
     ///
     /// - The key being registered is one `previous` still accepts, so a key nobody announced never
-    ///   becomes the key receipts are checked against, and a key that has already retired is never
-    ///   restored.
+    ///   becomes the key receipts are checked against, and a key that has retired cannot put itself
+    ///   back. A later registration may announce it again as a successor, which is an ordinary
+    ///   rotation back and needs the current key's signature like any other.
     /// - The announced successor may name itself only once the recorded retirement has passed, so
     ///   the overlap the predecessor announced is the overlap it gets.
     /// - A replacement that keeps the registered key keeps the succession that key announced,
@@ -1389,12 +1397,33 @@ mod tests {
         });
         assert!(shortened.supersedes(&first), "a grace may be cut short");
 
-        // Leaving grace is the allowance being restored; the next exhaustion is a new event.
-        let mut restored = first.clone();
-        restored.revision = RelayLeaseRevision::new(2);
-        restored.grace = Nullable::null();
-        restored.byte_ceiling = U64::new(grace.byte_ceiling.get());
+        // Leaving grace is the allowance being restored, which means a ceiling above what the
+        // grace itself permitted. A replacement that drops the grace while restoring nothing is
+        // refused, because the revision after it could then open a second window.
+        let mut hollow = first.clone();
+        hollow.revision = RelayLeaseRevision::new(2);
+        hollow.grace = Nullable::null();
+        hollow.byte_ceiling = U64::new(grace.byte_ceiling.get());
+        assert!(!hollow.supersedes(&first), "nothing was restored");
+
+        let mut restored = hollow.clone();
+        restored.byte_ceiling = U64::new(grace.byte_ceiling.get() + 1);
         assert!(restored.supersedes(&first));
+
+        // And the three-revision walk that the hollow step would have opened: out of grace at a
+        // ceiling that restores nothing, then into a fresh window.
+        let mut second_window = restored.clone();
+        second_window.revision = RelayLeaseRevision::new(3);
+        second_window.expires_at_ms = TimestampMs::new(now + 2 * MAX_GRACE_DURATION_MS);
+        second_window.grace = Nullable::some(RelayGrace {
+            started_at_ms: TimestampMs::new(now + MAX_GRACE_DURATION_MS),
+            ends_at_ms: TimestampMs::new(now + 2 * MAX_GRACE_DURATION_MS),
+            byte_ceiling: U64::new(restored.byte_ceiling.get() + 1024),
+        });
+        // It is only reachable through a step that restored a real allowance, which is a new
+        // exhaustion rather than a continuation of the first one.
+        assert!(second_window.supersedes(&restored));
+        assert!(!second_window.supersedes(&first));
     }
 
     #[test]
