@@ -16,6 +16,7 @@
 //! * The Unicode model is pinned rather than defaulted, so the width of a cell is a property of
 //!   the profile and not of whatever the library's default happened to be that month.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -335,7 +336,27 @@ pub struct CanonicalGrid {
     unrecognised: u64,
     tail: Option<TailCell>,
     dropped_marks: u64,
+    fragile: VecDeque<FragileRow>,
 }
+
+/// A row whose cells the library would re-cluster if it compacted the row.
+///
+/// The library keeps a row in one of two representations and converts to the compact one when the
+/// screen scrolls. The compact one stores the row as a single string and works out where its cells
+/// are by clustering that string again, which joins scalars this width model gives a cell each and
+/// shifts everything after them to the left. A copy of the row is kept while it is at risk, and put
+/// back if that happens. Only rows that were written with such a cell are copied, which is nearly
+/// none of them.
+#[derive(Debug, Clone)]
+struct FragileRow {
+    stable: i64,
+    text: String,
+    cells: usize,
+    line: wezterm_term::Line,
+}
+
+/// How many rows are kept against re-clustering. Older ones are let go first.
+const MAX_FRAGILE_ROWS: usize = 64;
 
 /// The cell a text run ended on, so a later combining mark can still join it.
 ///
@@ -410,6 +431,7 @@ impl CanonicalGrid {
             unrecognised: 0,
             tail: None,
             dropped_marks: 0,
+            fragile: VecDeque::new(),
         })
     }
 
@@ -437,6 +459,7 @@ impl CanonicalGrid {
             && let Ok(text) = core::str::from_utf8(event.raw())
         {
             self.print(text);
+            self.repair_fragile();
             return adapted;
         }
         // Anything that is not printed text ends the cell, exactly as it would have done inside one
@@ -445,7 +468,81 @@ impl CanonicalGrid {
         if !adapted.actions.is_empty() {
             self.terminal.perform_actions(adapted.actions.clone());
         }
+        self.repair_fragile();
         adapted
+    }
+
+    /// Remembers a row whose cells the library would re-cluster if it compacted the row.
+    fn remember_fragile(&mut self, row: i64) {
+        let stable = self.stable_row(row);
+        let Some(line) = self.line_at(stable) else {
+            return;
+        };
+        let text = line.as_str().into_owned();
+        let cells = line.visible_cells().count();
+        let entry = FragileRow {
+            stable,
+            text,
+            cells,
+            line,
+        };
+        self.fragile.retain(|held| held.stable != stable);
+        if self.fragile.len() == MAX_FRAGILE_ROWS {
+            self.fragile.pop_front();
+        }
+        self.fragile.push_back(entry);
+    }
+
+    /// Puts back any remembered row the library has re-clustered, and keeps the rest current.
+    ///
+    /// A row is only put back when it still holds the same text and has fewer cells than it had,
+    /// which is exactly what compacting does to it. A row the application has rewritten holds
+    /// different text, so it is remembered again as it now is rather than undone.
+    fn repair_fragile(&mut self) {
+        if self.fragile.is_empty() {
+            return;
+        }
+        let mut fragile = core::mem::take(&mut self.fragile);
+        for held in &mut fragile {
+            let stable = isize::try_from(held.stable).unwrap_or(isize::MIN);
+            let screen = self.terminal.screen_mut();
+            let Some(phys) = screen.stable_row_to_phys(stable) else {
+                // The row has been evicted, so there is nothing to keep it for.
+                held.stable = i64::MIN;
+                continue;
+            };
+            let line = screen.line_mut(phys);
+            if *line.as_str() == held.text {
+                if line.visible_cells().count() < held.cells {
+                    *line = held.line.clone();
+                }
+            } else {
+                held.text = line.as_str().into_owned();
+                held.cells = line.visible_cells().count();
+                held.line = line.clone();
+            }
+        }
+        fragile.retain(|held| held.stable != i64::MIN);
+        self.fragile = fragile;
+    }
+
+    /// The stable identifier of a visible row.
+    fn stable_row(&self, row: i64) -> i64 {
+        i64::try_from(self.terminal.screen().visible_row_to_stable_row(row)).unwrap_or(0)
+    }
+
+    /// A copy of the row with this stable identifier, when it is still retained.
+    fn line_at(&self, stable: i64) -> Option<wezterm_term::Line> {
+        Self::line_of(&self.terminal, stable)
+    }
+
+    fn line_of(terminal: &Terminal, stable: i64) -> Option<wezterm_term::Line> {
+        let screen = terminal.screen();
+        let phys = screen.stable_row_to_phys(isize::try_from(stable).ok()?)?;
+        screen
+            .lines_in_phys_range(phys..phys + 1)
+            .into_iter()
+            .next()
     }
 
     /// Draws a text run as the profile's width model says it should look.
@@ -523,12 +620,22 @@ impl CanonicalGrid {
     fn print_cell(&mut self, base: &str, marks: &str) {
         let (_, row) = self.cursor_cell();
         let _ = self.terminal.screen_mut().get_cell(0, row);
+        let previous = self
+            .tail
+            .as_ref()
+            .and_then(|tail| tail.text.chars().next_back());
         let before = self.print_origin();
         self.terminal
             .perform_actions(vec![Action::PrintString(base.to_owned())]);
         self.tail = self.locate(base, before);
         if !marks.is_empty() {
             self.rejoin(marks);
+        }
+        let joins = previous
+            .zip(base.chars().next())
+            .is_some_and(|(previous, scalar)| crate::unicode::may_recluster(previous, scalar));
+        if joins && let Some(row) = self.tail.as_ref().map(|tail| tail.row) {
+            self.remember_fragile(row);
         }
     }
 

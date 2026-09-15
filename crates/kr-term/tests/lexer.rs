@@ -800,3 +800,37 @@ fn a_truncated_prelude_is_an_extension_whatever_follows_it() {
         );
     }
 }
+
+/// A row keeps its cells when it scrolls, which is when the library would recount them.
+#[test]
+fn a_row_keeps_its_cells_when_it_scrolls() {
+    for (text, cells) in [
+        ("\u{1f469}\u{200d}\u{1f4bb}X", 5u32),
+        ("\u{1100}\u{1100}ZX", 6),
+        ("\u{1f44d}\u{1f3fb}X", 5),
+    ] {
+        let mut engine = kr_term::engine::Engine::new(kr_term::engine::EngineConfig {
+            size: kr_term::budget::GridSize::new(20, 3),
+            ..kr_term::engine::EngineConfig::DEFAULT
+        })
+        .expect("engine");
+        engine.feed(format!("{text}\r\n").as_bytes(), 0);
+        engine.quiesce(0);
+        let live: u32 = engine.grid().visible_rows()[0]
+            .runs
+            .iter()
+            .map(|run| run.cells)
+            .sum();
+        assert_eq!(live, cells, "{text:?} on screen");
+
+        engine.feed(b"a\r\nb\r\nc\r\n", 0);
+        engine.quiesce(0);
+        let (oldest, _) = engine.grid().stable_range();
+        let scrolled: u32 = engine.grid().history_rows(oldest, 1)[0]
+            .runs
+            .iter()
+            .map(|run| run.cells)
+            .sum();
+        assert_eq!(scrolled, cells, "{text:?} after it scrolled");
+    }
+}

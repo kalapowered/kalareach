@@ -206,9 +206,13 @@ them in one call and the cell count follows the pinned model. Listing the joins 
 faster and wrong, because the list is longer than emoji and grows with the library; cutting at every
 cell costs nothing on ordinary output, because plain ASCII is not cut at all.
 
-The library also keeps a row in one of two representations, and reads a compact row by clustering
-its text again. A cell of the row is read back before every write, which converts the row to the
-representation that remembers where its cells are.
+The library also keeps a row in one of two representations and reads a compact row by clustering its
+text again, which would undo the cut. Two things answer that. A cell of the row is read back before
+every write, which converts a live row to the representation that remembers where its cells are. And
+a bounded copy is kept of any row that was written with a cell the clustering could join, so that a
+row compacted anyway is put back as it was. That copy is the exception to there being one store of
+state, and it is a narrow one: it holds at most 64 rows, only rows that were actually at risk, and it
+is used only to undo a change nothing asked for.
 
 Three rules keep the answer the same however the reads fall.
 
@@ -221,7 +225,13 @@ Three rules keep the answer the same however the reads fall.
    the cell again where it already is, with the mark on it. Nothing moves the cursor, nothing is
    printed and insert mode plays no part, so the marks cannot shift the cells beside it or wrap the
    row, and the width cannot change because a zero-width scalar adds none. Without this, quiescing
-   between two scalars would lose the mark.
+   between two scalars would lose the mark. The marks of a cell that arrived together go the same
+   way, so that both orders produce the same cell.
+
+The cell a mark joins has to still be the cell that was drawn: a resize reflows the rows and
+eviction moves them, so the write checks what is there first and drops the mark rather than
+overwriting whatever moved in. The write takes a sequence number of its own, so the row counts as
+changed and the mark reaches a client reading deltas.
 
 The result is checked by feeding every case one byte at a time, settling the screen after each byte,
 and requiring the same screen as the single-read answer.
@@ -295,7 +305,7 @@ pinned revision. All three need the same narrow published patch: a public access
 | `TerminalState::pending_wrap()` | Section 8 lists pending wrap among the restored state | The snapshot carries `None`; a reconnecting client re-derives it from the next character it places. At the bottom-right corner that character can change what scrolls, so this is a real gap and not a cosmetic one |
 | `TerminalState::saved_cursor()` as a shared reference, with the saved rendition and character sets among its public fields | Section 8 lists saved cursors among the restored state, and a saved cursor carrying only a position restores the wrong colours | The snapshot carries `None`; a restored session behaves as though nothing was saved until the application saves again |
 | `TerminalState::inactive_screen()` | Section 8 requires a restoration sequence to reproduce **both** buffer states, and the accessor the revision exposes returns whichever buffer is active | The snapshot carries the active buffer's rows and `None` for the other. A client that reconnects while a full-screen application is running gets that application's screen and no primary-buffer content until the application exits and the shell redraws |
-| `Line::compress_for_scrollback()` preserving the cell boundaries it was given | The compact row representation stores a row as one string and clusters that string again when the row is read, which joins adjacent scalars this model gives a cell each | A row keeps its cells while it is on screen. Once it scrolls it loses the columns that were reserved for joined scalars: the text is all still there and the row is narrower than it was. Rows without emoji sequences or Hangul jamo are unaffected, which is nearly all of them |
+| `TerminalState::restore_cursor()` leaving newline mode and the shift-out selection alone, and exposing newline mode for reading back | Restoring a cursor clears both in this revision, which xterm does not do, so a direct terminal following the same bytes ends up in a different mode | The profile applies the same rule so that there is one answer, and asks the attachment to project when that changes anything |
 
 The last one is worth being plain about. The worker does maintain both buffers, because the library
 holds both; what is missing is a way to read the one that is not showing. Copying the primary

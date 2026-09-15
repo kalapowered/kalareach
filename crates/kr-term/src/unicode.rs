@@ -84,6 +84,34 @@ pub fn leading_zero_width(text: &str) -> usize {
         .map_or(text.len(), |(index, _)| index)
 }
 
+/// Whether the library's clustering could join these two cells into one.
+///
+/// This is not what decides where the cells go: the text is cut at every cell whatever this says,
+/// so the screen is right either way. It decides only whether a row is worth keeping a copy of
+/// against the library compacting it, and the answer is no for almost every row.
+///
+/// The scalars that can join what is before them and still have a width of their own are the
+/// Hangul jamo and syllables, the regional indicators, the emoji modifiers, and anything after a
+/// zero-width joiner.
+#[must_use]
+pub fn may_recluster(previous: char, scalar: char) -> bool {
+    if previous == ZERO_WIDTH_JOINER {
+        return true;
+    }
+    let hangul = |value: char| {
+        let value = value as u32;
+        (0x1100..=0x11ff).contains(&value)
+            || (0xa960..=0xa97f).contains(&value)
+            || (0xd7b0..=0xd7ff).contains(&value)
+            || (0xac00..=0xd7a3).contains(&value)
+    };
+    let regional = |value: char| ('\u{1f1e6}'..='\u{1f1ff}').contains(&value);
+    if ('\u{1f3fb}'..='\u{1f3ff}').contains(&scalar) {
+        return true;
+    }
+    (hangul(previous) && hangul(scalar)) || (regional(previous) && regional(scalar))
+}
+
 /// How many cells `text` occupies under the pinned width model.
 ///
 /// The model is per scalar, so this sums the widths rather than asking the library what one cluster
@@ -167,11 +195,13 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          is cut at every cell, so the reducer never sees two of them in one call. Zero-width \
          scalars are left where they are, because folding those is exactly what the model asks \
          for.",
-        "The library keeps a row in one of two representations, and converts a row to the compact \
+        "The library keeps a row in one of two representations and converts a row to the compact \
          one when it scrolls. The compact one stores the row as a single string and works out \
-         where its cells are by clustering that string again, so a cell is read back before every \
-         write to keep the row in the representation that remembers. See the patch this still \
-         needs for rows that have scrolled.",
+         where its cells are by clustering that string again, which would undo the cut. Two things \
+         answer that: a cell of the row is read back before every write, which keeps a live row in \
+         the representation that remembers; and a bounded copy is kept of any row that was written \
+         with a cell the clustering could join, so that if the row is compacted anyway it is put \
+         back as it was.",
         "Raster graphics are disabled in configuration and no image sequence is ever forwarded, so \
          the library's sixel, iTerm2 and Kitty image paths stay unreachable.",
         "The library is built with a writer that accepts no bytes. Every reply comes from the \
@@ -211,15 +241,12 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
                       saved until the application saves again",
         },
         RequiredPatch {
-            state: "Line::compress_for_scrollback() preserving the cell boundaries it was given, \
-                    rather than re-clustering the row's text when it is read",
-            reason: "the pinned width model gives a cell to every scalar that has a width of its \
-                     own, and the compact row representation joins adjacent scalars that the \
-                     library's own clustering would join",
-            interim: "a row keeps its cells while it is on screen, and loses the columns reserved \
-                      for joined scalars once it scrolls: the text is all still there and the row \
-                      is narrower than it was. Rows without emoji sequences, Hangul jamo or other \
-                      joined scalars are unaffected, which is nearly all of them",
+            state: "TerminalState::restore_cursor() leaving newline mode and the shift-out \
+                    selection alone, and exposing newline mode for reading back",
+            reason: "restoring a cursor clears both in this revision, which xterm does not do, so \
+                     a direct terminal following the same bytes ends up in a different mode",
+            interim: "the profile applies the same rule so that there is one answer, and asks the \
+                      attachment to project when it changes anything",
         },
         RequiredPatch {
             state: "TerminalState::inactive_screen(), the buffer that is not active",
