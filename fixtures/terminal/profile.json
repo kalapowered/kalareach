@@ -35,7 +35,8 @@
       "The revision accepts already-parsed actions, so the engine parses once and the library never re-frames a byte. That is what makes a second parse unnecessary rather than merely discouraged.",
       "The width model is configuration, not a fork: generation 9 with narrow ambiguous characters is exactly the pinned kr-vt/1 model.",
       "In-band resize and DECCOLM never reach the library, because the policy layer classifies them before the reducer sees anything. The library's own support for them is therefore not part of the profile.",
-      "The library's cluster reducer runs on ordinary text and is more modern than the pinned width model: it folds an emoji sequence into one cell where this model gives each scalar with a width of its own a cell of its own. The qualified change is in what the library is given, not in the library: a text run is cut before every scalar the reducer would fold, so the two never arrive in the same call and the cell count follows the pinned model. Zero-width scalars are left where they are, because folding those is exactly what the model asks for.",
+      "The library's cluster reducer runs on ordinary text and is more modern than the pinned width model: it folds emoji sequences, Hangul jamo and more into one cell where this model gives each scalar with a width of its own a cell of its own. The qualified change is in what the library is given rather than in the library: a run that is not plain ASCII is cut at every cell, so the reducer never sees two of them in one call. Zero-width scalars are left where they are, because folding those is exactly what the model asks for.",
+      "The library keeps a row in one of two representations, and converts a row to the compact one when it scrolls. The compact one stores the row as a single string and works out where its cells are by clustering that string again, so a cell is read back before every write to keep the row in the representation that remembers. See the patch this still needs for rows that have scrolled.",
       "Raster graphics are disabled in configuration and no image sequence is ever forwarded, so the library's sixel, iTerm2 and Kitty image paths stay unreachable.",
       "The library is built with a writer that accepts no bytes. Every reply comes from the query broker, and the fixtures fail if the library ever writes one.",
       "A sequence the library marks unspecified, at any nesting, is not applied and not forwarded. The mapping is therefore checked by what the library does with it rather than by whether it parsed.",
@@ -52,6 +53,11 @@
         "interim": "the snapshot carries None; a restored session behaves as though nothing was saved until the application saves again",
         "reason": "section 8 lists saved cursors among the state a snapshot restores, and a saved cursor that carries only a position restores the wrong colours",
         "state": "TerminalState::saved_cursor() as a shared reference, with the saved rendition and character sets among its public fields"
+      },
+      {
+        "interim": "a row keeps its cells while it is on screen, and loses the columns reserved for joined scalars once it scrolls: the text is all still there and the row is narrower than it was. Rows without emoji sequences, Hangul jamo or other joined scalars are unaffected, which is nearly all of them",
+        "reason": "the pinned width model gives a cell to every scalar that has a width of its own, and the compact row representation joins adjacent scalars that the library's own clustering would join",
+        "state": "Line::compress_for_scrollback() preserving the cell boundaries it was given, rather than re-clustering the row's text when it is read"
       },
       {
         "interim": "the snapshot carries the active buffer and None for the other; a client that reconnects during a full-screen application has no primary-buffer content until that application exits and the shell redraws",

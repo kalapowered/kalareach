@@ -161,12 +161,17 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          them before the reducer sees anything. The library's own support for them is therefore \
          not part of the profile.",
         "The library's cluster reducer runs on ordinary text and is more modern than the pinned \
-         width model: it folds an emoji sequence into one cell where this model gives each scalar \
-         with a width of its own a cell of its own. The qualified change is in what the library is \
-         given, not in the library: a text run is cut before every scalar the reducer would fold, \
-         so the two never arrive in the same call and the cell count follows the pinned model. \
-         Zero-width scalars are left where they are, because folding those is exactly what the \
-         model asks for.",
+         width model: it folds emoji sequences, Hangul jamo and more into one cell where this \
+         model gives each scalar with a width of its own a cell of its own. The qualified change \
+         is in what the library is given rather than in the library: a run that is not plain ASCII \
+         is cut at every cell, so the reducer never sees two of them in one call. Zero-width \
+         scalars are left where they are, because folding those is exactly what the model asks \
+         for.",
+        "The library keeps a row in one of two representations, and converts a row to the compact \
+         one when it scrolls. The compact one stores the row as a single string and works out \
+         where its cells are by clustering that string again, so a cell is read back before every \
+         write to keep the row in the representation that remembers. See the patch this still \
+         needs for rows that have scrolled.",
         "Raster graphics are disabled in configuration and no image sequence is ever forwarded, so \
          the library's sixel, iTerm2 and Kitty image paths stay unreachable.",
         "The library is built with a writer that accepts no bytes. Every reply comes from the \
@@ -204,6 +209,17 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
                      saved cursor that carries only a position restores the wrong colours",
             interim: "the snapshot carries None; a restored session behaves as though nothing was \
                       saved until the application saves again",
+        },
+        RequiredPatch {
+            state: "Line::compress_for_scrollback() preserving the cell boundaries it was given, \
+                    rather than re-clustering the row's text when it is read",
+            reason: "the pinned width model gives a cell to every scalar that has a width of its \
+                     own, and the compact row representation joins adjacent scalars that the \
+                     library's own clustering would join",
+            interim: "a row keeps its cells while it is on screen, and loses the columns reserved \
+                      for joined scalars once it scrolls: the text is all still there and the row \
+                      is narrower than it was. Rows without emoji sequences, Hangul jamo or other \
+                      joined scalars are unaffected, which is nearly all of them",
         },
         RequiredPatch {
             state: "TerminalState::inactive_screen(), the buffer that is not active",

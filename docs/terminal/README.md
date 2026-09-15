@@ -71,13 +71,31 @@ highlight mouse tracking, which the profile does not advertise. One parameter is
 than one is the tracking request, which is `X`.
 
 **The window-manipulation row splits three ways.** Geometry and window-state reports (`11`, `13`,
-`14`, `15`, `16`, `18`, `19`) are `Q`. The title stack (`22`, `23`) is `M`. Everything else asks for
-a physical window change and is `X`, because rows and columns belong to the size owner.
+`14`, `15`, `16`, `18`, `19`) are `Q`. The title stack (`22`, `23`) is `M`, and its second parameter
+names which title: `0` for both, `1` for the icon name, `2` for the window title, and nothing else.
+Everything else asks for a physical window change and is `X`, because rows and columns belong to the
+size owner.
+
+A selective push saves only the title it names, so a saved title and an absent one are different
+things: popping a title nothing saved leaves the current one alone rather than clearing it.
+
+**A parameter that selects an operation is never reduced.** Counts and coordinates are bounded by
+what the grid can act on, because a cursor movement cannot do more than fill the screen. An erase or
+tab-clear parameter is not a count: at every value it is a different operation, so reducing it would
+quietly do something else. Those values are checked against their own set instead, and a value
+outside it is `X`.
 
 **Keyboard negotiation is checked before it travels.** Only `modifyOtherKeys` resource 4 at level 0,
 1 or 2 is qualified, and only the Kitty keyboard flags in the profile's subset. `CSI > 16 u` asks
 for text association, which the input encoders cannot produce, so it is `X` rather than a flag the
-application believes it got.
+application believes it got. A colon sublist belongs to ordinary SGR and nowhere else, so
+`CSI > 4 : 99 m` is not a level.
+
+What is qualified is a mode, and a mode is forwarded live. A direct terminal that did not see the
+negotiation would keep sending the old encoding, which is exactly the mismatch the negotiation
+exists to prevent. The profile still tracks it, and still keeps it away from the canonical grid,
+which has nothing to do with key encodings. Each screen buffer keeps its own Kitty stack, so a
+full-screen application's negotiation cannot leak into the shell's when it exits.
 
 **DECSCA is not classified as display.** Nothing in the profile implements selective erase, so the
 attribute is `X` and DA1 does not claim `6`. Advertising a capability and then dropping it is worse
@@ -85,6 +103,20 @@ than not advertising it.
 
 **Only qualified colour selectors are colours.** The Tektronix colours (OSC 15, 16, 18 and their
 resets) have no canonical state here, so asking about one or setting one is `X`.
+
+## Controls inside a sequence
+
+A terminal performs a C0 control where it appears, even in the middle of a control sequence, and
+carries on collecting the sequence around it. So does this engine: the controls are kept with the
+sequence they were found in, performed in order before it, and each one is decided on its own, so a
+bell inside a cursor movement still reaches the lease holder and a line feed still moves the screen.
+The sequence itself then happens as though the controls had not been there.
+
+The bytes stop there. Forwarding them would perform each control a second time, once by this engine
+and once by the terminal reading the same bytes, and a repainted screen is a smaller price than two
+bells. NUL and DEL are the exception both ways: every terminal discards them, so they are discarded
+here and the sequence still travels. A sequence carrying more than eight controls is an extension,
+because at that point it is not a sequence with controls in it.
 
 ## The byte policy
 
@@ -167,12 +199,16 @@ to the cell before it. A multi-scalar emoji sequence therefore takes one cell pe
 width: U+1F469 U+200D U+1F4BB is four cells, not two, and a thumbs-up with a skin-tone modifier is
 four, not two. The profile does not advertise mode 2027 and does not pretend to implement it.
 
-The grid library's own cluster reducer is more modern than that. Three joins matter, because in each
-the second scalar has a width of its own: a scalar after a zero-width joiner, an emoji modifier, and
-the second half of a regional-indicator pair. The qualified change is in what the library is given
-rather than in the library: a text run is cut before each of those, so the two scalars never arrive
-in the same call and the cell count follows the pinned model. Cutting costs nothing on ordinary
-output, because every joining scalar is outside ASCII.
+The grid library's own cluster reducer is more modern than that: it folds emoji sequences, Hangul
+jamo and more into single cells. The qualified change is in what the library is given rather than in
+the library: a run that is not plain ASCII is cut at every cell, so the reducer never sees two of
+them in one call and the cell count follows the pinned model. Listing the joins to cut at would be
+faster and wrong, because the list is longer than emoji and grows with the library; cutting at every
+cell costs nothing on ordinary output, because plain ASCII is not cut at all.
+
+The library also keeps a row in one of two representations, and reads a compact row by clustering
+its text again. A cell of the row is read back before every write, which converts the row to the
+representation that remembers where its cells are.
 
 Three rules keep the answer the same however the reads fall.
 
@@ -181,9 +217,11 @@ Three rules keep the answer the same however the reads fall.
 2. `Engine::quiesce` releases that cell, and the session loop calls it when a read returns nothing.
    A snapshot calls it itself and hands back the output the settling produced, so a settled screen
    is what the snapshot describes and a direct attachment still receives those bytes.
-3. A combining mark that arrives *after* the cell has been drawn joins it anyway: the grid draws the
-   cell again with the mark on it, in place, which the width model guarantees cannot move anything
-   beside it. Without this, quiescing between two scalars would lose the mark.
+3. A combining mark that arrives *after* the cell has been drawn joins it anyway: the grid writes
+   the cell again where it already is, with the mark on it. Nothing moves the cursor, nothing is
+   printed and insert mode plays no part, so the marks cannot shift the cells beside it or wrap the
+   row, and the width cannot change because a zero-width scalar adds none. Without this, quiescing
+   between two scalars would lose the mark.
 
 The result is checked by feeding every case one byte at a time, settling the screen after each byte,
 and requiring the same screen as the single-read answer.
@@ -257,6 +295,7 @@ pinned revision. All three need the same narrow published patch: a public access
 | `TerminalState::pending_wrap()` | Section 8 lists pending wrap among the restored state | The snapshot carries `None`; a reconnecting client re-derives it from the next character it places. At the bottom-right corner that character can change what scrolls, so this is a real gap and not a cosmetic one |
 | `TerminalState::saved_cursor()` as a shared reference, with the saved rendition and character sets among its public fields | Section 8 lists saved cursors among the restored state, and a saved cursor carrying only a position restores the wrong colours | The snapshot carries `None`; a restored session behaves as though nothing was saved until the application saves again |
 | `TerminalState::inactive_screen()` | Section 8 requires a restoration sequence to reproduce **both** buffer states, and the accessor the revision exposes returns whichever buffer is active | The snapshot carries the active buffer's rows and `None` for the other. A client that reconnects while a full-screen application is running gets that application's screen and no primary-buffer content until the application exits and the shell redraws |
+| `Line::compress_for_scrollback()` preserving the cell boundaries it was given | The compact row representation stores a row as one string and clusters that string again when the row is read, which joins adjacent scalars this model gives a cell each | A row keeps its cells while it is on screen. Once it scrolls it loses the columns that were reserved for joined scalars: the text is all still there and the row is narrower than it was. Rows without emoji sequences or Hangul jamo are unaffected, which is nearly all of them |
 
 The last one is worth being plain about. The worker does maintain both buffers, because the library
 holds both; what is missing is a way to read the one that is not showing. Copying the primary
@@ -326,13 +365,30 @@ sends will change it.
 Pixel geometry is reported as zero. Raster graphics are disabled, so nothing needs a pixel size, and
 inventing one would be worse than reporting none.
 
+The palette is the session's. Colour requests never reach the grid library, so there is one palette
+and one thing that answers questions about it.
+
 A colour request may mix mutations with questions: `OSC 4 ; 1 ; #ff0000 ; 2 ; ?` sets one colour and
-asks about another. Both halves happen. A dynamic-colour request addresses consecutive selectors, so
-`OSC 10 ; fg ; bg` sets both.
+asks about another. The operations are executed once, in the order they were written, and each
+question is answered from the palette as it stands at that point in the request, so
+`OSC 4 ; 1 ; ? ; 1 ; #ff0000 ; 1 ; ?` gives two different answers. A request that both asks and
+changes stops here and asks the attachment to project, because the change went into the canonical
+palette and a physical terminal never saw it. A dynamic-colour request addresses consecutive
+selectors, so `OSC 10 ; fg ; bg` sets both.
+
+Every field of a request has to be a colour this palette understands or a question. A field that is
+neither is not a smaller request: the canonical palette would not change while a physical terminal's
+might, and the two would disagree about the colour of everything drawn afterwards. So the whole
+request is an extension.
 
 XTGETTCAP repeats the name it was asked about, so a name is validated before it is repeated: hex
 only, bounded length, and printable. Anything else gets the bare failure reply. An application must
 not be able to choose the bytes that travel on the trusted lane.
+
+A reply's subject is what decides whether a newer answer may replace a waiting one while the lane is
+shedding load, and for a capability or setting report the subject is the name itself rather than a
+hash of it. A hash collision there is not a slow lookup: it lets one capability's answer stand in
+for another's, and the application reads a reply to a question it never asked.
 
 ### The response lane
 
@@ -390,7 +446,10 @@ with one that was left out. An OSC 9 with an unrecognised numeric subcommand, an
 `notify`, an OSC 99 without a payload, an OSC 9 progress report whose state is outside 0 to 4 or is
 not a number at all, a progress percentage above 100: all `X`. OSC 99 metadata is checked key by
 key, and the qualified keys are the identifier, the payload part, the done and encoding flags, the
-urgency and the display condition; anything else, including a notification action, is `X`.
+urgency and the display condition; anything else, including a notification action, is `X`. Those
+keys are acted on rather than merely allowed: `p` says whether the payload is the title or the body
+and `e=1` says it is base64. A notification that says more of it is coming (`d=0`) is `X`, because
+this profile delivers a notification when it arrives and nothing would assemble the parts.
 
 OSC 52 has two bounds. The encoded string is bounded at 1 MiB in the lexer, so a larger one is
 discarded as an oversized control string and never becomes a clipboard operation at all. Inside that
@@ -448,18 +507,26 @@ checkpoint.
 
 ### Deltas and history
 
-A delta names the cursor it continues from, and the engine keeps a window of the last 64 such
-points. A base outside the window, or a base from before the projection was reset, is refused and
-the client takes a fresh snapshot instead, which is cheaper than reasoning about what it might have
-missed. Inside the window, the delta carries the rows that actually changed since that point, the
-modes and title that changed with them, and the palette or dimensions when either moved.
-`Engine::acknowledge` tells the engine a client has caught up, so a change is carried once rather
-than in every delta until the next snapshot.
+A delta names the state it continues from: the cursor **and** the projection generation. Both,
+because a projection reset can happen without a byte arriving, so the same cursor can name two
+different screens and a client that named only the cursor would be handed a delta against a screen
+it never saw. A reset drops the bases taken before it rather than refusing them one at a time, and a
+geometry change is one, because every row was laid out for the old width and reflows.
+
+The engine keeps a window of the last 64 bases. A base outside the window, or from another
+generation, is refused and the client takes a fresh snapshot instead, which is cheaper than
+reasoning about what it might have missed. Inside the window, the delta carries the rows that
+actually changed since that point, the modes, title, keyboard negotiation, palette and dimensions
+that changed with them, and the presentation state a repaint needs: margins, the current rendition,
+the tab stops, the character sets and the hyperlink ranges of the rows it carries.
 
 A history page carries at most 1,000 rows and at most 1 MiB, whichever binds first, and states its
 oldest retained row and whether anything below it has been evicted. The size counts everything the
 page carries, including hyperlink targets and per-run bookkeeping, because a page of short heavily
-linked rows would otherwise pass the bound several times over.
+linked rows would otherwise pass the bound several times over. Rows are built a batch at a time
+rather than all at once: the rows that do not fit are rows nobody asked to have built, and rows
+carrying long hyperlink targets can cost many times the page bound before the first byte is
+counted.
 
 ### Bounds
 
@@ -550,6 +617,12 @@ lives here is the pinned data and the responder that answers from it.
 A probe is a short, bounded, synchronous conversation with the terminal a person is sitting in front
 of. It happens once, before the application gets any input, and everything about it is designed so
 that no answer can arrive later and be mistaken for something the person typed.
+
+Every answer is checked against the form it should have before it is recorded. A device-attributes
+reply names at least one attribute, a mode report carries one of the five defined statuses, a
+keyboard reply carries flags the profile advertises, and a version reply is not empty. A reply that
+does not fit its form is not an answer, so the question stays unanswered and the attach fails: a
+capability record built from a reply nobody can read outlives the attach that built it.
 
 `PROBE_SET` lists every question a probe may ask: terminal identity, foreground, background, Kitty
 keyboard flags, synchronised output, and then primary device attributes. DA1 is last because every

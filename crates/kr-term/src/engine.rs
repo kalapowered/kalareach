@@ -201,6 +201,9 @@ const ROW_CACHE_INTERVAL: u32 = 64;
 /// count says.
 const ROW_CACHE_ROW_STEP: usize = 32;
 
+/// How many rows a history page builds at a time before checking its byte bound.
+const PAGE_BATCH_ROWS: usize = 32;
+
 /// The terminal engine for one session.
 #[derive(Debug)]
 pub struct Engine {
@@ -1288,24 +1291,37 @@ impl Engine {
         let mut rows = Vec::new();
         let mut bytes = 0usize;
         let mut truncated = false;
-        for mut row in self.grid.history_rows(from, limits.history_page_rows) {
-            let mut row_bytes = encoded_row_bytes(&row);
-            if row_bytes > limits.history_page_bytes {
-                // One row larger than a whole page still has to be representable, or a reader
-                // could never get past it. It is degraded explicitly rather than dropped.
-                if !rows.is_empty() {
-                    truncated = true;
-                    break;
-                }
-                truncate_row(&mut row, limits.history_page_bytes);
-                row_bytes = encoded_row_bytes(&row);
-            }
-            if bytes + row_bytes > limits.history_page_bytes {
-                truncated = true;
+        let mut next = from;
+        // Rows are taken a batch at a time rather than all at once. A page is bounded in bytes as
+        // well as in rows, and the rows that do not fit are rows nobody asked to have built: rows
+        // carrying long hyperlink targets can cost many times the page bound before the first byte
+        // of the page is counted.
+        'page: while rows.len() < limits.history_page_rows {
+            let want = PAGE_BATCH_ROWS.min(limits.history_page_rows - rows.len());
+            let batch = self.grid.history_rows(next, want);
+            if batch.is_empty() {
                 break;
             }
-            bytes += row_bytes;
-            rows.push(row);
+            next = next.saturating_add(i64::try_from(batch.len()).unwrap_or(0));
+            for mut row in batch {
+                let mut row_bytes = encoded_row_bytes(&row);
+                if row_bytes > limits.history_page_bytes {
+                    // One row larger than a whole page still has to be representable, or a reader
+                    // could never get past it. It is degraded explicitly rather than dropped.
+                    if !rows.is_empty() {
+                        truncated = true;
+                        break 'page;
+                    }
+                    truncate_row(&mut row, limits.history_page_bytes);
+                    row_bytes = encoded_row_bytes(&row);
+                }
+                if bytes + row_bytes > limits.history_page_bytes {
+                    truncated = true;
+                    break 'page;
+                }
+                bytes += row_bytes;
+                rows.push(row);
+            }
         }
         let (oldest, newest) = self.grid.stable_range();
         let last = from.saturating_add(i64::try_from(rows.len()).unwrap_or(0));
