@@ -1,0 +1,34 @@
+# Local workspace files
+AGENTS*.md
+agents*.md
+CLAUDE*.md
+claude*.md
+GEMINI*.md
+gemini*.md
+.claude/
+.codex/
+.agents/
+.gemini/
+.cursor/
+.cursorrules
+.windsurf/
+.windsurfrules
+.aider*
+.clinerules
+**/.github/copilot-instructions.md
+**/.github/instructions/
+**/.github/prompts/
+
+# Build output and dependencies
+node_modules/
+target/
+dist/
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
