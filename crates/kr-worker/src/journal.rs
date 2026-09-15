@@ -167,6 +167,10 @@ impl Journal {
                  CREATE TABLE IF NOT EXISTS closure (
                      session_id BLOB PRIMARY KEY,
                      record     BLOB NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS session (
+                     session_id BLOB PRIMARY KEY,
+                     summary    BLOB NOT NULL
                  );",
             )
             .map_err(unavailable)?;
@@ -211,6 +215,10 @@ impl Journal {
             .execute_batch(
                 "BEGIN;
                  ALTER TABLE receipts ADD COLUMN intent BLOB;
+                 CREATE TABLE IF NOT EXISTS session (
+                     session_id BLOB PRIMARY KEY,
+                     summary    BLOB NOT NULL
+                 );
                  UPDATE schema_version SET version = 2;
                  COMMIT;",
             )
@@ -530,22 +538,6 @@ impl Journal {
         )
     }
 
-    /// Records the authoritative outcome of a dispatched action.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transition is not permitted or the write fails.
-    pub fn complete(
-        &mut self,
-        actor_id: ActorId,
-        action_id: ActionId,
-        state: ReceiptState,
-        error: Option<ProtocolError>,
-        now_ms: TimestampMs,
-    ) -> Result<Receipt> {
-        self.advance(actor_id, action_id, state, None, error, now_ms)
-    }
-
     /// Records a rejection before dispatch.
     ///
     /// # Errors
@@ -742,34 +734,6 @@ impl Journal {
         Ok(removed)
     }
 
-    /// Stores the result a duplicate request must receive back.
-    ///
-    /// A retry of `session.attach` has to be given the attachment the first request allocated, not
-    /// a second one. Keeping the result beside the receipt is what makes that possible.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
-    pub fn record_result(
-        &mut self,
-        actor_id: &ActorId,
-        action_id: ActionId,
-        result: &[u8],
-    ) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO results (actor_id, action_id, result) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (actor_id, action_id) DO UPDATE SET result = excluded.result",
-                params![
-                    actor_id.as_str(),
-                    action_id.get().as_bytes().as_slice(),
-                    result
-                ],
-            )
-            .map_err(unavailable)?;
-        Ok(())
-    }
-
     /// Reads the retained result of an action.
     ///
     /// # Errors
@@ -784,6 +748,80 @@ impl Journal {
             )
             .optional()
             .map_err(unavailable)
+    }
+
+    /// Opens a journal for reading only.
+    ///
+    /// A controller reads a closed session's journal to recover what the worker recorded: the
+    /// closure it wrote, and the session it described. Opening read-only is what makes that safe
+    /// to do beside a store the worker may still be finishing with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the file cannot be opened or is not a
+    /// journal this build reads.
+    pub fn open_read_only(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(unavailable)?;
+        let recorded: i64 = connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .map_err(unavailable)?;
+        if recorded != SCHEMA_VERSION {
+            return Err(unavailable_detail_owned(format!(
+                "this journal is at schema version {recorded}; this build reads {SCHEMA_VERSION}"
+            )));
+        }
+        Ok(Self { connection })
+    }
+
+    /// Records what the session is, so a reader can describe it after the worker has gone.
+    ///
+    /// Without this the only thing left of a closed session is its closure record, and a summary
+    /// rebuilt from that alone loses the shell it ran, the directory it ran in and when it started.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn record_session(&mut self, summary: &kr_protocol::session::SessionSummary) -> Result<()> {
+        let encoded = kr_cbor::to_canonical_vec(summary)
+            .map_err(|error| unavailable_detail_owned(error.to_string()))?;
+        self.connection
+            .execute(
+                "INSERT INTO session (session_id, summary) VALUES (?1, ?2)
+                 ON CONFLICT (session_id) DO UPDATE SET summary = excluded.summary",
+                params![summary.session_id.get().as_bytes().as_slice(), encoded],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Reads the session a journal describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn read_session(
+        &self,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Result<Option<kr_protocol::session::SessionSummary>> {
+        let encoded: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT summary FROM session WHERE session_id = ?1",
+                params![session_id.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(unavailable)?;
+        encoded
+            .map(|bytes| {
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                    .map_err(|error| unavailable_detail_owned(error.to_string()))
+            })
+            .transpose()
     }
 
     /// Records the session's final closure.
@@ -1078,10 +1116,11 @@ mod tests {
             .resolve_unfinished_dispatches(TimestampMs::new(2_000))
             .expect("resolves");
         let reconciled = journal
-            .complete(
+            .settle(
                 actor(),
                 action_id_from([6; 16]),
                 ReceiptState::Applied,
+                None,
                 None,
                 TimestampMs::new(3_000),
             )

@@ -375,6 +375,28 @@ impl Controller {
         self.generation
     }
 
+    /// Tells every worker holding a close for this action that the caller has its acceptance.
+    ///
+    /// The worker cannot know when the daemon finished passing the reply on, and it must not
+    /// signal a process group whose command is still waiting to read its own answer.
+    async fn confirm_delivery(&self, action_id: kr_protocol::ids::ActionId) {
+        let links: Vec<Arc<tokio::sync::Mutex<Option<LocalClient>>>> = self
+            .connections
+            .lock()
+            .await
+            .values()
+            .map(Arc::clone)
+            .collect();
+        for link in links {
+            let mut held = link.lock().await;
+            if let Some(client) = held.as_mut()
+                && client.confirm_delivery(action_id).await.is_err()
+            {
+                *held = None;
+            }
+        }
+    }
+
     /// Announces the environment's current authority revision to every worker it knows about.
     ///
     /// A revocation is not complete when the daemon records it. It is complete for a worker when
@@ -959,7 +981,8 @@ impl Controller {
                 }
                 ControlMessage::Request(request) if negotiated => self.read_method(&request).await,
                 ControlMessage::Mutation(mutation) if negotiated => {
-                    match mutation.method.method() {
+                    let confirm = mutation.action_id;
+                    let reply = match mutation.method.method() {
                         Some(method) => match self.check_envelope(&window, &mutation, method) {
                             Ok(deadline) => {
                                 self.write_method(
@@ -981,7 +1004,14 @@ impl Controller {
                             ErrorCode::PermissionDenied,
                             "the method is not in the registry",
                         ),
+                    };
+                    // The acceptance reaches the caller here. A worker that is holding a close for
+                    // this action learns that it has, and only then starts signalling.
+                    if writer.write_message(&reply).await.is_err() {
+                        break;
                     }
+                    self.confirm_delivery(confirm).await;
+                    continue;
                 }
                 _ => error_reply(
                     RequestId::new(0),
@@ -1149,15 +1179,16 @@ impl Controller {
             }
         }
         if params.include_closed {
+            let mut closed = Vec::new();
             let registry = self.registry.lock().await;
             for reservation in registry.closed_reservations()? {
                 if let Some(closure) = registry.closure(reservation.session_id)? {
-                    sessions.push(closed_summary(
-                        &closure,
-                        self.paths.environment_id(),
-                        reservation.display_number,
-                    ));
+                    closed.push((closure, reservation.display_number));
                 }
+            }
+            drop(registry);
+            for (closure, display_number) in closed {
+                sessions.push(self.closed_session(&closure, display_number).await);
             }
         }
         sessions.sort_by_key(|session| session.display_number.get());
@@ -1202,7 +1233,7 @@ impl Controller {
             Some(closure) => {
                 let display = display.unwrap_or(kr_protocol::session::DisplayNumber::new(0));
                 encode(&SessionReadResult {
-                    session: closed_summary(&closure, self.paths.environment_id(), display),
+                    session: self.closed_session(&closure, display).await,
                     endpoint: Nullable::null(),
                 })
             }
@@ -1363,11 +1394,9 @@ impl Controller {
         drop(registry);
         match closure {
             Some(closure) => encode(&SessionCreateResult {
-                session: closed_summary(
-                    &closure,
-                    self.paths.environment_id(),
-                    reservation.display_number,
-                ),
+                session: self
+                    .closed_session(&closure, reservation.display_number)
+                    .await,
                 // A closed session has no endpoint to attach to, which the reply says rather than
                 // handing back a path that leads nowhere.
                 endpoint: Nullable::null(),
@@ -1525,6 +1554,16 @@ impl Controller {
         if let Some(existing) = self.registry.lock().await.closure(session_id)? {
             return Ok(existing);
         }
+        // The worker's own journal is the authority on how its session ended. It recorded the
+        // root's exit status, what it stopped and how much of that it could account for; a record
+        // written from outside knows none of those. This is read only after the worker is
+        // confirmed gone, so nothing is still writing to it.
+        if let Some(recovered) = self.recovered_closure(session_id) {
+            self.retire(&recovered).await?;
+            return Ok(recovered);
+        }
+        // Nothing authoritative survived. What is written instead says so: the coverage is
+        // incomplete and the root's result is absent rather than invented.
         let record = ClosureRecord {
             session_id,
             session_epoch: SessionEpoch::V1,
@@ -1533,7 +1572,7 @@ impl Controller {
             root_signal: Nullable::null(),
             terminated: vec![kr_protocol::session::TerminatedProcess {
                 identity: identity.clone(),
-                name: Nullable::some("kr-worker".to_owned()),
+                name: Nullable::some("the session's worker".to_owned()),
                 forced: false,
             }],
             surviving: Vec::new(),
@@ -1545,6 +1584,41 @@ impl Controller {
         };
         self.retire(&record).await?;
         Ok(record)
+    }
+
+    /// Reads the closure a worker wrote for itself, when one survived it.
+    fn recovered_closure(&self, session_id: SessionId) -> Option<ClosureRecord> {
+        let path = self.paths.journal_database(session_id);
+        let journal = kr_worker::journal::Journal::open_read_only(&path).ok()?;
+        journal.read_closure(session_id).ok().flatten()
+    }
+
+    /// Reads the session a worker described, when its journal survived it.
+    fn recovered_summary(&self, session_id: SessionId) -> Option<SessionSummary> {
+        let path = self.paths.journal_database(session_id);
+        let journal = kr_worker::journal::Journal::open_read_only(&path).ok()?;
+        journal.read_session(session_id).ok().flatten()
+    }
+
+    /// Describes a closed session from what its worker recorded, or from what is left.
+    async fn closed_session(
+        &self,
+        closure: &ClosureRecord,
+        display_number: kr_protocol::session::DisplayNumber,
+    ) -> SessionSummary {
+        // The worker recorded what its session was. Using it keeps the shell, the directory, the
+        // geometry and the creation time a person sees after the session has closed.
+        self.recovered_summary(closure.session_id).map_or_else(
+            || closed_summary(closure, self.paths.environment_id(), display_number),
+            |mut summary| {
+                summary.state = SessionState::Closed;
+                summary.attachment_count = U64::ZERO;
+                summary.application_state = Nullable::null();
+                summary.root_process = Nullable::null();
+                summary.closure = Nullable::some(closure.clone());
+                summary
+            },
+        )
     }
 
     /// Records a closed session, removes its descriptor and forgets its key.

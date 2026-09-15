@@ -24,6 +24,9 @@ pub const READ_QUEUE_DEPTH: usize = 64;
 /// How often the root shell's status is checked, independently of the terminal.
 pub const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How often a closing session is asked whether its processes have stopped.
+pub const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// A running session and the tasks around it.
 #[derive(Debug)]
 pub struct SessionRuntime {
@@ -126,20 +129,38 @@ impl SessionRuntime {
         // restarts the shell.
         let monitor_session = Arc::clone(&session);
         let monitor_closed = Arc::clone(&closed);
+        let monitor_input = input_sender.clone();
+        let monitor_wake = Arc::clone(&wake);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(CHILD_POLL_INTERVAL).await;
-                let ended = {
+                let initiated = {
                     let Ok(mut session) = monitor_session.lock() else {
                         break;
                     };
                     if session.state() == SessionState::Closed {
                         break;
                     }
+                    // The set of processes the session owns is built up while it runs. One that
+                    // starts and ends between two closures would otherwise never be recorded.
+                    session.observe_owned();
                     session.poll_root_exit()
                 };
-                if ended {
-                    monitor_closed.notify_waiters();
+                if initiated {
+                    // A root shell that ended on its own goes through the same sequence a
+                    // requested close does, so descendants are still stopped and output is still
+                    // drained before the record is written.
+                    let runtime = SessionRuntime {
+                        session: Arc::clone(&monitor_session),
+                        input: monitor_input.clone(),
+                        wake: Arc::clone(&monitor_wake),
+                        closed: Arc::clone(&monitor_closed),
+                    };
+                    CloseGate {
+                        runtime: Arc::new(runtime),
+                        initiated: true,
+                    }
+                    .release();
                     break;
                 }
             }
@@ -262,6 +283,13 @@ impl SessionRuntime {
     }
 }
 
+/// How long a worker waits for a proxy to confirm it delivered the acceptance.
+///
+/// A close that was admitted happens. Waiting for confirmation is what stops the requester's
+/// process group being signalled before it has read its own answer; waiting for it forever would
+/// let a proxy that went away leave a session closing and never closed.
+pub const ACCEPTANCE_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The right to start a session's termination sequence.
 ///
 /// Holding one means a close has been admitted and nothing has been signalled yet.
@@ -272,9 +300,28 @@ pub struct CloseGate {
 }
 
 impl CloseGate {
+    /// Releases the gate when a proxy confirms delivery, or when the wait for it runs out.
+    ///
+    /// The requester of a proxied close is not the peer this worker replied to: the daemon still
+    /// has to pass the acceptance on. Signalling before that would stop the very command that is
+    /// waiting to read its answer.
+    #[must_use]
+    pub fn release_on_delivery(self, timeout: std::time::Duration) -> PendingDelivery {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            // Either answer releases the gate. A confirmation means the requester has its
+            // acceptance; the deadline means nobody is going to confirm, and the close still
+            // happens, because it was admitted.
+            let _ = tokio::time::timeout(timeout, receiver).await;
+            self.release();
+        });
+        PendingDelivery { sender }
+    }
+
     /// Starts the grace period, the forced stop and the drain.
     ///
-    /// Call this only after the acceptance has been written to the requester.
+    /// Call this only after the acceptance has reached the requester, or after it has become clear
+    /// that it will not.
     pub fn release(self) {
         if !self.initiated {
             return;
@@ -285,7 +332,22 @@ impl CloseGate {
                 let mut session = runtime.session();
                 let _ = session.request_stop();
             }
-            tokio::time::sleep(GRACE_PERIOD).await;
+            // The grace period is an allowance, not a delay. A session whose processes have all
+            // stopped moves on immediately; one that still holds something is given the full five
+            // seconds before anything is forced.
+            let deadline = tokio::time::Instant::now() + GRACE_PERIOD;
+            loop {
+                let remaining = {
+                    let session = runtime.session();
+                    session
+                        .owned()
+                        .is_none_or(|owned| !owned.surviving().is_empty())
+                };
+                if !remaining || tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(STOP_POLL_INTERVAL).await;
+            }
             let forced = {
                 let mut session = runtime.session();
                 session.force_close().unwrap_or(false)
@@ -297,6 +359,19 @@ impl CloseGate {
             }
             runtime.closed.notify_waiters();
         });
+    }
+}
+
+/// A close waiting for its acceptance to be confirmed delivered.
+#[derive(Debug)]
+pub struct PendingDelivery {
+    sender: tokio::sync::oneshot::Sender<()>,
+}
+
+impl PendingDelivery {
+    /// Confirms that the requester has the acceptance, which starts the termination sequence.
+    pub fn confirm(self) {
+        let _ = self.sender.send(());
     }
 }
 

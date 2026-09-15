@@ -218,14 +218,25 @@ impl WorkerService {
             let reply = self.handle(&mut state, &peer, message).await;
             if let Some(reply) = reply {
                 let mut sender = writer.lock().await;
-                if sender.write_message(&reply).await.is_err() {
-                    break;
-                }
+                let written = sender.write_message(&reply).await.is_ok();
                 drop(sender);
-                // Whatever the reply was, it has reached the peer now. A close admitted while
-                // building it may start its termination sequence.
-                if let Some(gate) = state.close_gate.take() {
-                    gate.release();
+                // A close that was admitted happens, whether or not its acceptance could be
+                // written. The session is already `closing`; leaving the gate unreleased because
+                // the peer went away would leave it closing and never closed.
+                if let Some((action_id, gate)) = state.close_gate.take() {
+                    if written && state.client_kind == LocalClientKind::Controller {
+                        // The requester is not the peer that was just written to: the daemon still
+                        // has to pass the acceptance on. Termination waits for it to say so.
+                        state.pending_delivery = Some((
+                            action_id,
+                            gate.release_on_delivery(crate::runtime::ACCEPTANCE_DELIVERY_TIMEOUT),
+                        ));
+                    } else {
+                        gate.release();
+                    }
+                }
+                if !written {
+                    break;
                 }
                 // A controller announces itself in its hello; the worker answers with a challenge
                 // it will only accept once.
@@ -306,6 +317,14 @@ impl WorkerService {
                 state.delivery = Some(task);
             }
         }
+        // A close whose acceptance was never confirmed delivered still happens. The connection is
+        // gone, so nothing is going to confirm it.
+        if let Some((_, gate)) = state.close_gate.take() {
+            gate.release();
+        }
+        if let Some((_, delivery)) = state.pending_delivery.take() {
+            delivery.confirm();
+        }
         // A connection that goes away takes its delivery task and its attachments with it.
         // Undelivered input from them is discarded rather than replayed.
         if let Some(task) = state.delivery.take() {
@@ -337,6 +356,18 @@ impl WorkerService {
             }
             ControlMessage::GenerationToken(token) => Some(self.accept_generation(state, &token)),
             ControlMessage::ActionWindowRenew(_) => Some(self.renew_window(state)),
+            ControlMessage::AcceptanceDelivered(action_id) => {
+                // The proxy has passed the acceptance on. Whatever it names, only the close this
+                // connection is holding can be released by it.
+                if let Some((held, delivery)) = state.pending_delivery.take() {
+                    if held == action_id {
+                        delivery.confirm();
+                    } else {
+                        state.pending_delivery = Some((held, delivery));
+                    }
+                }
+                None
+            }
             ControlMessage::AuthorityRevision(notice) => {
                 Some(self.acknowledge_revision(state, &notice))
             }
@@ -873,26 +904,35 @@ impl WorkerService {
                 // between them would leave a receipt that claims an outcome beside a result no
                 // reader can retrieve.
                 let bytes = kr_cbor::encode(value.as_value());
-                journal.settle(
+                // A failure here cannot unwind the effect, which has already happened. It is
+                // recorded against the session rather than turned into a refusal the caller would
+                // read as "nothing happened".
+                let settled = journal.settle(
                     actor_id,
                     mutation.action_id,
                     kr_protocol::receipt::ReceiptState::Applied,
                     Some(&bytes),
                     None,
                     now,
-                )?;
+                );
+                if let Err(error) = settled {
+                    session.note_journal_failure(&error);
+                }
             }
             (Err(error), Some(journal)) => {
                 // Past the marker there is no rejection. Whether the effect happened cannot be
                 // established from here, so the outcome is recorded as unknown.
-                journal.settle(
+                let settled = journal.settle(
                     actor_id,
                     mutation.action_id,
                     kr_protocol::receipt::ReceiptState::Unknown,
                     None,
                     Some(error.to_protocol_error()),
                     now,
-                )?;
+                );
+                if let Err(failure) = settled {
+                    session.note_journal_failure(&failure);
+                }
             }
             (_, None) => {}
         }
@@ -905,7 +945,7 @@ impl WorkerService {
         match after {
             AfterEffect::None => {}
             AfterEffect::Input(pending) => self.runtime.send_input(pending),
-            AfterEffect::Close(gate) => state.close_gate = Some(gate),
+            AfterEffect::Close(gate) => state.close_gate = Some((mutation.action_id, gate)),
         }
         Ok(value)
     }
@@ -1622,7 +1662,9 @@ pub struct ConnectionState {
     /// The last input sequence accepted on this connection.
     pub input_sequence: u64,
     /// A close that has been admitted and whose acceptance has not yet been written.
-    pub close_gate: Option<crate::runtime::CloseGate>,
+    pub close_gate: Option<(kr_protocol::ids::ActionId, crate::runtime::CloseGate)>,
+    /// A close whose acceptance was written and whose delivery a proxy has not yet confirmed.
+    pub pending_delivery: Option<(kr_protocol::ids::ActionId, crate::runtime::PendingDelivery)>,
     /// A generation challenge waiting to be sent after the current reply.
     pub pending_challenge: Option<ControlMessage>,
     /// Where a new subscription replays retained output from before live output resumes.
@@ -1663,6 +1705,7 @@ impl ConnectionState {
             subscribed: None,
             input_sequence: 0,
             close_gate: None,
+            pending_delivery: None,
             pending_challenge: None,
             replay_from: None,
             delivery: None,

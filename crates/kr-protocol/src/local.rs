@@ -216,6 +216,13 @@ pub enum ControlMessage {
     ActionWindow(ActionWindowGrant),
     /// A mutation the control daemon admitted, passed to the worker that owns its subject.
     Forwarded(Box<ForwardedMutation>),
+    /// A proxy's confirmation that a caller has received an action's acceptance.
+    ///
+    /// A close is accepted before anything is signalled, because the requester is often a command
+    /// inside the process group the closure will stop. When the acceptance travels through a proxy,
+    /// the worker learns it has arrived here rather than assuming its own write was the end of the
+    /// journey.
+    AcceptanceDelivered(crate::ids::ActionId),
 }
 
 #[cfg(test)]

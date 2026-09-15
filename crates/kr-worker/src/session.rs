@@ -32,7 +32,7 @@ use kr_protocol::recovery::{EventsSnapshotResult, HistoryPageResult, ResyncReaso
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 use kr_protocol::session::{
     ApplicationState, ClosureReason, ClosureRecord, Dimensions, Durability, OwnershipCoverage,
-    SessionState, SessionSummary, ShellMode, TerminatedProcess,
+    SessionState, SessionSummary, ShellMode,
 };
 
 use crate::attachments::AttachmentTable;
@@ -41,6 +41,7 @@ use crate::history::{OutputHistory, SpoolLayout};
 use crate::input::{InputLease, LeaseRefusal, PasteFramer};
 use crate::journal::Journal;
 use crate::output::{OutputHub, OutputStream};
+use crate::ownership::OwnedProcesses;
 use crate::pty::{Pty, RootShell, ShellCommand, ShellExit};
 
 /// How long an owned process group has to stop before it is forced.
@@ -111,6 +112,8 @@ pub struct Session {
     closing_reason: Option<ClosureReason>,
     created_at_ms: TimestampMs,
     pending_input: Vec<Vec<u8>>,
+    owned: Option<OwnedProcesses>,
+    root_exit: Option<ShellExit>,
 }
 
 impl std::fmt::Debug for Session {
@@ -169,6 +172,8 @@ impl Session {
             closing_reason: None,
             created_at_ms: kr_ipc::now_ms(),
             pending_input: Vec::new(),
+            owned: None,
+            root_exit: None,
             config,
         })
     }
@@ -188,9 +193,25 @@ impl Session {
         let command = self.config.shell.clone();
         match self.pty.launch(&command) {
             Ok(shell) => {
+                // Ownership is established with the shell, not at closure: a process that started
+                // and ended while the session ran is still one this session owned, and a boundary
+                // created afterwards would never have seen it.
+                self.owned = Some(OwnedProcesses::establish(
+                    crate::ownership::boundary_for(shell.foreground_group(), shell.identity()),
+                    shell.identity().clone(),
+                ));
                 self.shell = Some(shell);
                 self.state = SessionState::Live;
                 self.application_state = Some(ApplicationState::ShellReady);
+                // What the session is, written where a reader can find it after this worker is
+                // gone. Without it a closed session is only a closure record, and the shell it ran,
+                // the directory it ran in and when it started are lost with the process.
+                let summary = self.summary();
+                if let Some(journal) = self.journal.as_mut()
+                    && let Err(error) = journal.record_session(&summary)
+                {
+                    self.journal_failure = Some(error.to_string());
+                }
                 Ok(())
             }
             Err(error) => {
@@ -222,6 +243,22 @@ impl Session {
     #[must_use]
     pub const fn output_cursor(&self) -> u64 {
         self.history.next_cursor()
+    }
+
+    /// Records every process the session's ownership boundary currently holds.
+    ///
+    /// The set is built up while the session runs. A process that appears once and is gone by the
+    /// next look was still this session's, and is accounted for in its closure record.
+    pub fn observe_owned(&mut self) {
+        if let Some(owned) = self.owned.as_mut() {
+            owned.observe();
+        }
+    }
+
+    /// Returns what the session owns, once its shell has started.
+    #[must_use]
+    pub const fn owned(&self) -> Option<&OwnedProcesses> {
+        self.owned.as_ref()
     }
 
     /// Returns the root shell's process identity while one is running.
@@ -704,10 +741,19 @@ impl Session {
     ///
     /// Returns an error when the signal cannot be sent.
     pub fn request_stop(&mut self) -> Result<()> {
-        match self.shell.as_mut() {
+        // Everything the boundary holds is asked to stop, not only the root. A shell that has
+        // already exited leaves descendants behind, and they are what this reaches.
+        if let Some(owned) = self.owned.as_mut() {
+            owned.observe();
+        }
+        let outcome = match self.shell.as_mut() {
             Some(shell) => shell.request_stop(),
             None => Ok(()),
+        };
+        if let Some(owned) = self.owned.as_ref() {
+            crate::ownership::request_stop(owned);
         }
+        outcome
     }
 
     /// Forces whatever is left of the owned group to stop.
@@ -716,22 +762,31 @@ impl Session {
     ///
     /// Returns an error when the signal cannot be sent.
     pub fn force_close(&mut self) -> Result<bool> {
-        let Some(shell) = self.shell.as_mut() else {
-            return Ok(false);
-        };
-        if shell.try_wait()?.is_some() {
-            return Ok(false);
+        if let Some(owned) = self.owned.as_mut() {
+            owned.observe();
         }
-        shell.force_stop()?;
-        Ok(true)
+        let remaining = self
+            .owned
+            .as_ref()
+            .is_some_and(|owned| !owned.surviving().is_empty());
+        if let Some(shell) = self.shell.as_mut()
+            && shell.try_wait()?.is_none()
+        {
+            shell.force_stop()?;
+        }
+        if let Some(owned) = self.owned.as_ref() {
+            crate::ownership::force_stop(owned);
+        }
+        Ok(remaining)
     }
 
     /// Writes the final record and moves the session to `closed`.
     pub fn finish_close(&mut self, forced: bool) -> ClosureRecord {
-        let exit = self
-            .shell
-            .as_mut()
-            .and_then(|shell| shell.try_wait().ok().flatten());
+        let exit = self.root_exit.clone().or_else(|| {
+            self.shell
+                .as_mut()
+                .and_then(|shell| shell.try_wait().ok().flatten())
+        });
         let reason = self.closing_reason.unwrap_or(ClosureReason::CloseRequested);
         self.record_closure_with(reason, exit, forced)
     }
@@ -743,18 +798,28 @@ impl Session {
     /// two are observed separately.
     pub fn poll_root_exit(&mut self) -> bool {
         if self.state == SessionState::Closed {
-            return true;
+            return false;
         }
         let exit = match self.shell.as_mut().map(RootShell::try_wait) {
             Some(Ok(Some(exit))) => exit,
             _ => return false,
         };
+        self.root_exit.get_or_insert(exit.clone());
         if self.state == SessionState::Closing {
-            // A closure already under way finishes through its own sequence, which drains output
-            // before it writes the record.
+            // A closure already under way finishes through its own sequence, which stops the rest
+            // of what the session owns and drains output before it writes the record.
             return false;
         }
-        self.note_shell_exit(exit);
+        // A root shell that ends on its own is a closure like any other: it goes through the same
+        // sequence, so descendants are still stopped and output is still drained. Committing the
+        // record here would skip both.
+        let reason = if exit.signalled() {
+            ClosureReason::RootSignal
+        } else {
+            ClosureReason::RootExit
+        };
+        self.state = SessionState::Closing;
+        self.closing_reason = Some(reason);
         true
     }
 
@@ -804,24 +869,27 @@ impl Session {
         if let Some(existing) = self.closure.clone() {
             return existing;
         }
-        let terminated = self
-            .shell
-            .as_ref()
-            .map(|shell| {
-                vec![TerminatedProcess {
-                    identity: shell.identity().clone(),
-                    name: Nullable::some(self.config.shell.program.clone()),
-                    forced,
-                }]
-            })
-            .unwrap_or_default();
-        // The worker knows the process group it owned. It does not claim to have discovered every
-        // application a session may have started, so coverage is complete only when the group is
-        // confirmed gone.
-        let coverage = match self.shell.as_mut().map(RootShell::try_wait) {
-            Some(Ok(Some(_))) | None => OwnershipCoverage::Complete,
-            _ => OwnershipCoverage::Incomplete,
-        };
+        // One last look before the record is written, so a process that started late is still
+        // accounted for.
+        if let Some(owned) = self.owned.as_mut() {
+            owned.observe();
+            if forced {
+                owned.note_all_forced();
+            }
+        }
+        // Only confirmed terminations are listed, and coverage follows the boundary this host
+        // actually has rather than the outcome it would prefer. A terminal process group cannot
+        // see a descendant that left it, so a host with only that never reports complete.
+        let (terminated, surviving, coverage) = self.owned.as_ref().map_or_else(
+            || (Vec::new(), Vec::new(), OwnershipCoverage::Incomplete),
+            |owned| {
+                (
+                    owned.terminated(),
+                    owned.surviving_resources(),
+                    owned.coverage(),
+                )
+            },
+        );
         let mut record = ClosureRecord {
             session_id: self.config.session_id,
             session_epoch: self.config.session_epoch,
@@ -833,7 +901,7 @@ impl Session {
             ),
             root_signal: Nullable(exit.as_ref().and_then(|exit| exit.signal.as_ref()).cloned()),
             terminated,
-            surviving: Vec::new(),
+            surviving,
             ownership_coverage: coverage,
             durability: self.durability(),
             closed_at_ms: kr_ipc::now_ms(),
@@ -863,8 +931,17 @@ impl Session {
         }
     }
 
+    /// Records that a durable write failed.
+    ///
+    /// The journal stays open, because a later write may well succeed and the de-duplication
+    /// records in it are still the session's. What changes is the answer the host gives about
+    /// durability, which stops being a claim the session cannot support.
+    pub fn note_journal_failure(&mut self, detail: impl std::fmt::Display) {
+        self.journal_failure = Some(detail.to_string());
+    }
+
     const fn durability(&self) -> Durability {
-        if self.journal.is_some() {
+        if self.journal.is_some() && self.journal_failure.is_none() {
             Durability::Durable
         } else {
             Durability::Volatile

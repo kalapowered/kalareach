@@ -346,6 +346,17 @@ impl LocalClient {
         self.await_response(request_id).await
     }
 
+    /// Confirms to a worker that a caller has received an action's acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport failure.
+    pub async fn confirm_delivery(&mut self, action_id: ActionId) -> Result<()> {
+        self.writer
+            .write_message(&ControlMessage::AcceptanceDelivered(action_id))
+            .await
+    }
+
     /// Announces the host's current authority revision and waits for the worker to install it.
     ///
     /// The acknowledgement is what makes a revocation complete for that worker: until it arrives,

@@ -40,6 +40,20 @@ pub fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
     platform::process_start_identity(pid)
 }
 
+/// Returns the process identifiers currently in one process group.
+///
+/// A terminal session's processes normally stay in the group the shell leads, which is what makes
+/// this the set a worker can act on. It is not a complete ownership boundary: a process that calls
+/// `setsid` leaves the group and stops appearing here, which is exactly why a host built on this
+/// alone never claims complete coverage.
+///
+/// # Errors
+///
+/// Returns an error when the platform will not enumerate processes.
+pub fn processes_in_group(group: u32) -> Result<Vec<u32>> {
+    platform::processes_in_group(group)
+}
+
 /// Reads this process's own start identity.
 ///
 /// # Errors
@@ -103,6 +117,40 @@ mod platform {
 
     const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 
+    pub(super) fn processes_in_group(group: u32) -> Result<Vec<u32>> {
+        let entries = std::fs::read_dir("/proc")
+            .map_err(|error| unavailable("process group", format!("/proc: {error}")))?;
+        let mut members = Vec::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            // Field five of the statistics line is the process group. The command name before it
+            // can contain spaces and brackets, so the fields are counted from after its closing
+            // bracket rather than from the start of the line.
+            let Ok(line) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            let Some(rest) = line.rsplit_once(')').map(|(_, rest)| rest) else {
+                continue;
+            };
+            if rest
+                .split_whitespace()
+                .nth(3)
+                .and_then(|field| field.parse::<u32>().ok())
+                == Some(group)
+            {
+                members.push(pid);
+            }
+        }
+        members.sort_unstable();
+        Ok(members)
+    }
+
     pub(super) fn boot_identity() -> Result<BootIdentity> {
         let text = std::fs::read_to_string(BOOT_ID_PATH)
             .map_err(|error| unavailable("boot identity", format!("{BOOT_ID_PATH}: {error}")))?;
@@ -164,7 +212,13 @@ mod platform {
 mod platform {
     use libproc::bsd_info::BSDInfo;
     use libproc::proc_pid::pidinfo;
+    use libproc::processes::{ProcFilter, pids_by_type};
     use sysctl::Sysctl as _;
+
+    pub(super) fn processes_in_group(group: u32) -> super::Result<Vec<u32>> {
+        pids_by_type(ProcFilter::ByProgramGroup { pgrpid: group })
+            .map_err(|error| super::unavailable("process group", format!("group {group}: {error}")))
+    }
 
     use super::{
         BootIdentity, BootIdentitySource, ProcessStartIdentity, ProcessStartSource, Result,
@@ -240,6 +294,13 @@ mod platform {
         BootIdentity, BootIdentitySource, ProcessStartIdentity, ProcessStartSource, Result,
         unavailable,
     };
+
+    pub(super) fn processes_in_group(_group: u32) -> Result<Vec<u32>> {
+        // Windows has no process group to enumerate. A worker's descendants are held by its job
+        // object instead, which is a complete boundary rather than a partial one, so nothing here
+        // needs to guess at group membership.
+        Ok(Vec::new())
+    }
 
     pub(super) fn boot_identity() -> Result<BootIdentity> {
         let boot = sysinfo::System::boot_time();
