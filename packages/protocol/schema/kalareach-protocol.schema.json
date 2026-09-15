@@ -2284,7 +2284,8 @@
       ]
     },
     "ParamsValue": {
-      "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings appear as unpadded base64url and cannot be told apart from text."
+      "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.",
+      "tsType": "unknown"
     },
     "PluginId": {
       "description": "A plugin identifier from its manifest.",
@@ -2516,19 +2517,19 @@
     },
     "ReceiveLimits": {
       "additionalProperties": false,
-      "description": "The receive limits a peer declares.\n\nBoth sides state their own bounds; the selection carries the negotiated values and the\ntranscript covers them, so a downgrade cannot be introduced after `hello`.",
+      "description": "The receive limits a peer declares.\n\nBoth sides state their own bounds; the selection carries the negotiated values and the\ntranscript covers them, so a downgrade cannot be introduced after `hello`.\n\nEach frame bound covers the complete frame, its four-byte length prefix included, which is the\nsame quantity [`crate::frame::StreamKind::max_frame_len`] bounds. A sender subtracts the prefix\nto get the payload it may send.",
       "properties": {
         "max_attachment_frame_len": {
           "$ref": "#/$defs/U64",
-          "description": "Maximum attachment frame payload, in bytes."
+          "description": "Maximum complete attachment frame, in bytes, length prefix included."
         },
         "max_control_frame_len": {
           "$ref": "#/$defs/U64",
-          "description": "Maximum control frame payload, in bytes."
+          "description": "Maximum complete control frame, in bytes, length prefix included."
         },
         "max_input_frame_len": {
           "$ref": "#/$defs/U64",
-          "description": "Maximum input frame payload, in bytes."
+          "description": "Maximum complete input frame, in bytes, length prefix included."
         },
         "max_outstanding_mutations": {
           "$ref": "#/$defs/U64",

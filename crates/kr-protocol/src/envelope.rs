@@ -240,8 +240,13 @@ impl JsonSchema for ParamsValue {
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        // The value can be anything the profile permits: a map, an array, text, an integer, a
+        // boolean or null. A schema that only carries a description is read as an object by the
+        // TypeScript generator, which would reject a valid array or scalar result, so the type is
+        // stated outright.
         json_schema!({
-            "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings appear as unpadded base64url and cannot be told apart from text."
+            "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.",
+            "tsType": "unknown"
         })
     }
 }

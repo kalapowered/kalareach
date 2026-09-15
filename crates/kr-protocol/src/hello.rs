@@ -65,14 +65,18 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
 ///
 /// Both sides state their own bounds; the selection carries the negotiated values and the
 /// transcript covers them, so a downgrade cannot be introduced after `hello`.
+///
+/// Each frame bound covers the complete frame, its four-byte length prefix included, which is the
+/// same quantity [`crate::frame::StreamKind::max_frame_len`] bounds. A sender subtracts the prefix
+/// to get the payload it may send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReceiveLimits {
-    /// Maximum control frame payload, in bytes.
+    /// Maximum complete control frame, in bytes, length prefix included.
     pub max_control_frame_len: U64,
-    /// Maximum input frame payload, in bytes.
+    /// Maximum complete input frame, in bytes, length prefix included.
     pub max_input_frame_len: U64,
-    /// Maximum attachment frame payload, in bytes.
+    /// Maximum complete attachment frame, in bytes, length prefix included.
     pub max_attachment_frame_len: U64,
     /// Maximum outstanding mutations per session.
     pub max_outstanding_mutations: U64,

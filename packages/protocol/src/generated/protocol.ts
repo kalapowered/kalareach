@@ -314,6 +314,10 @@ export type ResourceSelectorKind =
  */
 export type RejectionReason =
   'admission_failed' | 'expired' | 'cancelled' | 'revoked' | 'stale_preconditions'
+/**
+ * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+ */
+export type ParamsValue = unknown
 
 /**
  * Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.
@@ -472,15 +476,15 @@ export interface ClientOffer {
  */
 export interface ReceiveLimits {
   /**
-   * Maximum attachment frame payload, in bytes.
+   * Maximum complete attachment frame, in bytes, length prefix included.
    */
   max_attachment_frame_len: string
   /**
-   * Maximum control frame payload, in bytes.
+   * Maximum complete control frame, in bytes, length prefix included.
    */
   max_control_frame_len: string
   /**
-   * Maximum input frame payload, in bytes.
+   * Maximum complete input frame, in bytes, length prefix included.
    */
   max_input_frame_len: string
   /**
@@ -668,15 +672,15 @@ export interface HostSelection {
  */
 export interface ReceiveLimits1 {
   /**
-   * Maximum attachment frame payload, in bytes.
+   * Maximum complete attachment frame, in bytes, length prefix included.
    */
   max_attachment_frame_len: string
   /**
-   * Maximum control frame payload, in bytes.
+   * Maximum complete control frame, in bytes, length prefix included.
    */
   max_control_frame_len: string
   /**
-   * Maximum input frame payload, in bytes.
+   * Maximum complete input frame, in bytes, length prefix included.
    */
   max_input_frame_len: string
   /**
@@ -1040,9 +1044,7 @@ export interface MutationRequest {
   /**
    * The subject preconditions this mutation requires.
    */
-  expected: {
-    [k: string]: unknown
-  }
+  expected: unknown
   /**
    * The grant this mutation is claimed under. A local caller's host-stamped context leaves this
    * null and the host resolves its own owner authority.
@@ -1059,9 +1061,7 @@ export interface MutationRequest {
   /**
    * The method's parameters.
    */
-  params: {
-    [k: string]: unknown
-  }
+  params: unknown
   /**
    * Correlates the response. Durable operation identity is `action_id`, not this.
    */
@@ -1112,9 +1112,7 @@ export interface Notification {
   /**
    * The event payload.
    */
-  payload: {
-    [k: string]: unknown
-  }
+  payload: unknown
   /**
    * The position of this event in that stream.
    */
@@ -1328,11 +1326,9 @@ export interface Request {
    */
   method_version: number
   /**
-   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings appear as unpadded base64url and cannot be told apart from text.
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
    */
-  params: {
-    [k: string]: unknown
-  }
+  params: unknown
   /**
    * Correlates the response. Unique for the lifetime of one connection.
    */
@@ -1356,12 +1352,6 @@ export interface Response {
    * The request this response answers.
    */
   request_id: string
-}
-/**
- * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings appear as unpadded base64url and cannot be told apart from text.
- */
-export interface ParamsValue {
-  [k: string]: unknown
 }
 /**
  * A session and the epoch it was addressed in.

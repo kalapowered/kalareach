@@ -82,8 +82,9 @@ so a peer cannot make the host allocate a gigabyte by claiming a large string.
 | `max_bytes_len` | 1 MiB | One byte string |
 | `max_text_len` | 1 MiB | One text string |
 
-Callers override these per stream kind. A terminal input stream, for example, uses a 64 KiB message
-bound.
+Callers override these per stream kind. A terminal input stream, for example, is bounded by a
+64 KiB frame, so its message bound is 65 532 bytes: the frame less its four-byte length prefix. The
+receive limits a peer declares in `hello` are complete-frame bounds for the same reason.
 
 ### Why a maintained encoder plus a strict layer
 

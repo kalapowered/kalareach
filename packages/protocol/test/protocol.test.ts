@@ -9,7 +9,12 @@ import {
   signingInput,
   valuesEqual
 } from '../src/index.js'
-import type { MutationRequest, Receipt } from '../src/generated/protocol.js'
+import type {
+  MutationRequest,
+  Notification,
+  Receipt,
+  Response
+} from '../src/generated/protocol.js'
 import { bytesToHex, findCase, hexToBytes, loadFixture, parseValue } from './fixtures.js'
 
 const frames = loadFixture('protocol', 'frames.json')
@@ -172,5 +177,27 @@ describe('transcripts.json', () => {
         ])
       )
     ).toBe(entry.sha256)
+  })
+})
+
+describe('the generated envelope types', () => {
+  it('admit every value the profile permits as an opaque payload', () => {
+    // A result or an event payload is any KR-CBOR-1 value, not only a map. A generated type that
+    // only admitted objects would reject a valid array, scalar or null result.
+    const responses: Response[] = [
+      { request_id: '1', outcome: { ok: null } },
+      { request_id: '2', outcome: { ok: ['a', 'b'] } },
+      { request_id: '3', outcome: { ok: { session_count: '3' } } },
+      { request_id: '4', outcome: { ok: 'plain text' } }
+    ]
+    expect(responses).toHaveLength(4)
+
+    const event: Notification = {
+      stream_id: 'session.output',
+      sequence: '7',
+      event_type: 'terminal.output',
+      payload: true
+    }
+    expect(event.payload).toBe(true)
   })
 })
