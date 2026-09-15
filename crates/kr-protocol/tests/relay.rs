@@ -16,9 +16,12 @@ use kr_protocol::pairing::NetworkHint;
 use kr_protocol::relay::{
     MAX_GRACE_BYTES, MAX_GRACE_DURATION_MS, MAX_OUTSTANDING_RESERVED_BYTES, MeteringRole,
     PayerAuthorisation, PayerPrincipal, RELAY_INSTANCE_DOMAIN, RELAY_LEASE_DOMAIN,
-    RELAY_RECEIPT_DOMAIN, RELAY_REVOKE_DOMAIN, RelayConsumptionReceipt, RelayDirection, RelayGrace,
-    RelayInstanceRegistration, RelayKeySuccession, RelayLease, RelayLeaseRevocation, RelayScope,
+    RELAY_RECEIPT_DOMAIN, RELAY_REVOKE_DOMAIN, RelayConsumptionReceipt, RelayConsumptionReport,
+    RelayDirection, RelayGrace, RelayInstanceRegistration, RelayKeySuccession, RelayLease,
+    RelayLeaseRequest, RelayLeaseRevocation, RelayScope, SignedRelayConsumptionReceipt,
+    SignedRelayInstanceRegistration, SignedRelayLease, SignedRelayLeaseRevocation,
 };
+use kr_protocol::scalars::Signature64;
 use kr_protocol::scalars::{
     EndpointKey, Nullable, RelayInstanceKey, ServiceAdmissionKey, TimestampMs, U64, Uuid,
 };
@@ -394,4 +397,129 @@ fn the_two_leases_sign_differently() {
     let second = grace_lease().signing_input().expect("a signing input");
 
     assert_ne!(first, second);
+}
+
+/// A signature is 64 bytes of whatever the signer produced; the vectors need one that is stable.
+fn signature(byte: u8) -> Signature64 {
+    Signature64::from_bytes([byte; 64])
+}
+
+fn install() -> RelayLeaseRequest {
+    RelayLeaseRequest::Install {
+        lease: Box::new(SignedRelayLease {
+            lease: bidirectional_lease(),
+            signature: signature(0x51),
+        }),
+    }
+}
+
+fn revoke() -> RelayLeaseRequest {
+    RelayLeaseRequest::Revoke {
+        revocation: SignedRelayLeaseRevocation {
+            revocation: revocation(),
+            signature: signature(0x52),
+        },
+    }
+}
+
+fn consumption_report() -> RelayConsumptionReport {
+    RelayConsumptionReport {
+        relay_instance_id: frankfurt(),
+        reservation_id: reservation(),
+        receipts: vec![
+            SignedRelayConsumptionReceipt {
+                receipt: receipt(1, 262_144, 1_800_000_010_000),
+                signature: signature(0x53),
+            },
+            SignedRelayConsumptionReceipt {
+                receipt: receipt(2, 1_048_576, 1_800_000_020_000),
+                signature: signature(0x54),
+            },
+        ],
+    }
+}
+
+fn signed_registration() -> SignedRelayInstanceRegistration {
+    SignedRelayInstanceRegistration {
+        registration: registration(),
+        signature: signature(0x55),
+    }
+}
+
+/// Checks one envelope: the same object, through both representations, with nothing lost.
+fn round_trip<T>(document: &Json, id: &str, object: &T)
+where
+    T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let vector = case(document, id);
+    let value = to_canonical_value(object).expect("a canonical value");
+
+    assert_eq!(
+        value,
+        parse_value(&vector["value"]),
+        "{id}: the envelope changed"
+    );
+    assert_eq!(
+        hex::encode(encode(&value)),
+        vector["cbor_hex"].as_str().expect("cbor_hex"),
+        "{id}: canonical encoding changed"
+    );
+    assert_eq!(
+        serde_json::to_value(object).expect("a JSON representation"),
+        vector["json"],
+        "{id}: the JSON representation changed"
+    );
+
+    // Both representations return the same object, which is what lets a relay be given an envelope
+    // as JSON and verify the signatures inside it against the bytes they actually cover.
+    let from_json: T = serde_json::from_value(vector["json"].clone())
+        .unwrap_or_else(|error| panic!("{id}: the JSON representation does not parse: {error}"));
+    assert_eq!(&from_json, object, "{id}: the JSON representation is lossy");
+
+    let bytes = encode(&value);
+    let decoded: T = kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::default())
+        .unwrap_or_else(|error| panic!("{id}: the canonical encoding does not decode: {error}"));
+    assert_eq!(&decoded, object, "{id}: the canonical encoding is lossy");
+}
+
+#[test]
+fn envelope_vectors_match() {
+    let document = load("envelopes.json");
+
+    round_trip(&document, "lease_install", &install());
+    round_trip(&document, "lease_revoke", &revoke());
+    round_trip(&document, "consumption_report", &consumption_report());
+    round_trip(&document, "instance_registration", &signed_registration());
+}
+
+#[test]
+fn an_envelope_carries_the_signing_input_of_what_is_inside_it() {
+    let RelayLeaseRequest::Install { lease } = install() else {
+        unreachable!("an install request");
+    };
+
+    // The envelope adds nothing to what the signature covers: the lease inside it signs exactly
+    // what the lease vector says, so a relay that unwrapped one verifies the bytes it was given.
+    assert_eq!(
+        lease.lease.signing_input().expect("a signing input"),
+        bidirectional_lease()
+            .signing_input()
+            .expect("a signing input")
+    );
+
+    let report = consumption_report();
+    assert!(report.is_well_formed());
+    assert!(report.is_contiguous());
+    for (position, signed) in report.receipts.iter().enumerate() {
+        assert_eq!(
+            signed.receipt.signing_input().expect("a signing input"),
+            receipt(
+                position as u64 + 1,
+                if position == 0 { 262_144 } else { 1_048_576 },
+                1_800_000_010_000 + position as u64 * 10_000,
+            )
+            .signing_input()
+            .expect("a signing input")
+        );
+    }
 }

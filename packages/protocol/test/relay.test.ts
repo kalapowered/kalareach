@@ -258,3 +258,50 @@ function signingInputFromJson (domain: string, json: unknown): Uint8Array {
       throw new Error(`no relay object signs under ${domain}`)
   }
 }
+
+describe('the envelopes that carry them', () => {
+  const envelopes = loadFixture('relay', 'envelopes.json')
+
+  it.each((envelopes.cases ?? []).map((entry) => [entry.id, entry] as const))(
+    '%s encodes to the bytes the vector states and decodes back',
+    (_id, entry) => {
+      const value = parseValue(entry['value'])
+      expect(bytesToHex(encodeCanonical(value))).toBe(entry.cbor_hex)
+
+      const decoded = decodeCanonical(hexToBytes(entry.cbor_hex as string))
+      expect(decoded).toEqual(value)
+      expect(bytesToHex(encodeCanonical(decoded))).toBe(entry.cbor_hex)
+    }
+  )
+
+  it('adds nothing to what the signatures inside it cover', () => {
+    const install = findCase(envelopes, 'lease_install')['json'] as {
+      install: { lease: { lease: RelayLease; signature: string } }
+    }
+    const lease = findCase(leases, 'lease_bidirectional')
+
+    // The lease inside the envelope signs exactly what the lease vector says, so a relay handed an
+    // envelope verifies the same bytes as one handed the lease on its own.
+    expect(bytesToHex(relayLeaseSigningInput(install.install.lease.lease))).toBe(
+      lease['signing_input_hex']
+    )
+  })
+
+  it('carries the receipts of one reservation in order', () => {
+    const report = findCase(envelopes, 'consumption_report')['json'] as {
+      reservation_id: string
+      receipts: Array<{ receipt: RelayConsumptionReceipt; signature: string }>
+    }
+
+    expect(report.receipts).toHaveLength(2)
+    for (const [position, signed] of report.receipts.entries()) {
+      expect(signed.receipt.reservation_id).toBe(report.reservation_id)
+      expect(Number(signed.receipt.sequence)).toBe(position + 1)
+      expect(bytesToHex(relayConsumptionReceiptSigningInput(signed.receipt))).toBe(
+        findCase(receipts, position === 0 ? 'receipt_first' : 'receipt_second')[
+          'signing_input_hex'
+        ]
+      )
+    }
+  })
+})

@@ -467,9 +467,17 @@ impl RelayLease {
     /// reservation inherits its running total, so it must keep everything that total was priced
     /// against and may only raise the ceiling. A replacement that takes a new reservation is a new
     /// allocation, and the service settles the one it closed.
+    ///
+    /// A grace already in force is carried unchanged. Section 17 gives a principal one grace,
+    /// starting at its first exhaustion, that reconnects and new endpoints cannot restart; a
+    /// replacement that could move either end of the window would be exactly that restart, taken
+    /// one revision at a time.
     #[must_use]
     pub fn supersedes(&self, previous: &Self) -> bool {
         if self.lease_id != previous.lease_id || self.revision.get() <= previous.revision.get() {
+            return false;
+        }
+        if !self.continues_grace_of(previous) {
             return false;
         }
         if self.reservation_id != previous.reservation_id {
@@ -477,6 +485,21 @@ impl RelayLease {
         }
         self.binds_reservation_as(previous)
             && self.effective_byte_ceiling() >= previous.effective_byte_ceiling()
+    }
+
+    /// Returns true when `self` carries `previous`'s grace window unchanged, or none at all.
+    ///
+    /// Leaving grace is allowed: the service restored the allowance, and the next exhaustion is a
+    /// new event with a new window. Moving the window of a grace that is still in force is not.
+    #[must_use]
+    pub fn continues_grace_of(&self, previous: &Self) -> bool {
+        match (self.grace.0, previous.grace.0) {
+            (_, None) | (None, Some(_)) => true,
+            (Some(next), Some(current)) => {
+                next.started_at_ms == current.started_at_ms
+                    && next.ends_at_ms.get() <= current.ends_at_ms.get()
+            }
+        }
     }
 
     /// Returns true when both leases bind their reservation to the same facts.
@@ -871,11 +894,20 @@ impl RelayInstanceRegistration {
 
     /// Returns true when `self` may replace `previous` at `now_ms`.
     ///
-    /// Beyond the revision, two rules hold. The key being registered is either the one already
-    /// registered or the successor that registration announced, so a key nobody has announced never
-    /// becomes the key receipts are checked against. And the successor may name itself only once
-    /// the predecessor's recorded retirement has passed, so the overlap the predecessor announced
-    /// is the overlap it gets.
+    /// Beyond the revision, four rules hold, and each one closes a way of taking an instance over:
+    ///
+    /// - The key being registered is one `previous` still accepts, so a key nobody announced never
+    ///   becomes the key receipts are checked against, and a key that has already retired is never
+    ///   restored.
+    /// - The announced successor may name itself only once the recorded retirement has passed, so
+    ///   the overlap the predecessor announced is the overlap it gets.
+    /// - A replacement that keeps the registered key keeps the succession that key announced,
+    ///   unless the overlap has not started, in which case there is nothing relying on it yet.
+    /// - A succession it announces retires in the future. One that had already finished would hand
+    ///   sole authority to a key on the strength of a single submission.
+    ///
+    /// Together these mean the key that signed a replacement is still accepted afterwards: no
+    /// submission can hand an instance to a key that has proved nothing.
     ///
     /// The caller separately requires the submission to be signed by a key `previous` accepts at
     /// `now_ms`: this states which registrations may follow which, not who may submit one.
@@ -884,20 +916,46 @@ impl RelayInstanceRegistration {
         if self.relay_instance_id != previous.relay_instance_id
             || self.revision.get() <= previous.revision.get()
             || !self.takes_effect_at(now_ms)
+            || !previous.accepts_key(self.instance_key, now_ms)
+        {
+            return false;
+        }
+        if let Some(successor) = self.successor.0
+            && successor.predecessor_retires_at_ms.get() <= now_ms
         {
             return false;
         }
         match previous.successor.0 {
-            None => self.instance_key == previous.instance_key,
+            None => true,
             Some(successor) => {
-                if self.instance_key == previous.instance_key {
-                    true
-                } else if self.instance_key == successor.instance_key {
+                if self.instance_key == successor.instance_key {
                     now_ms >= successor.predecessor_retires_at_ms.get()
+                } else if now_ms < successor.overlap_from_ms.get() {
+                    // Nothing is signing under the successor yet, so the announcement may be
+                    // withdrawn or replaced outright.
+                    true
                 } else {
-                    false
+                    self.successor.0 == Some(successor)
                 }
             }
+        }
+    }
+
+    /// The only key this registration accepts at `now_ms`, or null when it accepts two.
+    ///
+    /// A registration that accepts one key has handed that key sole authority over the instance.
+    /// Which is why [`Self::replaces`] refuses a replacement that would do that to a key other than
+    /// the one submitting it.
+    #[must_use]
+    pub fn sole_accepted_key(&self, now_ms: u64) -> Nullable<RelayInstanceKey> {
+        let mut accepted = [self.instance_key, self.instance_key]
+            .into_iter()
+            .take(1)
+            .chain(self.successor.0.map(|successor| successor.instance_key))
+            .filter(|key| self.accepts_key(*key, now_ms));
+        match (accepted.next(), accepted.next()) {
+            (Some(only), None) => Nullable::some(only),
+            _ => Nullable::null(),
         }
     }
 
@@ -1295,6 +1353,51 @@ mod tests {
     }
 
     #[test]
+    fn a_replacement_cannot_restart_a_grace_that_is_still_running() {
+        let now = 1_700_000_000_000;
+        let grace = RelayGrace {
+            started_at_ms: TimestampMs::new(now),
+            ends_at_ms: TimestampMs::new(now + MAX_GRACE_DURATION_MS),
+            byte_ceiling: U64::new(4 * 1024 * 1024 + 1024),
+        };
+        let mut first = lease();
+        first.expires_at_ms = TimestampMs::new(now + MAX_GRACE_DURATION_MS);
+        first.grace = Nullable::some(grace);
+
+        let mut moved = first.clone();
+        moved.revision = RelayLeaseRevision::new(2);
+        moved.grace = Nullable::some(RelayGrace {
+            started_at_ms: TimestampMs::new(now + 60_000),
+            ends_at_ms: TimestampMs::new(now + 60_000 + MAX_GRACE_DURATION_MS),
+            ..grace
+        });
+        assert!(!moved.supersedes(&first), "a grace cannot be restarted");
+
+        let mut extended = first.clone();
+        extended.revision = RelayLeaseRevision::new(2);
+        extended.grace = Nullable::some(RelayGrace {
+            ends_at_ms: TimestampMs::new(now + MAX_GRACE_DURATION_MS + 1),
+            ..grace
+        });
+        assert!(!extended.supersedes(&first), "a grace cannot be extended");
+
+        let mut shortened = first.clone();
+        shortened.revision = RelayLeaseRevision::new(2);
+        shortened.grace = Nullable::some(RelayGrace {
+            ends_at_ms: TimestampMs::new(now + 60_000),
+            ..grace
+        });
+        assert!(shortened.supersedes(&first), "a grace may be cut short");
+
+        // Leaving grace is the allowance being restored; the next exhaustion is a new event.
+        let mut restored = first.clone();
+        restored.revision = RelayLeaseRevision::new(2);
+        restored.grace = Nullable::null();
+        restored.byte_ceiling = U64::new(grace.byte_ceiling.get());
+        assert!(restored.supersedes(&first));
+    }
+
+    #[test]
     fn a_revocation_fences_only_lower_revisions_of_its_own_lease_at_its_own_relay() {
         let lease = lease();
         let revocation = RelayLeaseRevocation {
@@ -1520,10 +1623,75 @@ mod tests {
         imposed.instance_key = stranger;
         assert!(!imposed.replaces(&previous, 6_000));
 
-        // The registered key may always restate itself, which is how a rotation is cancelled.
+        // The registered key may withdraw a rotation before anything starts signing under it, and
+        // not afterwards: inside the overlap the successor may already have signed a receipt.
         let mut cancelled = registration(Nullable::null());
         cancelled.revision = RelayRegistrationRevision::new(2);
-        assert!(cancelled.replaces(&previous, 5_000));
+        assert!(cancelled.replaces(&previous, 3_000));
+        assert!(!cancelled.replaces(&previous, 5_000));
+    }
+
+    #[test]
+    fn a_retired_key_is_never_restored_and_a_live_succession_is_never_dropped() {
+        let old = RelayInstanceKey::from_bytes([0x61; 32]);
+        let new = RelayInstanceKey::from_bytes([0x62; 32]);
+        let announced = registration(Nullable::some(RelayKeySuccession {
+            instance_key: new,
+            overlap_from_ms: TimestampMs::new(4_000),
+            predecessor_retires_at_ms: TimestampMs::new(6_000),
+        }));
+
+        // After the retirement the predecessor answers for nothing, so it cannot be put back.
+        let mut restored = registration(Nullable::null());
+        restored.revision = RelayRegistrationRevision::new(2);
+        restored.instance_key = old;
+        assert!(!restored.replaces(&announced, 7_000));
+
+        // Inside the overlap the successor may already be signing, so the announcement stands.
+        let mut dropped = registration(Nullable::null());
+        dropped.revision = RelayRegistrationRevision::new(2);
+        assert!(!dropped.replaces(&announced, 5_000));
+        // Before it opens, nothing relies on it yet.
+        assert!(dropped.replaces(&announced, 3_000));
+
+        // The same announcement may be restated while the overlap runs.
+        let mut restated = announced.clone();
+        restated.revision = RelayRegistrationRevision::new(2);
+        restated.relay_url = NetworkHint::new("https://relay-2.reach.kala.to").expect("a URL");
+        assert!(restated.replaces(&announced, 5_000));
+    }
+
+    #[test]
+    fn a_succession_that_has_already_finished_cannot_be_announced() {
+        let previous = registration(Nullable::null());
+        let mut sneaked = registration(Nullable::some(RelayKeySuccession {
+            instance_key: RelayInstanceKey::from_bytes([0x63; 32]),
+            overlap_from_ms: TimestampMs::new(1_500),
+            predecessor_retires_at_ms: TimestampMs::new(2_000),
+        }));
+        sneaked.revision = RelayRegistrationRevision::new(2);
+
+        // It is well formed, and it would hand sole authority to a key that has proved nothing.
+        assert!(sneaked.is_well_formed());
+        assert_eq!(
+            sneaked.sole_accepted_key(5_000),
+            Nullable::some(RelayInstanceKey::from_bytes([0x63; 32]))
+        );
+        assert!(!sneaked.replaces(&previous, 5_000));
+
+        // Announced for the future, the key that submits it keeps answering in the meantime.
+        let mut proper = sneaked.clone();
+        proper.successor = Nullable::some(RelayKeySuccession {
+            instance_key: RelayInstanceKey::from_bytes([0x63; 32]),
+            overlap_from_ms: TimestampMs::new(6_000),
+            predecessor_retires_at_ms: TimestampMs::new(7_000),
+        });
+        assert!(proper.replaces(&previous, 5_000));
+        assert_eq!(proper.sole_accepted_key(5_000), Nullable::some(old_key()));
+    }
+
+    fn old_key() -> RelayInstanceKey {
+        RelayInstanceKey::from_bytes([0x61; 32])
     }
 
     #[test]

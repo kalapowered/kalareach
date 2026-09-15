@@ -317,9 +317,16 @@ encoding to keep in step.
   `outstanding_bytes` rather than the ceiling itself that a relay checks against its running total.
 - **A registration is replaced, not amended.** It carries its own revision, so a registration an
   instance has replaced cannot be replayed to cancel a rotation. `replaces` states the rest: the key
-  registered is either the one already registered or the successor that registration announced, and
-  the successor may name itself only once the predecessor's recorded retirement has passed, so
-  receipts the predecessor has signed but not yet delivered still verify.
+  registered is one the current registration still accepts, so a retired key is never restored; the
+  announced successor may name itself only once the recorded retirement has passed, so receipts the
+  predecessor signed but has not yet delivered still verify; a live succession cannot be dropped,
+  only withdrawn before its overlap opens; and a succession a replacement announces retires in the
+  future. Together those mean the key that signed a replacement is still accepted afterwards, so no
+  single submission can hand an instance to a key that has proved nothing.
+- **A grace survives a replacement.** Section 17 gives a principal one grace, starting at its first
+  exhaustion, that reconnects cannot restart. `supersedes` therefore refuses a replacement that
+  moves either end of a window still in force; it may be cut short, and leaving grace entirely is
+  the allowance being restored.
 - **Grace raises the same ceiling.** The grace after exhaustion belongs to the principal, is shared
   across its connections and starts at the first exhaustion. A relay receives a slice of what is
   left as a raised cumulative ceiling and a deadline, so it cannot restart a grace, extend one or
@@ -493,6 +500,7 @@ ordering cases test what they claim to test.
 | `relay/leases.json` | A two-way lease on a two-relay route, a sponsored single-relay lease inside its grace, and a revocation |
 | `relay/receipts.json` | Two consumption receipts of one reservation, showing the cumulative count |
 | `relay/instances.json` | A relay instance registration and an announced key rotation |
+| `relay/envelopes.json` | The install, revoke, report and registration messages that carry them |
 | `accounts/leases.json` | The signing input of every account authority object, with the role ceilings and lifetimes |
 
 An invalid case names its rule with the same string in both languages, for example
