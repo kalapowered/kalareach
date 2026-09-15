@@ -225,6 +225,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "kr-protocol",
+ "libc",
  "schemars",
  "semver",
  "serde",

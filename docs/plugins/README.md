@@ -201,10 +201,14 @@ owns:
 
 `upstream_method` names a method the package's own `connector.json` routes and classifies, so what
 the broker sends is something a publisher qualified. The route must travel towards the application.
-Each binding says which declared parameter fills which field of the request; every required
-parameter must be bound; and no two bindings may write the same field or write inside each other's
-object, because that leaves the broker choosing which value wins. A binding over the request
-identifier or the method name is refused: those belong to the broker.
+Each binding says which declared parameter fills which field of the request, and every required
+parameter must be bound.
+
+Two bindings conflict when they name the same field, when one is inside the other, or when they
+disagree about what a shared prefix is: `params.0` and `params.name` need `params` to be both an
+array and an object. A binding over the request identifier or the method name is refused too; those
+belong to the broker. A field path is a list of tagged segments, a member name or an array index, so
+`"0"` as a member is never confused with element zero.
 
 `terminal_text` is a list of literal segments and parameter references. A literal is printable
 ASCII, tab and newline only: a template that could carry an escape sequence would be a way to drive
@@ -514,10 +518,12 @@ report the same code for the same defect.
 | `control_parameters_widen` | A control's parameters do not narrow its action's |
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 
-`kr-plugin-sandbox` reads each file through the handle it opened rather than through its path, so
-what it measures is what it hashes. It refuses a link, a device, a file with more than one name, and
-anything that grows past its limit while being read. It stops at the file count limit rather than
-walking a directory somebody made arbitrarily wide.
+`kr-plugin-sandbox` opens each file in a way that refuses to follow a link and cannot block on a
+device, checks the open handle rather than the path, and reads through it once. It refuses a link, a
+device, a file with more than one name, and anything that grows past its limit while being read. The
+manifests are parsed from those same bytes rather than read again, so the digest a package is pinned
+by covers the document the validator looked at. It stops at the file count limit rather than walking
+a directory somebody made arbitrarily wide.
 
 ## What a signature does not do
 

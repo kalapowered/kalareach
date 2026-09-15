@@ -224,10 +224,20 @@ interface adapter {
         executable: string,
     }
 
+    /// One step of a path into an upstream request.
+    ///
+    /// A member and an index are different things: `"0"` as a member name is not element zero of an
+    /// array, and a path that spelled both the same way would leave the broker guessing which
+    /// container to build.
+    variant field-segment {
+        member(string),
+        index(u32),
+    }
+
     /// One field of an upstream request and the value that goes in it.
     record field-assignment {
-        /// The path into the request, as member names and array indices from its root.
-        path: list<string>,
+        /// The path into the request, from its root.
+        path: list<field-segment>,
         value: argument,
     }
 

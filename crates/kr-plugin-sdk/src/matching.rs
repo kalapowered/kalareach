@@ -129,10 +129,15 @@ impl ExecutableMatch {
             return false;
         };
         segments.retain(|segment| !segment.is_empty());
-        let stem = if file.len() > 4 && file[file.len() - 4..].eq_ignore_ascii_case(".exe") {
-            &file[..file.len() - 4]
-        } else {
-            file
+        // Sliced by character boundary rather than by byte, because a file name is not always
+        // ASCII and splitting inside a character is a panic rather than a mismatch.
+        let stem = match file
+            .len()
+            .checked_sub(4)
+            .and_then(|start| file.get(start..))
+        {
+            Some(suffix) if suffix.eq_ignore_ascii_case(".exe") => &file[..file.len() - 4],
+            _ => file,
         };
         if !stem.eq_ignore_ascii_case(&self.file_stem) {
             return false;
@@ -285,6 +290,21 @@ mod tests {
         // A directory named after the executable is not the executable.
         assert!(!codex.matches_path("/usr/local/codex/"));
         assert!(!codex.matches_path(""));
+        // A name whose last four bytes are inside one character must not split it.
+        for unicode in [
+            "/usr/bin/\u{e9}abc",
+            "/usr/bin/\u{1F600}",
+            "/usr/bin/caf\u{e9}",
+        ] {
+            assert!(!codex.matches_path(unicode), "matched {unicode:?}");
+        }
+        let accented = ExecutableMatch {
+            file_stem: "caf\u{e9}".to_owned(),
+            path_suffix: Vec::new(),
+            version_range: Nullable(None),
+        };
+        assert!(accented.matches_path("/usr/bin/caf\u{e9}"));
+        assert!(accented.matches_path("/usr/bin/caf\u{e9}.EXE"));
     }
 
     #[test]

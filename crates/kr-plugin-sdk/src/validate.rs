@@ -331,31 +331,26 @@ pub struct Validated {
 #[must_use]
 pub fn validate_package_directory(directory: &Path) -> Validated {
     let mut report = Report::default();
-    let files = match scan(directory, &mut report) {
-        Some(files) => files,
-        None => {
-            return Validated {
-                package: None,
-                report,
-            };
-        }
+    let Some(Scanned { files, manifests }) = scan(directory, &mut report) else {
+        return Validated {
+            package: None,
+            report,
+        };
     };
 
     check_file_set(&files, &mut report);
 
-    let Some(manifest) = read_plugin_manifest(directory, &mut report) else {
+    let Some(manifest) = read_plugin_manifest(&manifests, &mut report) else {
         return Validated {
             package: None,
             report,
         };
     };
     let presentation =
-        read_manifest::<PresentationManifest>(directory, PRESENTATION_FILE, &mut report);
-    let connector_present = files
-        .iter()
-        .any(|file| file.path.as_str() == CONNECTOR_FILE);
+        read_manifest::<PresentationManifest>(&manifests, PRESENTATION_FILE, &mut report);
+    let connector_present = manifests.contains_key(CONNECTOR_FILE);
     let connector = if connector_present {
-        read_manifest::<ConnectorManifest>(directory, CONNECTOR_FILE, &mut report)
+        read_manifest::<ConnectorManifest>(&manifests, CONNECTOR_FILE, &mut report)
     } else {
         None
     };
@@ -411,7 +406,19 @@ pub fn validate_package_directory(directory: &Path) -> Validated {
     Validated { package, report }
 }
 
-fn scan(directory: &Path, report: &mut Report) -> Option<Vec<PackageFile>> {
+/// What one pass over a package directory found.
+struct Scanned {
+    /// Every file, by path, with its length and digest.
+    files: Vec<PackageFile>,
+    /// The text of each manifest, exactly as it was hashed.
+    ///
+    /// The manifests are parsed from these bytes rather than read again. Reading a file twice is
+    /// two chances for it to be a different file, and the digest a package is pinned by would then
+    /// cover something other than what was validated.
+    manifests: BTreeMap<String, Vec<u8>>,
+}
+
+fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
     if !directory.is_dir() {
         report.push(Finding::new(
             FindingCode::DirectoryUnreadable,
@@ -420,6 +427,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Vec<PackageFile>> {
         return None;
     }
     let mut files = Vec::new();
+    let mut manifests: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut total: u64 = 0;
     let mut queue: Vec<(PathBuf, Vec<String>)> = vec![(directory.to_path_buf(), Vec::new())];
     while let Some((current, prefix)) = queue.pop() {
@@ -521,7 +529,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Vec<PackageFile>> {
                         "reading it would take the package past the {MAX_PACKAGE_BYTES} byte limit"
                     ),
                 ));
-                return Some(files);
+                return Some(Scanned { files, manifests });
             }
             let limit = if is_manifest_name(path.as_str()) {
                 MANIFEST_BYTES
@@ -529,16 +537,19 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Vec<PackageFile>> {
                 MAX_PACKAGE_BYTES
             };
             match read_bounded(&entry.path(), limit) {
-                Ok(bytes) => files.push(PackageFile {
-                    path,
-                    size_bytes: bytes.len() as u64,
-                    digest: PayloadDigest::of(&bytes),
-                }),
-                Err(error) => report.push(Finding::at(
-                    FindingCode::NotARegularFile,
-                    relative,
-                    error.to_string(),
-                )),
+                Ok(bytes) => {
+                    if is_manifest_name(path.as_str()) {
+                        manifests.insert(path.to_string(), bytes.clone());
+                    }
+                    files.push(PackageFile {
+                        path,
+                        size_bytes: bytes.len() as u64,
+                        digest: PayloadDigest::of(&bytes),
+                    });
+                }
+                Err(rejection) => {
+                    report.push(Finding::at(rejection.code, relative, rejection.detail))
+                }
             }
             if files.len() > MAX_PACKAGE_FILES {
                 report.push(Finding::new(
@@ -547,12 +558,12 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Vec<PackageFile>> {
                         "the package holds more than {MAX_PACKAGE_FILES} files; nothing past that was read"
                     ),
                 ));
-                return Some(files);
+                return Some(Scanned { files, manifests });
             }
         }
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
-    Some(files)
+    Some(Scanned { files, manifests })
 }
 
 fn check_file_set(files: &[PackageFile], report: &mut Report) {
@@ -588,11 +599,11 @@ fn check_file_set(files: &[PackageFile], report: &mut Report) {
 }
 
 fn read_manifest<T: serde::de::DeserializeOwned>(
-    directory: &Path,
+    manifests: &BTreeMap<String, Vec<u8>>,
     name: &str,
     report: &mut Report,
 ) -> Option<T> {
-    let text = read_manifest_text(directory, name, report)?;
+    let text = manifest_text(manifests, name, report)?;
     match serde_json::from_str::<T>(&text) {
         Ok(value) => Some(value),
         Err(error) => {
@@ -606,63 +617,26 @@ fn read_manifest<T: serde::de::DeserializeOwned>(
     }
 }
 
-/// Reads one manifest's text after checking what it is.
+/// Returns one manifest's text from the bytes the scan read.
 ///
-/// The check is by `symlink_metadata` on the exact path about to be read, rather than by trusting
-/// the earlier directory scan. A named pipe called `plugin.json` would block a read forever, and a
-/// symbolic link would read a file outside the package; both are rejected here, before the open.
-fn read_manifest_text(directory: &Path, name: &str, report: &mut Report) -> Option<String> {
-    let path = directory.join(name);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            report.push(Finding::at(
-                FindingCode::ManifestMissing,
-                name,
-                "every package carries this manifest",
-            ));
-            return None;
-        }
-        Err(error) => {
-            report.push(Finding::at(
-                FindingCode::ManifestUnreadable,
-                name,
-                error.to_string(),
-            ));
-            return None;
-        }
+/// The scan already opened the file through a handle it checked, hashed what it read and bounded
+/// the read. Parsing those same bytes is what makes the digest in the index cover the document the
+/// validator actually looked at.
+fn manifest_text(
+    manifests: &BTreeMap<String, Vec<u8>>,
+    name: &str,
+    report: &mut Report,
+) -> Option<String> {
+    let Some(bytes) = manifests.get(name) else {
+        report.push(Finding::at(
+            FindingCode::ManifestMissing,
+            name,
+            "every package carries this manifest",
+        ));
+        return None;
     };
-    if !metadata.is_file() {
-        report.push(Finding::at(
-            FindingCode::NotARegularFile,
-            name,
-            "a manifest is a regular file; a link or a device is not read",
-        ));
-        return None;
-    }
-    if metadata.len() > MANIFEST_BYTES {
-        report.push(Finding::at(
-            FindingCode::PackageTooLarge,
-            name,
-            format!(
-                "a manifest is at most {MANIFEST_BYTES} bytes, not {}",
-                metadata.len()
-            ),
-        ));
-        return None;
-    }
-    match read_bounded(&path, MANIFEST_BYTES) {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => Some(text),
-            Err(error) => {
-                report.push(Finding::at(
-                    FindingCode::ManifestUnreadable,
-                    name,
-                    error.to_string(),
-                ));
-                None
-            }
-        },
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text.to_owned()),
         Err(error) => {
             report.push(Finding::at(
                 FindingCode::ManifestUnreadable,
@@ -677,42 +651,75 @@ fn read_manifest_text(directory: &Path, name: &str, report: &mut Report) -> Opti
 /// Reads a file through a handle whose identity is checked after it is open.
 ///
 /// The check is `fstat` on the open handle rather than `stat` on the path, so what is measured is
-/// what is read. A file that is replaced between the two cannot be substituted here, a link or a
-/// device is refused before any byte is taken, and the read itself stops one byte past the limit
-/// rather than trusting the length reported before it started.
+/// what is read. On Unix the open itself refuses a symbolic link and never blocks on a device, so a
+/// path replaced between the directory scan and the read cannot redirect the read or stop it. The
+/// read stops one byte past the limit rather than trusting the length reported before it started.
 ///
 /// A hard link is refused too. A package holds one name per file, and a second name is a way to
 /// make one file's bytes answer for two declared payloads.
-fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, Finding> {
     use std::io::Read as _;
 
-    let mut file = fs::File::open(path)?;
-    let metadata = file.metadata()?;
+    let reject = |code: FindingCode, detail: String| Finding {
+        code,
+        path: None,
+        detail,
+    };
+
+    let mut file = open_regular(path)
+        .map_err(|error| reject(FindingCode::NotARegularFile, error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| reject(FindingCode::NotARegularFile, error.to_string()))?;
     if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
+        return Err(reject(
+            FindingCode::NotARegularFile,
+            "a package holds regular files only".to_owned(),
         ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         if metadata.nlink() > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a package holds one name per file",
+            return Err(reject(
+                FindingCode::NotARegularFile,
+                "a package holds one name per file".to_owned(),
             ));
         }
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len().min(limit)).unwrap_or(0));
-    let read = file.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+    let read = file
+        .by_ref()
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| reject(FindingCode::DirectoryUnreadable, error.to_string()))?;
     if read as u64 > limit {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("over the {limit} byte limit"),
+        return Err(reject(
+            FindingCode::PackageTooLarge,
+            format!("it is over the {limit} byte limit"),
         ));
     }
     Ok(bytes)
+}
+
+/// Opens a file without following a link into it and without blocking on a device.
+///
+/// On Unix the open itself refuses a symbolic link and never blocks, so a path replaced between the
+/// directory scan and the read cannot redirect the read or stop it. Elsewhere the handle's own
+/// metadata is the check, which is the strongest thing the standard library offers there.
+fn open_regular(path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::File::open(path)
+    }
 }
 
 /// Returns true when a path names one of the package's own manifests.
@@ -798,8 +805,11 @@ fn check_duplicate_members(name: &str, text: &str, report: &mut Report) {
 /// an unsafe path or an invented effect class is reported as itself rather than as a parse error
 /// in a nested field. A package that fails either check is not parsed further: a manifest whose
 /// paths cannot be trusted is not a manifest a host reads the rest of.
-fn read_plugin_manifest(directory: &Path, report: &mut Report) -> Option<PluginManifest> {
-    let text = read_manifest_text(directory, MANIFEST_FILE, report)?;
+fn read_plugin_manifest(
+    manifests: &BTreeMap<String, Vec<u8>>,
+    report: &mut Report,
+) -> Option<PluginManifest> {
+    let text = manifest_text(manifests, MANIFEST_FILE, report)?;
     let before = report.findings.len();
     check_duplicate_members(MANIFEST_FILE, &text, report);
     let raw: serde_json::Value = match serde_json::from_str(&text) {
@@ -1236,13 +1246,14 @@ fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut R
             "the bridge's application range admits versions nobody wrote the recipe for",
         ));
     }
-    // Targets are compared case-folded, because the application's own plugin directory is on the
-    // same filesystem as everything else and `Plugin.js` and `plugin.js` are one file on two of the
-    // three platforms.
+    // An install step and the removal that undoes it name the same thing exactly. A configuration
+    // key is a JSON member, where case is part of the name, and a path spelled differently is a
+    // different file on Linux. Case-folded collisions between two install destinations are a
+    // separate problem, reported separately below.
     let mut written: BTreeMap<(String, Option<String>), Option<PayloadDigest>> = BTreeMap::new();
     for step in &bridge.install {
         let (path, key) = step.writes();
-        let target = (path.collision_key(), key.map(str::to_ascii_lowercase));
+        let target = (path.to_string(), key.map(str::to_owned));
         let digest = match step {
             BridgeStep::InstallFile { digest, .. } => Some(*digest),
             BridgeStep::AddConfigurationKey { .. } => None,
@@ -1310,6 +1321,27 @@ fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut R
             }
         }
     }
+    // Two install steps that write one file on macOS or Windows are a defect wherever the
+    // application's plugin directory happens to live.
+    let destinations: Vec<crate::paths::PackagePath> = bridge
+        .install
+        .iter()
+        .filter_map(|step| match step {
+            BridgeStep::InstallFile { destination, .. } => Some(destination.clone()),
+            BridgeStep::AddConfigurationKey { .. } => None,
+        })
+        .collect();
+    for collision in find_collisions(&destinations) {
+        report.push(Finding::at(
+            FindingCode::BridgeRecipeInvalid,
+            MANIFEST_FILE,
+            format!(
+                "the recipe installs {} and {}, which are one file on a case-insensitive filesystem",
+                collision.first, collision.second
+            ),
+        ));
+    }
+
     let mut undone: BTreeMap<(String, Option<String>), Option<PayloadDigest>> = BTreeMap::new();
     for step in &bridge.remove {
         let (path, key) = step.undoes();
@@ -1317,10 +1349,18 @@ fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut R
             BridgeRemoval::RemoveFile { digest, .. } => Some(*digest),
             BridgeRemoval::RemoveConfigurationKey { .. } => None,
         };
-        undone.insert(
-            (path.collision_key(), key.map(str::to_ascii_lowercase)),
-            digest,
-        );
+        // One removal per target. A second removal of the same target would replace the first
+        // before either was checked, so a recipe could hide a removal that names the wrong bytes.
+        if undone
+            .insert((path.to_string(), key.map(str::to_owned)), digest)
+            .is_some()
+        {
+            report.push(Finding::at(
+                FindingCode::BridgeRecipeInvalid,
+                MANIFEST_FILE,
+                format!("the recipe removes {path} more than once"),
+            ));
+        }
     }
     for (target, installed) in &written {
         let (path, key) = target;
@@ -1830,12 +1870,26 @@ fn check_connector_presence(
     }
 }
 
-/// Returns true when two field paths name the same field or one contains the other.
+/// Returns true when two field paths cannot both be written into one request.
+///
+/// Two paths conflict when they name the same field, when one is inside the other, or when they
+/// disagree about what a shared prefix is. `params.0` and `params.name` need `params` to be both an
+/// array and an object, so writing both is not a thing a broker can do, and the manifest says so
+/// rather than leaving it to find out.
 fn paths_overlap(left: &FieldPath, right: &FieldPath) -> bool {
-    left.segments
-        .iter()
-        .zip(&right.segments)
-        .all(|(one, other)| one == other)
+    use crate::connector::FieldSegment;
+
+    for (one, other) in left.segments.iter().zip(&right.segments) {
+        if one == other {
+            continue;
+        }
+        return matches!(
+            (one, other),
+            (FieldSegment::Member { .. }, FieldSegment::Index { .. })
+                | (FieldSegment::Index { .. }, FieldSegment::Member { .. })
+        );
+    }
+    true
 }
 
 /// Checks one bounded field path.
