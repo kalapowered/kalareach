@@ -84,34 +84,6 @@ pub fn leading_zero_width(text: &str) -> usize {
         .map_or(text.len(), |(index, _)| index)
 }
 
-/// Whether the library's clustering could join these two cells into one.
-///
-/// This is not what decides where the cells go: the text is cut at every cell whatever this says,
-/// so the screen is right either way. It decides only whether a row is worth keeping a copy of
-/// against the library compacting it, and the answer is no for almost every row.
-///
-/// The scalars that can join what is before them and still have a width of their own are the
-/// Hangul jamo and syllables, the regional indicators, the emoji modifiers, and anything after a
-/// zero-width joiner.
-#[must_use]
-pub fn may_recluster(previous: char, scalar: char) -> bool {
-    if previous == ZERO_WIDTH_JOINER {
-        return true;
-    }
-    let hangul = |value: char| {
-        let value = value as u32;
-        (0x1100..=0x11ff).contains(&value)
-            || (0xa960..=0xa97f).contains(&value)
-            || (0xd7b0..=0xd7ff).contains(&value)
-            || (0xac00..=0xd7a3).contains(&value)
-    };
-    let regional = |value: char| ('\u{1f1e6}'..='\u{1f1ff}').contains(&value);
-    if ('\u{1f3fb}'..='\u{1f3ff}').contains(&scalar) {
-        return true;
-    }
-    (hangul(previous) && hangul(scalar)) || (regional(previous) && regional(scalar))
-}
-
 /// How many cells `text` occupies under the pinned width model.
 ///
 /// The model is per scalar, so this sums the widths rather than asking the library what one cluster
