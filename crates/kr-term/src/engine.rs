@@ -174,6 +174,7 @@ struct Revisions {
     dimensions: u64,
     keyboard: u64,
     presentation: u64,
+    saved: u64,
 }
 
 /// One point a delta may be built against.
@@ -235,6 +236,7 @@ pub struct Engine {
     palette_revision: u64,
     dimensions_revision: u64,
     presentation_revision: u64,
+    saved_revision: u64,
     measured_rows: usize,
     measure_now: bool,
     links_seen: u64,
@@ -277,6 +279,7 @@ impl Engine {
             palette_revision: 0,
             dimensions_revision: 0,
             presentation_revision: 0,
+            saved_revision: 0,
             measured_rows: 0,
             measure_now: false,
             links_seen: 0,
@@ -458,6 +461,9 @@ impl Engine {
             // it clears is noted before the restore and put back after it.
             let restore_state = (decision.apply_to_grid && restores_cursor(&event.kind))
                 .then(|| (self.modes.is_set(ModeKind::Ansi, 20), self.grid.shift_out()));
+            if decision.apply_to_grid && saves_cursor(&event.kind) {
+                self.saved_revision = self.next_revision();
+            }
             // A measurement asked for part way through a read is taken there, not at the end of
             // it: one read can carry a session's worth of links, and the bound is only a bound if
             // something looks before the rest of them arrive.
@@ -478,6 +484,13 @@ impl Engine {
                         now_ms,
                         "the session hyperlink table is full; the link is not recorded",
                     );
+                    // The link that was open has to end here. Leaving it open would put the text
+                    // that belongs to the refused link inside the previous one, which is worse than
+                    // having no link at all. The screens now differ, so the attachment projects.
+                    self.grid.close_hyperlink();
+                    outcome
+                        .projection_required_at
+                        .get_or_insert(event.span.start());
                     disposition = DirectDisposition::Withhold;
                 } else {
                     let adapted = self.grid.apply(event);
@@ -715,12 +728,15 @@ impl Engine {
             return true;
         }
         // Every occurrence is another link object the grid holds, whether or not the session has
-        // seen the target before, so the session bound applies to all of them and not only to the
-        // ones that are new to the table.
-        if self.budget.session_over_budget() {
+        // seen the target before, so what it will cost is reserved before it is applied rather than
+        // noticed at the next measurement. One read can carry a session's worth of links.
+        let resident = crate::grid::link_cost(&uri);
+        if !self.budget.metadata_fits(resident) {
             self.budget.record_truncation();
             return true;
         }
+        self.budget
+            .add_screen_links(self.grid.alternate_active(), resident);
         if self.links.contains(&uri) {
             return false;
         }
@@ -777,7 +793,8 @@ impl Engine {
             return;
         }
         self.measure_now = false;
-        self.budget.set_screen_links(self.grid.screen_link_bytes());
+        self.budget
+            .set_screen_links(self.grid.alternate_active(), self.grid.screen_link_bytes());
         self.measured_rows = rows;
         if self.grid.alternate_active() {
             return;
@@ -848,6 +865,7 @@ impl Engine {
             dimensions: self.dimensions_revision,
             keyboard: self.keyboard_revision,
             presentation: self.presentation_revision,
+            saved: self.saved_revision,
         }
     }
 
@@ -866,7 +884,7 @@ impl Engine {
             margin_left: left + 1,
             margin_right: right + 1,
             origin_mode: self.grid.origin_mode(),
-            cursor_style: self.cursor_style,
+            cursor_style: self.grid.cursor_style(),
         }
     }
 
@@ -1176,7 +1194,7 @@ impl Engine {
                 col,
                 row,
                 visible: self.modes.is_set(ModeKind::Dec, 25),
-                style: self.cursor_style,
+                style: self.grid.cursor_style(),
                 // Not observable from the pinned grid library; see `crate::unicode::LIBRARY`.
                 pending_wrap: None,
             },
@@ -1337,7 +1355,7 @@ impl Engine {
                 col,
                 row,
                 visible: self.modes.is_set(ModeKind::Dec, 25),
-                style: self.cursor_style,
+                style: self.grid.cursor_style(),
                 pending_wrap: None,
             },
             modes: self.changed_modes(base.revisions.any),
@@ -1374,6 +1392,7 @@ impl Engine {
                 .then(|| self.grid.size()),
             title_stack: (self.title_revision > base.revisions.title)
                 .then(|| self.titles.entries().to_vec()),
+            saved_cursors: (self.saved_revision > base.revisions.saved).then_some([None, None]),
             hyperlink: (self.presentation_revision > base.revisions.presentation)
                 .then(|| self.grid.pen_hyperlink()),
         })
@@ -1487,6 +1506,34 @@ fn enters_alternate(kind: &EventKind) -> bool {
             .numbers
             .iter()
             .any(|slot| matches!(slot, Some(47 | 1047 | 1049)))
+}
+
+/// Whether a sequence saves or restores a cursor, directly or as part of a buffer switch.
+fn saves_cursor(kind: &EventKind) -> bool {
+    if restores_cursor(kind) {
+        return true;
+    }
+    match kind {
+        EventKind::Esc {
+            intermediate: None,
+            final_byte: b'7',
+            ..
+        } => true,
+        EventKind::Csi {
+            params, final_byte, ..
+        } => {
+            let csi = crate::classify::CsiView::new(params, *final_byte);
+            match csi.final_byte {
+                b's' if csi.private.is_none() && csi.numbers.is_empty() => true,
+                b'h' if csi.private == Some(b'?') => csi
+                    .numbers
+                    .iter()
+                    .any(|slot| matches!(slot, Some(1048 | 1049))),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Whether a sequence restores a saved cursor, directly or as part of leaving a buffer.

@@ -568,12 +568,17 @@ retained rows converge back under the bound over the following rows rather than 
 Measuring means walking the scrollback, so doing it on every read would cost more than the bound
 saves; every 64 reads keeps the overshoot to a fraction of the cache.
 
-What the rows cost includes the hyperlinks they hold: every cell inside a link holds a reference to
-the whole link, so a screen of linked cells costs far more than its text, and counting only the text
-would let an application hold tens of megabytes inside a budget that said it was using nothing. The
-links on rows that are showing are counted with the rest of the session's metadata rather than with
-the historical cache, because the screens are not part of that cache. A session that passes the
-budget stops being given new links.
+What the rows cost includes the hyperlinks they hold. Every cell inside a link holds a reference to
+the whole link, and the object behind that reference costs far more than its target's characters, so
+what is counted is the object: each distinct one on a row, once. Counting only the characters would
+let an application hold tens of megabytes inside a budget that said it was using nothing.
+
+Each buffer's links are counted separately and charged together, because the buffer that is not
+showing still holds its own. A link's cost is reserved when it is applied rather than noticed at the
+next measurement: one read can carry a session's worth of links, and a bound that is only checked
+afterwards is not a bound. A link that will not fit is refused, and refusing one ends the link that
+was open, because the text that belonged to the refused link must not end up inside the previous
+one.
 
 What the budget records is what the rows actually cost, not what they are allowed to cost. Recording
 the bound instead would make a session that is over its cache look exactly like one that is at it,

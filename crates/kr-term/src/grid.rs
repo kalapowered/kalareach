@@ -20,9 +20,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use wezterm_escape_parser::csi::{CSI, Mode, TerminalMode, TerminalModeCode};
+use wezterm_escape_parser::osc::OperatingSystemCommand;
 use wezterm_escape_parser::{Action, ControlCode};
 
 use wezterm_escape_parser::hyperlink::Hyperlink;
+use wezterm_surface::CursorShape;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
     Alert, AlertHandler, CellAttributes, Intensity, Terminal, TerminalConfiguration, TerminalSize,
@@ -312,6 +314,15 @@ pub enum Blink {
     Rapid,
 }
 
+/// Where the cursor was, and what the screen looked like, before one cell was printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrintOrigin {
+    col: usize,
+    row: i64,
+    stable_top: i64,
+    cursor_seqno: usize,
+}
+
 /// A run of cells sharing one rendition and one hyperlink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
@@ -556,9 +567,14 @@ impl CanonicalGrid {
     }
 
     /// The cursor and the screen's position, which together say where a print put its cell.
-    fn print_origin(&self) -> (usize, i64, i64) {
+    fn print_origin(&self) -> PrintOrigin {
         let (col, row) = self.cursor_cell();
-        (col, row, self.stable_top())
+        PrintOrigin {
+            col,
+            row,
+            stable_top: self.stable_top(),
+            cursor_seqno: self.terminal.cursor_pos().seqno,
+        }
     }
 
     /// The stable identifier of the top visible row, which moves exactly when the screen scrolls.
@@ -578,19 +594,23 @@ impl CanonicalGrid {
     /// Comparing what is in the cell would be the obvious alternative and is wrong twice over: two
     /// cells can hold the same text, and a designated character set means a cell may not hold the
     /// scalars that were printed into it.
-    fn locate(&mut self, cell: &str, before: (usize, i64, i64)) -> Option<TailCell> {
+    fn locate(&mut self, cell: &str, before: PrintOrigin) -> Option<TailCell> {
         let width = crate::unicode::cells_for(cell);
         let (after_col, row) = self.cursor_cell();
         let left = self.terminal.get_left_and_right_margins().start;
-        // Three things say the print wrapped before it placed anything: the cursor is on another
-        // row, the screen scrolled, or the cursor column moved left. The last one matters on its
-        // own, because a scroll inside a region or on the alternate buffer moves neither the row
-        // nor the screen's own position.
-        let wrapped = self.stable_top() != before.2 || row != before.1 || after_col < before.0;
+        // Four things say the print wrapped before it placed anything: the cursor is on another
+        // row, the screen scrolled, the cursor column moved left, or the cursor was placed rather
+        // than advanced. The last one is what a scroll inside a region looks like, where the row,
+        // the column and the screen's own position can all come back the same.
+        let placed = self.terminal.cursor_pos().seqno != before.cursor_seqno;
+        let wrapped = self.stable_top() != before.stable_top
+            || row != before.row
+            || after_col < before.col
+            || placed;
         let (col, row) = if wrapped {
             (left, row)
         } else {
-            (before.0, before.1)
+            (before.col, before.row)
         };
         let stored = self.cell_text(col, row)?;
         Some(TailCell {
@@ -623,10 +643,23 @@ impl CanonicalGrid {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
             return;
         };
-        if tail.stored.len() + marks.len() > self.config.cell_bytes {
+        // A cell has a content bound, and the marks that fit inside it are kept whether they
+        // arrived together or one at a time: cutting the whole group because the last one does not
+        // fit would make the answer depend on how the reads fell.
+        let room = self.config.cell_bytes.saturating_sub(tail.stored.len());
+        let keep = marks
+            .char_indices()
+            .take_while(|(index, scalar)| index + scalar.len_utf8() <= room)
+            .map(|(index, scalar)| index + scalar.len_utf8())
+            .last()
+            .unwrap_or(0);
+        if keep < marks.len() {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
+        }
+        if keep == 0 {
             return;
         }
+        let marks = &marks[..keep];
         let Some((attributes, found)) = self
             .terminal
             .screen_mut()
@@ -831,6 +864,17 @@ impl CanonicalGrid {
         Ok(())
     }
 
+    /// Ends the hyperlink the pen is inside, if it is inside one.
+    pub fn close_hyperlink(&mut self) {
+        if self.pen_hyperlink().is_none() {
+            return;
+        }
+        self.terminal
+            .perform_actions(vec![Action::OperatingSystemCommand(Box::new(
+                OperatingSystemCommand::SetHyperlink(None),
+            ))]);
+    }
+
     /// Turns newline mode back on, after something in the reducer cleared it.
     pub fn set_newline_mode(&mut self) {
         self.terminal
@@ -843,6 +887,23 @@ impl CanonicalGrid {
     pub fn set_shift_out(&mut self) {
         self.terminal
             .perform_actions(vec![Action::Control(ControlCode::ShiftOut)]);
+    }
+
+    /// The DECSCUSR style the reducer is using.
+    ///
+    /// A cursor restore puts back the shape that was saved with it, without a sequence of its own,
+    /// so the reducer is the answer rather than a tracker watching sequences.
+    #[must_use]
+    pub fn cursor_style(&self) -> u32 {
+        match self.terminal.cursor_pos().shape {
+            CursorShape::BlinkingBlock => 1,
+            CursorShape::SteadyBlock => 2,
+            CursorShape::BlinkingUnderline => 3,
+            CursorShape::SteadyUnderline => 4,
+            CursorShape::BlinkingBar => 5,
+            CursorShape::SteadyBar => 6,
+            CursorShape::Default => 0,
+        }
     }
 
     /// Whether autowrap is on.
@@ -1098,24 +1159,58 @@ fn link_bytes(line: &wezterm_term::Line) -> u64 {
         return 0;
     }
     let mut bytes = 0u64;
-    let mut seen: Option<*const Hyperlink> = None;
+    // Every distinct object on the row, not every run of them: one link can be opened once and used
+    // in cells that are not next to each other, and charging it again each time would report a row
+    // as costing a thousand times what it does.
+    let mut seen: Vec<*const Hyperlink> = Vec::new();
     for cell in line.visible_cells() {
-        match cell.attrs().hyperlink() {
-            Some(link) if seen != Some(Arc::as_ptr(link)) => {
-                let params: u64 = link
-                    .params()
-                    .iter()
-                    .map(|(key, value)| (key.len() + value.len() + 2) as u64)
-                    .sum();
-                bytes = bytes.saturating_add(link.uri().len() as u64 + params);
-                seen = Some(Arc::as_ptr(link));
-            }
-            Some(_) => {}
-            None => seen = None,
+        let Some(link) = cell.attrs().hyperlink() else {
+            continue;
+        };
+        let pointer = Arc::as_ptr(link);
+        if seen.contains(&pointer) {
+            continue;
+        }
+        bytes = bytes.saturating_add(link_object_bytes(link));
+        if seen.len() < MAX_ROW_LINKS {
+            seen.push(pointer);
         }
     }
     bytes
 }
+
+/// What a link of this length will cost once the grid holds it.
+///
+/// `text` is the parameters and the target, as one string. The bound a caller checks before it
+/// applies a link has to be the cost of the object the grid will build, not the length of what
+/// arrived.
+#[must_use]
+pub fn link_cost(text: &str) -> u64 {
+    LINK_OBJECT_BYTES + text.len() as u64 + PARAMETER_OVERHEAD_BYTES
+}
+
+/// What one link object costs, as the pinned library holds it.
+///
+/// The strings are the visible part. The object also carries an allocation of its own, a map of its
+/// parameters and the bookkeeping around them, which together cost far more than a short target:
+/// counting only the characters would report a screen of links as almost free.
+fn link_object_bytes(link: &Hyperlink) -> u64 {
+    let params: u64 = link
+        .params()
+        .iter()
+        .map(|(key, value)| (key.len() + value.len()) as u64 + PARAMETER_OVERHEAD_BYTES)
+        .sum();
+    LINK_OBJECT_BYTES + link.uri().len() as u64 + params
+}
+
+/// Distinct links one row is tracked against before the count stops being exact.
+const MAX_ROW_LINKS: usize = 256;
+
+/// What one link object costs beyond its strings.
+const LINK_OBJECT_BYTES: u64 = 320;
+
+/// What one link parameter costs beyond its key and value.
+const PARAMETER_OVERHEAD_BYTES: u64 = 64;
 
 fn to_library_size(size: GridSize) -> TerminalSize {
     TerminalSize {

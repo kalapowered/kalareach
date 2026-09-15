@@ -744,6 +744,30 @@ fn clustering_does_not_depend_on_read_boundaries() {
             text: "a\u{200b}X",
             cells: 2,
         },
+        // A wrap inside a scroll region, where the cursor comes back to the column it left.
+        Case {
+            cols: 2,
+            rows: 3,
+            setup: b"\x1b[2;3r\x1b[3;1H",
+            text: "abX\u{0301}",
+            cells: 1,
+        },
+        // The same on the alternate buffer.
+        Case {
+            cols: 2,
+            rows: 3,
+            setup: b"\x1b[?1049h\x1b[3;1H",
+            text: "abX\u{0301}",
+            cells: 1,
+        },
+        // More marks than a cell can hold: the ones that fit are kept either way.
+        Case {
+            cols: 20,
+            rows: 3,
+            setup: b"\x1b(0",
+            text: "q\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}X",
+            cells: 2,
+        },
     ];
 
     for case in &cases {

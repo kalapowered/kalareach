@@ -1087,7 +1087,74 @@ fn hyperlinks_on_the_screen_are_counted() {
     engine.feed(input.as_bytes(), 0);
     engine.quiesce(0);
     assert!(
-        engine.budget().usage().screen_links > 0,
+        engine.budget().usage().screen_links[0] > 0,
         "the links the rows on screen hold are resident state"
     );
+}
+
+/// A hyperlink the session cannot hold ends the one before it rather than extending it.
+#[test]
+fn a_refused_hyperlink_does_not_extend_the_one_before_it() {
+    let mut engine = engine();
+    let input = format!(
+        "\x1b]8;;https://old.invalid\x1b\\A\x1b]8;;https://new.invalid/{}\x1b\\B",
+        "x".repeat(4096)
+    );
+    let outcome = engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+    assert!(engine.budget().truncations() > 0);
+    assert!(
+        outcome.projection_required_at.is_some(),
+        "the canonical screen lost a link a terminal would have kept"
+    );
+    let rows = engine.grid().visible_rows();
+    let linked: Vec<Option<String>> = rows[0]
+        .runs
+        .iter()
+        .map(|run| run.hyperlink.clone())
+        .collect();
+    assert_eq!(
+        linked,
+        vec![Some("https://old.invalid".to_owned()), None],
+        "the text after the refused link is not inside the previous one"
+    );
+}
+
+/// The cursor style a report gives is the one the grid is using.
+#[test]
+fn the_cursor_style_follows_a_restore() {
+    let mut engine = engine();
+    engine.feed(b"\x1b[5 q\x1b7\x1b[2 q\x1b8", 0);
+    let view = viewport(&engine);
+    let (snapshot, _) = engine.snapshot(view, 0);
+    assert_eq!(
+        snapshot.cursor.style, 5,
+        "the restore put back the style that was saved with the cursor"
+    );
+}
+
+/// A reply that does not fit the grammar of the question is not an answer.
+#[test]
+fn a_reply_in_the_wrong_shape_does_not_answer_a_probe() {
+    for (item, reply) in [
+        (ProbeItem::Version, b"\x1bP>1;2|fake\x1b\\".as_slice()),
+        (ProbeItem::Version, b"\x1bP>!|fake\x1b\\".as_slice()),
+        (
+            ProbeItem::Foreground,
+            b"\x1b]10;rgb:ffff/0000/0000;garbage\x1b\\".as_slice(),
+        ),
+    ] {
+        let (mut session, _) =
+            ProbeSession::start(0, InputContext::Clean, &[item]).expect("clean stream");
+        let mut input = reply.to_vec();
+        input.extend_from_slice(b"\x1b[?62;22c");
+        session.observe(&input, 10).expect("observed");
+        let error = session.finish(20).expect_err("the question is unanswered");
+        assert!(matches!(
+            error,
+            TermError::ProbeFailed {
+                reason: ProbeFailure::MissingAnswer
+            }
+        ));
+    }
 }

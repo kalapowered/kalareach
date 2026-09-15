@@ -129,15 +129,18 @@ pub struct BudgetUsage {
     pub rows: u64,
     /// Bytes held by the hyperlink and title tables.
     pub metadata: u64,
-    /// Bytes held by the hyperlinks of the rows that are showing.
-    pub screen_links: u64,
+    /// Bytes held by the hyperlinks of each buffer's rows, primary first.
+    ///
+    /// Both, because the buffer that is not showing still holds its links: charging only the active
+    /// one would let a session fill the primary buffer, switch, and fill the alternate as well.
+    pub screen_links: [u64; 2],
 }
 
 impl BudgetUsage {
     /// Total committed bytes.
     #[must_use]
     pub const fn total(self) -> u64 {
-        self.screens + self.rows + self.metadata + self.screen_links
+        self.screens + self.rows + self.metadata + self.screen_links[0] + self.screen_links[1]
     }
 }
 
@@ -171,7 +174,7 @@ impl SessionBudget {
                 screens: 0,
                 rows: 0,
                 metadata: 0,
-                screen_links: 0,
+                screen_links: [0, 0],
             },
             truncations: 0,
         }
@@ -215,7 +218,10 @@ impl SessionBudget {
     /// committed.
     pub const fn check_geometry(&self, size: GridSize) -> Result<u64> {
         let cost = Self::screens_cost(size);
-        let other = self.usage.rows + self.usage.metadata + self.usage.screen_links;
+        let other = self.usage.rows
+            + self.usage.metadata
+            + self.usage.screen_links[0]
+            + self.usage.screen_links[1];
         if cost + other > self.limits.session_bytes {
             return Err(TermError::Budget {
                 what: "canonical screens",
@@ -263,9 +269,18 @@ impl SessionBudget {
         self.usage.metadata = bytes;
     }
 
-    /// Records what the hyperlinks of the rows that are showing cost.
-    pub const fn set_screen_links(&mut self, bytes: u64) {
-        self.usage.screen_links = bytes;
+    /// Records what one buffer's hyperlinks cost.
+    pub const fn set_screen_links(&mut self, alternate: bool, bytes: u64) {
+        self.usage.screen_links[alternate as usize] = bytes;
+    }
+
+    /// Adds the cost of a link that has just been admitted.
+    ///
+    /// Admission cannot wait for the next measurement: one read can carry a session's worth of
+    /// links, and a bound that is only checked afterwards is not a bound.
+    pub const fn add_screen_links(&mut self, alternate: bool, bytes: u64) {
+        let slot = alternate as usize;
+        self.usage.screen_links[slot] = self.usage.screen_links[slot].saturating_add(bytes);
     }
 
     /// Whether another `bytes` of metadata would fit.

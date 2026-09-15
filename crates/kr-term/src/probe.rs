@@ -395,18 +395,27 @@ fn interpret(event: &Event) -> Option<(ProbeItem, ProbeAnswer)> {
                 Some(11) => ProbeItem::Background,
                 _ => return None,
             };
+            // A colour reply is the selector and one colour. Anything after that is not part of the
+            // answer to this question, so the whole reply is not one.
+            if parts.len() != 2 {
+                return None;
+            }
             let spec = parts.get(1)?;
             let colour = Rgb::parse(core::str::from_utf8(spec).ok()?)?;
             Some((item, ProbeAnswer::Colour(colour)))
         }
         EventKind::Dcs {
             params,
+            intermediates,
             final_byte,
             payload,
             ..
         } => {
-            // XTVERSION answers as `DCS > | <identity> ST`.
+            // XTVERSION answers as `DCS > | <identity> ST`: one private marker, no intermediates and
+            // nothing else. A reply with parameters of its own is a different sequence.
             let is_version = *final_byte == b'|'
+                && intermediates.is_empty()
+                && params.len() == 1
                 && params
                     .first()
                     .and_then(|param| param.punct())

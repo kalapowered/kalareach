@@ -294,6 +294,12 @@ pub struct Delta {
     pub dimensions: Option<GridSize>,
     /// The virtual title stack, when the titles changed since the base.
     pub title_stack: Option<Vec<SavedTitle>>,
+    /// The saved cursor of each buffer, when one was saved or restored since the base.
+    ///
+    /// A save changes what a later restore will do, and two sessions whose saved pens differ are
+    /// two different sessions. `None` for a buffer means the pinned grid library does not expose
+    /// its saved cursor; see the narrow patch recorded in [`crate::unicode::LIBRARY`].
+    pub saved_cursors: Option<[Option<SavedCursor>; 2]>,
     /// The hyperlink the next character would be part of, when the presentation state changed.
     ///
     /// `Some(None)` is an open link that closed. Without this a reconnecting client cannot put the

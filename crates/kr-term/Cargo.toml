@@ -27,6 +27,7 @@ serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
 vtparse.workspace = true
 wezterm-escape-parser.workspace = true
+wezterm-surface.workspace = true
 wezterm-term.workspace = true
 
 [dev-dependencies]
