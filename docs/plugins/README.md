@@ -200,8 +200,11 @@ owns:
 | `terminal_text` | Writes a bounded template into the terminal | `terminal.input` |
 
 `upstream_method` names a method the package's own `connector.json` routes and classifies, so what
-the broker sends is something a publisher qualified. Each binding says which declared parameter
-fills which field of the request, and every required parameter must be bound.
+the broker sends is something a publisher qualified. The route must travel towards the application.
+Each binding says which declared parameter fills which field of the request; every required
+parameter must be bound; and no two bindings may write the same field or write inside each other's
+object, because that leaves the broker choosing which value wins. A binding over the request
+identifier or the method name is refused: those belong to the broker.
 
 `terminal_text` is a list of literal segments and parameter references. A literal is printable
 ASCII, tab and newline only: a template that could carry an escape sequence would be a way to drive
@@ -220,12 +223,17 @@ parameters, at most 24 choices.
 
 Integers are bounded to the range every supported language represents exactly, from -(2^53 - 1) to
 2^53 - 1. Byte counts and durations travel as decimal strings for the same reason: a value that
-changes when it crosses a language boundary is a value nobody can check.
+changes when it crosses a language boundary is a value nobody can check. Those strings carry the
+`uint64_decimal` format in the generated schema, so a validator checks the range rather than only
+the digits.
 
-A control may narrow its action's parameters but never widen them. It may omit an optional one. It
-may not introduce one the action does not declare, change what one accepts, make an optional one
-required, or omit a required one. The host checks every invocation against the action's schema, so a
-control that promises otherwise is a control that fails when somebody uses it.
+A control may narrow its action's parameters but never widen them. It may omit an optional one,
+shorten a text limit, tighten a range, offer a subset of the choices, and require what the action
+treats as optional. It may not introduce a parameter the action does not declare, accept values the
+action would reject, treat a required parameter as optional, or omit one. A form's fields are
+checked the same way against its submit action. The host checks every invocation against the
+action's schema, so a control that promises otherwise is a control that fails when somebody uses
+it.
 
 The bound is what makes the parameter hash in the action token mean something. A callback is bound
 to the actor, the grant, the application and thread revision, the declared action and the hash of
@@ -352,6 +360,12 @@ implements the `adapter` interface and targets the `plugin` world.
 | `encode-response` | Encodes a validated decision | 50 ms |
 | `checkpoint` | Returns resumable component state | 100 ms |
 | `restore` | Restores state from a checkpoint | 100 ms |
+
+`prepare-action` returns an effect plan whose operation is one the broker already performs:
+present, send a routed upstream method with its fields filled in, cancel the current turn,
+contribute a completed attachment handle, or write terminal text. A component chooses between them
+and supplies the values. It cannot describe an operation the broker has no way to perform, and it
+cannot name a destination outside the binding the host made.
 
 `prepare-action` receives the invocation's token: the actor, the grant, the binding and thread
 revisions, the declared action and the hash of exactly the parameters a person saw. `encode-response`
@@ -500,6 +514,11 @@ report the same code for the same defect.
 | `control_parameters_widen` | A control's parameters do not narrow its action's |
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 
+`kr-plugin-sandbox` reads each file through the handle it opened rather than through its path, so
+what it measures is what it hashes. It refuses a link, a device, a file with more than one name, and
+anything that grows past its limit while being read. It stops at the file count limit rather than
+walking a directory somebody made arbitrarily wide.
+
 ## What a signature does not do
 
 A signed package establishes provenance. It says which publisher released these exact bytes. It
@@ -530,8 +549,9 @@ Present defects: unsafe extraction path, case-colliding names, duplicate declare
 size expansion, digest mismatch, undeclared file, unknown effect class, unregistered action, effect
 without capability, unbounded SDK range, undeclared connector table, over-deep predicate, repeated
 JSON member, misplaced payload role, mismatched implementation, unsatisfied implementation,
-incomplete bridge recipe, duplicate element identifier, widened control parameters, ambiguous
-connector table, and an unsupported presentation version.
+incomplete bridge recipe, duplicate element identifier, widened control parameters, a control that
+widens a range, conflicting upstream bindings, a method routed the wrong way, ambiguous connector
+table, and an unsupported presentation version.
 
 ## Generation and checking
 

@@ -413,8 +413,8 @@ pub enum EvidenceError {
     /// A package's own declaration claimed a positive result.
     #[error("a package declaration cannot establish that a capability was qualified")]
     DeclaredQualification,
-    /// A signed record named no profile to invalidate it against.
-    #[error("a signed record must name the qualification profile it came from")]
+    /// A record named no profile to invalidate it against.
+    #[error("a record from a signed profile must name the profile's digest")]
     MissingProfileIdentity,
     /// An unusable state carried no reason for a person to read.
     #[error("state {state:?} needs a user-facing disabled reason")]
@@ -441,8 +441,13 @@ impl CapabilityEvidence {
         {
             return Err(EvidenceError::DeclaredQualification);
         }
-        if self.source == EvidenceSource::SignedRecord
-            && self.state.is_positive()
+        // A signed record came from a profile, whatever it says. Without the profile's digest,
+        // the `profile_changed` trigger has nothing to compare against, so the record never goes
+        // stale.
+        if (self.source == EvidenceSource::SignedRecord
+            || self
+                .invalidated_by
+                .contains(&InvalidationTrigger::ProfileChanged))
             && self.identity.profile_digest.0.is_none()
         {
             return Err(EvidenceError::MissingProfileIdentity);

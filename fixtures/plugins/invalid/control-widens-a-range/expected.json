@@ -1,0 +1,6 @@
+{
+  "note": "A control that accepts longer text than its action does.",
+  "codes": [
+    "control_parameters_widen"
+  ]
+}

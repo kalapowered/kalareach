@@ -201,6 +201,39 @@ pub struct ParameterChoice {
     pub label: Label,
 }
 
+impl ParameterKind {
+    /// Returns true when this kind accepts no more than `parent` accepts.
+    ///
+    /// A control may tighten what its action accepts: a shorter text limit, a narrower range, a
+    /// subset of the choices. It may not widen any of them, because the host checks the invocation
+    /// against the action's schema and a widened control produces invocations that fail.
+    #[must_use]
+    pub fn narrows(&self, parent: &Self) -> bool {
+        match (self, parent) {
+            (
+                Self::Text { max_length, .. },
+                Self::Text {
+                    max_length: parent, ..
+                },
+            ) => max_length.get() <= parent.get(),
+            (
+                Self::Integer { minimum, maximum },
+                Self::Integer {
+                    minimum: parent_minimum,
+                    maximum: parent_maximum,
+                },
+            ) => minimum.get() >= parent_minimum.get() && maximum.get() <= parent_maximum.get(),
+            (Self::Choice { choices }, Self::Choice { choices: parent }) => choices
+                .iter()
+                .all(|choice| parent.iter().any(|allowed| allowed.id == choice.id)),
+            (Self::Boolean {}, Self::Boolean {})
+            | (Self::AttachmentHandle {}, Self::AttachmentHandle {})
+            | (Self::NodeRef {}, Self::NodeRef {}) => true,
+            _ => false,
+        }
+    }
+}
+
 /// One parameter of an action.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -577,6 +610,38 @@ pub struct AttachmentContribution {
     pub external_destination: Nullable<Label>,
 }
 
+impl AttachmentContribution {
+    /// Returns the rights the broker intersects when this contribution is dispatched.
+    ///
+    /// The insertion method decides this, not the effect class. Writing a path into the terminal
+    /// draft is terminal input whatever the attachment is for, and section 11 keeps input
+    /// authority, input leases and file grants separate from each other. An action that contributes
+    /// an attachment is checked against the union of its class's rights and these.
+    #[must_use]
+    pub fn required_rights(&self) -> CanonicalSet<ActionRight> {
+        let mut rights: CanonicalSet<ActionRight> = EffectClass::UpstreamAttachment
+            .required_rights()
+            .iter()
+            .copied()
+            .collect();
+        if self.insertion == AttachmentInsertion::TerminalDraftPath {
+            rights.insert(ActionRight::TerminalInput);
+        }
+        rights
+    }
+
+    /// Returns the capability the package must request for this insertion method.
+    #[must_use]
+    pub const fn required_capability(&self) -> PluginCapability {
+        match self.insertion {
+            AttachmentInsertion::TerminalDraftPath => PluginCapability::TerminalInput,
+            AttachmentInsertion::NativeComposer | AttachmentInsertion::UpstreamUpload => {
+                PluginCapability::UpstreamAction
+            }
+        }
+    }
+}
+
 /// How an attachment reaches the upstream draft.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -633,6 +698,38 @@ mod tests {
     }
 
     #[test]
+    fn writing_an_attachment_path_into_the_terminal_needs_input_authority() {
+        let contribution = |insertion| AttachmentContribution {
+            accepted_media_types: vec!["image/png".to_owned()],
+            max_bytes: U64::new(1_048_576),
+            max_count: Count::new(4),
+            insertion,
+            external_destination: Nullable(None),
+        };
+        let terminal = contribution(AttachmentInsertion::TerminalDraftPath);
+        assert!(
+            terminal
+                .required_rights()
+                .contains(&ActionRight::TerminalInput)
+        );
+        assert_eq!(
+            terminal.required_capability(),
+            PluginCapability::TerminalInput
+        );
+
+        let composer = contribution(AttachmentInsertion::NativeComposer);
+        assert!(
+            !composer
+                .required_rights()
+                .contains(&ActionRight::TerminalInput)
+        );
+        assert_eq!(
+            composer.required_capability(),
+            PluginCapability::UpstreamAction
+        );
+    }
+
+    #[test]
     fn decoding_never_answers() {
         assert!(EffectClass::ApprovalDecode.required_rights().is_empty());
         assert_eq!(
@@ -645,6 +742,41 @@ mod tests {
     fn an_unknown_effect_class_has_no_meaning() {
         assert_eq!(EffectClass::from_wire("shell.exec"), None);
         assert_eq!(EffectClass::from_wire("Observe"), None);
+    }
+
+    #[test]
+    fn a_kind_narrows_when_it_accepts_no_more_than_its_parent() {
+        let choice = |ids: &[&str]| ParameterKind::Choice {
+            choices: ids
+                .iter()
+                .map(|id| ParameterChoice {
+                    id: ParameterName::new(*id).expect("a literal choice id"),
+                    label: Label::new("Choice").expect("a literal label"),
+                })
+                .collect(),
+        };
+        let integer = |minimum: i64, maximum: i64| ParameterKind::Integer {
+            minimum: SafeInt::new(minimum).expect("in range"),
+            maximum: SafeInt::new(maximum).expect("in range"),
+        };
+        let text = |max_length: u32| ParameterKind::Text {
+            max_length: Count::new(max_length),
+            multiline: false,
+        };
+
+        assert!(text(20).narrows(&text(100)));
+        assert!(text(100).narrows(&text(100)));
+        assert!(!text(200).narrows(&text(100)));
+
+        assert!(integer(10, 20).narrows(&integer(0, 100)));
+        assert!(!integer(-1, 20).narrows(&integer(0, 100)));
+        assert!(!integer(0, 200).narrows(&integer(0, 100)));
+
+        assert!(choice(&["a"]).narrows(&choice(&["a", "b"])));
+        assert!(!choice(&["a", "c"]).narrows(&choice(&["a", "b"])));
+
+        assert!(ParameterKind::Boolean {}.narrows(&ParameterKind::Boolean {}));
+        assert!(!ParameterKind::Boolean {}.narrows(&text(10)));
     }
 
     #[test]

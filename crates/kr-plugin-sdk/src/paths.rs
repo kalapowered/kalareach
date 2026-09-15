@@ -35,13 +35,12 @@ pub const MAX_PATH_DEPTH: usize = 8;
 
 /// The pattern a package path matches, for consumers that check the JSON Schema alone.
 ///
-/// A regular expression cannot express every rule in this module: Windows device names and
-/// case-folded collisions need the code below. It does carry the rules that matter most to a
-/// consumer reading the schema without a KalaReach implementation beside it: relative, no
-/// traversal, no backslash, no drive prefix, and none of the characters that make one name mean
-/// two files.
+/// A regular expression cannot express every rule in this module: Windows device names,
+/// case-folded collisions and one path shadowing another's directory need the code below. It does
+/// carry the rules a consumer can check without a KalaReach implementation beside it: relative, no
+/// traversal, the portable alphabet, and no leading, trailing or repeated separator.
 pub const PACKAGE_PATH_PATTERN: &str =
-    r#"^(?!.*(?:^|/)\.{1,2}(?:/|$))[^\x00-\x1F\x7F/\\<>:"|?*]+(?:/[^\x00-\x1F\x7F/\\<>:"|?*]+)*$"#;
+    r"^(?!(?:.*/)?\.+(?:/|$))[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$";
 
 /// Device names that Windows resolves regardless of directory or extension.
 const WINDOWS_DEVICE_NAMES: &[&str] = &[
@@ -293,8 +292,13 @@ pub enum CollisionKind {
 
 /// Finds every pair of paths that cannot both exist on a case-insensitive filesystem.
 ///
-/// The result is ordered by the shared key, so a validator reports collisions in the same order on
-/// every run.
+/// The scan is linear in the number of paths and their depth: every path's folded key goes into
+/// one map, and each path then looks up its own directory prefixes. Comparing every pair would be
+/// quadratic, and a package is allowed enough files that quadratic is a way to spend a validator's
+/// afternoon.
+///
+/// The result is ordered by the shared key and the colliding path, so a validator reports
+/// collisions in the same order on every run.
 #[must_use]
 pub fn find_collisions(paths: &[PackagePath]) -> Vec<PathCollision> {
     let mut seen: BTreeMap<String, PackagePath> = BTreeMap::new();
@@ -313,25 +317,28 @@ pub fn find_collisions(paths: &[PackagePath]) -> Vec<PathCollision> {
             }
         }
     }
-    for (index, path) in paths.iter().enumerate() {
-        for other in &paths[index + 1..] {
-            let (file, directory) = if path.shadows(other) {
-                (other, path)
-            } else if other.shadows(path) {
-                (path, other)
-            } else {
-                continue;
-            };
-            collisions.push(PathCollision {
-                first: file.clone(),
-                second: directory.clone(),
-                key: file.collision_key(),
-                kind: CollisionKind::FileAndDirectory,
-            });
+    for path in paths {
+        let key = path.collision_key();
+        let mut boundary = 0;
+        while let Some(offset) = key[boundary..].find('/') {
+            boundary += offset;
+            let prefix = &key[..boundary];
+            if let Some(file) = seen.get(prefix) {
+                collisions.push(PathCollision {
+                    first: file.clone(),
+                    second: path.clone(),
+                    key: prefix.to_owned(),
+                    kind: CollisionKind::FileAndDirectory,
+                });
+            }
+            boundary += 1;
         }
     }
     collisions.sort_by(|left, right| {
         (&left.key, left.second.as_str()).cmp(&(&right.key, right.second.as_str()))
+    });
+    collisions.dedup_by(|left, right| {
+        left.kind == right.kind && left.key == right.key && left.second == right.second
     });
     collisions
 }
@@ -378,7 +385,7 @@ impl JsonSchema for PackagePath {
             "minLength": 1,
             "maxLength": MAX_PATH_LEN,
             "pattern": PACKAGE_PATH_PATTERN,
-            "description": "A relative POSIX path inside the package. No '..', no absolute or drive-prefixed path, no backslash, no Windows device name, no trailing dot or space, at most 8 segments."
+            "description": "A relative POSIX path inside the package, in ASCII letters, digits, '.', '-' and '_'. At most 8 segments. A '..' or '.' segment, a segment of only dots, a trailing dot, a Windows device name, a case-folded collision with another path and a path that shadows another's directory are all rejected by the host; a pattern cannot express them."
         })
     }
 }
@@ -389,6 +396,45 @@ mod tests {
 
     fn path(text: &str) -> PackagePath {
         PackagePath::new(text).expect("valid package path")
+    }
+
+    #[test]
+    fn the_published_pattern_agrees_with_the_code_on_the_cases_it_covers() {
+        // The pattern is what a consumer checks without a KalaReach implementation beside it, so
+        // the two must not disagree about a path either of them can decide.
+        let pattern = regex_lite_matches;
+        for accepted in ["plugin.json", "assets/icon.svg", "a/b/c.d"] {
+            assert!(pattern(accepted), "the pattern rejects {accepted:?}");
+            assert!(PackagePath::new(accepted).is_ok());
+        }
+        for rejected in [
+            "../escape",
+            "./here",
+            "assets/../escape",
+            "assets/...",
+            "/absolute",
+            "C:/drive",
+            "back\\slash",
+            "caf\u{e9}.svg",
+            "with space.svg",
+            "trailing/",
+        ] {
+            assert!(!pattern(rejected), "the pattern accepts {rejected:?}");
+            assert!(PackagePath::new(rejected).is_err(), "accepted {rejected:?}");
+        }
+    }
+
+    /// Evaluates [`PACKAGE_PATH_PATTERN`] without a regular expression engine.
+    ///
+    /// The pattern says: no segment is only dots, and every segment is one or more characters from
+    /// the portable alphabet.
+    fn regex_lite_matches(path: &str) -> bool {
+        !path.is_empty()
+            && path.split('/').all(|segment| {
+                !segment.is_empty()
+                    && !segment.chars().all(|character| character == '.')
+                    && segment.chars().all(is_portable_path_char)
+            })
     }
 
     #[test]

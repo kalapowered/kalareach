@@ -605,7 +605,7 @@ export type MethodClass = 'observation' | 'mutation' | 'credential' | 'unsupport
  */
 export type OperatingSystem = 'linux' | 'mac_os' | 'windows'
 /**
- * A relative POSIX path inside the package. No '..', no absolute or drive-prefixed path, no backslash, no Windows device name, no trailing dot or space, at most 8 segments.
+ * A relative POSIX path inside the package, in ASCII letters, digits, '.', '-' and '_'. At most 8 segments. A '..' or '.' segment, a segment of only dots, a trailing dot, a Windows device name, a case-folded collision with another path and a path that shadows another's directory are all rejected by the host; a pattern cannot express them.
  */
 export type PackagePath = string
 /**

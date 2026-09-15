@@ -214,7 +214,7 @@ interface document {
 
 /// What a component implements.
 interface adapter {
-    use types.{id, revision, timestamp-ms, effect-class, method-class, named-argument, fault, source-event-handle, native-request-id, action-token};
+    use types.{id, revision, timestamp-ms, effect-class, method-class, argument, named-argument, fault, source-event-handle, native-request-id, action-token};
 
     /// The binding this instance serves.
     record binding {
@@ -224,13 +224,48 @@ interface adapter {
         executable: string,
     }
 
+    /// One field of an upstream request and the value that goes in it.
+    record field-assignment {
+        /// The path into the request, as member names and array indices from its root.
+        path: list<string>,
+        value: argument,
+    }
+
+    /// What the broker does with a prepared effect.
+    ///
+    /// Each form names an operation the broker already owns. A component chooses between them and
+    /// fills in the values; it cannot describe an operation the broker has no way to perform, and
+    /// it cannot name a destination outside the binding the host made.
+    variant prepared-operation {
+        /// Redraw the component's own document. Nothing leaves the host.
+        present,
+        /// Send one method the connector table routes and classifies.
+        upstream-method(upstream-call),
+        /// Request cancellation of the bound execution's current turn.
+        upstream-cancel,
+        /// Contribute a completed attachment handle to the upstream draft.
+        upstream-attachment(id),
+        /// Write text into the terminal. The host quotes nothing on the component's behalf.
+        terminal-text(string),
+    }
+
+    /// One routed upstream method and its filled-in fields.
+    record upstream-call {
+        /// The method as the connector table names it.
+        method: string,
+        /// The fields the broker fills in before it sends the request.
+        fields: list<field-assignment>,
+    }
+
     /// An effect a component proposes.
     ///
-    /// Proposing is not doing. The broker checks the class against the action's declaration, the
-    /// actor's grant and the binding revision, then claims and dispatches.
+    /// Proposing is not doing. The broker checks the operation against the action's declared effect
+    /// class, the actor's grant and the binding revision, then claims and dispatches. A method the
+    /// connector table does not route, or routes the other way, is refused here rather than sent.
     record effect-plan {
         action-id: id,
         class: effect-class,
+        operation: prepared-operation,
         arguments: list<named-argument>,
     }
 

@@ -122,11 +122,18 @@ impl ExecutableMatch {
     #[must_use]
     pub fn matches_path(&self, path: &str) -> bool {
         let normalised = path.replace('\\', "/");
-        let mut segments: Vec<&str> = normalised.split('/').filter(|s| !s.is_empty()).collect();
-        let Some(file) = segments.pop() else {
+        let mut segments: Vec<&str> = normalised.split('/').collect();
+        // A trailing separator names a directory, and a directory is not an executable. The empty
+        // last segment stays in the list so that `/usr/bin/app/` fails rather than matching `app`.
+        let Some(file) = segments.pop().filter(|file| !file.is_empty()) else {
             return false;
         };
-        let stem = file.strip_suffix(".exe").unwrap_or(file);
+        segments.retain(|segment| !segment.is_empty());
+        let stem = if file.len() > 4 && file[file.len() - 4..].eq_ignore_ascii_case(".exe") {
+            &file[..file.len() - 4]
+        } else {
+            file
+        };
         if !stem.eq_ignore_ascii_case(&self.file_stem) {
             return false;
         }
@@ -272,8 +279,12 @@ mod tests {
         assert!(codex.matches_path("/usr/local/bin/codex"));
         assert!(codex.matches_path("C:\\Program Files\\Codex\\codex.exe"));
         assert!(codex.matches_path("/opt/homebrew/bin/CODEX"));
+        assert!(codex.matches_path("C:\\Program Files\\Codex\\CODEX.EXE"));
         assert!(!codex.matches_path("/usr/local/bin/codex-helper"));
         assert!(!codex.matches_path("/usr/local/bin/"));
+        // A directory named after the executable is not the executable.
+        assert!(!codex.matches_path("/usr/local/codex/"));
+        assert!(!codex.matches_path(""));
     }
 
     #[test]

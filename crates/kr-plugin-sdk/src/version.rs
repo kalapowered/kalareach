@@ -37,9 +37,14 @@ pub struct PackageVersion(Version);
 impl PackageVersion {
     /// Parses an exact semantic version.
     ///
+    /// Parsing is the only way to build one, so every `PackageVersion` is inside the bound the
+    /// schema publishes. A constructor that took a `semver::Version` directly would let Rust build
+    /// a version the schema rejects, and then serialise it.
+    ///
     /// # Errors
     ///
-    /// Returns [`semver::Error`] when the text is not a semantic version.
+    /// Returns [`semver::Error`] when the text is not a semantic version or is longer than
+    /// [`MAX_VERSION_LEN`] bytes.
     pub fn parse(text: &str) -> Result<Self, semver::Error> {
         if text.len() > MAX_VERSION_LEN {
             // `semver::Error` has no public constructor, so the bound is expressed as a parse
@@ -53,12 +58,6 @@ impl PackageVersion {
     #[must_use]
     pub const fn get(&self) -> &Version {
         &self.0
-    }
-}
-
-impl From<Version> for PackageVersion {
-    fn from(value: Version) -> Self {
-        Self(value)
     }
 }
 

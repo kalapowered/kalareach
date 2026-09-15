@@ -114,6 +114,26 @@ for (const [name, range] of Object.entries(integerFormats)) {
   })
 }
 
+/** The largest value a decimal 64-bit counter may spell. */
+const maxDecimalU64 = 18446744073709551615n
+
+/**
+ * Unsigned 64-bit counters travel as decimal strings, because a JavaScript number cannot carry one
+ * exactly. The pattern alone admits a value one past the range, which Rust rejects, so the range
+ * is checked here where the value is still exact.
+ */
+ajv.addFormat('uint64_decimal', {
+  type: 'string',
+  validate: (value: string) => {
+    try {
+      const parsed = BigInt(value)
+      return parsed >= 0n && parsed <= maxDecimalU64
+    } catch {
+      return false
+    }
+  }
+})
+
 ajv.addSchema(schema, 'kalareach-plugin-sdk')
 
 const validators = new Map<string, ValidateFunction>()

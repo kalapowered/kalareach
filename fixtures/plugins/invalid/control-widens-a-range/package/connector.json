@@ -1,0 +1,87 @@
+{
+  "manifest_version": 1,
+  "plugin_id": "kalareach/example-connector",
+  "protocol": {
+    "name": "example-agent-rpc",
+    "qualified_range": ">=1.0.0, <2.0.0",
+    "tested_version": "1.2.0"
+  },
+  "transport": "stdio",
+  "framing": {
+    "type": "line_delimited_json",
+    "max_message_bytes": "1048576"
+  },
+  "request_id_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "id"
+      }
+    ]
+  },
+  "method_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "method"
+      }
+    ]
+  },
+  "response_correlation": {
+    "type": "matching_id",
+    "id_path": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "id"
+        }
+      ]
+    }
+  },
+  "routes": [
+    {
+      "method": "turn.start",
+      "wire_name": "turn/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "turn.cancel",
+      "wire_name": "turn/cancel",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "status.read",
+      "wire_name": "status/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "credential.read",
+      "wire_name": "credential/read",
+      "direction": "upstream_to_host"
+    }
+  ],
+  "methods": [
+    {
+      "method": "turn.start",
+      "class": "mutation",
+      "evidence": "Starts a turn, which writes to the workspace"
+    },
+    {
+      "method": "turn.cancel",
+      "class": "mutation",
+      "evidence": "Ends the current turn"
+    },
+    {
+      "method": "status.read",
+      "class": "observation",
+      "evidence": "Returns the current turn state and nothing else"
+    },
+    {
+      "method": "credential.read",
+      "class": "credential",
+      "evidence": "Carries the upstream token; the broker keeps it"
+    }
+  ],
+  "volatile_forwarding": false,
+  "qualification_note": "Qualified against example-agent 1.2.0 with the published protocol reference"
+}

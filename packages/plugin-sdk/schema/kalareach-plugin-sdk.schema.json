@@ -785,6 +785,8 @@
     },
     "CapabilityRevision": {
       "description": "Current evidence for a versioned capability. Never permission.",
+      "format": "uint64_decimal",
+      "maxLength": 20,
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
@@ -2477,10 +2479,10 @@
       "type": "string"
     },
     "PackagePath": {
-      "description": "A relative POSIX path inside the package. No '..', no absolute or drive-prefixed path, no backslash, no Windows device name, no trailing dot or space, at most 8 segments.",
+      "description": "A relative POSIX path inside the package, in ASCII letters, digits, '.', '-' and '_'. At most 8 segments. A '..' or '.' segment, a segment of only dots, a trailing dot, a Windows device name, a case-folded collision with another path and a path that shadows another's directory are all rejected by the host; a pattern cannot express them.",
       "maxLength": 512,
       "minLength": 1,
-      "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^\\x00-\\x1F\\x7F/\\\\<>:\"|?*]+(?:/[^\\x00-\\x1F\\x7F/\\\\<>:\"|?*]+)*$",
+      "pattern": "^(?!(?:.*/)?\\.+(?:/|$))[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$",
       "type": "string"
     },
     "PackageVersion": {
@@ -3429,6 +3431,8 @@
     },
     "RepositoryGeneration": {
       "description": "The catalogue generation a plugin package was resolved against.",
+      "format": "uint64_decimal",
+      "maxLength": 20,
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
@@ -3798,6 +3802,8 @@
     },
     "TimestampMs": {
       "description": "A UTC timestamp in milliseconds, as a decimal string in JSON.",
+      "format": "uint64_decimal",
+      "maxLength": 20,
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
@@ -3828,6 +3834,8 @@
     },
     "U64": {
       "description": "An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.",
+      "format": "uint64_decimal",
+      "maxLength": 20,
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },

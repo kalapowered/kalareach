@@ -65,7 +65,8 @@ pub fn sdk_schema() -> Value {
         "vocabulary".to_owned(),
         vocabulary(&mut generator).to_value(),
     );
-    let definitions = generator.take_definitions(true);
+    let mut definitions = generator.take_definitions(true);
+    bound_decimal_counters(&mut definitions);
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "KalaReach plugin SDK",
@@ -74,6 +75,37 @@ pub fn sdk_schema() -> Value {
         "properties": Value::Object(properties),
         "$defs": Value::Object(definitions.into_iter().collect()),
     })
+}
+
+/// The format name a decimal 64-bit counter carries in the generated schema.
+pub const DECIMAL_U64_FORMAT: &str = "uint64_decimal";
+
+/// The largest value a decimal 64-bit counter may spell.
+pub const DECIMAL_U64_MAX: &str = "18446744073709551615";
+
+/// Marks every decimal 64-bit counter with its format and its exact length bound.
+///
+/// Section 4 puts unsigned 64-bit counters on the wire as decimal strings, and the pattern alone
+/// admits `18446744073709551616`, which Rust rejects and a schema consumer would accept. The
+/// format names the range so a validator can check it; the length bound is what a validator that
+/// does not know the format still enforces.
+fn bound_decimal_counters(definitions: &mut Map<String, Value>) {
+    for definition in definitions.values_mut() {
+        let Some(object) = definition.as_object_mut() else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("string") {
+            continue;
+        }
+        if object.get("pattern").and_then(Value::as_str) != Some("^(0|[1-9][0-9]*)$") {
+            continue;
+        }
+        object.insert("format".to_owned(), Value::from(DECIMAL_U64_FORMAT));
+        object.insert(
+            "maxLength".to_owned(),
+            Value::from(DECIMAL_U64_MAX.len() as u64),
+        );
+    }
 }
 
 /// Registers the closed vocabularies so every consumer gets a named type for each one.

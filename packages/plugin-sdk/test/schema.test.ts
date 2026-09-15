@@ -128,6 +128,20 @@ describe('manifest validation', () => {
     expect(validatePluginManifest(overflowed).ok).toBe(false)
   })
 
+  it('rejects a counter past the 64-bit range', () => {
+    const presentation = readJson('valid', 'example-declarative', 'presentation.json') as {
+      nodes: Array<{ body: Record<string, unknown> }>
+    }
+    const progress = presentation.nodes.find((node) => node.body.kind === 'progress')
+    expect(progress).toBeDefined()
+    if (!progress) return
+    progress.body.state = { kind: 'determinate', completed: '0', total: '18446744073709551616' }
+    expect(validatePresentationManifest(presentation).ok).toBe(false)
+
+    progress.body.state = { kind: 'determinate', completed: '0', total: '18446744073709551615' }
+    expect(validatePresentationManifest(presentation).ok).toBe(true)
+  })
+
   it('keeps a 64-bit byte count exact', () => {
     const manifest = readJson('valid', 'example-connector', 'plugin.json') as {
       payloads: Array<{ size_bytes: string }>

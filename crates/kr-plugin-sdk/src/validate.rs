@@ -9,7 +9,7 @@
 //! wants the whole list. It executes nothing: no script, no Wasm, no installation step. A signed
 //! package establishes provenance, not safety, and this module is where the safety part happens.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::capability::PluginCapability;
 use crate::connector::{
     ConnectorManifest, FieldPath, Framing, MAX_CLASSIFIED_METHODS, MAX_FIELD_PATH_DEPTH,
-    MethodClass,
+    MethodClass, RouteDirection,
 };
 use crate::digest::PayloadDigest;
 use crate::effect::{
@@ -34,7 +34,9 @@ use crate::package::{
     Package, PackageFile,
 };
 use crate::paths::{PackagePath, find_collisions};
-use crate::plugin::{BridgeStep, NativeBridge, PayloadRef, PayloadRole, PluginManifest};
+use crate::plugin::{
+    BridgeRemoval, BridgeStep, NativeBridge, PayloadRef, PayloadRole, PluginManifest,
+};
 use crate::presentation::{
     Control, MAX_CONTROLS, MAX_DOCUMENT_NODES, NodeBody, PresentationManifest,
 };
@@ -521,25 +523,31 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Vec<PackageFile>> {
                 ));
                 return Some(files);
             }
-            if is_manifest_name(path.as_str()) && size_bytes > MANIFEST_BYTES {
-                report.push(Finding::at(
-                    FindingCode::PackageTooLarge,
-                    relative,
-                    format!("a manifest is at most {MANIFEST_BYTES} bytes, not {size_bytes}"),
-                ));
-                continue;
-            }
-            match fs::read(entry.path()) {
+            let limit = if is_manifest_name(path.as_str()) {
+                MANIFEST_BYTES
+            } else {
+                MAX_PACKAGE_BYTES
+            };
+            match read_bounded(&entry.path(), limit) {
                 Ok(bytes) => files.push(PackageFile {
                     path,
                     size_bytes: bytes.len() as u64,
                     digest: PayloadDigest::of(&bytes),
                 }),
                 Err(error) => report.push(Finding::at(
-                    FindingCode::DirectoryUnreadable,
+                    FindingCode::NotARegularFile,
                     relative,
                     error.to_string(),
                 )),
+            }
+            if files.len() > MAX_PACKAGE_FILES {
+                report.push(Finding::new(
+                    FindingCode::TooManyFiles,
+                    format!(
+                        "the package holds more than {MAX_PACKAGE_FILES} files; nothing past that was read"
+                    ),
+                ));
+                return Some(files);
             }
         }
     }
@@ -557,7 +565,9 @@ fn check_file_set(files: &[PackageFile], report: &mut Report) {
             ),
         ));
     }
-    let total: u64 = files.iter().map(|file| file.size_bytes).sum();
+    let total: u64 = files
+        .iter()
+        .fold(0u64, |total, file| total.saturating_add(file.size_bytes));
     if total > MAX_PACKAGE_BYTES {
         report.push(Finding::new(
             FindingCode::PackageTooLarge,
@@ -641,8 +651,18 @@ fn read_manifest_text(directory: &Path, name: &str, report: &mut Report) -> Opti
         ));
         return None;
     }
-    match fs::read_to_string(&path) {
-        Ok(text) => Some(text),
+    match read_bounded(&path, MANIFEST_BYTES) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                report.push(Finding::at(
+                    FindingCode::ManifestUnreadable,
+                    name,
+                    error.to_string(),
+                ));
+                None
+            }
+        },
         Err(error) => {
             report.push(Finding::at(
                 FindingCode::ManifestUnreadable,
@@ -652,6 +672,47 @@ fn read_manifest_text(directory: &Path, name: &str, report: &mut Report) -> Opti
             None
         }
     }
+}
+
+/// Reads a file through a handle whose identity is checked after it is open.
+///
+/// The check is `fstat` on the open handle rather than `stat` on the path, so what is measured is
+/// what is read. A file that is replaced between the two cannot be substituted here, a link or a
+/// device is refused before any byte is taken, and the read itself stops one byte past the limit
+/// rather than trusting the length reported before it started.
+///
+/// A hard link is refused too. A package holds one name per file, and a second name is a way to
+/// make one file's bytes answer for two declared payloads.
+fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a package holds one name per file",
+            ));
+        }
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len().min(limit)).unwrap_or(0));
+    let read = file.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+    if read as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("over the {limit} byte limit"),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Returns true when a path names one of the package's own manifests.
@@ -1053,15 +1114,27 @@ fn check_implementation(
                     ),
                 )),
                 Some(connector) => {
-                    if !connector.routes.iter().any(|route| &route.method == method) {
-                        report.push(Finding::at(
+                    match connector.routes.iter().find(|route| &route.method == method) {
+                        None => report.push(Finding::at(
                             FindingCode::ImplementationUnsatisfied,
                             MANIFEST_FILE,
                             format!(
                                 "the action {} sends the method {method}, which the connector table does not route",
                                 action.id
                             ),
-                        ));
+                        )),
+                        Some(route) => {
+                            if route.direction == RouteDirection::UpstreamToHost {
+                                report.push(Finding::at(
+                                    FindingCode::ImplementationUnsatisfied,
+                                    MANIFEST_FILE,
+                                    format!(
+                                        "the action {} sends {method}, which the connector table routes from the application to the host",
+                                        action.id
+                                    ),
+                                ));
+                            }
+                        }
                     }
                     if connector.classify(method) == MethodClass::Unsupported {
                         report.push(Finding::at(
@@ -1073,10 +1146,24 @@ fn check_implementation(
                             ),
                         ));
                     }
+                    for binding in bindings {
+                        for reserved in [&connector.request_id_path, &connector.method_path] {
+                            if paths_overlap(&binding.field, reserved) {
+                                report.push(Finding::at(
+                                    FindingCode::ImplementationUnsatisfied,
+                                    MANIFEST_FILE,
+                                    format!(
+                                        "the action {} binds {} over a field the broker owns",
+                                        action.id, binding.parameter
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             let mut bound = BTreeSet::new();
-            for binding in bindings {
+            for (index, binding) in bindings.iter().enumerate() {
                 if !bound.insert(&binding.parameter) {
                     report.push(Finding::at(
                         FindingCode::ImplementationUnsatisfied,
@@ -1088,6 +1175,20 @@ fn check_implementation(
                     ));
                 }
                 check_field_path(&binding.field, &format!("action {}", action.id), report);
+                // Two parameters that write the same field, or one that writes inside another's
+                // object, leave the broker choosing which value wins.
+                for other in &bindings[index + 1..] {
+                    if paths_overlap(&binding.field, &other.field) {
+                        report.push(Finding::at(
+                            FindingCode::ImplementationUnsatisfied,
+                            MANIFEST_FILE,
+                            format!(
+                                "the action {} binds {} and {} to overlapping fields",
+                                action.id, binding.parameter, other.parameter
+                            ),
+                        ));
+                    }
+                }
             }
             for parameter in &action.parameters.parameters {
                 if parameter.required && !bound.contains(&parameter.name) {
@@ -1135,10 +1236,18 @@ fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut R
             "the bridge's application range admits versions nobody wrote the recipe for",
         ));
     }
-    let mut written: BTreeSet<(String, Option<String>)> = BTreeSet::new();
+    // Targets are compared case-folded, because the application's own plugin directory is on the
+    // same filesystem as everything else and `Plugin.js` and `plugin.js` are one file on two of the
+    // three platforms.
+    let mut written: BTreeMap<(String, Option<String>), Option<PayloadDigest>> = BTreeMap::new();
     for step in &bridge.install {
         let (path, key) = step.writes();
-        if !written.insert((path.to_string(), key.map(str::to_owned))) {
+        let target = (path.collision_key(), key.map(str::to_ascii_lowercase));
+        let digest = match step {
+            BridgeStep::InstallFile { digest, .. } => Some(*digest),
+            BridgeStep::AddConfigurationKey { .. } => None,
+        };
+        if written.insert(target, digest).is_some() {
             report.push(Finding::at(
                 FindingCode::BridgeRecipeInvalid,
                 MANIFEST_FILE,
@@ -1201,25 +1310,44 @@ fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut R
             }
         }
     }
-    let mut undone: BTreeSet<(String, Option<String>)> = BTreeSet::new();
+    let mut undone: BTreeMap<(String, Option<String>), Option<PayloadDigest>> = BTreeMap::new();
     for step in &bridge.remove {
         let (path, key) = step.undoes();
-        undone.insert((path.to_string(), key.map(str::to_owned)));
+        let digest = match step {
+            BridgeRemoval::RemoveFile { digest, .. } => Some(*digest),
+            BridgeRemoval::RemoveConfigurationKey { .. } => None,
+        };
+        undone.insert(
+            (path.collision_key(), key.map(str::to_ascii_lowercase)),
+            digest,
+        );
     }
-    for (path, key) in &written {
-        if !undone.contains(&(path.clone(), key.clone())) {
-            report.push(Finding::at(
+    for (target, installed) in &written {
+        let (path, key) = target;
+        match undone.get(target) {
+            None => report.push(Finding::at(
                 FindingCode::BridgeRecipeInvalid,
                 MANIFEST_FILE,
                 match key {
                     Some(key) => format!("the recipe adds {path} {key} and never removes it"),
                     None => format!("the recipe installs {path} and never removes it"),
                 },
-            ));
+            )),
+            Some(removed) => {
+                // Removal checks the digest before it deletes, so it must be the digest the recipe
+                // installed. A removal that names different bytes never matches and never removes.
+                if removed != installed {
+                    report.push(Finding::at(
+                        FindingCode::BridgeRecipeInvalid,
+                        MANIFEST_FILE,
+                        format!("the recipe removes {path} by a digest it never installed"),
+                    ));
+                }
+            }
         }
     }
-    for (path, key) in &undone {
-        if !written.contains(&(path.clone(), key.clone())) {
+    for (path, key) in undone.keys() {
+        if !written.contains_key(&(path.clone(), key.clone())) {
             report.push(Finding::at(
                 FindingCode::BridgeRecipeInvalid,
                 MANIFEST_FILE,
@@ -1478,8 +1606,17 @@ fn check_presentation(
             ));
         }
         controls.extend(node.body.controls());
-        if let NodeBody::Form { fields, .. } = &node.body {
+        if let NodeBody::Form { fields, submit, .. } = &node.body {
             check_parameters(fields, &format!("the form {}", node.id), report);
+            // A form's fields are what a person fills in and what the submission then carries, so
+            // they are checked against the submit action exactly as a control's parameters are.
+            if let Some(action) = manifest
+                .actions
+                .iter()
+                .find(|action| action.id == submit.action_id)
+            {
+                check_control_narrows(fields, &format!("the form {}", node.id), action, report);
+            }
         }
         for action_id in node.body.action_ids() {
             if !registered.contains(&action_id) {
@@ -1535,7 +1672,12 @@ fn check_presentation(
             .iter()
             .find(|action| action.id == control.action_id)
         {
-            check_control_narrows(control, action, report);
+            check_control_narrows(
+                &control.parameters,
+                &format!("the control {}", control.id),
+                action,
+                report,
+            );
         }
     }
     for node_id in presentation
@@ -1578,14 +1720,20 @@ fn check_presentation(
     }
 }
 
-/// Checks that a control's parameters narrow its action's rather than widening them.
+/// Checks that a set of parameters narrows an action's rather than widening them.
 ///
-/// A control may supply fewer parameters than its action accepts, which is how one action serves
-/// several controls. It may not introduce a parameter the action does not declare, change what one
-/// accepts, or make an optional parameter required, because the host checks the invocation against
-/// the action's schema and a control that promises otherwise produces a control that fails.
-fn check_control_narrows(control: &Control, action: &ActionDeclaration, report: &mut Report) {
-    for parameter in &control.parameters.parameters {
+/// A control may tighten what its action accepts and may require what the action treats as
+/// optional. It may not introduce a parameter the action does not declare, accept values the
+/// action would reject, treat a required parameter as optional, or omit one. The host checks every
+/// invocation against the action's own schema, so a control that promises otherwise is a control
+/// that fails when somebody uses it.
+fn check_control_narrows(
+    parameters: &ParameterSchema,
+    owner: &str,
+    action: &ActionDeclaration,
+    report: &mut Report,
+) {
+    for parameter in &parameters.parameters {
         match action
             .parameters
             .parameters
@@ -1596,28 +1744,31 @@ fn check_control_narrows(control: &Control, action: &ActionDeclaration, report: 
                 FindingCode::ControlParametersWiden,
                 PRESENTATION_FILE,
                 format!(
-                    "the control {} declares the parameter {}, which the action {} does not",
-                    control.id, parameter.name, action.id
+                    "{owner} declares the parameter {}, which the action {} does not",
+                    parameter.name, action.id
                 ),
             )),
             Some(declared) => {
-                if declared.kind != parameter.kind {
+                if !parameter.kind.narrows(&declared.kind) {
                     report.push(Finding::at(
                         FindingCode::ControlParametersWiden,
                         PRESENTATION_FILE,
                         format!(
-                            "the control {} accepts a different value for {} than the action {}",
-                            control.id, parameter.name, action.id
+                            "{owner} accepts values for {} that the action {} does not",
+                            parameter.name, action.id
                         ),
                     ));
                 }
-                if parameter.required && !declared.required {
+                // Requiring what the action treats as optional is narrowing. Treating what the
+                // action requires as optional is not: the person could leave it out, and the
+                // invocation would then fail the action's own schema.
+                if declared.required && !parameter.required {
                     report.push(Finding::at(
                         FindingCode::ControlParametersWiden,
                         PRESENTATION_FILE,
                         format!(
-                            "the control {} requires {}, which the action {} treats as optional",
-                            control.id, parameter.name, action.id
+                            "{owner} treats {} as optional, which the action {} requires",
+                            parameter.name, action.id
                         ),
                     ));
                 }
@@ -1626,8 +1777,7 @@ fn check_control_narrows(control: &Control, action: &ActionDeclaration, report: 
     }
     for declared in &action.parameters.parameters {
         if declared.required
-            && !control
-                .parameters
+            && !parameters
                 .parameters
                 .iter()
                 .any(|parameter| parameter.name == declared.name)
@@ -1636,8 +1786,8 @@ fn check_control_narrows(control: &Control, action: &ActionDeclaration, report: 
                 FindingCode::ControlParametersWiden,
                 PRESENTATION_FILE,
                 format!(
-                    "the control {} omits {}, which the action {} requires",
-                    control.id, declared.name, action.id
+                    "{owner} omits {}, which the action {} requires",
+                    declared.name, action.id
                 ),
             ));
         }
@@ -1678,6 +1828,14 @@ fn check_connector_presence(
             ),
         ));
     }
+}
+
+/// Returns true when two field paths name the same field or one contains the other.
+fn paths_overlap(left: &FieldPath, right: &FieldPath) -> bool {
+    left.segments
+        .iter()
+        .zip(&right.segments)
+        .all(|(one, other)| one == other)
 }
 
 /// Checks one bounded field path.
