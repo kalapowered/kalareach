@@ -57,8 +57,8 @@ tracing = "=0.1.44"
 url = "=2.5.8"
 vtparse = { git = "https://github.com/wezterm/wezterm", rev = "699fd77b44641c43476c945054cfae6518dbd632" }
 wezterm-escape-parser = { git = "https://github.com/wezterm/wezterm", rev = "699fd77b44641c43476c945054cfae6518dbd632", features = ["std"] }
-wezterm-term = { git = "https://github.com/wezterm/wezterm", rev = "699fd77b44641c43476c945054cfae6518dbd632" }
 wezterm-surface = { git = "https://github.com/wezterm/wezterm", rev = "699fd77b44641c43476c945054cfae6518dbd632" }
+wezterm-term = { git = "https://github.com/wezterm/wezterm", rev = "699fd77b44641c43476c945054cfae6518dbd632" }
 wit-parser = "=0.259.0"
 zeroize = { version = "=1.9.0", features = ["derive"] }
 
