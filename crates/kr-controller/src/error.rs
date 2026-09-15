@@ -64,6 +64,12 @@ pub enum ControllerError {
         /// The token that was reused.
         token: String,
     },
+    /// The method is not reachable from this caller.
+    #[error("{method} is not reachable from a local caller")]
+    NotListed {
+        /// The method that was named.
+        method: String,
+    },
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
@@ -114,6 +120,7 @@ impl ControllerError {
             Self::UnknownSession { .. } => ErrorCode::UnknownSession,
             Self::SessionClosed { .. } => ErrorCode::SessionClosed,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
+            Self::NotListed { .. } => ErrorCode::PermissionDenied,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::Ipc(error) => error.code(),
             Self::NotConfigured(_) => ErrorCode::HostNotConfigured,

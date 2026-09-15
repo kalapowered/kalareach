@@ -90,7 +90,8 @@ pub struct Reservation {
     ///
     /// It is written before anything is spawned. A daemon that restarts mid-create can then say
     /// what the session was going to be instead of holding an identifier with no request behind it.
-    pub create_intent: Vec<u8>,
+    /// It is absent only for a reservation an earlier schema recorded without one.
+    pub create_intent: Option<Vec<u8>>,
     /// The session identifier allocated for it.
     pub session_id: SessionId,
     /// The display number allocated for it.
@@ -188,7 +189,7 @@ impl Registry {
                      actor_id          TEXT NOT NULL,
                      create_token      BLOB NOT NULL,
                      payload_digest    BLOB NOT NULL,
-                     create_intent     BLOB NOT NULL,
+                     create_intent     BLOB,
                      session_id        BLOB NOT NULL UNIQUE,
                      display_number    INTEGER NOT NULL UNIQUE,
                      phase             TEXT NOT NULL,
@@ -232,6 +233,7 @@ impl Registry {
                     .map_err(ControllerError::registry)?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
+            Some(1) => self.migrate_1_to_2()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -250,6 +252,28 @@ impl Registry {
                     i64::try_from(kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT)
                         .unwrap_or(128)
                 ],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Brings a version 1 registry forward.
+    ///
+    /// Version 1 recorded a create request's digest but not the request, and recorded the worker's
+    /// key only once the session went live. Both columns are added empty: a reservation written by
+    /// version 1 genuinely has no recorded request, and recovery treats a missing one as a launch
+    /// it cannot resume rather than inventing a session to start.
+    ///
+    /// This migration goes when there can no longer be a version 1 registry to read, which is the
+    /// first release: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_1_to_2(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "BEGIN;
+                 ALTER TABLE reservations ADD COLUMN create_intent BLOB;
+                 ALTER TABLE reservations ADD COLUMN claimed_key BLOB;
+                 UPDATE schema_version SET version = 2;
+                 COMMIT;",
             )
             .map_err(ControllerError::registry)?;
         Ok(())
@@ -448,7 +472,7 @@ impl Registry {
             actor_id: actor_id.clone(),
             create_token,
             payload_digest,
-            create_intent: create_intent.to_vec(),
+            create_intent: Some(create_intent.to_vec()),
             session_id: SessionId::new(kr_ipc::new_uuid()),
             display_number: DisplayNumber::new(u64::try_from(next_display).unwrap_or_default()),
             phase: LaunchPhase::Reserved,
@@ -466,7 +490,7 @@ impl Registry {
                     reservation.actor_id.as_str(),
                     reservation.create_token.as_bytes().as_slice(),
                     reservation.payload_digest.as_bytes().as_slice(),
-                    reservation.create_intent.as_slice(),
+                    create_intent,
                     reservation.session_id.get().as_bytes().as_slice(),
                     i64::try_from(reservation.display_number.get()).unwrap_or(i64::MAX),
                     reservation.phase.as_str(),
@@ -577,6 +601,34 @@ impl Registry {
         transaction.commit().map_err(ControllerError::registry)?;
         self.reservation(reservation_id)?
             .ok_or_else(|| ControllerError::rendezvous("the reservation vanished"))
+    }
+
+    /// Moves a reservation out of `claimed` into a resolved phase.
+    ///
+    /// Only a claim is resolved this way. A reservation that has been fenced since the claim was
+    /// consumed stays fenced: whatever answer arrives afterwards does not tell the host which of
+    /// two claimants owns the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn resolve_claim(
+        &mut self,
+        reservation_id: ReservationId,
+        phase: LaunchPhase,
+    ) -> Result<bool> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE reservations SET phase = ?2 WHERE reservation_id = ?1 AND phase = ?3",
+                params![
+                    reservation_id.get().as_bytes().as_slice(),
+                    phase.as_str(),
+                    LaunchPhase::Claimed.as_str()
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(changed > 0)
     }
 
     /// Fences a reservation, whatever phase it is in.
@@ -774,6 +826,43 @@ impl Registry {
         Ok(())
     }
 
+    /// Records a worker row without touching any reservation phase.
+    ///
+    /// Recovery uses this: the worker already exists and already proved itself, so what is missing
+    /// is the daemon's own record of it, not a transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn adopt_worker(&mut self, worker: &WorkerRecord) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO workers (session_id, display_number, public_key, process_pid,
+                     process_source, process_start, endpoint, profile, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (session_id) DO UPDATE SET
+                     public_key = excluded.public_key,
+                     process_pid = excluded.process_pid,
+                     process_source = excluded.process_source,
+                     process_start = excluded.process_start,
+                     endpoint = excluded.endpoint,
+                     state = excluded.state",
+                params![
+                    worker.session_id.get().as_bytes().as_slice(),
+                    i64::try_from(worker.display_number.get()).unwrap_or(i64::MAX),
+                    worker.public_key.as_bytes().as_slice(),
+                    i64::try_from(worker.process_identity.pid.get()).unwrap_or(i64::MAX),
+                    source_name(worker.process_identity.source),
+                    i64::try_from(worker.process_identity.start_value.get()).unwrap_or(i64::MAX),
+                    worker.endpoint,
+                    worker.profile.as_str(),
+                    worker.state.as_str(),
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
     /// Returns every worker the registry knows about.
     ///
     /// # Errors
@@ -903,7 +992,7 @@ struct RawReservation {
     source: Option<String>,
     start: Option<i64>,
     created: i64,
-    create_intent: Vec<u8>,
+    create_intent: Option<Vec<u8>>,
     claimed_key: Option<Vec<u8>>,
 }
 

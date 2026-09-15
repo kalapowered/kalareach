@@ -12,7 +12,7 @@ publish.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-protocol.workspace = true
-rustix = { workspace = true, features = ["fs", "net", "process"] }
+rustix = { workspace = true, features = ["fs", "net", "process", "time"] }
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }

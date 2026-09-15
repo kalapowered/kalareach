@@ -115,10 +115,16 @@ impl HostPaths {
     pub fn open_environment_id(&self) -> Result<EnvironmentId> {
         create_private_tree(&self.state_root, &self.state_root)?;
         let path = self.environment_id_file();
-        // Creation must not replace: two first starts racing here would otherwise each rename
-        // their own identity into place and walk away believing different answers, and the
-        // per-environment singleton lock cannot undo a split that happened before it existed.
-        // Exactly one caller creates the file; every other caller reads what that one wrote.
+        // An identity that already exists is read, and nothing else happens. Publishing first and
+        // discovering afterwards that the file was there would make reading a perfectly good
+        // identity depend on being able to write a new one.
+        if let Some(identity) = read_environment_id(&path)? {
+            return Ok(identity);
+        }
+        // Creation must not replace: two first starts racing here would otherwise each publish
+        // their own identity and walk away believing different answers, and the per-environment
+        // singleton lock cannot undo a split that happened before it existed. Exactly one caller
+        // creates the file; every other caller reads what that one wrote.
         match create_new_owner_only_file(
             &path,
             format!("{}\n", EnvironmentId::new(crate::new_uuid())).as_bytes(),
@@ -128,15 +134,13 @@ impl HostPaths {
                 if source.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
-        let text =
-            std::fs::read_to_string(&path).map_err(|error| IpcError::io("read", &path, error))?;
-        text.trim()
-            .parse::<Uuid>()
-            .map(EnvironmentId::new)
-            .map_err(|error| IpcError::IdentityUnavailable {
-                what: "environment identity",
-                detail: format!("{}: {error}", path.display()),
-            })
+        read_environment_id(&path)?.ok_or_else(|| IpcError::IdentityUnavailable {
+            what: "environment identity",
+            detail: format!(
+                "{}: the file vanished after it was published",
+                path.display()
+            ),
+        })
     }
 
     /// Returns the directories one environment uses.
@@ -597,6 +601,26 @@ pub fn current_uid() -> u32 {
 #[must_use]
 pub fn current_uid() -> u32 {
     0
+}
+
+/// Reads an installation's recorded environment identity, when one exists.
+///
+/// # Errors
+///
+/// Returns an error when the file exists and cannot be read, or does not hold an identity.
+fn read_environment_id(path: &Path) -> Result<Option<EnvironmentId>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(IpcError::io("read", path, error)),
+    };
+    text.trim()
+        .parse::<Uuid>()
+        .map(|value| Some(EnvironmentId::new(value)))
+        .map_err(|error| IpcError::IdentityUnavailable {
+            what: "environment identity",
+            detail: format!("{}: {error}", path.display()),
+        })
 }
 
 /// Writes a file owner-only, replacing any previous contents atomically.

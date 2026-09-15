@@ -17,9 +17,7 @@ use kr_ipc::freshness::FreshnessWindow;
 use kr_ipc::paths::{Endpoint, EnvironmentPaths};
 use kr_ipc::peer::PeerIdentity;
 use kr_ipc::verify::{ControllerIdentity, check_rendezvous};
-use kr_protocol::envelope::{
-    ActionTarget, MutationRequest, Outcome, ParamsValue, Request, Response,
-};
+use kr_protocol::envelope::{MutationRequest, Outcome, ParamsValue, Request, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{PROTOCOL_VERSION, ReceiveLimits};
@@ -49,7 +47,7 @@ use crate::directory::{Directory, KnownWorker, Reconnect};
 use crate::error::{ControllerError, Result};
 use crate::registry::{LaunchPhase, Registry, WorkerRecord};
 use crate::singleton::SingletonLock;
-use crate::supervision::{WorkerLaunch, WorkerSupervisor};
+use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 
 /// How long a closing worker is watched before the controller stops waiting for it to end.
 pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -67,6 +65,13 @@ pub const ACTION_WINDOW_MS: u64 = 5 * 60 * 1000;
 pub struct Controller {
     registry: Mutex<Registry>,
     directory: Mutex<Directory>,
+    /// One authenticated connection per worker.
+    ///
+    /// Presenting a generation token fences whatever connection held that authority before it, so
+    /// a daemon that opened a fresh connection for every call would spend its time fencing itself:
+    /// a status read would invalidate a close that had already been authorised. One connection per
+    /// worker, used in order, is what stops that.
+    connections: Mutex<BTreeMap<SessionId, Arc<tokio::sync::Mutex<Option<LocalClient>>>>>,
     pending: Mutex<BTreeMap<ReservationId, PendingCreate>>,
     identity: ControllerIdentity,
     generation: ControllerGeneration,
@@ -103,17 +108,18 @@ impl Controller {
     /// or the controller identity is missing.
     pub async fn start(setup: ControllerSetup) -> Result<Arc<Self>> {
         setup.paths.create()?;
+        // The lock comes before everything the environment owns: the registry's own creation and
+        // migration, the persistent identity, the generation and the directory. Two daemons
+        // starting together would otherwise both run the schema creation, and both find an empty
+        // key store, and the loser would overwrite the key every live worker recorded at spawn.
+        let mut lock = SingletonLock::acquire(&setup.paths.singleton_lock(), setup.environment_id)?;
         let mut registry = Registry::open(setup.paths.registry_database(), setup.environment_id)?;
-        // The lock comes before everything the environment owns: the persistent identity, the
-        // generation and the directory. Two daemons starting together would otherwise both find an
-        // empty key store, both create an identity, and the loser would overwrite the key every
-        // live worker recorded at spawn.
-        let lock = SingletonLock::acquire(&setup.paths.singleton_lock(), &mut registry)?;
-        let generation = lock.generation();
+        let generation = lock.advance(&mut registry)?;
         let identity = (setup.identity)()?;
         let controller = Arc::new(Self {
             registry: Mutex::new(registry),
             directory: Mutex::new(Directory::default()),
+            connections: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
             identity,
             generation,
@@ -151,40 +157,200 @@ impl Controller {
             rows
         };
         for reservation in unresolved {
-            let resolution = match (reservation.phase, reservation.launcher_identity.as_ref()) {
+            match reservation.phase {
                 // Nothing was ever handed to the service manager: the phase moves to `spawned`
                 // before the call and this one never got there.
-                (LaunchPhase::Reserved, _) => Some(LaunchPhase::Failed),
-                // The launcher never reported an identity, so there is nothing to ask about. The
-                // execution stays unresolved and keeps its slot rather than being guessed at.
-                (_, None) => None,
-                (_, Some(identity)) => match kr_ipc::identity::process_state(identity) {
-                    // The process the launcher started is gone and it never became live, so no
-                    // worker came of it. This is a confirmed failure.
-                    kr_ipc::identity::ProcessState::Ended => Some(LaunchPhase::Failed),
-                    kr_ipc::identity::ProcessState::Running
-                    | kr_ipc::identity::ProcessState::Unknown { .. } => None,
-                },
-            };
-            if let Some(phase) = resolution {
-                let mut registry = self.registry.lock().await;
-                registry.set_phase(reservation.reservation_id, phase)?;
+                LaunchPhase::Reserved => {
+                    let mut registry = self.registry.lock().await;
+                    registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                }
+                // Spawned and never claimed. A worker starts its shell only after the rendezvous
+                // hands it a launch specification, and that never happened, so an ended process
+                // means nothing came of this launch. A process still running, or one the kernel
+                // will not describe, keeps its slot.
+                LaunchPhase::Spawned => {
+                    if reservation
+                        .launcher_identity
+                        .as_ref()
+                        .is_some_and(|identity| {
+                            matches!(
+                                kr_ipc::identity::process_state(identity),
+                                kr_ipc::identity::ProcessState::Ended
+                            )
+                        })
+                    {
+                        let mut registry = self.registry.lock().await;
+                        registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                    }
+                }
+                // Claimed. This worker received its launch specification, so it may have started a
+                // shell. It is recovered by challenge where it still answers, and recorded as an
+                // abnormal closure where its process is confirmed gone; a claim is never resolved
+                // as though nothing had run.
+                LaunchPhase::Claimed => self.recover_claim(&reservation).await?,
+                _ => {}
             }
         }
-        // A worker row whose process has ended is reconciled whether or not its descriptor
-        // answered, so a session that died while no daemon was running is recorded rather than
-        // silently omitted from every later list.
-        let sessions: Vec<SessionId> = {
-            let registry = self.registry.lock().await;
-            registry
-                .workers()?
-                .into_iter()
-                .map(|worker| worker.session_id)
-                .collect()
-        };
-        for session_id in sessions {
-            let _ = self.reconcile(session_id).await;
+        self.recover_workers().await?;
+        Ok(())
+    }
+
+    /// Recovers a worker whose claim was consumed but whose session never reached the directory.
+    async fn recover_claim(&self, reservation: &crate::registry::Reservation) -> Result<()> {
+        let endpoint = self.paths.worker_endpoint(reservation.display_number)?;
+        if let Some(key) = reservation.claimed_key
+            && let Ok(proof) = self
+                .challenge(&endpoint, &key, reservation.session_id)
+                .await
+        {
+            // The worker is alive and is the one this reservation admitted. Its descriptor and its
+            // registry row are rebuilt from its own signed answer.
+            self.adopt(reservation.display_number, &key, &proof, &endpoint)
+                .await?;
+            let mut registry = self.registry.lock().await;
+            registry.resolve_claim(reservation.reservation_id, LaunchPhase::Live)?;
+            return Ok(());
         }
+        let ended = reservation
+            .launcher_identity
+            .as_ref()
+            .is_some_and(|identity| {
+                matches!(
+                    kr_ipc::identity::process_state(identity),
+                    kr_ipc::identity::ProcessState::Ended
+                )
+            });
+        if ended {
+            // The worker that held this claim is gone. It may have started a shell, so this is
+            // recorded as a session that ended abnormally rather than as a launch that never
+            // happened, and the coverage says the host did not watch it end.
+            let identity = reservation
+                .launcher_identity
+                .clone()
+                .expect("the identity was just read");
+            self.record_final(
+                reservation.session_id,
+                ClosureReason::WorkerCrash,
+                &identity,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Restores the directory entry of every worker the registry records.
+    ///
+    /// A daemon that crashed between recording a worker and publishing its descriptor left a row
+    /// with nothing on disk pointing at it. The row carries the key and the endpoint, which is
+    /// everything a challenge needs, and the worker's own answer carries everything a descriptor
+    /// needs.
+    async fn recover_workers(&self) -> Result<()> {
+        let rows = {
+            let registry = self.registry.lock().await;
+            registry.workers()?
+        };
+        for row in rows {
+            if self.directory.lock().await.get(row.session_id).is_some() {
+                continue;
+            }
+            let Ok(endpoint) = Endpoint::from_path(&row.endpoint) else {
+                continue;
+            };
+            match self
+                .challenge(&endpoint, &row.public_key, row.session_id)
+                .await
+            {
+                Ok(proof) => {
+                    self.adopt(row.display_number, &row.public_key, &proof, &endpoint)
+                        .await?;
+                }
+                // A worker that does not answer is not necessarily gone. Reconciliation asks the
+                // kernel; only a confirmed death produces a closure record.
+                Err(_) => {
+                    let _ = self.reconcile(row.session_id).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Challenges a worker against a key this daemon already holds, and presents its generation.
+    async fn challenge(
+        &self,
+        endpoint: &Endpoint,
+        worker_public_key: &kr_protocol::scalars::AuthorisationKey,
+        session_id: SessionId,
+    ) -> Result<kr_protocol::worker::WorkerVerifyProof> {
+        let identity = &self.identity;
+        let generation = self.generation;
+        let boot = self.boot_identity.clone();
+        let endpoint_text = endpoint.as_text();
+        tokio::time::timeout(crate::directory::RECONNECT_TIMEOUT, async move {
+            let mut client =
+                LocalClient::connect(endpoint, LocalClientKind::Controller, self.build_id.clone())
+                    .await?;
+            let proof = client
+                .challenge_worker(
+                    worker_public_key,
+                    session_id,
+                    SessionEpoch::V1,
+                    &endpoint_text,
+                )
+                .await?;
+            client
+                .present_generation(move |nonce| {
+                    identity
+                        .generation_token(generation, &boot, nonce)
+                        .map_err(kr_ipc::IpcError::from)
+                })
+                .await?;
+            Ok::<_, ControllerError>(proof)
+        })
+        .await
+        .map_err(|_| {
+            ControllerError::supervision("the worker did not answer its challenge in time")
+        })?
+    }
+
+    /// Records a recovered worker and republishes its descriptor.
+    async fn adopt(
+        &self,
+        display_number: kr_protocol::session::DisplayNumber,
+        worker_public_key: &kr_protocol::scalars::AuthorisationKey,
+        proof: &kr_protocol::worker::WorkerVerifyProof,
+        endpoint: &Endpoint,
+    ) -> Result<()> {
+        let record = WorkerRecord {
+            session_id: proof.session_id,
+            display_number,
+            public_key: *worker_public_key,
+            process_identity: proof.process_start_identity.clone(),
+            endpoint: proof.endpoint.clone(),
+            profile: WorkerProfile::HeadlessUser,
+            state: SessionState::Live,
+        };
+        {
+            let mut registry = self.registry.lock().await;
+            registry.adopt_worker(&record)?;
+        }
+        let descriptor = WorkerDescriptor {
+            session_id: proof.session_id,
+            session_epoch: proof.session_epoch,
+            environment_id: self.paths.environment_id(),
+            display_number,
+            boot_identity: proof.boot_identity.clone(),
+            process_start_identity: proof.process_start_identity.clone(),
+            protocol_version: proof.protocol_version,
+            endpoint: proof.endpoint.clone(),
+            worker_public_key: *worker_public_key,
+            worker_profile: WorkerProfile::HeadlessUser,
+            published_at_ms: kr_ipc::now_ms(),
+        };
+        kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
+        self.directory.lock().await.insert(KnownWorker {
+            descriptor,
+            endpoint: endpoint.clone(),
+        });
         Ok(())
     }
 
@@ -282,8 +448,11 @@ impl Controller {
                 Ok(())
             }
             ControlMessage::WorkerFailed(error) => {
+                // A worker that says it could not start resolves its own claim, but only its own:
+                // a reservation that was fenced while this report was in flight stays fenced,
+                // because the report does not answer the question fencing asked.
                 let mut registry = self.registry.lock().await;
-                registry.set_phase(reservation_id, LaunchPhase::Closed)?;
+                registry.resolve_claim(reservation_id, LaunchPhase::Failed)?;
                 drop(registry);
                 self.resolve(reservation_id, Err(error)).await;
                 Ok(())
@@ -356,13 +525,19 @@ impl Controller {
             let mut registry = self.registry.lock().await;
             registry.claim_rendezvous(claim.reservation_id, claim.worker_public_key)?
         };
+        let recorded = reservation.create_intent.as_deref().ok_or_else(|| {
+            ControllerError::rendezvous(
+                "this reservation has no recorded create request, so nothing can be launched from it",
+            )
+        })?;
         let create: SessionCreateParams =
-            kr_cbor::from_canonical_slice(&reservation.create_intent, &kr_cbor::Limits::DEFAULT)
-                .map_err(|error| {
+            kr_cbor::from_canonical_slice(recorded, &kr_cbor::Limits::DEFAULT).map_err(
+                |error| {
                     ControllerError::registry(format!(
                         "the recorded create request cannot be read: {error}"
                     ))
-                })?;
+                },
+            )?;
 
         Ok(WorkerLaunchSpec {
             session_id: reservation.session_id,
@@ -496,6 +671,29 @@ impl Controller {
     /// is a first admission the host will accept at all. Both are checked before the create token
     /// reaches the registry, so an expired window never reserves a session.
     fn check_envelope(&self, window: &FreshnessWindow, mutation: &MutationRequest) -> Result<()> {
+        use kr_protocol::authority::{AuthorityDecision, ResourceSelectorKind};
+
+        // The registry decides first: an unlisted name, a version this build does not implement
+        // and an ingress that may not reach the method are all refused before a parameter is read.
+        let entry = match kr_protocol::method::decide(
+            mutation.method.as_str(),
+            mutation.method_version,
+            kr_protocol::actor::ActorIngress::LocalIpc,
+        ) {
+            AuthorityDecision::Listed(entry) => entry,
+            AuthorityDecision::Denied(reason) => {
+                return Err(match reason.error_code() {
+                    ErrorCode::UnsupportedSchema => ControllerError::InvalidArgument(format!(
+                        "{} is not implemented at version {}",
+                        mutation.method.as_str(),
+                        mutation.method_version
+                    )),
+                    _ => ControllerError::NotListed {
+                        method: mutation.method.as_str().to_owned(),
+                    },
+                });
+            }
+        };
         mutation
             .target
             .validate()
@@ -506,12 +704,56 @@ impl Controller {
                 self.paths.environment_id()
             )));
         }
+        // A method whose registry entry names a session acts on one, and the session its
+        // parameters name is the session its target names. A close that pointed at one session and
+        // carried another in its parameters would close the one nobody addressed.
+        if entry
+            .resource_selectors
+            .contains(&ResourceSelectorKind::Session)
+        {
+            let named = mutation
+                .target
+                .session_id
+                .as_ref()
+                .copied()
+                .ok_or_else(|| {
+                    ControllerError::InvalidArgument(format!(
+                        "{} names the session it acts on",
+                        entry.name
+                    ))
+                })?;
+            let params: SessionCloseParams = parse(&mutation.params)?;
+            if params.session_id != named {
+                return Err(ControllerError::InvalidArgument(
+                    "the request's target and its parameters name different sessions".to_owned(),
+                ));
+            }
+        }
         // A local caller's authority is the operating-system caller the listener authenticated.
         if mutation.grant_id.as_ref().is_some() {
             return Err(ControllerError::InvalidArgument(
                 "a local caller acts under its authenticated operating-system identity, not a \
                  grant"
                     .to_owned(),
+            ));
+        }
+        // The requested lifetime is the caller's request, not its decision. A lifetime beyond the
+        // protocol maximum is a malformed envelope rather than a longer deadline.
+        if mutation.requested_ttl_ms.get() > kr_protocol::limits::MAX_MUTATION_TTL.get() {
+            return Err(ControllerError::InvalidArgument(format!(
+                "a mutation lifetime is at most {} milliseconds",
+                kr_protocol::limits::MAX_MUTATION_TTL.get()
+            )));
+        }
+        // Preconditions belong to the subject, and the subject of a session mutation is the
+        // worker. They are forwarded there unchanged; what this daemon checks is that the field is
+        // a map at all, so a malformed envelope is refused before a reservation is written.
+        if !matches!(
+            mutation.expected.as_value(),
+            kr_cbor::CanonicalValue::Map(_)
+        ) {
+            return Err(ControllerError::InvalidArgument(
+                "the subject preconditions are a map of the facts the caller depends on".to_owned(),
             ));
         }
         window
@@ -629,7 +871,7 @@ impl Controller {
         };
         let outcome = match method {
             Method::SessionCreate => self.session_create(actor_id, mutation).await,
-            Method::SessionClose => self.session_close(&mutation.params).await,
+            Method::SessionClose => self.session_close(mutation).await,
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
                 method.as_str()
@@ -844,17 +1086,33 @@ impl Controller {
             jobs_directory: self.paths.jobs_dir(),
         };
         let identity = match self.supervisor.start(&launch) {
-            Ok(identity) => identity,
-            Err(error) => {
-                // The service manager refused. Nothing started, so the reservation is resolved as
-                // a confirmed failure and stops occupying the environment; it is never resumed.
+            LaunchOutcome::Started(identity) => identity,
+            // Nothing started, so the reservation is resolved as a confirmed failure and stops
+            // occupying the environment. It is never resumed.
+            LaunchOutcome::NotStarted { detail } => {
                 self.pending
                     .lock()
                     .await
                     .remove(&reservation.reservation_id);
                 let mut registry = self.registry.lock().await;
                 registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
-                return Err(error);
+                drop(registry);
+                return Err(ControllerError::Supervision { detail });
+            }
+            // A process may be running. The create fails for the caller, and the reservation stays
+            // spawned: it keeps its slot until something settles what happened to that process.
+            LaunchOutcome::Uncertain { detail, pid } => {
+                self.pending
+                    .lock()
+                    .await
+                    .remove(&reservation.reservation_id);
+                if let Some(pid) = pid
+                    && let Ok(identity) = kr_ipc::identity::process_start_identity(pid)
+                {
+                    let mut registry = self.registry.lock().await;
+                    registry.record_launch(reservation.reservation_id, &identity)?;
+                }
+                return Err(ControllerError::Supervision { detail });
             }
         };
         {
@@ -938,8 +1196,14 @@ impl Controller {
         }
     }
 
-    async fn session_close(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
-        let params: SessionCloseParams = parse(params)?;
+    /// Proxies a close to the worker that owns the session.
+    ///
+    /// The caller's envelope is forwarded, not replaced. The action identifier is the durable
+    /// identity of the caller's action, and rewriting it here would give the worker a different
+    /// action from the one the caller asked for: a retry would then find no receipt, and the
+    /// caller's own identifier would name nothing.
+    async fn session_close(self: &Arc<Self>, mutation: &MutationRequest) -> Result<ParamsValue> {
+        let params: SessionCloseParams = parse(&mutation.params)?;
         let worker = self.directory.lock().await.get(params.session_id).cloned();
         let Some(worker) = worker else {
             let registry = self.registry.lock().await;
@@ -958,15 +1222,17 @@ impl Controller {
                 }),
             };
         };
-        let mut client = self.open_worker(&worker).await?;
-        let result = client
-            .mutate(
-                Method::SessionClose,
-                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
-                session_target(self.paths.environment_id(), params.session_id),
-                &params,
-            )
-            .await?;
+        let result = {
+            let mut held = self.worker_client(&worker).await?;
+            let client = held.as_mut().expect("the connection is open");
+            match client.forward(mutation).await {
+                Ok(result) => result,
+                Err(error) => {
+                    *held = None;
+                    return Err(error.into());
+                }
+            }
+        };
         match result {
             Ok(value) => {
                 let reply: SessionCloseResult = value
@@ -1102,11 +1368,13 @@ impl Controller {
         drop(registry);
         kr_ipc::descriptor::retire(&self.paths, record.session_id)?;
         self.directory.lock().await.remove(record.session_id);
+        self.connections.lock().await.remove(&record.session_id);
         Ok(())
     }
 
     async fn read_from_worker(&self, worker: &KnownWorker) -> Result<SessionSummary> {
-        let mut client = self.open_worker(worker).await?;
+        let mut held = self.worker_client(worker).await?;
+        let client = held.as_mut().expect("the connection is open");
         let result = client
             .request(
                 Method::SessionRead,
@@ -1114,7 +1382,16 @@ impl Controller {
                     session_id: worker.descriptor.session_id,
                 },
             )
-            .await?;
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                // A transport failure ends this connection. The next call opens a new one and
+                // presents the generation again rather than writing into a socket that is gone.
+                *held = None;
+                return Err(error.into());
+            }
+        };
         match result {
             Ok(value) => {
                 let read: SessionReadResult = value
@@ -1124,6 +1401,29 @@ impl Controller {
             }
             Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
         }
+    }
+
+    /// Returns this daemon's one connection to a worker, opening it if there is none.
+    ///
+    /// The guard is held for the whole call, so two operations against one worker run in order
+    /// rather than racing each other's authority.
+    async fn worker_client(
+        &self,
+        worker: &KnownWorker,
+    ) -> Result<tokio::sync::OwnedMutexGuard<Option<LocalClient>>> {
+        let link = {
+            let mut connections = self.connections.lock().await;
+            Arc::clone(
+                connections
+                    .entry(worker.descriptor.session_id)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
+            )
+        };
+        let mut held = link.lock_owned().await;
+        if held.is_none() {
+            *held = Some(self.open_worker(worker).await?);
+        }
+        Ok(held)
     }
 
     async fn open_worker(&self, worker: &KnownWorker) -> Result<LocalClient> {
@@ -1172,16 +1472,6 @@ pub struct ControllerSetup {
     pub build_id: BuildId,
     /// The release string sessions report as their terminal program version.
     pub release: String,
-}
-
-fn session_target(environment_id: EnvironmentId, session_id: SessionId) -> ActionTarget {
-    ActionTarget {
-        environment_id,
-        session_id: Nullable::some(session_id),
-        session_epoch: Nullable::some(SessionEpoch::V1),
-        application_instance_id: Nullable::null(),
-        agent_binding_revision: Nullable::null(),
-    }
 }
 
 fn closed_summary(

@@ -249,14 +249,14 @@ pub fn check_proof(
     challenge: &WorkerVerifyChallenge,
     proof: &WorkerVerifyProof,
 ) -> VerificationResult<()> {
-    if proof.session_id != descriptor.session_id {
-        return Err(VerificationError::IdentityMismatch { field: "session" });
-    }
-    if proof.session_epoch != descriptor.session_epoch {
-        return Err(VerificationError::IdentityMismatch {
-            field: "session epoch",
-        });
-    }
+    check_proof_against(
+        &descriptor.worker_public_key,
+        descriptor.session_id,
+        descriptor.session_epoch,
+        &descriptor.endpoint,
+        challenge,
+        proof,
+    )?;
     if proof.boot_identity != descriptor.boot_identity {
         return Err(VerificationError::IdentityMismatch { field: "boot" });
     }
@@ -270,7 +270,37 @@ pub fn check_proof(
             field: "protocol version",
         });
     }
-    if proof.endpoint != descriptor.endpoint {
+    Ok(())
+}
+
+/// Checks a worker's answer against a key and the identity a caller already knows.
+///
+/// A controller that lost its published descriptor still knows three things from its own registry:
+/// the key the rendezvous established, the session that key answers for, and the endpoint that
+/// session was given. That is enough to challenge the worker and rebuild the descriptor from its
+/// answer, which is what recovery does rather than starting a second worker.
+///
+/// # Errors
+///
+/// Returns [`VerificationError::IdentityMismatch`] when a field disagrees with what the caller
+/// knows, and a cryptographic error when the signature does not verify.
+pub fn check_proof_against(
+    worker_public_key: &AuthorisationKey,
+    session_id: SessionId,
+    session_epoch: SessionEpoch,
+    endpoint: &str,
+    challenge: &WorkerVerifyChallenge,
+    proof: &WorkerVerifyProof,
+) -> VerificationResult<()> {
+    if proof.session_id != session_id {
+        return Err(VerificationError::IdentityMismatch { field: "session" });
+    }
+    if proof.session_epoch != session_epoch {
+        return Err(VerificationError::IdentityMismatch {
+            field: "session epoch",
+        });
+    }
+    if proof.endpoint != endpoint {
         return Err(VerificationError::IdentityMismatch { field: "endpoint" });
     }
     let elements = verify_elements(
@@ -284,7 +314,7 @@ pub fn check_proof(
     )
     .map_err(kr_crypto::CryptoError::from)?;
     sign::verify_elements(
-        &descriptor.worker_public_key,
+        worker_public_key,
         WORKER_VERIFY_DOMAIN,
         elements,
         &proof.signature,

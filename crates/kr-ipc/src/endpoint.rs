@@ -155,26 +155,28 @@ mod platform {
         inner: UnixListener,
         path: std::path::PathBuf,
         identity: (u64, u64),
-        // Held for this listener's lifetime. Probing, replacing, binding and removing one endpoint
-        // all happen under it, so two processes cannot interleave those steps and leave one of
-        // them bound to a socket the other has already unlinked.
-        _guard: EndpointGuard,
     }
 
     impl Listener {
         pub(super) fn bind(endpoint: &Endpoint) -> Result<Self> {
             let path = endpoint.as_path().to_path_buf();
+            // The guard covers the change and nothing else. Probing an address, unlinking it and
+            // binding it are three steps, and two processes interleaving them would leave one of
+            // them bound to an address the other had already unlinked. Holding it for the
+            // listener's whole life would instead make a second bind wait for the first listener
+            // to end, which is not the answer either: that bind should be told the address is
+            // taken.
             let guard = EndpointGuard::take(&path)?;
             replace_stale_socket(&path)?;
             let inner =
                 UnixListener::bind(&path).map_err(|error| IpcError::socket("bind", error))?;
             set_owner_only(&path)?;
             let identity = socket_identity(&path)?;
+            drop(guard);
             Ok(Self {
                 inner,
                 path,
                 identity,
-                _guard: guard,
             })
         }
 
@@ -197,8 +199,12 @@ mod platform {
             // the same socket this listener bound: another process may already have replaced it,
             // and deleting a working endpoint out from under it would be worse than leaving a
             // stale file.
-            // Removal happens under the same guard the bind was taken under, so it cannot
-            // interleave with another process's probe.
+            // Removal takes the guard as well, so it cannot interleave with another process's
+            // probe. A guard that cannot be taken leaves the file alone: a stale socket file is a
+            // smaller problem than deleting a working endpoint.
+            let Ok(_guard) = EndpointGuard::take(&self.path) else {
+                return;
+            };
             if socket_identity(&self.path).is_ok_and(|identity| identity == self.identity) {
                 let _ = std::fs::remove_file(&self.path);
             }

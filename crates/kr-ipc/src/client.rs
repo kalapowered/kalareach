@@ -170,6 +170,44 @@ impl LocalClient {
         Ok(proof)
     }
 
+    /// Challenges the worker behind this endpoint against a key the caller already holds.
+    ///
+    /// This is the recovery path: a daemon whose published descriptor is missing still knows the
+    /// key its own rendezvous established and the endpoint the session was given, and the answer
+    /// carries every field a descriptor needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worker does not answer, the signature does not verify, or an
+    /// identity field disagrees with what the caller knows.
+    pub async fn challenge_worker(
+        &mut self,
+        worker_public_key: &kr_protocol::scalars::AuthorisationKey,
+        session_id: kr_protocol::ids::SessionId,
+        session_epoch: kr_protocol::ids::SessionEpoch,
+        endpoint: &str,
+    ) -> Result<WorkerVerifyProof> {
+        let challenge = fresh_challenge().map_err(IpcError::from)?;
+        self.writer
+            .write_message(&ControlMessage::VerifyChallenge(challenge))
+            .await?;
+        let ControlMessage::VerifyProof(proof) = self.reader.read_message().await? else {
+            return Err(IpcError::UnexpectedMessage(
+                "the worker did not answer the challenge",
+            ));
+        };
+        crate::verify::check_proof_against(
+            worker_public_key,
+            session_id,
+            session_epoch,
+            endpoint,
+            &challenge,
+            &proof,
+        )
+        .map_err(IpcError::from)?;
+        Ok(proof)
+    }
+
     /// Answers the worker's generation challenge.
     ///
     /// # Errors
@@ -304,6 +342,30 @@ impl LocalClient {
                 requested_ttl_ms: DurationMs::new(kr_protocol::limits::DEFAULT_MUTATION_TTL.get()),
                 params,
             }))
+            .await?;
+        self.await_response(request_id).await
+    }
+
+    /// Forwards a caller's mutation unchanged except for what belongs to this connection.
+    ///
+    /// The action identifier, the target, the preconditions and the requested lifetime are the
+    /// caller's and stay exactly as they arrived, so the receipt the host writes is the receipt the
+    /// caller asked for. Only the request identifier and the freshness window change, because both
+    /// name this connection rather than the caller's.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error, or a transport failure.
+    pub async fn forward(
+        &mut self,
+        mutation: &MutationRequest,
+    ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
+        let request_id = self.next_id();
+        let mut forwarded = mutation.clone();
+        forwarded.request_id = request_id;
+        forwarded.action_window_id = self.acknowledgement.action_window_id.clone();
+        self.writer
+            .write_message(&ControlMessage::Mutation(forwarded))
             .await?;
         self.await_response(request_id).await
     }

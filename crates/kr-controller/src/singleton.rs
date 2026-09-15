@@ -38,17 +38,34 @@ impl SingletonLock {
     ///
     /// Returns [`ControllerError::AlreadyRunning`] when another daemon holds the environment, and
     /// a registry failure when the generation cannot be advanced.
-    pub fn acquire(path: &Path, registry: &mut Registry) -> Result<Self> {
-        let file = Self::open(path, registry.environment_id())?;
-        Self::lock(&file, registry.environment_id())?;
-        // The generation advances while the lock is held, before anything reconnects to a worker.
-        let generation = registry.advance_generation()?;
+    pub fn acquire(path: &Path, environment_id: EnvironmentId) -> Result<Self> {
+        let file = Self::open(path, environment_id)?;
+        Self::lock(&file, environment_id)?;
         Ok(Self {
             _file: file,
             path: path.to_path_buf(),
-            environment_id: registry.environment_id(),
-            generation,
+            environment_id,
+            generation: ControllerGeneration::new(0),
         })
+    }
+
+    /// Advances the environment's persistent generation under this lock.
+    ///
+    /// The registry is opened, created and migrated under the lock as well, so two first starts
+    /// cannot both run the schema creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry failure when the generation cannot be advanced.
+    pub fn advance(&mut self, registry: &mut Registry) -> Result<ControllerGeneration> {
+        if registry.environment_id() != self.environment_id {
+            return Err(ControllerError::registry(
+                "this registry belongs to another environment",
+            ));
+        }
+        // The generation advances while the lock is held, before anything reconnects to a worker.
+        self.generation = registry.advance_generation()?;
+        Ok(self.generation)
     }
 
     /// Returns the generation this daemon speaks for.
@@ -141,13 +158,13 @@ mod tests {
         let paths = host.environment();
         let mut registry = Registry::open(paths.registry_database(), host.environment_id())
             .expect("opens the registry");
-        let first =
-            SingletonLock::acquire(&paths.singleton_lock(), &mut registry).expect("takes the lock");
-        assert_eq!(first.generation().get(), 1);
+        let mut first = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id())
+            .expect("takes the lock");
+        assert_eq!(first.advance(&mut registry).expect("advances").get(), 1);
         drop(first);
-        let second = SingletonLock::acquire(&paths.singleton_lock(), &mut registry)
+        let mut second = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id())
             .expect("takes the lock again");
-        assert_eq!(second.generation().get(), 2);
+        assert_eq!(second.advance(&mut registry).expect("advances").get(), 2);
     }
 
     #[cfg(unix)]
@@ -155,11 +172,9 @@ mod tests {
     fn a_second_daemon_is_refused_while_the_first_holds_the_environment() {
         let host = kr_ipc::testing::TempHost::create();
         let paths = host.environment();
-        let mut registry = Registry::open(paths.registry_database(), host.environment_id())
-            .expect("opens the registry");
-        let _held =
-            SingletonLock::acquire(&paths.singleton_lock(), &mut registry).expect("takes the lock");
-        let error = SingletonLock::acquire(&paths.singleton_lock(), &mut registry)
+        let _held = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id())
+            .expect("takes the lock");
+        let error = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id())
             .expect_err("refuses the second");
         assert!(matches!(error, ControllerError::AlreadyRunning { .. }));
     }

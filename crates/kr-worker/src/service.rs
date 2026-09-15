@@ -97,6 +97,14 @@ pub struct WorkerService {
     boot_identity: BootIdentity,
     controller_public_key: AuthorisationKey,
     authority: Mutex<Authority>,
+    /// The serial boundary every mutation and every authority change passes through.
+    ///
+    /// Checking authority and then acting on it are two operations, and between them a replacement
+    /// controller can install a newer generation. Holding this for the whole sequence — the
+    /// authority check, the admission, the revalidation, the dispatch marker and the effect — is
+    /// what makes the check mean something by the time the effect happens. Authority changes take
+    /// it too, so one cannot slip between the two halves of the other.
+    dispatch: Mutex<()>,
     build_id: kr_protocol::ids::BuildId,
 }
 
@@ -150,6 +158,7 @@ impl WorkerService {
                 bound_connection: None,
                 acknowledged_revision: None,
             }),
+            dispatch: Mutex::new(()),
             build_id: binding.build_id,
         }
     }
@@ -348,6 +357,17 @@ impl WorkerService {
         peer: &PeerIdentity,
         hello: &LocalHello,
     ) -> ControlMessage {
+        if state.negotiated {
+            // One connection, one identity. Sending a second hello would otherwise let a fenced
+            // controller reintroduce itself as a local caller and skip the authority check.
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::UnsupportedSchema,
+                    "this connection has already negotiated; open another one to change client",
+                ),
+            );
+        }
         if !hello
             .offered_versions
             .iter()
@@ -430,6 +450,13 @@ impl WorkerService {
                 ),
             );
         };
+        // Taken before the authority lock, and held for the whole decision. A generation that
+        // arrives while a mutation is between its authority check and its effect waits here, so no
+        // request is ever fenced half way through.
+        let _barrier = self
+            .dispatch
+            .lock()
+            .expect("the dispatch barrier is not poisoned");
         // One lock for the whole decision. Reading the accepted generation, checking the token
         // against it and installing the new generation with the connection that presented it
         // happen without a window in between, so two tokens cannot interleave and leave the
@@ -469,15 +496,35 @@ impl WorkerService {
         }
     }
 
-    /// Records the authority revision the controller now holds.
+    /// Installs the authority revision the controller now holds, and fences what it removes.
     ///
-    /// Only the connection that holds current authority may announce one: an announcement is what
-    /// a revocation is waiting on, and a fenced controller must not be able to satisfy it.
+    /// A revision is not a number to store. Section 9 makes a revocation complete only once every
+    /// worker that could still act under the removed authority has stopped being able to, so
+    /// installing one rejects every intent this worker has admitted and not yet dispatched. An
+    /// intent past its dispatch marker cannot be taken back from here, and is not claimed to be.
+    ///
+    /// The whole sequence runs inside the dispatch barrier, so a mutation cannot be admitted under
+    /// the old revision after this has begun and before it finishes.
     fn acknowledge_revision(
         &self,
         state: &ConnectionState,
         notice: &kr_protocol::worker::AuthorityRevisionNotice,
     ) -> ControlMessage {
+        let _barrier = self
+            .dispatch
+            .lock()
+            .expect("the dispatch barrier is not poisoned");
+        // Only the controller that holds current authority may announce one. A revocation is what
+        // this answers; a caller that the revocation might be about must not be able to satisfy it.
+        if state.client_kind != LocalClientKind::Controller {
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "only the control daemon announces an authority revision",
+                ),
+            );
+        }
         if let Err(error) = self.check_authority(state) {
             return failure(RequestId::new(0), &error.to_protocol_error());
         }
@@ -490,23 +537,56 @@ impl WorkerService {
                 ),
             );
         }
+        let held = {
+            let authority = self
+                .authority
+                .lock()
+                .expect("the authority lock is not poisoned");
+            authority.acknowledged_revision
+        };
+        // Revisions are ordered and only the host issues them, so an older one never replaces a
+        // newer one that has already been acknowledged.
+        if held.is_some_and(|held| held.get() >= notice.revision.get()) {
+            return ControlMessage::AuthorityRevisionAck(
+                kr_protocol::worker::AuthorityRevisionAck {
+                    session_id: self.runtime.session().id(),
+                    revision: held.unwrap_or(notice.revision),
+                },
+            );
+        }
+        let fenced = {
+            let mut session = self.runtime.session();
+            match session.journal_mut() {
+                Some(journal) => journal.revoke_undispatched(
+                    Some(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        format!(
+                            "the authority this action was admitted under was revoked at revision \
+                             {}",
+                            notice.revision
+                        ),
+                    )),
+                    kr_ipc::now_ms(),
+                ),
+                // Without a journal there is no admitted intent to fence, because no ordinary
+                // mutation is admitted at all.
+                None => Ok(0),
+            }
+        };
+        if let Err(error) = fenced {
+            // The acknowledgement is what the controller waits on before it calls a revocation
+            // complete. Reporting success while the fence did not run would answer it wrongly.
+            return failure(RequestId::new(0), &error.to_protocol_error());
+        }
         let mut authority = self
             .authority
             .lock()
             .expect("the authority lock is not poisoned");
-        // Revisions are ordered and only the host issues them, so an older one never replaces a
-        // newer one that has already been acknowledged.
-        if authority
-            .acknowledged_revision
-            .is_none_or(|held| held.get() < notice.revision.get())
-        {
-            authority.acknowledged_revision = Some(notice.revision);
-        }
-        let revision = authority.acknowledged_revision.unwrap_or(notice.revision);
+        authority.acknowledged_revision = Some(notice.revision);
         drop(authority);
         ControlMessage::AuthorityRevisionAck(kr_protocol::worker::AuthorityRevisionAck {
             session_id: self.runtime.session().id(),
-            revision,
+            revision: notice.revision,
         })
     }
 
@@ -620,17 +700,36 @@ impl WorkerService {
         method: Method,
         entry: &'static kr_protocol::authority::MethodEntry,
     ) -> Result<ParamsValue> {
+        // Everything from here to the recorded outcome happens inside the barrier. The authority
+        // this request was admitted under cannot change underneath it, and two mutations cannot
+        // interleave their checks with each other's effects.
+        let _barrier = self
+            .dispatch
+            .lock()
+            .expect("the dispatch barrier is not poisoned");
+        self.check_authority(state)?;
         let actor_id = state.actor_id.clone();
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
+
+        // A retained action is answered before anything about a first admission is considered.
+        // Current authority decides whether the caller may see it, which is checked above; the
+        // freshness window and the subject preconditions decide whether a *new* action is
+        // admitted, and applying them here would refuse a caller its own completed result because
+        // its own effect moved the subject on.
+        if let Some(retained) = self.retained(&actor_id, mutation, digest)? {
+            return Ok(retained);
+        }
+
         // The envelope is checked before anything durable happens: the target this worker will
         // act on, the grant the caller claims, the preconditions the subject must still satisfy
-        // and the freshness window that admits a first request. A duplicate is resolved after
-        // this, so a retained result is never handed back on authority the caller no longer has.
+        // and the freshness window that admits a first request.
         self.check_envelope(mutation, entry)?;
         let window_remaining_ms = self.check_window(state, mutation)?;
         let intent = kr_cbor::to_canonical_vec(mutation)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
+        let accepted_deadline =
+            state.accepted_deadline(mutation.requested_ttl_ms.get(), window_remaining_ms);
         let submission = crate::journal::Submission {
             actor_id: actor_id.clone(),
             action_id: mutation.action_id,
@@ -638,20 +737,21 @@ impl WorkerService {
             method_version: mutation.method_version,
             payload_digest: digest,
             intent,
-            accepted_deadline_ms: Some(
-                state.accepted_deadline(mutation.requested_ttl_ms.get(), window_remaining_ms),
-            ),
+            accepted_deadline_ms: Some(accepted_deadline),
             now_ms: kr_ipc::now_ms(),
         };
 
         // Storage failure stops an ordinary typed mutation before dispatch. An authorised stop is
         // the named exception: section 7 requires `session.close` to proceed on current in-memory
         // authority and report `durability=volatile`.
-        let admission = {
+        let admitted = {
             let mut session = self.runtime.session();
             match session.journal_mut() {
-                Some(journal) => Some(journal.accept(&submission)?),
-                None if method == Method::SessionClose => None,
+                Some(journal) => {
+                    journal.accept(&submission)?;
+                    true
+                }
+                None if method == Method::SessionClose => false,
                 None => {
                     return Err(WorkerError::JournalUnavailable {
                         detail:
@@ -662,37 +762,22 @@ impl WorkerService {
             }
         };
 
-        if let Some(admission) = admission.as_ref()
-            && admission.deduplicated
-        {
-            let retained = {
-                let mut session = self.runtime.session();
-                match session.journal_mut() {
-                    Some(journal) => journal.read_result(&actor_id, mutation.action_id)?,
-                    None => None,
-                }
-            };
-            if let Some(bytes) = retained {
-                let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
-                    .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
-                return Ok(ParamsValue::new(value));
-            }
-            // The action is known and it has no result to return. Section 9 answers that with the
-            // receipt as it stands rather than performing the effect a second time or refusing as
-            // though the request were malformed: the caller learns the action's real state and can
-            // read it again when it settles.
-            return encode(&kr_protocol::receipt::ReceiptResponse {
-                request_id: mutation.request_id,
-                receipt: admission.receipt.clone(),
-            });
-        }
-
         // Revalidate before the marker. Anything that was true at acceptance may not be now.
         if let Err(error) = self.validate(state, mutation, method) {
             self.reject(&actor_id, mutation, &error);
             return Err(error);
         }
-        if admission.is_some() {
+        // The deadline the host derived is the deadline it keeps. A request whose accepted
+        // lifetime is already spent is rejected rather than dispatched, which is also what makes a
+        // zero requested lifetime mean what it says.
+        if accepted_deadline.get() <= kr_ipc::now_ms().get() {
+            let error = WorkerError::WindowExpired {
+                detail: "the accepted deadline for this action has passed".to_owned(),
+            };
+            self.expire(&actor_id, mutation, &error);
+            return Err(error);
+        }
+        if admitted {
             let mut session = self.runtime.session();
             if let Some(journal) = session.journal_mut() {
                 journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())?;
@@ -732,6 +817,62 @@ impl WorkerService {
             (_, None) => {}
         }
         outcome
+    }
+
+    /// Returns the answer a retained action is owed, when this caller has one.
+    ///
+    /// The de-duplication key is the actor and the action together, so this can only ever find the
+    /// calling actor's own action. An identifier reused with a different payload is a conflict, not
+    /// a second action.
+    fn retained(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        digest: kr_protocol::scalars::Digest256,
+    ) -> Result<Option<ParamsValue>> {
+        let (receipt, result) = {
+            let mut session = self.runtime.session();
+            let Some(journal) = session.journal_mut() else {
+                return Ok(None);
+            };
+            let Some(receipt) = journal.read(actor_id.clone(), mutation.action_id)? else {
+                return Ok(None);
+            };
+            let result = journal.read_result(actor_id, mutation.action_id)?;
+            (receipt, result)
+        };
+        if receipt.payload_digest != digest {
+            return Err(WorkerError::IdConflict {
+                action: mutation.action_id.to_string(),
+            });
+        }
+        if let Some(bytes) = result {
+            let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
+                .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
+            return Ok(Some(ParamsValue::new(value)));
+        }
+        // The action is known and it has no result to return. Section 9 answers that with the
+        // receipt as it stands rather than performing the effect a second time or refusing as
+        // though the request were malformed: the caller learns the action's real state and can
+        // read it again when it settles.
+        encode(&kr_protocol::receipt::ReceiptResponse {
+            request_id: mutation.request_id,
+            receipt,
+        })
+        .map(Some)
+    }
+
+    fn expire(&self, actor_id: &ActorId, mutation: &MutationRequest, error: &WorkerError) {
+        let mut session = self.runtime.session();
+        if let Some(journal) = session.journal_mut() {
+            let _ = journal.reject(
+                actor_id.clone(),
+                mutation.action_id,
+                kr_protocol::receipt::RejectionReason::Expired,
+                Some(error.to_protocol_error()),
+                kr_ipc::now_ms(),
+            );
+        }
     }
 
     fn reject(&self, actor_id: &ActorId, mutation: &MutationRequest, error: &WorkerError) {
@@ -825,11 +966,7 @@ impl WorkerService {
     /// is no longer true refuses the mutation before it is admitted, so a client acting on a stale
     /// screen cannot resize, take input or close on facts that have moved.
     fn check_preconditions(&self, mutation: &MutationRequest) -> Result<()> {
-        let expected: MutationPreconditions = mutation.expected.to_typed().map_err(|error| {
-            WorkerError::InvalidArgument(format!(
-                "the subject preconditions are not a precondition map: {error}"
-            ))
-        })?;
+        let expected = MutationPreconditions::parse(&mutation.expected)?;
         let session = self.runtime.session();
         if let Some(state) = expected.session_state
             && state != session.state()
@@ -1349,24 +1486,80 @@ impl WorkerService {
 /// The subject facts a mutation requires to still be true.
 ///
 /// A precondition map is not a closed object with nullable fields: a caller states what it depends
-/// on, and states nothing about the rest. Absence therefore means "no precondition", which is why
-/// these are `Option` and not `Nullable`. The map itself is closed, so a precondition this host
-/// does not implement is a refusal rather than a field that quietly has no effect.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+/// on, and states nothing about the rest. Absence therefore means "no precondition". An explicit
+/// null is neither: it names a fact and then declines to say what it should be, so it is refused
+/// rather than read as absence. The map itself is closed, so a precondition this host does not
+/// implement is a refusal, not a field that quietly has no effect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MutationPreconditions {
     /// The lifecycle state the session must be in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_state: Option<kr_protocol::session::SessionState>,
     /// The geometry epoch the session must be at.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry_epoch: Option<kr_protocol::ids::GeometryEpoch>,
     /// The input lease epoch the session must be at.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_lease_epoch: Option<kr_protocol::ids::InputLeaseEpoch>,
     /// The output cursor the session must be at.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_cursor: Option<u64>,
+}
+
+impl MutationPreconditions {
+    /// The keys a precondition map may carry.
+    pub const KEYS: [&'static str; 4] = [
+        "geometry_epoch",
+        "input_lease_epoch",
+        "output_cursor",
+        "session_state",
+    ];
+
+    /// Reads a precondition map out of a mutation's `expected` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-argument failure when the value is not a map, names a precondition this
+    /// host does not implement, or carries an explicit null.
+    pub fn parse(expected: &ParamsValue) -> Result<Self> {
+        let kr_cbor::CanonicalValue::Map(map) = expected.as_value() else {
+            return Err(WorkerError::InvalidArgument(
+                "the subject preconditions are a map of the facts the caller depends on".to_owned(),
+            ));
+        };
+        let mut preconditions = Self::default();
+        for (key, value) in map.entries() {
+            if matches!(value, kr_cbor::CanonicalValue::Null) {
+                return Err(WorkerError::InvalidArgument(format!(
+                    "the precondition {key} names a fact and then says nothing about it"
+                )));
+            }
+            match key.as_str() {
+                "session_state" => {
+                    preconditions.session_state = Some(decode_precondition(key, value)?);
+                }
+                "geometry_epoch" => {
+                    preconditions.geometry_epoch = Some(decode_precondition(key, value)?);
+                }
+                "input_lease_epoch" => {
+                    preconditions.input_lease_epoch = Some(decode_precondition(key, value)?);
+                }
+                "output_cursor" => {
+                    preconditions.output_cursor = Some(decode_precondition(key, value)?);
+                }
+                other => {
+                    return Err(WorkerError::InvalidArgument(format!(
+                        "{other} is not a precondition this host evaluates"
+                    )));
+                }
+            }
+        }
+        Ok(preconditions)
+    }
+}
+
+fn decode_precondition<T: serde::de::DeserializeOwned + serde::Serialize>(
+    key: &str,
+    value: &kr_cbor::CanonicalValue,
+) -> Result<T> {
+    kr_cbor::from_canonical_value(value)
+        .map_err(|error| WorkerError::InvalidArgument(format!("the precondition {key}: {error}")))
 }
 
 /// What a worker was told about the host it belongs to.

@@ -141,7 +141,7 @@ impl Journal {
                      state                TEXT    NOT NULL,
                      reason               TEXT,
                      payload_digest       BLOB    NOT NULL,
-                     intent               BLOB    NOT NULL,
+                     intent               BLOB,
                      accepted_deadline_ms INTEGER,
                      error_code           TEXT,
                      error_message        TEXT,
@@ -154,19 +154,15 @@ impl Journal {
                      actor_id  TEXT NOT NULL,
                      action_id BLOB NOT NULL,
                      result    BLOB NOT NULL,
-                     PRIMARY KEY (actor_id, action_id),
-                     FOREIGN KEY (actor_id, action_id)
-                         REFERENCES receipts (actor_id, action_id) ON DELETE CASCADE
+                     PRIMARY KEY (actor_id, action_id)
                  );
                  CREATE TABLE IF NOT EXISTS receipt_events (
-                     sequence      INTEGER PRIMARY KEY AUTOINCREMENT,
-                     actor_id      TEXT    NOT NULL,
-                     action_id     BLOB    NOT NULL,
-                     revision      INTEGER NOT NULL,
-                     state         TEXT    NOT NULL,
-                     recorded_at_ms INTEGER NOT NULL,
-                     FOREIGN KEY (actor_id, action_id)
-                         REFERENCES receipts (actor_id, action_id) ON DELETE CASCADE
+                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     actor_id       TEXT    NOT NULL,
+                     action_id      BLOB    NOT NULL,
+                     revision       INTEGER NOT NULL,
+                     state          TEXT    NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS closure (
                      session_id BLOB PRIMARY KEY,
@@ -189,6 +185,7 @@ impl Journal {
                     .map_err(unavailable)?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
+            Some(1) => self.migrate_1_to_2()?,
             Some(version) => {
                 // Migrations are forward-only and this build reads one schema. A journal written
                 // by a later build is refused rather than read as though it were this one.
@@ -197,6 +194,27 @@ impl Journal {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Brings a version 1 journal forward.
+    ///
+    /// Version 1 stored a digest of each mutation but not the mutation, and recorded no event for
+    /// a receipt's transitions. The intent column is added empty, because a receipt written by
+    /// version 1 genuinely has none; its de-duplication key, its state and its retained result all
+    /// survive, which is what a retry and a recovery need.
+    ///
+    /// This migration goes when there can no longer be a version 1 journal to read, which is the
+    /// first release.
+    fn migrate_1_to_2(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "BEGIN;
+                 ALTER TABLE receipts ADD COLUMN intent BLOB;
+                 UPDATE schema_version SET version = 2;
+                 COMMIT;",
+            )
+            .map_err(unavailable)?;
         Ok(())
     }
 
@@ -232,7 +250,8 @@ impl Journal {
             error: Nullable::null(),
             updated_at_ms: submission.now_ms,
         };
-        self.connection
+        let transaction = self.connection.transaction().map_err(unavailable)?;
+        transaction
             .execute(
                 "INSERT INTO receipts (actor_id, action_id, method, method_version, revision,
                      state, reason, payload_digest, intent, accepted_deadline_ms, error_code,
@@ -254,7 +273,8 @@ impl Journal {
                 ],
             )
             .map_err(unavailable)?;
-        self.append_event(&receipt)?;
+        append_event(&transaction, &receipt)?;
+        transaction.commit().map_err(unavailable)?;
         Ok(Admission {
             receipt,
             deduplicated: false,
@@ -440,24 +460,50 @@ impl Journal {
         }
         Ok(events)
     }
+}
 
-    fn append_event(&self, receipt: &Receipt) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO receipt_events (actor_id, action_id, revision, state, recorded_at_ms)
+fn write_state(transaction: &rusqlite::Transaction<'_>, receipt: &Receipt) -> Result<()> {
+    transaction
+        .execute(
+            "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5, error_code = ?6,
+                 error_message = ?7, updated_at_ms = ?8
+             WHERE actor_id = ?1 AND action_id = ?2",
+            params![
+                receipt.actor_id.as_str(),
+                receipt.action_id.get().as_bytes().as_slice(),
+                i64::try_from(receipt.revision.get()).unwrap_or(i64::MAX),
+                receipt.state.as_str(),
+                receipt.reason.as_ref().map(|reason| reason.as_str()),
+                receipt
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str().to_owned()),
+                receipt.error.as_ref().map(|error| error.message.clone()),
+                i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(unavailable)?;
+    Ok(())
+}
+
+fn append_event(transaction: &rusqlite::Transaction<'_>, receipt: &Receipt) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO receipt_events (actor_id, action_id, revision, state, recorded_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    receipt.actor_id.as_str(),
-                    receipt.action_id.get().as_bytes().as_slice(),
-                    i64::try_from(receipt.revision.get()).unwrap_or(i64::MAX),
-                    receipt.state.as_str(),
-                    i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(unavailable)?;
-        Ok(())
-    }
+            params![
+                receipt.actor_id.as_str(),
+                receipt.action_id.get().as_bytes().as_slice(),
+                i64::try_from(receipt.revision.get()).unwrap_or(i64::MAX),
+                receipt.state.as_str(),
+                i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(unavailable)?;
+    Ok(())
+}
 
+impl Journal {
     /// Commits the dispatch marker before the external effect.
     ///
     /// # Errors
@@ -537,33 +583,63 @@ impl Journal {
         })?;
         receipt.error = Nullable(error);
         receipt.updated_at_ms = now_ms;
-        self.write_state(&receipt)?;
-        self.append_event(&receipt)?;
+        let transaction = self.connection.transaction().map_err(unavailable)?;
+        write_state(&transaction, &receipt)?;
+        append_event(&transaction, &receipt)?;
+        transaction.commit().map_err(unavailable)?;
         Ok(receipt)
     }
 
-    fn write_state(&self, receipt: &Receipt) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5, error_code = ?6,
-                     error_message = ?7, updated_at_ms = ?8
-                 WHERE actor_id = ?1 AND action_id = ?2",
-                params![
-                    receipt.actor_id.as_str(),
-                    receipt.action_id.get().as_bytes().as_slice(),
-                    i64::try_from(receipt.revision.get()).unwrap_or(i64::MAX),
-                    receipt.state.as_str(),
-                    receipt.reason.as_ref().map(|reason| reason.as_str()),
-                    receipt
-                        .error
-                        .as_ref()
-                        .map(|error| error.code.as_str().to_owned()),
-                    receipt.error.as_ref().map(|error| error.message.clone()),
-                    i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(unavailable)?;
-        Ok(())
+    /// Rejects every intent that has not been dispatched.
+    ///
+    /// An authority revision that removes the authority an intent was admitted under is what
+    /// section 9 calls a revocation. An intent past its dispatch marker cannot be taken back from
+    /// here; one that has not been dispatched can, and this is where it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn revoke_undispatched(
+        &mut self,
+        error: Option<ProtocolError>,
+        now_ms: TimestampMs,
+    ) -> Result<usize> {
+        let pending: Vec<(ActorId, ActionId)> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT actor_id, action_id FROM receipts WHERE state = ?1")
+                .map_err(unavailable)?;
+            let rows = statement
+                .query_map(params![ReceiptState::Accepted.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(unavailable)?;
+            let mut pending = Vec::new();
+            for row in rows {
+                let (actor, action) = row.map_err(unavailable)?;
+                let action = <[u8; 16]>::try_from(action.as_slice()).map_err(|_| {
+                    unavailable_detail("a stored action identifier is not 16 bytes")
+                })?;
+                pending.push((
+                    ActorId::new(actor)
+                        .map_err(|_| unavailable_detail("a stored actor is not valid"))?,
+                    ActionId::new(Uuid::from_bytes(action)),
+                ));
+            }
+            pending
+        };
+        let count = pending.len();
+        for (actor_id, action_id) in pending {
+            self.advance(
+                actor_id,
+                action_id,
+                ReceiptState::Rejected,
+                Some(RejectionReason::Revoked),
+                error.clone(),
+                now_ms,
+            )?;
+        }
+        Ok(count)
     }
 
     /// Reads one receipt.

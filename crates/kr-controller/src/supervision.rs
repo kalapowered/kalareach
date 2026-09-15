@@ -83,15 +83,48 @@ impl WorkerLaunch {
     }
 }
 
+/// What asking the platform to start a worker produced.
+///
+/// The difference between the last two matters more than it looks. "Nothing started" releases the
+/// reservation's slot and resolves it for good. "Something may be running" does neither: the host
+/// has no evidence that a process is not out there holding a session, so the reservation keeps its
+/// slot until something settles the question. Collapsing the two would let a failure that happened
+/// *after* a successful spawn free a slot the spawn still occupies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchOutcome {
+    /// The worker started and the kernel described it.
+    Started(ProcessStartIdentity),
+    /// Nothing was started.
+    NotStarted {
+        /// What went wrong.
+        detail: String,
+    },
+    /// A process may be running, and this host cannot say whether it is.
+    Uncertain {
+        /// What went wrong.
+        detail: String,
+        /// The process identifier the launcher reported, when it reported one.
+        pid: Option<u32>,
+    },
+}
+
+impl LaunchOutcome {
+    /// Renders the outcome as the failure a caller is given.
+    #[must_use]
+    pub fn failure(&self) -> Option<ControllerError> {
+        match self {
+            Self::Started(_) => None,
+            Self::NotStarted { detail } | Self::Uncertain { detail, .. } => {
+                Some(ControllerError::supervision(detail.clone()))
+            }
+        }
+    }
+}
+
 /// How this host starts workers.
 pub trait WorkerSupervisor: Send + Sync + std::fmt::Debug {
-    /// Starts a worker and returns the identity the launcher reported.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::Supervision`] when the worker cannot be started or the launcher
-    /// does not report a usable identity.
-    fn start(&self, launch: &WorkerLaunch) -> Result<ProcessStartIdentity>;
+    /// Starts a worker and says what happened.
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome;
 
     /// Names this supervisor for diagnostics.
     fn describe(&self) -> String;
@@ -195,26 +228,53 @@ fn plist_string(value: &str) -> String {
 
 #[cfg(target_os = "macos")]
 impl WorkerSupervisor for LaunchdSupervisor {
-    fn start(&self, launch: &WorkerLaunch) -> Result<ProcessStartIdentity> {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
         let domain = format!("gui/{}", kr_ipc::paths::current_uid());
         let label = launch.label();
-        let job = Self::write_job(launch)?;
-        run(
+        // Writing the job definition and loading it start nothing: `RunAtLoad` is false, so until
+        // the kickstart there is no process to be uncertain about.
+        let job = match Self::write_job(launch) {
+            Ok(job) => job,
+            Err(error) => {
+                return LaunchOutcome::NotStarted {
+                    detail: error.to_string(),
+                };
+            }
+        };
+        if let Err(error) = run(
             "/bin/launchctl",
             &["bootstrap", &domain, &job.display().to_string()],
-        )?;
+        ) {
+            return LaunchOutcome::NotStarted {
+                detail: error.to_string(),
+            };
+        }
         // `-p` starts a job that is not running and prints the process identifier. `-k` would kill
         // a running job first, which for a session worker means killing a live shell.
-        let output = run(
+        //
+        // From here the answer can only be uncertain: a kickstart that fails part way through may
+        // still have started the job.
+        let output = match run(
             "/bin/launchctl",
             &["kickstart", "-p", &format!("{domain}/{label}")],
-        )?;
-        let pid = parse_pid(&output).ok_or_else(|| {
-            ControllerError::supervision(format!(
-                "launchctl kickstart did not report a process identifier: {output}"
-            ))
-        })?;
-        identity_when_available(pid)
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                return LaunchOutcome::Uncertain {
+                    detail: error.to_string(),
+                    pid: None,
+                };
+            }
+        };
+        let Some(pid) = parse_pid(&output) else {
+            return LaunchOutcome::Uncertain {
+                detail: format!(
+                    "launchctl kickstart did not report a process identifier: {output}"
+                ),
+                pid: None,
+            };
+        };
+        settle(pid)
     }
 
     fn describe(&self) -> String {
@@ -238,18 +298,21 @@ impl SystemdSupervisor {
     /// Returns true when this host has a user service manager to ask.
     #[must_use]
     pub fn available() -> bool {
+        // A user manager that answers a property query is a user manager that exists. Running
+        // `systemctl` successfully proves only that the binary is installed, which a host with no
+        // user manager also has.
         std::process::Command::new("systemctl")
-            .args(["--user", "is-system-running"])
+            .args(["--user", "show", "--property=Version", "--value"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok()
+            .is_ok_and(|status| status.success())
     }
 }
 
 #[cfg(target_os = "linux")]
 impl WorkerSupervisor for SystemdSupervisor {
-    fn start(&self, launch: &WorkerLaunch) -> Result<ProcessStartIdentity> {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
         let unit = launch.label();
         // A transient *service*, not a scope: `MainPID` is defined for a service, so the launcher
         // has an identity to record. A scope would leave the controller guessing.
@@ -265,18 +328,32 @@ impl WorkerSupervisor for SystemdSupervisor {
         ];
         arguments.extend(launch.arguments());
         let borrowed: Vec<&str> = arguments.iter().map(String::as_str).collect();
-        run("systemd-run", &borrowed)?;
-        let output = run(
+        if let Err(error) = run("systemd-run", &borrowed) {
+            return LaunchOutcome::NotStarted {
+                detail: error.to_string(),
+            };
+        }
+        // The unit exists from here on, so anything that goes wrong afterwards leaves a process
+        // that may be running.
+        let output = match run(
             "systemctl",
             &["--user", "show", "-p", "MainPID", "--value", &unit],
-        )?;
-        let pid = output.trim().parse::<u32>().ok().filter(|pid| *pid != 0);
-        let pid = pid.ok_or_else(|| {
-            ControllerError::supervision(format!(
-                "the transient service {unit} reported no main process"
-            ))
-        })?;
-        identity_when_available(pid)
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                return LaunchOutcome::Uncertain {
+                    detail: error.to_string(),
+                    pid: None,
+                };
+            }
+        };
+        let Some(pid) = output.trim().parse::<u32>().ok().filter(|pid| *pid != 0) else {
+            return LaunchOutcome::Uncertain {
+                detail: format!("the transient service {unit} reported no main process"),
+                pid: None,
+            };
+        };
+        settle(pid)
     }
 
     fn describe(&self) -> String {
@@ -302,9 +379,14 @@ impl DetachedSupervisor {
 }
 
 impl WorkerSupervisor for DetachedSupervisor {
-    fn start(&self, launch: &WorkerLaunch) -> Result<ProcessStartIdentity> {
-        let child = detached_command(&launch.program, &launch.arguments())?;
-        identity_when_available(child)
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        match detached_command(&launch.program, &launch.arguments()) {
+            Ok(child) => settle(child),
+            // The spawn itself failed, so no process exists.
+            Err(error) => LaunchOutcome::NotStarted {
+                detail: error.to_string(),
+            },
+        }
     }
 
     fn describe(&self) -> String {
@@ -351,17 +433,30 @@ fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
 /// How long the launcher's reported process is given to become readable.
 pub const IDENTITY_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Reads a freshly started process's start identity, allowing for the moment it takes to appear.
+/// Reads a started process's identity and says what the launch produced.
 ///
 /// A service manager reports the process identifier as soon as it has spawned the process, which
 /// can be before the kernel will answer questions about it: the process may still be part way
 /// through replacing its image. Retrying briefly is the difference between recording the identity
 /// and refusing a worker that started perfectly well.
+#[must_use]
+pub fn settle(pid: u32) -> LaunchOutcome {
+    match identity_when_available(pid) {
+        Ok(identity) => LaunchOutcome::Started(identity),
+        // The launcher reported a process and the kernel will not describe it. That is not proof
+        // the process never ran, so the reservation keeps its slot.
+        Err(error) => LaunchOutcome::Uncertain {
+            detail: error.to_string(),
+            pid: Some(pid),
+        },
+    }
+}
+
+/// Reads a freshly started process's start identity, allowing for the moment it takes to appear.
 ///
 /// # Errors
 ///
-/// Returns [`ControllerError::Supervision`] when the identity is still unreadable at the deadline,
-/// which means the process is genuinely gone.
+/// Returns [`ControllerError::Supervision`] when the identity is still unreadable at the deadline.
 pub fn identity_when_available(pid: u32) -> Result<ProcessStartIdentity> {
     let deadline = std::time::Instant::now() + IDENTITY_SETTLE;
     loop {
