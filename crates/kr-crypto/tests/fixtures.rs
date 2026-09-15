@@ -136,6 +136,36 @@ fn every_signature_vector_verifies_and_every_negative_case_fails() {
 }
 
 #[test]
+fn the_connection_proof_vector_needs_both_signatures() {
+    let document = fixture("signatures.json");
+    let host = host_authorisation_key().expect("the host key");
+    let client = client_authorisation_key().expect("the client key");
+    let transcript = SigningTranscript::from_canonical_bytes(
+        document["connect_proofs"]["domain"]
+            .as_str()
+            .expect("a domain"),
+        bytes(&document, "/connect_proofs/transcript_hex"),
+    )
+    .expect("the connection transcript");
+    assert_eq!(
+        transcript.digest().as_bytes(),
+        &fixed::<32>(&document, "/connect_proofs/transcript_sha256")
+    );
+
+    let client_proof =
+        Signature64::from_bytes(fixed(&document, "/connect_proofs/client_signature_hex"));
+    let host_proof =
+        Signature64::from_bytes(fixed(&document, "/connect_proofs/host_signature_hex"));
+    assert!(sign::verify(client.public(), &transcript, &client_proof).is_ok());
+    assert!(sign::verify(host.public(), &transcript, &host_proof).is_ok());
+
+    // Neither proof stands in for the other: a holder of one transport key cannot substitute the
+    // authorised application identity.
+    assert!(sign::verify(host.public(), &transcript, &client_proof).is_err());
+    assert!(sign::verify(client.public(), &transcript, &host_proof).is_err());
+}
+
+#[test]
 fn the_rfc_8032_vector_confirms_standard_ed25519() {
     let document = fixture("signatures.json");
     // RFC 8032 section 7.1 test vector 1: the public key of that seed and its signature over the

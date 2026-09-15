@@ -103,6 +103,29 @@ describe('signature vectors', () => {
     expect(ok).toBe(true)
   })
 
+  it('requires both connection proofs', () => {
+    const proofs = document.connect_proofs
+    const transcript = hexToBytes(proofs.transcript_hex)
+    expect(sha256(transcript)).toBe(proofs.transcript_sha256)
+
+    const value = decodeCanonical(transcript)
+    expect(value.kind).toBe('array')
+    if (value.kind !== 'array') throw new Error('unreachable')
+    expect(value.items[0]).toEqual(krText(proofs.domain))
+
+    const hostKey = ed25519PublicKey(hexToBytes(document.keys.host.public_key_hex))
+    const clientKey = ed25519PublicKey(hexToBytes(document.keys.client.public_key_hex))
+    const hostProof = Buffer.from(hexToBytes(proofs.host_signature_hex))
+    const clientProof = Buffer.from(hexToBytes(proofs.client_signature_hex))
+    const message = Buffer.from(transcript)
+
+    expect(verify(null, message, hostKey, hostProof)).toBe(true)
+    expect(verify(null, message, clientKey, clientProof)).toBe(true)
+    // Neither proof stands in for the other.
+    expect(verify(null, message, hostKey, clientProof)).toBe(false)
+    expect(verify(null, message, clientKey, hostProof)).toBe(false)
+  })
+
   it('derives the same key identifier', () => {
     const raw = hexToBytes(document.keys.host.public_key_hex)
     const input = signingInput(document.key_id_domain, [krText('authorisation'), krBytes(raw)])

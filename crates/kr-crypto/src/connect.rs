@@ -166,17 +166,19 @@ pub fn verify_connect(
 /// Verifies a connection and consumes the challenge the host issued for it.
 ///
 /// This is the entry point a host uses. [`verify_connect`] alone proves that the two devices
-/// signed this transcript; it does not prove that the transcript is new. The challenge the host
-/// issued at the start of the connection is consumed here, exactly once, so the same proofs
-/// presented again are rejected before they are checked.
+/// signed this transcript; it does not prove that the transcript is this connection's. The host
+/// therefore supplies the nonce it retained when it opened this connection: the selection must
+/// name that exact nonce, and it is consumed here, exactly once.
 ///
 /// # Errors
 ///
-/// Returns [`CryptoError::BindingMismatch`] when the challenge was not outstanding, and then
-/// whatever [`verify_connect`] returns.
+/// Returns [`CryptoError::BindingMismatch`] when the selection names another connection's
+/// challenge or when the challenge was not outstanding, and then whatever [`verify_connect`]
+/// returns.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_connect_once(
     ledger: &mut ChallengeLedger,
+    issued_host_nonce: &Nonce256,
     offer: &ClientOffer,
     selection: &HostSelection,
     client: &PairedPeer,
@@ -185,7 +187,12 @@ pub fn verify_connect_once(
     live_host_endpoint: &EndpointKey,
     proofs: &ConnectProofs,
 ) -> Result<Digest256> {
-    ledger.consume(&selection.host_nonce)?;
+    if &selection.host_nonce != issued_host_nonce {
+        return Err(CryptoError::BindingMismatch {
+            what: "the host challenge, which is not the one this connection issued",
+        });
+    }
+    ledger.consume(issued_host_nonce)?;
     verify_connect(
         offer,
         selection,
@@ -209,6 +216,7 @@ pub fn verify_connect_once(
 #[derive(Debug, Default)]
 pub struct ChallengeLedger {
     outstanding: BTreeSet<[u8; 32]>,
+    consumed: BTreeSet<[u8; 32]>,
     limit: usize,
 }
 
@@ -218,6 +226,7 @@ impl ChallengeLedger {
     pub fn with_limit(limit: usize) -> Self {
         Self {
             outstanding: BTreeSet::new(),
+            consumed: BTreeSet::new(),
             limit,
         }
     }
@@ -230,7 +239,9 @@ impl ChallengeLedger {
     /// for a 256-bit random nonce means a generator failure, and [`CryptoError::TooLarge`] when the
     /// ledger is full.
     pub fn issue(&mut self, host_nonce: &Nonce256) -> Result<()> {
-        if self.outstanding.contains(host_nonce.as_bytes()) {
+        if self.outstanding.contains(host_nonce.as_bytes())
+            || self.consumed.contains(host_nonce.as_bytes())
+        {
             return Err(CryptoError::BindingMismatch {
                 what: "a reissued connection challenge",
             });
@@ -254,6 +265,11 @@ impl ChallengeLedger {
     /// been consumed.
     pub fn consume(&mut self, host_nonce: &Nonce256) -> Result<()> {
         if self.outstanding.remove(host_nonce.as_bytes()) {
+            // Remembering it stops the same nonce being issued again. For a 256-bit random value a
+            // repeat means a generator failure rather than an attack, and a host that has issued
+            // enough challenges to fill this set has restarted many times over; it is cleared with
+            // the ledger, which lives as long as one host process.
+            self.consumed.insert(*host_nonce.as_bytes());
             Ok(())
         } else {
             Err(CryptoError::BindingMismatch {
@@ -267,7 +283,9 @@ impl ChallengeLedger {
     /// Abandoning a challenge is not the same as consuming one: it frees the slot, and the nonce
     /// can never be presented afterwards because it is no longer outstanding either way.
     pub fn abandon(&mut self, host_nonce: &Nonce256) {
-        self.outstanding.remove(host_nonce.as_bytes());
+        if self.outstanding.remove(host_nonce.as_bytes()) {
+            self.consumed.insert(*host_nonce.as_bytes());
+        }
     }
 
     /// Returns how many challenges are outstanding.
@@ -481,15 +499,25 @@ mod tests {
         ));
 
         assert!(ledger.consume(&first).is_ok());
-        // Consuming frees the slot but never makes the nonce usable again.
+        // Consuming frees the slot but never makes the nonce usable again, by either route.
         assert!(matches!(
             ledger.consume(&first),
             Err(CryptoError::BindingMismatch { .. })
+        ));
+        assert!(matches!(
+            ledger.issue(&first),
+            Err(CryptoError::BindingMismatch {
+                what: "a reissued connection challenge"
+            })
         ));
         assert!(ledger.issue(&third).is_ok());
         ledger.abandon(&second);
         assert!(matches!(
             ledger.consume(&second),
+            Err(CryptoError::BindingMismatch { .. })
+        ));
+        assert!(matches!(
+            ledger.issue(&second),
             Err(CryptoError::BindingMismatch { .. })
         ));
         assert_eq!(ledger.len(), 1);
@@ -506,6 +534,7 @@ mod tests {
         assert!(
             verify_connect_once(
                 &mut ledger,
+                &fixture.selection.host_nonce,
                 &fixture.offer,
                 &fixture.selection,
                 &fixture.client,
@@ -519,6 +548,7 @@ mod tests {
         assert!(matches!(
             verify_connect_once(
                 &mut ledger,
+                &fixture.selection.host_nonce,
                 &fixture.offer,
                 &fixture.selection,
                 &fixture.client,
@@ -529,6 +559,31 @@ mod tests {
             ),
             Err(CryptoError::BindingMismatch {
                 what: "a connection challenge that is not outstanding"
+            })
+        ));
+    }
+
+    #[test]
+    fn another_connections_challenge_is_rejected() {
+        let fixture = fixture();
+        let proofs = proofs(&fixture);
+        let mut ledger = ChallengeLedger::with_limit(4);
+        let other = Nonce256::from_bytes([42; 32]);
+        ledger.issue(&other).expect("issued");
+        assert!(matches!(
+            verify_connect_once(
+                &mut ledger,
+                &other,
+                &fixture.offer,
+                &fixture.selection,
+                &fixture.client,
+                &fixture.host,
+                &fixture.client.endpoint_id,
+                &fixture.host.endpoint_id,
+                &proofs,
+            ),
+            Err(CryptoError::BindingMismatch {
+                what: "the host challenge, which is not the one this connection issued"
             })
         ));
     }

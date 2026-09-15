@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
 use crate::scalars::{
-    AuthorisationKey, Bytes, CanonicalSet, Digest256, KeyId, Nonce192, Signature64, TimestampMs,
-    U64,
+    AuthorisationKey, Bytes, CanonicalSet, Digest256, KeyId, Nonce192, SecretBytes32, Signature64,
+    TimestampMs, U64,
 };
 
 /// The size of one `secretstream` record, in bytes.
@@ -27,6 +27,9 @@ pub const MAX_ARCHIVE_DESCRIPTOR_LEN: usize = 64 * 1024;
 
 /// The maximum number of recipients an archive descriptor names by default.
 pub const MAX_ARCHIVE_RECIPIENTS: usize = 128;
+
+/// The recovery kit profile version this build writes and reads.
+pub const RECOVERY_KIT_PROFILE_VERSION: u64 = 1;
 
 /// The `crypto_kdf` context the recovery seed derives under.
 pub const RECOVERY_KDF_CONTEXT: &str = "KRRECOV1";
@@ -314,9 +317,34 @@ pub enum DescriptorError {
     /// The recovery kit does not name the service origin a restore is trying.
     #[error("the recovery kit does not name that service origin")]
     UnknownServiceOrigin,
+    /// The bytes were not a canonical descriptor.
+    #[error("the archive descriptor is not canonical KR-CBOR-1: {0}")]
+    Encoding(#[from] CborError),
 }
 
 impl ArchiveDescriptor {
+    /// Reads a descriptor from canonical bytes, bounding it before it is decoded.
+    ///
+    /// This is the entry point a restore uses. Section 20 requires an invalid descriptor to fail
+    /// before object allocation or filesystem writes, and a descriptor that arrives over the
+    /// network is bounded before it is parsed, not after.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescriptorError::TooLarge`] before decoding, [`DescriptorError::Encoding`] when
+    /// the bytes are not a canonical descriptor, and then whatever [`Self::validate`] returns.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DescriptorError> {
+        if bytes.len() > MAX_ARCHIVE_DESCRIPTOR_LEN {
+            return Err(DescriptorError::TooLarge {
+                len: bytes.len(),
+                limit: MAX_ARCHIVE_DESCRIPTOR_LEN,
+            });
+        }
+        let descriptor: Self = kr_cbor::from_canonical_slice(bytes, &kr_cbor::Limits::DEFAULT)?;
+        descriptor.validate(bytes.len())?;
+        Ok(descriptor)
+    }
+
     /// Validates the descriptor before any object is allocated or written.
     ///
     /// `encoded_len` is the size of the descriptor as it arrived, which is the quantity section 20
@@ -465,13 +493,17 @@ impl RecoveryKit {
 ///
 /// A seed with no way to find the encrypted bundle is not a complete kit, so the kit names the
 /// configured service origins and the stable bundle locator alongside the seed.
+///
+/// `Debug` is derived, and the seed redacts itself, so a kit can be logged without publishing the
+/// owner's recovery authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryKit {
     /// The kit format and cryptographic profile version.
     pub profile_version: U64,
-    /// The 256-bit recovery seed.
-    pub seed: Bytes,
+    /// The 256-bit recovery seed. It zeroises when the kit is dropped and never appears in debug
+    /// output: it is the whole of the owner's recovery authority.
+    pub seed: SecretBytes32,
     /// The seed checksum, so a mistyped kit fails before it is used.
     pub seed_checksum: Bytes,
     /// Each configured service origin.
@@ -563,7 +595,7 @@ mod tests {
     fn a_kit_only_yields_a_context_for_an_origin_it_names() {
         let kit = RecoveryKit {
             profile_version: U64::new(1),
-            seed: Bytes::new(vec![1; 32]),
+            seed: SecretBytes32::from_bytes([1; 32]),
             seed_checksum: Bytes::new(vec![2; 4]),
             service_origins: vec!["https://reach.kala.to".to_owned()],
             bundle_locator: "opaque-locator".to_owned(),
@@ -583,6 +615,40 @@ mod tests {
             context.to_canonical_bytes().expect("bytes"),
             other.to_canonical_bytes().expect("bytes")
         );
+    }
+
+    #[test]
+    fn an_oversized_descriptor_fails_before_it_is_decoded() {
+        let oversized = vec![0u8; MAX_ARCHIVE_DESCRIPTOR_LEN + 1];
+        assert!(matches!(
+            ArchiveDescriptor::from_canonical_bytes(&oversized),
+            Err(DescriptorError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_descriptor_round_trips_through_its_bounded_entry_point() {
+        let manifest = object_ref(7);
+        let descriptor = descriptor(vec![wrap(&manifest, 1)]);
+        let bytes = kr_cbor::to_canonical_vec(&descriptor).expect("canonical bytes");
+        assert_eq!(
+            ArchiveDescriptor::from_canonical_bytes(&bytes).expect("a descriptor"),
+            descriptor
+        );
+    }
+
+    #[test]
+    fn a_recovery_kit_redacts_its_seed() {
+        let kit = RecoveryKit {
+            profile_version: U64::new(RECOVERY_KIT_PROFILE_VERSION),
+            seed: SecretBytes32::from_bytes([7; 32]),
+            seed_checksum: Bytes::new(vec![1; 4]),
+            service_origins: vec!["https://reach.kala.to".to_owned()],
+            bundle_locator: "opaque-locator".to_owned(),
+        };
+        let rendered = format!("{kit:?}");
+        assert!(rendered.contains("SecretBytes32(redacted)"));
+        assert!(!rendered.contains(&crate::scalars::to_base64url(&[7u8; 32])));
     }
 
     #[test]

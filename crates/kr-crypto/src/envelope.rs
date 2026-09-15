@@ -172,6 +172,19 @@ where
     let plaintext: EnvelopePlaintext =
         kr_cbor::from_canonical_slice(&opened.expose()[..content_len], &kr_cbor::Limits::DEFAULT)?;
 
+    if plaintext.payload_type == MailboxPayloadType::NotificationPreview
+        && content_len as u64 > SMALL_MAILBOX_PLAINTEXT_BYTES
+    {
+        // The sealing side refuses one this large, and so does this side: a paired sender is
+        // authenticated, not trusted, and a preview padded by the mailbox rule above 16 KiB would
+        // be a size the notification rule never produces.
+        return Err(CryptoError::TooLarge {
+            what: "a notification preview",
+            limit: SMALL_MAILBOX_PLAINTEXT_BYTES as usize,
+            actual: content_len,
+        });
+    }
+
     if plaintext.sender_key_id != key_id(KeyPurpose::StoredEnvelope, sender.as_bytes()) {
         return Err(CryptoError::BindingMismatch {
             what: "the sender key identifier in the envelope",

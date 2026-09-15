@@ -690,6 +690,93 @@ fixed_bytes!(
     "A 64-byte Ed25519 detached signature. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."
 );
 
+/// Thirty-two secret bytes.
+///
+/// It is the type of a value that must not reach a log, an analytics event or a debug rendering:
+/// a pairing invitation's secret, a printed recovery seed. It zeroises when it is dropped and
+/// redacts itself in debug output, and it is deliberately not `Copy`, because a `Copy` secret
+/// leaves a duplicate behind on every move and a duplicate cannot be zeroised.
+///
+/// It has the same two wire representations as every other fixed-width byte string.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretBytes32([u8; 32]);
+
+impl SecretBytes32 {
+    /// Length in bytes.
+    pub const LEN: usize = 32;
+
+    /// Wraps raw bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the raw bytes.
+    ///
+    /// The name is deliberate: every call site that reads the secret is one a reviewer can find.
+    #[must_use]
+    pub const fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl Drop for SecretBytes32 {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for SecretBytes32 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretBytes32(redacted)")
+    }
+}
+
+impl Serialize for SecretBytes32 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&to_base64url(&self.0))
+        } else {
+            serializer.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretBytes32 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let text = String::deserialize(deserializer)?;
+            let bytes = from_base64url(&text).map_err(de::Error::custom)?;
+            <[u8; 32]>::try_from(bytes.as_slice())
+                .map(Self)
+                .map_err(|_| de::Error::invalid_length(bytes.len(), &"32 bytes"))
+        } else {
+            deserializer
+                .deserialize_bytes(FixedBytesVisitor::<32>)
+                .map(Self)
+        }
+    }
+}
+
+impl JsonSchema for SecretBytes32 {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SecretBytes32".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        "kalareach::SecretBytes32".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        base64url_schema(
+            "Thirty-two secret bytes. They zeroise when dropped and never appear in debug output, a log or an analytics event.",
+            Some(32),
+        )
+    }
+}
+
 fixed_bytes!(
     /// A 192-bit nonce, as used by XChaCha20-Poly1305 and `crypto_box_easy`.
     Nonce192,

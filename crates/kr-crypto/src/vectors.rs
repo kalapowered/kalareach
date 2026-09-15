@@ -274,6 +274,7 @@ fn signatures(repository_root: &Path) -> Result<Value> {
             "signature_hex": hex::encode(rfc_signature),
         },
         "cases": cases,
+        "connect_proofs": connect_proofs(&host, &client, &sources)?,
         "negative_cases": negative_cases(&host, &client, &sources[0].domain, &sources[0].message)?,
     }))
 }
@@ -287,6 +288,33 @@ fn rfc_expanded(seed: &[u8]) -> Result<crate::secret::Secret<64>> {
     let held = crate::secret::Secret::from_bytes(expanded);
     sodium::memzero(&mut expanded);
     Ok(held)
+}
+
+/// Builds the mutual `kr-connect/1` proof over the published connection transcript.
+///
+/// Section 23 requires both proofs: one signature proves that one device signed the transcript, not
+/// that the connection has two authorised ends. The vector publishes both so a TypeScript client
+/// can check the pair it will receive.
+fn connect_proofs(
+    host: &AuthorisationKeyPair,
+    client: &AuthorisationKeyPair,
+    sources: &[SourceCase],
+) -> Result<Value> {
+    let case = sources
+        .iter()
+        .find(|case| case.domain == kr_protocol::hello::CONNECT_DOMAIN)
+        .ok_or_else(|| CryptoError::SecretStore {
+            message: "the protocol fixtures publish no kr-connect/1 transcript".to_owned(),
+        })?;
+    let transcript = SigningTranscript::from_canonical_bytes(&case.domain, case.message.clone())?;
+    Ok(json!({
+        "description": "Both kr-connect/1 proofs over the transcript fixtures/protocol/transcripts.json publishes. A verifier requires both.",
+        "domain": case.domain,
+        "transcript_hex": hex::encode(&case.message),
+        "transcript_sha256": hex::encode(kr_cbor::sha256(&case.message)),
+        "client_signature_hex": hex::encode(crate::sign::sign(client, &transcript)?.as_bytes()),
+        "host_signature_hex": hex::encode(crate::sign::sign(host, &transcript)?.as_bytes()),
+    }))
 }
 
 /// Builds the three cases a verifier must reject.

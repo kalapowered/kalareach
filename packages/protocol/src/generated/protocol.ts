@@ -2099,6 +2099,9 @@ export interface TrustedWriter {
  *
  * A seed with no way to find the encrypted bundle is not a complete kit, so the kit names the
  * configured service origins and the stable bundle locator alongside the seed.
+ *
+ * `Debug` is derived, and the seed redacts itself, so a kit can be logged without publishing the
+ * owner's recovery authority.
  */
 export interface RecoveryKit {
   /**
@@ -2110,7 +2113,8 @@ export interface RecoveryKit {
    */
   profile_version: string
   /**
-   * The 256-bit recovery seed.
+   * The 256-bit recovery seed. It zeroises when the kit is dropped and never appears in debug
+   * output: it is the whole of the owner's recovery authority.
    */
   seed: string
   /**

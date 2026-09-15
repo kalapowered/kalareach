@@ -3814,7 +3814,7 @@
     },
     "RecoveryKit": {
       "additionalProperties": false,
-      "description": "The printable and QR recovery kit.\n\nA seed with no way to find the encrypted bundle is not a complete kit, so the kit names the\nconfigured service origins and the stable bundle locator alongside the seed.",
+      "description": "The printable and QR recovery kit.\n\nA seed with no way to find the encrypted bundle is not a complete kit, so the kit names the\nconfigured service origins and the stable bundle locator alongside the seed.\n\n`Debug` is derived, and the seed redacts itself, so a kit can be logged without publishing the\nowner's recovery authority.",
       "properties": {
         "bundle_locator": {
           "description": "The stable opaque locator of the recovery bundle.",
@@ -3825,8 +3825,8 @@
           "description": "The kit format and cryptographic profile version."
         },
         "seed": {
-          "$ref": "#/$defs/Bytes",
-          "description": "The 256-bit recovery seed."
+          "$ref": "#/$defs/SecretBytes32",
+          "description": "The 256-bit recovery seed. It zeroises when the kit is dropped and never appears in debug\noutput: it is the whole of the owner's recovery authority."
         },
         "seed_checksum": {
           "$ref": "#/$defs/Bytes",
@@ -4518,6 +4518,12 @@
         "ciphertext"
       ],
       "type": "object"
+    },
+    "SecretBytes32": {
+      "contentEncoding": "base64url",
+      "description": "Thirty-two secret bytes. They zeroise when dropped and never appear in debug output, a log or an analytics event.",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "type": "string"
     },
     "SensitiveAction": {
       "description": "What a sensitive action is being confirmed for.",

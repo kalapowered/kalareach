@@ -43,8 +43,10 @@ pub const MAX_SECRET_NAME_LEN: usize = 128;
 
 /// The name of one stored secret.
 ///
-/// Names are restricted to lower-case ASCII, digits, `.`, `-`, `_` and `/`, so a name is also a
-/// safe file name in the fallback store and a safe account name in a platform store.
+/// Names are restricted to lower-case ASCII, digits, `.`, `-`, `_` and `/`, and no segment starts
+/// with a dot, so a name is a safe file name in the fallback store and a safe account name in a
+/// platform store. The dot rule is what keeps a secret from colliding with the fallback store's
+/// own staging files and marker, which all start with one.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SecretName(String);
 
@@ -75,9 +77,15 @@ impl SecretName {
                 "a secret name uses lower-case ASCII, digits, '.', '-', '_' and '/'",
             ));
         }
-        if name.starts_with('/') || name.ends_with('/') || name.split('/').any(|part| part == "..")
+        if name.starts_with('/')
+            || name.ends_with('/')
+            || name
+                .split('/')
+                .any(|part| part.is_empty() || part.starts_with('.'))
         {
-            return Err(invalid("a secret name has no empty or traversing segment"));
+            return Err(invalid(
+                "a secret name has no empty segment and no segment starting with a dot",
+            ));
         }
         Ok(Self(name))
     }
@@ -244,9 +252,30 @@ impl FileStore {
                 message: format!("{} is a symbolic link", directory.display()),
             });
         }
+        let existed = directory.exists();
         std::fs::create_dir_all(&directory).map_err(|error| CryptoError::SecretStore {
             message: format!("create {}: {error}", directory.display()),
         })?;
+        // No component of the path may be a link, so the mode this store sets is the mode of the
+        // directory it believes it is writing to.
+        let resolved =
+            std::fs::canonicalize(&directory).map_err(|error| CryptoError::SecretStore {
+                message: format!("resolve {}: {error}", directory.display()),
+            })?;
+        if resolved != directory {
+            return Err(CryptoError::SecretStore {
+                message: format!(
+                    "{} resolves to {}; the fallback store follows no links",
+                    directory.display(),
+                    resolved.display()
+                ),
+            });
+        }
+        if existed {
+            // A directory this store did not create is checked before its mode is changed, so it
+            // never relaxes or tightens something that belongs to another account.
+            check_owner_only(&directory)?;
+        }
         set_mode(&directory, 0o700)?;
         check_owner_only(&directory)?;
         Ok(Self { directory })
@@ -547,40 +576,93 @@ impl Drop for MemoryStore {
 /// Returns [`CryptoError::SecretStore`] when neither store can be opened.
 pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStore> {
     let platform = PlatformStore::open(service);
-    let has_fallback_secrets = directory_has_entries(fallback_directory);
-
-    if has_fallback_secrets {
-        let store = FileStore::open(fallback_directory)?;
-        return Ok(OpenedStore {
-            store: Box::new(store),
-            kind: StoreKind::FileFallback,
-            migration_available: platform.is_ok(),
-        });
-    }
-    match platform {
-        Ok(store) => Ok(OpenedStore {
-            store: Box::new(store),
-            kind: StoreKind::Platform,
-            migration_available: false,
-        }),
-        Err(platform_error) => match FileStore::open(fallback_directory) {
-            Ok(store) => Ok(OpenedStore {
+    match read_recorded_kind(fallback_directory) {
+        Some(StoreKind::Platform) => {
+            // The host's secrets are in the platform store. If it has gone away this is an error:
+            // falling back would start from an empty store while the secrets still exist.
+            let store = platform.map_err(|error| CryptoError::SecretStore {
+                message: format!(
+                    "this host recorded the platform credential store, which is now unavailable: {error}"
+                ),
+            })?;
+            Ok(OpenedStore {
+                store: Box::new(store),
+                kind: StoreKind::Platform,
+                migration_available: false,
+            })
+        }
+        Some(StoreKind::FileFallback) => {
+            // The host's secrets are in files and stay there, even when a secret service appears.
+            let store = FileStore::open(fallback_directory)?;
+            Ok(OpenedStore {
                 store: Box::new(store),
                 kind: StoreKind::FileFallback,
-                migration_available: false,
-            }),
-            Err(fallback_error) => Err(CryptoError::SecretStore {
-                message: format!(
-                    "no platform store ({platform_error}) and no fallback ({fallback_error})"
-                ),
-            }),
+                migration_available: platform.is_ok(),
+            })
+        }
+        None => match platform {
+            Ok(store) => {
+                record_kind(fallback_directory, StoreKind::Platform)?;
+                Ok(OpenedStore {
+                    store: Box::new(store),
+                    kind: StoreKind::Platform,
+                    migration_available: false,
+                })
+            }
+            Err(platform_error) => match FileStore::open(fallback_directory) {
+                Ok(store) => {
+                    record_kind(fallback_directory, StoreKind::FileFallback)?;
+                    Ok(OpenedStore {
+                        store: Box::new(store),
+                        kind: StoreKind::FileFallback,
+                        migration_available: false,
+                    })
+                }
+                Err(fallback_error) => Err(CryptoError::SecretStore {
+                    message: format!(
+                        "no platform store ({platform_error}) and no fallback ({fallback_error})"
+                    ),
+                }),
+            },
         },
     }
 }
 
-/// Returns true when `directory` exists and holds at least one entry.
-fn directory_has_entries(directory: &Path) -> bool {
-    std::fs::read_dir(directory).is_ok_and(|mut entries| entries.next().is_some())
+/// The file that records which store a host chose.
+///
+/// It starts with a dot, which no valid [`SecretName`] can produce, so it can never collide with a
+/// stored secret. It carries no secret itself: it names a backend.
+const STORE_KIND_MARKER: &str = ".store-kind";
+
+/// Reads the recorded choice, or `None` when this host has not chosen yet.
+fn read_recorded_kind(directory: &Path) -> Option<StoreKind> {
+    match std::fs::read_to_string(directory.join(STORE_KIND_MARKER))
+        .ok()?
+        .trim()
+    {
+        "platform" => Some(StoreKind::Platform),
+        "file" => Some(StoreKind::FileFallback),
+        _ => None,
+    }
+}
+
+/// Records the choice so a later start does not silently pick the other backend.
+fn record_kind(directory: &Path, kind: StoreKind) -> Result<()> {
+    std::fs::create_dir_all(directory).map_err(|error| CryptoError::SecretStore {
+        message: format!("create {}: {error}", directory.display()),
+    })?;
+    let text = match kind {
+        StoreKind::Platform => "platform",
+        StoreKind::FileFallback => "file",
+    };
+    std::fs::write(directory.join(STORE_KIND_MARKER), text).map_err(|error| {
+        CryptoError::SecretStore {
+            message: format!(
+                "record the store choice in {}: {error}",
+                directory.display()
+            ),
+        }
+    })
 }
 
 /// The store a host opened and what it means.
@@ -706,6 +788,29 @@ pub fn load_device_keys(store: &dyn SecretStore, scope: &str) -> Result<Option<D
     }))
 }
 
+/// Reads only the notification-preview keypair.
+///
+/// The notification extension receives that private key and paired sender public keys, and no
+/// general stored-envelope, archive, recovery or control-signing private key. It therefore needs a
+/// loader that reads one item: [`load_device_keys`] reads all four and is for the host.
+///
+/// # Errors
+///
+/// Returns an error when the store fails or the stored seed is not 32 bytes.
+pub fn load_notification_preview_key(
+    store: &dyn SecretStore,
+    scope: &str,
+) -> Result<Option<NotificationPreviewKeyPair>> {
+    let name = SecretName::device_key(scope, KeyPurpose::NotificationPreview)?;
+    let Some(stored) = store.get(&name)? else {
+        return Ok(None);
+    };
+    NotificationPreviewKeyPair::from_seed(NotificationPreviewSeed::from_stored_bytes(
+        stored.expose(),
+    )?)
+    .map(Some)
+}
+
 /// Writes the recovery seed to its own item.
 ///
 /// # Errors
@@ -744,6 +849,9 @@ mod tests {
         assert!(SecretName::new("host/device-key/stored_envelope").is_ok());
         assert!(SecretName::new("host/device key").is_err());
         assert!(SecretName::new("host/../escape").is_err());
+        assert!(SecretName::new("host/.staging").is_err());
+        assert!(SecretName::new(".store-kind").is_err());
+        assert!(SecretName::new("host//x").is_err());
         assert!(SecretName::new("Host/device-key").is_err());
         assert!(SecretName::new("/host").is_err());
         assert!(SecretName::new("host/").is_err());
@@ -807,6 +915,22 @@ mod tests {
             )
             .expect("a write");
         assert!(load_device_keys(&store, "host").is_err());
+    }
+
+    #[test]
+    fn the_notification_extension_loads_only_its_own_key() {
+        let store = MemoryStore::new();
+        let keys = DeviceKeys::generate().expect("keys");
+        store_device_keys(&store, "host", &keys).expect("a write");
+        let preview = load_notification_preview_key(&store, "host")
+            .expect("a read")
+            .expect("the preview key");
+        assert_eq!(preview.public(), keys.notification_preview.public());
+        assert!(
+            load_notification_preview_key(&store, "other")
+                .expect("a read")
+                .is_none()
+        );
     }
 
     #[test]
@@ -878,12 +1002,13 @@ mod tests {
         not(any(target_os = "macos", target_os = "ios", target_os = "android"))
     ))]
     #[test]
-    fn a_fallback_directory_already_holding_secrets_is_not_abandoned() {
+    fn a_recorded_fallback_is_not_abandoned() {
         let base = scratch_directory("migration");
         let store = FileStore::open(&base).expect("a store");
         store
             .set(&SecretName::new("host/x").expect("a name"), b"seed")
             .expect("a write");
+        record_kind(&base, StoreKind::FileFallback).expect("a record");
         let opened = open_store("kalareach-test", &base).expect("a store");
         assert_eq!(opened.kind, StoreKind::FileFallback);
         assert_eq!(

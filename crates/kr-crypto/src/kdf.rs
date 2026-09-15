@@ -8,9 +8,9 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use kr_protocol::archive::{
     RECOVERY_BUNDLE_DOMAIN, RECOVERY_BUNDLE_SUBKEY_ID, RECOVERY_KDF_CONTEXT,
-    RECOVERY_RECIPIENT_SUBKEY_ID, RecoveryContext, RecoveryKit,
+    RECOVERY_KIT_PROFILE_VERSION, RECOVERY_RECIPIENT_SUBKEY_ID, RecoveryContext, RecoveryKit,
 };
-use kr_protocol::scalars::{Bytes, Mac256, StoredEnvelopeKey, U64};
+use kr_protocol::scalars::{Bytes, Mac256, SecretBytes32, StoredEnvelopeKey, U64};
 use sha2::Sha256;
 
 use crate::error::{CryptoError, Result};
@@ -145,29 +145,34 @@ impl RecoverySeed {
     /// A seed without a way to find the encrypted bundle is not a complete kit, so the locator and
     /// the origins travel with it.
     #[must_use]
-    pub fn to_kit(
-        &self,
-        profile_version: u64,
-        service_origins: Vec<String>,
-        bundle_locator: String,
-    ) -> RecoveryKit {
+    pub fn to_kit(&self, service_origins: Vec<String>, bundle_locator: String) -> RecoveryKit {
         RecoveryKit {
-            profile_version: U64::new(profile_version),
-            seed: Bytes::new(self.0.expose().to_vec()),
+            profile_version: U64::new(RECOVERY_KIT_PROFILE_VERSION),
+            seed: SecretBytes32::from_bytes(*self.0.expose()),
             seed_checksum: Bytes::new(self.checksum().to_vec()),
             service_origins,
             bundle_locator,
         }
     }
 
-    /// Reads the seed out of a kit, checking its checksum first.
+    /// Reads the seed out of a kit, checking its profile version and its checksum first.
+    ///
+    /// The version is checked before anything is derived: a kit written under another
+    /// cryptographic profile would derive different keys, and silently applying this profile to it
+    /// would produce keys that authenticate nothing.
     ///
     /// # Errors
     ///
-    /// Returns [`CryptoError::Authentication`] when the checksum does not match the seed, which is
-    /// what a mistyped printed kit looks like, and a length error when the seed is not 32 bytes.
+    /// Returns [`CryptoError::BindingMismatch`] for an unsupported profile version and
+    /// [`CryptoError::Authentication`] when the checksum does not match the seed, which is what a
+    /// mistyped printed kit looks like.
     pub fn from_kit(kit: &RecoveryKit) -> Result<Self> {
-        let seed = Self::from_stored_bytes(kit.seed.as_slice())?;
+        if kit.profile_version.get() != RECOVERY_KIT_PROFILE_VERSION {
+            return Err(CryptoError::BindingMismatch {
+                what: "the recovery kit profile version, which this build does not read",
+            });
+        }
+        let seed = Self::from_stored_bytes(kit.seed.expose())?;
         if !seed.checksum_matches(kit.seed_checksum.as_slice()) {
             return Err(CryptoError::Authentication {
                 what: "a recovery kit checksum",
@@ -332,18 +337,24 @@ mod tests {
     fn a_kit_round_trips_and_a_mistyped_checksum_fails() {
         let seed = RecoverySeed::generate().expect("a seed");
         let kit = seed.to_kit(
-            1,
             vec!["https://reach.kala.to".to_owned()],
             "opaque-locator".to_owned(),
         );
         let restored = RecoverySeed::from_kit(&kit).expect("the seed");
         assert_eq!(restored.checksum(), seed.checksum());
 
-        let mut mistyped = kit;
+        let mut mistyped = kit.clone();
         mistyped.seed_checksum = Bytes::new(vec![0; 4]);
         assert!(matches!(
             RecoverySeed::from_kit(&mistyped),
             Err(CryptoError::Authentication { .. })
+        ));
+
+        let mut other_profile = kit;
+        other_profile.profile_version = U64::new(RECOVERY_KIT_PROFILE_VERSION + 1);
+        assert!(matches!(
+            RecoverySeed::from_kit(&other_profile),
+            Err(CryptoError::BindingMismatch { .. })
         ));
     }
 

@@ -68,6 +68,22 @@ pub fn encrypt_object(key: &SymmetricKey, plaintext: &[u8]) -> Result<Vec<u8>> {
 /// [`CryptoError::RecordsAfterFinal`] when data follows it, and
 /// [`CryptoError::Authentication`] when any record fails to authenticate.
 pub fn decrypt_object(key: &SymmetricKey, object: &[u8]) -> Result<SecretVec> {
+    // The plaintext is never longer than the object, so this allocation never grows and never
+    // abandons a buffer holding a copy of it.
+    let mut plaintext = Vec::with_capacity(object.len());
+    match decrypt_into(key, object, &mut plaintext) {
+        Ok(()) => Ok(SecretVec::new(plaintext)),
+        Err(error) => {
+            // Every failure path arrives here, so a partly assembled plaintext is wiped whether
+            // the object was cut short, carried a record after its final one, or failed a tag.
+            sodium::memzero(&mut plaintext);
+            Err(error)
+        }
+    }
+}
+
+/// Reads every record into `plaintext`, leaving the zeroisation of a failure to the caller.
+fn decrypt_into(key: &SymmetricKey, object: &[u8], plaintext: &mut Vec<u8>) -> Result<()> {
     if object.len() < HEADER_LEN {
         return Err(CryptoError::Truncated {
             what: "an encrypted object",
@@ -79,7 +95,6 @@ pub fn decrypt_object(key: &SymmetricKey, object: &[u8]) -> Result<SecretVec> {
     let header: &[u8; HEADER_LEN] = header.try_into().expect("the split is the header length");
     let mut state = sodium::stream_init_pull(header, key.expose())?;
 
-    let mut plaintext = Vec::with_capacity(object.len());
     loop {
         if records.is_empty() {
             // Every object ends with a final record, so running out of records means the object
@@ -88,24 +103,21 @@ pub fn decrypt_object(key: &SymmetricKey, object: &[u8]) -> Result<SecretVec> {
         }
         let take = records.len().min(FULL_RECORD_LEN);
         let (record, rest) = records.split_at(take);
-        let (chunk, tag) = sodium::stream_pull(&mut state, record)?;
+        let (mut chunk, tag) = sodium::stream_pull(&mut state, record)?;
         plaintext.extend_from_slice(&chunk);
-        // `chunk` is a plain Vec that has already been copied into `plaintext`; zeroise the copy
-        // the library handed back rather than leaving it to the allocator.
-        let mut chunk = chunk;
+        // The library handed back its own allocation; wipe it rather than leaving it to the
+        // allocator.
         sodium::memzero(&mut chunk);
         records = rest;
         if tag == sodium::TAG_FINAL {
-            if !records.is_empty() {
-                sodium::memzero(&mut plaintext);
-                return Err(CryptoError::RecordsAfterFinal);
+            if records.is_empty() {
+                return Ok(());
             }
-            return Ok(SecretVec::new(plaintext));
+            return Err(CryptoError::RecordsAfterFinal);
         }
         if take != FULL_RECORD_LEN {
             // A short record that is not the final one breaks the framing rule, so the object was
             // not produced by this format.
-            sodium::memzero(&mut plaintext);
             return Err(CryptoError::MissingFinalRecord);
         }
     }

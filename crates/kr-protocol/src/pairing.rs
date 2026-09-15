@@ -54,7 +54,7 @@ use crate::ids::{
 use crate::rights::ActionRight;
 use crate::scalars::{
     AuthorisationKey, Bytes, CanonicalSet, Digest256, EndpointKey, KeyId, Mac256, Nonce256,
-    NotificationPreviewKey, Nullable, Signature64, StoredEnvelopeKey, TimestampMs,
+    NotificationPreviewKey, Nullable, SecretBytes32, Signature64, StoredEnvelopeKey, TimestampMs,
 };
 
 /// The Bitcoin Base58 alphabet the ten-character code is drawn from.
@@ -368,19 +368,15 @@ fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), PairingTextEr
         return Err(PairingTextError("a rendezvous origin has a host"));
     }
     if bracketed {
-        // The bracketed form is the canonical one for an IPv6 literal, and its characters are
-        // restricted here; a fuller address check belongs to the transport layer that dials it.
-        if !host
-            .bytes()
-            .all(|byte| (byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) || byte == b':')
-        {
+        // One address has many spellings. The canonical one is what the standard library writes,
+        // so an origin that spells it differently is rejected rather than producing a second
+        // transcript for the same service.
+        let parsed: std::net::Ipv6Addr = host
+            .parse()
+            .map_err(|_| PairingTextError("a bracketed origin host is an IPv6 literal"))?;
+        if parsed.to_string() != host {
             return Err(PairingTextError(
-                "an IPv6 origin is lower-case hexadecimal and colons",
-            ));
-        }
-        if !host.contains(':') {
-            return Err(PairingTextError(
-                "a bracketed origin host is an IPv6 literal",
+                "an IPv6 origin uses the canonical spelling of its address",
             ));
         }
         return Ok(());
@@ -392,6 +388,21 @@ fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), PairingTextEr
         return Err(PairingTextError(
             "a rendezvous origin host has no trailing dot",
         ));
+    }
+    // An IPv4 literal is a host as well, and it too has one canonical spelling.
+    if host
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        let parsed: std::net::Ipv4Addr = host
+            .parse()
+            .map_err(|_| PairingTextError("a numeric origin host is an IPv4 literal"))?;
+        if parsed.to_string() != host {
+            return Err(PairingTextError(
+                "an IPv4 origin uses the canonical spelling of its address",
+            ));
+        }
+        return Ok(());
     }
     for label in host.split('.') {
         if label.is_empty() || label.len() > 63 {
@@ -473,6 +484,14 @@ impl fmt::Debug for ShortCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Section 10: the six secret characters never enter a log or an analytics event.
         write!(formatter, "ShortCode({}-...-...)", self.locator())
+    }
+}
+
+impl Drop for ShortCode {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+
+        self.0.zeroize();
     }
 }
 
@@ -1207,8 +1226,9 @@ pub struct DirectQrPayload {
     pub endpoint_id: EndpointKey,
     /// The selected discovery and relay configuration.
     pub network_config: NetworkConfig,
-    /// The random 256-bit invitation secret.
-    pub secret: Nonce256,
+    /// The random 256-bit invitation secret. It is the whole of the invitation's authority until
+    /// the owner approves, so it zeroises when it is dropped and never appears in debug output.
+    pub secret: SecretBytes32,
     /// The rights the invitation proposes.
     pub proposed_grant: ProposedGrant,
     /// The invitation's expiry in UTC milliseconds.
@@ -1340,7 +1360,7 @@ impl QrPayload {
                 )?;
                 map.insert(
                     "secret".to_owned(),
-                    CanonicalValue::bytes(secret.as_bytes().as_slice()),
+                    CanonicalValue::bytes(secret.expose().as_slice()),
                 )?;
                 map.insert(
                     "proposed_grant".to_owned(),
@@ -1454,7 +1474,7 @@ impl QrPayload {
                     )),
                     endpoint_id: EndpointKey::from_bytes(fixed_member(map, "endpoint_id")?),
                     network_config,
-                    secret: Nonce256::from_bytes(fixed_member(map, "secret")?),
+                    secret: SecretBytes32::from_bytes(fixed_member(map, "secret")?),
                     proposed_grant: typed_member(map, "proposed_grant")?,
                     expires_at_ms: TimestampMs::new(
                         map.get("expires_at")
@@ -1488,6 +1508,15 @@ impl QrPayload {
     /// Returns [`QrPayloadError`] when the text is not base64url or the bytes are not a valid
     /// payload.
     pub fn from_text(text: &str) -> Result<Self, QrPayloadError> {
+        // Four base64url characters carry three bytes, so the text is bounded before it is
+        // decoded and an oversized input never reaches an allocation.
+        let limit = MAX_QR_PAYLOAD_LEN.div_ceil(3) * 4;
+        if text.len() > limit {
+            return Err(QrPayloadError::TooLarge {
+                len: text.len(),
+                limit,
+            });
+        }
         let bytes = crate::scalars::from_base64url(text).map_err(|reason| {
             QrPayloadError::InvalidMember {
                 member: "payload text",
@@ -2039,7 +2068,7 @@ mod tests {
                 discovery_origins: Vec::new(),
                 direct_addresses: Vec::new(),
             },
-            secret: Nonce256::from_bytes([3; 32]),
+            secret: SecretBytes32::from_bytes([3; 32]),
             proposed_grant: ProposedGrant {
                 parent_grant_id: Nullable::null(),
                 environment_selector: EnvironmentSelector::Any,
@@ -2073,6 +2102,14 @@ mod tests {
         assert!(RendezvousOrigin::new("https://[2001:db8::1]:8443").is_ok());
         assert!(RendezvousOrigin::new("https://[2001:DB8::1]").is_err());
         assert!(RendezvousOrigin::new("https://2001:db8::1").is_err());
+        // One address, one spelling.
+        assert!(RendezvousOrigin::new("https://[:::]").is_err());
+        assert!(RendezvousOrigin::new("https://[2001:0db8::1]").is_err());
+        assert!(RendezvousOrigin::new("https://[2001:db8:0:0:0:0:0:1]").is_err());
+        assert!(RendezvousOrigin::new("https://[::1]").is_ok());
+        assert!(RendezvousOrigin::new("https://192.0.2.1").is_ok());
+        assert!(RendezvousOrigin::new("https://192.0.02.1").is_err());
+        assert!(RendezvousOrigin::new("https://192.0.2.1.5").is_err());
         assert!(RendezvousOrigin::new("https://reach.kala.to:8443").is_ok());
     }
 

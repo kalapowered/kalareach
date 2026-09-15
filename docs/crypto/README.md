@@ -119,8 +119,10 @@ prefix, `0x82 || CBOR(context) || 0x58 0x20`, is then rebuilt and compared with 
 the key is the remaining 32 bytes. Rebuilding rather than decoding is both the context check and the
 reason no value tree ever holds a copy of the key.
 
-An archive descriptor is validated before any object is allocated: its byte limit first, then its
-version, its recipient count, and every wrap's archive, generation, object, hash and recipient.
+`ArchiveDescriptor::from_canonical_bytes` is the entry point a restore uses: it bounds the bytes
+before decoding them, then validates the version, the recipient count, and every wrap's archive,
+generation, object, hash, purpose and recipient. An invalid descriptor therefore fails before any
+object is allocated or written.
 
 A manifest is verified against a writer key from the owner's recovery bundle. `verify_manifest`
 takes the trusted writers as an argument and has no way to read one out of the archive, so a
@@ -147,6 +149,9 @@ length could not tell which rule produced it.
 
 This reduces precision. It does not hide traffic patterns, and section 20 says so.
 
+A notification preview over 16 KiB is refused on both sides: a paired sender is authenticated, not
+trusted.
+
 Opening an envelope also checks the expiry, and `ReplayLedger` refuses an envelope that has expired
 as well as one it has already seen, so the retention window cannot be outlasted. The ledger's
 durable store belongs to the controller: `entries` and `restore` are how it survives a restart.
@@ -165,8 +170,9 @@ rather than causing trust in archive-supplied writer keys. Nothing else signs th
 `secretstream` object authenticates it under a key only the seed derives, so a restore that has
 only the kit can authenticate what it retrieved.
 
-`RecoverySeed::to_kit` exports the user's copy and `from_kit` reads it back after checking the
-checksum. `store::store_recovery_seed` and `store::load_recovery_seed` keep the owner's copy in the
+`RecoverySeed::to_kit` exports the user's copy and `from_kit` reads it back after checking the kit's
+profile version and its checksum. The kit's seed is a redacted, zeroising secret, so printing a kit
+does not print the owner's recovery authority. `store::store_recovery_seed` and `store::load_recovery_seed` keep the owner's copy in the
 secure store.
 
 The recovery recipient is an ordinary stored-envelope `crypto_box` recipient. It is not a fifth key
@@ -187,7 +193,8 @@ anything is decrypted.
   downgrade to files. iOS and Android keys belong to the companion application's platform layer,
   which owns Keychain and Keystore access.
 
-  The directory is mode 0700, owned by this account and not a symbolic link. Every secret is created
+  The directory is mode 0700, owned by this account, and neither it nor any component of its path
+  is a symbolic link. Every secret is created
   exclusively at mode 0600 under a staging name no valid secret name can collide with, flushed,
   renamed into place and the directory entry flushed, so a reader never sees a partial secret, one
   with the wrong mode, or a lost write after a crash. **That is the whole protection.** It depends on
@@ -196,10 +203,15 @@ anything is decrypted.
   copy-on-write filesystem may not honour.
 - `MemoryStore` is for tests, never touches a disk and redacts itself in debug output.
 
-`open_store` reports which store it opened. A host whose fallback directory already holds secrets
-keeps using it even when a secret service appears later, and reports that a migration is available:
-switching on whichever backend happens to work today would leave the application reading an empty
-platform store while its keys sat in files. Moving them is an explicit, verified step.
+`open_store` records which store a host chose in a `.store-kind` marker beside the fallback
+directory, and keeps using it. A host that chose files keeps using files even when a secret service
+appears later, reporting that a migration is available; a host that chose the platform store and
+now finds it missing fails rather than starting from an empty fallback. Switching on whichever
+backend happens to work today would leave the application reading an empty store while its secrets
+sat elsewhere. Moving them is an explicit, verified step.
+
+A secret name may not contain a segment beginning with a dot, and the store's staging files and its
+marker all do, so a secret can never collide with them.
 
 Loading a device's keys reads four items. A partially written set is an error, never a silent
 regeneration: regenerating one purpose would change that public key and break every record that
@@ -224,10 +236,11 @@ negotiated limit may exceed what the client said it could receive. Signatures au
 values; they do not establish that the negotiation was valid.
 
 `ChallengeLedger` holds each challenge from the moment the host issues it until the connection's
-proofs consume it, exactly once. `verify_connect_once` is the entry point a host uses: it consumes
-the challenge before it checks anything, so one set of proofs is accepted once. The ledger is
-bounded, and a full ledger is answered by ending idle connections rather than by forgetting a
-challenge.
+proofs consume it, exactly once, and never issues a consumed one again. `verify_connect_once` is
+the entry point a host uses: it is given the nonce this connection issued, requires the selection to
+name that exact nonce, and consumes it before it checks anything. One set of proofs is therefore
+accepted once, on the connection it belongs to. The outstanding set is bounded, and a full ledger is
+answered by ending idle connections rather than by forgetting a challenge.
 
 ## Vectors
 
@@ -237,7 +250,7 @@ challenge.
 
 | File | Contents |
 | --- | --- |
-| `signatures.json` | Ed25519 signatures over the domain-separated transcripts `fixtures/cbor/digests.json` and `fixtures/protocol/transcripts.json` publish, the RFC 8032 section 7.1 test vector, and three negative cases a verifier must reject |
+| `signatures.json` | Ed25519 signatures over the domain-separated transcripts `fixtures/cbor/digests.json` and `fixtures/protocol/transcripts.json` publish, both `kr-connect/1` proofs over the published connection transcript, the RFC 8032 section 7.1 test vector, and three negative cases a verifier must reject |
 | `envelopes.json` | A sealed mailbox envelope with its authenticated plaintext and canonical bytes; a sealed manifest key wrap with its plaintext; the section 20 size buckets |
 | `kdf.json` | The RFC 5869 HKDF-SHA256 vector, an HMAC-SHA256 vector, the `KRRECOV1` subkeys with the recovery recipient's public key, and the context-bound bundle key |
 
