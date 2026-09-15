@@ -87,6 +87,32 @@ pub enum IpcError {
         /// What the peer offered.
         offered: String,
     },
+    /// Two environments whose identities share a directory prefix tried to use one directory.
+    #[error("{path} belongs to environment {holder}, not {requested}")]
+    EnvironmentPrefixCollision {
+        /// The directory.
+        path: PathBuf,
+        /// The environment that owns it.
+        holder: String,
+        /// The environment that asked for it.
+        requested: String,
+    },
+    /// The stream ended part way through a frame.
+    #[error("the stream ended after {received} of {expected} bytes of a frame")]
+    TruncatedFrame {
+        /// Bytes received.
+        received: usize,
+        /// Bytes the frame declared.
+        expected: usize,
+    },
+    /// A published file is not one this host may act on.
+    #[error("{path}: {reason}")]
+    UntrustedFile {
+        /// The file.
+        path: PathBuf,
+        /// Why it is not trustworthy.
+        reason: &'static str,
+    },
     /// A host identity could not be read from the operating system.
     #[error("{what}: {detail}")]
     IdentityUnavailable {
@@ -120,12 +146,15 @@ impl IpcError {
             Self::Io { .. } | Self::Socket { .. } | Self::IdentityUnavailable { .. } => {
                 ErrorCode::ResourceUnavailable
             }
-            Self::DirectoryNotOwnerOnly { .. } | Self::PeerRejected { .. } => {
-                ErrorCode::PermissionDenied
-            }
+            Self::DirectoryNotOwnerOnly { .. }
+            | Self::PeerRejected { .. }
+            | Self::UntrustedFile { .. } => ErrorCode::PermissionDenied,
+            Self::EnvironmentPrefixCollision { .. } => ErrorCode::EnvironmentUnavailable,
             Self::PeerUnknown { .. } => ErrorCode::PermissionDenied,
             Self::SocketPathTooLong { .. } => ErrorCode::HostNotConfigured,
-            Self::Frame(_) | Self::UnexpectedMessage(_) => ErrorCode::InvalidArgument,
+            Self::Frame(_) | Self::UnexpectedMessage(_) | Self::TruncatedFrame { .. } => {
+                ErrorCode::InvalidArgument
+            }
             Self::PeerClosed => ErrorCode::ResourceUnavailable,
             Self::VersionMismatch { .. } => ErrorCode::UnsupportedSchema,
         }

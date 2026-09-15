@@ -23,7 +23,9 @@ libproc.workspace = true
 sysctl.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+interprocess.workspace = true
 sysinfo.workspace = true
+widestring.workspace = true
 
 [features]
 # A disposable owner-only host tree for the other host crates' tests.

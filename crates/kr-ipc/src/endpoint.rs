@@ -60,12 +60,12 @@ impl Listener {
             let accepted = self.inner.accept().await;
             let (connection, peer) = match accepted {
                 Ok(accepted) => accepted,
-                // A caller whose credentials the kernel will no longer report cannot be
-                // authenticated, whatever is still sitting in its receive buffer. Some platforms
-                // report that as "not connected" the moment the caller closes its end. Dropping
-                // the connection and waiting for the next caller is the safe answer; it is not a
-                // reason for the listener to stop serving the owner.
-                Err(IpcError::PeerClosed) => continue,
+                // A caller whose credentials the kernel will not report cannot be authenticated,
+                // whatever is still sitting in its receive buffer. Some platforms report that as
+                // "not connected" the moment the caller closes its end. Dropping the connection
+                // and waiting for the next caller is the safe answer; it is not a reason for the
+                // listener to stop serving the owner, which is why neither failure escapes here.
+                Err(IpcError::PeerClosed | IpcError::PeerUnknown { .. }) => continue,
                 Err(error) => return Err(error),
             };
             match peer.authorise(self.owner_uid) {
@@ -141,7 +141,9 @@ mod platform {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
+    use std::os::unix::fs::FileTypeExt as _;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
     use tokio::net::{UnixListener, UnixStream};
 
     use crate::error::{IpcError, Result};
@@ -152,38 +154,22 @@ mod platform {
     pub(super) struct Listener {
         inner: UnixListener,
         path: std::path::PathBuf,
+        identity: (u64, u64),
     }
 
     impl Listener {
         pub(super) fn bind(endpoint: &Endpoint) -> Result<Self> {
             let path = endpoint.as_path().to_path_buf();
-            if let Some(parent) = path.parent() {
-                crate::paths::create_owner_only_directory(parent)?;
-            }
-            // A socket file is not a lock. If one is present, try to reach it: a listener that
-            // answers means another process owns this endpoint, and a refused connection means the
-            // file outlived its owner and can be replaced.
-            if path.exists() {
-                match std::os::unix::net::UnixStream::connect(&path) {
-                    Ok(_) => {
-                        return Err(IpcError::socket(
-                            "bind",
-                            std::io::Error::new(
-                                std::io::ErrorKind::AddrInUse,
-                                "another process is listening on this endpoint",
-                            ),
-                        ));
-                    }
-                    Err(_) => {
-                        std::fs::remove_file(&path)
-                            .map_err(|error| IpcError::io("replace", &path, error))?;
-                    }
-                }
-            }
+            replace_stale_socket(&path)?;
             let inner =
                 UnixListener::bind(&path).map_err(|error| IpcError::socket("bind", error))?;
             set_owner_only(&path)?;
-            Ok(Self { inner, path })
+            let identity = socket_identity(&path)?;
+            Ok(Self {
+                inner,
+                path,
+                identity,
+            })
         }
 
         pub(super) async fn accept(&self) -> Result<(super::Connection, PeerIdentity)> {
@@ -201,9 +187,55 @@ mod platform {
     impl Drop for Listener {
         fn drop(&mut self) {
             // The address stays reserved until the file is gone, and leaving it behind makes the
-            // next bind decide whether a live process owns it.
-            let _ = std::fs::remove_file(&self.path);
+            // next bind decide whether a live process owns it. Remove it only while it is still
+            // the same socket this listener bound: another process may already have replaced it,
+            // and deleting a working endpoint out from under it would be worse than leaving a
+            // stale file.
+            if socket_identity(&self.path).is_ok_and(|identity| identity == self.identity) {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
+    }
+
+    /// Removes a socket file only when nothing is listening on it.
+    ///
+    /// A socket file is not a lock, so its presence proves nothing on its own. A connection that
+    /// is refused proves the previous owner is gone. Any other failure — a permission error, an
+    /// exhausted descriptor table, a full backlog — proves nothing at all, and unlinking on those
+    /// would let one process delete another's live endpoint.
+    fn replace_stale_socket(path: &std::path::Path) -> Result<()> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(IpcError::io("inspect", path, error)),
+        };
+        if !metadata.file_type().is_socket() {
+            return Err(IpcError::UntrustedFile {
+                path: path.to_path_buf(),
+                reason: "an endpoint address is occupied by something that is not a socket",
+            });
+        }
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => Err(IpcError::socket(
+                "bind",
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "another process is listening on this endpoint",
+                ),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(path).map_err(|error| IpcError::io("replace", path, error))
+            }
+            Err(error) => Err(IpcError::socket("probe", error)),
+        }
+    }
+
+    fn socket_identity(path: &std::path::Path) -> Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| IpcError::io("inspect", path, error))?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     fn set_owner_only(path: &std::path::Path) -> Result<()> {
@@ -299,12 +331,13 @@ mod platform {
     use crate::paths::Endpoint;
     use crate::peer::PeerIdentity;
 
-    /// Owner and creator only, with inheritance blocked.
+    /// The object's owner only, with inheritance blocked.
     ///
-    /// `D:P` makes the list protected, so no inherited entry widens it. The single entry grants
-    /// the creator-owner every access, which is the same reach the Unix runtime directory's 0700
-    /// gives.
-    const OWNER_ONLY_DESCRIPTOR: &str = "D:P(A;;GA;;;CO)";
+    /// `D:P` makes the list protected, so no inherited entry widens it. `OW` is the OWNER RIGHTS
+    /// identifier, which resolves to whoever owns the object: the process that created the pipe,
+    /// which is this user. The CREATOR OWNER identifier would be wrong here, because it is a
+    /// placeholder that only means anything in an inheritable entry.
+    const OWNER_ONLY_DESCRIPTOR: &str = "D:P(A;;GA;;;OW)";
 
     #[derive(Debug)]
     pub(super) struct Listener {
@@ -366,8 +399,9 @@ mod platform {
                 .0
                 .peer_creds()
                 .map_err(|source| IpcError::PeerUnknown { source })?;
-            // The pipe's access-control list already restricts the namespace to this user, so the
-            // identity a Windows peer carries is its process rather than a separate user field.
+            // Windows reports the peer's process, not a numeric user. The access-control list on
+            // the pipe is what keeps another user out, so the identity carried here is the process
+            // and the owning user this endpoint belongs to.
             Ok(PeerIdentity {
                 uid: crate::paths::current_uid(),
                 gid: 0,

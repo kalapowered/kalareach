@@ -17,6 +17,12 @@ use kr_protocol::worker::WorkerDescriptor;
 use crate::error::{IpcError, Result};
 use crate::paths::{EnvironmentPaths, write_owner_only_file};
 
+/// The largest descriptor this host will read.
+///
+/// A descriptor is a few hundred bytes. The bound exists so a reader cannot be made to allocate by
+/// a file that claims to be one.
+pub const MAX_DESCRIPTOR_LEN: u64 = 16 * 1024;
+
 /// Writes a descriptor into the runtime directory, replacing any previous version atomically.
 ///
 /// # Errors
@@ -35,7 +41,25 @@ pub fn publish(paths: &EnvironmentPaths, descriptor: &WorkerDescriptor) -> Resul
 ///
 /// Returns an error when the file exists but cannot be read or is not a canonical descriptor.
 pub fn read(paths: &EnvironmentPaths, session_id: SessionId) -> Result<Option<WorkerDescriptor>> {
-    read_file(&paths.descriptor_file(session_id))
+    let path = paths.descriptor_file(session_id);
+    let Some(descriptor) = read_file(&path)? else {
+        return Ok(None);
+    };
+    // The filename is a hint. A descriptor whose contents name a different session or environment
+    // is not this session's descriptor, whatever it is called.
+    if descriptor.session_id != session_id {
+        return Err(IpcError::UntrustedFile {
+            path,
+            reason: "the descriptor names a different session from its filename",
+        });
+    }
+    if descriptor.environment_id != paths.environment_id() {
+        return Err(IpcError::UntrustedFile {
+            path,
+            reason: "the descriptor names a different environment from its directory",
+        });
+    }
+    Ok(Some(descriptor))
 }
 
 /// Reads every descriptor currently published for an environment.
@@ -102,15 +126,67 @@ pub fn retire(paths: &EnvironmentPaths, session_id: SessionId) -> Result<()> {
     }
 }
 
+/// Reads a descriptor file that this user owns, is not a link, and is small enough to be one.
+///
+/// The public key inside a descriptor decides which worker a client will trust, so the file has to
+/// be one this host wrote. A symbolic link, another user's file or a file with group or other
+/// permissions is refused: a challenge cannot save a reader that was pointed at an impostor's
+/// endpoint *and* handed the impostor's key.
 fn read_file(path: &Path) -> Result<Option<WorkerDescriptor>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(IpcError::io("read", path, error)),
+        Err(error) => return Err(IpcError::io("inspect", path, error)),
     };
+    if metadata.file_type().is_symlink() {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "a descriptor must not be a symbolic link",
+        });
+    }
+    if !metadata.is_file() {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "a descriptor must be a regular file",
+        });
+    }
+    if metadata.len() > MAX_DESCRIPTOR_LEN {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "a descriptor is larger than any descriptor this host writes",
+        });
+    }
+    check_owner(path, &metadata)?;
+    let bytes = std::fs::read(path).map_err(|error| IpcError::io("read", path, error))?;
     kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
         .map(Some)
         .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))
+}
+
+#[cfg(unix)]
+fn check_owner(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if metadata.uid() != crate::paths::current_uid() {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "a descriptor must be owned by this user",
+        });
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "a descriptor must not be readable or writable by anyone else",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_owner(_path: &Path, _metadata: &std::fs::Metadata) -> Result<()> {
+    // The Windows qualification pass adds the explicit protected access-control list check here;
+    // the directory lives inside the user's own profile.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -194,6 +270,50 @@ mod tests {
         retire(&paths, published.session_id).expect("retires");
         assert!(read(&paths, published.session_id).expect("reads").is_none());
         retire(&paths, published.session_id).expect("retiring again succeeds");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descriptor_another_user_could_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let host = TempHost::create();
+        let paths = host.environment();
+        let published = descriptor(&host, 6);
+        publish(&paths, &published).expect("publishes");
+        let file = paths.descriptor_file(published.session_id);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+        let error = read(&paths, published.session_id).expect_err("refuses");
+        assert!(matches!(error, IpcError::UntrustedFile { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descriptor_that_is_a_symbolic_link_is_refused() {
+        let host = TempHost::create();
+        let paths = host.environment();
+        let published = descriptor(&host, 7);
+        publish(&paths, &published).expect("publishes");
+        let real = paths.descriptor_file(published.session_id);
+        let planted = descriptor(&host, 8);
+        let link = paths.descriptor_file(planted.session_id);
+        std::os::unix::fs::symlink(&real, &link).expect("links");
+        let error = read(&paths, planted.session_id).expect_err("refuses");
+        assert!(matches!(error, IpcError::UntrustedFile { .. }));
+    }
+
+    #[test]
+    fn a_descriptor_whose_contents_name_another_session_is_refused() {
+        let host = TempHost::create();
+        let paths = host.environment();
+        let mut published = descriptor(&host, 9);
+        let filename_session = published.session_id;
+        published.session_id = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([200; 16]));
+        let bytes = kr_cbor::to_canonical_vec(&published).expect("encodes");
+        crate::paths::write_owner_only_file(&paths.descriptor_file(filename_session), &bytes)
+            .expect("writes");
+        let error = read(&paths, filename_session).expect_err("refuses");
+        assert!(matches!(error, IpcError::UntrustedFile { .. }));
     }
 
     #[test]

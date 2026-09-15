@@ -8,7 +8,12 @@
 //! | --- | --- | --- |
 //! | Linux | `/proc/sys/kernel/random/boot_id` | `/proc/<pid>/stat` field 22 |
 //! | macOS | `kern.bootsessionuuid` | `proc_pidinfo(PROC_PIDTBSDINFO)` |
-//! | Windows | the recorded boot time | `GetProcessTimes` creation time |
+//! | Windows | the recorded boot time | the process creation time in whole seconds |
+//!
+//! The Windows values come from `sysinfo`, which reports the boot time as the wall clock minus the
+//! uptime and the creation time in whole seconds. Both are coarser than the kernel's own values;
+//! the Windows qualification pass narrows them, and a Windows worker's per-session Job Object
+//! carries the ownership a recycled identifier could otherwise confuse.
 
 use kr_protocol::identity::{
     BootIdentity, BootIdentitySource, ProcessStartIdentity, ProcessStartSource,
@@ -44,15 +49,42 @@ pub fn current_process_start_identity() -> Result<ProcessStartIdentity> {
     process_start_identity(std::process::id())
 }
 
-/// Returns true when the process named by this identity is still the process that was recorded.
+/// What the kernel says about a process the host recorded earlier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessState {
+    /// The process is running and its start identity matches the recorded one.
+    Running,
+    /// The process is gone, or its identifier now belongs to a different process.
+    Ended,
+    /// The operating system did not answer, so neither answer is established.
+    ///
+    /// This is not "ended". A recovery path that treated a denied or failed query as death would
+    /// complete a revocation, take over a journal or release a session identity while the original
+    /// process was still running.
+    Unknown {
+        /// Why the query failed.
+        detail: String,
+    },
+}
+
+/// Asks the kernel whether a recorded process is still the process that was recorded.
 ///
 /// A process identifier on its own proves nothing: the kernel reuses them, and an unrelated
-/// program can hold the number within milliseconds. This re-reads the start identity and compares
-/// both halves, so a recycled identifier reads as absent.
+/// program can hold the number within milliseconds. Both halves are compared, so a recycled
+/// identifier reads as [`ProcessState::Ended`] rather than as the original process.
 #[must_use]
-pub fn process_still_running(identity: &ProcessStartIdentity) -> bool {
-    let pid = u32::try_from(identity.pid.get()).unwrap_or(u32::MAX);
-    process_start_identity(pid).is_ok_and(|current| current.matches(identity))
+pub fn process_state(identity: &ProcessStartIdentity) -> ProcessState {
+    let Ok(pid) = u32::try_from(identity.pid.get()) else {
+        return ProcessState::Ended;
+    };
+    match process_start_identity(pid) {
+        Ok(current) if current.matches(identity) => ProcessState::Running,
+        Ok(_) => ProcessState::Ended,
+        Err(error) if platform::is_absent(&error) => ProcessState::Ended,
+        Err(error) => ProcessState::Unknown {
+            detail: error.to_string(),
+        },
+    }
 }
 
 fn unavailable(what: &'static str, detail: impl Into<String>) -> IpcError {
@@ -78,6 +110,11 @@ mod platform {
             source: BootIdentitySource::LinuxBootId,
             value: kr_protocol::scalars::Bytes::new(text.trim().as_bytes().to_vec()),
         })
+    }
+
+    pub(super) fn is_absent(error: &crate::error::IpcError) -> bool {
+        // The only failure that proves absence on Linux is a missing /proc entry.
+        error.to_string().contains("No such file or directory")
     }
 
     pub(super) fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
@@ -167,6 +204,13 @@ mod platform {
         })
     }
 
+    pub(super) fn is_absent(error: &crate::error::IpcError) -> bool {
+        // `proc_pidinfo` reports a process that is not there as "No such process"; every other
+        // failure leaves the question open.
+        let message = error.to_string();
+        message.contains("No such process") || message.contains("not a process identifier")
+    }
+
     pub(super) fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
         let pid = i32::try_from(pid).map_err(|_| {
             unavailable(
@@ -208,6 +252,10 @@ mod platform {
         })
     }
 
+    pub(super) fn is_absent(error: &crate::error::IpcError) -> bool {
+        error.to_string().contains("is gone")
+    }
+
     pub(super) fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
         use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
 
@@ -223,7 +271,7 @@ mod platform {
             .ok_or_else(|| unavailable("process start identity", format!("pid {pid} is gone")))?;
         Ok(ProcessStartIdentity::new(
             u64::from(pid),
-            ProcessStartSource::WindowsProcessTimes,
+            ProcessStartSource::WindowsProcessStartSeconds,
             process.start_time(),
         ))
     }
@@ -245,13 +293,23 @@ mod tests {
         let second = current_process_start_identity().expect("the kernel answers");
         assert_eq!(first, second);
         assert_eq!(first.pid.get(), u64::from(std::process::id()));
-        assert!(process_still_running(&first));
+        assert_eq!(process_state(&first), ProcessState::Running);
     }
 
     #[test]
     fn a_different_start_value_reads_as_a_different_process() {
         let mut altered = current_process_start_identity().expect("the kernel answers");
         altered.start_value = kr_protocol::scalars::U64::new(altered.start_value.get() + 1);
-        assert!(!process_still_running(&altered));
+        assert_eq!(process_state(&altered), ProcessState::Ended);
+    }
+
+    #[test]
+    fn a_process_identifier_that_cannot_exist_reads_as_ended() {
+        let impossible = ProcessStartIdentity::new(
+            u64::from(u32::MAX) + 1,
+            kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+            1,
+        );
+        assert_eq!(process_state(&impossible), ProcessState::Ended);
     }
 }

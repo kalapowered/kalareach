@@ -23,19 +23,36 @@ pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWri
         FrameReader {
             half: reader,
             codec: FrameCodec::new(kind),
+            prefix: [0; FRAME_LENGTH_PREFIX_LEN],
+            prefix_filled: 0,
+            payload: Vec::new(),
+            payload_filled: 0,
+            declared: None,
         },
         FrameWriter {
             half: writer,
             codec: FrameCodec::new(kind),
+            pending: Vec::new(),
+            sent: 0,
         },
     )
 }
 
 /// The reading half of a framed connection.
+///
+/// The reader keeps its own buffer and its own position in the current frame, so a read whose
+/// future is dropped part way through — a `select!` arm that lost, a task that was cancelled —
+/// resumes from where it stopped instead of restarting mid-frame against a stream that has already
+/// moved on.
 #[derive(Debug)]
 pub struct FrameReader {
     half: ReadHalf<Connection>,
     codec: FrameCodec,
+    prefix: [u8; FRAME_LENGTH_PREFIX_LEN],
+    prefix_filled: usize,
+    payload: Vec<u8>,
+    payload_filled: usize,
+    declared: Option<usize>,
 }
 
 impl FrameReader {
@@ -43,25 +60,55 @@ impl FrameReader {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PeerClosed`] at a clean end of stream, or a framing failure when the
-    /// declared length is out of bounds or the stream ends mid-frame.
+    /// Returns [`IpcError::PeerClosed`] at a clean frame boundary, [`IpcError::TruncatedFrame`]
+    /// when the stream ends part way through a frame, or a framing failure when the declared
+    /// length is out of bounds.
     pub async fn read_payload(&mut self) -> Result<Vec<u8>> {
-        let mut prefix = [0_u8; FRAME_LENGTH_PREFIX_LEN];
-        match self.half.read_exact(&mut prefix).await {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(IpcError::PeerClosed);
+        while self.declared.is_none() {
+            let read = self
+                .half
+                .read(&mut self.prefix[self.prefix_filled..])
+                .await
+                .map_err(|error| IpcError::socket("read", error))?;
+            if read == 0 {
+                return if self.prefix_filled == 0 {
+                    // A clean end at a frame boundary is the peer going away, not a broken frame.
+                    Err(IpcError::PeerClosed)
+                } else {
+                    Err(IpcError::TruncatedFrame {
+                        received: self.prefix_filled,
+                        expected: FRAME_LENGTH_PREFIX_LEN,
+                    })
+                };
             }
-            Err(error) => return Err(IpcError::socket("read", error)),
+            self.prefix_filled += read;
+            if self.prefix_filled == FRAME_LENGTH_PREFIX_LEN {
+                // The bound is checked here, before the buffer is grown.
+                let declared = self.codec.decode_length(self.prefix)?;
+                self.payload = vec![0_u8; declared];
+                self.payload_filled = 0;
+                self.declared = Some(declared);
+            }
         }
-        // The bound is checked here, before the buffer exists.
-        let declared = self.codec.decode_length(prefix)?;
-        let mut payload = vec![0_u8; declared];
-        self.half
-            .read_exact(&mut payload)
-            .await
-            .map_err(|error| IpcError::socket("read", error))?;
-        Ok(payload)
+        let declared = self.declared.unwrap_or_default();
+        while self.payload_filled < declared {
+            let read = self
+                .half
+                .read(&mut self.payload[self.payload_filled..])
+                .await
+                .map_err(|error| IpcError::socket("read", error))?;
+            if read == 0 {
+                return Err(IpcError::TruncatedFrame {
+                    received: self.payload_filled,
+                    expected: declared,
+                });
+            }
+            self.payload_filled += read;
+        }
+        self.prefix_filled = 0;
+        self.payload_filled = 0;
+        self.declared = None;
+        Ok(std::mem::take(&mut self.payload))
     }
 
     /// Reads one frame and parses it as `T`.
@@ -78,10 +125,15 @@ impl FrameReader {
 }
 
 /// The writing half of a framed connection.
+///
+/// Like the reader, the writer keeps the bytes it has not yet sent. A cancelled write therefore
+/// leaves a partial frame pending rather than lost, and the next call finishes it.
 #[derive(Debug)]
 pub struct FrameWriter {
     half: WriteHalf<Connection>,
     codec: FrameCodec,
+    pending: Vec<u8>,
+    sent: usize,
 }
 
 impl FrameWriter {
@@ -100,20 +152,30 @@ impl FrameWriter {
     ///
     /// # Errors
     ///
-    /// Returns a socket failure when the peer is gone.
+    /// Returns [`IpcError::PeerClosed`] when the peer is gone, or a socket failure.
     pub async fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
-        match self.half.write_all(frame).await {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                return Err(IpcError::PeerClosed);
-            }
-            Err(error) => return Err(IpcError::socket("write", error)),
+        if self.sent == self.pending.len() {
+            self.pending.clear();
+            self.pending.extend_from_slice(frame);
+            self.sent = 0;
         }
+        while self.sent < self.pending.len() {
+            match self.half.write(&self.pending[self.sent..]).await {
+                Ok(0) => return Err(IpcError::PeerClosed),
+                Ok(written) => self.sent += written,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    return Err(IpcError::PeerClosed);
+                }
+                Err(error) => return Err(IpcError::socket("write", error)),
+            }
+        }
+        self.pending.clear();
+        self.sent = 0;
         self.half
             .flush()
             .await
@@ -202,6 +264,35 @@ mod tests {
         assert!(matches!(
             error,
             IpcError::Frame(kr_protocol::frame::FrameError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_mid_frame_is_truncated_rather_than_closed() {
+        let (endpoint, listener, _host) = pair();
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.expect("accepts");
+            let (mut reader, mut writer) = split(connection, StreamKind::Control);
+            let first: ControlMessage = reader.read_message().await.expect("reads the frame");
+            writer.write_message(&first).await.expect("acknowledges");
+            reader.read_payload().await.expect_err("reports truncation")
+        });
+        let client = Connection::connect(&endpoint).await.expect("connects");
+        let (mut reader, mut writer) = split(client, StreamKind::Control);
+        writer.write_message(&request(1)).await.expect("writes");
+        let _acknowledged: ControlMessage = reader.read_message().await.expect("reads the reply");
+        // Two bytes of a four-byte length prefix, then the connection goes.
+        writer
+            .write_frame(&[0, 0])
+            .await
+            .expect("writes a fragment");
+        drop((reader, writer));
+        assert!(matches!(
+            server.await.expect("server task"),
+            IpcError::TruncatedFrame {
+                received: 2,
+                expected: 4
+            }
         ));
     }
 

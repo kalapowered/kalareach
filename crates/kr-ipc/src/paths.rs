@@ -113,24 +113,30 @@ impl HostPaths {
     /// Returns an error when the state root cannot be created or the file cannot be read or
     /// written.
     pub fn open_environment_id(&self) -> Result<EnvironmentId> {
-        create_owner_only_directory(&self.state_root)?;
+        create_private_tree(&self.state_root, &self.state_root)?;
         let path = self.environment_id_file();
-        match std::fs::read_to_string(&path) {
-            Ok(text) => text
-                .trim()
-                .parse::<Uuid>()
-                .map(EnvironmentId::new)
-                .map_err(|error| IpcError::IdentityUnavailable {
-                    what: "environment identity",
-                    detail: format!("{}: {error}", path.display()),
-                }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let allocated = EnvironmentId::new(crate::new_uuid());
-                write_owner_only_file(&path, format!("{allocated}\n").as_bytes())?;
-                Ok(allocated)
-            }
-            Err(error) => Err(IpcError::io("read", path, error)),
+        // Creation must not replace: two first starts racing here would otherwise each rename
+        // their own identity into place and walk away believing different answers, and the
+        // per-environment singleton lock cannot undo a split that happened before it existed.
+        // Exactly one caller creates the file; every other caller reads what that one wrote.
+        match create_new_owner_only_file(
+            &path,
+            format!("{}\n", EnvironmentId::new(crate::new_uuid())).as_bytes(),
+        ) {
+            Ok(()) => {}
+            Err(IpcError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
+        let text =
+            std::fs::read_to_string(&path).map_err(|error| IpcError::io("read", &path, error))?;
+        text.trim()
+            .parse::<Uuid>()
+            .map(EnvironmentId::new)
+            .map_err(|error| IpcError::IdentityUnavailable {
+                what: "environment identity",
+                detail: format!("{}: {error}", path.display()),
+            })
     }
 
     /// Returns the directories one environment uses.
@@ -139,6 +145,8 @@ impl HostPaths {
         let prefix = short_prefix(environment_id);
         EnvironmentPaths {
             environment_id,
+            runtime_root: self.runtime_root.clone(),
+            state_root: self.state_root.clone(),
             runtime_dir: self.runtime_root.join(&prefix),
             state_dir: self.state_root.join("environments").join(&prefix),
         }
@@ -164,6 +172,8 @@ pub fn short_prefix(environment_id: EnvironmentId) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvironmentPaths {
     environment_id: EnvironmentId,
+    runtime_root: PathBuf,
+    state_root: PathBuf,
     runtime_dir: PathBuf,
     state_dir: PathBuf,
 }
@@ -194,14 +204,46 @@ impl EnvironmentPaths {
     /// Returns an error when a directory cannot be created, or when one already exists with wider
     /// permissions or a different owner.
     pub fn create(&self) -> Result<()> {
-        create_owner_only_directory(&self.runtime_dir)?;
-        create_owner_only_directory(&self.descriptors_dir())?;
-        create_owner_only_directory(&self.state_dir)?;
-        create_owner_only_directory(&self.journals_dir())?;
-        create_owner_only_directory(&self.spool_dir())?;
-        create_owner_only_directory(&self.jobs_dir())?;
-        create_owner_only_directory(&self.secrets_dir())?;
-        Ok(())
+        for path in [&self.runtime_dir, &self.descriptors_dir()] {
+            create_private_tree(&self.runtime_root, path)?;
+        }
+        for path in [
+            &self.state_dir,
+            &self.journals_dir(),
+            &self.spool_dir(),
+            &self.jobs_dir(),
+            &self.secrets_dir(),
+        ] {
+            create_private_tree(&self.state_root, path)?;
+        }
+        // The directory name is an eight-character prefix, short enough for a socket address but
+        // not unique. Each directory therefore carries the complete identity, and a second
+        // environment whose identity shares that prefix is refused rather than allowed to open
+        // another environment's registry, journals and sockets.
+        self.claim_identity(&self.runtime_dir)?;
+        self.claim_identity(&self.state_dir)
+    }
+
+    fn claim_identity(&self, directory: &Path) -> Result<()> {
+        let marker = directory.join(ENVIRONMENT_MARKER);
+        match std::fs::read_to_string(&marker) {
+            Ok(text) => {
+                let recorded = text.trim();
+                if recorded == self.environment_id.to_string() {
+                    Ok(())
+                } else {
+                    Err(IpcError::EnvironmentPrefixCollision {
+                        path: directory.to_path_buf(),
+                        holder: recorded.to_owned(),
+                        requested: self.environment_id.to_string(),
+                    })
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_owner_only_file(&marker, format!("{}\n", self.environment_id).as_bytes())
+            }
+            Err(error) => Err(IpcError::io("read", marker, error)),
+        }
     }
 
     /// Returns the directory holding published worker descriptors.
@@ -223,7 +265,7 @@ impl EnvironmentPaths {
     /// Returns [`IpcError::SocketPathTooLong`] when the path does not fit the platform's socket
     /// address.
     pub fn controller_endpoint(&self) -> Result<Endpoint> {
-        self.endpoint("c.sock", "controller")
+        self.endpoint("c")
     }
 
     /// Returns the controller's owner-only rendezvous endpoint.
@@ -235,7 +277,7 @@ impl EnvironmentPaths {
     /// Returns [`IpcError::SocketPathTooLong`] when the path does not fit the platform's socket
     /// address.
     pub fn rendezvous_endpoint(&self) -> Result<Endpoint> {
-        self.endpoint("r.sock", "rendezvous")
+        self.endpoint("r")
     }
 
     /// Returns one worker's private endpoint.
@@ -249,7 +291,7 @@ impl EnvironmentPaths {
     /// Returns [`IpcError::SocketPathTooLong`] when the path does not fit the platform's socket
     /// address.
     pub fn worker_endpoint(&self, display_number: DisplayNumber) -> Result<Endpoint> {
-        self.endpoint(&format!("w{}.sock", display_number.get()), "worker")
+        self.endpoint(&format!("w{}", display_number.get()))
     }
 
     /// Returns the controller's singleton lock file.
@@ -301,17 +343,29 @@ impl EnvironmentPaths {
         self.state_dir.join("secrets")
     }
 
-    fn endpoint(&self, file_name: &str, _role: &str) -> Result<Endpoint> {
-        let path = self.runtime_dir.join(file_name);
-        Endpoint::from_path(path)
+    #[cfg(unix)]
+    fn endpoint(&self, role: &str) -> Result<Endpoint> {
+        Endpoint::from_path(self.runtime_dir.join(format!("{role}.sock")))
+    }
+
+    #[cfg(windows)]
+    fn endpoint(&self, role: &str) -> Result<Endpoint> {
+        // A named pipe lives in the pipe namespace, not the filesystem, so the address is a name
+        // rather than a path. It is scoped by the user and the environment for the same reason the
+        // Unix socket lives in a per-user, per-environment directory.
+        Endpoint::from_name(format!(
+            "kalareach-{}-{}-{role}",
+            current_uid(),
+            short_prefix(self.environment_id)
+        ))
     }
 }
 
 /// The address of one local endpoint.
 ///
 /// On Unix this is a filesystem path inside the owner-only runtime directory. On Windows it is a
-/// named-pipe name; the directory permissions have no equivalent there, so the pipe carries an
-/// owner-only access-control list instead.
+/// named-pipe name; the pipe namespace has no directory permissions to inherit, so the pipe
+/// carries an owner-only access-control list instead.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Endpoint(PathBuf);
 
@@ -323,6 +377,19 @@ impl Endpoint {
     /// Returns [`IpcError::SocketPathTooLong`] when the path is too long to bind.
     pub fn from_path(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
+        // A descriptor carries this address as text. A path that is not valid UTF-8 would be
+        // published in a different form from the one that was bound, so it is refused here rather
+        // than quietly altered by a lossy conversion.
+        if path.to_str().is_none() {
+            return Err(IpcError::io(
+                "bind",
+                &path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "an endpoint path must be valid UTF-8",
+                ),
+            ));
+        }
         let len = path.as_os_str().as_encoded_bytes().len();
         if len > MAX_SOCKET_PATH_LEN {
             return Err(IpcError::SocketPathTooLong {
@@ -334,37 +401,106 @@ impl Endpoint {
         Ok(Self(path))
     }
 
+    /// Wraps a namespaced endpoint name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::SocketPathTooLong`] when the name is longer than the platform accepts.
+    pub fn from_name(name: impl Into<String>) -> Result<Self> {
+        Self::from_path(PathBuf::from(name.into()))
+    }
+
     /// Returns the address as a path.
+    ///
+    /// On Windows this is the pipe name rather than a filesystem path.
     #[must_use]
     pub fn as_path(&self) -> &Path {
         &self.0
     }
 
     /// Returns the address as text, for a descriptor or a diagnostic.
+    ///
+    /// The constructor refused a path that is not valid UTF-8, so this is the exact address that
+    /// was bound.
     #[must_use]
     pub fn as_text(&self) -> String {
-        self.0.to_string_lossy().into_owned()
+        self.0
+            .to_str()
+            .expect("an endpoint path was checked for UTF-8 when it was built")
+            .to_owned()
     }
 }
 
 impl core::fmt::Display for Endpoint {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str(&self.0.to_string_lossy())
+        formatter.write_str(&self.as_text())
     }
 }
 
-/// Creates a directory owner-only, and checks an existing one.
+/// The file that records which environment owns a directory whose name is only a prefix.
+pub const ENVIRONMENT_MARKER: &str = "environment";
+
+/// Creates a KalaReach directory tree owner-only, under a root this installation owns.
 ///
-/// A directory that already exists with a different owner or wider permissions is an error rather
-/// than something to repair silently: the host cannot tell whether it was widened by accident or
-/// by someone else, and both answers make the endpoints inside it untrustworthy.
+/// Only the root and the directories below it are KalaReach's. Their parents are not: `/tmp` is
+/// world-writable by design, and `~/.cache` and `~/.local/state` are ordinarily group-readable.
+/// Demanding 0700 of those would refuse to start on a perfectly normal system, so the boundary is
+/// explicit: everything above `root` is created with the platform's ordinary permissions and
+/// checked for nothing, and `root` itself and every component below it is created owner-only and
+/// verified on every open.
+///
+/// # Errors
+///
+/// Returns an error when `path` is not inside `root`, when a directory cannot be created, or when
+/// one exists with the wrong owner or wider permissions, or as a symbolic link.
+pub fn create_private_tree(root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        IpcError::io(
+            "create",
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the path is outside this installation's root",
+            ),
+        )
+    })?;
+    if let Some(parent) = root.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| IpcError::io("create", parent, error))?;
+    }
+    let mut current = root.to_path_buf();
+    create_private_directory(&current)?;
+    for component in relative.components() {
+        current.push(component);
+        create_private_directory(&current)?;
+    }
+    Ok(())
+}
+
+/// Creates one directory owner-only, or checks an existing one.
+///
+/// A directory that already exists with a different owner, wider permissions, or as a symbolic
+/// link is an error rather than something to repair silently: the host cannot tell whether it was
+/// widened by accident or by someone else, and both answers make the endpoints inside it
+/// untrustworthy.
 ///
 /// # Errors
 ///
 /// Returns an error when the directory cannot be created, or when it exists with the wrong owner
 /// or permissions.
-pub fn create_owner_only_directory(path: &Path) -> Result<()> {
-    match std::fs::metadata(path) {
+pub fn create_private_directory(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(IpcError::io(
+                "open",
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a KalaReach directory must not be a symbolic link",
+                ),
+            ));
+        }
         Ok(metadata) if metadata.is_dir() => return check_owner_only(path, &metadata),
         Ok(_) => {
             return Err(IpcError::io(
@@ -379,13 +515,9 @@ pub fn create_owner_only_directory(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(IpcError::io("inspect", path, error)),
     }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        create_owner_only_directory(parent)?;
-    }
     build_owner_only_directory(path)?;
-    let metadata = std::fs::metadata(path).map_err(|error| IpcError::io("inspect", path, error))?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| IpcError::io("inspect", path, error))?;
     check_owner_only(path, &metadata)
 }
 
@@ -432,8 +564,9 @@ fn check_owner_only(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
 
 #[cfg(not(unix))]
 fn check_owner_only(_path: &Path, _metadata: &std::fs::Metadata) -> Result<()> {
-    // Windows has no mode bits. The state directory inherits the user profile's access-control
-    // list, and each endpoint carries its own owner-only list.
+    // Windows has no mode bits. The runtime and state directories live under the user's own
+    // profile, and each endpoint carries its own owner-only access-control list; the Windows
+    // qualification pass adds an explicit protected access-control list here.
     Ok(())
 }
 
@@ -463,7 +596,6 @@ pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write as _;
 
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    create_owner_only_directory(directory)?;
     let temporary = directory.join(format!(".{}.tmp", crate::new_uuid()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -488,7 +620,50 @@ pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&temporary);
         return Err(IpcError::io("publish", path, error));
     }
-    Ok(())
+    // The file's own contents are on disk, but the rename that gave it its name is a change to the
+    // directory. Without this a crash can leave the name missing while the data is safe.
+    sync_directory(directory)
+}
+
+/// Writes a file owner-only, failing when it already exists.
+///
+/// This is the publication a racing caller must lose rather than win. `rename` always replaces, so
+/// it cannot answer "who got there first"; an exclusive create can.
+///
+/// # Errors
+///
+/// Returns [`IpcError::Io`] with [`std::io::ErrorKind::AlreadyExists`] when the file is present,
+/// and any other failure of the write.
+pub fn create_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(OWNER_ONLY_FILE_MODE);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| IpcError::io("create", path, error))?;
+    file.write_all(contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| IpcError::io("write", path, error))?;
+    drop(file);
+    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+/// Flushes a directory entry to disk after a file inside it is created or renamed.
+fn sync_directory(directory: &Path) -> Result<()> {
+    match std::fs::File::open(directory) {
+        Ok(handle) => handle
+            .sync_all()
+            .map_err(|error| IpcError::io("flush", directory, error)),
+        // Not every platform lets a directory be opened for synchronisation. Where it cannot be,
+        // the rename is still ordered by the filesystem's own rules.
+        Err(_) => Ok(()),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -565,7 +740,7 @@ mod tests {
     fn temporary_root(name: &str) -> PathBuf {
         let suffix = crate::new_uuid().to_string();
         let base = std::env::temp_dir().join(format!("kr-{name}-{}", &suffix[..6]));
-        create_owner_only_directory(&base).expect("temporary directory");
+        create_private_tree(&base, &base).expect("temporary directory");
         base
     }
 
@@ -573,7 +748,7 @@ mod tests {
     fn directories_are_created_owner_only() {
         let root = temporary_root("dirs");
         let nested = root.join("a").join("b");
-        create_owner_only_directory(&nested).expect("creates");
+        create_private_tree(&root, &nested).expect("creates");
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
@@ -590,9 +765,9 @@ mod tests {
 
         let root = temporary_root("widened");
         let target = root.join("run");
-        create_owner_only_directory(&target).expect("creates");
+        create_private_tree(&root, &target).expect("creates");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let error = create_owner_only_directory(&target).expect_err("refuses");
+        let error = create_private_tree(&root, &target).expect_err("refuses");
         assert!(matches!(error, IpcError::DirectoryNotOwnerOnly { .. }));
         std::fs::remove_dir_all(&root).ok();
     }
@@ -600,6 +775,7 @@ mod tests {
     #[test]
     fn publication_is_atomic_and_owner_only() {
         let root = temporary_root("publish");
+        create_private_tree(&root, &root.join("sessions")).expect("directory");
         let target = root.join("sessions").join("descriptor.kr");
         write_owner_only_file(&target, b"first").expect("writes");
         write_owner_only_file(&target, b"second").expect("replaces");
@@ -638,10 +814,69 @@ mod tests {
     }
 
     #[test]
+    fn an_ordinary_parent_directory_is_accepted() {
+        // The platform temporary directory is world-writable by design and the user cache
+        // directory is usually group-readable. Neither is KalaReach's to change.
+        let root = std::env::temp_dir().join(format!("kr-parent-{}", crate::new_uuid()));
+        let nested = root.join("run").join("ab12cd34");
+        create_private_tree(&root, &nested).expect("creates under an ordinary parent");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_symbolic_link_is_never_used_as_a_private_directory() {
+        let root = temporary_root("symlink");
+        let elsewhere = root.join("elsewhere");
+        create_private_tree(&root, &elsewhere).expect("creates");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("links");
+        let error = create_private_tree(&root, &link).expect_err("refuses");
+        assert!(matches!(error, IpcError::Io { .. }));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn one_caller_wins_the_environment_identity() {
+        let root = temporary_root("race");
+        let paths = HostPaths::new(root.join("r"), root.join("s"));
+        let first = paths.open_environment_id().expect("allocates");
+        // A second caller that would have generated its own identity must read the winner's.
+        let second = paths.open_environment_id().expect("reads");
+        assert_eq!(first, second);
+        // The file is created exclusively, so a second create attempt is refused rather than
+        // replacing the winner.
+        let error = create_new_owner_only_file(&paths.environment_id_file(), b"other")
+            .expect_err("refuses");
+        assert!(matches!(
+            error,
+            IpcError::Io { ref source, .. } if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_prefix_collision_is_refused_rather_than_shared() {
+        let root = temporary_root("collision");
+        let paths = HostPaths::new(root.join("r"), root.join("s"));
+        let mut first_bytes = [7_u8; 16];
+        first_bytes[15] = 1;
+        let mut second_bytes = first_bytes;
+        second_bytes[15] = 2;
+        let first = paths.environment(EnvironmentId::new(Uuid::from_bytes(first_bytes)));
+        let second = paths.environment(EnvironmentId::new(Uuid::from_bytes(second_bytes)));
+        assert_eq!(first.runtime_dir(), second.runtime_dir());
+        first.create().expect("claims");
+        let error = second.create().expect_err("refuses");
+        assert!(matches!(error, IpcError::EnvironmentPrefixCollision { .. }));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn endpoint_names_stay_inside_the_platform_limit() {
         let root = temporary_root("endpoints");
         let paths = HostPaths::new(root.join("run"), root.join("state"));
         let environment = paths.environment(EnvironmentId::new(Uuid::NIL));
+        environment.create().expect("directories");
         environment.controller_endpoint().expect("fits");
         environment.rendezvous_endpoint().expect("fits");
         environment

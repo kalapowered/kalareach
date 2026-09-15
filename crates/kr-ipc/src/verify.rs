@@ -49,6 +49,14 @@ pub enum VerificationError {
     /// The controller's generation token was refused.
     #[error("the controller generation was refused: {0:?}")]
     GenerationRefused(GenerationRefusal),
+    /// An identity was to be created but one already exists.
+    #[error("this environment already has a controller identity")]
+    IdentityAlreadyPresent,
+    /// An identity was expected and the secret store does not hold it.
+    #[error(
+        "this environment's controller identity is missing; every live worker holds its public key, so it cannot be replaced without closing them"
+    )]
+    IdentityMissing,
 }
 
 impl From<VerificationError> for IpcError {
@@ -299,21 +307,25 @@ pub struct ControllerIdentity {
 }
 
 impl ControllerIdentity {
-    /// Loads the environment's identity, generating one on first use.
+    /// Creates the environment's identity for the first time.
+    ///
+    /// This is a deliberate first-start step, taken under the singleton lock. It is separate from
+    /// [`ControllerIdentity::load`] because the two failures look identical from inside a process
+    /// and mean opposite things: an empty store on first start is normal, and an empty store on a
+    /// later start means the key is lost. Generating a fresh key in the second case would leave
+    /// every live worker holding a public key that no longer answers, and section C's rule that
+    /// rotation closes all live workers would have been broken silently.
     ///
     /// # Errors
     ///
-    /// Returns an error when the secret store cannot be read or written.
-    pub fn open(
+    /// Returns an error when an identity already exists, or when the store cannot be written.
+    pub fn initialise(
         store: &dyn SecretStore,
         environment_id: EnvironmentId,
     ) -> VerificationResult<Self> {
         let scope = environment_id.to_string();
-        if let Some(keys) = load_device_keys(store, &scope)? {
-            return Ok(Self {
-                keys,
-                environment_id,
-            });
+        if load_device_keys(store, &scope)?.is_some() {
+            return Err(VerificationError::IdentityAlreadyPresent);
         }
         let keys = DeviceKeys::generate()?;
         store_device_keys(store, &scope, &keys)?;
@@ -321,6 +333,48 @@ impl ControllerIdentity {
             keys,
             environment_id,
         })
+    }
+
+    /// Loads the environment's existing identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerificationError::IdentityMissing`] when no identity has been created, which is
+    /// a recovery condition rather than an invitation to make a new one.
+    pub fn load(
+        store: &dyn SecretStore,
+        environment_id: EnvironmentId,
+    ) -> VerificationResult<Self> {
+        let scope = environment_id.to_string();
+        let keys = load_device_keys(store, &scope)?.ok_or(VerificationError::IdentityMissing)?;
+        Ok(Self {
+            keys,
+            environment_id,
+        })
+    }
+
+    /// Loads the environment's identity, creating it only on a genuine first start.
+    ///
+    /// The caller states whether this host has ever initialised its identity. A host that has is
+    /// never given a fresh key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read or written, or when an identity that was
+    /// recorded as present is missing.
+    pub fn open(
+        store: &dyn SecretStore,
+        environment_id: EnvironmentId,
+        initialised_before: bool,
+    ) -> VerificationResult<Self> {
+        if initialised_before {
+            Self::load(store, environment_id)
+        } else {
+            match Self::initialise(store, environment_id) {
+                Err(VerificationError::IdentityAlreadyPresent) => Self::load(store, environment_id),
+                other => other,
+            }
+        }
     }
 
     /// Returns the public key a worker records at spawn.
@@ -563,16 +617,34 @@ mod tests {
     fn a_controller_identity_is_generated_once_and_then_loaded() {
         let store = MemoryStore::new();
         let environment = EnvironmentId::new(Uuid::from_bytes([5; 16]));
-        let first = ControllerIdentity::open(&store, environment).expect("generates");
-        let second = ControllerIdentity::open(&store, environment).expect("loads");
+        let first = ControllerIdentity::initialise(&store, environment).expect("generates");
+        let second = ControllerIdentity::load(&store, environment).expect("loads");
         assert_eq!(first.public_key(), second.public_key());
+        assert!(matches!(
+            ControllerIdentity::initialise(&store, environment),
+            Err(VerificationError::IdentityAlreadyPresent)
+        ));
+    }
+
+    #[test]
+    fn a_lost_identity_is_a_recovery_error_rather_than_a_silent_rotation() {
+        let store = MemoryStore::new();
+        let environment = EnvironmentId::new(Uuid::from_bytes([6; 16]));
+        assert!(matches!(
+            ControllerIdentity::load(&store, environment),
+            Err(VerificationError::IdentityMissing)
+        ));
+        assert!(matches!(
+            ControllerIdentity::open(&store, environment, true),
+            Err(VerificationError::IdentityMissing)
+        ));
     }
 
     #[test]
     fn a_generation_token_answers_the_workers_own_challenge() {
         let store = MemoryStore::new();
         let environment = EnvironmentId::new(Uuid::from_bytes([5; 16]));
-        let controller = ControllerIdentity::open(&store, environment).expect("generates");
+        let controller = ControllerIdentity::initialise(&store, environment).expect("generates");
         let acceptance = GenerationAcceptance {
             controller_public_key: *controller.public_key(),
             environment_id: environment,
@@ -590,7 +662,7 @@ mod tests {
     fn the_same_generation_is_accepted_again_after_a_fresh_challenge() {
         let store = MemoryStore::new();
         let environment = EnvironmentId::new(Uuid::from_bytes([5; 16]));
-        let controller = ControllerIdentity::open(&store, environment).expect("generates");
+        let controller = ControllerIdentity::initialise(&store, environment).expect("generates");
         let acceptance = GenerationAcceptance {
             controller_public_key: *controller.public_key(),
             environment_id: environment,
@@ -608,7 +680,7 @@ mod tests {
     fn a_lower_generation_is_refused() {
         let store = MemoryStore::new();
         let environment = EnvironmentId::new(Uuid::from_bytes([5; 16]));
-        let controller = ControllerIdentity::open(&store, environment).expect("generates");
+        let controller = ControllerIdentity::initialise(&store, environment).expect("generates");
         let acceptance = GenerationAcceptance {
             controller_public_key: *controller.public_key(),
             environment_id: environment,
@@ -631,7 +703,7 @@ mod tests {
     fn a_replayed_generation_token_is_refused() {
         let store = MemoryStore::new();
         let environment = EnvironmentId::new(Uuid::from_bytes([5; 16]));
-        let controller = ControllerIdentity::open(&store, environment).expect("generates");
+        let controller = ControllerIdentity::initialise(&store, environment).expect("generates");
         let acceptance = GenerationAcceptance {
             controller_public_key: *controller.public_key(),
             environment_id: environment,
@@ -655,9 +727,10 @@ mod tests {
     fn a_token_from_another_environment_key_is_refused() {
         let store = MemoryStore::new();
         let environment = EnvironmentId::new(Uuid::from_bytes([5; 16]));
-        let controller = ControllerIdentity::open(&store, environment).expect("generates");
+        let controller = ControllerIdentity::initialise(&store, environment).expect("generates");
         let other_store = MemoryStore::new();
-        let impostor = ControllerIdentity::open(&other_store, environment).expect("generates");
+        let impostor =
+            ControllerIdentity::initialise(&other_store, environment).expect("generates");
         let acceptance = GenerationAcceptance {
             controller_public_key: *controller.public_key(),
             environment_id: environment,
