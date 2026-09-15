@@ -17,6 +17,7 @@ name = "kr-plugin-sandbox"
 path = "src/bin/kr-plugin-sandbox.rs"
 
 [dependencies]
+cap-fs-ext.workspace = true
 cap-std.workspace = true
 hex.workspace = true
 kr-protocol.workspace = true
@@ -26,6 +27,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

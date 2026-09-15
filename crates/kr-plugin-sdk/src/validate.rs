@@ -12,8 +12,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, DirEntry};
+use cap_std::fs::{Dir, OpenOptions};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -462,11 +463,11 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                     return None;
                 }
             };
-            let name = entry.file_name();
-            let Some(name) = name.to_str().map(str::to_owned) else {
+            let name_os = entry.file_name();
+            let Some(name) = name_os.to_str().map(str::to_owned) else {
                 report.push(Finding::at(
                     FindingCode::NameNotUtf8,
-                    format!("{}/{}", prefix.join("/"), name.to_string_lossy()),
+                    format!("{}/{}", prefix.join("/"), name_os.to_string_lossy()),
                     "a package file name is valid UTF-8; a name that is not cannot be declared",
                 ));
                 continue;
@@ -475,7 +476,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
             segments.push(name);
             let relative = segments.join("/");
 
-            let metadata = match entry.metadata() {
+            let metadata = match current.symlink_metadata(&name_os) {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     report.push(Finding::at(
@@ -504,7 +505,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                     ));
                     continue;
                 }
-                match entry.open_dir() {
+                match current.open_dir(&name_os) {
                     Ok(child) => queue.push((child, segments)),
                     Err(error) => report.push(Finding::at(
                         FindingCode::DirectoryUnreadable,
@@ -553,7 +554,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
             } else {
                 MAX_PACKAGE_BYTES
             };
-            match read_bounded(&entry, limit) {
+            match read_bounded(&current, &name_os, limit) {
                 Ok(bytes) => {
                     if is_manifest_name(path.as_str()) {
                         manifests.insert(path.to_string(), bytes.clone());
@@ -681,7 +682,7 @@ fn manifest_text(
 /// non-regular file is refused, and so is a file with more than one name, because a second name is
 /// a way to make one file's bytes answer for two declared payloads. The read stops one byte past
 /// the limit rather than trusting the length reported before it started.
-fn read_bounded(entry: &DirEntry, limit: u64) -> Result<Vec<u8>, Finding> {
+fn read_bounded(directory: &Dir, name: &std::ffi::OsStr, limit: u64) -> Result<Vec<u8>, Finding> {
     use std::io::Read as _;
 
     let reject = |code: FindingCode, detail: String| Finding {
@@ -690,8 +691,18 @@ fn read_bounded(entry: &DirEntry, limit: u64) -> Result<Vec<u8>, Finding> {
         detail,
     };
 
-    let mut file = entry
-        .open()
+    // The open refuses a link and does not wait. `O_NOFOLLOW` stops a name replaced by a link from
+    // redirecting the read, and `O_NONBLOCK` stops one replaced by a named pipe from holding the
+    // validator open until somebody writes to it. The handle's own metadata then decides.
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = directory
+        .open_with(name, &options)
         .map_err(|error| reject(FindingCode::NotARegularFile, error.to_string()))?;
     let metadata = file
         .metadata()

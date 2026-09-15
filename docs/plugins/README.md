@@ -522,10 +522,15 @@ report the same code for the same defect.
 file and subdirectory is opened from the handle of the directory that holds it, so a link, an
 absolute path or a `..` cannot reach outside the package, and a directory replaced during the walk
 cannot redirect a read: the handle refers to the directory that was opened, not to the name it was
-opened by. It refuses a link, a device, a file with more than one name, and anything that grows past
-its limit while being read. The manifests are parsed from those same bytes rather than read again,
-so the digest a package is pinned by covers the document the validator looked at. It stops at the
-file count limit rather than walking a directory somebody made arbitrarily wide.
+opened by.
+
+Each file is opened without following a link and without waiting, so a name replaced by a link
+cannot redirect the read and one replaced by a named pipe cannot hold the validator open. The
+handle's own metadata decides what it is: a link, a device or a file with more than one name is
+refused, and so is anything that grows past its limit while being read. The manifests are parsed
+from those same bytes rather than read again, so the digest a package is pinned by covers the
+document the validator looked at. The walk stops at the file count limit rather than continuing
+through a directory somebody made arbitrarily wide.
 
 ## What a signature does not do
 

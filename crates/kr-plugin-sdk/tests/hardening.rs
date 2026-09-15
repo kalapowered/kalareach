@@ -92,7 +92,7 @@ fn a_symbolic_link_is_rejected_rather_than_followed() {
     std::os::unix::fs::symlink(&outside, package.join(MANIFEST_FILE)).expect("the link is made");
     let validated = validate_package_directory(&package);
     assert!(validated.report.has(FindingCode::NotARegularFile));
-    assert!(validated.package.is_none());
+    assert!(!validated.report.is_valid());
 }
 
 #[test]
@@ -124,4 +124,24 @@ fn a_repeated_member_is_reported_before_the_value_tree_loses_it() {
     let validated = validate_package_directory(&package);
     assert!(validated.report.has(FindingCode::DuplicateMember));
     assert!(validated.package.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_does_not_hold_the_validator_open() {
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let package = temporary.path().join("package");
+    write_valid_package(&package);
+
+    // A named pipe with no writer. An ordinary read-only open of one waits for a writer that never
+    // arrives; the validator's open does not wait, and the handle is refused as not a regular file.
+    let made = std::process::Command::new("mkfifo")
+        .arg(package.join("pipe.txt"))
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "the pipe was not created");
+
+    let validated = validate_package_directory(&package);
+    assert!(validated.report.has(FindingCode::NotARegularFile));
+    assert!(!validated.report.is_valid());
 }
