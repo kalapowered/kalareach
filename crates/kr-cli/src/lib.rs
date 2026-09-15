@@ -10,15 +10,19 @@
 //! | [`cli`] | The command surface: the commands, their short forms and the standard options |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
 //! | [`attach`] | Attaching a terminal, forwarding bytes, and the restoration guard |
-//! | [`terminal`] | Raw mode, terminal size and the saved modes the guard holds |
+//! | [`session`] | Driving one attachment's input, output and connection in a single loop |
+//! | [`terminal`] | Raw mode, terminal size and the saved state the guard holds |
+//! | [`platform`] | The one place this crate calls the operating system directly |
 //! | [`report`] | Text for people and the `--json` shapes |
 //! | [`error`] | The failures above, each with its own exit code |
 
 pub mod attach;
 pub mod cli;
 pub mod error;
+pub mod platform;
 pub mod report;
 pub mod resolve;
+pub mod session;
 pub mod terminal;
 
 pub use crate::error::{CliError, Result};

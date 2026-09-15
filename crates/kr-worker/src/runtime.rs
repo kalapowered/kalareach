@@ -144,7 +144,13 @@ impl SessionRuntime {
                     // The set of processes the session owns is built up while it runs. One that
                     // starts and ends between two closures would otherwise never be recorded.
                     session.observe_owned();
-                    session.poll_root_exit()
+                    // A desktop-bound session belongs to one login. When that login ends the
+                    // session ends with it, with the reason that says so.
+                    if session.desktop_lost() {
+                        session.begin_close(ClosureReason::DesktopLost).initiated
+                    } else {
+                        session.poll_root_exit()
+                    }
                 };
                 if initiated {
                     // A root shell that ended on its own goes through the same sequence a

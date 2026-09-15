@@ -11,7 +11,6 @@
 
 use std::io::Read as _;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 
 use kr_ipc::client::LocalClient;
 use kr_protocol::attachment::{
@@ -19,20 +18,28 @@ use kr_protocol::attachment::{
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::ids::{ActionId, AttachmentId, SessionEpoch, SessionId};
-use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
-use kr_protocol::local::ControlMessage;
+use kr_protocol::input::{InputAcquireParams, InputAcquireResult};
 use kr_protocol::method::Method;
-use kr_protocol::recovery::{EventStream, EventsSubscribeParams, OutputEvent};
-use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable};
+use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
+use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::Dimensions;
 use kr_protocol::worker::WorkerDescriptor;
-use rustix::termios::Termios;
 
 use crate::error::{CliError, Result};
 use crate::terminal::{ControllingTerminal, SavedModes};
 
 /// The byte that tells the guard the terminal has already been restored.
 pub const GUARD_RELEASE: u8 = b'R';
+
+/// The byte a guard sends once it is holding the terminal's state.
+pub const GUARD_READY: u8 = b'A';
+
+/// How long the attach process waits for its guard to report that it is armed.
+///
+/// The guard does two things before it answers: it ignores the background-write signal and it
+/// decodes the state it was handed. A guard that has not answered by now is not going to, and
+/// entering raw mode without one would leave a terminal nothing could restore.
+pub const GUARD_ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The out-of-process restoration guard.
 ///
@@ -48,8 +55,9 @@ pub struct RestorationGuard {
 impl RestorationGuard {
     /// Arms a guard for this terminal.
     ///
-    /// The guard is started before the terminal is touched and confirms that it is holding the
-    /// state before the caller changes anything.
+    /// The guard is started before the terminal is touched and **confirms** that it is holding the
+    /// state before this call returns. Returning before that confirmation would leave a window in
+    /// which the terminal was raw and nothing could put it back.
     ///
     /// # Errors
     ///
@@ -57,29 +65,56 @@ impl RestorationGuard {
     pub fn arm(
         program: &std::path::Path,
         terminal: &ControllingTerminal,
-        saved: &Termios,
+        saved: &SavedModes,
     ) -> Result<Self> {
         let (reader, writer) = std::io::pipe()
+            .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
+        let (mut ready_reader, ready_writer) = std::io::pipe()
             .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
         let handle = terminal
             .handle()
             .try_clone()
             .map_err(|error| CliError::Terminal(format!("duplicate the terminal: {error}")))?;
-        let modes = SavedModes::from_termios(saved);
         let mut command = detached(program);
         command
             .arg("--modes")
-            .arg(modes.encode())
+            .arg(saved.encode())
             .stdin(Stdio::from(reader))
             .stdout(Stdio::from(handle))
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(ready_writer));
         let child = command
             .spawn()
             .map_err(|error| CliError::Terminal(format!("start the restoration guard: {error}")))?;
-        Ok(Self {
+        let mut guard = Self {
             child,
             release: Some(writer),
-        })
+        };
+        // The readiness byte. A guard that never sends it is stopped rather than trusted, because
+        // the whole point of it is to be holding the state before the terminal changes.
+        let armed = std::thread::spawn(move || {
+            let mut answer = [0_u8; 1];
+            matches!(ready_reader.read(&mut answer), Ok(1) if answer[0] == GUARD_READY)
+        });
+        let deadline = std::time::Instant::now() + GUARD_ARM_TIMEOUT;
+        while !armed.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                let _ = guard.child.kill();
+                let _ = guard.child.wait();
+                return Err(CliError::Terminal(
+                    "the restoration guard did not report that it was holding the terminal"
+                        .to_owned(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !armed.join().unwrap_or(false) {
+            let _ = guard.child.kill();
+            let _ = guard.child.wait();
+            return Err(CliError::Terminal(
+                "the restoration guard could not hold the terminal".to_owned(),
+            ));
+        }
+        Ok(guard)
     }
 
     /// Releases the guard without it acting, after the caller has restored the terminal itself.
@@ -100,8 +135,8 @@ fn detached(program: &std::path::Path) -> Command {
 
     // The guard gets its own process group, so a signal aimed at this command's group — the one a
     // shell sends on Ctrl-C, or on the pipeline's exit — does not reach it. It keeps the
-    // controlling terminal, because restoring that terminal is its whole purpose; it handles the
-    // background-write signal itself rather than being stopped by it.
+    // controlling terminal, because restoring that terminal is its whole purpose; it ignores the
+    // background-write signal rather than being stopped by it.
     let mut command = Command::new(program);
     command.process_group(0);
     command
@@ -136,6 +171,7 @@ pub async fn attach(
     descriptor: &WorkerDescriptor,
     dimensions: Dimensions,
     claim_geometry: bool,
+    probe: bool,
 ) -> Result<Attachment> {
     let mut requested = CanonicalSet::new();
     requested.insert(AttachmentCapability::ObserveTerminal);
@@ -148,12 +184,18 @@ pub async fn attach(
         mode: AttachMode::Terminal,
         claim_geometry,
         dimensions: Nullable::some(dimensions),
-        terminal_profile_id: Nullable(std::env::var("TERM").ok()),
+        // The terminal's own declaration of what it is. `--no-probe` withholds it, and the session
+        // uses the conservative profile instead of one this terminal has not been asked to
+        // confirm.
+        terminal_profile_id: Nullable(probe.then(|| std::env::var("TERM").ok()).flatten()),
         requested,
     };
     let result: SessionAttachResult =
         call(client, Method::SessionAttach, target(descriptor), &params).await?;
     let attachment_id = result.attachment.attachment_id;
+    // Implicit acquisition, because this is the local operating-system path: the worker
+    // authenticated the caller by peer credentials. A network client cannot assert that, and the
+    // lease is taken here so the first keystroke does not have to wait for a second exchange.
     let lease: InputAcquireResult = call(
         client,
         Method::InputAcquire,
@@ -170,6 +212,34 @@ pub async fn attach(
         lease: Some(lease),
         result,
     })
+}
+
+/// Returns the guard executable that sits beside this one.
+#[must_use]
+pub fn guard_program() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("kr-attach-guard")))
+        .unwrap_or_else(|| std::path::PathBuf::from("kr-attach-guard"))
+}
+
+/// Detaches an attachment of a session, named explicitly.
+///
+/// # Errors
+///
+/// Returns the host's refusal, or a transport failure.
+pub async fn detach_attachment(
+    client: &mut LocalClient,
+    descriptor: &WorkerDescriptor,
+    attachment_id: AttachmentId,
+) -> Result<kr_protocol::attachment::SessionDetachResult> {
+    call(
+        client,
+        Method::SessionDetach,
+        target(descriptor),
+        &SessionDetachParams { attachment_id },
+    )
+    .await
 }
 
 /// Subscribes an attachment to the session's output.
@@ -194,79 +264,6 @@ pub async fn subscribe(
     };
     let outcome = client.request(Method::EventsSubscribe, &params).await?;
     outcome.map(|_| ()).map_err(CliError::Refused)
-}
-
-/// Detaches an attachment.
-///
-/// # Errors
-///
-/// Returns the host's refusal, or a transport failure.
-pub async fn detach(
-    client: &mut LocalClient,
-    descriptor: &WorkerDescriptor,
-    attachment_id: AttachmentId,
-) -> Result<()> {
-    let _: kr_protocol::attachment::SessionDetachResult = call(
-        client,
-        Method::SessionDetach,
-        target(descriptor),
-        &SessionDetachParams { attachment_id },
-    )
-    .await?;
-    Ok(())
-}
-
-/// Forwards one batch of input bytes.
-///
-/// # Errors
-///
-/// Returns the host's refusal, or a transport failure.
-pub async fn write_input(
-    client: &mut LocalClient,
-    session_id: SessionId,
-    attachment_id: AttachmentId,
-    epoch: kr_protocol::ids::InputLeaseEpoch,
-    sequence: u64,
-    bytes: Vec<u8>,
-) -> Result<()> {
-    let params = InputWriteParams {
-        session_id,
-        attachment_id,
-        epoch,
-        sequence: kr_protocol::ids::InputSequence::new(sequence),
-        bytes: Bytes::new(bytes),
-    };
-    let outcome = client.request(Method::InputWrite, &params).await?;
-    outcome.map(|_| ()).map_err(CliError::Refused)
-}
-
-/// Reads output notifications and writes them to the terminal, in order.
-///
-/// Nothing here interprets the bytes. They came from the application and they go to the terminal
-/// exactly as they are.
-pub async fn pump_output(client: &mut LocalClient, terminal: Arc<std::fs::File>) -> Result<()> {
-    use std::io::Write as _;
-
-    loop {
-        let message = match client.recv().await {
-            Ok(message) => message,
-            Err(kr_ipc::IpcError::PeerClosed) => return Ok(()),
-            Err(error) => return Err(CliError::Ipc(error)),
-        };
-        let ControlMessage::Notification(notification) = message else {
-            continue;
-        };
-        if notification.event_type.as_str() == "session.output" {
-            let Ok(event) = notification.payload.to_typed::<OutputEvent>() else {
-                continue;
-            };
-            let mut handle = terminal.as_ref();
-            if handle.write_all(event.bytes.as_slice()).is_err() {
-                return Ok(());
-            }
-            let _ = handle.flush();
-        }
-    }
 }
 
 /// Reads the terminal in a blocking thread and hands batches to the caller.

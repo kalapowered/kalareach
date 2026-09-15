@@ -255,6 +255,28 @@ impl Session {
         }
     }
 
+    /// Returns whether the login session a desktop-bound worker was bound to has ended.
+    ///
+    /// A headless worker is bound to nothing and answers false: outliving a logout is what that
+    /// profile is for. A desktop-bound one is bound to a login generation, and a generation that is
+    /// gone means the desktop this session belongs to is gone with it.
+    #[must_use]
+    pub fn desktop_lost(&self) -> bool {
+        if self.config.worker_profile != WorkerProfile::DesktopBound {
+            return false;
+        }
+        let Some(bound) = self.config.desktop.login_generation.as_ref() else {
+            return false;
+        };
+        let current = crate::environment::desktop_binding();
+        // A binding this host can no longer read, or one that now names a different login, is a
+        // desktop that has ended. A reading that agrees is a desktop that has not.
+        current
+            .login_generation
+            .as_ref()
+            .is_none_or(|generation| generation.get() != bound.get())
+    }
+
     /// Returns what the session owns, once its shell has started.
     #[must_use]
     pub const fn owned(&self) -> Option<&OwnedProcesses> {

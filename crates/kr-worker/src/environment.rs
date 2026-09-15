@@ -19,6 +19,12 @@ pub const COLORTERM: &str = "truecolor";
 /// The terminal program every KalaReach session declares.
 pub const TERM_PROGRAM: &str = "KalaReach";
 
+/// The variable that names the session a command is running inside.
+///
+/// It identifies a candidate session, never an authority: the host validates the caller's local
+/// peer and its session binding before it accepts anything quoted from here.
+pub const SESSION_VARIABLE: &str = "KR_SESSION";
+
 /// The prefix reserved for KalaReach's own bootstrap values.
 ///
 /// A creator's snapshot cannot set one of these. They come from the worker or not at all.
@@ -89,6 +95,74 @@ impl LaunchEnvironment {
 pub struct ExecutionContext {
     /// Values the selected broker supplies, such as `DISPLAY` or `XDG_RUNTIME_DIR`.
     pub variables: BTreeMap<String, String>,
+    /// The login session a desktop-bound worker is tied to.
+    pub desktop: Option<kr_protocol::identity::DesktopBinding>,
+}
+
+/// The variables a desktop context supplies, in the order a session needs them.
+///
+/// A desktop-bound session needs the display and the session bus to reach the desktop it belongs
+/// to. A headless one has none of them, and passing a stale one through from a creator's snapshot
+/// would point the session at a desktop that is not there.
+pub const DESKTOP_VARIABLES: &[&str] = &[
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_ID",
+    "XDG_SESSION_TYPE",
+];
+
+impl ExecutionContext {
+    /// Resolves the context a worker of this profile runs in.
+    ///
+    /// A desktop-bound worker takes the desktop values from the environment this process was
+    /// started in, which is the login session the service manager placed it in. A headless worker
+    /// takes none of them: it must keep working after that login session ends, and a session that
+    /// carried a dead display would fail at the first application that used it.
+    #[must_use]
+    pub fn resolve(profile: kr_protocol::identity::WorkerProfile) -> Self {
+        let mut variables = BTreeMap::new();
+        if profile == kr_protocol::identity::WorkerProfile::DesktopBound {
+            for name in DESKTOP_VARIABLES {
+                if let Ok(value) = std::env::var(name) {
+                    variables.insert((*name).to_owned(), value);
+                }
+            }
+        }
+        Self {
+            desktop: (profile == kr_protocol::identity::WorkerProfile::DesktopBound)
+                .then(desktop_binding),
+            variables,
+        }
+    }
+}
+
+/// Reads the login session a desktop-bound worker is tied to.
+///
+/// The generation is what makes the binding checkable later: a session identifier that is reused
+/// after a logout names a different login, and a worker that compared only the identifier would
+/// keep running against a desktop that had gone.
+#[must_use]
+pub fn desktop_binding() -> kr_protocol::identity::DesktopBinding {
+    let named = std::env::var("XDG_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("SECURITYSESSIONID").ok());
+    let generation = named.as_deref().and_then(|value| {
+        u64::from_str_radix(value.trim().trim_start_matches("0x"), 16)
+            .ok()
+            .or_else(|| value.trim().parse::<u64>().ok())
+    });
+    kr_protocol::identity::DesktopBinding {
+        desktop_session_id: kr_protocol::scalars::Nullable(named.and_then(|value| {
+            kr_protocol::ids::DesktopSessionId::new(value.trim().to_owned()).ok()
+        })),
+        login_generation: kr_protocol::scalars::Nullable(
+            generation.map(kr_protocol::scalars::U64::new),
+        ),
+    }
 }
 
 /// Builds the environment for one root shell.
@@ -102,6 +176,7 @@ pub fn build(
     context: &ExecutionContext,
     shell_path: &str,
     release: &str,
+    session_id: kr_protocol::ids::SessionId,
 ) -> LaunchEnvironment {
     let mut variables = BTreeMap::new();
     let mut removed = Vec::new();
@@ -157,6 +232,11 @@ pub fn build(
     // A child invocation of this path is not a second active root integration; `SHELL` names the
     // executable that was actually launched.
     variables.insert("SHELL".to_owned(), shell_path.to_owned());
+    // The session a command inside this shell is running in. It names a candidate, and it is not a
+    // credential: a command that quotes it still reaches the host over an authenticated local
+    // socket, and the host checks the caller before it acts. Setting it is what lets `kr close`
+    // and `kr status` mean "this one" without being told.
+    variables.insert(SESSION_VARIABLE.to_owned(), session_id.to_string());
 
     removed.sort_unstable();
     removed.dedup();
@@ -187,6 +267,11 @@ fn is_creator_terminal(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The session these tests build an environment for.
+    fn test_session() -> kr_protocol::ids::SessionId {
+        kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]))
+    }
+
     fn snapshot(pairs: &[(&str, &str)]) -> Vec<EnvironmentVariable> {
         pairs
             .iter()
@@ -212,6 +297,7 @@ mod tests {
             &ExecutionContext::default(),
             "/bin/zsh",
             "0.1.0",
+            test_session(),
         );
         assert!(!built.variables.contains_key("ITERM_SESSION_ID"));
         assert!(!built.variables.contains_key("ITERM_PROFILE"));
@@ -251,6 +337,7 @@ mod tests {
             &ExecutionContext::default(),
             "/bin/zsh",
             "0.1.0",
+            test_session(),
         );
         assert!(built.variables.contains_key("SSH_CONNECTION"));
         assert!(built.variables.contains_key("SSH_CLIENT"));
@@ -270,6 +357,7 @@ mod tests {
             &context,
             "/bin/zsh",
             "0.1.0",
+            test_session(),
         );
         assert_eq!(
             built.variables.get("PATH").map(String::as_str),
@@ -289,6 +377,7 @@ mod tests {
             &ExecutionContext::default(),
             "/bin/zsh",
             "0.1.0",
+            test_session(),
         );
         assert!(!built.variables.contains_key("KR_SESSION_TOKEN"));
         assert!(built.removed.iter().any(|name| name == "KR_SESSION_TOKEN"));

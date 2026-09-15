@@ -603,6 +603,36 @@ pub fn current_uid() -> u32 {
     0
 }
 
+/// Reads the environment identity a runtime or state directory records.
+///
+/// Every directory this host creates for an environment carries the complete identity, because an
+/// eight-character prefix is a directory name rather than a name that is unique. A directory whose
+/// marker is missing or unreadable is not an environment.
+///
+/// # Errors
+///
+/// Returns an error when the marker is missing or does not hold an identity.
+pub fn read_environment_marker(directory: &Path) -> Result<EnvironmentId> {
+    let path = directory.join(ENVIRONMENT_MARKER);
+    let bytes = read_owner_only_file(&path, MAX_ENVIRONMENT_ID_LEN)?.ok_or_else(|| {
+        IpcError::IdentityUnavailable {
+            what: "environment identity",
+            detail: format!("{}: no marker", path.display()),
+        }
+    })?;
+    let text = String::from_utf8(bytes).map_err(|_| IpcError::IdentityUnavailable {
+        what: "environment identity",
+        detail: format!("{}: the marker is not text", path.display()),
+    })?;
+    text.trim()
+        .parse::<Uuid>()
+        .map(EnvironmentId::new)
+        .map_err(|error| IpcError::IdentityUnavailable {
+            what: "environment identity",
+            detail: format!("{}: {error}", path.display()),
+        })
+}
+
 /// Reads an installation's recorded environment identity, when one exists.
 ///
 /// # Errors

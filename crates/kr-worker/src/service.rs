@@ -1134,9 +1134,23 @@ impl WorkerService {
                 let params: SessionAttachParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)
             }
+            // An attachment of this session, not only one this connection made. Every attachment
+            // of a local session belongs to the same operating-system user, whom the listener has
+            // already authenticated, and `kr detach` from another window is the ordinary way to
+            // end an attachment whose own terminal has gone. An identifier that names no
+            // attachment of this session is still refused.
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(&mutation.params)?;
-                Self::check_attachment(state, params.attachment_id)
+                if session
+                    .attachment_capabilities(params.attachment_id)
+                    .is_some()
+                {
+                    Ok(())
+                } else {
+                    Err(WorkerError::UnknownAttachment {
+                        attachment: params.attachment_id.to_string(),
+                    })
+                }
             }
             Method::SessionClose => {
                 let params: kr_protocol::session::SessionCloseParams = parse(&mutation.params)?;

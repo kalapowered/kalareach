@@ -405,9 +405,12 @@ impl WorkerSupervisor for DetachedSupervisor {
 fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
     use std::os::unix::process::CommandExt as _;
 
-    // The worker gets its own process group and no inherited terminal, so nothing aimed at this
-    // daemon reaches it and it is reparented to init when this daemon exits. It is the fallback
-    // for a host with no service manager to ask; where one exists, that manager owns the worker.
+    // The worker gets its own process group here, and makes itself a session leader as soon as it
+    // starts, which is what actually leaves this daemon's session and controlling terminal. Doing
+    // the second half in the worker keeps it out of the child-setup path, where the only way to
+    // call `setsid` is one this codebase does not allow. It is reparented to init when this daemon
+    // exits. This is the fallback for a host with no service manager to ask; where one exists,
+    // that manager owns the worker.
     let mut command = std::process::Command::new(program);
     command.process_group(0);
     command.args(arguments);
@@ -423,9 +426,17 @@ fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
 
 #[cfg(not(unix))]
 fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
-    // Windows workers are explicitly outside the control daemon's kill-on-close Job Object; each
-    // worker owns its own per-session Job.
+    use std::os::windows::process::CommandExt as _;
+
+    // A worker must outlive this daemon. A process started by a daemon that is itself inside a
+    // job object with kill-on-close would be killed with it, so the worker breaks away from that
+    // job and is given its own console-free process group.
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+
     let mut command = std::process::Command::new(program);
+    command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     command.args(arguments);
     command
         .stdin(std::process::Stdio::null())

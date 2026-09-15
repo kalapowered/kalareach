@@ -79,11 +79,60 @@ pub struct KnownEnvironment {
 ///
 /// Returns an error when the state directory cannot be read.
 pub fn environments(paths: &HostPaths) -> Result<Vec<KnownEnvironment>> {
-    let environment_id = paths.open_environment_id()?;
-    Ok(vec![KnownEnvironment {
-        environment_id,
-        paths: paths.environment(environment_id),
-    }])
+    // This installation's own environment always counts, whether or not it has run yet. Every
+    // other one is a directory this host created and left a complete identity in; a directory
+    // whose marker cannot be read is not an environment this command will act on.
+    let mut found = vec![{
+        let environment_id = paths.open_environment_id()?;
+        KnownEnvironment {
+            environment_id,
+            paths: paths.environment(environment_id),
+        }
+    }];
+    if let Ok(entries) = std::fs::read_dir(paths.state_root().join("environments")) {
+        for entry in entries.flatten() {
+            let Ok(environment_id) = kr_ipc::paths::read_environment_marker(&entry.path()) else {
+                continue;
+            };
+            if found
+                .iter()
+                .any(|known| known.environment_id == environment_id)
+            {
+                continue;
+            }
+            found.push(KnownEnvironment {
+                environment_id,
+                paths: paths.environment(environment_id),
+            });
+        }
+    }
+    found.sort_by_key(|known| known.environment_id.to_string());
+    Ok(found)
+}
+
+/// Returns the environment a command acts in.
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] when the text is not an environment identifier, and
+/// [`CliError::HostUnavailable`] when this installation has no such environment.
+pub fn select(paths: &HostPaths, named: Option<&str>) -> Result<KnownEnvironment> {
+    let known = environments(paths)?;
+    let Some(text) = named else {
+        return known
+            .into_iter()
+            .next()
+            .ok_or_else(|| CliError::HostUnavailable("this host has no environment".to_owned()));
+    };
+    let wanted: EnvironmentId = text
+        .parse()
+        .map_err(|_| CliError::Usage(format!("{text} is not an environment identifier")))?;
+    known
+        .into_iter()
+        .find(|known| known.environment_id == wanted)
+        // A selector that names an environment this host does not have is refused rather than
+        // quietly answered by the default one.
+        .ok_or_else(|| CliError::HostUnavailable(format!("this host has no environment {wanted}")))
 }
 
 /// Finds the descriptor a selector names.

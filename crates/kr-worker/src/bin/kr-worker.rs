@@ -94,6 +94,11 @@ fn main() -> ExitCode {
 }
 
 async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
+    // A worker's lifetime must not depend on whatever started it. Becoming a session leader is
+    // what detaches it: it leaves the launcher's session and its controlling terminal, so nothing
+    // aimed at that terminal or that session reaches this process or the shell it will start.
+    // A worker a service manager already placed in its own session is one already, and says so.
+    detach_from_the_launcher();
     let session_id = SessionId::new(arguments.session);
     let environment_id = EnvironmentId::new(arguments.environment);
     let paths = HostPaths::new(&arguments.runtime_dir, &arguments.state_dir);
@@ -245,12 +250,28 @@ fn session_config(
     _endpoint: &Endpoint,
 ) -> SessionConfig {
     let create: &SessionCreateParams = &specification.create;
-    let shell_path = create.shell.as_ref().cloned().unwrap_or_else(default_shell);
+    // The shell the request named, or the one this host is configured to use, or the platform's
+    // own. Nothing is substituted silently: the session reports the executable it launched.
+    let shell_path = create
+        .shell
+        .as_ref()
+        .cloned()
+        .or_else(configured_shell)
+        .unwrap_or_else(default_shell);
+    // The context a worker of this profile runs in, resolved from the login session the service
+    // manager placed it in. A headless worker takes none of it, because it must outlive that
+    // login session.
+    let context = ExecutionContext::resolve(create.worker_profile);
+    let desktop = context
+        .desktop
+        .clone()
+        .unwrap_or_else(kr_protocol::identity::DesktopBinding::none);
     let launch_environment = build_environment(
         &create.environment_snapshot,
-        &ExecutionContext::default(),
+        &context,
         &shell_path,
         &specification.release,
+        specification.session_id,
     );
     let dimensions = create
         .dimensions
@@ -275,7 +296,7 @@ fn session_config(
         },
         shell_mode: create.shell_mode,
         worker_profile: create.worker_profile,
-        desktop: kr_protocol::identity::DesktopBinding::none(),
+        desktop,
         dimensions,
         journal_path: Some(environment.journal_database(specification.session_id)),
         spool_directory: Some(environment.session_spool(specification.session_id)),
@@ -289,26 +310,73 @@ fn session_config(
 /// A `native_compat` session runs the selected stock shell as an interactive shell. It is never a
 /// non-interactive script invocation turned interactive, and it is never a silently substituted
 /// binary: this is the executable the create request named, run the way an interactive login does.
+///
+/// The arguments belong to the shell, not to the platform. A PowerShell given `-l -i` would treat
+/// them as a script path and a parameter and fail; a Bourne-family shell given `-NoLogo` would do
+/// the same in reverse.
 fn interactive_arguments(shell_path: &str, _presentation: Presentation) -> Vec<String> {
     let name = std::path::Path::new(shell_path)
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or(shell_path);
+        .unwrap_or(shell_path)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
     match name {
         "fish" => vec!["--interactive".to_owned()],
-        "pwsh" | "powershell" => vec!["-NoLogo".to_owned()],
+        "pwsh" | "powershell" => vec!["-NoLogo".to_owned(), "-NoExit".to_owned()],
+        "cmd" => vec!["/K".to_owned()],
+        // A login shell reads the profile that sets the user's own path and prompt, which is what
+        // makes the first prompt look like the one they get anywhere else.
         _ => vec!["-l".to_owned(), "-i".to_owned()],
     }
 }
 
+/// The shell this host is configured to launch when a request names none.
+///
+/// The operating system's own record of the user's shell is what a login uses, so it is what a
+/// session uses too. A value that names nothing runnable is ignored rather than launched.
+fn configured_shell() -> Option<String> {
+    let configured = std::env::var("SHELL").ok()?;
+    let configured = configured.trim();
+    (!configured.is_empty() && std::path::Path::new(configured).is_file())
+        .then(|| configured.to_owned())
+}
+
+/// The shell a platform falls back to when nothing else names one.
 fn default_shell() -> String {
-    if cfg!(target_os = "macos") {
+    #[cfg(target_vendor = "apple")]
+    {
         "/bin/zsh".to_owned()
-    } else {
+    }
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    {
         "/bin/bash".to_owned()
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no `/bin`. PowerShell is the shell a Windows user gets, and `cmd` is the
+        // fallback when it is not installed.
+        std::env::var("ComSpec").unwrap_or_else(|_| "powershell.exe".to_owned())
     }
 }
 
 fn build_id() -> BuildId {
     BuildId::new(format!("kr-worker/{RELEASE}")).expect("the build identifier is well formed")
 }
+
+/// Leaves the session and controlling terminal of whatever started this worker.
+///
+/// `setsid` fails when the caller already leads a process group, which is exactly the case when a
+/// service manager has already put this worker in its own session. That failure means the goal is
+/// already met, so it is not one.
+#[cfg(unix)]
+fn detach_from_the_launcher() {
+    let _ = rustix::process::setsid();
+}
+
+/// Leaves the session of whatever started this worker.
+///
+/// Windows has no sessions to leave. A worker is kept out of the control daemon's job object by
+/// the way the daemon starts it, which is where that decision belongs.
+#[cfg(not(unix))]
+const fn detach_from_the_launcher() {}

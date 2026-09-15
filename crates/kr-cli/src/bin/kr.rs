@@ -1,13 +1,12 @@
 //! The `kr` command line.
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::Parser as _;
-use kr_cli::attach::{Attachment, RestorationGuard};
 use kr_cli::cli::{Cli, Command};
 use kr_cli::error::{CliError, Result};
 use kr_cli::resolve::{SessionSelector, find, open_controller, open_worker};
+use kr_cli::session::AttachOptions;
 use kr_cli::terminal::ControllingTerminal;
 use kr_cli::{build_id, report};
 use kr_ipc::paths::HostPaths;
@@ -17,12 +16,19 @@ use kr_protocol::ids::{ActionId, EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{
-    Dimensions, SessionCloseParams, SessionCloseResult, SessionCreateParams, SessionCreateResult,
-    SessionListParams, SessionListResult, SessionReadParams, SessionReadResult, ShellMode,
+    Dimensions, Presentation, SessionCloseParams, SessionCloseResult, SessionCreateParams,
+    SessionCreateResult, SessionListParams, SessionListResult, SessionReadParams,
+    SessionReadResult, ShellMode,
 };
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Whether the caller asked for machine-readable output has to be known before the arguments
+    // parse, because a usage mistake is one of the things a script has to be able to read.
+    let json = std::env::args().any(|argument| argument == "--json");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return usage(&error, json),
+    };
     let json = cli.json;
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -38,11 +44,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report::failure(&error))
-                        .unwrap_or_else(|_| "{}".to_owned())
-                );
+                print_json(&report::failure(&error));
             } else {
                 eprintln!("kr: {error}");
             }
@@ -51,10 +53,24 @@ fn main() -> ExitCode {
     }
 }
 
+/// Reports a usage mistake, in the form the caller asked for.
+fn usage(error: &clap::Error, json: bool) -> ExitCode {
+    if error.use_stderr() {
+        if json {
+            let failure = CliError::Usage(error.render().to_string().trim().to_owned());
+            print_json(&report::failure(&failure));
+            return ExitCode::from(failure.exit_code());
+        }
+        eprint!("{}", error.render());
+        return ExitCode::from(2);
+    }
+    // `--help` and `--version` are not failures.
+    print!("{}", error.render());
+    ExitCode::SUCCESS
+}
+
 async fn run(cli: Cli) -> Result<()> {
     let paths = HostPaths::discover()?;
-    let environment_id = paths.open_environment_id()?;
-    let environment = paths.environment(environment_id);
     match cli.command {
         Command::New(arguments) => {
             let presentation = arguments.presentation.resolve(stdio_is_terminal())?;
@@ -64,19 +80,23 @@ async fn run(cli: Cli) -> Result<()> {
                     arguments.shell_mode
                 )));
             }
+            // The environment the session is created in is the one the caller named, resolved
+            // before anything connects. A selector that is ignored would create the session
+            // somewhere else and say nothing about it.
+            let environment = kr_cli::resolve::select(&paths, arguments.environment.as_deref())?;
             let dimensions = match presentation {
-                kr_protocol::session::Presentation::Attach => {
-                    // The creating terminal and its size are registered before the shell starts, so
-                    // the first prompt is drawn at the real geometry.
+                Presentation::Attach => {
+                    // The creating terminal's size is registered before the shell starts, so the
+                    // first prompt is drawn at the real geometry rather than redrawn at it.
                     ControllingTerminal::open()
                         .ok()
                         .and_then(|terminal| terminal.size().ok())
-                        .map(|size| Dimensions::new(u64::from(size.ws_col), u64::from(size.ws_row)))
+                        .map(|size| Dimensions::new(u64::from(size.columns), u64::from(size.rows)))
                 }
-                _ => None,
+                Presentation::Terminal | Presentation::Invisible => None,
             };
             let params = SessionCreateParams {
-                environment_id,
+                environment_id: environment.environment_id,
                 presentation,
                 shell: Nullable(arguments.shell),
                 shell_mode: ShellMode::NativeCompat,
@@ -86,21 +106,41 @@ async fn run(cli: Cli) -> Result<()> {
                         .map(|path| path.display().to_string())
                 })),
                 dimensions: Nullable(dimensions),
-                worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                worker_profile: worker_profile(presentation),
                 environment_snapshot: snapshot(),
             };
-            let mut client = open_controller(&environment, build_id()).await?;
+            let mut client = open_controller(&environment.paths, build_id()).await?;
             let outcome = client
                 .mutate(
                     Method::SessionCreate,
                     ActionId::new(kr_ipc::new_uuid()),
-                    environment_target(environment_id),
+                    ActionTarget::environment(environment.environment_id),
                     &params,
                 )
                 .await?;
             let created: SessionCreateResult = typed(outcome)?;
+            drop(client);
+
+            // The session exists. Presenting it is a separate step, and a presentation that fails
+            // never produces a second session: the failure is reported against the one that was
+            // created.
+            let presented = present(&paths, &created, presentation).await;
             if cli.json {
-                print_json(&report::session(&created.session));
+                let mut document = report::session(&created.session);
+                if let Some(object) = document.as_object_mut() {
+                    object.insert(
+                        "presentation".to_owned(),
+                        serde_json::json!(presentation.as_str()),
+                    );
+                    object.insert(
+                        "presentation_error".to_owned(),
+                        match presented.as_ref() {
+                            Ok(()) => serde_json::Value::Null,
+                            Err(error) => serde_json::json!(error.to_string()),
+                        },
+                    );
+                }
+                print_json(&document);
             } else {
                 println!(
                     "created session {} ({})",
@@ -111,79 +151,124 @@ async fn run(cli: Cli) -> Result<()> {
                     created.session.shell_mode.as_str(),
                     created.session.shell_path
                 );
-                if let Some(error) = created.presentation_error.as_ref() {
+                if let Err(error) = presented.as_ref() {
                     eprintln!("kr: the session was created; its terminal was not opened: {error}");
                 }
             }
-            Ok(())
+            presented
         }
         Command::Attach(arguments) => {
             let selector = SessionSelector::parse(&arguments.session)?;
             let wanted = parse_environment(arguments.environment.as_deref())?;
             let (_, descriptor) = find(&paths, &selector, wanted)?;
-            attach_session(&descriptor, arguments.take_geometry).await
+            let (outcome, session_id) = kr_cli::session::run(
+                &descriptor,
+                AttachOptions {
+                    take_geometry: arguments.take_geometry,
+                    no_probe: arguments.no_probe,
+                },
+            )
+            .await?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "ok": !outcome.is_failure(),
+                    "session_id": session_id.to_string(),
+                    "outcome": outcome.detail(),
+                }));
+            } else {
+                println!("{}", outcome.detail());
+            }
+            outcome.into_error().map_or(Ok(()), Err)
         }
         Command::Detach(arguments) => {
-            let attachment = arguments
-                .attachment
-                .as_deref()
-                .ok_or(CliError::NotInSession)?;
-            let selector = match arguments.session.as_deref() {
-                Some(text) => SessionSelector::parse(text)?,
-                None => SessionSelector::Identifier(
-                    kr_cli::resolve::current_session().ok_or(CliError::NotInSession)?,
-                ),
-            };
+            let selector = session_selector(arguments.session.as_deref())?;
             let (_, descriptor) = find(&paths, &selector, None)?;
-            let attachment_id = attachment
-                .parse()
-                .map_err(|_| CliError::Usage(format!("{attachment} is not an attachment")))?;
             let mut client = open_worker(&descriptor, build_id()).await?;
-            kr_cli::attach::detach(&mut client, &descriptor, attachment_id).await?;
+            let attachment_id = match arguments.attachment.as_deref() {
+                Some(text) => text
+                    .parse()
+                    .map_err(|_| CliError::Usage(format!("{text} is not an attachment")))?,
+                // Nothing was named, so the session is asked what is attached. One terminal
+                // attachment is unambiguous; more than one is not, and the command says which
+                // rather than guessing.
+                None => sole_terminal_attachment(&mut client, descriptor.session_id).await?,
+            };
+            let result =
+                kr_cli::attach::detach_attachment(&mut client, &descriptor, attachment_id).await?;
             if cli.json {
-                print_json(&serde_json::json!({ "ok": true, "detached": attachment }));
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "session_id": descriptor.session_id.to_string(),
+                    "detached": attachment_id.to_string(),
+                    "remaining": result.remaining.get(),
+                }));
             } else {
-                println!("detached {attachment}");
+                println!(
+                    "detached {attachment_id}; {} attachment(s) remain",
+                    result.remaining
+                );
             }
             Ok(())
         }
         Command::Close(arguments) => {
             let selector = session_selector(arguments.session.as_deref())?;
             let wanted = parse_environment(arguments.environment.as_deref())?;
+            let environment = kr_cli::resolve::select(&paths, arguments.environment.as_deref())?;
             // Closing goes through the control daemon where one is running, because the daemon
             // owns the registry and writes the closure record. With no daemon the command still
             // works: it closes the worker directly, and the daemon reconciles the record when it
             // comes back.
-            let session_id = match find(&paths, &selector, wanted) {
-                Ok((_, descriptor)) => Some(descriptor.session_id),
-                Err(CliError::UnknownSession(_)) => resolve_identifier(&selector).ok(),
+            let located = match find(&paths, &selector, wanted) {
+                Ok((known, descriptor)) => Some((known, descriptor)),
+                Err(CliError::UnknownSession(_)) => None,
                 Err(error) => return Err(error),
             };
-            let session_id =
-                session_id.ok_or_else(|| CliError::UnknownSession(selector.to_string()))?;
-            let closed = match open_controller(&environment, build_id()).await {
-                Ok(mut client) => {
-                    let outcome = client
-                        .mutate(
-                            Method::SessionClose,
-                            ActionId::new(kr_ipc::new_uuid()),
-                            session_target(environment_id, session_id),
-                            &SessionCloseParams { session_id },
-                        )
-                        .await?;
-                    typed::<SessionCloseResult>(outcome)?
+            let closed = match located {
+                Some((known, descriptor)) => {
+                    match open_controller(&known.paths, build_id()).await {
+                        Ok(mut client) => {
+                            let outcome = client
+                                .mutate(
+                                    Method::SessionClose,
+                                    ActionId::new(kr_ipc::new_uuid()),
+                                    session_target(known.environment_id, descriptor.session_id),
+                                    &SessionCloseParams {
+                                        session_id: descriptor.session_id,
+                                    },
+                                )
+                                .await?;
+                            typed::<SessionCloseResult>(outcome)?
+                        }
+                        Err(_) => {
+                            let mut client = open_worker(&descriptor, build_id()).await?;
+                            let outcome = client
+                                .mutate(
+                                    Method::SessionClose,
+                                    ActionId::new(kr_ipc::new_uuid()),
+                                    session_target(
+                                        descriptor.environment_id,
+                                        descriptor.session_id,
+                                    ),
+                                    &SessionCloseParams {
+                                        session_id: descriptor.session_id,
+                                    },
+                                )
+                                .await?;
+                            typed::<SessionCloseResult>(outcome)?
+                        }
+                    }
                 }
-                Err(_) => {
-                    let (_, descriptor) = find(&paths, &selector, wanted)?;
-                    let mut client = open_worker(&descriptor, build_id()).await?;
+                // No descriptor, so the session is closed or was never here. The daemon knows
+                // which, and it resolves a display number through the reservations it retains.
+                None => {
+                    let mut client = open_controller(&environment.paths, build_id()).await?;
+                    let session_id = resolve_closed(&mut client, &selector).await?;
                     let outcome = client
                         .mutate(
                             Method::SessionClose,
                             ActionId::new(kr_ipc::new_uuid()),
-                            session_target(descriptor.environment_id, descriptor.session_id),
-                            &SessionCloseParams {
-                                session_id: descriptor.session_id,
-                            },
+                            session_target(environment.environment_id, session_id),
+                            &SessionCloseParams { session_id },
                         )
                         .await?;
                     typed::<SessionCloseResult>(outcome)?
@@ -194,21 +279,27 @@ async fn run(cli: Cli) -> Result<()> {
                     "ok": true,
                     "session_id": closed.session_id.to_string(),
                     "state": closed.state.as_str(),
+                    "durability": match closed.durability {
+                        kr_protocol::session::Durability::Durable => "durable",
+                        kr_protocol::session::Durability::Volatile => "volatile",
+                    },
                 }));
             } else {
                 println!("session {} is {}", closed.session_id, closed.state);
+                if closed.durability == kr_protocol::session::Durability::Volatile {
+                    println!("this closure was not recorded durably");
+                }
             }
             Ok(())
         }
         Command::List(arguments) => {
-            let mut client = open_controller(&environment, build_id()).await?;
+            let environment = kr_cli::resolve::select(&paths, arguments.environment.as_deref())?;
+            let mut client = open_controller(&environment.paths, build_id()).await?;
             let outcome = client
                 .request(
                     Method::SessionList,
                     &SessionListParams {
-                        environment_id: Nullable(parse_environment(
-                            arguments.environment.as_deref(),
-                        )?),
+                        environment_id: Nullable::some(environment.environment_id),
                         include_closed: arguments.include_closed,
                     },
                 )
@@ -230,32 +321,22 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Status(arguments) => {
             let selector = session_selector(arguments.session.as_deref())?;
             let wanted = parse_environment(arguments.environment.as_deref())?;
+            let environment = kr_cli::resolve::select(&paths, arguments.environment.as_deref())?;
             let summary = match find(&paths, &selector, wanted) {
-                Ok((_, descriptor)) => match read_session(&descriptor).await {
+                Ok((known, descriptor)) => match read_session(&descriptor).await {
                     Ok(summary) => summary,
                     // A descriptor that no longer answers is a hint that has gone stale. The
                     // daemon reconciles it and returns the closure record.
                     Err(CliError::HostUnavailable(_)) => {
-                        let mut client = open_controller(&environment, build_id()).await?;
-                        let outcome = client
-                            .request(
-                                Method::SessionRead,
-                                &SessionReadParams {
-                                    session_id: descriptor.session_id,
-                                },
-                            )
-                            .await?;
-                        typed::<SessionReadResult>(outcome)?.session
+                        let mut client = open_controller(&known.paths, build_id()).await?;
+                        read_from_controller(&mut client, descriptor.session_id).await?
                     }
                     Err(error) => return Err(error),
                 },
                 Err(CliError::UnknownSession(_)) => {
-                    let mut client = open_controller(&environment, build_id()).await?;
-                    let session_id = resolve_identifier(&selector)?;
-                    let outcome = client
-                        .request(Method::SessionRead, &SessionReadParams { session_id })
-                        .await?;
-                    typed::<SessionReadResult>(outcome)?.session
+                    let mut client = open_controller(&environment.paths, build_id()).await?;
+                    let session_id = resolve_closed(&mut client, &selector).await?;
+                    read_from_controller(&mut client, session_id).await?
                 }
                 Err(error) => return Err(error),
             };
@@ -276,12 +357,16 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Doctor(_) => {
-            let mut client = open_controller(&environment, build_id()).await?;
+        Command::Doctor(arguments) => {
+            let environment = kr_cli::resolve::select(&paths, None)?;
+            let mut client = open_controller(&environment.paths, build_id()).await?;
             let info: HostInfoResult = typed(client.request(Method::HostInfo, &()).await?)?;
             let checks: HostDoctorResult = typed(client.request(Method::HostDoctor, &()).await?)?;
+            // One document, whether the diagnostics passed or not. A command that printed a result
+            // and then a failure would give a reader two documents to reconcile.
             if cli.json {
                 print_json(&serde_json::json!({
+                    "ok": checks.healthy,
                     "host": report::host(&info),
                     "doctor": report::doctor(&checks),
                 }));
@@ -291,8 +376,18 @@ async fn run(cli: Cli) -> Result<()> {
                     info.environment_id, info.generation, info.live_sessions, info.session_limit
                 );
                 print!("{}", report::doctor_lines(&checks));
+                if arguments.verbose {
+                    // The detail of every check, including the ones that passed, and the remedy
+                    // for any that did not.
+                    for check in &checks.checks {
+                        println!("  {}: {}", check.id, check.detail);
+                        if let Some(remedy) = check.remedy.as_ref() {
+                            println!("    {remedy}");
+                        }
+                    }
+                }
             }
-            if checks.healthy {
+            if checks.healthy || cli.json {
                 Ok(())
             } else {
                 Err(CliError::Other(
@@ -303,107 +398,208 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-async fn attach_session(
-    descriptor: &kr_protocol::worker::WorkerDescriptor,
-    take_geometry: bool,
+/// Presents a session that has just been created.
+///
+/// A failure here never creates a second session: the session exists, and what could not be done
+/// is opening a window on it.
+async fn present(
+    paths: &HostPaths,
+    created: &SessionCreateResult,
+    presentation: Presentation,
 ) -> Result<()> {
-    let terminal = ControllingTerminal::open()?;
-    let size = terminal.size()?;
-    let dimensions = Dimensions::new(u64::from(size.ws_col), u64::from(size.ws_row));
-    let mut client = open_worker(descriptor, build_id()).await?;
-    let attachment: Attachment =
-        kr_cli::attach::attach(&mut client, descriptor, dimensions, take_geometry).await?;
-    let epoch = attachment
-        .lease
-        .as_ref()
-        .map_or(kr_protocol::ids::InputLeaseEpoch::new(0), |lease| {
-            lease.lease.epoch
-        });
-    // From the beginning of what is retained, not from the live edge: a terminal that attaches to
-    // a running session shows what is on it. The worker clamps the request to the oldest cursor it
-    // still holds and names the gap when there is one.
-    kr_cli::attach::subscribe(
-        &mut client,
-        descriptor.session_id,
-        attachment.attachment_id,
-        Some(0),
-    )
-    .await?;
-
-    // The guard is armed before the terminal is touched, so there is no window in which the
-    // terminal is raw and nothing is holding its previous state.
-    let saved = terminal.modes()?;
-    let guard = RestorationGuard::arm(&guard_program(), &terminal, &saved)?;
-    let saved = terminal.enter_raw_mode()?;
-
-    let handle = Arc::new(
-        terminal
-            .handle()
-            .try_clone()
-            .map_err(|error| CliError::Terminal(error.to_string()))?,
-    );
-    let input_handle = terminal
-        .handle()
-        .try_clone()
-        .map_err(|error| CliError::Terminal(error.to_string()))?;
-    let mut input = kr_cli::attach::spawn_input_reader(input_handle);
-
-    let (mut reader, mut writer, acknowledgement) = client.into_halves();
-    let output_terminal = Arc::clone(&handle);
-    let output = tokio::spawn(async move {
-        use std::io::Write as _;
-
-        while let Ok(message) = reader
-            .read_message::<kr_protocol::local::ControlMessage>()
-            .await
-        {
-            if let kr_protocol::local::ControlMessage::Notification(notification) = message
-                && notification.event_type.as_str() == "session.output"
-                && let Ok(event) = notification
-                    .payload
-                    .to_typed::<kr_protocol::recovery::OutputEvent>()
-            {
-                let mut handle = output_terminal.as_ref();
-                if handle.write_all(event.bytes.as_slice()).is_err() {
-                    break;
-                }
-                let _ = handle.flush();
-            }
+    match presentation {
+        Presentation::Invisible => Ok(()),
+        Presentation::Attach => {
+            let selector = SessionSelector::Identifier(created.session.session_id);
+            let (_, descriptor) = find(paths, &selector, Some(created.session.environment_id))?;
+            let (outcome, _) = kr_cli::session::run(
+                &descriptor,
+                AttachOptions {
+                    // A terminal that created the session is the session's terminal: it claims the
+                    // geometry, which is what section 8 makes the default for a creating client.
+                    take_geometry: true,
+                    no_probe: false,
+                },
+            )
+            .await?;
+            outcome.into_error().map_or(Ok(()), Err)
         }
-    });
-
-    let mut sequence = 0_u64;
-    let mut request_id = 1_u64;
-    while let Some(bytes) = input.recv().await {
-        let params = kr_protocol::input::InputWriteParams {
-            session_id: descriptor.session_id,
-            attachment_id: attachment.attachment_id,
-            epoch,
-            sequence: kr_protocol::ids::InputSequence::new(sequence),
-            bytes: kr_protocol::scalars::Bytes::new(bytes),
-        };
-        let Ok(params) = kr_protocol::envelope::ParamsValue::from_typed(&params) else {
-            break;
-        };
-        let message = kr_protocol::local::ControlMessage::Request(kr_protocol::envelope::Request {
-            request_id: kr_protocol::ids::RequestId::new(request_id),
-            method: Method::InputWrite.into(),
-            method_version: kr_protocol::method::MethodVersion::V1,
-            params,
-        });
-        if writer.write_message(&message).await.is_err() {
-            break;
-        }
-        sequence += 1;
-        request_id += 1;
+        Presentation::Terminal => open_terminal_application(created.session.display_number.get()),
     }
-    output.abort();
-    let _ = acknowledgement;
+}
 
-    // The terminal comes back here on the ordinary path; the guard is released only once it has.
-    terminal.restore(&saved)?;
-    guard.release();
-    Ok(())
+/// Opens an installed terminal application on a session.
+///
+/// # Errors
+///
+/// Returns [`CliError::TerminalUnavailable`] when this host has no launcher. The session is
+/// already created, so this is reported against it rather than causing a second one.
+#[cfg(target_vendor = "apple")]
+fn open_terminal_application(display_number: u64) -> Result<()> {
+    // The command is passed as a vector and the session is named by its number, so nothing here
+    // interpolates text into a shell command.
+    let program = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "kr".to_owned());
+    let command = format!("{program} attach {display_number}");
+    for application in ["iTerm", "Terminal"] {
+        let script = format!(
+            "tell application \"{application}\" to activate\n\
+             tell application \"{application}\" to do script \"{}\"",
+            command.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let started = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(&script)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if started.is_ok_and(|status| status.success()) {
+            return Ok(());
+        }
+    }
+    Err(CliError::TerminalUnavailable(
+        "no terminal application this host can open was found".to_owned(),
+    ))
+}
+
+/// Opens an installed terminal application on a session.
+///
+/// # Errors
+///
+/// Returns [`CliError::TerminalUnavailable`] when this host has no launcher.
+#[cfg(not(target_vendor = "apple"))]
+fn open_terminal_application(display_number: u64) -> Result<()> {
+    let program = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "kr".to_owned());
+    // Each candidate is invoked as a vector, never as a command line a shell would re-parse.
+    let candidates: [(&str, Vec<String>); 4] = [
+        (
+            "x-terminal-emulator",
+            vec![
+                "-e".to_owned(),
+                program.clone(),
+                "attach".to_owned(),
+                display_number.to_string(),
+            ],
+        ),
+        (
+            "gnome-terminal",
+            vec![
+                "--".to_owned(),
+                program.clone(),
+                "attach".to_owned(),
+                display_number.to_string(),
+            ],
+        ),
+        (
+            "konsole",
+            vec![
+                "-e".to_owned(),
+                program.clone(),
+                "attach".to_owned(),
+                display_number.to_string(),
+            ],
+        ),
+        (
+            "xterm",
+            vec![
+                "-e".to_owned(),
+                program,
+                "attach".to_owned(),
+                display_number.to_string(),
+            ],
+        ),
+    ];
+    for (launcher, arguments) in candidates {
+        let started = std::process::Command::new(launcher)
+            .args(&arguments)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if started.is_ok() {
+            return Ok(());
+        }
+    }
+    Err(CliError::TerminalUnavailable(
+        "no terminal application this host can open was found".to_owned(),
+    ))
+}
+
+/// Returns the one terminal attachment of a session, or says why there is not one.
+async fn sole_terminal_attachment(
+    client: &mut kr_ipc::client::LocalClient,
+    session_id: SessionId,
+) -> Result<kr_protocol::ids::AttachmentId> {
+    let outcome = client
+        .request(
+            Method::EventsSnapshot,
+            &kr_protocol::recovery::EventsSnapshotParams { session_id },
+        )
+        .await?;
+    let snapshot: kr_protocol::recovery::EventsSnapshotResult = typed(outcome)?;
+    let terminals: Vec<&kr_protocol::attachment::AttachmentSummary> = snapshot
+        .attachments
+        .iter()
+        .filter(|attachment| attachment.mode == kr_protocol::attachment::AttachMode::Terminal)
+        .collect();
+    match terminals.len() {
+        0 => Err(CliError::UnknownSession(format!(
+            "session {session_id} has no terminal attachment to detach"
+        ))),
+        1 => Ok(terminals[0].attachment_id),
+        _ => Err(CliError::Usage(format!(
+            "session {session_id} has {} terminal attachments; name one with --attachment: {}",
+            terminals.len(),
+            terminals
+                .iter()
+                .map(|attachment| attachment.attachment_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// Resolves a selector that names no live descriptor, through what the daemon retains.
+async fn resolve_closed(
+    client: &mut kr_ipc::client::LocalClient,
+    selector: &SessionSelector,
+) -> Result<SessionId> {
+    if let SessionSelector::Identifier(session_id) = selector {
+        return Ok(*session_id);
+    }
+    // A display number belongs to the environment for good, so a closed session still answers to
+    // the number it was listed under.
+    let outcome = client
+        .request(
+            Method::SessionList,
+            &SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: true,
+            },
+        )
+        .await?;
+    let listed: SessionListResult = typed(outcome)?;
+    let SessionSelector::Display(number) = selector else {
+        unreachable!("an identifier was answered above");
+    };
+    listed
+        .sessions
+        .iter()
+        .find(|summary| summary.display_number.get() == *number)
+        .map(|summary| summary.session_id)
+        .ok_or_else(|| CliError::UnknownSession(selector.to_string()))
+}
+
+async fn read_from_controller(
+    client: &mut kr_ipc::client::LocalClient,
+    session_id: SessionId,
+) -> Result<kr_protocol::session::SessionSummary> {
+    let outcome = client
+        .request(Method::SessionRead, &SessionReadParams { session_id })
+        .await?;
+    Ok(typed::<SessionReadResult>(outcome)?.session)
 }
 
 async fn read_session(
@@ -421,30 +617,12 @@ async fn read_session(
     Ok(typed::<SessionReadResult>(outcome)?.session)
 }
 
-fn guard_program() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("kr-attach-guard")))
-        .unwrap_or_else(|| std::path::PathBuf::from("kr-attach-guard"))
-}
-
 fn session_selector(named: Option<&str>) -> Result<SessionSelector> {
     match named {
         Some(text) => SessionSelector::parse(text),
         None => kr_cli::resolve::current_session()
             .map(SessionSelector::Identifier)
             .ok_or(CliError::NotInSession),
-    }
-}
-
-fn resolve_identifier(selector: &SessionSelector) -> Result<SessionId> {
-    match selector {
-        SessionSelector::Identifier(session_id) => Ok(*session_id),
-        // A closed session has no descriptor to translate a number through. Protocol identity is
-        // the UUID, so that is what a closed session is read by.
-        SessionSelector::Display(number) => Err(CliError::UnknownSession(format!(
-            "{number}: a closed session is read by its identifier"
-        ))),
     }
 }
 
@@ -457,8 +635,17 @@ fn parse_environment(named: Option<&str>) -> Result<Option<EnvironmentId>> {
         .transpose()
 }
 
-fn environment_target(environment_id: EnvironmentId) -> ActionTarget {
-    ActionTarget::environment(environment_id)
+/// Returns the execution context a session created this way is bound to.
+const fn worker_profile(presentation: Presentation) -> kr_protocol::identity::WorkerProfile {
+    match presentation {
+        // A session with a terminal on it belongs to the desktop that terminal is part of, and
+        // closes with reason `desktop_lost` when that login session ends.
+        Presentation::Attach | Presentation::Terminal => {
+            kr_protocol::identity::WorkerProfile::DesktopBound
+        }
+        // A session created with no terminal outlives a logout.
+        Presentation::Invisible => kr_protocol::identity::WorkerProfile::HeadlessUser,
+    }
 }
 
 fn session_target(environment_id: EnvironmentId, session_id: SessionId) -> ActionTarget {

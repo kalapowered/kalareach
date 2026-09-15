@@ -31,5 +31,18 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 [dev-dependencies]
 kr-ipc = { workspace = true, features = ["testing"] }
 
-[lints]
-workspace = true
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+# The workspace forbids unsafe code, which a crate that calls the console API cannot honour. This
+# crate denies it instead and allows it in exactly one module, `terminal::windows::console`, which
+# owns every call into the operating system. Nothing else in this crate may relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
