@@ -251,7 +251,8 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`TermError::Geometry`] for dimensions outside the three simultaneous constraints,
-    /// and [`TermError::Budget`] when the screens would not fit.
+    /// and [`TermError::Admission`] when what both screen buffers can hold at that size does not
+    /// fit the session budget.
     pub fn new(config: EngineConfig) -> Result<Self> {
         let mut budget = SessionBudget::new();
         let grid = CanonicalGrid::new(config.size, config.grid, &mut budget)?;
@@ -1278,8 +1279,8 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`TermError::Geometry`] for dimensions outside the three simultaneous constraints
-    /// and [`TermError::Budget`] when the new screens would not fit. The grid is unchanged in both
-    /// cases, and so is the projection.
+    /// and [`TermError::Admission`] when what both screen buffers can hold at the new size does not
+    /// fit the session budget. The grid is unchanged in both cases, and so is the projection.
     pub fn resize(&mut self, size: GridSize, now_ms: u64) -> Result<()> {
         self.grid.resize(size, &mut self.budget)?;
         // Rows move between the screen and the history when the grid reflows, and the two are

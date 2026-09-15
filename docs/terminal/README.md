@@ -553,14 +553,58 @@ counted.
 | One cell's content | 64 bytes |
 | In-memory historical rows | 8 MiB per session |
 | Distinct hyperlink targets | 4,096 per session |
+| One hyperlink | 2,048 bytes |
 | Canonical screens, metadata and per-cell storage | 64 MiB per session |
 | History page | 1,000 rows and 1 MiB |
 
 The three geometry constraints apply at the same time. The independent maxima are not valid
 together: 2,048 columns is allowed, 1,024 rows is allowed, and 2,048 by 1,024 is 2,097,152 cells and
 is refused. Validation uses checked multiplication and happens before any allocation, and a refusal
-names the constraint it hit. The same is true of the session budget: a geometry change that would
-not fit is refused before the grid is touched, and the current grid is unchanged.
+names the constraint it hit and returns `INVALID_ARGUMENT`.
+
+#### The cell maximum is a dimension bound, and the budget decides admission
+
+A geometry inside those three constraints is then admitted against the session budget. The
+dimension bound says what a request may ask for; the budget says what this session can be given.
+They are different questions, and 262,144 cells is the answer to the first one only.
+
+The worst-case resident footprint of a geometry is what both screen buffers can come to at that
+size, and it is reserved before the grid is built. A geometry whose footprint does not fit is
+refused with `RESOURCE_UNAVAILABLE`, naming the cells that were asked for, what they would cost and
+the budget. The reservation is the whole point of the rule: once a geometry is admitted, text
+arriving for its screens is never refused, because the room it needs is already held.
+
+One cell of one buffer, with the figures the model uses on a 64-bit target:
+
+| Part | Bytes | Why |
+| --- | --- | --- |
+| The slot the cell takes in its row | 64 | Twice the larger of the two forms a row is held in |
+| Its text | 128 | 64 bytes of content, at twice what it holds, because a row appends to its string |
+| Its attributes | 96 | The allocation a cell keeps for colours, underline colour, link handle and image list |
+| Its text's heap header | 32 | A cell's text leaves the cell once it is longer than a machine word |
+| | **320** | per cell, per buffer; **640** for both |
+
+And the parts that do not depend on the geometry:
+
+| Part | Bytes | Why |
+| --- | --- | --- |
+| Hyperlink envelope | 17,137,960 | 4,096 targets of 2,048 bytes, at twice what they hold, with the table slots and the first node |
+| Row arrays | 288 per row | Both buffers' rows, the primary buffer's 3,500 scrollback slots included, at twice the rows they hold |
+| Titles and the virtual stack | 46,064 | Ten entries of two 1,024-byte titles, at twice what they hold, plus the current pair |
+| Alert channel | 1,073,152 | 256 alerts of two 1,024-byte strings, at twice what the list holds |
+
+So an 80 by 24 session reserves 20,507,800 bytes of its 67,108,864, and the default invisible
+120 by 40 reserves 22,360,216. The boundary falls at about 74,000 cells: 272 by 272 is admitted at
+66,771,608 bytes and 273 by 273 is refused; 2,048 by 36 is admitted and 2,048 by 37 is refused. The
+largest grid the dimensions allow, 2,048 by 128, would need 187,111,064 bytes, so it is refused
+before anything is allocated for it. `fixtures/terminal/admission.json` records each of those.
+
+The historical row cache is not in that figure. Section 8 gives it its own 8 MiB bound beside the
+64 MiB session budget, so a session's resident state is bounded by the two together and each is
+enforced where it belongs.
+
+A resize goes through the same admission. One that does not fit is refused before the grid is
+touched, and the geometry, the reservation and the projection are all unchanged.
 
 A cursor restore is a case of its own. The pinned revision clears newline mode and the shift-out
 selection when it restores a cursor, which a terminal does not: DECRC restores the cursor, the
@@ -570,42 +614,47 @@ application would have used.
 
 The historical-row bound is enforced rather than reported. The engine measures the retained rows
 periodically, and when they pass the bound it lowers the library's scrollback row count so older
-rows are evicted as new ones arrive. The new row count is proportional to the overshoot, so the
-retained rows converge back under the bound over the following rows rather than oscillating.
-Measuring every retained row means walking the scrollback, so doing it on every read would cost more
-than the bound saves. A full measurement happens when the rows have grown, when something asks, and
-every 64 reads otherwise; between two of them the charge is what each applied event reserved, plus
-what the rows that scrolled off cost. Eviction lowers the row count by a figure worked out from the
-average cost of a row, and rows are not all the same size, so it converges over a few passes rather
-than landing under the bound in one step.
+rows are evicted as new ones arrive. Measuring every retained row means walking the scrollback, so
+doing it on every read would cost more than the bound saves. A full measurement happens when the
+rows have grown, when the stream goes quiet, when something asks, and every 64 reads otherwise;
+between two of them the charge is what the rows that scrolled off cost, which is taken where they
+arrive.
+
+Eviction is one pass and lands under the bound rather than converging towards it. The row count to
+keep is read off the rows themselves: the oldest rows are dropped one at a time until the rows still
+ahead cost no more than the bound, and that count becomes the library's scrollback size. Each row is
+visited at most once. Working the count out from the average cost of a row would leave it wrong
+whenever the rows are not all the same size, which is the usual case, and would need a loop with no
+proof that it ends.
 
 What the rows cost includes the hyperlinks they hold. Every cell inside a link holds a reference to
 the whole link, and the object behind that reference costs far more than its target's characters, so
 what is counted is the object: each distinct one on a row, once. Counting only the characters would
 let an application hold tens of megabytes inside a budget that said it was using nothing.
 
-Each buffer's links and its cell content are counted separately and charged together, because the
-buffer that is not showing still holds its own.
-
-Growth is charged as it happens rather than noticed at the next measurement, because one read can
-carry a session's worth of links or fill a screen, and a bound that is only checked afterwards is
-not a bound.
+Both buffers are measured, because the buffer that is not showing still holds its own: a session
+can fill the primary buffer, switch, and fill the alternate one as well. Each distinct link object
+is counted once wherever it is held, so a link spanning several rows, or one the pen and a row are
+sharing, is not counted again for each place it appears. The link the pen is inside and the links
+the two saved cursors carry are counted as well: those are on no row, and a measurement that only
+walked rows would report them as free.
 
 What is refused before it is allocated: a geometry that cannot fit, and hyperlinks. A link's cost is
-reserved before it is applied, and one that will not fit is refused; refusing one ends the link that
-was open, because the text that belonged to the refused link must not end up inside the previous
-one. A link with parameters and no target is refused the same way:
+reserved before it is applied, against the hyperlink envelope, and one that will not fit is refused;
+refusing one ends the link that was open, because the text that belonged to the refused link must
+not end up inside the previous one. A link with parameters and no target is refused the same way:
 that is a close, and keeping its parameters would let an application hold a session's worth of
 identifiers in links nothing can follow. A cell that reaches its content bound drops the marks past
 it. The alert channel holds a bounded number of alerts, each cut to a bounded length.
 
-What the screens hold is charged rather than refused. Printing is charged as it is applied, held at
-what the buffer's cells can hold, and an erase or fill made with a pen that needs an allocation of
-its own is charged what those allocations can come to. Rows that scroll off the screen are charged
-where they join the historical cache, counted by where the history ends rather than by how many rows
-it holds, so a row that arrives while the library drops an older one is still counted, and the cache
-is brought back towards its bound there rather than at the next measurement: two rows can carry more
-than the whole of it.
+Nothing else is refused. Text, titles and the rows that scroll off all draw on room the geometry
+already reserved, so an admitted session can fill its screens, set a title as often as it likes and
+push its stack to the bound without meeting a refusal. Rows that scroll off the screen are charged
+to the historical cache where they join it, counted by where the history ends rather than by how
+many rows it holds, so a row that arrives while the library drops an older one is still counted, and
+the cache is brought back under its bound there rather than at the next measurement: two rows can
+carry more than the whole of it. A resize moves rows between a screen and the history, and the two
+are charged to different bounds, so both are measured again at the resize.
 
 Where a reservation and a measurement look at the same thing, the reservation is the larger. Both
 work a link's parameter table out through the same rounding, from the separators the parameter field
@@ -615,35 +664,23 @@ column it can cover.
 
 What a measurement counts is what the grid is holding rather than a figure standing in for it: a
 link's parameter table as it is allocated rather than as many entries as it has, each key and value
-at its capacity, the first node the link table opens, and the allocation a cell keeps for the
-colours, underline colour, link handle and image list that the packed form on the cell cannot hold,
-counted for every column the cell covers. Counting only characters would report a screen of
-coloured, linked cells as costing what a screen of plain ones costs.
+at its capacity, the first node the link table opens, the allocation a cell keeps for the colours,
+underline colour, link handle and image list that the packed form on the cell cannot hold, counted
+for every column the cell covers, the header a cell's text keeps once it has left the cell, and the
+room the title stack grew to rather than the entries left on it. Counting only characters would
+report a screen of coloured, linked cells as costing what a screen of plain ones costs.
 
-The charges are conservative where they look, and they do not look everywhere yet. A cell holding
-eight bytes or more keeps a header of its own that nothing counts; an empty row and the array the
-rows sit in are not counted; a title that is set or pushed is applied before anything reserves for
-it, and the stack keeps the room it grew to after entries are popped; a resize moves rows between a
-screen and the history without moving their charges; and a link held only by the live pen or by a
-saved cursor is not on any row, so nothing measures it. Each of those is a figure lower than the
-truth rather than an unbounded one.
+Every measurement is compared with the reservation made for it, and `SessionBudget::excess` is what
+the measurements found beyond their reservations. It is zero, and the tests assert so across a
+screen filled with the most expensive cell there is. A figure above zero would mean the model had
+reserved less than the truth, which is why it is reported rather than assumed away.
 
-One thing section 8 asks for is not here yet: it asks for rejection before a state allocation that
-cannot fit, and printing into a screen that has already been admitted is charged and reported
-rather than refused. The two bounds also meet awkwardly at the extremes. The largest grid section 8
-allows is 262,144 cells, each of which may hold 64 bytes of encoded content and an allocation of
-its own for attributes the packed form cannot hold; two buffers of those, filled, come to more than
-the 64 MiB session budget. Closing that means either reserving what a screen can hold when its
-geometry is admitted, which would refuse grids section 8 calls valid, or refusing text once a
-screen's own growth would pass the budget. Until one of those is chosen, such a session is reported
-as under resident pressure.
-
-What the budget records is what the rows actually cost, not what they are allowed to cost. Recording
-the bound instead would make a session that is over its cache look exactly like one that is at it,
-and the reading that matters most is the one taken while the cache is too big. While eviction
-catches up, `FeedOutcome::resident_pressure` says so on every feed. It is a degradation rather than
-a failure, and it is reported there rather than only as a diagnostic, because diagnostics are rate
-limited and this is the one a caller must not miss.
+What the budget records for the row cache is what the rows actually cost, not what they are allowed
+to cost. Recording the bound instead would make a session that is over its cache look exactly like
+one that is at it, and the reading that matters most is the one taken while the cache is too big.
+While eviction catches up, `FeedOutcome::resident_pressure` says so on every feed. It is a
+degradation rather than a failure, and it is reported there rather than only as a diagnostic,
+because diagnostics are rate limited and this is the one a caller must not miss.
 
 A control-sequence parameter is clamped to 65,535 before it reaches the grid. A parameter is a
 repeat count, a column or a tab stop, and the grid is at most 2,048 by 1,024, so a larger value
@@ -755,7 +792,7 @@ interesting part.
 
 ## Fixtures
 
-`fixtures/terminal/` holds seven files, generated from the corpus in
+`fixtures/terminal/` holds eight files, generated from the corpus in
 `crates/kr-term/src/conformance.rs`.
 
 | File | What it pins | Requirements |
@@ -765,6 +802,7 @@ interesting part.
 | `broker.json` | Every query and the exact reply bytes | KR-ACC-001, KR-REQ-08.05 |
 | `width.json` | CJK, combining marks, emoji at both margins, emoji modifiers, regional indicators, keycap sequences, delayed wrap, bottom-row scrolling | KR-REQ-08.39 |
 | `snapshot.json` | Snapshots mid-output and at alternate-screen transitions | KR-REQ-08.40 |
+| `admission.json` | The geometries the budget admits and refuses, and the footprint each one reserves | KR-REQ-08.71, KR-REQ-08.79 |
 | `profile.json` | What kr-vt/1 advertises, what it refuses, the identity bytes, and the library record | KR-REQ-08.10, KR-REQ-04.02, KR-REQ-04.24 |
 | `terminfo-xterm-256color.json` | The pinned database and the class of every advertised capability | KR-REQ-08.11, KR-REQ-08.35 |
 
