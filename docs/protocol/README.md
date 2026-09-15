@@ -91,23 +91,39 @@ The specification requires maintained encoders with a strict validator and adapt
 forbids writing a new cryptographic implementation for canonicalisation. Both languages follow the
 same split.
 
-`ciborium` in Rust and `cborg` in TypeScript own the serde and value work. This repository owns the
-byte rules, because a decoded value cannot answer the questions the profile asks: whether a length
-was indefinite, whether an argument used a longer head than necessary, whether two keys collided,
-what order the keys arrived in, or whether bytes followed the object. A decoder that answers those
-questions has to read the bytes, so `kr_cbor::decode` and `decodeCanonical` do, and each names the
-rule that failed.
+`ciborium` in Rust and `cborg` in TypeScript write the bytes and, in Rust, do the serde work. This
+repository owns the byte rules on the way in, because a decoded value cannot answer the questions
+the profile asks: whether a length was indefinite, whether an argument used a longer head than
+necessary, whether two keys collided, what order the keys arrived in, or whether bytes followed the
+object. A decoder that answers those questions has to read the bytes, so `kr_cbor::decode` and
+`decodeCanonical` do, and each names the rule that failed.
 
-Encoding is the mirror image. `CanonicalValue` admits only permitted shapes and keeps maps in key
-order, so encoding cannot produce non-canonical bytes. In TypeScript, `cborg` does the encoding
-with its `rfc8949EncodeOptions`, which sorts map keys by the encoded key, and the adaptation layer
-converts a validated value into the shapes `cborg` encodes.
+Encoding needs no such reader. `CanonicalValue` admits only permitted shapes and keeps maps in key
+order, so a validated tree serialises to canonical bytes: Rust hands it to `ciborium::into_writer`
+and TypeScript to `cborg.encode` with `rfc8949EncodeOptions`, which sorts map keys by the encoded
+key. The conformance tests check that against the fixture bytes rather than assuming it.
+
+Both decoders finish by re-encoding the value they produced and requiring the input bytes back.
+Every rule is already checked while reading, so that is unreachable in a correct decoder. It is
+there because canonicity is what signatures rest on: a reader that normalised something instead of
+rejecting it would show up as different bytes rather than as a valid signature over a different
+value.
+
+`cborg`'s own decoder is not used for that check. It strips a leading U+FEFF from text strings, so
+it reads `"﻿"` and `""` as the same key. That is a different interpretation rather than a
+stricter one, and `fixtures/cbor/map-ordering.json` pins the case.
 
 ### Digests and signing input
 
 A domain-separated signing input is `CBOR([domain, element, ...])`, encoded canonically. Everything
 signed in the protocol has this shape, so no signature covers a fragment of a message and none
 covers a re-serialised diagnostic document.
+
+A collection inside a signed object cannot normalise on the way through, or the transcript would
+cover bytes the peer never sent. Sets on the wire therefore use `CanonicalSet`, which serialises in
+ascending element order and rejects an incoming sequence that is not already strictly ascending, so
+a received value re-encodes to the bytes it arrived in. The action-right vocabulary orders by its
+wire string, so a reader can verify the order from the encoded values alone.
 
 Two domains live in this repository:
 
@@ -143,6 +159,17 @@ Base64url is unpadded, and non-canonical encodings are rejected in both language
 characters, standard base64 characters and non-zero trailing bits all fail.
 
 JSON is never a signing representation.
+
+## Version negotiation
+
+Each peer lists every version it supports, and the selection is the highest version present in both
+lists. Supporting one minor says nothing about the minors below it, and the specification states no
+such compatibility rule, so nothing infers one. A major mismatch returns `UNSUPPORTED_SCHEMA`
+before any session data.
+
+The `kr-connect/1` transcript covers the complete offer and the complete selection, so the
+negotiated versions, capabilities and limits are all bound by the proof. The host selection echoes
+the client nonce as well as carrying its own, which binds one exact offer to one exact selection.
 
 ## Framing
 
@@ -181,6 +208,16 @@ A notification carries a stream identifier, a sequence, an event type and a payl
 envelope, resolves the method in the registry, and only then parses that method's own closed
 parameter schema. That ordering is what lets an unknown method return a correlated error instead of
 failing to parse.
+
+An opaque value renders to JSON for diagnostics only. Byte strings become base64url and integers
+become decimal strings, so nothing loses precision, but reading that JSON back cannot tell which
+strings were byte strings or integers. The section 23 example shows small integers as JSON numbers;
+that block is a diagnostic rendering, and section 4's exactness rule is what this implements.
+
+An enum on the wire is externally tagged: a variant with fields is a single-entry map whose key
+names the variant, and a variant without fields is that name as a text string. A tagged
+representation would buffer the variant's content, which both hides unknown fields on a variant
+that carries none and changes the representation of the scalars inside it.
 
 Mutation types use `#[serde(deny_unknown_fields)]`. An unknown field rejects; it is never stripped
 and then verified.
@@ -310,6 +347,11 @@ An invalid case names its rule with the same string in both languages, for examp
 `unsorted_map_keys` or `non_shortest_integer`. `CborError::rule` in Rust and `KrCborError.rule` in
 TypeScript return those strings. A case may carry a `limits` object, merged over the defaults, so a
 short vector can test a bound without a megabyte of input.
+
+These fixtures cover bytes, digests and signing input. Signature vectors need a signing
+implementation, which lives with the cryptography crate rather than here; that crate consumes
+`fixtures/cbor/digests.json` and `fixtures/protocol/transcripts.json` as its inputs and adds fixed
+keys, expected signatures and negative verification cases beside them.
 
 ## Generation and checking
 
