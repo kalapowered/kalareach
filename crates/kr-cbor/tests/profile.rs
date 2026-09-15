@@ -195,3 +195,50 @@ fn deserialisation_never_sees_a_non_canonical_message() {
         Err(CborError::TrailingBytes { .. })
     ));
 }
+
+#[test]
+fn an_empty_collection_does_not_consume_the_depth_of_its_members() {
+    // An empty array or map has no children, so it fits wherever a scalar fits. Inbound and
+    // outbound limits have to agree about that.
+    let limits = Limits {
+        max_depth: 1,
+        ..Limits::DEFAULT
+    };
+    for hex_bytes in ["80", "a0", "00"] {
+        let bytes = hex::decode(hex_bytes).expect("hex");
+        let value = decode(&bytes, &limits)
+            .unwrap_or_else(|error| panic!("{hex_bytes} at depth 1: {error}"));
+        value
+            .check_limits(&limits)
+            .unwrap_or_else(|error| panic!("{hex_bytes} outbound at depth 1: {error}"));
+    }
+
+    // One member does consume it.
+    let bytes = hex::decode("8100").expect("hex");
+    assert_eq!(
+        decode(&bytes, &limits)
+            .expect_err("a member is one level deeper")
+            .rule(),
+        "depth_limit"
+    );
+    assert_eq!(
+        CanonicalValue::Array(vec![CanonicalValue::integer(0).expect("int")])
+            .check_limits(&limits)
+            .expect_err("outbound agrees")
+            .rule(),
+        "depth_limit"
+    );
+
+    // An empty collection nested at the limit is still accepted by both directions.
+    let nested = hex::decode("818180").expect("hex");
+    let limits = Limits {
+        max_depth: 2,
+        ..Limits::DEFAULT
+    };
+    assert_eq!(
+        decode(&nested, &limits).expect_err("three levels").rule(),
+        "depth_limit"
+    );
+    let two_levels = hex::decode("8180").expect("hex");
+    assert!(decode(&two_levels, &limits).is_ok());
+}

@@ -236,3 +236,13 @@ describe('limits', () => {
     })
   })
 })
+
+describe('empty collections', () => {
+  it('do not consume the depth their members would', () => {
+    const limits = limitsFromFixture({ max_depth: 1 })
+    for (const hex of ['80', 'a0', '00']) {
+      expect(() => decodeCanonical(hexToBytes(hex), limits)).not.toThrowError()
+    }
+    expect(() => decodeCanonical(hexToBytes('8100'), limits)).toThrowError(/depth_limit/)
+  })
+})

@@ -133,29 +133,45 @@ where
 
 /// Deserialises a validated canonical value.
 ///
+/// The value is canonical, but that is not enough on its own: serde accepts more than one
+/// representation of the same typed value. A unit enum variant, for example, arrives either as its
+/// name or as a single-entry map holding null, and both produce the same Rust value while only one
+/// of them is what the type serialises back to. A signed object that arrived in the other form
+/// would re-serialise to different bytes than the ones its signature covers.
+///
+/// So the typed value is serialised again here and has to equal the value it came from. That makes
+/// one representation of each type reachable, which is what lets a later stage re-encode a decoded
+/// object and still get the bytes the signature was taken over.
+///
 /// # Errors
 ///
-/// Returns [`CborError::Deserialize`] when the value does not match the target schema.
+/// Returns [`CborError::Deserialize`] when the value does not match the target schema, or
+/// [`CborError::NonCanonical`] when the typed value does not serialise back to the same value.
 pub fn from_canonical_value<T>(value: &CanonicalValue) -> Result<T>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + Serialize,
 {
-    to_ciborium(value)
+    let typed: T = to_ciborium(value)
         .deserialized()
         .map_err(|error| CborError::Deserialize {
             message: error.to_string(),
-        })
+        })?;
+    if &to_canonical_value(&typed)? != value {
+        return Err(CborError::NonCanonical);
+    }
+    Ok(typed)
 }
 
 /// Strictly decodes canonical bytes and deserialises them.
 ///
 /// # Errors
 ///
-/// Returns the first broken byte rule, or [`CborError::Deserialize`] when the validated value does
-/// not match the target schema.
+/// Returns the first broken byte rule, [`CborError::Deserialize`] when the validated value does
+/// not match the target schema, or [`CborError::NonCanonical`] when the typed value does not
+/// serialise back to the bytes it came from.
 pub fn from_canonical_slice<T>(bytes: &[u8], limits: &Limits) -> Result<T>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + Serialize,
 {
     from_canonical_value(&decode(bytes, limits)?)
 }

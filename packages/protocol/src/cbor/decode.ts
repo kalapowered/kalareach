@@ -141,7 +141,8 @@ class Reader {
    * Checks the depth and item budgets a collection is about to consume, before it is built.
    */
   private reserveItems (members: number, memberDepth: number): void {
-    if (memberDepth > this.limits.maxDepth) {
+    // An empty collection has no children, so it does not consume the depth its members would.
+    if (members > 0 && memberDepth > this.limits.maxDepth) {
       fail('depth_limit', `nesting depth exceeds the limit of ${this.limits.maxDepth}`)
     }
     if (this.items + members > this.limits.maxItems) {

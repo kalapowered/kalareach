@@ -173,7 +173,8 @@ impl Reader<'_> {
     /// A collection reserves capacity for its members, so the budget for those members has to be
     /// checked before the reservation rather than while reading them.
     fn reserve_items(&self, members: usize, member_depth: usize) -> Result<()> {
-        if member_depth > self.limits.max_depth {
+        // An empty collection has no children, so it does not consume the depth its members would.
+        if members > 0 && member_depth > self.limits.max_depth {
             return Err(CborError::DepthLimit {
                 limit: self.limits.max_depth,
             });
