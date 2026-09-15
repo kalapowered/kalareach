@@ -14,12 +14,20 @@ use std::collections::BTreeMap;
 
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::{Endpoint, EnvironmentPaths};
-use kr_protocol::ids::{BuildId, SessionId};
+use kr_ipc::verify::ControllerIdentity;
+use kr_protocol::identity::BootIdentity;
+use kr_protocol::ids::{BuildId, ControllerGeneration, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::Result;
 use crate::registry::Registry;
+
+/// How long one worker has to answer its challenge and accept a generation during a rebuild.
+///
+/// A silent endpoint is a reason to quarantine one descriptor, never a reason for the daemon not
+/// to finish starting.
+pub const RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One entry in the directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +65,7 @@ impl Directory {
     pub async fn rebuild(
         paths: &EnvironmentPaths,
         registry: &Registry,
-        build_id: &BuildId,
+        reconnect: &Reconnect<'_>,
     ) -> Result<Self> {
         let mut directory = Self::default();
         let recorded = registry.workers()?;
@@ -92,7 +100,7 @@ impl Directory {
                 });
                 continue;
             }
-            match verify(&descriptor, build_id).await {
+            match reconnect_to(&descriptor, reconnect).await {
                 Ok(endpoint) => {
                     directory.verified.insert(
                         descriptor.session_id,
@@ -133,17 +141,52 @@ impl Directory {
     }
 }
 
-async fn verify(
+/// What a replacement daemon needs to reconnect to a worker.
+#[derive(Clone, Copy, Debug)]
+pub struct Reconnect<'a> {
+    /// The identity that signs generation tokens.
+    pub identity: &'a ControllerIdentity,
+    /// The generation this daemon advanced to.
+    pub generation: ControllerGeneration,
+    /// The boot this daemon is running in.
+    pub boot_identity: &'a BootIdentity,
+    /// This daemon's build.
+    pub build_id: &'a BuildId,
+}
+
+async fn reconnect_to(
     descriptor: &WorkerDescriptor,
-    build_id: &BuildId,
+    reconnect: &Reconnect<'_>,
 ) -> std::result::Result<Endpoint, String> {
     let endpoint = Endpoint::from_path(&descriptor.endpoint).map_err(|error| error.to_string())?;
-    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Controller, build_id.clone())
+    // Bounded, because starting the daemon must not depend on a worker that never answers. A
+    // descriptor that runs out of time is quarantined like any other that fails its challenge.
+    tokio::time::timeout(RECONNECT_TIMEOUT, async {
+        let mut client = LocalClient::connect(
+            &endpoint,
+            LocalClientKind::Controller,
+            reconnect.build_id.clone(),
+        )
         .await
         .map_err(|error| error.to_string())?;
-    client
-        .verify_worker(descriptor)
-        .await
-        .map_err(|error| error.to_string())?;
+        client
+            .verify_worker(descriptor)
+            .await
+            .map_err(|error| error.to_string())?;
+        // Presenting the generation is what fences the daemon this one replaced. Verifying the
+        // worker only establishes that the endpoint is the session it claims to be.
+        client
+            .present_generation(|nonce| {
+                reconnect
+                    .identity
+                    .generation_token(reconnect.generation, reconnect.boot_identity, nonce)
+                    .map_err(kr_ipc::IpcError::from)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| "the worker did not answer its challenge in time".to_owned())??;
     Ok(endpoint)
 }

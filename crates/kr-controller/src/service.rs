@@ -44,7 +44,7 @@ use kr_protocol::worker::{
 };
 use tokio::sync::{Mutex, oneshot};
 
-use crate::directory::{Directory, KnownWorker};
+use crate::directory::{Directory, KnownWorker, Reconnect};
 use crate::error::{ControllerError, Result};
 use crate::registry::{LaunchPhase, Registry, WorkerRecord};
 use crate::singleton::SingletonLock;
@@ -90,7 +90,6 @@ impl std::fmt::Debug for Controller {
 }
 
 struct PendingCreate {
-    create: SessionCreateParams,
     ready: oneshot::Sender<std::result::Result<WorkerReady, ProtocolError>>,
 }
 
@@ -104,13 +103,16 @@ impl Controller {
     pub async fn start(setup: ControllerSetup) -> Result<Arc<Self>> {
         setup.paths.create()?;
         let mut registry = Registry::open(setup.paths.registry_database(), setup.environment_id)?;
+        // The lock comes before everything the environment owns: the persistent identity, the
+        // generation and the directory. Two daemons starting together would otherwise both find an
+        // empty key store, both create an identity, and the loser would overwrite the key every
+        // live worker recorded at spawn.
         let lock = SingletonLock::acquire(&setup.paths.singleton_lock(), &mut registry)?;
         let generation = lock.generation();
-        let identity = setup.identity;
-        let directory = Directory::rebuild(&setup.paths, &registry, &setup.build_id).await?;
-        Ok(Arc::new(Self {
+        let identity = (setup.identity)()?;
+        let controller = Arc::new(Self {
             registry: Mutex::new(registry),
-            directory: Mutex::new(directory),
+            directory: Mutex::new(Directory::default()),
             pending: Mutex::new(BTreeMap::new()),
             identity,
             generation,
@@ -122,13 +124,83 @@ impl Controller {
             release: setup.release,
             started_at_ms: kr_ipc::now_ms(),
             _lock: lock,
-        }))
+        });
+        // Reconnecting is not only verifying. A replacement daemon has to present the generation it
+        // advanced to, because that is what fences the daemon it replaced.
+        let directory = {
+            let registry = controller.registry.lock().await;
+            Directory::rebuild(&controller.paths, &registry, &controller.reconnect()).await?
+        };
+        *controller.directory.lock().await = directory;
+        controller.recover_reservations().await?;
+        Ok(controller)
+    }
+
+    /// Resolves every create that a previous daemon did not finish.
+    ///
+    /// The rule is the one section 24 asks for: a launch that is confirmed not to have started is
+    /// resolved and stops occupying the environment; a launch that may have started is preserved,
+    /// never respawned, and keeps its slot until something confirms what happened to it.
+    async fn recover_reservations(&self) -> Result<()> {
+        let unresolved = {
+            let registry = self.registry.lock().await;
+            let mut rows = registry.reservations_in(LaunchPhase::Reserved)?;
+            rows.extend(registry.reservations_in(LaunchPhase::Spawned)?);
+            rows.extend(registry.reservations_in(LaunchPhase::Claimed)?);
+            rows
+        };
+        for reservation in unresolved {
+            let resolution = match (reservation.phase, reservation.launcher_identity.as_ref()) {
+                // Nothing was ever handed to the service manager: the phase moves to `spawned`
+                // before the call and this one never got there.
+                (LaunchPhase::Reserved, _) => Some(LaunchPhase::Failed),
+                // The launcher never reported an identity, so there is nothing to ask about. The
+                // execution stays unresolved and keeps its slot rather than being guessed at.
+                (_, None) => None,
+                (_, Some(identity)) => match kr_ipc::identity::process_state(identity) {
+                    // The process the launcher started is gone and it never became live, so no
+                    // worker came of it. This is a confirmed failure.
+                    kr_ipc::identity::ProcessState::Ended => Some(LaunchPhase::Failed),
+                    kr_ipc::identity::ProcessState::Running
+                    | kr_ipc::identity::ProcessState::Unknown { .. } => None,
+                },
+            };
+            if let Some(phase) = resolution {
+                let mut registry = self.registry.lock().await;
+                registry.set_phase(reservation.reservation_id, phase)?;
+            }
+        }
+        // A worker row whose process has ended is reconciled whether or not its descriptor
+        // answered, so a session that died while no daemon was running is recorded rather than
+        // silently omitted from every later list.
+        let sessions: Vec<SessionId> = {
+            let registry = self.registry.lock().await;
+            registry
+                .workers()?
+                .into_iter()
+                .map(|worker| worker.session_id)
+                .collect()
+        };
+        for session_id in sessions {
+            let _ = self.reconcile(session_id).await;
+        }
+        Ok(())
     }
 
     /// Returns the generation this daemon speaks for.
     #[must_use]
     pub const fn generation(&self) -> ControllerGeneration {
         self.generation
+    }
+
+    /// Returns what a worker needs to accept this daemon's authority.
+    fn reconnect(&self) -> Reconnect<'_> {
+        Reconnect {
+            identity: &self.identity,
+            generation: self.generation,
+            boot_identity: &self.boot_identity,
+            build_id: &self.build_id,
+        }
     }
 
     /// Returns the environment's directories.
@@ -227,64 +299,69 @@ impl Controller {
         peer: &PeerIdentity,
     ) -> Result<WorkerLaunchSpec> {
         check_rendezvous(claim).map_err(ControllerError::rendezvous)?;
-        let mut registry = self.registry.lock().await;
-        let reservation = registry
-            .reservation(claim.reservation_id)?
-            .ok_or_else(|| ControllerError::rendezvous("no reservation matches this claim"))?;
-        if reservation.session_id != claim.session_id {
-            return Err(ControllerError::rendezvous(
-                "the claim names a different session from its reservation",
-            ));
-        }
-        // Exactly one rendezvous per reservation. A second attempt is refused, recorded, and the
-        // reservation is fenced: two processes claiming one reservation means the host does not
-        // know which of them owns the session.
-        if reservation.phase != LaunchPhase::Spawned {
-            registry.set_phase(claim.reservation_id, LaunchPhase::Fenced)?;
-            return Err(ControllerError::rendezvous(format!(
-                "this reservation is {} and accepts no further claim",
-                reservation.phase.as_str()
-            )));
-        }
-        drop(registry);
-        // The launcher's identity is recorded as soon as the service manager reports it, which can
-        // be after the worker has already connected. Waiting for it is not optional: without it
-        // there is nothing to compare the connecting process against.
-        let launcher = self.await_launch_identity(claim.reservation_id).await?;
-        let launcher = &launcher;
-        let mut registry = self.registry.lock().await;
-        // The connecting process must be the process the launcher started, checked by both its
-        // identifier and the kernel's record of when it started.
-        let peer_pid = peer
-            .pid
-            .ok_or_else(|| ControllerError::rendezvous("the platform did not report the peer"))?;
-        if u64::from(peer_pid) != launcher.pid.get() {
-            registry.set_phase(claim.reservation_id, LaunchPhase::Fenced)?;
-            return Err(ControllerError::rendezvous(
-                "the connecting process is not the one the launcher started",
-            ));
-        }
-        if &claim.process_start_identity != launcher {
-            registry.set_phase(claim.reservation_id, LaunchPhase::Fenced)?;
-            return Err(ControllerError::rendezvous(
-                "the claim's process identity is not the launcher's",
-            ));
+        {
+            let registry = self.registry.lock().await;
+            let reservation = registry
+                .reservation(claim.reservation_id)?
+                .ok_or_else(|| ControllerError::rendezvous("no reservation matches this claim"))?;
+            if reservation.session_id != claim.session_id {
+                return Err(ControllerError::rendezvous(
+                    "the claim names a different session from its reservation",
+                ));
+            }
         }
         if claim.boot_identity != self.boot_identity {
             return Err(ControllerError::rendezvous(
                 "the claim names a different boot",
             ));
         }
-        drop(registry);
+        // The launcher's identity is recorded as soon as the service manager reports it, which can
+        // be after the worker has already connected. Waiting for it is not optional: without it
+        // there is nothing to compare the connecting process against.
+        let launcher = self.await_launch_identity(claim.reservation_id).await?;
+        let peer_pid = peer
+            .pid
+            .ok_or_else(|| ControllerError::rendezvous("the platform did not report the peer"))?;
+        if u64::from(peer_pid) != launcher.pid.get() {
+            self.registry.lock().await.fence(claim.reservation_id)?;
+            return Err(ControllerError::rendezvous(
+                "the connecting process is not the one the launcher started",
+            ));
+        }
+        // The kernel is asked about the process on the other end of this socket, now. A signed
+        // claim only says what the worker believes about itself; reading the identity here is what
+        // rules out a different process that happens to hold the same identifier.
+        let connected = kr_ipc::identity::process_start_identity(peer_pid).map_err(|error| {
+            ControllerError::rendezvous(format!(
+                "the kernel would not describe the connecting process: {error}"
+            ))
+        })?;
+        if connected != launcher {
+            self.registry.lock().await.fence(claim.reservation_id)?;
+            return Err(ControllerError::rendezvous(
+                "the connecting process did not start when the launcher's did",
+            ));
+        }
+        if claim.process_start_identity != connected {
+            self.registry.lock().await.fence(claim.reservation_id)?;
+            return Err(ControllerError::rendezvous(
+                "the claim's process identity is not the connecting process's",
+            ));
+        }
 
-        let pending = self.pending.lock().await;
-        let create = pending
-            .get(&claim.reservation_id)
-            .map(|pending| pending.create.clone())
-            .ok_or_else(|| {
-                ControllerError::rendezvous("no create request is waiting for this reservation")
-            })?;
-        drop(pending);
+        // Admission is consumed here, in one transaction, together with the key that authenticates
+        // this worker from now on. Everything above is a check; this is the commitment.
+        let reservation = {
+            let mut registry = self.registry.lock().await;
+            registry.claim_rendezvous(claim.reservation_id, claim.worker_public_key)?
+        };
+        let create: SessionCreateParams =
+            kr_cbor::from_canonical_slice(&reservation.create_intent, &kr_cbor::Limits::DEFAULT)
+                .map_err(|error| {
+                    ControllerError::registry(format!(
+                        "the recorded create request cannot be read: {error}"
+                    ))
+                })?;
 
         Ok(WorkerLaunchSpec {
             session_id: reservation.session_id,
@@ -655,11 +732,22 @@ impl Controller {
         let create: SessionCreateParams = parse(&mutation.params)?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // The create request itself is recorded with the reservation, before anything is spawned.
+        // A daemon that dies between the reservation and the launch then finds a request it can
+        // resolve rather than an identifier with nothing behind it.
+        let intent = kr_cbor::to_canonical_vec(&create)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // The action identifier is the create token. One identifier, one session; a retry with the
         // same payload resolves to the same reservation rather than launching a second shell.
         let admission = {
             let mut registry = self.registry.lock().await;
-            registry.reserve(actor_id, mutation.action_id.get(), digest, kr_ipc::now_ms())?
+            registry.reserve(
+                actor_id,
+                mutation.action_id.get(),
+                digest,
+                &intent,
+                kr_ipc::now_ms(),
+            )?
         };
         let reservation = admission.reservation;
         if admission.deduplicated {
@@ -667,13 +755,10 @@ impl Controller {
         }
 
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(
-            reservation.reservation_id,
-            PendingCreate {
-                create: create.clone(),
-                ready: sender,
-            },
-        );
+        self.pending
+            .lock()
+            .await
+            .insert(reservation.reservation_id, PendingCreate { ready: sender });
 
         // The reservation moves to `spawned` before anything is started. A worker can reach the
         // rendezvous socket the instant the service manager starts it, which is sooner than the
@@ -697,7 +782,20 @@ impl Controller {
             state_directory: self.paths.state_root().to_path_buf(),
             jobs_directory: self.paths.jobs_dir(),
         };
-        let identity = self.supervisor.start(&launch)?;
+        let identity = match self.supervisor.start(&launch) {
+            Ok(identity) => identity,
+            Err(error) => {
+                // The service manager refused. Nothing started, so the reservation is resolved as
+                // a confirmed failure and stops occupying the environment; it is never resumed.
+                self.pending
+                    .lock()
+                    .await
+                    .remove(&reservation.reservation_id);
+                let mut registry = self.registry.lock().await;
+                registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                return Err(error);
+            }
+        };
         {
             let mut registry = self.registry.lock().await;
             registry.record_launch(reservation.reservation_id, &identity)?;
@@ -997,8 +1095,12 @@ pub struct ControllerSetup {
     pub paths: EnvironmentPaths,
     /// The environment identity.
     pub environment_id: EnvironmentId,
-    /// The persistent identity this daemon signs generation tokens with.
-    pub identity: ControllerIdentity,
+    /// Opens or creates the persistent identity this daemon signs generation tokens with.
+    ///
+    /// It is a closure because it must run **after** the singleton lock is held: creating the
+    /// environment's key is a first-start step, and two daemons racing for it would leave one of
+    /// them holding a key no live worker recognises.
+    pub identity: Box<dyn FnOnce() -> Result<ControllerIdentity> + Send>,
     /// The boot this host is running.
     pub boot_identity: BootIdentity,
     /// How workers are started.

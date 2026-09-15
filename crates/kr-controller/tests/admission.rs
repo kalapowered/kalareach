@@ -16,6 +16,11 @@ fn digest(byte: u8) -> Digest256 {
     Digest256::from_bytes([byte; 32])
 }
 
+/// The recorded create request. Its contents do not matter here; that it is recorded does.
+fn intent() -> Vec<u8> {
+    vec![0xa0]
+}
+
 fn registry() -> (kr_ipc::testing::TempHost, Registry) {
     let host = kr_ipc::testing::TempHost::create();
     let registry = Registry::open(
@@ -31,11 +36,23 @@ fn a_repeated_create_token_resolves_to_the_same_reservation() {
     let (_host, mut registry) = registry();
     let token = kr_ipc::new_uuid();
     let first = registry
-        .reserve(&actor("local:501"), token, digest(1), TimestampMs::new(1))
+        .reserve(
+            &actor("local:501"),
+            token,
+            digest(1),
+            &intent(),
+            TimestampMs::new(1),
+        )
         .expect("reserves");
     assert!(!first.deduplicated);
     let second = registry
-        .reserve(&actor("local:501"), token, digest(1), TimestampMs::new(2))
+        .reserve(
+            &actor("local:501"),
+            token,
+            digest(1),
+            &intent(),
+            TimestampMs::new(2),
+        )
         .expect("resolves to the same intent");
     assert!(second.deduplicated);
     assert_eq!(second.reservation, first.reservation);
@@ -51,10 +68,22 @@ fn the_same_token_with_a_different_payload_is_refused() {
     let (_host, mut registry) = registry();
     let token = kr_ipc::new_uuid();
     registry
-        .reserve(&actor("local:501"), token, digest(1), TimestampMs::new(1))
+        .reserve(
+            &actor("local:501"),
+            token,
+            digest(1),
+            &intent(),
+            TimestampMs::new(1),
+        )
         .expect("reserves");
     let error = registry
-        .reserve(&actor("local:501"), token, digest(2), TimestampMs::new(2))
+        .reserve(
+            &actor("local:501"),
+            token,
+            digest(2),
+            &intent(),
+            TimestampMs::new(2),
+        )
         .expect_err("refuses");
     assert!(matches!(error, ControllerError::IdConflict { .. }));
     assert_eq!(registry.occupancy().expect("counts"), 1);
@@ -65,10 +94,22 @@ fn the_same_token_from_another_actor_is_a_different_intent() {
     let (_host, mut registry) = registry();
     let token = kr_ipc::new_uuid();
     let first = registry
-        .reserve(&actor("local:501"), token, digest(1), TimestampMs::new(1))
+        .reserve(
+            &actor("local:501"),
+            token,
+            digest(1),
+            &intent(),
+            TimestampMs::new(1),
+        )
         .expect("reserves");
     let second = registry
-        .reserve(&actor("local:502"), token, digest(1), TimestampMs::new(2))
+        .reserve(
+            &actor("local:502"),
+            token,
+            digest(1),
+            &intent(),
+            TimestampMs::new(2),
+        )
         .expect("reserves");
     assert!(!second.deduplicated);
     assert_ne!(second.reservation.session_id, first.reservation.session_id);
@@ -85,6 +126,7 @@ fn the_limit_refuses_before_anything_is_spawned_and_never_evicts() {
                 &actor("local:501"),
                 kr_ipc::new_uuid(),
                 digest(9),
+                &intent(),
                 TimestampMs::new(1),
             )
             .expect("reserves");
@@ -95,6 +137,7 @@ fn the_limit_refuses_before_anything_is_spawned_and_never_evicts() {
             &actor("local:501"),
             kr_ipc::new_uuid(),
             digest(9),
+            &intent(),
             TimestampMs::new(2),
         )
         .expect_err("refuses");
@@ -118,6 +161,7 @@ fn the_limit_refuses_before_anything_is_spawned_and_never_evicts() {
             &actor("local:501"),
             kr_ipc::new_uuid(),
             digest(9),
+            &intent(),
             TimestampMs::new(3),
         )
         .expect("the freed capacity is usable");
@@ -133,6 +177,7 @@ fn display_numbers_increase_and_are_never_reused() {
                 &actor("local:501"),
                 kr_ipc::new_uuid(),
                 digest(3),
+                &intent(),
                 TimestampMs::new(1),
             )
             .expect("reserves");
@@ -153,6 +198,7 @@ fn display_numbers_increase_and_are_never_reused() {
             &actor("local:501"),
             kr_ipc::new_uuid(),
             digest(3),
+            &intent(),
             TimestampMs::new(2),
         )
         .expect("reserves");
@@ -180,5 +226,119 @@ fn the_generation_advances_and_is_remembered_across_opens() {
         reopened.advance_generation().expect("advances").get(),
         3,
         "a replacement daemon is strictly ahead of the one it replaced"
+    );
+}
+
+#[test]
+fn one_launched_process_gets_one_rendezvous_admission() {
+    let (_host, mut registry) = registry();
+    let admission = registry
+        .reserve(
+            &actor("local:501"),
+            kr_ipc::new_uuid(),
+            digest(1),
+            &intent(),
+            TimestampMs::new(1),
+        )
+        .expect("reserves");
+    let reservation = admission.reservation.reservation_id;
+    registry
+        .set_phase(reservation, LaunchPhase::Spawned)
+        .expect("marks the launch attempt");
+
+    let key = kr_protocol::scalars::AuthorisationKey::from_bytes([7; 32]);
+    let claimed = registry
+        .claim_rendezvous(reservation, key)
+        .expect("admits the first claim");
+    assert_eq!(claimed.phase, LaunchPhase::Claimed);
+    assert_eq!(
+        claimed.claimed_key,
+        Some(key),
+        "the key is durable before the worker is told anything"
+    );
+
+    let second = registry
+        .claim_rendezvous(
+            reservation,
+            kr_protocol::scalars::AuthorisationKey::from_bytes([8; 32]),
+        )
+        .expect_err("refuses the second claim");
+    assert!(matches!(second, ControllerError::RendezvousRefused { .. }));
+    assert_eq!(
+        registry
+            .reservation(reservation)
+            .expect("reads")
+            .expect("present")
+            .phase,
+        LaunchPhase::Fenced,
+        "two processes claiming one reservation fences it"
+    );
+}
+
+#[test]
+fn a_ready_report_cannot_revive_a_fenced_reservation() {
+    let (_host, mut registry) = registry();
+    let admission = registry
+        .reserve(
+            &actor("local:501"),
+            kr_ipc::new_uuid(),
+            digest(1),
+            &intent(),
+            TimestampMs::new(1),
+        )
+        .expect("reserves");
+    let reservation = admission.reservation;
+    registry
+        .set_phase(reservation.reservation_id, LaunchPhase::Fenced)
+        .expect("fences");
+    let record = kr_controller::registry::WorkerRecord {
+        session_id: reservation.session_id,
+        display_number: reservation.display_number,
+        public_key: kr_protocol::scalars::AuthorisationKey::from_bytes([9; 32]),
+        process_identity: kr_protocol::identity::ProcessStartIdentity::new(
+            4242,
+            kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo,
+            77,
+        ),
+        endpoint: "/tmp/kr-test.sock".to_owned(),
+        profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        state: kr_protocol::session::SessionState::Live,
+    };
+    assert!(
+        registry
+            .record_worker(reservation.reservation_id, &record)
+            .is_err(),
+        "a late ready report does not answer the question fencing asked"
+    );
+}
+
+#[test]
+fn a_fenced_reservation_keeps_its_slot_and_a_failed_one_does_not() {
+    let (_host, mut registry) = registry();
+    let admission = registry
+        .reserve(
+            &actor("local:501"),
+            kr_ipc::new_uuid(),
+            digest(1),
+            &intent(),
+            TimestampMs::new(1),
+        )
+        .expect("reserves");
+    let reservation = admission.reservation.reservation_id;
+    registry
+        .set_phase(reservation, LaunchPhase::Fenced)
+        .expect("fences");
+    assert_eq!(
+        registry.occupancy().expect("counts"),
+        1,
+        "an unresolved execution still occupies the environment"
+    );
+    registry
+        .set_phase(reservation, LaunchPhase::Failed)
+        .expect("resolves");
+    assert_eq!(
+        registry.occupancy().expect("counts"),
+        0,
+        "a launch confirmed not to have started occupies nothing"
     );
 }

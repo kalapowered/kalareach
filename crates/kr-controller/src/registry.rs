@@ -24,19 +24,24 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::error::{ControllerError, Result};
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// How far a reservation has progressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchPhase {
     /// Recorded, nothing spawned.
     Reserved,
-    /// The service manager was asked to start a worker.
+    /// The service manager was asked to start a worker. Execution may have begun.
     Spawned,
-    /// The worker presented its startup claim and the session is live.
+    /// A worker claimed this reservation. The claim is consumed; no second one is admitted.
+    Claimed,
+    /// The worker reported its root shell and the session is live.
     Live,
-    /// The reservation was fenced and must never be resumed.
+    /// The reservation was fenced and must never be resumed. Its execution is unresolved, so it
+    /// still occupies a slot: something may be running that this host did not admit.
     Fenced,
+    /// The launch is confirmed not to have produced a running worker. It occupies nothing.
+    Failed,
     /// The session closed.
     Closed,
 }
@@ -48,8 +53,10 @@ impl LaunchPhase {
         match self {
             Self::Reserved => "reserved",
             Self::Spawned => "spawned",
+            Self::Claimed => "claimed",
             Self::Live => "live",
             Self::Fenced => "fenced",
+            Self::Failed => "failed",
             Self::Closed => "closed",
         }
     }
@@ -58,8 +65,10 @@ impl LaunchPhase {
         match text {
             "reserved" => Some(Self::Reserved),
             "spawned" => Some(Self::Spawned),
+            "claimed" => Some(Self::Claimed),
             "live" => Some(Self::Live),
             "fenced" => Some(Self::Fenced),
+            "failed" => Some(Self::Failed),
             "closed" => Some(Self::Closed),
             _ => None,
         }
@@ -77,6 +86,11 @@ pub struct Reservation {
     pub create_token: Uuid,
     /// The digest of the immutable create payload.
     pub payload_digest: Digest256,
+    /// The create request itself, canonically encoded.
+    ///
+    /// It is written before anything is spawned. A daemon that restarts mid-create can then say
+    /// what the session was going to be instead of holding an identifier with no request behind it.
+    pub create_intent: Vec<u8>,
     /// The session identifier allocated for it.
     pub session_id: SessionId,
     /// The display number allocated for it.
@@ -85,6 +99,11 @@ pub struct Reservation {
     pub phase: LaunchPhase,
     /// The process identity the launcher reported, once one exists.
     pub launcher_identity: Option<ProcessStartIdentity>,
+    /// The public key the claiming worker presented, recorded when the claim was consumed.
+    ///
+    /// This reaches storage before the worker is told anything, so a worker that starts a shell and
+    /// then loses its ready report is still a worker this host can authenticate.
+    pub claimed_key: Option<AuthorisationKey>,
     /// When it was recorded.
     pub created_at_ms: TimestampMs,
 }
@@ -169,12 +188,14 @@ impl Registry {
                      actor_id          TEXT NOT NULL,
                      create_token      BLOB NOT NULL,
                      payload_digest    BLOB NOT NULL,
+                     create_intent     BLOB NOT NULL,
                      session_id        BLOB NOT NULL UNIQUE,
                      display_number    INTEGER NOT NULL UNIQUE,
                      phase             TEXT NOT NULL,
                      launcher_pid      INTEGER,
                      launcher_source   TEXT,
                      launcher_start    INTEGER,
+                     claimed_key       BLOB,
                      created_at_ms     INTEGER NOT NULL,
                      UNIQUE (actor_id, create_token)
                  );
@@ -313,7 +334,11 @@ impl Registry {
         Ok(())
     }
 
-    /// Returns how many sessions are live or still being created.
+    /// Returns how many sessions occupy the environment.
+    ///
+    /// A fenced reservation counts. Fencing means the host stopped trusting a claim, not that the
+    /// execution behind it ended; until that is resolved something may be running, and admitting a
+    /// new session in its place would put the environment over its limit.
     ///
     /// # Errors
     ///
@@ -322,12 +347,43 @@ impl Registry {
         let value: i64 = self
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM reservations WHERE phase IN ('reserved', 'spawned', 'live')",
+                "SELECT COUNT(*) FROM reservations
+                 WHERE phase IN ('reserved', 'spawned', 'claimed', 'live', 'fenced')",
                 [],
                 |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
         Ok(u64::try_from(value).unwrap_or_default())
+    }
+
+    /// Returns every reservation in one phase.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
+    pub fn reservations_in(&self, phase: LaunchPhase) -> Result<Vec<Reservation>> {
+        let ids: Vec<Vec<u8>> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT reservation_id FROM reservations WHERE phase = ?1
+                     ORDER BY display_number",
+                )
+                .map_err(ControllerError::registry)?;
+            let rows = statement
+                .query_map(params![phase.as_str()], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(ControllerError::registry)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(ControllerError::registry)?
+        };
+        let mut reservations = Vec::new();
+        for id in ids {
+            let reservation_id = ReservationId::new(uuid_from(&id)?);
+            if let Some(reservation) = self.reservation(reservation_id)? {
+                reservations.push(reservation);
+            }
+        }
+        Ok(reservations)
     }
 
     /// Records a reservation, or returns the one this create token already made.
@@ -346,6 +402,7 @@ impl Registry {
         actor_id: &ActorId,
         create_token: Uuid,
         payload_digest: Digest256,
+        create_intent: &[u8],
         now_ms: TimestampMs,
     ) -> Result<Admission> {
         if let Some(existing) = self.reservation_for_token(actor_id, create_token)? {
@@ -391,22 +448,25 @@ impl Registry {
             actor_id: actor_id.clone(),
             create_token,
             payload_digest,
+            create_intent: create_intent.to_vec(),
             session_id: SessionId::new(kr_ipc::new_uuid()),
             display_number: DisplayNumber::new(u64::try_from(next_display).unwrap_or_default()),
             phase: LaunchPhase::Reserved,
             launcher_identity: None,
+            claimed_key: None,
             created_at_ms: now_ms,
         };
         transaction
             .execute(
                 "INSERT INTO reservations (reservation_id, actor_id, create_token, payload_digest,
-                     session_id, display_number, phase, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     create_intent, session_id, display_number, phase, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     reservation.reservation_id.get().as_bytes().as_slice(),
                     reservation.actor_id.as_str(),
                     reservation.create_token.as_bytes().as_slice(),
                     reservation.payload_digest.as_bytes().as_slice(),
+                    reservation.create_intent.as_slice(),
                     reservation.session_id.get().as_bytes().as_slice(),
                     i64::try_from(reservation.display_number.get()).unwrap_or(i64::MAX),
                     reservation.phase.as_str(),
@@ -421,7 +481,11 @@ impl Registry {
         })
     }
 
-    /// Records the identity the launcher reported and moves the reservation to `spawned`.
+    /// Records the identity the launcher reported for a spawned reservation.
+    ///
+    /// The phase is not touched. It moved to `spawned` before the service manager was called, and
+    /// a reservation that has since been claimed or fenced must not be moved back by a launcher
+    /// report that arrives afterwards.
     ///
     /// # Errors
     ///
@@ -433,12 +497,11 @@ impl Registry {
     ) -> Result<()> {
         self.connection
             .execute(
-                "UPDATE reservations SET phase = ?2, launcher_pid = ?3, launcher_source = ?4,
-                        launcher_start = ?5
+                "UPDATE reservations SET launcher_pid = ?2, launcher_source = ?3,
+                        launcher_start = ?4
                  WHERE reservation_id = ?1",
                 params![
                     reservation_id.get().as_bytes().as_slice(),
-                    LaunchPhase::Spawned.as_str(),
                     i64::try_from(identity.pid.get()).unwrap_or(i64::MAX),
                     source_name(identity.source),
                     i64::try_from(identity.start_value.get()).unwrap_or(i64::MAX),
@@ -446,6 +509,83 @@ impl Registry {
             )
             .map_err(ControllerError::registry)?;
         Ok(())
+    }
+
+    /// Consumes a reservation's single rendezvous admission.
+    ///
+    /// One launched process, one claim. The phase moves out of `spawned` in the same transaction
+    /// that reads it, so two claims arriving together cannot both find it spawned; the second one
+    /// finds `claimed` and is fenced. The worker's public key is written here, before the worker is
+    /// told anything, so a claim that is admitted is a claim this host can authenticate afterwards
+    /// whatever happens next.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RendezvousRefused`] when the reservation is not waiting for a
+    /// claim, and a registry failure when the write fails.
+    pub fn claim_rendezvous(
+        &mut self,
+        reservation_id: ReservationId,
+        worker_public_key: AuthorisationKey,
+    ) -> Result<Reservation> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(ControllerError::registry)?;
+        let phase: Option<String> = transaction
+            .query_row(
+                "SELECT phase FROM reservations WHERE reservation_id = ?1",
+                params![reservation_id.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        let phase = phase
+            .as_deref()
+            .and_then(LaunchPhase::parse)
+            .ok_or_else(|| ControllerError::rendezvous("no reservation matches this claim"))?;
+        if phase != LaunchPhase::Spawned {
+            // A second claim on one reservation means the host cannot tell which process owns the
+            // session. Fencing it is the only answer that does not hand the session to a guess.
+            if matches!(phase, LaunchPhase::Claimed | LaunchPhase::Live) {
+                transaction
+                    .execute(
+                        "UPDATE reservations SET phase = ?2 WHERE reservation_id = ?1",
+                        params![
+                            reservation_id.get().as_bytes().as_slice(),
+                            LaunchPhase::Fenced.as_str()
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+                transaction.commit().map_err(ControllerError::registry)?;
+            }
+            return Err(ControllerError::rendezvous(format!(
+                "this reservation is {} and accepts no further claim",
+                phase.as_str()
+            )));
+        }
+        transaction
+            .execute(
+                "UPDATE reservations SET phase = ?2, claimed_key = ?3 WHERE reservation_id = ?1",
+                params![
+                    reservation_id.get().as_bytes().as_slice(),
+                    LaunchPhase::Claimed.as_str(),
+                    worker_public_key.as_bytes().as_slice(),
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        self.reservation(reservation_id)?
+            .ok_or_else(|| ControllerError::rendezvous("the reservation vanished"))
+    }
+
+    /// Fences a reservation, whatever phase it is in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn fence(&mut self, reservation_id: ReservationId) -> Result<()> {
+        self.set_phase(reservation_id, LaunchPhase::Fenced)
     }
 
     /// Moves a reservation to a new phase.
@@ -472,7 +612,7 @@ impl Registry {
         self.read_reservation(
             "SELECT reservation_id, actor_id, create_token, payload_digest, session_id,
                     display_number, phase, launcher_pid, launcher_source, launcher_start,
-                    created_at_ms
+                    created_at_ms, create_intent, claimed_key
              FROM reservations WHERE reservation_id = ?1",
             params![reservation_id.get().as_bytes().as_slice()],
         )
@@ -490,7 +630,7 @@ impl Registry {
         self.read_reservation(
             "SELECT reservation_id, actor_id, create_token, payload_digest, session_id,
                     display_number, phase, launcher_pid, launcher_source, launcher_start,
-                    created_at_ms
+                    created_at_ms, create_intent, claimed_key
              FROM reservations WHERE session_id = ?1",
             params![session_id.get().as_bytes().as_slice()],
         )
@@ -504,7 +644,7 @@ impl Registry {
         self.read_reservation(
             "SELECT reservation_id, actor_id, create_token, payload_digest, session_id,
                     display_number, phase, launcher_pid, launcher_source, launcher_start,
-                    created_at_ms
+                    created_at_ms, create_intent, claimed_key
              FROM reservations WHERE actor_id = ?1 AND create_token = ?2",
             params![actor_id.as_str(), create_token.as_bytes().as_slice()],
         )
@@ -517,74 +657,25 @@ impl Registry {
     ) -> Result<Option<Reservation>> {
         self.connection
             .query_row(query, parameters, |row| {
-                let reservation: Vec<u8> = row.get(0)?;
-                let token: Vec<u8> = row.get(2)?;
-                let digest: Vec<u8> = row.get(3)?;
-                let session: Vec<u8> = row.get(4)?;
-                let phase: String = row.get(6)?;
-                let pid: Option<i64> = row.get(7)?;
-                let source: Option<String> = row.get(8)?;
-                let start: Option<i64> = row.get(9)?;
-                Ok((
-                    reservation,
-                    row.get::<_, String>(1)?,
-                    token,
-                    digest,
-                    session,
-                    row.get::<_, i64>(5)?,
-                    phase,
-                    pid,
-                    source,
-                    start,
-                    row.get::<_, i64>(10)?,
-                ))
+                Ok(RawReservation {
+                    reservation: row.get(0)?,
+                    actor: row.get(1)?,
+                    token: row.get(2)?,
+                    digest: row.get(3)?,
+                    session: row.get(4)?,
+                    display: row.get(5)?,
+                    phase: row.get(6)?,
+                    pid: row.get(7)?,
+                    source: row.get(8)?,
+                    start: row.get(9)?,
+                    created: row.get(10)?,
+                    create_intent: row.get(11)?,
+                    claimed_key: row.get(12)?,
+                })
             })
             .optional()
             .map_err(ControllerError::registry)?
-            .map(
-                |(
-                    reservation,
-                    actor,
-                    token,
-                    digest,
-                    session,
-                    display,
-                    phase,
-                    pid,
-                    source,
-                    start,
-                    created,
-                )| {
-                    Ok(Reservation {
-                        reservation_id: ReservationId::new(uuid_from(&reservation)?),
-                        actor_id: ActorId::new(actor).map_err(|_| {
-                            ControllerError::registry("a stored actor is not valid")
-                        })?,
-                        create_token: uuid_from(&token)?,
-                        payload_digest: digest_from(&digest)?,
-                        session_id: SessionId::new(uuid_from(&session)?),
-                        display_number: DisplayNumber::new(
-                            u64::try_from(display).unwrap_or_default(),
-                        ),
-                        phase: LaunchPhase::parse(&phase).ok_or_else(|| {
-                            ControllerError::registry("a stored launch phase is not known")
-                        })?,
-                        launcher_identity: match (pid, source, start) {
-                            (Some(pid), Some(source), Some(start)) => Some(ProcessStartIdentity {
-                                pid: kr_protocol::scalars::U64::new(
-                                    u64::try_from(pid).unwrap_or_default(),
-                                ),
-                                source: source_from(&source)?,
-                                start_value: kr_protocol::scalars::U64::new(
-                                    u64::try_from(start).unwrap_or_default(),
-                                ),
-                            }),
-                            _ => None,
-                        },
-                        created_at_ms: TimestampMs::new(u64::try_from(created).unwrap_or_default()),
-                    })
-                },
-            )
+            .map(RawReservation::into_reservation)
             .transpose()
     }
 
@@ -661,15 +752,24 @@ impl Registry {
                 ],
             )
             .map_err(ControllerError::registry)?;
-        transaction
+        // Only a consumed claim becomes live. A reservation that was fenced while its worker was
+        // reporting stays fenced: the ready report does not answer the question fencing asked.
+        let promoted = transaction
             .execute(
-                "UPDATE reservations SET phase = ?2 WHERE reservation_id = ?1",
+                "UPDATE reservations SET phase = ?2 WHERE reservation_id = ?1 AND phase = ?3",
                 params![
                     reservation_id.get().as_bytes().as_slice(),
-                    LaunchPhase::Live.as_str()
+                    LaunchPhase::Live.as_str(),
+                    LaunchPhase::Claimed.as_str(),
                 ],
             )
             .map_err(ControllerError::registry)?;
+        if promoted == 0 {
+            transaction.rollback().map_err(ControllerError::registry)?;
+            return Err(ControllerError::rendezvous(
+                "this reservation is no longer waiting for a ready report",
+            ));
+        }
         transaction.commit().map_err(ControllerError::registry)?;
         Ok(())
     }
@@ -788,6 +888,51 @@ impl Registry {
                     .map_err(ControllerError::registry)
             })
             .transpose()
+    }
+}
+
+struct RawReservation {
+    reservation: Vec<u8>,
+    actor: String,
+    token: Vec<u8>,
+    digest: Vec<u8>,
+    session: Vec<u8>,
+    display: i64,
+    phase: String,
+    pid: Option<i64>,
+    source: Option<String>,
+    start: Option<i64>,
+    created: i64,
+    create_intent: Vec<u8>,
+    claimed_key: Option<Vec<u8>>,
+}
+
+impl RawReservation {
+    fn into_reservation(self) -> Result<Reservation> {
+        Ok(Reservation {
+            reservation_id: ReservationId::new(uuid_from(&self.reservation)?),
+            actor_id: ActorId::new(self.actor)
+                .map_err(|_| ControllerError::registry("a stored actor is not valid"))?,
+            create_token: uuid_from(&self.token)?,
+            payload_digest: digest_from(&self.digest)?,
+            create_intent: self.create_intent,
+            session_id: SessionId::new(uuid_from(&self.session)?),
+            display_number: DisplayNumber::new(u64::try_from(self.display).unwrap_or_default()),
+            phase: LaunchPhase::parse(&self.phase)
+                .ok_or_else(|| ControllerError::registry("a stored launch phase is not known"))?,
+            launcher_identity: match (self.pid, self.source, self.start) {
+                (Some(pid), Some(source), Some(start)) => Some(ProcessStartIdentity {
+                    pid: kr_protocol::scalars::U64::new(u64::try_from(pid).unwrap_or_default()),
+                    source: source_from(&source)?,
+                    start_value: kr_protocol::scalars::U64::new(
+                        u64::try_from(start).unwrap_or_default(),
+                    ),
+                }),
+                _ => None,
+            },
+            claimed_key: self.claimed_key.as_deref().map(key_from).transpose()?,
+            created_at_ms: TimestampMs::new(u64::try_from(self.created).unwrap_or_default()),
+        })
     }
 }
 
