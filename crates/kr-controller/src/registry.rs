@@ -350,9 +350,9 @@ impl Registry {
     ) -> Result<Admission> {
         if let Some(existing) = self.reservation_for_token(actor_id, create_token)? {
             if existing.payload_digest != payload_digest {
-                return Err(ControllerError::InvalidArgument(format!(
-                    "create token {create_token} was already used with a different request"
-                )));
+                return Err(ControllerError::IdConflict {
+                    token: create_token.to_string(),
+                });
             }
             return Ok(Admission {
                 reservation: existing,

@@ -22,6 +22,9 @@ pub enum CliError {
     /// The command must run inside a session and did not.
     #[error("this command needs a session; run it inside one or name the session")]
     NotInSession,
+    /// The host does not implement the requested shell integration mode.
+    #[error("{0}")]
+    ShellIntegrationUnsupported(String),
     /// The command needs a terminal and does not have one.
     #[error("this command needs a terminal")]
     NotATerminal,
@@ -51,6 +54,7 @@ impl CliError {
             Self::HostUnavailable(_) => 3,
             Self::UnknownSession(_) | Self::NotInSession => 4,
             Self::AmbiguousSession(_) => 5,
+            Self::ShellIntegrationUnsupported(_) => 2,
             Self::NotATerminal | Self::Terminal(_) => 6,
             Self::TerminalUnavailable(_) => 7,
             Self::Refused(_) => 8,
@@ -71,8 +75,14 @@ impl CliError {
                     .as_str()
                     .to_owned()
             }
-            Self::UnknownSession(_) | Self::NotInSession => {
-                kr_protocol::error::ErrorCode::UnknownSession
+            Self::UnknownSession(_) => kr_protocol::error::ErrorCode::UnknownSession
+                .as_str()
+                .to_owned(),
+            Self::NotInSession => kr_protocol::error::ErrorCode::NotInKrSession
+                .as_str()
+                .to_owned(),
+            Self::ShellIntegrationUnsupported(_) => {
+                kr_protocol::error::ErrorCode::ShellIntegrationUnsupported
                     .as_str()
                     .to_owned()
             }

@@ -59,7 +59,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::New(arguments) => {
             let presentation = arguments.presentation.resolve(stdio_is_terminal())?;
             if arguments.shell_mode != ShellMode::NativeCompat.as_str() {
-                return Err(CliError::Usage(format!(
+                return Err(CliError::ShellIntegrationUnsupported(format!(
                     "this host implements the native_compat shell mode; {} needs a qualified shell package",
                     arguments.shell_mode
                 )));

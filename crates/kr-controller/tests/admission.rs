@@ -56,7 +56,7 @@ fn the_same_token_with_a_different_payload_is_refused() {
     let error = registry
         .reserve(&actor("local:501"), token, digest(2), TimestampMs::new(2))
         .expect_err("refuses");
-    assert!(matches!(error, ControllerError::InvalidArgument(_)));
+    assert!(matches!(error, ControllerError::IdConflict { .. }));
     assert_eq!(registry.occupancy().expect("counts"), 1);
 }
 

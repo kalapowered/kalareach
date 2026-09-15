@@ -52,6 +52,12 @@ pub enum ControllerError {
         /// The identifier that was named.
         session: String,
     },
+    /// A create token was reused with a different request.
+    #[error("create token {token} was already used with a different request")]
+    IdConflict {
+        /// The token that was reused.
+        token: String,
+    },
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
@@ -99,6 +105,7 @@ impl ControllerError {
             Self::RendezvousRefused { .. } | Self::Verification(_) => ErrorCode::PermissionDenied,
             Self::UnknownSession { .. } => ErrorCode::UnknownSession,
             Self::SessionClosed { .. } => ErrorCode::SessionClosed,
+            Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::Ipc(error) => error.code(),
             Self::NotConfigured(_) => ErrorCode::HostNotConfigured,
