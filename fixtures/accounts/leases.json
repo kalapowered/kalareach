@@ -1,0 +1,430 @@
+{
+  "cases": [
+    {
+      "cbor_hex": "82756b722d6d656d626572736869702d6c656173652f31a764726f6c65656f776e65726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306c6973737565645f61745f6d731b0000019b76daa8006c6b65795f7265766973696f6e026d657870697265735f61745f6d731b0000019b76e863a06e6d6178696d756d5f6772616e7473866a66696c65732e72656164707175657374696f6e2e726573706f6e646d73657373696f6e2e636c6f73656d73657373696f6e2e73686172656c73657373696f6e2e766965776e7465726d696e616c2e696e7075746f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "description": "A fifteen-minute owner lease, signed by the revision the head names.",
+      "domain": "kr-membership-lease/1",
+      "id": "membership_lease",
+      "json": {
+        "payload": {
+          "account_id": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90",
+          "expires_at_ms": "1767226500000",
+          "issued_at_ms": "1767225600000",
+          "key_revision": "2",
+          "maximum_grants": [
+            "files.read",
+            "question.respond",
+            "session.close",
+            "session.share",
+            "session.view",
+            "terminal.input"
+          ],
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "role": "owner"
+        },
+        "signature": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWg"
+      },
+      "sha256": "8f264ac2796ca9f584fa37fa780c895c7283914f951270b70525147319342833",
+      "value": {
+        "array": [
+          {
+            "text": "kr-membership-lease/1"
+          },
+          {
+            "map": [
+              [
+                "role",
+                {
+                  "text": "owner"
+                }
+              ],
+              [
+                "account_id",
+                {
+                  "text": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90"
+                }
+              ],
+              [
+                "issued_at_ms",
+                {
+                  "int": "1767225600000"
+                }
+              ],
+              [
+                "key_revision",
+                {
+                  "int": "2"
+                }
+              ],
+              [
+                "expires_at_ms",
+                {
+                  "int": "1767226500000"
+                }
+              ],
+              [
+                "maximum_grants",
+                {
+                  "array": [
+                    {
+                      "text": "files.read"
+                    },
+                    {
+                      "text": "question.respond"
+                    },
+                    {
+                      "text": "session.close"
+                    },
+                    {
+                      "text": "session.share"
+                    },
+                    {
+                      "text": "session.view"
+                    },
+                    {
+                      "text": "terminal.input"
+                    }
+                  ]
+                }
+              ],
+              [
+                "organisation_id",
+                {
+                  "bytes": "8f14e45fea1e4b9e9f3a0a3a9b0d2f61"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82756b722d6d656d626572736869702d6c656173652f31a764726f6c656872657669657765726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306c6973737565645f61745f6d731b0000019b76daa8006c6b65795f7265766973696f6e026d657870697265735f61745f6d731b0000019b76df3be06e6d6178696d756d5f6772616e7473826a66696c65732e726561646c73657373696f6e2e766965776f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "description": "A five-minute reviewer lease naming less than the role's ceiling.",
+      "domain": "kr-membership-lease/1",
+      "id": "membership_lease_narrowed",
+      "json": {
+        "payload": {
+          "account_id": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90",
+          "expires_at_ms": "1767225900000",
+          "issued_at_ms": "1767225600000",
+          "key_revision": "2",
+          "maximum_grants": [
+            "files.read",
+            "session.view"
+          ],
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "role": "reviewer"
+        },
+        "signature": "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2traw"
+      },
+      "sha256": "c4ec549d6b47fc32065dabf95639338d6274b4467f8a398bb03cde0d8f2461d6",
+      "value": {
+        "array": [
+          {
+            "text": "kr-membership-lease/1"
+          },
+          {
+            "map": [
+              [
+                "role",
+                {
+                  "text": "reviewer"
+                }
+              ],
+              [
+                "account_id",
+                {
+                  "text": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90"
+                }
+              ],
+              [
+                "issued_at_ms",
+                {
+                  "int": "1767225600000"
+                }
+              ],
+              [
+                "key_revision",
+                {
+                  "int": "2"
+                }
+              ],
+              [
+                "expires_at_ms",
+                {
+                  "int": "1767225900000"
+                }
+              ],
+              [
+                "maximum_grants",
+                {
+                  "array": [
+                    {
+                      "text": "files.read"
+                    },
+                    {
+                      "text": "session.view"
+                    }
+                  ]
+                }
+              ],
+              [
+                "organisation_id",
+                {
+                  "bytes": "8f14e45fea1e4b9e9f3a0a3a9b0d2f61"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82756b722d706f6c6963792d617574686f726974792f31a56a7075626c69635f6b6579582011111111111111111111111111111111111111111111111111111111111111116c6b65795f7265766973696f6e016d6e6f745f6265666f72655f6d731b0000019b71b44c006f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f617570726576696f75735f6b65795f7265766973696f6ef6",
+      "description": "The first revision of a chain, which signs itself and names no predecessor.",
+      "domain": "kr-policy-authority/1",
+      "id": "policy_authority_first_revision",
+      "json": {
+        "payload": {
+          "key_revision": "1",
+          "not_before_ms": "1767139200000",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "previous_key_revision": null,
+          "public_key": "ERERERERERERERERERERERERERERERERERERERERERE"
+        },
+        "signature": "ISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhIQ"
+      },
+      "sha256": "e986dbd202b75b53cc6ab4ee4032f533ee2ab7142ea60c7318a3adbf73954675",
+      "value": {
+        "array": [
+          {
+            "text": "kr-policy-authority/1"
+          },
+          {
+            "map": [
+              [
+                "public_key",
+                {
+                  "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
+                }
+              ],
+              [
+                "key_revision",
+                {
+                  "int": "1"
+                }
+              ],
+              [
+                "not_before_ms",
+                {
+                  "int": "1767139200000"
+                }
+              ],
+              [
+                "organisation_id",
+                {
+                  "bytes": "8f14e45fea1e4b9e9f3a0a3a9b0d2f61"
+                }
+              ],
+              [
+                "previous_key_revision",
+                {
+                  "null": true
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82756b722d706f6c6963792d617574686f726974792f31a56a7075626c69635f6b6579582022222222222222222222222222222222222222222222222222222222222222226c6b65795f7265766973696f6e026d6e6f745f6265666f72655f6d731b0000019b74477a006f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f617570726576696f75735f6b65795f7265766973696f6e01",
+      "description": "The second revision, signed by the first.",
+      "domain": "kr-policy-authority/1",
+      "id": "policy_authority_rotation",
+      "json": {
+        "payload": {
+          "key_revision": "2",
+          "not_before_ms": "1767182400000",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "previous_key_revision": "1",
+          "public_key": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI"
+        },
+        "signature": "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMg"
+      },
+      "sha256": "2fba9fb861f5f52ffc1861536cdc82881f6e71a15f79ef21526080fa577f1c8a",
+      "value": {
+        "array": [
+          {
+            "text": "kr-policy-authority/1"
+          },
+          {
+            "map": [
+              [
+                "public_key",
+                {
+                  "bytes": "2222222222222222222222222222222222222222222222222222222222222222"
+                }
+              ],
+              [
+                "key_revision",
+                {
+                  "int": "2"
+                }
+              ],
+              [
+                "not_before_ms",
+                {
+                  "int": "1767182400000"
+                }
+              ],
+              [
+                "organisation_id",
+                {
+                  "bytes": "8f14e45fea1e4b9e9f3a0a3a9b0d2f61"
+                }
+              ],
+              [
+                "previous_key_revision",
+                {
+                  "int": "1"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82781a6b722d706f6c6963792d617574686f726974792d686561642f31a46c6973737565645f61745f6d731b0000019b76daa8006c6b65795f7265766973696f6e026d657870697265735f61745f6d731b0000019b76e863a06f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "description": "The statement that revision 2 signs leases now.",
+      "domain": "kr-policy-authority-head/1",
+      "id": "policy_authority_head",
+      "json": {
+        "payload": {
+          "expires_at_ms": "1767226500000",
+          "issued_at_ms": "1767225600000",
+          "key_revision": "2",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61"
+        },
+        "signature": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQw"
+      },
+      "sha256": "057aac76488eff16bc8177772a95f9fb274e096e5575238165feecc1b849f2e8",
+      "value": {
+        "array": [
+          {
+            "text": "kr-policy-authority-head/1"
+          },
+          {
+            "map": [
+              [
+                "issued_at_ms",
+                {
+                  "int": "1767225600000"
+                }
+              ],
+              [
+                "key_revision",
+                {
+                  "int": "2"
+                }
+              ],
+              [
+                "expires_at_ms",
+                {
+                  "int": "1767226500000"
+                }
+              ],
+              [
+                "organisation_id",
+                {
+                  "bytes": "8f14e45fea1e4b9e9f3a0a3a9b0d2f61"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "description": "Membership leases and the organisation policy-signing authority chain: the exact bytes each signature covers.",
+  "lifetimes_ms": {
+    "membership_lease_maximum": "900000",
+    "membership_lease_refresh": "300000",
+    "policy_authority_head_maximum": "900000"
+  },
+  "name": "leases",
+  "note": "Values use the same description grammar as fixtures/cbor. cbor_hex is the canonical KR-CBOR-1 encoding of CBOR([domain, payload]), the bytes a signature covers; sha256 is its digest. json is the managed HTTP representation of the whole record, signature included. The signatures in json are fixed test bytes, not verifiable signatures: signature vectors need a signing implementation and live with the cryptography fixtures. Every case belongs to the chain in published_authority, whose revision 2 has been signing since twelve hours before the leases were issued.",
+  "published_authority": {
+    "chain": [
+      {
+        "payload": {
+          "key_revision": "1",
+          "not_before_ms": "1767139200000",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "previous_key_revision": null,
+          "public_key": "ERERERERERERERERERERERERERERERERERERERERERE"
+        },
+        "signature": "ISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhIQ"
+      },
+      {
+        "payload": {
+          "key_revision": "2",
+          "not_before_ms": "1767182400000",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "previous_key_revision": "1",
+          "public_key": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI"
+        },
+        "signature": "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMg"
+      }
+    ],
+    "head": {
+      "payload": {
+        "expires_at_ms": "1767226500000",
+        "issued_at_ms": "1767225600000",
+        "key_revision": "2",
+        "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61"
+      },
+      "signature": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQw"
+    },
+    "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61"
+  },
+  "roles": [
+    {
+      "maximum_grants": [
+        "question.respond",
+        "session.view"
+      ],
+      "role": "viewer"
+    },
+    {
+      "maximum_grants": [
+        "files.read",
+        "question.respond",
+        "session.view"
+      ],
+      "role": "reviewer"
+    },
+    {
+      "maximum_grants": [
+        "files.read",
+        "question.respond",
+        "session.view",
+        "terminal.input"
+      ],
+      "role": "controller"
+    },
+    {
+      "maximum_grants": [
+        "files.read",
+        "question.respond",
+        "session.close",
+        "session.share",
+        "session.view",
+        "terminal.input"
+      ],
+      "role": "owner"
+    }
+  ]
+}

@@ -407,10 +407,53 @@ Reading the fields:
 - `input.write` is the only method with `ordered_stream` idempotency and an `input_lease` freshness
   context. Raw input is an ordered stream per connection, never replayed after a reconnect.
 
+## Account authority objects
+
+An organisation states membership with a signed object, so a host can check it while the service is
+unreachable. `crates/kr-protocol/src/account.rs` holds three of them, and `packages/protocol`
+builds the same bytes in TypeScript.
+
+| Domain | Payload | What it says |
+| --- | --- | --- |
+| `kr-membership-lease/1` | `MembershipLeasePayload` | One account held one role in one organisation until a stated time |
+| `kr-policy-authority/1` | `PolicyAuthorityLinkPayload` | One revision of an organisation's policy-signing key, signed by the revision it follows |
+| `kr-policy-authority-head/1` | `PolicyAuthorityHeadPayload` | Which revision signs leases now, signed by that revision |
+
+Each signature covers `CBOR([domain, payload])`, where the payload is the record without its
+signature, encoded as a canonical map. The domain is what stops one statement being read as
+another.
+
+A lease lasts at most fifteen minutes and is refreshed every five. It names `maximum_grants` from
+the action-right vocabulary the rest of the protocol uses, so a host intersects a lease with the
+grants it already understands rather than with a second set of names. The role is a label for that
+ceiling: `TeamRole::maximum_grants` is the most a role may ever carry, a lease may name less, and
+`MembershipLeasePayload::grants_within_role` is the check that it names no more. Authority still
+comes from the grants, never from the label.
+
+The first revision of a chain signs itself and names no predecessor, which is what a host pins.
+Every later revision names the revision whose key signed it, so a host walks forward from the
+revision it pinned without being told which key to trust. Any prefix of a chain verifies on its
+own, so the head statement is what says the chain is complete.
+
+`PolicyAuthority::check_structure` makes every check that needs neither a signature nor the clock:
+ordering, succession, activation times, that the head names the last revision, and that it was not
+issued before that revision took over. Accepting a chain is that check, then the signature of each
+link under the key of the revision it names as its predecessor, then the head under the key of the
+revision the head names, then that the head is valid at the current time, then refusing a head
+below the highest revision this host has already accepted — and only then recording the new
+highest revision.
+
+What that proves has a boundary worth stating. A head expires, so a captured head stops being
+usable, and a host that has accepted a later revision refuses one naming an earlier revision.
+Neither fact proves that the private key of a retired revision is gone: a host that never saw the
+rotation cannot tell a fresh revision-1 head signed by a retained revision-1 key from a legitimate
+one. Rotation therefore destroys the private half of the revision it retires, and a host that must
+detect a compromised predecessor needs evidence from outside this chain.
+
 ## Fixtures
 
-`fixtures/cbor/`, `fixtures/protocol/` and `fixtures/relay/` hold the vectors both languages run
-against. The Rust
+`fixtures/cbor/`, `fixtures/protocol/`, `fixtures/relay/` and `fixtures/accounts/` hold the vectors
+both languages run against. The Rust
 tests read them from `crates/*/tests/`, and the vitest suites read the same files.
 
 Values use a small tagged grammar, so a fixture can express a byte string, a 64-bit integer and a
@@ -443,6 +486,7 @@ ordering cases test what they claim to test.
 | `relay/leases.json` | A two-way lease on a two-relay route, a sponsored single-relay lease inside its grace, and a revocation |
 | `relay/receipts.json` | Two consumption receipts of one reservation, showing the cumulative count |
 | `relay/instances.json` | A relay instance registration and an announced key rotation |
+| `accounts/leases.json` | The signing input of every account authority object, with the role ceilings and lifetimes |
 
 An invalid case names its rule with the same string in both languages, for example
 `unsorted_map_keys` or `non_shortest_integer`. `CborError::rule` in Rust and `KrCborError.rule` in
