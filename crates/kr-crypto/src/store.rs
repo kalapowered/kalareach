@@ -399,11 +399,9 @@ pub const FILE_FALLBACK_SUPPORTED: bool = cfg!(all(
 /// tightens something that belongs to another account, and the mode it sets is the mode of the
 /// directory it believes it is writing to.
 fn prepare_private_directory(directory: &Path) -> Result<()> {
-    if directory.is_symlink() {
-        return Err(CryptoError::SecretStore {
-            message: format!("{} is a symbolic link", directory.display()),
-        });
-    }
+    // Every component is checked before anything is created. `create_dir_all` on
+    // `parent/link/new` would otherwise create `new` through the link and only then be rejected.
+    reject_ancestor_links(directory)?;
     if directory.exists() {
         check_path_is_unresolved(directory)?;
         check_owner_only(directory)?;
@@ -414,6 +412,23 @@ fn prepare_private_directory(directory: &Path) -> Result<()> {
     check_path_is_unresolved(directory)?;
     set_mode(directory, 0o700)?;
     check_owner_only(directory)
+}
+
+/// Rejects a path if it, or any of its ancestors, is a symbolic link.
+///
+/// A component that does not exist yet is not a link, so this is meaningful before the directory
+/// is created as well as after.
+fn reject_ancestor_links(path: &Path) -> Result<()> {
+    let mut component = Some(path);
+    while let Some(current) = component {
+        if current.is_symlink() {
+            return Err(CryptoError::SecretStore {
+                message: format!("{} is a symbolic link", current.display()),
+            });
+        }
+        component = current.parent().filter(|parent| *parent != current);
+    }
+    Ok(())
 }
 
 /// Rejects a path any component of which is a link.

@@ -273,10 +273,16 @@ Two secret buffers in this path are not cleared, and neither is reachable from t
    Encoding and decoding an `EnvelopePlaintext` builds an intermediate value tree whose byte and
    text buffers this crate does not own and cannot reach. The buffers it does own are cleared: the
    canonical encoding, the padded plaintext and the opened `SecretVec` all zeroise. The
-   key-carrying paths avoid the trees entirely: a key wrap is assembled and read by hand, and every
-   key lives in a `Secret`. Closing this means either a value tree whose temporaries clear
-   themselves or a hand-written encoding for each envelope schema; both belong with the crate that
-   owns the encoder.
+   key-carrying paths avoid the trees entirely: a key wrap is assembled and read by hand, every key
+   lives in a `Secret`, and the QR payload's encoding is assembled by hand around its secret.
+
+   `EnvelopePlaintext` itself carries the payload in an ordinary `Bytes`, which does not zeroise
+   either. That does not make the intermediate copies harmless; it means the whole chain is
+   uncleared, and closing it means either a value tree whose temporaries clear themselves or a
+   secret-bearing payload type. Both belong with the crate that owns the encoder.
+
+   A QR payload that fails to decode is the same case in miniature: `kr-cbor` drops its own partial
+   tree before this crate can clear it. A payload that decodes is cleared.
 2. **`hkdf` 0.13.0 keeps its pseudorandom key and expansion buffers uncleared.** The crate has no
    `zeroize` feature; `hmac` and `sha2` are built with theirs. Closing this means a maintained
    release that clears them, or a reviewed patch. Section 20 requires a maintained implementation,

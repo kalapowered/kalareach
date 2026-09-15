@@ -468,6 +468,22 @@ pub fn from_base64url(text: &str) -> Result<Vec<u8>, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Decodes unpadded base64url into a caller-supplied buffer.
+///
+/// A failed decode still leaves the prefix it managed to read in the buffer. That matters when the
+/// bytes are secret: the caller owns a buffer it can clear, rather than an allocation the decoder
+/// dropped on its way out.
+///
+/// # Errors
+///
+/// Returns a message describing the first invalid character or length. The buffer holds whatever
+/// was decoded before the failure.
+pub fn from_base64url_into(text: &str, buffer: &mut Vec<u8>) -> Result<(), String> {
+    URL_SAFE_NO_PAD
+        .decode_vec(text, buffer)
+        .map_err(|error| error.to_string())
+}
+
 impl Serialize for Bytes {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
@@ -750,7 +766,10 @@ impl<'de> Deserialize<'de> for SecretBytes32 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
             let text = Zeroizing::new(String::deserialize(deserializer)?);
-            let bytes = Zeroizing::new(from_base64url(&text).map_err(de::Error::custom)?);
+            // The buffer is under `Zeroizing` before the decode starts, so a decode that fails
+            // part way through does not leave the prefix it read behind.
+            let mut bytes = Zeroizing::new(Vec::with_capacity(32));
+            from_base64url_into(&text, &mut bytes).map_err(de::Error::custom)?;
             <[u8; 32]>::try_from(bytes.as_slice())
                 .map(Self)
                 .map_err(|_| de::Error::invalid_length(bytes.len(), &"32 bytes"))

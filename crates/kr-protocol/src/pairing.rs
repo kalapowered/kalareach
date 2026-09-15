@@ -1558,13 +1558,15 @@ impl QrPayload {
                 limit,
             });
         }
-        let bytes =
-            zeroize::Zeroizing::new(crate::scalars::from_base64url(text).map_err(|reason| {
-                QrPayloadError::InvalidMember {
-                    member: "payload text",
-                    reason,
-                }
-            })?);
+        // The buffer is under `Zeroizing` before the decode starts, so a decode that fails part
+        // way through does not leave the prefix it read behind.
+        let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(text.len() / 4 * 3));
+        crate::scalars::from_base64url_into(text, &mut bytes).map_err(|reason| {
+            QrPayloadError::InvalidMember {
+                member: "payload text",
+                reason,
+            }
+        })?;
         Self::from_canonical_bytes(&bytes)
     }
 }
@@ -2026,6 +2028,62 @@ mod tests {
         );
         assert_eq!(value.len(), VERIFICATION_VALUE_LEN);
         assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    fn sample_direct_payload() -> DirectQrPayload {
+        DirectQrPayload {
+            invitation_id: InvitationId::new(crate::scalars::Uuid::from_bytes([1; 16])),
+            endpoint_id: EndpointKey::from_bytes([2; 32]),
+            network_config: NetworkConfig {
+                relay_urls: vec![NetworkHint::new("https://relay.kala.to").expect("a hint")],
+                discovery_origins: Vec::new(),
+                direct_addresses: vec![NetworkHint::new("192.0.2.1:41234").expect("a hint")],
+            },
+            secret: SecretBytes32::from_bytes([3; 32]),
+            proposed_grant: ProposedGrant {
+                parent_grant_id: Nullable::null(),
+                environment_selector: EnvironmentSelector::Any,
+                session_selector: SessionSelector::None,
+                actions: CanonicalSet::new(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+                expiry: GrantExpiry::Never,
+                organisation: Nullable::null(),
+            },
+            expires_at_ms: TimestampMs::new(1_764_000_600_000),
+        }
+    }
+
+    #[test]
+    fn the_hand_assembled_encoding_matches_the_value_tree() {
+        // The encoder writes the map head and the two secret-carrying heads itself. This is the
+        // check that it writes what the canonical encoder would have written.
+        for payload in [
+            QrPayload::Code(CodeQrPayload {
+                rendezvous_origin: origin(),
+                code: ShortCode::new("aB3x-Yz7-9Qw").expect("a code"),
+            }),
+            QrPayload::Direct(Box::new(sample_direct_payload())),
+        ] {
+            let assembled = payload.to_canonical_bytes().expect("canonical bytes");
+            let through_the_tree =
+                kr_cbor::encode(&payload.to_canonical_value().expect("a value tree"));
+            assert_eq!(
+                assembled.as_slice(),
+                through_the_tree.as_slice(),
+                "{} payload",
+                payload.mode()
+            );
+            // And it round trips, so the members are in the order the decoder expects.
+            assert_eq!(
+                QrPayload::from_canonical_bytes(&assembled).expect("a payload"),
+                payload
+            );
+        }
     }
 
     #[test]
