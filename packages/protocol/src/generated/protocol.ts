@@ -19,9 +19,25 @@ export type GrantId = string
  */
 export type AuthorityRevision = string
 /**
+ * One signed revocation request published by a remote owner.
+ */
+export type RevocationRequestId = string
+/**
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
 export type CapabilityId = string
+/**
+ * One installed OS, distribution or container environment and OS user.
+ */
+export type EnvironmentId = string
+/**
+ * The session epoch, fixed at 1 in protocol version 1.
+ */
+export type SessionEpoch = string
+/**
+ * One KalaReach terminal session.
+ */
+export type SessionId = string
 /**
  * One permitted action in a grant.
  */
@@ -48,10 +64,6 @@ export type ActionRight =
   | 'automation.manage'
   | 'host.manage'
 /**
- * One installed OS, distribution or container environment and OS user.
- */
-export type EnvironmentId = string
-/**
  * A UTC timestamp in milliseconds, as a decimal string in JSON.
  */
 export type TimestampMs = string
@@ -63,10 +75,6 @@ export type ApprovalRequestId = string
  * One agent-to-user question.
  */
 export type QuestionId = string
-/**
- * One KalaReach terminal session.
- */
-export type SessionId = string
 /**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
@@ -96,6 +104,10 @@ export type AgentTurnId = string
  */
 export type ApplicationInstanceId = string
 /**
+ * One backup archive. The service sees only this opaque identifier.
+ */
+export type ArchiveId = string
+/**
  * One CLI or application attachment, independently of its device.
  */
 export type AttachmentId = string
@@ -107,6 +119,14 @@ export type AttachmentOrdinal = string
  * One pairing attempt by one candidate: 128 random bits.
  */
 export type AttemptId = string
+/**
+ * The backup generation an archive belongs to. Only its producer advances it.
+ */
+export type BackupGeneration = string
+/**
+ * One encrypted object inside a backup archive.
+ */
+export type BackupObjectId = string
 /**
  * The host boot epoch, which binds continuous-time deadlines to one boot.
  */
@@ -136,6 +156,10 @@ export type ChangeSetVersion = string
  */
 export type ClockEpoch = string
 /**
+ * One owner-confirmation challenge: single use and bound to one action digest.
+ */
+export type ConfirmationId = string
+/**
  * One transport connection, allocated by the host during hello.
  */
 export type ConnectionId = string
@@ -163,6 +187,10 @@ export type DraftId = string
  * The exact version of a draft.
  */
 export type DraftRevision = string
+/**
+ * One stored mailbox envelope: 128 random bits.
+ */
+export type EnvelopeId = string
 /**
  * A position in one notification stream.
  */
@@ -199,6 +227,10 @@ export type MachineId = string
  * One organisation whose signed policy a host has opted into.
  */
 export type OrganisationId = string
+/**
+ * The sequence number of one message inside a pairing bundle exchange.
+ */
+export type PairingSequence = string
 /**
  * A plugin identifier from its manifest.
  */
@@ -239,10 +271,6 @@ export type RepositoryGeneration = string
  * A request identifier, unique for the lifetime of one connection.
  */
 export type RequestId = string
-/**
- * The session epoch, fixed at 1 in protocol version 1.
- */
-export type SessionEpoch = string
 /**
  * A private broker handle for immutable upstream bytes and their execution provenance.
  */
@@ -310,6 +338,61 @@ export type ResourceSelectorKind =
   | 'mailbox'
   | 'agent_target'
 /**
+ * What `pair.status` reports.
+ *
+ * It never reveals secret material, and the host returns it only to the candidate's authenticated
+ * endpoint or to the issuing owner.
+ */
+export type PairStatus =
+  | {
+      open: {
+        /**
+         * A UTC timestamp in milliseconds, as a decimal string in JSON.
+         */
+        expires_at_ms: string
+        /**
+         * Remaining failed-confirmation allowance on the host.
+         */
+        remaining_confirmations: number
+      }
+    }
+  | {
+      awaiting_approval: {
+        /**
+         * The candidate's attempt.
+         */
+        attempt_id: string
+        /**
+         * A UTC timestamp in milliseconds, as a decimal string in JSON.
+         */
+        expires_at_ms: string
+        /**
+         * The verification value shown on both devices.
+         */
+        verification_value: string
+      }
+    }
+  | {
+      committed: {
+        /**
+         * One paired device.
+         */
+        device_id: string
+        /**
+         * One host-issued authority object.
+         */
+        grant_id: string
+      }
+    }
+  | {
+      consumed: {
+        /**
+         * Why it was consumed.
+         */
+        reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
+      }
+    }
+/**
  * Why an action was rejected before dispatch.
  */
 export type RejectionReason =
@@ -318,13 +401,23 @@ export type RejectionReason =
  * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
  */
 export type ParamsValue = unknown
+/**
+ * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
+ */
+export type NetworkHint = string
 
 /**
  * Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.
  */
 export interface KalaReachProtocol {
   actor_envelope?: ActorEnvelope
+  archive_descriptor?: ArchiveDescriptor
+  authority_revision_record?: AuthorityRevisionRecord
   client_offer?: ClientOffer
+  direct_challenge?: DirectChallenge
+  direct_redeem_proof?: DirectRedeemProof
+  envelope_plaintext?: EnvelopePlaintext
+  generation_checkpoint?: GenerationCheckpoint
   grant?: Grant
   host_selection?: HostSelection
   /**
@@ -339,10 +432,13 @@ export interface KalaReachProtocol {
     agent_turn_id?: AgentTurnId
     application_instance_id?: ApplicationInstanceId
     approval_request_id?: ApprovalRequestId
+    archive_id?: ArchiveId
     attachment_id?: AttachmentId
     attachment_ordinal?: AttachmentOrdinal
     attempt_id?: AttemptId
     authority_revision?: AuthorityRevision
+    backup_generation?: BackupGeneration
+    backup_object_id?: BackupObjectId
     boot_epoch?: BootEpoch
     build_id?: BuildId
     capability_id?: CapabilityId
@@ -351,6 +447,7 @@ export interface KalaReachProtocol {
     change_set_id?: ChangeSetId
     change_set_version?: ChangeSetVersion
     clock_epoch?: ClockEpoch
+    confirmation_id?: ConfirmationId
     connection_id?: ConnectionId
     controller_generation?: ControllerGeneration
     desktop_session_id?: DesktopSessionId
@@ -359,6 +456,7 @@ export interface KalaReachProtocol {
     diagnostic_id?: DiagnosticId
     draft_id?: DraftId
     draft_revision?: DraftRevision
+    envelope_id?: EnvelopeId
     environment_id?: EnvironmentId
     event_sequence?: EventSequence
     event_type?: EventType
@@ -370,6 +468,7 @@ export interface KalaReachProtocol {
     invitation_id?: InvitationId
     machine_id?: MachineId
     organisation_id?: OrganisationId
+    pairing_sequence?: PairingSequence
     plugin_id?: PluginId
     project_repository_id?: ProjectRepositoryId
     question_id?: QuestionId
@@ -382,6 +481,7 @@ export interface KalaReachProtocol {
     remote_dispatch_lease_id?: RemoteDispatchLeaseId
     repository_generation?: RepositoryGeneration
     request_id?: RequestId
+    revocation_request_id?: RevocationRequestId
     session_epoch?: SessionEpoch
     session_id?: SessionId
     source_event_handle?: SourceEventHandle
@@ -395,12 +495,25 @@ export interface KalaReachProtocol {
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
   notification?: Notification
+  owner_confirmation_proof?: OwnerConfirmationProof
+  owner_confirmation_request?: OwnerConfirmationRequest1
+  pair_finish_request?: PairFinishRequest
+  pair_status?: PairStatus
+  proposed_grant?: ProposedGrant
   protocol_error?: ProtocolError
   receipt?: Receipt
   receipt_response?: ReceiptResponse
+  recovery_bundle?: RecoveryBundle
+  recovery_kit?: RecoveryKit
   request?: Request
   response?: Response
+  revocation_acknowledgement?: RevocationAcknowledgement
+  revocation_request?: RevocationRequest
+  sealed_envelope?: SealedEnvelope
   session_ref?: SessionRef
+  signed_archive_manifest?: SignedArchiveManifest
+  signed_client_bundle?: SignedClientBundle
+  signed_host_bundle?: SignedHostBundle
   stream_header?: StreamHeader
 }
 /**
@@ -440,6 +553,136 @@ export interface ActorEnvelope {
    */
   ingress:
     'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
+}
+/**
+ * The public descriptor of one archive.
+ *
+ * Everything outside it is opaque: the archive identity and encrypted-object references. The
+ * descriptor is validated before any object is allocated or written, so an invalid one costs
+ * nothing.
+ */
+export interface ArchiveDescriptor {
+  /**
+   * The archive.
+   */
+  archive_id: string
+  /**
+   * The generation this descriptor points at.
+   */
+  backup_generation: string
+  encrypted_manifest: EncryptedObjectRef
+  /**
+   * The manifest key, wrapped once per authorised recipient.
+   */
+  manifest_key_wraps: SealedKeyWrap[]
+  /**
+   * The descriptor version.
+   */
+  version: string
+}
+/**
+ * The encrypted manifest object.
+ */
+export interface EncryptedObjectRef {
+  /**
+   * The stored size of the encrypted object, in bytes.
+   */
+  encrypted_len: string
+  /**
+   * The SHA-256 of the encrypted object, including its `secretstream` header.
+   */
+  encrypted_object_hash: string
+  /**
+   * The object identity.
+   */
+  object_id: string
+}
+/**
+ * One wrapped object key.
+ *
+ * Every wrap uses a fresh random 24-byte nonce. Reusing stored ciphertext when an upload resumes
+ * never reuses a nonce for a new wrap.
+ */
+export interface SealedKeyWrap {
+  /**
+   * The `crypto_box_easy` output over the canonical wrap plaintext.
+   */
+  ciphertext: string
+  context: KeyWrapContext
+  /**
+   * The fresh 24-byte nonce.
+   */
+  nonce: string
+}
+/**
+ * The fields the wrap authenticates.
+ */
+export interface KeyWrapContext {
+  /**
+   * The archive.
+   */
+  archive_id: string
+  /**
+   * The backup generation.
+   */
+  backup_generation: string
+  /**
+   * The SHA-256 of the encrypted object.
+   */
+  encrypted_object_hash: string
+  /**
+   * The wrap format.
+   */
+  format: 'kr-keywrap/1'
+  /**
+   * The object the key belongs to.
+   */
+  object_id: string
+  /**
+   * What the wrapped key opens.
+   */
+  purpose: 'manifest_key' | 'object_key' | 'recovery_bundle_key'
+  /**
+   * The recipient's stored-envelope key.
+   */
+  recipient_key_id: string
+  /**
+   * The sender's stored-envelope key.
+   */
+  sender_key_id: string
+}
+/**
+ * One ordered authority revision, issued by the host and by nobody else.
+ */
+export interface AuthorityRevisionRecord {
+  /**
+   * The revocation requests this revision applied, in ascending order.
+   */
+  applied_requests: RevocationRequestId[]
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The key identifier of the host's authorisation key.
+   */
+  host_key_id: string
+  /**
+   * When the host issued it, in UTC milliseconds.
+   */
+  issued_at_ms: string
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  previous_revision: string
+  /**
+   * The Ed25519 signature over `CBOR(["kr-authority/1", record without this field])`.
+   */
+  signature: string
 }
 /**
  * The client's complete `hello` offer.
@@ -508,6 +751,195 @@ export interface ProtocolVersion {
    * The minor version. A peer selects the highest minor both sides support.
    */
   minor: number
+}
+/**
+ * The host challenge a direct redemption starts from. Single use, and it expires with the
+ * invitation.
+ */
+export interface DirectChallenge {
+  /**
+   * The revision of those keys.
+   */
+  device_key_revision: string
+  /**
+   * The host's iroh endpoint identity.
+   */
+  endpoint_id: string
+  /**
+   * The invitation's original expiry.
+   */
+  expires_at_ms: string
+  host_keys: DevicePublicKeys
+  /**
+   * The fresh host nonce.
+   */
+  host_nonce: string
+  /**
+   * The invitation.
+   */
+  invitation_id: string
+}
+/**
+ * The host's complete purpose-key bundle.
+ */
+export interface DevicePublicKeys {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
+ * The proof a candidate submits in direct mode.
+ */
+export interface DirectRedeemProof {
+  client_keys: DevicePublicKeys1
+  /**
+   * The candidate's fresh nonce.
+   */
+  client_nonce: string
+  /**
+   * The revision of those keys.
+   */
+  device_key_revision: string
+  /**
+   * The candidate's display name.
+   */
+  device_name: string
+  /**
+   * The host challenge this redemption answers.
+   */
+  host_nonce: string
+  /**
+   * The invitation being redeemed.
+   */
+  invitation_id: string
+  /**
+   * The candidate's platform.
+   */
+  platform: 'macos' | 'windows' | 'linux' | 'ios' | 'android'
+  /**
+   * `HMAC-SHA256(invitation_secret, D)`.
+   */
+  secret_proof: string
+  /**
+   * The candidate's Ed25519 signature over `D`.
+   */
+  signature: string
+}
+/**
+ * The candidate's complete purpose-key bundle.
+ */
+export interface DevicePublicKeys1 {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
+ * The authenticated plaintext of one mailbox envelope.
+ *
+ * `crypto_box_easy` authenticates every field below for exactly one recipient. Authorisation-
+ * bearing payloads are signed before encryption, so pairwise message authentication never
+ * substitutes for an issuer's grant signature.
+ */
+export interface EnvelopePlaintext {
+  /**
+   * When the sender created it, in UTC milliseconds.
+   */
+  created_at_ms: string
+  /**
+   * The envelope identity. It is also the replay identifier.
+   */
+  envelope_id: string
+  /**
+   * The environment the payload targets, when it targets one.
+   */
+  environment_id: EnvironmentId | null
+  /**
+   * When it expires, in UTC milliseconds.
+   */
+  expires_at_ms: string
+  /**
+   * The grant the payload acts under, when it has one.
+   */
+  grant_id: GrantId | null
+  /**
+   * The payload. An authorisation-bearing payload is a signed object's canonical bytes.
+   */
+  payload: string
+  /**
+   * What the payload is.
+   */
+  payload_type:
+    'authority_feed_change' | 'revocation_request' | 'notification_preview' | 'sync_change'
+  /**
+   * The recipient's stored-envelope key.
+   */
+  recipient_key_id: string
+  /**
+   * The sender's stored-envelope key.
+   */
+  sender_key_id: string
+  /**
+   * The epoch of that session.
+   */
+  session_epoch: SessionEpoch | null
+  /**
+   * The session the payload targets, when it targets one.
+   */
+  session_id: SessionId | null
+  /**
+   * The envelope format version.
+   */
+  version: 'kr-mailbox/1'
+}
+/**
+ * A stored backup checkpoint a pairing transfers.
+ *
+ * A fresh client needs a trusted latest-generation checkpoint to detect a service replaying an
+ * older valid backup. Pairing is where that checkpoint moves between devices.
+ */
+export interface GenerationCheckpoint {
+  /**
+   * The archive the checkpoint describes.
+   */
+  archive_id: string
+  /**
+   * The latest generation the sending device has seen.
+   */
+  backup_generation: string
+  /**
+   * The hash of that generation's encrypted manifest.
+   */
+  encrypted_manifest_hash: string
+  /**
+   * When the sending device observed it, in UTC milliseconds.
+   */
+  observed_at_ms: string
 }
 /**
  * A host-issued authority object.
@@ -1123,6 +1555,265 @@ export interface Notification {
   stream_id: string
 }
 /**
+ * An owner's answer to a confirmation challenge.
+ *
+ * The verification ceremony itself is platform code; this object records its result and binds it
+ * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
+ * challenge-consumption transition together.
+ */
+export interface OwnerConfirmationProof {
+  /**
+   * How the confirmation reached the host.
+   */
+  channel:
+    | 'owner_device_presence'
+    | 'paired_owner_device'
+    | 'enrolled_presence_signer'
+    | 'local_bootstrap_terminal'
+    | 'session'
+    | 'plugin'
+    | 'contact_tool'
+  request: OwnerConfirmationRequest
+  /**
+   * The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request])`.
+   */
+  signature: string
+  /**
+   * The key identifier of the signer that produced the proof.
+   */
+  signer_key_id: string
+}
+/**
+ * The challenge this proof answers.
+ */
+export interface OwnerConfirmationRequest {
+  /**
+   * What is being confirmed.
+   */
+  action:
+    | 'issue_invitation'
+    | 'confirm_device'
+    | 'enlarge_grant'
+    | 'trust_repository_root'
+    | 'grant_executable_capability'
+    | 'change_host_authority'
+  /**
+   * The digest of the exact action. One confirmation authorises one digest.
+   */
+  action_digest: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * The keys the action sends authority to. Null when the action has no destination device.
+   */
+  destination_keys: DevicePublicKeys2 | null
+  /**
+   * The rights the action would grant.
+   */
+  destination_rights: ActionRight[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's iroh endpoint identity.
+   */
+  host_endpoint_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
+}
+/**
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
+ */
+export interface DevicePublicKeys2 {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
+ * A host-issued owner-confirmation challenge.
+ */
+export interface OwnerConfirmationRequest1 {
+  /**
+   * What is being confirmed.
+   */
+  action:
+    | 'issue_invitation'
+    | 'confirm_device'
+    | 'enlarge_grant'
+    | 'trust_repository_root'
+    | 'grant_executable_capability'
+    | 'change_host_authority'
+  /**
+   * The digest of the exact action. One confirmation authorises one digest.
+   */
+  action_digest: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * The keys the action sends authority to. Null when the action has no destination device.
+   */
+  destination_keys: DevicePublicKeys2 | null
+  /**
+   * The rights the action would grant.
+   */
+  destination_rights: ActionRight[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's iroh endpoint identity.
+   */
+  host_endpoint_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
+}
+/**
+ * The `pair.finish` request, which binds the pairing transcript to the live iroh identities.
+ */
+export interface PairFinishRequest {
+  /**
+   * The attempt.
+   */
+  attempt_id: string
+  /**
+   * The tag under the `iroh-bind` key.
+   */
+  binding_tag: string
+  /**
+   * The SHA-256 of the canonical client bundle.
+   */
+  client_bundle_hash: string
+  /**
+   * The SHA-256 of the canonical host bundle.
+   */
+  host_bundle_hash: string
+  /**
+   * The invitation.
+   */
+  invitation_id: string
+  /**
+   * The transcript both devices confirmed.
+   */
+  transcript: string
+}
+/**
+ * The rights an invitation proposes, before the host issues a grant.
+ *
+ * The client cannot enlarge the grant through its bundle: the host commits the grant it proposed,
+ * and the proposal is covered by the transcript both devices confirmed.
+ */
+export interface ProposedGrant {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * The deadline in UTC milliseconds.
+           */
+          expires_at_ms: string
+        }
+      }
+  history: HistoryScope1
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one will be delegated from, when it is a delegation.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
+}
+/**
+ * How far back it may see.
+ */
+export interface HistoryScope1 {
+  /**
+   * Whether the currently visible screen is included. This exception never grants inactive
+   * screen buffers, scrollback or the backing transcript.
+   */
+  include_live_screen: boolean
+  /**
+   * The earliest content this grant may see. Null means no retained history at all.
+   */
+  lower_bound_ms: TimestampMs | null
+  /**
+   * Current approval requests named explicitly, on the same terms.
+   */
+  named_approvals: ApprovalRequestId[]
+  /**
+   * Current questions named explicitly, even when they were created before the lower bound.
+   */
+  named_questions: QuestionId[]
+}
+/**
  * The error object returned in a response or recorded on a receipt.
  *
  * The message is plain text for a person or a log. The user interface translates the code into a
@@ -1314,6 +2005,124 @@ export interface Receipt1 {
   updated_at_ms: string
 }
 /**
+ * The versioned recovery bundle an owner keeps at a stable locator.
+ *
+ * Enabling a new backup writer or rotating its signing key commits an updated bundle before that
+ * writer is declared recovery-enabled.
+ */
+export interface RecoveryBundle {
+  /**
+   * The latest generation the owner verified for each archive.
+   */
+  checkpoints: ArchiveCheckpoint[]
+  /**
+   * Where the owner's collections live.
+   */
+  collections: CollectionLocator[]
+  /**
+   * The bundle revision, advanced on every compare-and-swap write.
+   */
+  revision: string
+  /**
+   * The bundle schema version.
+   */
+  schema_version: string
+  /**
+   * The writers a restore may trust.
+   */
+  trusted_writers: TrustedWriter[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  written_at_ms: string
+}
+/**
+ * The latest generation an owner has verified for one archive.
+ *
+ * A fresh client needs this to detect a service replaying an older valid backup. A recovery-only
+ * restore still shows its checkpoint and cannot prove that no newer archive exists.
+ */
+export interface ArchiveCheckpoint {
+  /**
+   * The archive.
+   */
+  archive_id: string
+  /**
+   * The latest generation the owner verified.
+   */
+  backup_generation: string
+  /**
+   * The hash of that generation's encrypted manifest.
+   */
+  encrypted_manifest_hash: string
+  /**
+   * When the owner verified it, in UTC milliseconds.
+   */
+  verified_at_ms: string
+}
+/**
+ * One collection a recovery bundle can find.
+ */
+export interface CollectionLocator {
+  /**
+   * The archive the locator points at.
+   */
+  archive_id: string
+  /**
+   * The stable opaque locator of the collection.
+   */
+  locator: string
+  /**
+   * The service origin the collection lives at.
+   */
+  service_origin: string
+}
+/**
+ * A backup writer a restore is allowed to trust.
+ */
+export interface TrustedWriter {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  enrolled_at_ms: string
+  /**
+   * The writer's Ed25519 signing public key.
+   */
+  signing_key: string
+  /**
+   * The writer's signing key identifier.
+   */
+  writer_key_id: string
+}
+/**
+ * The printable and QR recovery kit.
+ *
+ * A seed with no way to find the encrypted bundle is not a complete kit, so the kit names the
+ * configured service origins and the stable bundle locator alongside the seed.
+ */
+export interface RecoveryKit {
+  /**
+   * The stable opaque locator of the recovery bundle.
+   */
+  bundle_locator: string
+  /**
+   * The kit format and cryptographic profile version.
+   */
+  profile_version: string
+  /**
+   * The 256-bit recovery seed.
+   */
+  seed: string
+  /**
+   * The seed checksum, so a mistyped kit fails before it is used.
+   */
+  seed_checksum: string
+  /**
+   * Each configured service origin.
+   */
+  service_origins: string[]
+}
+/**
  * A read request.
  */
 export interface Request {
@@ -1354,6 +2163,131 @@ export interface Response {
   request_id: string
 }
 /**
+ * The host's acknowledgement of one revocation request.
+ */
+export interface RevocationAcknowledgement {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  acknowledged_at_ms: string
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * Whether the dispatch barrier has completed.
+   */
+  completion:
+    | 'complete'
+    | {
+        pending: {
+          /**
+           * How many workers are still outstanding.
+           */
+          pending_workers: string
+        }
+      }
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * One signed revocation request published by a remote owner.
+   */
+  request_id: string
+}
+/**
+ * A remote owner's signed revocation request.
+ *
+ * A device cannot assign a higher host revision to its own request: the record carries no host
+ * revision, because only the target host issues ordered authority revisions.
+ */
+export interface RevocationRequest {
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * One paired device.
+   */
+  issuer_device_id: string
+  /**
+   * The key identifier of the issuer's authorisation key.
+   */
+  issuer_key_id: string
+  /**
+   * One signed revocation request published by a remote owner.
+   */
+  request_id: string
+  /**
+   * The Ed25519 signature over `CBOR(["kr-revocation/1", request without this field])`.
+   */
+  signature: string
+  /**
+   * What it revokes.
+   */
+  target:
+    | {
+        grants: {
+          /**
+           * The grants to revoke.
+           */
+          grant_ids: GrantId[]
+        }
+      }
+    | {
+        devices: {
+          /**
+           * The devices to revoke.
+           */
+          device_ids: DeviceId[]
+        }
+      }
+}
+/**
+ * One envelope sealed for one recipient.
+ */
+export interface SealedEnvelope {
+  /**
+   * The `crypto_box_easy` output over the canonical plaintext.
+   */
+  ciphertext: string
+  /**
+   * The fresh 24-byte nonce, from libsodium's random generator.
+   */
+  nonce: string
+  routing: EnvelopeRouting
+}
+/**
+ * The routing record the service sees.
+ */
+export interface EnvelopeRouting {
+  /**
+   * The envelope identity the service indexes by.
+   */
+  envelope_id: string
+  /**
+   * When the service may delete the item, in UTC milliseconds.
+   */
+  expires_at_ms: string
+  /**
+   * The recipient the service delivers to.
+   */
+  recipient_key_id: string
+  /**
+   * The sender, so a recipient can select a paired sender key before attempting to open.
+   */
+  sender_key_id: string
+  /**
+   * The declared size bucket, in bytes. Quota accounting measures stored bytes, not this.
+   */
+  size_bucket_bytes: string
+}
+/**
  * A session and the epoch it was addressed in.
  */
 export interface SessionRef {
@@ -1365,6 +2299,271 @@ export interface SessionRef {
    * One KalaReach terminal session.
    */
   session_id: string
+}
+/**
+ * A manifest and the backup writer's signature over it.
+ */
+export interface SignedArchiveManifest {
+  manifest: ArchiveManifest
+  /**
+   * The Ed25519 signature over `CBOR(["kr-archive-manifest/1", manifest])`.
+   */
+  signature: string
+  /**
+   * The writer's signing key.
+   */
+  writer_key_id: string
+}
+/**
+ * The manifest.
+ */
+export interface ArchiveManifest {
+  /**
+   * The archive.
+   */
+  archive_id: string
+  /**
+   * The generation this manifest describes.
+   */
+  backup_generation: string
+  /**
+   * When the producer wrote it, in UTC milliseconds.
+   */
+  created_at_ms: string
+  /**
+   * The member objects, in the order the producer wrote them.
+   */
+  objects: ManifestObject[]
+  /**
+   * One paired device.
+   */
+  owner_device_id: string
+  /**
+   * The manifest schema version.
+   */
+  schema_version: string
+}
+/**
+ * One member of a manifest.
+ */
+export interface ManifestObject {
+  /**
+   * The member's filename. Filenames live inside the encrypted manifest, never outside it.
+   */
+  filename: string
+  object: EncryptedObjectRef1
+}
+/**
+ * The encrypted object this entry describes.
+ */
+export interface EncryptedObjectRef1 {
+  /**
+   * The stored size of the encrypted object, in bytes.
+   */
+  encrypted_len: string
+  /**
+   * The SHA-256 of the encrypted object, including its `secretstream` header.
+   */
+  encrypted_object_hash: string
+  /**
+   * The object identity.
+   */
+  object_id: string
+}
+/**
+ * A candidate bundle and the authorisation signature that binds its key purposes.
+ */
+export interface SignedClientBundle {
+  bundle: ClientBundle
+  /**
+   * The Ed25519 signature over `CBOR(["kr-pair/client-bundle/1", bundle, T])`.
+   */
+  signature: string
+  /**
+   * The transcript the signature covers.
+   */
+  transcript: string
+}
+/**
+ * The bundle.
+ */
+export interface ClientBundle {
+  /**
+   * The revision of those keys.
+   */
+  device_key_revision: string
+  /**
+   * The candidate's display name. Display text, never authority.
+   */
+  device_name: string
+  /**
+   * The candidate's iroh endpoint identity.
+   */
+  endpoint_id: string
+  keys: DevicePublicKeys3
+  /**
+   * The candidate's platform.
+   */
+  platform: 'macos' | 'windows' | 'linux' | 'ios' | 'android'
+}
+/**
+ * The candidate's purpose-separated public keys.
+ */
+export interface DevicePublicKeys3 {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
+ * A bundle and the authorisation signature that binds its key purposes.
+ *
+ * The encryption authenticates the initial bundle; this signature binds the key-purpose
+ * declarations to the authorisation key, and covers `T`, so it cannot be replayed from another
+ * transcript.
+ */
+export interface SignedHostBundle {
+  bundle: HostBundle
+  /**
+   * The Ed25519 signature over `CBOR(["kr-pair/host-bundle/1", bundle, T])`.
+   */
+  signature: string
+  /**
+   * The transcript the signature covers.
+   */
+  transcript: string
+}
+/**
+ * The bundle.
+ */
+export interface HostBundle {
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * The revision of the host's purpose-separated keys.
+   */
+  device_key_revision: string
+  /**
+   * The host's iroh endpoint identity.
+   */
+  endpoint_id: string
+  /**
+   * The invitation this bundle answers.
+   */
+  invitation_id: string
+  keys: DevicePublicKeys4
+  network_config: NetworkConfig
+  proposed_grant: ProposedGrant1
+}
+/**
+ * The host's purpose-separated public keys.
+ */
+export interface DevicePublicKeys4 {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
+ * The selected discovery and relay configuration, with current hints.
+ */
+export interface NetworkConfig {
+  /**
+   * Current direct-address hints. Hints only: the endpoint identity is what authenticates.
+   */
+  direct_addresses: NetworkHint[]
+  /**
+   * The selected discovery configuration, as Pkarr or DNS origins.
+   */
+  discovery_origins: NetworkHint[]
+  /**
+   * The selected relay configuration, as relay URLs.
+   */
+  relay_urls: NetworkHint[]
+}
+/**
+ * The rights the invitation proposes.
+ */
+export interface ProposedGrant1 {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * The deadline in UTC milliseconds.
+           */
+          expires_at_ms: string
+        }
+      }
+  history: HistoryScope1
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one will be delegated from, when it is a delegation.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
 }
 /**
  * The bounded header every stream sends first.

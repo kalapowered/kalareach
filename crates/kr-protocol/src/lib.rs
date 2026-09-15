@@ -33,6 +33,9 @@
 //! | [`error`] | Error codes, retry categories and the error object |
 //! | [`frame`] | Stream headers and the length-delimited frame codec |
 //! | [`hello`] | Version negotiation and the `kr-connect/1` proof transcript |
+//! | [`pairing`] | Pairing contexts, bundles, transcripts, QR payloads and owner confirmation |
+//! | [`mailbox`] | Stored mailbox envelopes and their size buckets |
+//! | [`archive`] | Backup key wraps, manifests, descriptors and recovery material |
 //! | [`digest`] | The mutation payload digest |
 //! | [`limits`] | Protocol defaults |
 //! | [`schema`] | Deterministic JSON Schema and method-table generation |
@@ -70,6 +73,7 @@
 //! ```
 
 pub mod actor;
+pub mod archive;
 pub mod authority;
 pub mod digest;
 pub mod envelope;
@@ -79,7 +83,9 @@ pub mod grant;
 pub mod hello;
 pub mod ids;
 pub mod limits;
+pub mod mailbox;
 pub mod method;
+pub mod pairing;
 pub mod receipt;
 pub mod rights;
 pub mod scalars;

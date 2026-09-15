@@ -319,6 +319,120 @@
       "minLength": 1,
       "type": "string"
     },
+    "ArchiveCheckpoint": {
+      "additionalProperties": false,
+      "description": "The latest generation an owner has verified for one archive.\n\nA fresh client needs this to detect a service replaying an older valid backup. A recovery-only\nrestore still shows its checkpoint and cannot prove that no newer archive exists.",
+      "properties": {
+        "archive_id": {
+          "$ref": "#/$defs/ArchiveId",
+          "description": "The archive."
+        },
+        "backup_generation": {
+          "$ref": "#/$defs/BackupGeneration",
+          "description": "The latest generation the owner verified."
+        },
+        "encrypted_manifest_hash": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The hash of that generation's encrypted manifest."
+        },
+        "verified_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the owner verified it, in UTC milliseconds."
+        }
+      },
+      "required": [
+        "archive_id",
+        "backup_generation",
+        "encrypted_manifest_hash",
+        "verified_at_ms"
+      ],
+      "type": "object"
+    },
+    "ArchiveDescriptor": {
+      "additionalProperties": false,
+      "description": "The public descriptor of one archive.\n\nEverything outside it is opaque: the archive identity and encrypted-object references. The\ndescriptor is validated before any object is allocated or written, so an invalid one costs\nnothing.",
+      "properties": {
+        "archive_id": {
+          "$ref": "#/$defs/ArchiveId",
+          "description": "The archive."
+        },
+        "backup_generation": {
+          "$ref": "#/$defs/BackupGeneration",
+          "description": "The generation this descriptor points at."
+        },
+        "encrypted_manifest": {
+          "$ref": "#/$defs/EncryptedObjectRef",
+          "description": "The encrypted manifest object."
+        },
+        "manifest_key_wraps": {
+          "description": "The manifest key, wrapped once per authorised recipient.",
+          "items": {
+            "$ref": "#/$defs/SealedKeyWrap"
+          },
+          "type": "array"
+        },
+        "version": {
+          "$ref": "#/$defs/U64",
+          "description": "The descriptor version."
+        }
+      },
+      "required": [
+        "version",
+        "archive_id",
+        "backup_generation",
+        "encrypted_manifest",
+        "manifest_key_wraps"
+      ],
+      "type": "object"
+    },
+    "ArchiveId": {
+      "description": "One backup archive. The service sees only this opaque identifier.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "ArchiveManifest": {
+      "additionalProperties": false,
+      "description": "The manifest of one archive generation.\n\nIt is encrypted as a separate object before upload. Its signature is verified against a trusted\nwriter key from the recovery bundle, never against a key an untrusted archive descriptor\nsupplied.",
+      "properties": {
+        "archive_id": {
+          "$ref": "#/$defs/ArchiveId",
+          "description": "The archive."
+        },
+        "backup_generation": {
+          "$ref": "#/$defs/BackupGeneration",
+          "description": "The generation this manifest describes."
+        },
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the producer wrote it, in UTC milliseconds."
+        },
+        "objects": {
+          "description": "The member objects, in the order the producer wrote them.",
+          "items": {
+            "$ref": "#/$defs/ManifestObject"
+          },
+          "type": "array"
+        },
+        "owner_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device that owns the archive."
+        },
+        "schema_version": {
+          "$ref": "#/$defs/U64",
+          "description": "The manifest schema version."
+        }
+      },
+      "required": [
+        "schema_version",
+        "archive_id",
+        "owner_device_id",
+        "backup_generation",
+        "objects",
+        "created_at_ms"
+      ],
+      "type": "object"
+    },
     "AttachmentId": {
       "description": "One CLI or application attachment, independently of its device.",
       "format": "uuid",
@@ -336,9 +450,74 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "AuthorisationKey": {
+      "contentEncoding": "base64url",
+      "description": "A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "type": "string"
+    },
     "AuthorityRevision": {
       "description": "The host's ordered authority revision. Only the host issues its own revisions.",
       "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "AuthorityRevisionRecord": {
+      "additionalProperties": false,
+      "description": "One ordered authority revision, issued by the host and by nobody else.",
+      "properties": {
+        "applied_requests": {
+          "description": "The revocation requests this revision applied, in ascending order.",
+          "items": {
+            "$ref": "#/$defs/RevocationRequestId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The revision this record establishes."
+        },
+        "host_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The host that issued it."
+        },
+        "host_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The key identifier of the host's authorisation key."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the host issued it, in UTC milliseconds."
+        },
+        "previous_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The revision it follows. A host rejects a record that does not follow its latest accepted\nrevision."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The Ed25519 signature over `CBOR([\"kr-authority/1\", record without this field])`."
+        }
+      },
+      "required": [
+        "host_device_id",
+        "authority_revision",
+        "previous_revision",
+        "applied_requests",
+        "issued_at_ms",
+        "host_key_id",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "BackupGeneration": {
+      "description": "The backup generation an archive belongs to. Only its producer advances it.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "BackupObjectId": {
+      "description": "One encrypted object inside a backup archive.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
     "BootEpoch": {
@@ -424,6 +603,40 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "ClientBundle": {
+      "additionalProperties": false,
+      "description": "The candidate's key bundle.\n\nIt carries no device identity: the host assigns one when it commits the device record, so a\ncandidate cannot choose or reuse an identity the host already knows.",
+      "properties": {
+        "device_key_revision": {
+          "$ref": "#/$defs/DeviceKeyRevision",
+          "description": "The revision of those keys."
+        },
+        "device_name": {
+          "$ref": "#/$defs/DeviceName",
+          "description": "The candidate's display name. Display text, never authority."
+        },
+        "endpoint_id": {
+          "$ref": "#/$defs/EndpointKey",
+          "description": "The candidate's iroh endpoint identity."
+        },
+        "keys": {
+          "$ref": "#/$defs/DevicePublicKeys",
+          "description": "The candidate's purpose-separated public keys."
+        },
+        "platform": {
+          "$ref": "#/$defs/DevicePlatform",
+          "description": "The candidate's platform."
+        }
+      },
+      "required": [
+        "endpoint_id",
+        "keys",
+        "device_key_revision",
+        "device_name",
+        "platform"
+      ],
+      "type": "object"
+    },
     "ClientOffer": {
       "additionalProperties": false,
       "description": "The client's complete `hello` offer.",
@@ -480,6 +693,76 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "CollectionLocator": {
+      "additionalProperties": false,
+      "description": "One collection a recovery bundle can find.",
+      "properties": {
+        "archive_id": {
+          "$ref": "#/$defs/ArchiveId",
+          "description": "The archive the locator points at."
+        },
+        "locator": {
+          "description": "The stable opaque locator of the collection.",
+          "type": "string"
+        },
+        "service_origin": {
+          "description": "The service origin the collection lives at.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "service_origin",
+        "locator",
+        "archive_id"
+      ],
+      "type": "object"
+    },
+    "ConfirmationChannel": {
+      "description": "How an owner confirmation reached the host.\n\nNoninteractive confirmation from a session, plugin or contact-tool channel is rejected: an\nagent's process label, operating-system peer credentials, terminal output or a newly created\ninvitation context is not a confirmation.",
+      "oneOf": [
+        {
+          "const": "owner_device_presence",
+          "description": "A protected native user-verification ceremony on the unlocked owner device.",
+          "type": "string"
+        },
+        {
+          "const": "paired_owner_device",
+          "description": "Approval from a separately paired owner device.",
+          "type": "string"
+        },
+        {
+          "const": "enrolled_presence_signer",
+          "description": "An explicitly enrolled user-presence-capable owner signer, for a headless host.",
+          "type": "string"
+        },
+        {
+          "const": "local_bootstrap_terminal",
+          "description": "The initial local bootstrap on an interactive controlling terminal outside a KR session.\n\nThis protects against accidental agent initiation. It is not isolation from other code\nrunning under the same operating-system identity.",
+          "type": "string"
+        },
+        {
+          "const": "session",
+          "description": "A KalaReach session channel. Never a confirmation.",
+          "type": "string"
+        },
+        {
+          "const": "plugin",
+          "description": "A plugin channel. Never a confirmation.",
+          "type": "string"
+        },
+        {
+          "const": "contact_tool",
+          "description": "A contact-tool channel. Never a confirmation.",
+          "type": "string"
+        }
+      ]
+    },
+    "ConfirmationId": {
+      "description": "One owner-confirmation challenge: single use and bound to one action digest.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
     "ConfirmationRequirement": {
       "description": "Whether a method needs a fresh owner confirmation.",
       "oneOf": [
@@ -528,6 +811,70 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "DeviceName": {
+      "description": "A device display name of at most 128 bytes and no control characters. Display text, never authority.",
+      "pattern": "^[^\\u0000-\\u001f\\u007f]{1,128}$",
+      "type": "string"
+    },
+    "DevicePlatform": {
+      "description": "The platform a device runs on.",
+      "oneOf": [
+        {
+          "const": "macos",
+          "description": "macOS.",
+          "type": "string"
+        },
+        {
+          "const": "windows",
+          "description": "Windows.",
+          "type": "string"
+        },
+        {
+          "const": "linux",
+          "description": "Linux, including a WSL2 distribution.",
+          "type": "string"
+        },
+        {
+          "const": "ios",
+          "description": "iOS or iPadOS.",
+          "type": "string"
+        },
+        {
+          "const": "android",
+          "description": "Android.",
+          "type": "string"
+        }
+      ]
+    },
+    "DevicePublicKeys": {
+      "additionalProperties": false,
+      "description": "One device's four purpose-separated public keys.\n\nAn authenticated pairing exchange binds these public keys and their explicit purposes to one\ndevice record.",
+      "properties": {
+        "authorisation": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The Ed25519 authorisation key."
+        },
+        "notification_preview": {
+          "$ref": "#/$defs/NotificationPreviewKey",
+          "description": "The X25519 notification-preview key."
+        },
+        "stored_envelope": {
+          "$ref": "#/$defs/StoredEnvelopeKey",
+          "description": "The X25519 stored-envelope key."
+        },
+        "transport": {
+          "$ref": "#/$defs/EndpointKey",
+          "description": "The iroh transport identity."
+        }
+      },
+      "required": [
+        "transport",
+        "authorisation",
+        "stored_envelope",
+        "notification_preview"
+      ],
+      "type": "object"
+    },
     "DiagnosticId": {
       "description": "An opaque diagnostic identifier. It carries no protocol meaning.",
       "maxLength": 256,
@@ -539,6 +886,99 @@
       "description": "A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
+    },
+    "DirectChallenge": {
+      "additionalProperties": false,
+      "description": "The host challenge a direct redemption starts from. Single use, and it expires with the\ninvitation.",
+      "properties": {
+        "device_key_revision": {
+          "$ref": "#/$defs/DeviceKeyRevision",
+          "description": "The revision of those keys."
+        },
+        "endpoint_id": {
+          "$ref": "#/$defs/EndpointKey",
+          "description": "The host's iroh endpoint identity."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The invitation's original expiry."
+        },
+        "host_keys": {
+          "$ref": "#/$defs/DevicePublicKeys",
+          "description": "The host's complete purpose-key bundle."
+        },
+        "host_nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The fresh host nonce."
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation."
+        }
+      },
+      "required": [
+        "invitation_id",
+        "host_nonce",
+        "host_keys",
+        "device_key_revision",
+        "endpoint_id",
+        "expires_at_ms"
+      ],
+      "type": "object"
+    },
+    "DirectRedeemProof": {
+      "additionalProperties": false,
+      "description": "The proof a candidate submits in direct mode.",
+      "properties": {
+        "client_keys": {
+          "$ref": "#/$defs/DevicePublicKeys",
+          "description": "The candidate's complete purpose-key bundle."
+        },
+        "client_nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The candidate's fresh nonce."
+        },
+        "device_key_revision": {
+          "$ref": "#/$defs/DeviceKeyRevision",
+          "description": "The revision of those keys."
+        },
+        "device_name": {
+          "$ref": "#/$defs/DeviceName",
+          "description": "The candidate's display name."
+        },
+        "host_nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The host challenge this redemption answers."
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation being redeemed."
+        },
+        "platform": {
+          "$ref": "#/$defs/DevicePlatform",
+          "description": "The candidate's platform."
+        },
+        "secret_proof": {
+          "$ref": "#/$defs/Mac256",
+          "description": "`HMAC-SHA256(invitation_secret, D)`."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The candidate's Ed25519 signature over `D`."
+        }
+      },
+      "required": [
+        "invitation_id",
+        "client_keys",
+        "device_key_revision",
+        "device_name",
+        "platform",
+        "host_nonce",
+        "client_nonce",
+        "secret_proof",
+        "signature"
+      ],
+      "type": "object"
     },
     "DraftId": {
       "description": "One durable device-owned draft, independent of an attachment.",
@@ -571,11 +1011,182 @@
         }
       ]
     },
+    "EncryptedObjectRef": {
+      "additionalProperties": false,
+      "description": "A reference to one encrypted object.",
+      "properties": {
+        "encrypted_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The stored size of the encrypted object, in bytes."
+        },
+        "encrypted_object_hash": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The SHA-256 of the encrypted object, including its `secretstream` header."
+        },
+        "object_id": {
+          "$ref": "#/$defs/BackupObjectId",
+          "description": "The object identity."
+        }
+      },
+      "required": [
+        "object_id",
+        "encrypted_object_hash",
+        "encrypted_len"
+      ],
+      "type": "object"
+    },
     "EndpointKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte iroh endpoint public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
+    },
+    "EnvelopeId": {
+      "description": "One stored mailbox envelope: 128 random bits.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "EnvelopePlaintext": {
+      "additionalProperties": false,
+      "description": "The authenticated plaintext of one mailbox envelope.\n\n`crypto_box_easy` authenticates every field below for exactly one recipient. Authorisation-\nbearing payloads are signed before encryption, so pairwise message authentication never\nsubstitutes for an issuer's grant signature.",
+      "properties": {
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the sender created it, in UTC milliseconds."
+        },
+        "envelope_id": {
+          "$ref": "#/$defs/EnvelopeId",
+          "description": "The envelope identity. It is also the replay identifier."
+        },
+        "environment_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EnvironmentId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The environment the payload targets, when it targets one."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it expires, in UTC milliseconds."
+        },
+        "grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant the payload acts under, when it has one."
+        },
+        "payload": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The payload. An authorisation-bearing payload is a signed object's canonical bytes."
+        },
+        "payload_type": {
+          "$ref": "#/$defs/MailboxPayloadType",
+          "description": "What the payload is."
+        },
+        "recipient_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The recipient's stored-envelope key."
+        },
+        "sender_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The sender's stored-envelope key."
+        },
+        "session_epoch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionEpoch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The epoch of that session."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session the payload targets, when it targets one."
+        },
+        "version": {
+          "$ref": "#/$defs/EnvelopeVersion",
+          "description": "The envelope format version."
+        }
+      },
+      "required": [
+        "version",
+        "envelope_id",
+        "sender_key_id",
+        "recipient_key_id",
+        "payload_type",
+        "created_at_ms",
+        "expires_at_ms",
+        "grant_id",
+        "environment_id",
+        "session_id",
+        "session_epoch",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "EnvelopeRouting": {
+      "additionalProperties": false,
+      "description": "The untrusted routing record a service stores beside the ciphertext.\n\nThe service needs an address and an expiry to deliver and expire the item. It is given nothing\nelse, and what it is given is checked against the decrypted envelope before use.",
+      "properties": {
+        "envelope_id": {
+          "$ref": "#/$defs/EnvelopeId",
+          "description": "The envelope identity the service indexes by."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the service may delete the item, in UTC milliseconds."
+        },
+        "recipient_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The recipient the service delivers to."
+        },
+        "sender_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The sender, so a recipient can select a paired sender key before attempting to open."
+        },
+        "size_bucket_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "The declared size bucket, in bytes. Quota accounting measures stored bytes, not this."
+        }
+      },
+      "required": [
+        "envelope_id",
+        "recipient_key_id",
+        "sender_key_id",
+        "expires_at_ms",
+        "size_bucket_bytes"
+      ],
+      "type": "object"
+    },
+    "EnvelopeVersion": {
+      "description": "The envelope format this build writes and reads.",
+      "oneOf": [
+        {
+          "const": "kr-mailbox/1",
+          "description": "Version 1.",
+          "type": "string"
+        }
+      ]
     },
     "EnvironmentId": {
       "description": "One installed OS, distribution or container environment and OS user.",
@@ -906,6 +1517,35 @@
         }
       ]
     },
+    "GenerationCheckpoint": {
+      "additionalProperties": false,
+      "description": "A stored backup checkpoint a pairing transfers.\n\nA fresh client needs a trusted latest-generation checkpoint to detect a service replaying an\nolder valid backup. Pairing is where that checkpoint moves between devices.",
+      "properties": {
+        "archive_id": {
+          "$ref": "#/$defs/ArchiveId",
+          "description": "The archive the checkpoint describes."
+        },
+        "backup_generation": {
+          "$ref": "#/$defs/BackupGeneration",
+          "description": "The latest generation the sending device has seen."
+        },
+        "encrypted_manifest_hash": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The hash of that generation's encrypted manifest."
+        },
+        "observed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the sending device observed it, in UTC milliseconds."
+        }
+      },
+      "required": [
+        "archive_id",
+        "backup_generation",
+        "encrypted_manifest_hash",
+        "observed_at_ms"
+      ],
+      "type": "object"
+    },
     "GeometryEpoch": {
       "description": "The current geometry-owner epoch, separate from the input lease.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -1101,6 +1741,50 @@
       ],
       "type": "object"
     },
+    "HostBundle": {
+      "additionalProperties": false,
+      "description": "The host's key bundle.",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The host's device identity."
+        },
+        "device_key_revision": {
+          "$ref": "#/$defs/DeviceKeyRevision",
+          "description": "The revision of the host's purpose-separated keys."
+        },
+        "endpoint_id": {
+          "$ref": "#/$defs/EndpointKey",
+          "description": "The host's iroh endpoint identity."
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation this bundle answers."
+        },
+        "keys": {
+          "$ref": "#/$defs/DevicePublicKeys",
+          "description": "The host's purpose-separated public keys."
+        },
+        "network_config": {
+          "$ref": "#/$defs/NetworkConfig",
+          "description": "The selected discovery and relay configuration, with current hints."
+        },
+        "proposed_grant": {
+          "$ref": "#/$defs/ProposedGrant",
+          "description": "The rights the invitation proposes."
+        }
+      },
+      "required": [
+        "invitation_id",
+        "device_id",
+        "device_key_revision",
+        "endpoint_id",
+        "keys",
+        "network_config",
+        "proposed_grant"
+      ],
+      "type": "object"
+    },
     "HostSelection": {
       "additionalProperties": false,
       "description": "The host's complete `hello` selection.\n\nIt echoes the client nonce as well as carrying its own, so the transcript binds one exact\noffer to one exact selection.",
@@ -1234,11 +1918,146 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "KeyId": {
+      "contentEncoding": "base64url",
+      "description": "A 32-byte key identifier: the SHA-256 of the domain-separated encoding of a key purpose and public key.",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "type": "string"
+    },
+    "KeyWrapContext": {
+      "additionalProperties": false,
+      "description": "The fields a key wrap authenticates, apart from the key itself.\n\nThe wrap is valid only for this object and this recipient: a receiver that reuses a wrap on a\ndifferent object or under a different archive fails authentication rather than decrypting the\nwrong thing.",
+      "properties": {
+        "archive_id": {
+          "$ref": "#/$defs/ArchiveId",
+          "description": "The archive."
+        },
+        "backup_generation": {
+          "$ref": "#/$defs/BackupGeneration",
+          "description": "The backup generation."
+        },
+        "encrypted_object_hash": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The SHA-256 of the encrypted object."
+        },
+        "format": {
+          "$ref": "#/$defs/KeyWrapFormat",
+          "description": "The wrap format."
+        },
+        "object_id": {
+          "$ref": "#/$defs/BackupObjectId",
+          "description": "The object the key belongs to."
+        },
+        "purpose": {
+          "$ref": "#/$defs/KeyWrapPurpose",
+          "description": "What the wrapped key opens."
+        },
+        "recipient_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The recipient's stored-envelope key."
+        },
+        "sender_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The sender's stored-envelope key."
+        }
+      },
+      "required": [
+        "format",
+        "purpose",
+        "archive_id",
+        "backup_generation",
+        "object_id",
+        "encrypted_object_hash",
+        "sender_key_id",
+        "recipient_key_id"
+      ],
+      "type": "object"
+    },
+    "KeyWrapFormat": {
+      "description": "The key-wrap format this build writes and reads.",
+      "oneOf": [
+        {
+          "const": "kr-keywrap/1",
+          "description": "Version 1.",
+          "type": "string"
+        }
+      ]
+    },
+    "KeyWrapPurpose": {
+      "description": "What a wrapped key opens.",
+      "oneOf": [
+        {
+          "const": "manifest_key",
+          "description": "The key of the encrypted manifest object.",
+          "type": "string"
+        },
+        {
+          "const": "object_key",
+          "description": "The key of one member object.",
+          "type": "string"
+        },
+        {
+          "const": "recovery_bundle_key",
+          "description": "The key of an encrypted recovery bundle.",
+          "type": "string"
+        }
+      ]
+    },
+    "Mac256": {
+      "contentEncoding": "base64url",
+      "description": "A 32-byte HMAC-SHA-256 tag. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "type": "string"
+    },
     "MachineId": {
       "description": "A logical machine group. Not a hardware identity.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "MailboxPayloadType": {
+      "description": "What an envelope carries.\n\nThe set is closed. A new payload kind is a new schema, not a new string a sender may invent:\nsection 23 forbids unknown fields and strip-and-verify behaviour on signed objects, and the\nsame rule applies to the type that decides how a payload is interpreted.",
+      "oneOf": [
+        {
+          "const": "authority_feed_change",
+          "description": "An announcement that a device's authority feed changed. It announces; it does not carry\nauthority.",
+          "type": "string"
+        },
+        {
+          "const": "revocation_request",
+          "description": "A signed revocation request published by a remote owner.",
+          "type": "string"
+        },
+        {
+          "const": "notification_preview",
+          "description": "An encrypted notification preview.",
+          "type": "string"
+        },
+        {
+          "const": "sync_change",
+          "description": "An announcement that a synchronised object changed.",
+          "type": "string"
+        }
+      ]
+    },
+    "ManifestObject": {
+      "additionalProperties": false,
+      "description": "One member of a manifest.",
+      "properties": {
+        "filename": {
+          "description": "The member's filename. Filenames live inside the encrypted manifest, never outside it.",
+          "type": "string"
+        },
+        "object": {
+          "$ref": "#/$defs/EncryptedObjectRef",
+          "description": "The encrypted object this entry describes."
+        }
+      },
+      "required": [
+        "object",
+        "filename"
+      ],
+      "type": "object"
     },
     "Method": {
       "description": "Every method in the section 23 method-groups table.",
@@ -2192,6 +3011,50 @@
       ],
       "type": "object"
     },
+    "NetworkConfig": {
+      "additionalProperties": false,
+      "description": "The selected discovery and relay configuration a pairing invitation carries.\n\nDiscovery and relay selection are separate configuration choices, and a self-hosted deployment\nreplaces each service independently, so each list stands on its own.",
+      "properties": {
+        "direct_addresses": {
+          "description": "Current direct-address hints. Hints only: the endpoint identity is what authenticates.",
+          "items": {
+            "$ref": "#/$defs/NetworkHint"
+          },
+          "type": "array"
+        },
+        "discovery_origins": {
+          "description": "The selected discovery configuration, as Pkarr or DNS origins.",
+          "items": {
+            "$ref": "#/$defs/NetworkHint"
+          },
+          "type": "array"
+        },
+        "relay_urls": {
+          "description": "The selected relay configuration, as relay URLs.",
+          "items": {
+            "$ref": "#/$defs/NetworkHint"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "relay_urls",
+        "discovery_origins",
+        "direct_addresses"
+      ],
+      "type": "object"
+    },
+    "NetworkHint": {
+      "description": "One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.",
+      "pattern": "^[!-~]{1,253}$",
+      "type": "string"
+    },
+    "Nonce192": {
+      "contentEncoding": "base64url",
+      "description": "A 24-byte nonce. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
+      "pattern": "^[A-Za-z0-9_-]{32}$",
+      "type": "string"
+    },
     "Nonce256": {
       "contentEncoding": "base64url",
       "description": "A 32-byte nonce. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
@@ -2226,6 +3089,12 @@
         "payload"
       ],
       "type": "object"
+    },
+    "NotificationPreviewKey": {
+      "contentEncoding": "base64url",
+      "description": "A 32-byte X25519 notification-preview public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "type": "string"
     },
     "OrganisationId": {
       "description": "One organisation whose signed policy a host has opted into.",
@@ -2283,6 +3152,293 @@
         }
       ]
     },
+    "OwnerConfirmationProof": {
+      "additionalProperties": false,
+      "description": "An owner's answer to a confirmation challenge.\n\nThe verification ceremony itself is platform code; this object records its result and binds it\nto the exact challenge. The host's acceptance record keeps the user-presence evidence and the\nchallenge-consumption transition together.",
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/ConfirmationChannel",
+          "description": "How the confirmation reached the host."
+        },
+        "request": {
+          "$ref": "#/$defs/OwnerConfirmationRequest",
+          "description": "The challenge this proof answers."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The Ed25519 signature over `CBOR([\"kr-pair/owner-confirm/1\", request])`."
+        },
+        "signer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The key identifier of the signer that produced the proof."
+        }
+      },
+      "required": [
+        "request",
+        "channel",
+        "signer_key_id",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "OwnerConfirmationRequest": {
+      "additionalProperties": false,
+      "description": "A host-issued owner-confirmation challenge.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/SensitiveAction",
+          "description": "What is being confirmed."
+        },
+        "action_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the exact action. One confirmation authorises one digest."
+        },
+        "confirmation_id": {
+          "$ref": "#/$defs/ConfirmationId",
+          "description": "The challenge identity. Single use."
+        },
+        "destination_keys": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DevicePublicKeys"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The keys the action sends authority to. Null when the action has no destination device."
+        },
+        "destination_rights": {
+          "description": "The rights the action would grant.",
+          "items": {
+            "$ref": "#/$defs/ActionRight"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The short expiry, in UTC milliseconds."
+        },
+        "host_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The host this confirmation is for."
+        },
+        "host_endpoint_id": {
+          "$ref": "#/$defs/EndpointKey",
+          "description": "The host's iroh endpoint identity."
+        },
+        "nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The host's fresh challenge nonce."
+        }
+      },
+      "required": [
+        "confirmation_id",
+        "action",
+        "action_digest",
+        "destination_keys",
+        "destination_rights",
+        "host_device_id",
+        "host_endpoint_id",
+        "nonce",
+        "expires_at_ms"
+      ],
+      "type": "object"
+    },
+    "PairFinishRequest": {
+      "additionalProperties": false,
+      "description": "The `pair.finish` request, which binds the pairing transcript to the live iroh identities.",
+      "properties": {
+        "attempt_id": {
+          "$ref": "#/$defs/AttemptId",
+          "description": "The attempt."
+        },
+        "binding_tag": {
+          "$ref": "#/$defs/Mac256",
+          "description": "The tag under the `iroh-bind` key."
+        },
+        "client_bundle_hash": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The SHA-256 of the canonical client bundle."
+        },
+        "host_bundle_hash": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The SHA-256 of the canonical host bundle."
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation."
+        },
+        "transcript": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The transcript both devices confirmed."
+        }
+      },
+      "required": [
+        "invitation_id",
+        "attempt_id",
+        "transcript",
+        "host_bundle_hash",
+        "client_bundle_hash",
+        "binding_tag"
+      ],
+      "type": "object"
+    },
+    "PairStatus": {
+      "description": "What `pair.status` reports.\n\nIt never reveals secret material, and the host returns it only to the candidate's authenticated\nendpoint or to the issuing owner.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The invitation is open and no candidate holds it.",
+          "properties": {
+            "open": {
+              "additionalProperties": false,
+              "properties": {
+                "expires_at_ms": {
+                  "$ref": "#/$defs/TimestampMs",
+                  "description": "When the invitation expires, in UTC milliseconds."
+                },
+                "remaining_confirmations": {
+                  "description": "Remaining failed-confirmation allowance on the host.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "remaining_confirmations",
+                "expires_at_ms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "open"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A candidate holds the invitation and owner approval is pending.",
+          "properties": {
+            "awaiting_approval": {
+              "additionalProperties": false,
+              "properties": {
+                "attempt_id": {
+                  "$ref": "#/$defs/AttemptId",
+                  "description": "The candidate's attempt."
+                },
+                "expires_at_ms": {
+                  "$ref": "#/$defs/TimestampMs",
+                  "description": "When the invitation expires, in UTC milliseconds."
+                },
+                "verification_value": {
+                  "description": "The verification value shown on both devices.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "attempt_id",
+                "verification_value",
+                "expires_at_ms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "awaiting_approval"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The owner approved and the host committed the device record and grant.",
+          "properties": {
+            "committed": {
+              "additionalProperties": false,
+              "properties": {
+                "device_id": {
+                  "$ref": "#/$defs/DeviceId",
+                  "description": "The device the host created."
+                },
+                "grant_id": {
+                  "$ref": "#/$defs/GrantId",
+                  "description": "The grant it issued."
+                }
+              },
+              "required": [
+                "device_id",
+                "grant_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "committed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The invitation was consumed without a grant.",
+          "properties": {
+            "consumed": {
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/PairingConsumedReason",
+                  "description": "Why it was consumed."
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "consumed"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PairingConsumedReason": {
+      "description": "Why an invitation was consumed without issuing a grant.",
+      "oneOf": [
+        {
+          "const": "denied",
+          "description": "The owner denied the request.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "The invitation reached its deadline.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The owner cancelled it.",
+          "type": "string"
+        },
+        {
+          "const": "attempts_exhausted",
+          "description": "The failed-confirmation allowance ran out.",
+          "type": "string"
+        },
+        {
+          "const": "host_restarted",
+          "description": "The host restarted while the invitation was unfinished.",
+          "type": "string"
+        }
+      ]
+    },
+    "PairingSequence": {
+      "description": "The sequence number of one message inside a pairing bundle exchange.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
     "ParamsValue": {
       "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.",
       "tsType": "unknown"
@@ -2298,6 +3454,68 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "ProposedGrant": {
+      "additionalProperties": false,
+      "description": "The rights an invitation proposes, before the host issues a grant.\n\nThe client cannot enlarge the grant through its bundle: the host commits the grant it proposed,\nand the proposal is covered by the transcript both devices confirmed.",
+      "properties": {
+        "actions": {
+          "description": "The actions it permits.",
+          "items": {
+            "$ref": "#/$defs/ActionRight"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "environment_selector": {
+          "$ref": "#/$defs/EnvironmentSelector",
+          "description": "Which environments it covers."
+        },
+        "expiry": {
+          "$ref": "#/$defs/GrantExpiry",
+          "description": "When it stops being valid."
+        },
+        "history": {
+          "$ref": "#/$defs/HistoryScope",
+          "description": "How far back it may see."
+        },
+        "organisation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OrganisationRequirement"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An optional organisation membership requirement."
+        },
+        "parent_grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant this one will be delegated from, when it is a delegation."
+        },
+        "session_selector": {
+          "$ref": "#/$defs/SessionSelector",
+          "description": "Which sessions it covers."
+        }
+      },
+      "required": [
+        "parent_grant_id",
+        "environment_selector",
+        "session_selector",
+        "actions",
+        "history",
+        "expiry",
+        "organisation"
+      ],
+      "type": "object"
     },
     "ProtocolError": {
       "additionalProperties": false,
@@ -2546,6 +3764,93 @@
         "max_attachment_frame_len",
         "max_outstanding_mutations",
         "max_send_queue_bytes"
+      ],
+      "type": "object"
+    },
+    "RecoveryBundle": {
+      "additionalProperties": false,
+      "description": "The versioned recovery bundle an owner keeps at a stable locator.\n\nEnabling a new backup writer or rotating its signing key commits an updated bundle before that\nwriter is declared recovery-enabled.",
+      "properties": {
+        "checkpoints": {
+          "description": "The latest generation the owner verified for each archive.",
+          "items": {
+            "$ref": "#/$defs/ArchiveCheckpoint"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "collections": {
+          "description": "Where the owner's collections live.",
+          "items": {
+            "$ref": "#/$defs/CollectionLocator"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The bundle revision, advanced on every compare-and-swap write."
+        },
+        "schema_version": {
+          "$ref": "#/$defs/U64",
+          "description": "The bundle schema version."
+        },
+        "trusted_writers": {
+          "description": "The writers a restore may trust.",
+          "items": {
+            "$ref": "#/$defs/TrustedWriter"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "written_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the owner wrote it, in UTC milliseconds."
+        }
+      },
+      "required": [
+        "schema_version",
+        "collections",
+        "trusted_writers",
+        "checkpoints",
+        "revision",
+        "written_at_ms"
+      ],
+      "type": "object"
+    },
+    "RecoveryKit": {
+      "additionalProperties": false,
+      "description": "The printable and QR recovery kit.\n\nA seed with no way to find the encrypted bundle is not a complete kit, so the kit names the\nconfigured service origins and the stable bundle locator alongside the seed.",
+      "properties": {
+        "bundle_locator": {
+          "description": "The stable opaque locator of the recovery bundle.",
+          "type": "string"
+        },
+        "profile_version": {
+          "$ref": "#/$defs/U64",
+          "description": "The kit format and cryptographic profile version."
+        },
+        "seed": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The 256-bit recovery seed."
+        },
+        "seed_checksum": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The seed checksum, so a mistyped kit fails before it is used."
+        },
+        "service_origins": {
+          "description": "Each configured service origin.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "profile_version",
+        "seed",
+        "seed_checksum",
+        "service_origins",
+        "bundle_locator"
       ],
       "type": "object"
     },
@@ -2960,6 +4265,182 @@
         }
       ]
     },
+    "RevocationAcknowledgement": {
+      "additionalProperties": false,
+      "description": "The host's acknowledgement of one revocation request.",
+      "properties": {
+        "acknowledged_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the host acknowledged it, in UTC milliseconds."
+        },
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The revision the host issued for it."
+        },
+        "completion": {
+          "$ref": "#/$defs/RevocationCompletion",
+          "description": "Whether the dispatch barrier has completed."
+        },
+        "host_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The host that acknowledged it."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RevocationRequestId",
+          "description": "The request acknowledged."
+        }
+      },
+      "required": [
+        "request_id",
+        "host_device_id",
+        "authority_revision",
+        "completion",
+        "acknowledged_at_ms"
+      ],
+      "type": "object"
+    },
+    "RevocationCompletion": {
+      "description": "Whether a revocation has reached every affected worker.",
+      "oneOf": [
+        {
+          "const": "complete",
+          "description": "Every affected worker acknowledged the fence or was confirmed to have ended.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Some workers have not acknowledged yet. The controller has already stopped forwarding.",
+          "properties": {
+            "pending": {
+              "additionalProperties": false,
+              "properties": {
+                "pending_workers": {
+                  "$ref": "#/$defs/U64",
+                  "description": "How many workers are still outstanding."
+                }
+              },
+              "required": [
+                "pending_workers"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "pending"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RevocationRequest": {
+      "additionalProperties": false,
+      "description": "A remote owner's signed revocation request.\n\nA device cannot assign a higher host revision to its own request: the record carries no host\nrevision, because only the target host issues ordered authority revisions.",
+      "properties": {
+        "host_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The host it is addressed to."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the issuer published it, in UTC milliseconds."
+        },
+        "issuer_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device that published it."
+        },
+        "issuer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The key identifier of the issuer's authorisation key."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RevocationRequestId",
+          "description": "The request identity. Unique per request."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The Ed25519 signature over `CBOR([\"kr-revocation/1\", request without this field])`."
+        },
+        "target": {
+          "$ref": "#/$defs/RevocationTarget",
+          "description": "What it revokes."
+        }
+      },
+      "required": [
+        "request_id",
+        "issuer_device_id",
+        "host_device_id",
+        "target",
+        "issued_at_ms",
+        "issuer_key_id",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "RevocationRequestId": {
+      "description": "One signed revocation request published by a remote owner.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "RevocationTarget": {
+      "description": "What a revocation removes.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Named grants, and every grant delegated from them.",
+          "properties": {
+            "grants": {
+              "additionalProperties": false,
+              "properties": {
+                "grant_ids": {
+                  "description": "The grants to revoke.",
+                  "items": {
+                    "$ref": "#/$defs/GrantId"
+                  },
+                  "type": "array",
+                  "uniqueItems": true
+                }
+              },
+              "required": [
+                "grant_ids"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "grants"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Named devices, and every grant issued to them.",
+          "properties": {
+            "devices": {
+              "additionalProperties": false,
+              "properties": {
+                "device_ids": {
+                  "description": "The devices to revoke.",
+                  "items": {
+                    "$ref": "#/$defs/DeviceId"
+                  },
+                  "type": "array",
+                  "uniqueItems": true
+                }
+              },
+              "required": [
+                "device_ids"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "devices"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "RightCondition": {
       "description": "When a required authority applies.",
       "oneOf": [
@@ -2991,6 +4472,89 @@
         {
           "const": "issuing_owner",
           "description": "Required only when the caller is the invitation's issuing owner rather than the candidate.",
+          "type": "string"
+        }
+      ]
+    },
+    "SealedEnvelope": {
+      "additionalProperties": false,
+      "description": "One envelope sealed for one recipient.",
+      "properties": {
+        "ciphertext": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The `crypto_box_easy` output over the canonical plaintext."
+        },
+        "nonce": {
+          "$ref": "#/$defs/Nonce192",
+          "description": "The fresh 24-byte nonce, from libsodium's random generator."
+        },
+        "routing": {
+          "$ref": "#/$defs/EnvelopeRouting",
+          "description": "The routing record the service sees."
+        }
+      },
+      "required": [
+        "routing",
+        "nonce",
+        "ciphertext"
+      ],
+      "type": "object"
+    },
+    "SealedKeyWrap": {
+      "additionalProperties": false,
+      "description": "One wrapped object key.\n\nEvery wrap uses a fresh random 24-byte nonce. Reusing stored ciphertext when an upload resumes\nnever reuses a nonce for a new wrap.",
+      "properties": {
+        "ciphertext": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The `crypto_box_easy` output over the canonical wrap plaintext."
+        },
+        "context": {
+          "$ref": "#/$defs/KeyWrapContext",
+          "description": "The fields the wrap authenticates."
+        },
+        "nonce": {
+          "$ref": "#/$defs/Nonce192",
+          "description": "The fresh 24-byte nonce."
+        }
+      },
+      "required": [
+        "context",
+        "nonce",
+        "ciphertext"
+      ],
+      "type": "object"
+    },
+    "SensitiveAction": {
+      "description": "What a sensitive action is being confirmed for.",
+      "oneOf": [
+        {
+          "const": "issue_invitation",
+          "description": "Issuing a persistent pairing invitation.",
+          "type": "string"
+        },
+        {
+          "const": "confirm_device",
+          "description": "Confirming a new device.",
+          "type": "string"
+        },
+        {
+          "const": "enlarge_grant",
+          "description": "Enlarging a persistent grant.",
+          "type": "string"
+        },
+        {
+          "const": "trust_repository_root",
+          "description": "Trusting a new repository root.",
+          "type": "string"
+        },
+        {
+          "const": "grant_executable_capability",
+          "description": "Granting executable or native-bridge capabilities.",
+          "type": "string"
+        },
+        {
+          "const": "change_host_authority",
+          "description": "Changing host-management authority.",
           "type": "string"
         }
       ]
@@ -3067,10 +4631,94 @@
         }
       ]
     },
+    "Signature64": {
+      "contentEncoding": "base64url",
+      "description": "A 64-byte Ed25519 detached signature. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
+      "pattern": "^[A-Za-z0-9_-]{86}$",
+      "type": "string"
+    },
+    "SignedArchiveManifest": {
+      "additionalProperties": false,
+      "description": "A manifest and the backup writer's signature over it.",
+      "properties": {
+        "manifest": {
+          "$ref": "#/$defs/ArchiveManifest",
+          "description": "The manifest."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The Ed25519 signature over `CBOR([\"kr-archive-manifest/1\", manifest])`."
+        },
+        "writer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The writer's signing key."
+        }
+      },
+      "required": [
+        "manifest",
+        "writer_key_id",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "SignedClientBundle": {
+      "additionalProperties": false,
+      "description": "A candidate bundle and the authorisation signature that binds its key purposes.",
+      "properties": {
+        "bundle": {
+          "$ref": "#/$defs/ClientBundle",
+          "description": "The bundle."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The Ed25519 signature over `CBOR([\"kr-pair/client-bundle/1\", bundle, T])`."
+        },
+        "transcript": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The transcript the signature covers."
+        }
+      },
+      "required": [
+        "bundle",
+        "transcript",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "SignedHostBundle": {
+      "additionalProperties": false,
+      "description": "A bundle and the authorisation signature that binds its key purposes.\n\nThe encryption authenticates the initial bundle; this signature binds the key-purpose\ndeclarations to the authorisation key, and covers `T`, so it cannot be replayed from another\ntranscript.",
+      "properties": {
+        "bundle": {
+          "$ref": "#/$defs/HostBundle",
+          "description": "The bundle."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The Ed25519 signature over `CBOR([\"kr-pair/host-bundle/1\", bundle, T])`."
+        },
+        "transcript": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The transcript the signature covers."
+        }
+      },
+      "required": [
+        "bundle",
+        "transcript",
+        "signature"
+      ],
+      "type": "object"
+    },
     "SourceEventHandle": {
       "description": "A private broker handle for immutable upstream bytes and their execution provenance.",
       "maxLength": 256,
       "minLength": 1,
+      "type": "string"
+    },
+    "StoredEnvelopeKey": {
+      "contentEncoding": "base64url",
+      "description": "A 32-byte X25519 stored-envelope public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },
     "StreamCursor": {
@@ -3211,6 +4859,30 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "TrustedWriter": {
+      "additionalProperties": false,
+      "description": "A backup writer a restore is allowed to trust.",
+      "properties": {
+        "enrolled_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the owner enrolled it, in UTC milliseconds."
+        },
+        "signing_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The writer's Ed25519 signing public key."
+        },
+        "writer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The writer's signing key identifier."
+        }
+      },
+      "required": [
+        "writer_key_id",
+        "signing_key",
+        "enrolled_at_ms"
+      ],
+      "type": "object"
+    },
     "U64": {
       "description": "An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -3247,8 +4919,26 @@
     "actor_envelope": {
       "$ref": "#/$defs/ActorEnvelope"
     },
+    "archive_descriptor": {
+      "$ref": "#/$defs/ArchiveDescriptor"
+    },
+    "authority_revision_record": {
+      "$ref": "#/$defs/AuthorityRevisionRecord"
+    },
     "client_offer": {
       "$ref": "#/$defs/ClientOffer"
+    },
+    "direct_challenge": {
+      "$ref": "#/$defs/DirectChallenge"
+    },
+    "direct_redeem_proof": {
+      "$ref": "#/$defs/DirectRedeemProof"
+    },
+    "envelope_plaintext": {
+      "$ref": "#/$defs/EnvelopePlaintext"
+    },
+    "generation_checkpoint": {
+      "$ref": "#/$defs/GenerationCheckpoint"
     },
     "grant": {
       "$ref": "#/$defs/Grant"
@@ -3283,6 +4973,9 @@
         "approval_request_id": {
           "$ref": "#/$defs/ApprovalRequestId"
         },
+        "archive_id": {
+          "$ref": "#/$defs/ArchiveId"
+        },
         "attachment_id": {
           "$ref": "#/$defs/AttachmentId"
         },
@@ -3294,6 +4987,12 @@
         },
         "authority_revision": {
           "$ref": "#/$defs/AuthorityRevision"
+        },
+        "backup_generation": {
+          "$ref": "#/$defs/BackupGeneration"
+        },
+        "backup_object_id": {
+          "$ref": "#/$defs/BackupObjectId"
         },
         "boot_epoch": {
           "$ref": "#/$defs/BootEpoch"
@@ -3319,6 +5018,9 @@
         "clock_epoch": {
           "$ref": "#/$defs/ClockEpoch"
         },
+        "confirmation_id": {
+          "$ref": "#/$defs/ConfirmationId"
+        },
         "connection_id": {
           "$ref": "#/$defs/ConnectionId"
         },
@@ -3342,6 +5044,9 @@
         },
         "draft_revision": {
           "$ref": "#/$defs/DraftRevision"
+        },
+        "envelope_id": {
+          "$ref": "#/$defs/EnvelopeId"
         },
         "environment_id": {
           "$ref": "#/$defs/EnvironmentId"
@@ -3375,6 +5080,9 @@
         },
         "organisation_id": {
           "$ref": "#/$defs/OrganisationId"
+        },
+        "pairing_sequence": {
+          "$ref": "#/$defs/PairingSequence"
         },
         "plugin_id": {
           "$ref": "#/$defs/PluginId"
@@ -3411,6 +5119,9 @@
         },
         "request_id": {
           "$ref": "#/$defs/RequestId"
+        },
+        "revocation_request_id": {
+          "$ref": "#/$defs/RevocationRequestId"
         },
         "session_epoch": {
           "$ref": "#/$defs/SessionEpoch"
@@ -3451,6 +5162,21 @@
     "notification": {
       "$ref": "#/$defs/Notification"
     },
+    "owner_confirmation_proof": {
+      "$ref": "#/$defs/OwnerConfirmationProof"
+    },
+    "owner_confirmation_request": {
+      "$ref": "#/$defs/OwnerConfirmationRequest"
+    },
+    "pair_finish_request": {
+      "$ref": "#/$defs/PairFinishRequest"
+    },
+    "pair_status": {
+      "$ref": "#/$defs/PairStatus"
+    },
+    "proposed_grant": {
+      "$ref": "#/$defs/ProposedGrant"
+    },
     "protocol_error": {
       "$ref": "#/$defs/ProtocolError"
     },
@@ -3460,14 +5186,38 @@
     "receipt_response": {
       "$ref": "#/$defs/ReceiptResponse"
     },
+    "recovery_bundle": {
+      "$ref": "#/$defs/RecoveryBundle"
+    },
+    "recovery_kit": {
+      "$ref": "#/$defs/RecoveryKit"
+    },
     "request": {
       "$ref": "#/$defs/Request"
     },
     "response": {
       "$ref": "#/$defs/Response"
     },
+    "revocation_acknowledgement": {
+      "$ref": "#/$defs/RevocationAcknowledgement"
+    },
+    "revocation_request": {
+      "$ref": "#/$defs/RevocationRequest"
+    },
+    "sealed_envelope": {
+      "$ref": "#/$defs/SealedEnvelope"
+    },
     "session_ref": {
       "$ref": "#/$defs/SessionRef"
+    },
+    "signed_archive_manifest": {
+      "$ref": "#/$defs/SignedArchiveManifest"
+    },
+    "signed_client_bundle": {
+      "$ref": "#/$defs/SignedClientBundle"
+    },
+    "signed_host_bundle": {
+      "$ref": "#/$defs/SignedHostBundle"
     },
     "stream_header": {
       "$ref": "#/$defs/StreamHeader"

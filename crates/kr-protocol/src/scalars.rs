@@ -645,6 +645,65 @@ fixed_bytes!(
     "A 32-byte iroh endpoint public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."
 );
 
+fixed_bytes!(
+    /// An Ed25519 authorisation public key.
+    ///
+    /// Section 10 keeps the four device key purposes separate and forbids converting or reusing
+    /// one private key across purposes. Each purpose therefore has its own type here, so a
+    /// transport key cannot be passed where an authorisation key is expected.
+    AuthorisationKey,
+    32,
+    "A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."
+);
+
+fixed_bytes!(
+    /// An X25519 stored-envelope public key.
+    StoredEnvelopeKey,
+    32,
+    "A 32-byte X25519 stored-envelope public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."
+);
+
+fixed_bytes!(
+    /// An X25519 notification-preview public key.
+    ///
+    /// The notification extension receives only this private key and paired sender public keys.
+    NotificationPreviewKey,
+    32,
+    "A 32-byte X25519 notification-preview public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."
+);
+
+fixed_bytes!(
+    /// A stable identifier for one purpose-separated public key.
+    ///
+    /// It is the SHA-256 of the domain-separated encoding of the purpose and the key, so two
+    /// devices name the same key identically and a key of one purpose never shares an identifier
+    /// with a key of another.
+    KeyId,
+    32,
+    "A 32-byte key identifier: the SHA-256 of the domain-separated encoding of a key purpose and public key."
+);
+
+fixed_bytes!(
+    /// An Ed25519 detached signature.
+    Signature64,
+    64,
+    "A 64-byte Ed25519 detached signature. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."
+);
+
+fixed_bytes!(
+    /// A 192-bit nonce, as used by XChaCha20-Poly1305 and `crypto_box_easy`.
+    Nonce192,
+    24,
+    "A 24-byte nonce. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."
+);
+
+fixed_bytes!(
+    /// A 256-bit message authentication tag, as produced by HMAC-SHA-256.
+    Mac256,
+    32,
+    "A 32-byte HMAC-SHA-256 tag. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."
+);
+
 /// A field that must be present and may be null.
 ///
 /// Section 23 states that `null` is not omission. A closed schema therefore cannot use

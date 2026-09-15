@@ -327,6 +327,32 @@ uuid_id!(
     TransferId,
     "One upload or download transfer."
 );
+
+uuid_id!(
+    /// One stored mailbox envelope. 128 random bits.
+    EnvelopeId,
+    "One stored mailbox envelope: 128 random bits."
+);
+uuid_id!(
+    /// One backup archive. The service sees only this opaque identifier.
+    ArchiveId,
+    "One backup archive. The service sees only this opaque identifier."
+);
+uuid_id!(
+    /// One encrypted object inside a backup archive.
+    BackupObjectId,
+    "One encrypted object inside a backup archive."
+);
+uuid_id!(
+    /// One signed revocation request published by a remote owner.
+    RevocationRequestId,
+    "One signed revocation request published by a remote owner."
+);
+uuid_id!(
+    /// One owner-confirmation challenge. Single use, bound to one action digest.
+    ConfirmationId,
+    "One owner-confirmation challenge: single use and bound to one action digest."
+);
 uuid_id!(
     /// One native application installation registered with a push gateway.
     InstallationId,
@@ -397,6 +423,17 @@ counter_id!(
     /// The revision of a device's purpose-separated public keys.
     DeviceKeyRevision,
     "The revision of a device's purpose-separated public keys."
+);
+
+counter_id!(
+    /// The backup generation an archive belongs to. Only its producer advances it.
+    BackupGeneration,
+    "The backup generation an archive belongs to. Only its producer advances it."
+);
+counter_id!(
+    /// The sequence number of one message inside a pairing bundle exchange.
+    PairingSequence,
+    "The sequence number of one message inside a pairing bundle exchange."
 );
 counter_id!(
     /// The current input lease epoch.

@@ -12,6 +12,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings, js
 use serde_json::{Map, Value, json};
 
 use crate::actor::ActorEnvelope;
+use crate::archive::{ArchiveDescriptor, RecoveryBundle, RecoveryKit, SignedArchiveManifest};
 use crate::authority::MethodEntry;
 use crate::envelope::{MutationRequest, Notification, Request, Response};
 use crate::error::ProtocolError;
@@ -20,7 +21,13 @@ use crate::grant::Grant;
 use crate::hello::{ClientOffer, HostSelection};
 use crate::ids;
 use crate::ids::SessionRef;
+use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
 use crate::method::{Method, REGISTRY};
+use crate::pairing::{
+    AuthorityRevisionRecord, DirectChallenge, DirectRedeemProof, GenerationCheckpoint,
+    OwnerConfirmationProof, OwnerConfirmationRequest, PairFinishRequest, PairStatus, ProposedGrant,
+    RevocationAcknowledgement, RevocationRequest, SignedClientBundle, SignedHostBundle,
+};
 use crate::receipt::{Receipt, ReceiptResponse};
 
 /// The generated JSON Schema bundle.
@@ -51,18 +58,37 @@ pub fn protocol_schema() -> Value {
     roots! {
         generator, properties,
         "actor_envelope" => ActorEnvelope,
+        "archive_descriptor" => ArchiveDescriptor,
+        "authority_revision_record" => AuthorityRevisionRecord,
         "client_offer" => ClientOffer,
+        "direct_challenge" => DirectChallenge,
+        "direct_redeem_proof" => DirectRedeemProof,
+        "envelope_plaintext" => EnvelopePlaintext,
+        "generation_checkpoint" => GenerationCheckpoint,
         "grant" => Grant,
         "host_selection" => HostSelection,
         "method_entry" => MethodEntry,
         "mutation_request" => MutationRequest,
         "notification" => Notification,
+        "owner_confirmation_proof" => OwnerConfirmationProof,
+        "owner_confirmation_request" => OwnerConfirmationRequest,
+        "pair_finish_request" => PairFinishRequest,
+        "pair_status" => PairStatus,
+        "proposed_grant" => ProposedGrant,
         "protocol_error" => ProtocolError,
         "receipt" => Receipt,
         "receipt_response" => ReceiptResponse,
+        "recovery_bundle" => RecoveryBundle,
+        "recovery_kit" => RecoveryKit,
         "request" => Request,
         "response" => Response,
+        "revocation_acknowledgement" => RevocationAcknowledgement,
+        "revocation_request" => RevocationRequest,
+        "sealed_envelope" => SealedEnvelope,
         "session_ref" => SessionRef,
+        "signed_archive_manifest" => SignedArchiveManifest,
+        "signed_client_bundle" => SignedClientBundle,
+        "signed_host_bundle" => SignedHostBundle,
         "stream_header" => StreamHeader,
     }
     properties.insert(
@@ -109,10 +135,13 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "agent_turn_id" => ids::AgentTurnId,
         "application_instance_id" => ids::ApplicationInstanceId,
         "approval_request_id" => ids::ApprovalRequestId,
+        "archive_id" => ids::ArchiveId,
         "attachment_id" => ids::AttachmentId,
         "attachment_ordinal" => ids::AttachmentOrdinal,
         "attempt_id" => ids::AttemptId,
         "authority_revision" => ids::AuthorityRevision,
+        "backup_generation" => ids::BackupGeneration,
+        "backup_object_id" => ids::BackupObjectId,
         "boot_epoch" => ids::BootEpoch,
         "build_id" => ids::BuildId,
         "capability_id" => ids::CapabilityId,
@@ -121,6 +150,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "change_set_id" => ids::ChangeSetId,
         "change_set_version" => ids::ChangeSetVersion,
         "clock_epoch" => ids::ClockEpoch,
+        "confirmation_id" => ids::ConfirmationId,
         "connection_id" => ids::ConnectionId,
         "controller_generation" => ids::ControllerGeneration,
         "desktop_session_id" => ids::DesktopSessionId,
@@ -129,6 +159,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "diagnostic_id" => ids::DiagnosticId,
         "draft_id" => ids::DraftId,
         "draft_revision" => ids::DraftRevision,
+        "envelope_id" => ids::EnvelopeId,
         "environment_id" => ids::EnvironmentId,
         "event_sequence" => ids::EventSequence,
         "event_type" => ids::EventType,
@@ -140,6 +171,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "invitation_id" => ids::InvitationId,
         "machine_id" => ids::MachineId,
         "organisation_id" => ids::OrganisationId,
+        "pairing_sequence" => ids::PairingSequence,
         "plugin_id" => ids::PluginId,
         "project_repository_id" => ids::ProjectRepositoryId,
         "question_id" => ids::QuestionId,
@@ -147,6 +179,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "remote_dispatch_lease_id" => ids::RemoteDispatchLeaseId,
         "repository_generation" => ids::RepositoryGeneration,
         "request_id" => ids::RequestId,
+        "revocation_request_id" => ids::RevocationRequestId,
         "session_epoch" => ids::SessionEpoch,
         "session_id" => ids::SessionId,
         "source_event_handle" => ids::SourceEventHandle,
