@@ -590,7 +590,7 @@ The rest of the reservation:
 | --- | --- | --- |
 | Row arrays | 288 a row | The array slot of every row of both buffers, the primary buffer's 3,500 scrollback slots included, at twice the rows they hold |
 | Row storage | 136 a screen row | What a row allocates for itself before anything is on it: eighty bytes of room for its text, and a header each for the cell offsets and the wide-cell bits. A retained row's own storage is the row cache's to carry |
-| Hyperlink envelope | 17,137,960 | 4,096 targets of 2,048 bytes, at twice what they hold, with the table slots and the first node |
+| Hyperlink envelope | 17,137,960 | 4,096 targets of 2,048 bytes, at twice what they hold, with the table slots and the first node. One envelope holds every link object the grid keeps, on a screen or on a retained row, so a row scrolling off moves no charge |
 | Titles and the virtual stack | 50,208 | Ten entries of two 1,024-byte titles, at twice what they hold, the current pair, and the copy of each title the grid keeps |
 | Alert channel | 1,073,152 | 256 alerts of two 1,024-byte strings, at twice what the list holds |
 
@@ -618,14 +618,22 @@ touched, and the geometry, the reservation and the projection are all unchanged.
 
 A resize that does fit has work to do afterwards. Reflowing into fewer columns builds as many rows
 as the text needs, which can be many times the rows the new geometry keeps, and it hands a row of
-blanks back whole rather than cutting it to the new width. Neither is undone until something
-scrolls, so the buffer that is showing is brought back to what its geometry holds as part of the
-resize: the row count returns to the screen and its scrollback, and a row still holding more
-columns than the screen has is cut to the columns it has. Such a row is blank, so cutting it loses
-nothing that was ever going to be shown. The buffer that is not showing cannot be reached that way,
-so it is done again when the buffers swap. Until then its rows are measured where they are, which
-is why the figure a session reports can be above what its current geometry reserved: what it is
-holding was reserved by the geometry it had before.
+blanks back whole rather than cutting it to the new width. The alternate buffer keeps no history,
+so a shorter geometry leaves it holding rows nothing can reach, and scrolling never drops them:
+with no scrollback the library removes exactly as many rows as it adds. None of that is undone on
+its own, so the buffer that is showing is brought back to what its geometry holds as part of the
+resize. Its row count returns to the screen and its scrollback, the alternate buffer's rows above
+the screen are dropped, and a row still holding more columns than the screen has is rebuilt at the
+width the screen has. Such a row is blank, so rebuilding it loses nothing that was ever going to be
+shown, and rebuilding rather than shortening gives back the room it was holding. The buffer that is
+not showing cannot be reached that way, so the same is done for it when the buffers swap.
+
+What a row gave up is given back; what the arrays behind them were holding is not. A vector that is
+shortened keeps the room it grew to, and the library offers no way to ask for that room back or to
+read how much of it there is, so a session that reflowed into one column keeps an array sized for
+the rows that reflow produced until the next reflow builds a new one. That room is bounded by the
+geometry the session was admitted at and the rows its cache may hold, and it is not in the figures
+below.
 
 A cursor restore is a case of its own. The pinned revision clears newline mode and the shift-out
 selection when it restores a cursor, which a terminal does not: DECRC restores the cursor, the
@@ -668,8 +676,6 @@ that is a close, and keeping its parameters would let an application hold a sess
 identifiers in links nothing can follow. A cell that reaches its content bound drops the marks past
 it. The alert channel holds a bounded number of alerts, each cut to a bounded length.
 
-A resize can move link objects the other way, from the history back onto a screen, and a screen
-that takes back more links than the envelope holds refuses the next one until it is under again.
 Nothing else is refused. Text, titles and the rows that scroll off all draw on room the geometry
 already reserved, so an admitted session can fill its screens, set a title as often as it likes and
 push its stack to the bound without meeting a refusal. Rows that scroll off the screen are charged
@@ -695,10 +701,10 @@ report a screen of coloured, linked cells as costing what a screen of plain ones
 
 Every measurement is compared with the reservation made for it. `SessionBudget::excess` is what the
 measurements found beyond their reservations, and `SessionBudget::committed` is the reservation
-plus that, so the figure a session reports is never below what it is holding. At a settled geometry
-the excess is zero, including on a screen filled with the most expensive cell there is. It is above
-zero only while a session is holding storage a geometry it has left reserved and the library has
-not released, which the resize rule above describes.
+plus that, so what a session reports is never below what its measurements found. The excess is
+zero, including on both buffers filled with the most expensive cell there is, and the tests assert
+so where each rule is proved. What the measurements cannot see is the room a shortened vector keeps,
+described above.
 
 What the budget records for the row cache is what the rows actually cost, not what they are allowed
 to cost. Recording the bound instead would make a session that is over its cache look exactly like

@@ -837,7 +837,7 @@ impl Engine {
         self.budget
             .add_row_cache(self.grid.newest_history_bytes(added));
         if self.budget.row_cache_over_budget() {
-            self.evict_history(now_ms);
+            self.evict_history(self.grid.history_bytes(), now_ms);
         }
     }
 
@@ -846,9 +846,8 @@ impl Engine {
     /// One pass. The grid works the row count out from the rows themselves rather than from an
     /// average, so what is left after it costs no more than the bound; the measurement afterwards
     /// is what the rows cost, not an estimate of it.
-    fn evict_history(&mut self, now_ms: u64) {
+    fn evict_history(&mut self, bytes: u64, now_ms: u64) {
         let limit = self.budget.limits().row_cache_bytes;
-        let bytes = self.grid.history_bytes();
         if self.grid.enforce_row_cache(bytes, limit) {
             self.measured_rows = self.grid.scrollback_rows();
             self.history_end_seen = self.grid.history_end();
@@ -922,16 +921,16 @@ impl Engine {
             .set_links(buffers.links.saturating_add(self.link_table_bytes()));
         self.budget
             .set_titles(self.titles.resident_bytes() + crate::grid::GRID_TITLE_BYTES);
+        self.budget.set_row_cache(buffers.history);
         if self.grid.alternate_active() {
             // Nothing appends to the primary buffer while the alternate one is showing, so its
-            // history cannot grow here; a resize can still move rows into it, so what it costs is
+            // history cannot grow here; a resize can still move rows into it, which is why it was
             // measured rather than assumed. Bringing it back under the bound waits until the
             // primary buffer is showing again, because the library drops the rows it is told to
-            // drop as it appends to them.
-            self.budget.set_row_cache(self.grid.history_bytes());
+            // drop as it appends to them, and it appends only to the buffer that is showing.
             return;
         }
-        self.evict_history(now_ms);
+        self.evict_history(buffers.history, now_ms);
         self.history_end_seen = self.grid.history_end();
     }
 

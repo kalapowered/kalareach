@@ -70,10 +70,10 @@
       "covers": "KR-REQ-08.72 the invisible default 120x40",
       "footprint": {
         "alerts": 1073152,
-        "cell_content": 2457600,
+        "cell_content": 2468480,
         "cell_slots": 1228800,
         "links": 17137960,
-        "row_arrays": 1041920,
+        "row_arrays": 1031040,
         "titles": 50208,
         "total": 22989640
       },
@@ -90,10 +90,10 @@
       "covers": "KR-REQ-08.79 a geometry that fits",
       "footprint": {
         "alerts": 1073152,
-        "cell_content": 983040,
+        "cell_content": 989568,
         "cell_slots": 491520,
         "links": 17137960,
-        "row_arrays": 1028352,
+        "row_arrays": 1021824,
         "titles": 50208,
         "total": 20764232
       },
@@ -110,10 +110,10 @@
       "covers": "KR-REQ-08.79 a geometry that fits",
       "footprint": {
         "alerts": 1073152,
-        "cell_content": 25165824,
+        "cell_content": 25172352,
         "cell_slots": 12582912,
         "links": 17137960,
-        "row_arrays": 1028352,
+        "row_arrays": 1021824,
         "titles": 50208,
         "total": 57038408
       },
@@ -130,10 +130,10 @@
       "covers": "KR-REQ-08.79 the largest square that fits",
       "footprint": {
         "alerts": 1073152,
-        "cell_content": 31744512,
+        "cell_content": 31812240,
         "cell_slots": 15872256,
         "links": 17137960,
-        "row_arrays": 1219152,
+        "row_arrays": 1151424,
         "titles": 50208,
         "total": 67097240
       },
@@ -162,10 +162,10 @@
       "covers": "KR-REQ-08.79 the widest grid that fits at a height",
       "footprint": {
         "alerts": 1073152,
-        "cell_content": 31866880,
+        "cell_content": 31877760,
         "cell_slots": 15933440,
         "links": 17137960,
-        "row_arrays": 1041920,
+        "row_arrays": 1031040,
         "titles": 50208,
         "total": 67103560
       },
@@ -194,10 +194,10 @@
       "covers": "KR-REQ-08.79 the largest cell count any shape is admitted at",
       "footprint": {
         "alerts": 1073152,
-        "cell_content": 31870976,
+        "cell_content": 31879408,
         "cell_slots": 15935488,
         "links": 17137960,
-        "row_arrays": 1034288,
+        "row_arrays": 1025856,
         "titles": 50208,
         "total": 67102072
       },
@@ -250,10 +250,10 @@
       "covers": "KR-REQ-08.70 an owner resize the session can hold",
       "footprint": {
         "alerts": 1073152,
-        "cell_content": 983040,
+        "cell_content": 989568,
         "cell_slots": 491520,
         "links": 17137960,
-        "row_arrays": 1028352,
+        "row_arrays": 1021824,
         "titles": 50208,
         "total": 20764232
       },
@@ -268,10 +268,10 @@
         "budget": 67108864,
         "footprint": {
           "alerts": 1073152,
-          "cell_content": 5120000,
+          "cell_content": 5133600,
           "cell_slots": 2560000,
           "links": 17137960,
-          "row_arrays": 1050400,
+          "row_arrays": 1036800,
           "titles": 50208,
           "total": 26991720
         },
@@ -293,10 +293,10 @@
       "covers": "KR-REQ-08.79 a resize refused before allocation",
       "footprint": {
         "alerts": 1073152,
-        "cell_content": 983040,
+        "cell_content": 989568,
         "cell_slots": 491520,
         "links": 17137960,
-        "row_arrays": 1028352,
+        "row_arrays": 1021824,
         "titles": 50208,
         "total": 20764232
       },

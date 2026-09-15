@@ -306,17 +306,20 @@ impl SessionBudget {
             cell_slots: 2u64
                 .saturating_mul(cells)
                 .saturating_mul(CELL_OVERHEAD_BYTES),
+            // What the cells of both buffers can hold, and what the rows they sit on allocate for
+            // themselves whether or not anything is on them. Both are in one figure because the
+            // measurement reads them from the same rows; what a retained row allocates is the row
+            // cache's to carry.
             cell_content: 2u64
                 .saturating_mul(cells)
-                .saturating_mul(cell_content_bytes(cell_bytes)),
+                .saturating_mul(cell_content_bytes(cell_bytes))
+                .saturating_add(2u64.saturating_mul(rows).saturating_mul(ROW_STORAGE_BYTES)),
             // The primary buffer's array holds the screen and the history; the alternate buffer
-            // keeps no history. Each row of a screen also allocates for itself, whether or not
-            // anything is on it; what a retained row allocates is the row cache's to carry.
+            // keeps no history.
             row_arrays: rows
                 .saturating_add(scrollback_rows as u64)
                 .saturating_add(rows)
-                .saturating_mul(ROW_SLOT_BYTES)
-                .saturating_add(2u64.saturating_mul(rows).saturating_mul(ROW_STORAGE_BYTES)),
+                .saturating_mul(ROW_SLOT_BYTES),
             links: self.limits.link_envelope(),
             // The session's own titles and stack, and the copy the grid keeps of each title.
             titles: crate::title::MAX_RESIDENT_BYTES.saturating_add(GRID_TITLE_BYTES),

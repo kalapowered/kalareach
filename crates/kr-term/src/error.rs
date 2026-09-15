@@ -101,10 +101,12 @@ impl TermError {
     /// The protocol error code this failure is reported as.
     ///
     /// The two geometry rules are answered differently on purpose. Dimensions outside the three
-    /// simultaneous constraints are a malformed request, and no session has room for them, so they
-    /// are `INVALID_ARGUMENT`. A geometry inside those constraints that this session cannot hold is
-    /// a resource that is not available: the same request on a session with less resident state, or
-    /// after this one gives some back, can succeed, so it is `RESOURCE_UNAVAILABLE`.
+    /// simultaneous constraints are a malformed request: no session anywhere has room for them, and
+    /// a client that asks again will be refused again, so they are `INVALID_ARGUMENT`. A geometry
+    /// inside those constraints is refused because the screens it would need do not fit the
+    /// session's resource budget, which is a resource that is not available rather than a request
+    /// that is wrong: the same dimensions are what another session runs at, and a client answers by
+    /// asking for a size that fits. So it is `RESOURCE_UNAVAILABLE`.
     #[must_use]
     pub const fn code(&self) -> ErrorCode {
         match self {

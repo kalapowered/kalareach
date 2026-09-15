@@ -171,6 +171,9 @@ impl TitleState {
             self.underflows = self.underflows.saturating_add(1);
             return false;
         };
+        // The room an entry took goes back with it. A stack that grew to its depth and then
+        // emptied would otherwise keep the array it grew for the rest of the session.
+        self.stack.shrink_to_fit();
         if matches!(target, TitleTarget::Icon | TitleTarget::Both) {
             if let Some(icon) = entry.icon {
                 self.current.icon = icon;

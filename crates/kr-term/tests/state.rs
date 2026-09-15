@@ -1811,10 +1811,13 @@ fn the_row_arrays_are_reserved_with_their_scrollback() {
     let footprint = budget.footprint(GridSize::new(80, 24), grid.scrollback_rows, 64);
     assert_eq!(
         footprint.row_arrays,
-        (24 + grid.scrollback_rows as u64 + 24) * kr_term::grid::ROW_SLOT_BYTES
-            + 48 * kr_term::grid::ROW_STORAGE_BYTES,
-        "the primary buffer's array holds the screen and the scrollback, the alternate keeps no \
-         history, and every row of a screen allocates for itself"
+        (24 + grid.scrollback_rows as u64 + 24) * kr_term::grid::ROW_SLOT_BYTES,
+        "the primary buffer's array holds the screen and the scrollback; the alternate keeps no \
+         history"
+    );
+    assert!(
+        footprint.cell_content >= 48 * kr_term::grid::ROW_STORAGE_BYTES,
+        "every row of both screens allocates for itself whether or not anything is on it"
     );
     let taller = budget.footprint(GridSize::new(80, 48), grid.scrollback_rows, 64);
     assert!(
@@ -1987,19 +1990,16 @@ fn a_screen_of_known_cells_measures_what_those_cells_cost() {
         ..EngineConfig::DEFAULT
     })
     .expect("engine");
-    // One cell, as expensive as a cell is allowed to be: an 'e' with combining marks up to the
-    // per-cell content bound, which is far past a machine word, so its text is on the heap behind
-    // a header; and a colour the packed form on the cell cannot hold, so the cell keeps an
-    // allocation of its own for its attributes.
-    let mut cell = String::from("e");
+    // One cell, exactly as expensive as a cell is allowed to be: an 'e' with an acute accent and
+    // combining marks up to the per-cell content bound, which is far past a machine word, so its
+    // text is on the heap behind a header; and a colour the packed form on the cell cannot hold,
+    // so the cell keeps an allocation of its own for its attributes.
+    let mut cell = String::from("\u{e9}");
     while cell.len() + 2 <= kr_term::grid::GridConfig::DEFAULT.cell_bytes {
         cell.push('\u{301}');
     }
     let cell = cell.as_str();
-    assert_eq!(
-        cell.len(),
-        kr_term::grid::GridConfig::DEFAULT.cell_bytes - 1
-    );
+    assert_eq!(cell.len(), kr_term::grid::GridConfig::DEFAULT.cell_bytes);
     let mut input = String::from("\x1b[38;2;10;20;30m");
     for _ in 0..(size.cols * size.rows) {
         input.push_str(cell);
@@ -2113,10 +2113,10 @@ fn a_narrower_geometry_releases_what_it_cannot_hold() {
     );
 }
 
-/// The alternate buffer keeps no history, so every row the library is still holding for it is its
-/// own and is measured, including the rows a shorter geometry left behind.
+/// The alternate buffer keeps no history, so a shorter geometry must leave it holding no rows
+/// beyond the ones it shows. Scrolling never drops them, so the resize does.
 #[test]
-fn the_alternate_buffer_measures_every_row_it_holds() {
+fn a_shorter_geometry_leaves_the_alternate_buffer_no_extra_rows() {
     let mut engine = Engine::new(EngineConfig {
         size: GridSize::new(64, 16),
         ..EngineConfig::DEFAULT
@@ -2136,9 +2136,20 @@ fn the_alternate_buffer_measures_every_row_it_holds() {
     engine.resize(GridSize::new(64, 1), 0).expect("admitted");
     engine.quiesce(0);
     assert!(
-        engine.budget().usage().screen_content[1] >= 16 * kr_term::grid::ROW_STORAGE_BYTES,
-        "every row the library is still holding for the alternate buffer is counted, not only the \
-         one the new geometry shows"
+        engine.budget().usage().screen_content[1] < full / 8,
+        "the rows the new geometry cannot show are gone, not held: {} bytes of {full}",
+        engine.budget().usage().screen_content[1]
+    );
+    assert_eq!(engine.budget().excess(), 0);
+    // And the row that is left is the one that was showing: the newest, not the oldest.
+    let rows = engine.grid().visible_rows();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0]
+            .runs
+            .iter()
+            .any(|run| run.text.contains("alternate row 15")),
+        "the rows dropped are the ones above the screen"
     );
 }
 
@@ -2186,4 +2197,39 @@ fn a_restored_title_stack_keeps_no_more_room_than_it_may() {
         kr_term::title::MAX_RESIDENT_BYTES
     );
     assert_eq!(titles.window().len(), kr_term::title::MAX_TITLE_BYTES);
+}
+
+/// A row scrolling off the screen moves no hyperlink object anywhere: one envelope holds every
+/// link the grid keeps, wherever the row it is on sits.
+#[test]
+fn a_row_scrolling_off_moves_no_hyperlink_charge() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(40, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    for row in 0..3u32 {
+        engine.feed(
+            format!("\x1b]8;;https://example.invalid/{row}\x1b\\link {row}\x1b]8;;\x1b\\\r\n")
+                .as_bytes(),
+            0,
+        );
+    }
+    engine.quiesce(0);
+    let on_screen = engine.budget().usage().links;
+    assert!(on_screen > 0, "the links the rows hold are resident state");
+
+    // Scroll every one of them into the retained rows.
+    engine.feed(b"\r\n\r\n\r\n", 0);
+    engine.quiesce(0);
+    assert!(
+        engine.grid().scrollback_rows() >= 3,
+        "the rows carrying the links are above the screen now"
+    );
+    assert_eq!(
+        engine.budget().usage().links,
+        on_screen,
+        "the objects are where they were; only the rows moved"
+    );
+    assert_eq!(engine.budget().excess(), 0);
 }

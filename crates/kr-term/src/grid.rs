@@ -162,13 +162,21 @@ pub const ALERT_LIST_BYTES: u64 =
     // alert carries at most two strings, each cut to the bound.
     (2 * MAX_ALERTS * (size_of::<GridAlert>() + 2 * MAX_ALERT_BYTES)) as u64;
 
-/// What the two screen buffers hold, measured together.
+/// What the grid is holding, measured in one pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BufferBytes {
-    /// What each buffer's rows hold beyond their cell slots, primary first.
+    /// What each buffer's rows that are showing hold beyond their cell slots, primary first.
     pub content: [u64; 2],
-    /// What the hyperlinks of both buffers cost, the pen's and the saved cursors' included.
+    /// What every hyperlink object the grid holds costs: the objects on the rows of both buffers,
+    /// the objects on the retained rows, the link the pen is inside and the links the saved
+    /// cursors carry.
+    ///
+    /// One figure, because a row moving between a screen and the retained rows moves no object: a
+    /// link counted in one place and not the other would look like an allocation where nothing was
+    /// allocated.
     pub links: u64,
+    /// What the retained rows hold, against the historical cache's own bound.
+    pub history: u64,
 }
 
 /// The configuration the grid library runs under.
@@ -984,15 +992,42 @@ impl CanonicalGrid {
     /// Only the screen that is showing. Reaching into the other one is not something the library
     /// offers, so it is done again when that one comes back.
     fn normalise_storage(&mut self) {
-        self.stale[usize::from(self.alternate_active())] = false;
+        let alternate = self.alternate_active();
+        self.stale[usize::from(alternate)] = false;
         let cols = self.size.cols as usize;
+        let rows = self.size.rows as usize;
         let seqno = self.terminal.current_seqno();
         let screen = self.terminal.screen_mut();
         screen.for_each_phys_line_mut(|_, line| {
-            if line.len() > cols {
+            if line.len() <= cols {
+                return;
+            }
+            if line.is_whitespace() {
+                // Rebuilt rather than cut. Shortening a row leaves the room it was holding, and
+                // this is the row a reflow handed back whole: it is as wide as the screen used to
+                // be. Every cell on it is a blank of one column, so the cells that fit are copied
+                // as they are and the rest are the columns the screen no longer has.
+                let wrapped = line.last_cell_was_wrapped();
+                let mut cells: Vec<wezterm_term::Cell> = Vec::with_capacity(cols);
+                cells.extend(line.visible_cells().take(cols).map(|cell| cell.as_cell()));
+                cells.resize(cols, wezterm_term::Cell::blank());
+                *line = wezterm_term::Line::from_cells(cells, seqno);
+                if wrapped {
+                    line.set_last_cell_was_wrapped(true, seqno);
+                }
+            } else {
                 line.resize(cols, seqno);
             }
         });
+        if alternate {
+            // The alternate buffer keeps no history, so a shorter geometry leaves it holding rows
+            // nothing can reach. Scrolling does not drop them: with no scrollback the library
+            // removes exactly as many rows as it adds. This is the one operation that does.
+            if screen.scrollback_rows() > rows {
+                screen.erase_scrollback();
+            }
+            return;
+        }
         self.trim_scrollback();
     }
 
@@ -1283,11 +1318,12 @@ impl CanonicalGrid {
             .saturating_sub(self.size.rows as usize)
     }
 
-    /// What the two screen buffers are holding.
+    /// What the grid is holding.
     ///
-    /// Both, because the buffer that is not showing still holds its own: a session can fill the
-    /// primary buffer, switch, and fill the alternate one as well. One walk of each screen answers
-    /// for its content and its hyperlinks together, because the two are read from the same cells.
+    /// Both buffers, because the one that is not showing still holds its own: a session can fill
+    /// the primary buffer, switch, and fill the alternate one as well. One walk of each screen
+    /// answers for its rows, its retained rows and its hyperlinks together, because all three are
+    /// read from the same cells.
     #[must_use]
     pub fn buffer_bytes(&self) -> BufferBytes {
         // Each distinct link object once, wherever it is held. The cells of one link share it, a
@@ -1309,20 +1345,31 @@ impl CanonicalGrid {
             }
         }
         let alternate = self.alternate_active();
-        let active =
-            self.content_showing(self.terminal.screen(), !alternate, &mut seen, &mut links);
-        let inactive = self.content_showing(
+        let mut history = 0u64;
+        let active = self.content_of(
+            self.terminal.screen(),
+            !alternate,
+            &mut seen,
+            &mut links,
+            &mut history,
+        );
+        let inactive = self.content_of(
             self.terminal.inactive_screen(),
             alternate,
             &mut seen,
             &mut links,
+            &mut history,
         );
         let content = if alternate {
             [inactive, active]
         } else {
             [active, inactive]
         };
-        BufferBytes { content, links }
+        BufferBytes {
+            content,
+            links,
+            history,
+        }
     }
 
     /// The screen the history belongs to, wherever it is.
@@ -1339,20 +1386,22 @@ impl CanonicalGrid {
         }
     }
 
-    /// What one screen's rows hold, adding their links to a running total.
+    /// What one screen's rows that are showing hold, adding its retained rows and every screen's
+    /// links to running totals.
     ///
     /// `keeps_history` says whether the rows above the screen belong to the historical cache,
     /// which has a bound of its own. Only the primary buffer keeps one. The alternate buffer's
     /// rows are all its own, including any the library is still holding from a taller geometry, so
     /// treating the oldest of them as somebody else's would leave them in no account at all.
-    fn content_showing(
+    fn content_of(
         &self,
         screen: &wezterm_term::screen::Screen,
         keeps_history: bool,
         seen: &mut BTreeSet<*const Hyperlink>,
         links: &mut u64,
+        history: &mut u64,
     ) -> u64 {
-        let history = if keeps_history {
+        let retained = if keeps_history {
             screen
                 .scrollback_rows()
                 .saturating_sub(self.size.rows as usize)
@@ -1362,11 +1411,15 @@ impl CanonicalGrid {
         let mut content = 0u64;
         let mut index = 0usize;
         screen.for_each_phys_line(|_, line| {
-            let counted = index >= history;
+            let showing = index >= retained;
             index += 1;
-            if counted {
+            // Every link object once, wherever the row it is on sits. A row that scrolls off takes
+            // no object with it and gives none up.
+            add_row_links(line, seen, links);
+            if showing {
                 content = content.saturating_add(row_content_bytes(line));
-                add_row_links(line, seen, links);
+            } else {
+                *history = history.saturating_add(history_row_bytes(line));
             }
         });
         content
@@ -1433,29 +1486,21 @@ impl CanonicalGrid {
 
 /// What one retained row costs the historical cache.
 ///
-/// Its cells, the text and attribute allocations they hold, and the hyperlink objects on it. The
-/// slot the row takes in its screen's array is not here: that array is reserved whole when the
-/// geometry is admitted, scrollback slots included, so charging it again would count it twice.
+/// Its cells and the text and attribute allocations they hold. Two things are deliberately not
+/// here. The slot the row takes in its screen's array is reserved whole when the geometry is
+/// admitted, scrollback slots included, so charging it again would count it twice. And the
+/// hyperlink objects on it are charged to the session's one hyperlink envelope wherever they are,
+/// so that a row scrolling off the screen moves no charge from one account to another.
 fn history_row_bytes(line: &wezterm_term::Line) -> u64 {
     let cells = line.len() as u64;
-    row_content_bytes(line)
-        .saturating_add(cells.saturating_mul(CELL_OVERHEAD_BYTES))
-        .saturating_add(link_bytes(line))
-}
-
-/// What the hyperlinks of one row cost, on their own.
-///
-/// A cell inside a hyperlink holds a reference to the whole link, and a row of them costs far more
-/// than its text. Each distinct link object is counted once: the cells of one link share it, and two
-/// links that happen to have the same target do not share anything.
-fn link_bytes(line: &wezterm_term::Line) -> u64 {
-    let mut seen = BTreeSet::new();
-    let mut bytes = 0u64;
-    add_row_links(line, &mut seen, &mut bytes);
-    bytes
+    row_content_bytes(line).saturating_add(cells.saturating_mul(CELL_OVERHEAD_BYTES))
 }
 
 /// Adds the link objects of one row that `seen` has not already counted.
+///
+/// A cell inside a hyperlink holds a reference to the whole link, and a row of them costs far more
+/// than its text. Each distinct link object is counted once: the cells of one link share it, and
+/// two links that happen to have the same target do not share anything.
 fn add_row_links(
     line: &wezterm_term::Line,
     seen: &mut BTreeSet<*const Hyperlink>,
