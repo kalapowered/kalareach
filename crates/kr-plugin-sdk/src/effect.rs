@@ -9,7 +9,6 @@
 //! here, in one table, rather than in each call site, so "what does this action need" has one
 //! answer.
 
-use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -17,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::capability::PluginCapability;
 use crate::ids::{ActionName, ParameterName};
 use crate::text::{Label, Summary};
+
+pub use kr_protocol::rights::ActionRight;
 
 /// What an action does.
 ///

@@ -57,6 +57,7 @@
 //! | [`validate`] | Package validation and its stable finding codes |
 //! | [`wit`] | The `kalareach:plugin` WIT package |
 //! | [`example`] | A complete example package |
+//! | [`scalars`] | The wire scalars these types are built from |
 //! | [`schema`] | Deterministic JSON Schema generation |
 //!
 //! # Example
@@ -99,6 +100,15 @@ pub mod plugin;
 pub mod predicate;
 pub mod presentation;
 pub mod schema;
+
+/// The wire scalars these types are built from.
+///
+/// They are defined in `kr-protocol` and re-exported here so a consumer can name every type that
+/// appears in this crate's public interface without depending on the protocol crate as well.
+pub mod scalars {
+    pub use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable, TimestampMs, U64, Uuid};
+}
+
 pub mod text;
 pub mod validate;
 pub mod version;

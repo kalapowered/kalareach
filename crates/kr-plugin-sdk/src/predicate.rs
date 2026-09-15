@@ -10,11 +10,11 @@
 //! [`MAX_PREDICATE_DEPTH`] levels and [`MAX_PREDICATE_TERMS`] terms per combinator. Evaluation
 //! terminates on every input, which is what makes rechecking on invocation affordable.
 
-use kr_protocol::rights::ActionRight;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::capability::{CapabilityState, PluginCapability};
+use crate::effect::ActionRight;
 use crate::ids::NodeId;
 
 /// Maximum nesting depth of a predicate.

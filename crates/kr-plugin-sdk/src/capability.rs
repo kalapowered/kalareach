@@ -17,12 +17,12 @@
 //! prose.
 
 use kr_protocol::ids::{CapabilityId, CapabilityRevision, EnvironmentId};
-use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::digest::PayloadDigest;
+use crate::effect::ActionRight;
 use crate::ids::{PluginId, PublisherId};
 use crate::text::{DisabledReason, Label, Summary};
 use crate::version::PackageVersion;
