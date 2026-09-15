@@ -50,17 +50,20 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     /// Sends one control frame.
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()>;
 
+    /// Claims the right to read this connection, which exactly one session may hold.
+    ///
+    /// Two readers on one stream would divide the frames between them, so a session claims the
+    /// receive side when it starts and a second claim is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::ConnectionEnded`] when the receive side is already claimed.
+    fn claim_receiver(&self) -> Result<()>;
+
     /// Reads the next control frame, or `None` when the peer ended the stream.
     ///
-    /// Exactly one task reads a connection. The second caller is refused rather than given a second
-    /// reader, because two readers on one stream would interleave frames.
+    /// Only the holder of the claim calls this.
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>>;
-
-    /// Opens a data stream, sending its bounded header first.
-    fn open_stream(&self, header: StreamHeader) -> TransportFuture<'_, DataStream>;
-
-    /// Accepts a data stream the host opened.
-    fn accept_stream(&self) -> TransportFuture<'_, DataStream>;
 
     /// Revokes every data stream, which is what the end of the control stream means.
     fn revoke_streams(&self);
@@ -78,6 +81,8 @@ pub struct NetworkTransport {
     initial_action_window: ActionWindow,
     writer: Arc<Mutex<FrameWriter>>,
     reader: Mutex<Option<FrameReader>>,
+    /// Set once a session has claimed the receive side.
+    claimed: std::sync::atomic::AtomicBool,
     streams: Arc<StreamRegistry>,
 }
 
@@ -102,10 +107,11 @@ impl NetworkTransport {
             .await
             .map_err(|error| kr_transport::TransportError::Connect(error.to_string()))?;
         let authorised = handshake::connect(&connection, identity, host_record).await?;
-        let streams = Arc::new(StreamRegistry::new(
+        let streams = Arc::new(StreamRegistry::with_limits(
             authorised.connection_id,
             Arc::new(StreamBudget::new(bulk_limits)),
             None,
+            authorised.selection.limits,
         ));
         Ok(Self {
             connection,
@@ -114,8 +120,30 @@ impl NetworkTransport {
             initial_action_window: authorised.action_window,
             writer: Arc::new(Mutex::new(authorised.control_writer)),
             reader: Mutex::new(Some(authorised.control_reader)),
+            claimed: std::sync::atomic::AtomicBool::new(false),
             streams,
         })
+    }
+
+    /// Opens a data stream, sending its bounded header first.
+    ///
+    /// Data streams are the network transport's own: a local socket carries the same control frames
+    /// but has no streams to multiplex, so this is not part of [`ControlTransport`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the bulk-limit refusal or a stream failure.
+    pub async fn open_stream(&self, header: StreamHeader) -> Result<DataStream> {
+        Ok(self.streams.open(&self.connection, header).await?)
+    }
+
+    /// Accepts a data stream the host opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stream failure, or a refusal when the header does not belong to this connection.
+    pub async fn accept_stream(&self) -> Result<DataStream> {
+        Ok(self.streams.accept(&self.connection).await?)
     }
 
     /// Returns a sender that can be held without the transport.
@@ -150,6 +178,13 @@ impl ControlTransport for NetworkTransport {
         })
     }
 
+    fn claim_receiver(&self) -> Result<()> {
+        if self.claimed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Err(ClientError::ConnectionEnded);
+        }
+        Ok(())
+    }
+
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
         Box::pin(async move {
             let mut held = self.reader.lock().await;
@@ -160,14 +195,6 @@ impl ControlTransport for NetworkTransport {
             }
             Ok(frame)
         })
-    }
-
-    fn open_stream(&self, header: StreamHeader) -> TransportFuture<'_, DataStream> {
-        Box::pin(async move { Ok(self.streams.open(&self.connection, header).await?) })
-    }
-
-    fn accept_stream(&self) -> TransportFuture<'_, DataStream> {
-        Box::pin(async move { Ok(self.streams.accept(&self.connection).await?) })
     }
 
     fn revoke_streams(&self) {

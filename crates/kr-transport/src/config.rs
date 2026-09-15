@@ -142,18 +142,27 @@ impl EndpointConfig {
     /// where this endpoint is reachable, so they belong on the address that is dialled rather than
     /// on the local endpoint. A hint is only a hint: the endpoint identity is what authenticates,
     /// and after a failure or a network change the identity is resolved again.
-    #[must_use]
-    pub fn peer_addr(&self, endpoint_id: &EndpointKey) -> EndpointAddr {
-        let mut addr = EndpointAddr::new(
-            PublicKey::from_bytes(endpoint_id.as_bytes()).expect("a 32-byte endpoint identity"),
-        );
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Configuration`] when the identity is 32 bytes but not a public
+    /// key. An endpoint identity arrives from a pairing invitation, so it is checked here rather
+    /// than trusted.
+    pub fn peer_addr(&self, endpoint_id: &EndpointKey) -> Result<EndpointAddr> {
+        let key = PublicKey::from_bytes(endpoint_id.as_bytes()).map_err(|error| {
+            TransportError::Configuration {
+                what: kr_protocol::scalars::to_base64url(endpoint_id.as_bytes()),
+                kind: "endpoint identity",
+                reason: error.to_string(),
+            }
+        })?;
+        let mut addr = EndpointAddr::new(key);
         if let Some(relay) = self.relay_urls.first() {
             addr = addr.with_relay_url(relay.clone());
         }
         for direct in &self.direct_addresses {
             addr = addr.with_ip_addr(*direct);
         }
-        addr
+        Ok(addr)
     }
 
     /// Returns the relay map iroh is configured with.

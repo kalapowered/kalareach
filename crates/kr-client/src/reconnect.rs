@@ -24,6 +24,11 @@ pub struct ClientState {
     pub cursors: StreamCursors,
     /// What each submitted action's receipt last said.
     pub receipts: ReceiptTracker,
+    /// Actions that were sent and whose outcome the client never saw settled.
+    ///
+    /// These are exactly the ones a receipt tracker cannot name, because no receipt arrived. The
+    /// next connection asks the host what became of them; it never submits them again.
+    pub submitted: Vec<kr_protocol::ids::ActionId>,
     /// What the ended connection left uncertain, when it had an input lane.
     pub interruption: Option<InputInterruption>,
 }
@@ -38,6 +43,7 @@ impl ClientState {
         Self {
             cursors: session.cursors().await,
             receipts: session.receipts().await,
+            submitted: session.submitted_actions().await,
             interruption,
         }
     }
@@ -52,9 +58,19 @@ impl ClientState {
     }
 
     /// Returns the actions whose outcome is still unresolved.
+    ///
+    /// Both halves count: the ones whose receipt has not reached a terminal state, and the ones
+    /// that were sent without any receipt arriving at all.
     #[must_use]
     pub fn unresolved_actions(&self) -> Vec<kr_protocol::ids::ActionId> {
-        self.receipts.unresolved()
+        let mut actions = self.receipts.unresolved();
+        for action_id in &self.submitted {
+            if !actions.contains(action_id) {
+                actions.push(*action_id);
+            }
+        }
+        actions.sort_unstable();
+        actions
     }
 }
 

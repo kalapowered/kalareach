@@ -3,7 +3,10 @@
 //! * KR-PERF-005: application scheduling adds less than 25 ms p95 above the measured path round
 //!   trip while a bulk transfer is running.
 //! * KR-PERF-006: after the transport is available, usable state arrives within two seconds for a
-//!   120x40 screen, excluding pairing, discovery outage and operating-system suspension.
+//!   120x40 screen, excluding pairing, discovery outage and operating-system suspension. What this
+//!   measures is the transport's share of that budget: reconnecting, completing the handshake,
+//!   opening the stream and carrying a screen-sized snapshot. Rendering a real screen from it
+//!   belongs to the terminal and the client that own the snapshot format.
 //!
 //! Both measure loopback, which is the floor rather than a claim about any network. What they
 //! prove is that the application's own scheduling and handshake do not add the delay, which is
@@ -347,7 +350,7 @@ async fn a_reconnect_reaches_usable_state_within_two_seconds() {
 
     assert_eq!(bytes_of(&snapshot).len(), SCREEN_BYTES);
     println!(
-        "KR-PERF-006 screen=120x40 bytes={SCREEN_BYTES} elapsed={:.3}ms limit=2000.000ms",
+        "KR-PERF-006 (transport share) screen=120x40 bytes={SCREEN_BYTES} elapsed={:.3}ms limit=2000.000ms",
         elapsed.as_secs_f64() * 1000.0
     );
     assert!(

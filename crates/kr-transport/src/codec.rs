@@ -198,6 +198,9 @@ pub struct FrameReader {
     codec: FrameCodec,
     /// The bound in force: the stream kind's ceiling, lowered to whatever this side declared.
     max_payload: usize,
+    /// Set while a read is in progress. A read that never completed consumed part of a frame, so
+    /// the byte after it is not a length prefix and the stream can carry nothing more.
+    interrupted: bool,
 }
 
 impl FrameReader {
@@ -209,6 +212,7 @@ impl FrameReader {
             stream,
             codec,
             max_payload: codec.max_payload_len(),
+            interrupted: false,
         }
     }
 
@@ -245,6 +249,7 @@ impl FrameReader {
             stream: self.stream,
             codec,
             max_payload: codec.max_payload_len(),
+            interrupted: self.interrupted,
         }
     }
 
@@ -302,6 +307,23 @@ impl FrameReader {
     ///
     /// As [`FrameReader::read_payload`], with `limit` applied as well.
     pub async fn read_payload_within(&mut self, limit: usize) -> Result<Option<Vec<u8>>> {
+        // `RecvStream::read_exact` is not cancellation safe: a caller that drops the future part
+        // way through has consumed bytes from the middle of a frame, and the next read would treat
+        // the remainder as a length prefix. The flag is set before the first await and cleared only
+        // when a whole frame has been read, so an interrupted reader refuses to carry on.
+        if self.interrupted {
+            self.stop();
+            return Err(TransportError::Stream(
+                "a cancelled read left this stream part way through a frame".to_owned(),
+            ));
+        }
+        self.interrupted = true;
+        let outcome = self.read_one(limit).await;
+        self.interrupted = false;
+        outcome
+    }
+
+    async fn read_one(&mut self, limit: usize) -> Result<Option<Vec<u8>>> {
         let mut prefix = [0u8; FRAME_LENGTH_PREFIX_LEN];
         match self.stream.read_exact(&mut prefix).await {
             Ok(()) => {}

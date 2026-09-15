@@ -17,7 +17,6 @@ use kr_transport::clock::{ContinuousClock, ManualClock};
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{HostEpochs, LocalIdentity, PairedDirectory};
 use kr_transport::window::{ActionWindowIssuer, MAX_WINDOW_VALIDITY};
-use tokio::sync::Mutex;
 
 /// One side of a paired pair.
 pub struct Side {
@@ -65,8 +64,8 @@ pub fn epochs() -> HostEpochs {
 }
 
 /// A fresh challenge ledger.
-pub fn ledger() -> Arc<Mutex<ChallengeLedger>> {
-    Arc::new(Mutex::new(ChallengeLedger::with_limit(64)))
+pub fn ledger() -> Arc<std::sync::Mutex<ChallengeLedger>> {
+    Arc::new(std::sync::Mutex::new(ChallengeLedger::with_limit(64)))
 }
 
 /// A fresh action-window issuer on a clock the test drives.

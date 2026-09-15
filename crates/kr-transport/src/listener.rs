@@ -298,7 +298,7 @@ pub async fn register_with_clock<H: HostHandler>(
         Arc::clone(&clock),
         config.action_window_validity,
     ));
-    let challenges = Arc::new(Mutex::new(ChallengeLedger::with_limit(
+    let challenges = Arc::new(std::sync::Mutex::new(ChallengeLedger::with_limit(
         config.max_outstanding_challenges,
     )));
 
@@ -330,7 +330,7 @@ struct AcceptLoop<H: HostHandler> {
     handler: Arc<H>,
     clock: Arc<dyn ContinuousClock>,
     windows: Arc<ActionWindowIssuer>,
-    challenges: Arc<Mutex<ChallengeLedger>>,
+    challenges: Arc<std::sync::Mutex<ChallengeLedger>>,
     /// How many connections may be mid-handshake or unpaired at once, across the whole host.
     admission: Arc<tokio::sync::Semaphore>,
 }
@@ -371,11 +371,8 @@ async fn accept_loop<H: HostHandler>(loop_state: AcceptLoop<H>) {
         };
         let state = loop_state.clone_state();
         tokio::spawn(async move {
-            let deadline = state.config.handshake_deadline;
-            match tokio::time::timeout(deadline, serve_connection(state, connecting, slot)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::debug!(%error, "a connection ended"),
-                Err(_) => tracing::debug!("a connection exceeded its handshake deadline"),
+            if let Err(error) = serve_connection(state, connecting, slot).await {
+                tracing::debug!(%error, "a connection ended");
             }
         });
     }
@@ -386,6 +383,61 @@ async fn serve_connection<H: HostHandler>(
     connecting: iroh::endpoint::Accepting,
     slot: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
+    // The deadline covers the unauthorised phase and nothing else. An authorised session lasts as
+    // long as its peer keeps it, and cancelling one after a minute would be a far worse failure
+    // than the one this bound exists to prevent.
+    let deadline = state.config.handshake_deadline;
+    let admitted = match tokio::time::timeout(deadline, admit(&state, connecting)).await {
+        Ok(admitted) => admitted?,
+        Err(_) => {
+            return Err(TransportError::handshake(
+                kr_protocol::error::ErrorCode::ResourceUnavailable,
+                "the connection exceeded its handshake deadline",
+            ));
+        }
+    };
+    let (connection, admitted) = admitted;
+
+    match admitted {
+        Admitted::Unpaired(mut unpaired) => {
+            let Some(surface) = state.handler.pairing_surface() else {
+                connection.close(REFUSED_UNPAIRED.into(), b"pairing is not open");
+                return Ok(());
+            };
+            let outcome = tokio::time::timeout(
+                deadline,
+                crate::preauth::serve(
+                    &mut unpaired,
+                    surface.as_ref(),
+                    state.config.preauth_limits,
+                    state.clock.as_ref(),
+                    state.config.controller_generation,
+                ),
+            )
+            .await;
+            connection.close(REFUSED_UNPAIRED.into(), b"the pairing exchange ended");
+            match outcome {
+                Ok(outcome) => outcome,
+                Err(_) => Err(TransportError::handshake(
+                    kr_protocol::error::ErrorCode::ResourceUnavailable,
+                    "the pairing exchange exceeded its deadline",
+                )),
+            }
+        }
+        Admitted::Authorised(authorised) => {
+            // An authorised connection is no longer unauthorised traffic, so it releases the
+            // admission slot it held; its own limits govern it from here.
+            drop(slot);
+            serve_authorised(state, connection, authorised).await
+        }
+    }
+}
+
+/// Completes the QUIC handshake and the KalaReach one, under the caller's deadline.
+async fn admit<H: HostHandler>(
+    state: &AcceptLoop<H>,
+    connecting: iroh::endpoint::Accepting,
+) -> Result<(Connection, Admitted)> {
     // The first bidirectional stream is accepted from the 0-RTT connection, because QUIC marks a
     // stream as early data only when it is accepted while the handshake is still running. Nothing
     // is *read* from it here: the read happens after `handshake_completed`, so no frame is ever
@@ -414,31 +466,7 @@ async fn serve_connection<H: HostHandler>(
         &state.windows,
     )
     .await?;
-
-    match admitted {
-        Admitted::Unpaired(mut unpaired) => {
-            let Some(surface) = state.handler.pairing_surface() else {
-                connection.close(REFUSED_UNPAIRED.into(), b"pairing is not open");
-                return Ok(());
-            };
-            let outcome = crate::preauth::serve(
-                &mut unpaired,
-                surface.as_ref(),
-                state.config.preauth_limits,
-                state.clock.as_ref(),
-                state.config.controller_generation,
-            )
-            .await;
-            connection.close(REFUSED_UNPAIRED.into(), b"the pairing exchange ended");
-            outcome
-        }
-        Admitted::Authorised(authorised) => {
-            // An authorised connection is no longer unauthorised traffic, so it releases the
-            // admission slot it held; its own limits govern it from here.
-            drop(slot);
-            serve_authorised(state, connection, authorised).await
-        }
-    }
+    Ok((connection, admitted))
 }
 
 async fn serve_authorised<H: HostHandler>(
@@ -465,23 +493,31 @@ async fn serve_authorised<H: HostHandler>(
         writer: Arc::new(Mutex::new(authorised.control_writer)),
         reader: authorised.control_reader,
     };
-    let keepalive = tokio::spawn(keepalive_loop(
-        control.sender(),
-        connection.clone(),
-        Arc::clone(&state.windows),
+    // While this flag is set the keepalive may issue a window. The guard clears it before it
+    // retires the connection, and the keepalive retires any window it issued after the flag was
+    // cleared, so no window can outlive the connection whichever order the two run in.
+    let issuing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let keepalive = tokio::spawn(keepalive_loop(Keepalive {
+        sender: control.sender(),
+        connection: connection.clone(),
+        windows: Arc::clone(&state.windows),
         connection_id,
-        state.config.epochs,
-        state.config.keepalive,
-        state.config.action_window_validity,
-    ));
+        epochs: state.config.epochs,
+        keepalive: state.config.keepalive,
+        window_validity: state.config.action_window_validity,
+        issuing: Arc::clone(&issuing),
+    }));
 
-    // The guard runs on every way out of this function, including a panic in the host's handler or
+    // The guard runs on every way out of this function, including a panic in the host's handler and
     // a cancellation of the task: the control stream is gone either way, and everything it
-    // authorised goes with it.
+    // authorised goes with it, the keepalive included.
     let cleanup = ConnectionCleanup {
         streams: Arc::clone(&streams),
         windows: Arc::clone(&state.windows),
         connection_id,
+        keepalive: Some(keepalive),
+        issuing,
+        connection: connection.clone(),
     };
 
     let session = AuthorisedSession {
@@ -500,11 +536,6 @@ async fn serve_authorised<H: HostHandler>(
         clock: Arc::clone(&state.clock),
     };
     Arc::clone(&state.handler).serve(session).await;
-
-    // The keepalive is stopped and *awaited* before the guard runs, so no window it was issuing can
-    // land after the connection's windows have been retired.
-    keepalive.abort();
-    let _ = keepalive.await;
     drop(cleanup);
     Ok(())
 }
@@ -515,10 +546,23 @@ struct ConnectionCleanup {
     streams: Arc<StreamRegistry>,
     windows: Arc<ActionWindowIssuer>,
     connection_id: ConnectionId,
+    keepalive: Option<tokio::task::JoinHandle<()>>,
+    issuing: Arc<std::sync::atomic::AtomicBool>,
+    connection: Connection,
 }
 
 impl Drop for ConnectionCleanup {
     fn drop(&mut self) {
+        // The order matters. Issuance is fenced first, so a keepalive that is between its check and
+        // its write cannot leave a window behind; then the task is stopped, the connection closed,
+        // the streams revoked and the windows retired.
+        self.issuing
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Some(keepalive) = self.keepalive.take() {
+            keepalive.abort();
+        }
+        self.connection
+            .close(CONTROL_LOST.into(), b"the connection ended");
         self.streams.revoke_all();
         self.windows.retire_connection(self.connection_id);
     }
@@ -549,12 +593,9 @@ impl RevocationHook for HandlerHook {
     }
 }
 
-/// Sends a keepalive while the connection is idle and renews the action window before it expires.
-///
-/// The window is renewed at half its validity, which leaves a full half-window of margin for a
-/// slow link. Section 9 calls the renewal explicit, and this is where the host is explicit about
-/// it: the client never asks.
-async fn keepalive_loop(
+/// What the keepalive task works from.
+#[derive(Debug)]
+struct Keepalive {
     sender: ControlSender,
     connection: Connection,
     windows: Arc<ActionWindowIssuer>,
@@ -562,7 +603,25 @@ async fn keepalive_loop(
     epochs: HostEpochs,
     keepalive: Duration,
     window_validity: Duration,
-) {
+    issuing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Sends a keepalive while the connection is idle and renews the action window before it expires.
+///
+/// The window is renewed at half its validity, which leaves a full half-window of margin for a
+/// slow link. Section 9 calls the renewal explicit, and this is where the host is explicit about
+/// it: the client never asks.
+async fn keepalive_loop(state: Keepalive) {
+    let Keepalive {
+        sender,
+        connection,
+        windows,
+        connection_id,
+        epochs,
+        keepalive,
+        window_validity,
+        issuing,
+    } = state;
     let mut keepalive_timer = tokio::time::interval(keepalive);
     keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut renewal_timer = tokio::time::interval(window_validity / 2);
@@ -575,8 +634,19 @@ async fn keepalive_loop(
         let frame = tokio::select! {
             _ = keepalive_timer.tick() => ControlFrame::Event(ControlEvent::Keepalive),
             _ = renewal_timer.tick() => {
+                if !issuing.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
                 match windows.issue(connection_id, epochs.boot_epoch) {
-                    Ok(window) => ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)),
+                    Ok(window) => {
+                        if !issuing.load(std::sync::atomic::Ordering::Acquire) {
+                            // The connection ended while this window was being issued, so it is
+                            // retired here rather than left for a retirement that already ran.
+                            windows.retire(&window.action_window_id);
+                            return;
+                        }
+                        ControlFrame::Event(ControlEvent::ActionWindowRenewed(window))
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "an action window could not be renewed");
                         continue;

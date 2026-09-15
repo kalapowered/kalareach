@@ -12,11 +12,13 @@
 //! read as completion.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use iroh::endpoint::Connection;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind};
+use kr_protocol::hello::ReceiveLimits;
 use kr_protocol::ids::ConnectionId;
 
 use crate::codec::{FrameReader, FrameWriter};
@@ -103,21 +105,6 @@ impl DataStream {
     #[must_use]
     pub const fn kind(&self) -> StreamKind {
         self.header.kind
-    }
-
-    /// Returns the writer, if this side sends on the stream.
-    ///
-    /// Prefer [`DataStream::write_message`] and [`DataStream::write_payload`]: a write made through
-    /// the writer directly does not race revocation and does not reserve queue space.
-    pub fn writer(&mut self) -> Option<&mut FrameWriter> {
-        self.writer.as_mut()
-    }
-
-    /// Returns the reader, if this side receives on the stream.
-    ///
-    /// Prefer [`DataStream::read_message`] and [`DataStream::read_payload`].
-    pub fn reader(&mut self) -> Option<&mut FrameReader> {
-        self.reader.as_mut()
     }
 
     /// Returns the handle that revokes this stream.
@@ -330,7 +317,11 @@ struct RegistryState {
     connection_id: ConnectionId,
     budget: Arc<StreamBudget>,
     hook: Option<Arc<dyn RevocationHook>>,
+    limits: ReceiveLimits,
     streams: Mutex<RegistryStreams>,
+    /// Woken when the control stream ends, so a stream that is waiting to open or be accepted stops
+    /// waiting for a peer that will never answer.
+    ended: tokio::sync::Notify,
 }
 
 #[derive(Debug, Default)]
@@ -338,6 +329,21 @@ struct RegistryStreams {
     next_key: StreamKey,
     open: HashMap<StreamKey, (StreamKind, StreamHandle)>,
     revoked: bool,
+}
+
+/// The negotiated bound on a frame of one kind, never above the kind's own ceiling.
+fn effective_limit(kind: StreamKind, limits: ReceiveLimits) -> usize {
+    let negotiated = match kind {
+        StreamKind::TerminalInput => limits.max_input_frame_len,
+        StreamKind::AttachmentChunks => limits.max_attachment_frame_len,
+        StreamKind::Control | StreamKind::TerminalOutput | StreamKind::SemanticUpdates => {
+            limits.max_control_frame_len
+        }
+    };
+    usize::try_from(negotiated.get())
+        .unwrap_or(usize::MAX)
+        .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN)
+        .min(kind.max_payload_len())
 }
 
 impl RegistryState {
@@ -360,12 +366,28 @@ impl StreamRegistry {
         budget: Arc<StreamBudget>,
         hook: Option<Arc<dyn RevocationHook>>,
     ) -> Self {
+        Self::with_limits(connection_id, budget, hook, ReceiveLimits::default())
+    }
+
+    /// Creates a registry that holds every stream to the limits the connection negotiated.
+    ///
+    /// A peer that said it could receive less than a stream kind's ceiling is held to what it said,
+    /// in both directions.
+    #[must_use]
+    pub fn with_limits(
+        connection_id: ConnectionId,
+        budget: Arc<StreamBudget>,
+        hook: Option<Arc<dyn RevocationHook>>,
+        limits: ReceiveLimits,
+    ) -> Self {
         Self {
             state: Arc::new(RegistryState {
                 connection_id,
                 budget,
                 hook,
+                limits,
                 streams: Mutex::new(RegistryStreams::default()),
+                ended: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -402,14 +424,12 @@ impl StreamRegistry {
             StreamClass::Bulk => Some(self.state.budget.open_bulk()?),
             _ => None,
         };
-        let (send, recv) = connection
-            .open_bi()
-            .await
-            .map_err(|error| TransportError::Stream(error.to_string()))?;
-        let mut writer = FrameWriter::new(send, header.kind);
+        let limit = effective_limit(header.kind, self.state.limits);
+        let (send, recv) = self.until_revoked(connection.open_bi()).await?;
+        let mut writer = FrameWriter::new(send, header.kind).with_max_payload(limit);
         writer.set_priority(priority_of(header.kind));
-        writer.write_header(&header).await?;
-        let reader = FrameReader::new(recv, header.kind);
+        self.until_revoked(writer.write_header(&header)).await?;
+        let reader = FrameReader::new(recv, header.kind).with_max_payload(limit);
         let (handle, registration) = self.register(header.kind)?;
         Ok(DataStream {
             header,
@@ -432,10 +452,7 @@ impl StreamRegistry {
         if self.is_revoked() {
             return Err(TransportError::ControlLost);
         }
-        let (send, recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|error| TransportError::Stream(error.to_string()))?;
+        let (send, recv) = self.until_revoked(connection.accept_bi()).await?;
         // The header is read on a control-bounded reader: the kind, and therefore the frame bound,
         // is not known until the header has been read, so it cannot decide how much to read.
         let mut reader = FrameReader::new(recv, StreamKind::Control);
@@ -448,16 +465,17 @@ impl StreamRegistry {
                 "early data is not accepted on a data stream",
             )));
         }
-        let header = reader.read_header().await?;
+        let header = self.until_revoked(reader.read_header()).await?;
         validate_header(&header, self.state.connection_id)
             .map_err(|refusal| TransportError::Handshake(ProtocolError::from(refusal)))?;
         let bulk_slot = match class_of(header.kind) {
             StreamClass::Bulk => Some(self.state.budget.open_bulk()?),
             _ => None,
         };
-        let writer = FrameWriter::new(send, header.kind);
+        let limit = effective_limit(header.kind, self.state.limits);
+        let writer = FrameWriter::new(send, header.kind).with_max_payload(limit);
         writer.set_priority(priority_of(header.kind));
-        let reader = reader.for_kind(header.kind);
+        let reader = reader.for_kind(header.kind).with_max_payload(limit);
         let (handle, registration) = self.register(header.kind)?;
         Ok(DataStream {
             header,
@@ -490,6 +508,9 @@ impl StreamRegistry {
         for handle in handles {
             handle.revoke();
         }
+        // A stream that is still waiting to open or be accepted has no handle yet, so it waits on
+        // the registry itself.
+        self.state.ended.notify_waiters();
         if let Some(hook) = &self.state.hook {
             hook.control_stream_lost(self.state.connection_id);
         }
@@ -511,6 +532,22 @@ impl StreamRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Runs one step of opening or accepting a stream, giving up if the control stream ends first.
+    async fn until_revoked<T, E: std::fmt::Display>(
+        &self,
+        step: impl Future<Output = std::result::Result<T, E>>,
+    ) -> Result<T> {
+        let ended = self.state.ended.notified();
+        tokio::pin!(ended);
+        if self.is_revoked() {
+            return Err(TransportError::ControlLost);
+        }
+        tokio::select! {
+            outcome = step => outcome.map_err(|error| TransportError::Stream(error.to_string())),
+            () = &mut ended => Err(TransportError::ControlLost),
+        }
     }
 
     fn register(&self, kind: StreamKind) -> Result<(StreamHandle, Registration)> {

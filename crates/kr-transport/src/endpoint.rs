@@ -15,7 +15,7 @@ use iroh_mdns_address_lookup::MdnsAddressLookup;
 use iroh_relay::tls::CaTlsConfig;
 use kr_crypto::keys::TransportIdentityKeyPair;
 use kr_protocol::hello::ALPN;
-use kr_protocol::limits::{INACTIVITY_THRESHOLD, KEEPALIVE_INTERVAL};
+use kr_protocol::limits::{INACTIVITY_THRESHOLD, KEEPALIVE_INTERVAL, MAX_SEND_QUEUE_BYTES};
 use rustls_pki_types::CertificateDer;
 
 use crate::config::{EndpointConfig, PublishedAddresses};
@@ -175,6 +175,10 @@ fn transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
         .keep_alive_interval(KEEPALIVE)
         .max_idle_timeout(Some(idle_timeout))
+        // Section 9's 8 MiB bounded send queue per peer, enforced by the connection itself rather
+        // than only by the application's own accounting: past this, a write waits instead of
+        // handing more bytes to a queue nothing can drain.
+        .send_window(MAX_SEND_QUEUE_BYTES as u64)
         .build()
 }
 

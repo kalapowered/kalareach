@@ -186,14 +186,20 @@ impl LeaseIssuer {
     /// only then does a fence from a lost control path lift.
     pub fn acknowledge(&self, session_id: SessionId, revision: AuthorityRevision) {
         let mut state = self.lock();
+        let current = state.authority_revision;
         let worker = state.workers.entry(session_id).or_default();
         if worker
             .acknowledged_revision
-            .is_none_or(|current| revision > current)
+            .is_none_or(|held| revision > held)
         {
             worker.acknowledged_revision = Some(revision);
         }
-        worker.fenced = false;
+        // Only an acknowledgement of the revision in force lifts a fence. A late acknowledgement of
+        // an older revision says nothing about the current one, and accepting it would let a stale
+        // message restore renewal for a worker whose control path was lost.
+        if revision == current {
+            worker.fenced = false;
+        }
     }
 
     /// Records that a worker's execution has ended.
@@ -477,7 +483,20 @@ mod tests {
             "a fenced worker cannot renew"
         );
 
-        // A fresh acknowledgement over a live connection lifts the fence.
+        // A stale acknowledgement says nothing about the revision in force and lifts nothing.
+        issuer.acknowledge(session(1), AuthorityRevision::new(2));
+        assert!(
+            issuer.is_fenced(session(1)),
+            "a stale acknowledgement lifts nothing"
+        );
+        assert_eq!(
+            issuer
+                .renew(session(1), ControllerGeneration::new(7), &clock)
+                .expect("a decision"),
+            Err(LeaseRefusal::RevisionNotAcknowledged)
+        );
+
+        // A fresh acknowledgement of the revision in force lifts the fence.
         issuer.acknowledge(session(1), AuthorityRevision::new(3));
         assert!(!issuer.is_fenced(session(1)));
         assert!(

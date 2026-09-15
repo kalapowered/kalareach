@@ -16,10 +16,18 @@ use kr_protocol::envelope::Notification;
 use kr_protocol::ids::{ActionId, EventSequence, StreamId};
 use kr_protocol::receipt::{Receipt, ReceiptState};
 
-/// The position a client has consumed on each subscribed stream.
+/// What a client has received and what it has actually applied, per subscribed stream.
+///
+/// The two are not the same, and a restoration that confuses them loses events. A notification is
+/// *received* when it arrives on the connection; it is *applied* when whatever consumes the stream
+/// has folded it into its state. A reconnect subscribes from the applied position, because an event
+/// that was received and never applied has to arrive again.
 #[derive(Clone, Debug, Default)]
 pub struct StreamCursors {
-    positions: BTreeMap<StreamId, EventSequence>,
+    received: BTreeMap<StreamId, EventSequence>,
+    applied: BTreeMap<StreamId, EventSequence>,
+    /// Streams whose partial state is no longer usable. They need a snapshot before anything else.
+    needs_snapshot: std::collections::BTreeSet<StreamId>,
 }
 
 impl StreamCursors {
@@ -29,67 +37,123 @@ impl StreamCursors {
         Self::default()
     }
 
-    /// Returns the cursor this client has reached on `stream_id`.
+    /// Returns the position a consumer has applied on `stream_id`.
+    ///
+    /// This is the position a restoration subscribes from. `None` means nothing usable is held.
     #[must_use]
     pub fn position(&self, stream_id: &StreamId) -> Option<EventSequence> {
-        self.positions.get(stream_id).copied()
+        if self.needs_snapshot.contains(stream_id) {
+            return None;
+        }
+        self.applied.get(stream_id).copied()
+    }
+
+    /// Returns the last position received on `stream_id`, applied or not.
+    #[must_use]
+    pub fn received(&self, stream_id: &StreamId) -> Option<EventSequence> {
+        self.received.get(stream_id).copied()
+    }
+
+    /// Returns true when this stream needs a fresh snapshot before it is usable.
+    #[must_use]
+    pub fn needs_snapshot(&self, stream_id: &StreamId) -> bool {
+        self.needs_snapshot.contains(stream_id)
     }
 
     /// Records one delivered event, returning whether it was the next one.
     ///
-    /// An event that is not the next one is a gap. The caller discards its partial state and
-    /// installs a fresh snapshot rather than applying an update whose base it never saw.
+    /// An event that is not the next one is a gap: the stream is marked as needing a snapshot, so
+    /// no later event can quietly establish a new position on top of state that has a hole in it.
     pub fn accept(&mut self, notification: &Notification) -> Delivery {
-        let next = self
-            .positions
-            .get(&notification.stream_id)
-            .map_or(0, |position| position.get().saturating_add(1));
+        let stream_id = &notification.stream_id;
         let sequence = notification.sequence.get();
-        if sequence < next {
-            // Already applied. A duplicate is not a gap and is not an error.
+        if self.needs_snapshot.contains(stream_id) {
+            // Nothing is tracked while a snapshot is owed; the events are still delivered, because
+            // a consumer that is rebuilding wants to see them, but they establish no position.
+            return Delivery::NeedsSnapshot;
+        }
+        let next = self
+            .received
+            .get(stream_id)
+            .map_or(0, |position| position.get().saturating_add(1));
+        if self.received.contains_key(stream_id) && sequence < next {
             return Delivery::Duplicate;
         }
-        if self.positions.contains_key(&notification.stream_id) && sequence > next {
+        if self.received.contains_key(stream_id) && sequence > next {
+            self.needs_snapshot.insert(stream_id.clone());
+            self.received.remove(stream_id);
+            self.applied.remove(stream_id);
             return Delivery::Gap {
                 expected: EventSequence::new(next),
                 received: notification.sequence,
             };
         }
-        self.positions
-            .insert(notification.stream_id.clone(), notification.sequence);
-        Delivery::Applied
+        self.received
+            .insert(stream_id.clone(), notification.sequence);
+        Delivery::Received
     }
 
-    /// Forgets a stream, which is what a resynchronisation requirement means.
+    /// Records that a consumer applied everything up to `sequence` on `stream_id`.
+    ///
+    /// Only this moves the position a reconnect subscribes from.
+    pub fn applied(&mut self, stream_id: &StreamId, sequence: EventSequence) {
+        if self.needs_snapshot.contains(stream_id) {
+            return;
+        }
+        let current = self
+            .applied
+            .get(stream_id)
+            .map_or(0, |position| position.get());
+        if sequence.get() > current {
+            self.applied.insert(stream_id.clone(), sequence);
+        }
+    }
+
+    /// Records that a snapshot at `sequence` was installed, which makes the stream usable again.
+    pub fn installed_snapshot(&mut self, stream_id: &StreamId, sequence: EventSequence) {
+        self.needs_snapshot.remove(stream_id);
+        self.received.insert(stream_id.clone(), sequence);
+        self.applied.insert(stream_id.clone(), sequence);
+    }
+
+    /// Discards a stream's state and marks it as needing a snapshot.
+    ///
+    /// This is what a resynchronisation requirement means, and what a gap does.
     pub fn discard(&mut self, stream_id: &StreamId) {
-        self.positions.remove(stream_id);
+        self.received.remove(stream_id);
+        self.applied.remove(stream_id);
+        self.needs_snapshot.insert(stream_id.clone());
     }
 
-    /// Forgets every stream.
+    /// Forgets every stream, holding none of them to a snapshot.
     pub fn discard_all(&mut self) {
-        self.positions.clear();
+        self.received.clear();
+        self.applied.clear();
+        self.needs_snapshot.clear();
     }
 
-    /// Returns how many streams are tracked.
+    /// Returns how many streams hold a usable position.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.positions.len()
+        self.applied.len()
     }
 
-    /// Returns true when nothing is tracked.
+    /// Returns true when no stream holds a usable position.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.positions.is_empty()
+        self.applied.is_empty()
     }
 }
 
 /// What happened to one delivered event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
-    /// The event was the next one and has been applied.
-    Applied,
-    /// The event had already been applied.
+    /// The event was the next one on the stream and has been recorded as received.
+    Received,
+    /// The event had already been received.
     Duplicate,
+    /// The stream is waiting for a snapshot, so the event establishes no position.
+    NeedsSnapshot,
     /// An event is missing. The client's state for this stream is no longer usable.
     Gap {
         /// The sequence that was expected next.
@@ -295,12 +359,19 @@ mod tests {
     }
 
     #[test]
-    fn events_apply_in_order_and_a_gap_is_visible() {
+    fn events_arrive_in_order_and_a_gap_stops_the_stream() {
         let mut cursors = StreamCursors::new();
         let stream_id = stream("session:1");
-        assert_eq!(cursors.accept(&event(&stream_id, 4)), Delivery::Applied);
-        assert_eq!(cursors.accept(&event(&stream_id, 5)), Delivery::Applied);
+        assert_eq!(cursors.accept(&event(&stream_id, 4)), Delivery::Received);
+        assert_eq!(cursors.accept(&event(&stream_id, 5)), Delivery::Received);
         assert_eq!(cursors.accept(&event(&stream_id, 5)), Delivery::Duplicate);
+        assert_eq!(cursors.received(&stream_id), Some(EventSequence::new(5)));
+
+        // Receiving is not applying: nothing is subscribed from until a consumer says so.
+        assert_eq!(cursors.position(&stream_id), None);
+        cursors.applied(&stream_id, EventSequence::new(5));
+        assert_eq!(cursors.position(&stream_id), Some(EventSequence::new(5)));
+
         assert_eq!(
             cursors.accept(&event(&stream_id, 9)),
             Delivery::Gap {
@@ -308,7 +379,18 @@ mod tests {
                 received: EventSequence::new(9),
             }
         );
-        assert_eq!(cursors.position(&stream_id), Some(EventSequence::new(5)));
+        // A gap leaves the stream owing a snapshot, and nothing after it establishes a position.
+        assert!(cursors.needs_snapshot(&stream_id));
+        assert_eq!(cursors.position(&stream_id), None);
+        assert_eq!(
+            cursors.accept(&event(&stream_id, 10)),
+            Delivery::NeedsSnapshot
+        );
+        assert_eq!(cursors.position(&stream_id), None);
+
+        cursors.installed_snapshot(&stream_id, EventSequence::new(12));
+        assert_eq!(cursors.position(&stream_id), Some(EventSequence::new(12)));
+        assert_eq!(cursors.accept(&event(&stream_id, 13)), Delivery::Received);
     }
 
     #[test]
@@ -316,6 +398,7 @@ mod tests {
         let mut cursors = StreamCursors::new();
         let stream_id = stream("session:1");
         cursors.accept(&event(&stream_id, 7));
+        cursors.applied(&stream_id, EventSequence::new(7));
 
         let mut restoration = Restoration::start(stream_id.clone(), &cursors);
         assert_eq!(
@@ -346,6 +429,7 @@ mod tests {
         let mut cursors = StreamCursors::new();
         let stream_id = stream("session:1");
         cursors.accept(&event(&stream_id, 7));
+        cursors.applied(&stream_id, EventSequence::new(7));
         let mut restoration = Restoration::start(stream_id.clone(), &cursors);
         restoration
             .subscribed()
@@ -354,6 +438,7 @@ mod tests {
         restoration.resynchronise(&mut cursors);
         assert_eq!(restoration.step(), RestorationStep::SubscribeFromStart);
         assert_eq!(cursors.position(&stream_id), None);
+        assert!(cursors.needs_snapshot(&stream_id));
         assert!(cursors.is_empty());
     }
 

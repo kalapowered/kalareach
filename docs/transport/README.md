@@ -143,8 +143,10 @@ candidate-authenticated `pair.status`, and nothing else. The surface is narrow o
 
 Two host-wide bounds sit above the per-connection ones, because a per-connection budget resets when
 a peer reconnects and a host-wide one does not: at most 64 connections may be mid-handshake or
-unpaired at once, and an unauthorised connection has 60 seconds to finish. A connection that spends
-its whole request budget is answered once and then ended.
+unpaired at once, and an unauthorised connection has 60 seconds to finish. The deadline covers the
+unauthorised phase only; an authorised session lasts as long as its peer keeps it. Every request is
+charged against the connection's budget, refused or not, and a connection that spends the whole
+budget is answered once and then ended.
 
 Pairing's own budgets, phase rules and proofs belong to the pairing crate, which implements the
 surface's trait. The transport is the door, not the ceremony behind it.
@@ -214,9 +216,11 @@ as completion. The connection's action windows are retired at the same moment, s
 first-admit a request through a connection that no longer exists.
 
 The cleanup runs on every way a connection can end, including a failed keepalive write, a panic in
-the host's handler and a cancelled task. The keepalive is stopped and awaited before the windows are
-retired, so a renewal cannot land after the retirement. Nothing kills a healthy worker to force any
-of this through.
+the host's handler and a cancelled task, because it is a guard the connection owns rather than a
+step at the end of a function. It fences window issuance first, then stops the keepalive, closes the
+connection, revokes the streams and retires the windows, so a renewal that was in flight retires
+itself rather than outliving the connection. Nothing kills a healthy worker to force any of this
+through.
 
 ## Keepalive and reconnect
 
@@ -233,11 +237,19 @@ input sequence belongs to one connection, acknowledgement positions are retained
 connection, and `InputLane` has no constructor that carries a position across. What the old lane
 left unacknowledged is reported as an interruption, not resent.
 
-The client restores state through cursors and receipts. `Restoration` enforces the order: subscribe
-from the cursor *first*, then install the snapshot the subscription returned, then apply the queued
-updates. A gap in the replay window, or a `RESYNC_REQUIRED` from the host, discards the partial
-state and starts again from a fresh snapshot. Receipts are carried across so a client can report
-which of its actions are unresolved or uncertain; it never redispatches an action whose receipt is
+The client restores state through cursors and receipts. `Restoration` enforces the order, and
+refuses a step taken out of it: subscribe from the cursor *first*, then install the snapshot the
+subscription returned, then apply the queued updates.
+
+Receiving an event is not applying it. The session records what arrived; a consumer records what it
+folded into its state, and only that moves the position a reconnect subscribes from. An event that
+was delivered and never applied arrives again rather than being skipped. A gap in the sequence, or a
+`RESYNC_REQUIRED` from the host, leaves the stream owing a snapshot: nothing it delivers establishes
+a position until one is installed.
+
+Receipts are carried across, and so are the identifiers of actions that were sent without any
+receipt arriving, which is the one case a receipt tracker cannot name. A client reports both as
+unresolved and asks the host what became of them; it never redispatches an action whose receipt is
 incomplete.
 
 ## Actor envelopes

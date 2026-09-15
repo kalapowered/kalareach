@@ -52,35 +52,54 @@ enum Answer {
     Receipt(Box<Receipt>),
 }
 
+/// Whom this connection owes an answer, and whether it can still give one.
+///
+/// The map and the ended flag are one thing under one synchronous lock. With two, a request could
+/// be registered after the reader stopped and wait for an answer that is never coming; and a
+/// waiter's destructor could not remove its own entry, because a destructor cannot await.
+#[derive(Debug, Default)]
+struct Waiters {
+    pending: HashMap<RequestId, oneshot::Sender<Answer>>,
+    ended: bool,
+}
+
 /// The shared state of one connection.
 #[derive(Debug)]
 struct SessionState {
-    waiters: Mutex<HashMap<RequestId, oneshot::Sender<Answer>>>,
+    waiters: std::sync::Mutex<Waiters>,
     action_window: Mutex<ActionWindow>,
     cursors: Mutex<StreamCursors>,
     receipts: Mutex<ReceiptTracker>,
-    /// Actions this client submitted. An entry stays until its receipt is terminal, so a connection
+    /// Actions this client submitted. An entry stays until its outcome is settled, so a connection
     /// that fails mid-flight leaves the uncertain action named rather than forgotten.
     submitted: Mutex<BTreeSet<ActionId>>,
     events: broadcast::Sender<Notification>,
     outstanding: AtomicU64,
     max_outstanding: u64,
-    /// Set once the control stream has ended. Every waiter is woken and no new one is registered.
-    ended: std::sync::atomic::AtomicBool,
 }
 
 impl SessionState {
     /// Ends the session, waking every waiter.
     ///
     /// A waiter that is dropped rather than answered resolves as [`ClientError::ConnectionEnded`],
-    /// which is what its caller is waiting to hear.
-    async fn end(&self) {
-        self.ended.store(true, Ordering::Release);
-        self.waiters.lock().await.clear();
+    /// which is what its caller is waiting to hear. Ending twice is harmless.
+    fn end(&self) {
+        let mut waiters = self.waiters();
+        waiters.ended = true;
+        waiters.pending.clear();
     }
 
-    fn has_ended(&self) -> bool {
-        self.ended.load(Ordering::Acquire)
+    fn waiters(&self) -> std::sync::MutexGuard<'_, Waiters> {
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn answer(&self, request_id: RequestId, answer: Answer) {
+        let waiter = self.waiters().pending.remove(&request_id);
+        if let Some(sender) = waiter {
+            let _ = sender.send(answer);
+        }
     }
 }
 
@@ -98,12 +117,17 @@ impl Session {
     ///
     /// The reader task begins immediately, because the host may send a window renewal or an event
     /// before the client asks for anything.
-    #[must_use]
-    pub fn start(transport: Arc<dyn ControlTransport>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::ConnectionEnded`] when another session already reads this
+    /// connection. Two sessions on one control stream would divide its frames between them.
+    pub fn start(transport: Arc<dyn ControlTransport>) -> Result<Self> {
+        transport.claim_receiver()?;
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let limits = transport.limits();
         let state = Arc::new(SessionState {
-            waiters: Mutex::new(HashMap::new()),
+            waiters: std::sync::Mutex::new(Waiters::default()),
             action_window: Mutex::new(transport.initial_action_window()),
             cursors: Mutex::new(StreamCursors::new()),
             receipts: Mutex::new(ReceiptTracker::new()),
@@ -111,15 +135,14 @@ impl Session {
             events,
             outstanding: AtomicU64::new(0),
             max_outstanding: limits.max_outstanding_mutations.get(),
-            ended: std::sync::atomic::AtomicBool::new(false),
         });
         let reader = tokio::spawn(read_loop(Arc::clone(&transport), Arc::clone(&state)));
-        Self {
+        Ok(Self {
             transport,
             state,
             next_request_id: AtomicU64::new(1),
             reader,
-        }
+        })
     }
 
     /// Returns the transport, for opening data streams.
@@ -157,7 +180,31 @@ impl Session {
         self.state.submitted.lock().await.iter().copied().collect()
     }
 
+    /// Records that a consumer applied everything up to `sequence` on `stream_id`.
+    ///
+    /// Only this moves the position a reconnect subscribes from. Receiving an event is not applying
+    /// it: an event the connection delivered but nothing folded into its state has to arrive again.
+    pub async fn applied(&self, stream_id: &StreamId, sequence: kr_protocol::ids::EventSequence) {
+        self.state.cursors.lock().await.applied(stream_id, sequence);
+    }
+
+    /// Records that a snapshot at `sequence` was installed, which makes the stream usable again.
+    pub async fn installed_snapshot(
+        &self,
+        stream_id: &StreamId,
+        sequence: kr_protocol::ids::EventSequence,
+    ) {
+        self.state
+            .cursors
+            .lock()
+            .await
+            .installed_snapshot(stream_id, sequence);
+    }
+
     /// Discards what this client held for one stream, which is what a resynchronisation means.
+    ///
+    /// The stream then owes a snapshot: nothing it delivers establishes a position until one is
+    /// installed.
     pub async fn discard_stream(&self, stream_id: &StreamId) {
         self.state.cursors.lock().await.discard(stream_id);
     }
@@ -182,7 +229,7 @@ impl Session {
             });
         }
         let request_id = self.next_request_id();
-        let waiter = self.register(request_id).await?;
+        let waiter = self.register(request_id)?;
         let request = Request {
             request_id,
             method: method.into(),
@@ -257,7 +304,7 @@ impl Session {
 
         let action_id = ActionId::new(kr_transport::random::fresh_uuid_v4()?);
         let request_id = self.next_request_id();
-        let waiter = self.register(request_id).await?;
+        let waiter = self.register(request_id)?;
         let mutation = MutationRequest {
             request_id,
             method: method.into(),
@@ -274,38 +321,55 @@ impl Session {
         // Recorded before the send: once the frame is on the wire the host may dispatch it, and a
         // client that cannot name the action cannot ask what happened to it.
         self.state.submitted.lock().await.insert(action_id);
-        self.transport
+        if self
+            .transport
             .send(&ControlFrame::Mutation(Box::new(mutation)))
             .await
-            .map_err(|_| ClientError::SubmissionUncertain { action_id })?;
+            .is_err()
+        {
+            // The frame may or may not have reached the host, so the action stays on the pending
+            // list and the caller is told the outcome is unknown.
+            return Err(ClientError::SubmissionUncertain { action_id });
+        }
 
         match waiter.wait().await {
             Ok(Answer::Receipt(receipt)) => Ok(*receipt),
-            Ok(Answer::Response(response)) => match response.outcome {
-                // A correlated error is the host's answer to this mutation, not a lost connection.
-                Outcome::Error(error) => Err(ClientError::from(error)),
-                Outcome::Ok(_) => Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::InvalidArgument,
-                    "a mutation was answered without a receipt",
-                ))),
-            },
+            Ok(Answer::Response(response)) => {
+                // A correlated answer is definite, whichever way it went: the host reached a
+                // decision about this action, so it is no longer an unknown outcome.
+                self.state.submitted.lock().await.remove(&action_id);
+                match response.outcome {
+                    Outcome::Error(error) => Err(ClientError::from(error)),
+                    Outcome::Ok(_) => {
+                        Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+                            kr_protocol::error::ErrorCode::InvalidArgument,
+                            "a mutation was answered without a receipt",
+                        )))
+                    }
+                }
+            }
             Err(_) => Err(ClientError::SubmissionUncertain { action_id }),
         }
     }
 
     /// Ends the session and the connection, waking every waiting call.
-    pub async fn close(&self) {
+    ///
+    /// The transition is synchronous, so a caller that drops this future still leaves the session
+    /// ended and every waiter woken.
+    pub fn close(&self) {
         self.transport.close();
-        self.state.end().await;
+        self.state.end();
         self.reader.abort();
     }
 
-    async fn register(&self, request_id: RequestId) -> Result<Waiter> {
-        if self.state.has_ended() {
+    fn register(&self, request_id: RequestId) -> Result<Waiter> {
+        let mut waiters = self.state.waiters();
+        if waiters.ended {
             return Err(ClientError::ConnectionEnded);
         }
         let (sender, receiver) = oneshot::channel();
-        self.state.waiters.lock().await.insert(request_id, sender);
+        waiters.pending.insert(request_id, sender);
+        drop(waiters);
         Ok(Waiter {
             state: Arc::clone(&self.state),
             request_id,
@@ -368,12 +432,9 @@ impl Waiter {
 
 impl Drop for Waiter {
     fn drop(&mut self) {
-        // A cancelled call leaves nothing behind. The entry is removed on a best-effort basis: the
-        // routing task holds the map only for the length of one lookup, and an entry that survives
-        // is cleared when the session ends.
-        if let Ok(mut waiters) = self.state.waiters.try_lock() {
-            waiters.remove(&self.request_id);
-        }
+        // A cancelled call leaves nothing behind. The lock is synchronous and is never held across
+        // an await, so this always removes the entry rather than hoping to.
+        self.state.waiters().pending.remove(&self.request_id);
     }
 }
 
@@ -389,16 +450,14 @@ async fn read_loop(transport: Arc<dyn ControlTransport>, state: Arc<SessionState
     // The control stream has ended, so every data stream it authorised goes with it and every
     // waiter learns that its answer is not coming.
     transport.revoke_streams();
-    state.end().await;
+    state.end();
 }
 
 async fn route(state: &Arc<SessionState>, frame: ControlFrame) {
     match frame {
         ControlFrame::Response(response) => {
-            let waiter = state.waiters.lock().await.remove(&response.request_id);
-            if let Some(sender) = waiter {
-                let _ = sender.send(Answer::Response(response));
-            }
+            let request_id = response.request_id;
+            state.answer(request_id, Answer::Response(response));
         }
         ControlFrame::Receipt(answer) => {
             let request_id = answer.request_id;
@@ -407,24 +466,14 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) {
             if receipt.state.is_terminal() {
                 state.submitted.lock().await.remove(&receipt.action_id);
             }
-            let waiter = state.waiters.lock().await.remove(&request_id);
-            if let Some(sender) = waiter {
-                let _ = sender.send(Answer::Receipt(Box::new(receipt)));
-            }
+            state.answer(request_id, Answer::Receipt(Box::new(receipt)));
         }
         ControlFrame::Notification(notification) => {
-            // A gap means this client's state for the stream is no longer usable. The cursor is
-            // discarded so the next restoration starts from a fresh snapshot; the event is still
-            // delivered, because a subscriber that is rebuilding wants to know why. A duplicate is
-            // not delivered again: a subscriber that already applied it would apply it twice.
-            let delivery = {
-                let mut cursors = state.cursors.lock().await;
-                let delivery = cursors.accept(&notification);
-                if matches!(delivery, Delivery::Gap { .. }) {
-                    cursors.discard(&notification.stream_id);
-                }
-                delivery
-            };
+            // A gap leaves the stream owing a snapshot, which the cursors record: no later event
+            // can establish a position on top of state with a hole in it. The event is still
+            // delivered, because a subscriber that is rebuilding wants to know why, but a duplicate
+            // is not: a subscriber that already applied it would apply it twice.
+            let delivery = state.cursors.lock().await.accept(&notification);
             if delivery != Delivery::Duplicate {
                 let _ = state.events.send(notification);
             }

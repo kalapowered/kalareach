@@ -150,14 +150,17 @@ impl RequestBudget {
                 break;
             }
         }
-        if state.recent.len() >= self.limits.max_requests_per_window {
+        // Every request is charged, refused or not. Decoding a frame and writing an answer is work
+        // the host did, and a budget that only counts the requests it served would let a peer keep
+        // a connection busy for as long as its deadline allows.
+        state.total += 1;
+        state.recent.push_back(now);
+        if state.recent.len() > self.limits.max_requests_per_window {
             return Charge::RateLimited(ProtocolError::new(
                 ErrorCode::RateLimited,
                 "too many pairing requests in a short interval",
             ));
         }
-        state.total += 1;
-        state.recent.push_back(now);
         Charge::Accepted
     }
 }

@@ -14,9 +14,11 @@
 //! kernel's answer and a deadline, because every composition of two imperfect clocks that we could
 //! write has a case where it stops.
 //!
-//! On a platform where `boot-time` has no continuous source it falls back to the ordinary monotonic
-//! clock, which excludes suspension. A host that ships a qualified platform time adapter supplies
-//! it through [`ContinuousClock`] instead of using the default; the trait exists for exactly that.
+//! On other platforms the crate falls back to [`std::time::Instant`], whose behaviour across a
+//! suspension is the platform's, not this crate's: on Windows that is the performance counter. A
+//! host on such a platform supplies its own qualified platform time adapter through
+//! [`ContinuousClock`] rather than relying on the default; the trait exists for exactly that, and
+//! until it does, host expiry there rests on a clock this crate has not qualified.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,9 +88,10 @@ impl Default for SystemContinuousClock {
 
 impl ContinuousClock for SystemContinuousClock {
     fn now(&self) -> ContinuousInstant {
-        // `saturating_duration_since` is the crate's documented workaround for a hardware or
-        // virtualisation bug that breaks monotonicity: it yields zero rather than panicking, which
-        // shortens a deadline rather than extending one.
+        // The clocks above are monotonic, so a reading before the anchor means the hardware or the
+        // hypervisor broke that guarantee. Saturating keeps the process alive instead of panicking;
+        // it is not a safety property, and a host that cannot trust its clock has to say so through
+        // its own time adapter rather than rely on this.
         ContinuousInstant(boot_time::Instant::now().saturating_duration_since(*self.anchor))
     }
 }

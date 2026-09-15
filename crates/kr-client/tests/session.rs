@@ -145,7 +145,7 @@ fn spawn_host(
                 let clock = ManualClock::new();
                 let clock: Arc<dyn ContinuousClock> = Arc::new(clock);
                 let issuer = Arc::new(ActionWindowIssuer::new(clock, MAX_WINDOW_VALIDITY));
-                let challenges = Arc::new(Mutex::new(ChallengeLedger::with_limit(16)));
+                let challenges = Arc::new(std::sync::Mutex::new(ChallengeLedger::with_limit(16)));
                 let Ok(Admitted::Authorised(authorised)) = handshake::accept(
                     &connection,
                     &identity,
@@ -258,7 +258,35 @@ async fn connect(client: &Side, host: &Side) -> Session {
     )
     .await
     .expect("an authorised connection");
-    Session::start(Arc::new(transport))
+    Session::start(Arc::new(transport)).expect("a session")
+}
+
+#[tokio::test]
+async fn one_connection_carries_one_session() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let serving = spawn_host(&host, client.record, Arc::new(HostScript::default()), None);
+
+    let transport: Arc<dyn kr_client::transport::ControlTransport> = Arc::new(
+        NetworkTransport::connect(
+            &client.endpoint,
+            direct_addr(&host),
+            &client.identity,
+            &host.record,
+            BulkLimits::default(),
+        )
+        .await
+        .expect("an authorised connection"),
+    );
+    let session = Session::start(Arc::clone(&transport)).expect("a session");
+    // Two sessions on one control stream would divide its frames between them.
+    assert!(
+        Session::start(Arc::clone(&transport)).is_err(),
+        "a connection carries one session"
+    );
+
+    session.close();
+    serving.abort();
 }
 
 #[tokio::test]
@@ -304,7 +332,7 @@ async fn a_read_returns_a_typed_result_and_a_mutation_returns_a_receipt() {
     let receipts = session.receipts().await;
     assert_eq!(receipts.unresolved(), vec![receipt.action_id]);
 
-    session.close().await;
+    session.close();
     serving.abort();
 }
 
@@ -348,7 +376,7 @@ async fn the_registry_decides_the_shape_of_a_call() {
         }
     ));
 
-    session.close().await;
+    session.close();
     serving.abort();
 }
 
@@ -375,7 +403,7 @@ async fn a_resynchronisation_requirement_is_its_own_error() {
         .expect("a snapshot");
     assert_eq!(listing.count, 2);
 
-    session.close().await;
+    session.close();
     serving.abort();
 }
 
@@ -397,8 +425,15 @@ async fn a_reconnect_subscribes_from_its_cursor_before_installing_a_snapshot() {
     let first = Restoration::start(stream_id.clone(), &session.cursors().await);
     assert_eq!(first.step(), RestorationStep::SubscribeFromStart);
 
-    // The host delivers two events, which move the cursor.
+    // The host delivers two events. Receiving them is not applying them: until the consumer says
+    // it folded them into its state, a reconnect has to ask for them again.
     deliver(&pushes, &session, &stream_id, &[1, 2]).await;
+    assert_eq!(
+        session.cursors().await.position(&stream_id),
+        None,
+        "a received event establishes no position on its own"
+    );
+    session.applied(&stream_id, EventSequence::new(2)).await;
 
     let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
     assert_eq!(
@@ -422,7 +457,7 @@ async fn a_reconnect_subscribes_from_its_cursor_before_installing_a_snapshot() {
         "and only then installs the snapshot"
     );
 
-    session.close().await;
+    session.close();
     serving.abort();
 }
 
@@ -496,7 +531,7 @@ async fn an_action_window_renewal_replaces_the_current_one() {
     .await;
     assert!(applied.is_ok(), "the renewed window replaced the first one");
 
-    session.close().await;
+    session.close();
     serving.abort();
 }
 
@@ -550,7 +585,7 @@ async fn a_mutation_refused_by_the_host_is_not_a_lost_connection() {
         .expect("a listing");
     assert_eq!(listing.count, 2);
 
-    session.close().await;
+    session.close();
     serving.abort();
 }
 
@@ -603,7 +638,7 @@ async fn a_gap_in_the_event_sequence_does_not_stop_the_connection() {
     .expect("a listing");
     assert_eq!(listing.count, 2);
 
-    session.close().await;
+    session.close();
     serving.abort();
 }
 
@@ -649,6 +684,6 @@ async fn a_cancelled_mutation_returns_its_place_in_the_outstanding_bound() {
     .expect("a receipt");
     assert_eq!(receipt.state, ReceiptState::Accepted);
 
-    session.close().await;
+    session.close();
     serving.abort();
 }

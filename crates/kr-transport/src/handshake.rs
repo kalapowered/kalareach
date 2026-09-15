@@ -218,7 +218,7 @@ pub async fn accept(
     identity: &LocalIdentity,
     epochs: HostEpochs,
     directory: &dyn PairedDirectory,
-    challenges: &Arc<tokio::sync::Mutex<ChallengeLedger>>,
+    challenges: &Arc<std::sync::Mutex<ChallengeLedger>>,
     windows: &ActionWindowIssuer,
 ) -> Result<Admitted> {
     let (send, recv) = connection
@@ -250,7 +250,7 @@ pub async fn accept_on(
     identity: &LocalIdentity,
     epochs: HostEpochs,
     directory: &dyn PairedDirectory,
-    challenges: &Arc<tokio::sync::Mutex<ChallengeLedger>>,
+    challenges: &Arc<std::sync::Mutex<ChallengeLedger>>,
     windows: &ActionWindowIssuer,
 ) -> Result<Admitted> {
     let mut writer = FrameWriter::new(send, StreamKind::Control);
@@ -333,7 +333,7 @@ pub async fn accept_on(
     // The challenge is held by a guard from here on. Every path out of this function that does not
     // consume it abandons it, including one that never reaches the proof at all: a ledger that
     // filled up with challenges nobody signed would stop the host accepting paired connections.
-    let mut challenge = Challenge::issue(Arc::clone(challenges), host_nonce).await?;
+    let mut challenge = Challenge::issue(Arc::clone(challenges), host_nonce)?;
     writer
         .write_message(&HelloReply::Selected(Box::new(selection.clone())))
         .await?;
@@ -374,7 +374,7 @@ pub async fn accept_on(
             })))
         }
         Err(error) => {
-            challenge.abandon().await;
+            challenge.abandon();
             writer
                 .write_message(&ConnectReply::Refused(error.to_protocol_error()))
                 .await?;
@@ -395,19 +395,20 @@ const REFUSAL_FLUSH: std::time::Duration = std::time::Duration::from_secs(2);
 pub const MAX_OFFER_LEN: usize = 16 * 1024;
 
 /// One issued connection challenge, released on every path that does not consume it.
+///
+/// The ledger is behind a synchronous lock and every operation on it is a set insertion or removal,
+/// so nothing is ever held across an await. That is what lets the guard release the challenge from
+/// `Drop`, which is the one place a cancelled handshake can still reach.
 #[derive(Debug)]
 struct Challenge {
-    ledger: Arc<tokio::sync::Mutex<ChallengeLedger>>,
+    ledger: Arc<std::sync::Mutex<ChallengeLedger>>,
     nonce: Nonce256,
     outstanding: bool,
 }
 
 impl Challenge {
-    async fn issue(
-        ledger: Arc<tokio::sync::Mutex<ChallengeLedger>>,
-        nonce: Nonce256,
-    ) -> Result<Self> {
-        ledger.lock().await.issue(&nonce)?;
+    fn issue(ledger: Arc<std::sync::Mutex<ChallengeLedger>>, nonce: Nonce256) -> Result<Self> {
+        lock_ledger(&ledger).issue(&nonce)?;
         Ok(Self {
             ledger,
             nonce,
@@ -416,27 +417,26 @@ impl Challenge {
     }
 
     /// Frees the challenge without recording it as used.
-    async fn abandon(&mut self) {
+    fn abandon(&mut self) {
         if self.outstanding {
+            lock_ledger(&self.ledger).abandon(&self.nonce);
             self.outstanding = false;
-            self.ledger.lock().await.abandon(&self.nonce);
         }
     }
 }
 
 impl Drop for Challenge {
     fn drop(&mut self) {
-        if self.outstanding {
-            // A cancelled handshake cannot await, so the entry is released without the lock's
-            // asynchronous path. `try_lock` fails only while another task holds the ledger, and
-            // that task is itself about to finish with it; a challenge that survives here is
-            // bounded by the ledger's own limit and can never be presented, because it was never
-            // sent to a peer that could sign it.
-            if let Ok(mut ledger) = self.ledger.try_lock() {
-                ledger.abandon(&self.nonce);
-            }
-        }
+        self.abandon();
     }
+}
+
+fn lock_ledger(
+    ledger: &Arc<std::sync::Mutex<ChallengeLedger>>,
+) -> std::sync::MutexGuard<'_, ChallengeLedger> {
+    ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -458,22 +458,6 @@ async fn admit_paired_peer(
             TransportError::handshake(ErrorCode::PermissionDenied, "no connection proof arrived")
         })?;
 
-    // The paired record is read again now, not only before the wait. A device revoked, or a key
-    // rotated, while this handshake was waiting for its proof must not be admitted under the record
-    // that was current when the wait began.
-    let current = directory.paired_peer(peer_endpoint_id).ok_or_else(|| {
-        TransportError::handshake(
-            ErrorCode::PermissionDenied,
-            "the paired record was withdrawn during the handshake",
-        )
-    })?;
-    if &current != paired {
-        return Err(TransportError::handshake(
-            ErrorCode::PermissionDenied,
-            "the paired record changed during the handshake",
-        ));
-    }
-
     // The host's own proof over the same transcript. It is produced before verification only
     // because both signatures are needed to check the pair; it is sent afterwards, and only if the
     // client's proof verified.
@@ -491,7 +475,7 @@ async fn admit_paired_peer(
     let local = identity.as_paired_peer();
 
     let digest = {
-        let mut ledger = challenge.ledger.lock().await;
+        let mut ledger = lock_ledger(&challenge.ledger);
         let outcome = kr_crypto::connect::verify_connect_once(
             &mut ledger,
             &selection.host_nonce,
@@ -509,6 +493,23 @@ async fn admit_paired_peer(
         }
         outcome?
     };
+
+    // The paired record is read again here, as late as the exchange allows: a device revoked, or a
+    // key rotated, while this handshake was waiting for its proof must not be admitted under the
+    // record that was current when the wait began. A revocation that lands after this point is the
+    // host's dispatch barrier to enforce, which is where section 9 puts it.
+    let current = directory.paired_peer(peer_endpoint_id).ok_or_else(|| {
+        TransportError::handshake(
+            ErrorCode::PermissionDenied,
+            "the paired record was withdrawn during the handshake",
+        )
+    })?;
+    if &current != paired {
+        return Err(TransportError::handshake(
+            ErrorCode::PermissionDenied,
+            "the paired record changed during the handshake",
+        ));
+    }
 
     let action_window = windows.issue(selection.connection_id, selection.boot_epoch)?;
     Ok((
