@@ -14,6 +14,7 @@
 //! | [`peer`] | Peer-credential authentication of a local caller |
 //! | [`endpoint`] | Binding, connecting and accepting, over Unix sockets or Windows named pipes |
 //! | [`framed`] | The length-delimited KR-CBOR-1 frame codec on a connection |
+//! | [`freshness`] | Host-stamped action windows on a continuous, suspend-aware deadline |
 //! | [`client`] | Connecting, negotiating, verifying a worker and calling a method |
 //! | [`descriptor`] | Atomic publication, reading and retirement of worker descriptors |
 //! | [`verify`] | The rendezvous, the challenge answer and the controller generation token |
@@ -60,6 +61,7 @@ pub mod descriptor;
 pub mod endpoint;
 pub mod error;
 pub mod framed;
+pub mod freshness;
 pub mod identity;
 pub mod paths;
 pub mod peer;
