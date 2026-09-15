@@ -422,10 +422,6 @@ impl Engine {
     /// still joins it. This releases that scalar. The session loop calls it when a read returns
     /// nothing, and a snapshot calls it itself, so a quiet stream never leaves a character held.
     pub fn quiesce(&mut self, now_ms: u64) -> FeedOutcome {
-        // A quiet stream is the moment to look at what is resident: nothing else is happening, and
-        // a session that has stopped printing would otherwise hold whatever it had until it printed
-        // again.
-        self.measure_now = true;
         let mut events = core::mem::take(&mut self.scratch);
         events.clear();
         self.lexer.flush_tail(&mut events);
@@ -812,20 +808,24 @@ impl Engine {
     /// not changing either, so the last measurement of it stands rather than being replaced by the
     /// alternate buffer's nothing.
     fn enforce_resident_state(&mut self, now_ms: u64) {
+        // The screens are small and are measured whenever anything asks: they are what an
+        // application grows quickly, and what a bound has to be checked against before the next
+        // read rather than after it.
+        let alternate = self.grid.alternate_active();
+        self.budget
+            .set_screen_links(alternate, self.grid.screen_link_bytes());
+        self.budget
+            .set_screen_content(alternate, self.grid.screen_content_bytes());
+        // The retained rows are not: measuring them walks the whole scrollback, so it happens when
+        // the rows have actually grown, when something asked, or periodically.
         let rows = self.grid.scrollback_rows();
         let grew = rows.abs_diff(self.measured_rows) >= ROW_CACHE_ROW_STEP;
         if !grew && !self.measure_now && !self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) {
             return;
         }
         self.measure_now = false;
-        self.budget
-            .set_screen_links(self.grid.alternate_active(), self.grid.screen_link_bytes());
-        self.budget.set_screen_content(
-            self.grid.alternate_active(),
-            self.grid.screen_content_bytes(),
-        );
         self.measured_rows = rows;
-        if self.grid.alternate_active() {
+        if alternate {
             return;
         }
         let mut bytes = self.grid.history_bytes();
