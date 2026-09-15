@@ -1,0 +1,36 @@
+[package]
+name = "kr-term"
+description = "KalaReach terminal engine: the kr-vt/1 sequence lexer, policy, canonical grid, query broker and snapshots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["conformance"]
+# The conformance corpus and the fixture generator. Enabled by default so `cargo test -p kr-term`
+# runs the corpus; the dependency plan spells it out as `--features conformance`.
+conformance = ["dep:serde_json"]
+
+[[bin]]
+name = "kr-term-fixtures"
+path = "src/bin/kr-term-fixtures.rs"
+required-features = ["conformance"]
+
+[dependencies]
+base64.workspace = true
+kr-protocol.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+thiserror.workspace = true
+vtparse.workspace = true
+wezterm-escape-parser.workspace = true
+wezterm-term.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

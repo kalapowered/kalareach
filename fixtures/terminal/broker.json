@@ -1,0 +1,1308 @@
+{
+  "cases": [
+    {
+      "covers": "KR-ACC-001 KR-REQ-08.05",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b63",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            3
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "da1",
+      "input": "1b5b63",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3f36323b313b323263"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-001 KR-REQ-08.05",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3e63",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            4
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "da2",
+      "input": "1b5b3e63",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3e34313b313b3063"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-001 KR-REQ-08.05",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3d63",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            4
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "da3",
+      "input": "1b5b3d63",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b50217c34423532303030311b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-001 KR-REQ-08.05",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b356e",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            4
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "dsr_status",
+      "input": "1b5b356e",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b306e"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-001 KR-REQ-08.05",
+      "diagnostics": [
+        {
+          "at": 8,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b333b3748",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            6
+          ]
+        },
+        {
+          "bytes": "7879",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            6,
+            8
+          ]
+        },
+        {
+          "bytes": "1b5b366e",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            8,
+            12
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          8
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "cpr_after_output",
+      "input": "1b5b333b374878791b5b366e",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b333b3952"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-001 KR-REQ-08.05",
+      "diagnostics": [
+        {
+          "at": 6,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b363b3248",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            6
+          ]
+        },
+        {
+          "bytes": "1b5b3f366e",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            6,
+            11
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          6
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decxcpr",
+      "input": "1b5b363b32481b5b3f366e",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3f363b323b3152"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-001 KR-REQ-08.05",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3f372470",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            6
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decrqm_autowrap",
+      "input": "1b5b3f372470",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3f373b312479"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-001 KR-REQ-08.05",
+      "diagnostics": [
+        {
+          "at": 5,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3f376c",
+          "class": "M",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        },
+        {
+          "bytes": "1b5b3f372470",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            5,
+            11
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          5
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decrqm_after_reset",
+      "input": "1b5b3f376c1b5b3f372470",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3f373b322479"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.23",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3f323032372470",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            9
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decrqm_grapheme",
+      "input": "1b5b3f323032372470",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3f323032373b302479"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.24",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3f323034382470",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            9
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decrqm_inband_resize",
+      "input": "1b5b3f323034382470",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3f323034383b302479"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.20",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3f332470",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            6
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decrqm_deccolm",
+      "input": "1b5b3f332470",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3f333b342479"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.21 CSI 18 t",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b313874",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "geometry_text_area",
+      "input": "1b5b313874",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b383b32343b383074"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.21 CSI 19 t",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b313974",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "geometry_screen",
+      "input": "1b5b313974",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b393b32343b383074"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.21 CSI 14 t",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b313474",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "geometry_pixels",
+      "input": "1b5b313474",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b343b303b3074"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.21 CSI 11 t",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b313174",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "window_state",
+      "input": "1b5b313174",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3174"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.35",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5024716d1b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "dcs",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            7
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decrqss_sgr_plain",
+      "input": "1b5024716d1b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b50312472306d1b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.35",
+      "diagnostics": [
+        {
+          "at": 10,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b313b343b33316d",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            9
+          ]
+        },
+        {
+          "bytes": "78",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            9,
+            10
+          ]
+        },
+        {
+          "bytes": "1b5024716d1b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "dcs",
+          "passthrough_depth": 0,
+          "span": [
+            10,
+            17
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          10
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decrqss_sgr_after_attributes",
+      "input": "1b5b313b343b33316d781b5024716d1b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b50312472303b313b343b33316d1b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.35",
+      "diagnostics": [
+        {
+          "at": 7,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b333b313272",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            7
+          ]
+        },
+        {
+          "bytes": "1b502471721b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "dcs",
+          "passthrough_depth": 0,
+          "span": [
+            7,
+            14
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          7
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decrqss_margins",
+      "input": "1b5b333b3132721b502471721b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b50312472333b3132721b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.35",
+      "diagnostics": [
+        {
+          "at": 5,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b342071",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        },
+        {
+          "bytes": "1b50247120711b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "dcs",
+          "passthrough_depth": 0,
+          "span": [
+            5,
+            13
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          5
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decrqss_cursor_style",
+      "input": "1b5b3420711b50247120711b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b503124723420711b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.35",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b50247122701b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "dcs",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            8
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "decrqss_conformance_level",
+      "input": "1b50247122701b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5031247236323b3122701b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.35 TN",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b502b71353434651b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "dcs",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            10
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "xtgettcap_name",
+      "input": "1b502b71353434651b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b50312b72353434453d373837343635373236443244333233353336363336463643364637321b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.35 colors",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b502b713633366636633666373237331b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "dcs",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            18
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "xtgettcap_colors",
+      "input": "1b502b713633366636633666373237331b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b50312b723633364636433646373237333d3332333533361b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.35 several names",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b502b71353434653b353436333b376137611b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "dcs",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            20
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "xtgettcap_multiple",
+      "input": "1b502b71353434653b353436333b376137611b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b50312b72353434453d373837343635373236443244333233353336363336463643364637321b5c",
+        "1b50312b72353436333d33311b5c",
+        "1b50302b72376137611b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.30",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5d343b323b3f1b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            9
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "colour_index_query",
+      "input": "1b5d343b323b3f1b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5d343b323b7267623a303030302f636463642f303030301b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.30",
+      "diagnostics": [
+        {
+          "at": 20,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5d343b323b7267623a31322f33342f35361b5c",
+          "class": "M",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            20
+          ]
+        },
+        {
+          "bytes": "1b5d343b323b3f1b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            20,
+            29
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          20
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "colour_index_after_change",
+      "input": "1b5d343b323b7267623a31322f33342f35361b5c1b5d343b323b3f1b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5d343b323b7267623a313231322f333433342f353635361b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.30",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5d31303b3f07",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            7
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "foreground_query",
+      "input": "1b5d31303b3f07",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5d31303b7267623a653565352f653565352f6535653507"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.30",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5d31313b3f1b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            8
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "background_query",
+      "input": "1b5d31313b3f1b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5d31313b7267623a303030302f303030302f303030301b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.25",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3e3071",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "xtversion",
+      "input": "1b5b3e3071",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b503e7c4b616c615265616368286b722d76742f31291b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.22",
+      "diagnostics": [
+        {
+          "at": 5,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3e3575",
+          "class": "M",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        },
+        {
+          "bytes": "1b5b3f75",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            5,
+            9
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          5
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "kitty_keyboard_query",
+      "input": "1b5b3e35751b5b3f75",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3f3575"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.22",
+      "diagnostics": [
+        {
+          "at": 7,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3e343b326d",
+          "class": "M",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            7
+          ]
+        },
+        {
+          "bytes": "1b5b3f346d",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            7,
+            12
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          7
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "modify_other_keys_query",
+      "input": "1b5b3e343b326d1b5b3f346d",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b3e343b326d"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.32",
+      "diagnostics": [],
+      "events": [
+        {
+          "bytes": "1b5d35323b633b3f1b5c",
+          "class": "S",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            10
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "clipboard_read_default",
+      "input": "1b5d35323b633b3f1b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5d35323b633b1b5c"
+      ],
+      "side_effects": []
+    }
+  ],
+  "description": "KR-ACC-001. Every query and the exact bytes the worker answers with. `forward` is empty in every case: no query reaches an attached terminal.",
+  "name": "broker",
+  "profile": "kr-vt/1"
+}

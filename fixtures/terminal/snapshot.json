@@ -1,0 +1,233 @@
+{
+  "cases": [
+    {
+      "active_buffer": "Primary",
+      "at_ground": true,
+      "cols": 12,
+      "covers": "KR-REQ-08.40 snapshot mid-output",
+      "cursor": {
+        "col": 4,
+        "row": 2,
+        "visible": true
+      },
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "hyperlinks": [],
+      "id": "mid_output",
+      "input": "6c696e65206f6e650d0a6c696e652074776f0d0a70617274",
+      "output_cursor": 24,
+      "projection_generation": 1,
+      "rows": 4,
+      "screen": [
+        {
+          "cells": 8,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": "line one"
+        },
+        {
+          "cells": 8,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": "line two"
+        },
+        {
+          "cells": 4,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": "part"
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 3,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "active_buffer": "Alternate",
+      "at_ground": true,
+      "cols": 12,
+      "covers": "KR-REQ-08.40 alternate-screen transition",
+      "cursor": {
+        "col": 9,
+        "row": 0,
+        "visible": true
+      },
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "hyperlinks": [],
+      "id": "alternate_entry",
+      "input": "7072696d6172790d0a1b5b3f31303439681b5b324a1b5b48616c7465726e617465",
+      "output_cursor": 33,
+      "projection_generation": 2,
+      "rows": 4,
+      "screen": [
+        {
+          "cells": 9,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": "alternate"
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 3,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "active_buffer": "Primary",
+      "at_ground": true,
+      "cols": 12,
+      "covers": "KR-REQ-08.40 alternate-screen transition",
+      "cursor": {
+        "col": 0,
+        "row": 1,
+        "visible": true
+      },
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "hyperlinks": [],
+      "id": "alternate_exit",
+      "input": "7072696d6172790d0a1b5b3f3130343968616c741b5b3f313034396c",
+      "output_cursor": 28,
+      "projection_generation": 3,
+      "rows": 4,
+      "screen": [
+        {
+          "cells": 7,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": "primary"
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 3,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "active_buffer": "Primary",
+      "at_ground": true,
+      "cols": 24,
+      "covers": "KR-ACC-002 hyperlink ranges survive",
+      "cursor": {
+        "col": 12,
+        "row": 0,
+        "visible": true
+      },
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "hyperlinks": [
+        {
+          "end_col": 8,
+          "row": 0,
+          "start_col": 4,
+          "uri": "https://example.invalid/"
+        }
+      ],
+      "id": "hyperlink_rows",
+      "input": "736565201b5d383b3b68747470733a2f2f6578616d706c652e696e76616c69642f1b5c686572651b5d383b3b1b5c206e6f77",
+      "output_cursor": 50,
+      "projection_generation": 1,
+      "rows": 3,
+      "screen": [
+        {
+          "cells": 12,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": "see here now"
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "active_buffer": "Primary",
+      "at_ground": false,
+      "cols": 12,
+      "covers": "KR-REQ-08.40 parser-ground boundary",
+      "cursor": {
+        "col": 4,
+        "row": 0,
+        "visible": true
+      },
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "hyperlinks": [],
+      "id": "mid_escape_sequence",
+      "input": "746578741b5b313b33",
+      "output_cursor": 9,
+      "projection_generation": 1,
+      "rows": 4,
+      "screen": [
+        {
+          "cells": 4,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": "text"
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 3,
+          "text": ""
+        }
+      ]
+    }
+  ],
+  "description": "Snapshots taken mid-output and at alternate-screen transitions, with the hyperlink ranges a reconnection restores as inert metadata.",
+  "name": "snapshot",
+  "profile": "kr-vt/1"
+}

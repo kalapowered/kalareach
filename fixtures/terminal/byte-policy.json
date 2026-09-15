@@ -1,0 +1,901 @@
+{
+  "cases": [
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.46 raw C1 introducer",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "raw-c1-control"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "9b33316d",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            4
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "raw_c1_csi",
+      "input": "9b33316d",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.46 raw C1 introducer",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "raw-c1-control"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "9d323b7469746c6507",
+          "class": "M",
+          "disposition": "RequireProjection",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            9
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "raw_c1_osc",
+      "input": "9d323b7469746c6507",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.46 raw C1 control",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "raw-c1-control"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "84",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "esc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            1
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "raw_c1_index",
+      "input": "84",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.46 unassigned C1",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "91",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "control",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            1
+          ]
+        },
+        {
+          "bytes": "99",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "control",
+          "passthrough_depth": 0,
+          "span": [
+            1,
+            2
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "raw_c1_unassigned",
+      "input": "9199",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.46 stray ST",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "9c",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "control",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            1
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "raw_c1_stray_st",
+      "input": "9c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.45 encoded C1 scalar",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "malformed-utf8"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "c29b",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:EncodedC1Scalar",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            2
+          ]
+        },
+        {
+          "bytes": "33316d",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            2,
+            5
+          ]
+        }
+      ],
+      "forward": [
+        [
+          2,
+          5
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "encoded_c1_scalar",
+      "input": "c29b33316d",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.45 overlong",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "malformed-utf8"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "c0",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:Overlong",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            1
+          ]
+        },
+        {
+          "bytes": "af",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:IsolatedContinuation",
+          "passthrough_depth": 0,
+          "span": [
+            1,
+            2
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "overlong_two_byte",
+      "input": "c0af",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.45 overlong",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "malformed-utf8"
+        },
+        {
+          "at": 1,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "e0",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:Overlong",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            1
+          ]
+        },
+        {
+          "bytes": "80",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "control",
+          "passthrough_depth": 0,
+          "span": [
+            1,
+            2
+          ]
+        },
+        {
+          "bytes": "af",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:IsolatedContinuation",
+          "passthrough_depth": 0,
+          "span": [
+            2,
+            3
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "overlong_three_byte",
+      "input": "e080af",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.45 surrogate",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "malformed-utf8"
+        },
+        {
+          "at": 2,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "ed",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:Surrogate",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            1
+          ]
+        },
+        {
+          "bytes": "a0",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:IsolatedContinuation",
+          "passthrough_depth": 0,
+          "span": [
+            1,
+            2
+          ]
+        },
+        {
+          "bytes": "80",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "control",
+          "passthrough_depth": 0,
+          "span": [
+            2,
+            3
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "surrogate",
+      "input": "eda080",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.45 out of range",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "malformed-utf8"
+        },
+        {
+          "at": 1,
+          "kind": "abandoned-control-string"
+        },
+        {
+          "at": 2,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "f4",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:OutOfRange",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            1
+          ]
+        },
+        {
+          "bytes": "90",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "discarded:ControlSequence:Cancelled",
+          "passthrough_depth": 0,
+          "span": [
+            1,
+            2
+          ]
+        },
+        {
+          "bytes": "80",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "control",
+          "passthrough_depth": 0,
+          "span": [
+            2,
+            3
+          ]
+        },
+        {
+          "bytes": "80",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": true,
+          "ground_after": true,
+          "kind": "control",
+          "passthrough_depth": 0,
+          "span": [
+            3,
+            4
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "out_of_range",
+      "input": "f4908080",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.45 invalid lead",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "malformed-utf8"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "f8",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:InvalidLead",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            1
+          ]
+        },
+        {
+          "bytes": "ff",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:InvalidLead",
+          "passthrough_depth": 0,
+          "span": [
+            1,
+            2
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "invalid_lead",
+      "input": "f8ff",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.45 isolated continuation",
+      "diagnostics": [
+        {
+          "at": 1,
+          "kind": "malformed-utf8"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "61",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            1
+          ]
+        },
+        {
+          "bytes": "a9",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:IsolatedContinuation",
+          "passthrough_depth": 0,
+          "span": [
+            1,
+            2
+          ]
+        },
+        {
+          "bytes": "62",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            2,
+            3
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          1
+        ],
+        [
+          2,
+          3
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "isolated_continuation",
+      "input": "61a962",
+      "projection_required_at": 1,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.45 truncated scalar",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "malformed-utf8"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "e282",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "replacement:TruncatedScalar",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            2
+          ]
+        },
+        {
+          "bytes": "41",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            2,
+            3
+          ]
+        }
+      ],
+      "forward": [
+        [
+          2,
+          3
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "truncated_scalar",
+      "input": "e28241",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 KR-REQ-08.45 continuation inside a scalar",
+      "diagnostics": [],
+      "events": [
+        {
+          "bytes": "c39c",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            2
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          2
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "continuation_not_c1",
+      "input": "c39c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 raw 0x9C is not a terminator",
+      "diagnostics": [],
+      "events": [
+        {
+          "bytes": "1b5d323bc39c6265721b5c",
+          "class": "M",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            11
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          11
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "st_inside_title",
+      "input": "1b5d323bc39c6265721b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 abandoned sequence",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "abandoned-control-string"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b313b32",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "discarded:ControlSequence:Cancelled",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        },
+        {
+          "bytes": "1b5b33316d",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            5,
+            10
+          ]
+        }
+      ],
+      "forward": [
+        [
+          5,
+          10
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "csi_aborted_by_esc",
+      "input": "1b5b313b321b5b33316d",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 cancelled string",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "abandoned-control-string"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5d323b7061727418",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "discarded:Osc:Cancelled",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            9
+          ]
+        },
+        {
+          "bytes": "72657374",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            9,
+            13
+          ]
+        }
+      ],
+      "forward": [
+        [
+          9,
+          13
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "osc_aborted_by_can",
+      "input": "1b5d323b706172741872657374",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 ill-formed prelude",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b20316d",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi-ignored",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "csi_ignored_prelude",
+      "input": "1b5b20316d",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 nested passthrough",
+      "diagnostics": [],
+      "events": [
+        {
+          "bytes": "1b5b33316d",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 2,
+          "span": [
+            0,
+            28
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "passthrough_depth_two",
+      "input": "1b50746d75783b1b1b50746d75783b1b1b1b1b5b33316d1b1b5c1b5c",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    }
+  ],
+  "description": "KR-ACC-024. Raw 8-bit C1, malformed UTF-8, nested tmux passthrough, oversized control strings and abandoned sequences. No case forwards bytes a physical terminal could read as an unclassified introducer, and no case lets a query or a side effect escape.",
+  "name": "byte-policy",
+  "profile": "kr-vt/1"
+}

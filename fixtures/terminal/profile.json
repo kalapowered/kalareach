@@ -1,0 +1,128 @@
+{
+  "capabilities": [
+    "cursor-operations",
+    "both-screen-buffers",
+    "scroll-regions",
+    "bracketed-paste",
+    "focus-events",
+    "sgr-mouse",
+    "hyperlinks",
+    "synchronised-output",
+    "xterm-modifier-keys",
+    "kitty-keyboard-subset",
+    "true-colour",
+    "indexed-palette"
+  ],
+  "description": "What kr-vt/1 advertises, what it refuses, and the exact identity bytes. Nothing here describes a physical terminal.",
+  "device_attributes": {
+    "primary": [
+      62,
+      1,
+      22
+    ],
+    "secondary": [
+      41,
+      1,
+      0
+    ],
+    "tertiary_unit_id": "4B520001"
+  },
+  "grid_library": {
+    "notes": [
+      "The revision accepts already-parsed actions, so the engine parses once and the library never re-frames a byte. That is what makes a second parse unnecessary rather than merely discouraged.",
+      "The width model is configuration, not a fork: generation 9 with narrow ambiguous characters is exactly the pinned kr-vt/1 model.",
+      "Grapheme clustering, in-band resize and DECCOLM never reach the library, because the policy layer classifies them before the reducer sees anything. The library's own support for them is therefore not part of the profile.",
+      "Raster graphics are disabled in configuration and no image sequence is ever forwarded, so the library's sixel, iTerm2 and Kitty image paths stay unreachable.",
+      "The library is built with a writer that accepts no bytes. Every reply comes from the query broker, and the fixtures fail if the library ever writes one."
+    ],
+    "patch_required": false,
+    "repository": "https://github.com/wezterm/wezterm",
+    "revision": "699fd77b44641c43476c945054cfae6518dbd632"
+  },
+  "identity": "KalaReach(kr-vt/1)",
+  "limits": {
+    "control_string_bytes": 65536,
+    "history_page_bytes": 1048576,
+    "history_page_rows": 1000,
+    "max_cells": 262144,
+    "max_cols": 2048,
+    "max_rows": 1024,
+    "osc52_string_bytes": 1048576,
+    "passthrough_depth": 4,
+    "response_lane_queue_bytes": 131072,
+    "responses_per_second": 256,
+    "row_cache_bytes": 8388608,
+    "session_bytes": 67108864
+  },
+  "name": "profile",
+  "profile": "kr-vt/1",
+  "term": "xterm-256color",
+  "tracked_ansi_modes": [
+    4,
+    20
+  ],
+  "tracked_dec_modes": [
+    1,
+    5,
+    6,
+    7,
+    8,
+    12,
+    25,
+    45,
+    66,
+    67,
+    69,
+    1000,
+    1002,
+    1003,
+    1004,
+    1005,
+    1006,
+    1007,
+    1034,
+    1047,
+    1048,
+    1049,
+    2004,
+    2026
+  ],
+  "withheld": [
+    {
+      "feature": "sixel-graphics",
+      "reason": "terminal raster graphics are disabled; images travel through the file protocol"
+    },
+    {
+      "feature": "kitty-graphics",
+      "reason": "terminal raster graphics are disabled; images travel through the file protocol"
+    },
+    {
+      "feature": "iterm2-inline-images",
+      "reason": "terminal raster graphics are disabled; images travel through the file protocol"
+    },
+    {
+      "feature": "grapheme-clustering-mode-2027",
+      "reason": "a physical terminal on the other side may cluster differently"
+    },
+    {
+      "feature": "in-band-resize-mode-2048",
+      "reason": "resize travels over the PTY or ConPTY notification, not a second in-band channel"
+    },
+    {
+      "feature": "deccolm-mode-3",
+      "reason": "rows and columns belong to the geometry owner"
+    },
+    {
+      "feature": "selective-erase",
+      "reason": "DECSCA is not implemented, so DA1 does not claim it"
+    },
+    {
+      "feature": "title-reporting",
+      "reason": "reporting the title back into the stream lets output become input"
+    },
+    {
+      "feature": "answerback",
+      "reason": "kr-vt/1 has no answerback string, so ENQ is answered with silence"
+    }
+  ]
+}
