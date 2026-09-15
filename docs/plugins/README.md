@@ -518,12 +518,14 @@ report the same code for the same defect.
 | `control_parameters_widen` | A control's parameters do not narrow its action's |
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 
-`kr-plugin-sandbox` opens each file in a way that refuses to follow a link and cannot block on a
-device, checks the open handle rather than the path, and reads through it once. It refuses a link, a
-device, a file with more than one name, and anything that grows past its limit while being read. The
-manifests are parsed from those same bytes rather than read again, so the digest a package is pinned
-by covers the document the validator looked at. It stops at the file count limit rather than walking
-a directory somebody made arbitrarily wide.
+`kr-plugin-sandbox` walks the package through a handle on its directory rather than by path. Every
+file and subdirectory is opened from the handle of the directory that holds it, so a link, an
+absolute path or a `..` cannot reach outside the package, and a directory replaced during the walk
+cannot redirect a read: the handle refers to the directory that was opened, not to the name it was
+opened by. It refuses a link, a device, a file with more than one name, and anything that grows past
+its limit while being read. The manifests are parsed from those same bytes rather than read again,
+so the digest a package is pinned by covers the document the validator looked at. It stops at the
+file count limit rather than walking a directory somebody made arbitrarily wide.
 
 ## What a signature does not do
 

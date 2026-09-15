@@ -10,9 +10,10 @@
 //! package establishes provenance, not safety, and this module is where the safety part happens.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, DirEntry};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -419,24 +420,33 @@ struct Scanned {
 }
 
 fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
-    if !directory.is_dir() {
-        report.push(Finding::new(
-            FindingCode::DirectoryUnreadable,
-            format!("{} is not a directory", directory.display()),
-        ));
-        return None;
-    }
+    // The walk is anchored to a directory handle. Every open below resolves inside that handle, so
+    // a link, an absolute path or a `..` cannot reach outside the package, and a directory replaced
+    // during the walk cannot redirect a read: the handle refers to the directory that was opened,
+    // not to the name it was opened by. Checking each path as text and then opening it by path
+    // would leave the gap between the two.
+    let root = match Dir::open_ambient_dir(directory, ambient_authority()) {
+        Ok(root) => root,
+        Err(error) => {
+            report.push(Finding::new(
+                FindingCode::DirectoryUnreadable,
+                format!("{}: {error}", directory.display()),
+            ));
+            return None;
+        }
+    };
+
     let mut files = Vec::new();
     let mut manifests: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut total: u64 = 0;
-    let mut queue: Vec<(PathBuf, Vec<String>)> = vec![(directory.to_path_buf(), Vec::new())];
+    let mut queue: Vec<(Dir, Vec<String>)> = vec![(root, Vec::new())];
     while let Some((current, prefix)) = queue.pop() {
-        let entries = match fs::read_dir(&current) {
+        let entries = match current.entries() {
             Ok(entries) => entries,
             Err(error) => {
                 report.push(Finding::new(
                     FindingCode::DirectoryUnreadable,
-                    format!("{}: {error}", current.display()),
+                    format!("{}: {error}", display_prefix(directory, &prefix)),
                 ));
                 return None;
             }
@@ -447,27 +457,25 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                 Err(error) => {
                     report.push(Finding::new(
                         FindingCode::DirectoryUnreadable,
-                        format!("{}: {error}", current.display()),
+                        format!("{}: {error}", display_prefix(directory, &prefix)),
                     ));
                     return None;
                 }
             };
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            let name = entry.file_name();
+            let Some(name) = name.to_str().map(str::to_owned) else {
                 report.push(Finding::at(
                     FindingCode::NameNotUtf8,
-                    format!(
-                        "{}/{}",
-                        prefix.join("/"),
-                        entry.file_name().to_string_lossy()
-                    ),
+                    format!("{}/{}", prefix.join("/"), name.to_string_lossy()),
                     "a package file name is valid UTF-8; a name that is not cannot be declared",
                 ));
                 continue;
             };
             let mut segments = prefix.clone();
-            segments.push(name.clone());
+            segments.push(name);
             let relative = segments.join("/");
-            let metadata = match fs::symlink_metadata(entry.path()) {
+
+            let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     report.push(Finding::at(
@@ -478,7 +486,8 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                     continue;
                 }
             };
-            if metadata.is_symlink() {
+            let kind = metadata.file_type();
+            if kind.is_symlink() {
                 report.push(Finding::at(
                     FindingCode::NotARegularFile,
                     relative,
@@ -486,7 +495,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                 ));
                 continue;
             }
-            if metadata.is_dir() {
+            if kind.is_dir() {
                 if let Err(rejection) = PackagePath::new(relative.clone()) {
                     report.push(Finding::at(
                         FindingCode::UnsafePath,
@@ -495,10 +504,17 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                     ));
                     continue;
                 }
-                queue.push((entry.path(), segments));
+                match entry.open_dir() {
+                    Ok(child) => queue.push((child, segments)),
+                    Err(error) => report.push(Finding::at(
+                        FindingCode::DirectoryUnreadable,
+                        relative,
+                        error.to_string(),
+                    )),
+                }
                 continue;
             }
-            if !metadata.is_file() {
+            if !kind.is_file() {
                 report.push(Finding::at(
                     FindingCode::NotARegularFile,
                     relative,
@@ -517,8 +533,9 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                     continue;
                 }
             };
-            // The length comes from the directory entry, so a file is measured against the
-            // package budget before any of it is read into memory.
+
+            // The length comes from the directory entry, so a file is measured against the package
+            // budget before any of it is read into memory.
             let size_bytes = metadata.len();
             total = total.saturating_add(size_bytes);
             if size_bytes > MAX_PACKAGE_BYTES || total > MAX_PACKAGE_BYTES {
@@ -536,7 +553,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
             } else {
                 MAX_PACKAGE_BYTES
             };
-            match read_bounded(&entry.path(), limit) {
+            match read_bounded(&entry, limit) {
                 Ok(bytes) => {
                     if is_manifest_name(path.as_str()) {
                         manifests.insert(path.to_string(), bytes.clone());
@@ -548,7 +565,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                     });
                 }
                 Err(rejection) => {
-                    report.push(Finding::at(rejection.code, relative, rejection.detail))
+                    report.push(Finding::at(rejection.code, relative, rejection.detail));
                 }
             }
             if files.len() > MAX_PACKAGE_FILES {
@@ -564,6 +581,15 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Some(Scanned { files, manifests })
+}
+
+/// Names a directory inside the package for a message.
+fn display_prefix(directory: &Path, prefix: &[String]) -> String {
+    if prefix.is_empty() {
+        directory.display().to_string()
+    } else {
+        format!("{}/{}", directory.display(), prefix.join("/"))
+    }
 }
 
 fn check_file_set(files: &[PackageFile], report: &mut Report) {
@@ -648,16 +674,14 @@ fn manifest_text(
     }
 }
 
-/// Reads a file through a handle whose identity is checked after it is open.
+/// Reads one directory entry through the handle its directory was opened with.
 ///
-/// The check is `fstat` on the open handle rather than `stat` on the path, so what is measured is
-/// what is read. On Unix the open itself refuses a symbolic link and never blocks on a device, so a
-/// path replaced between the directory scan and the read cannot redirect the read or stop it. The
-/// read stops one byte past the limit rather than trusting the length reported before it started.
-///
-/// A hard link is refused too. A package holds one name per file, and a second name is a way to
-/// make one file's bytes answer for two declared payloads.
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, Finding> {
+/// The entry is opened from a directory handle rather than by path, so nothing between the
+/// directory scan and the read can redirect it. The handle's own metadata is the check: a
+/// non-regular file is refused, and so is a file with more than one name, because a second name is
+/// a way to make one file's bytes answer for two declared payloads. The read stops one byte past
+/// the limit rather than trusting the length reported before it started.
+fn read_bounded(entry: &DirEntry, limit: u64) -> Result<Vec<u8>, Finding> {
     use std::io::Read as _;
 
     let reject = |code: FindingCode, detail: String| Finding {
@@ -666,7 +690,8 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, Finding> {
         detail,
     };
 
-    let mut file = open_regular(path)
+    let mut file = entry
+        .open()
         .map_err(|error| reject(FindingCode::NotARegularFile, error.to_string()))?;
     let metadata = file
         .metadata()
@@ -679,7 +704,7 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, Finding> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
+        use cap_std::fs::MetadataExt as _;
         if metadata.nlink() > 1 {
             return Err(reject(
                 FindingCode::NotARegularFile,
@@ -700,26 +725,6 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, Finding> {
         ));
     }
     Ok(bytes)
-}
-
-/// Opens a file without following a link into it and without blocking on a device.
-///
-/// On Unix the open itself refuses a symbolic link and never blocks, so a path replaced between the
-/// directory scan and the read cannot redirect the read or stop it. Elsewhere the handle's own
-/// metadata is the check, which is the strongest thing the standard library offers there.
-fn open_regular(path: &Path) -> io::Result<fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::File::open(path)
-    }
 }
 
 /// Returns true when a path names one of the package's own manifests.
@@ -1321,16 +1326,17 @@ fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut R
             }
         }
     }
-    // Two install steps that write one file on macOS or Windows are a defect wherever the
-    // application's plugin directory happens to live.
-    let destinations: Vec<crate::paths::PackagePath> = bridge
-        .install
-        .iter()
-        .filter_map(|step| match step {
-            BridgeStep::InstallFile { destination, .. } => Some(destination.clone()),
-            BridgeStep::AddConfigurationKey { .. } => None,
-        })
-        .collect();
+    // Two steps that write one file on macOS or Windows are a defect wherever the application's
+    // plugin directory happens to live. Configuration files count: two edits to `Settings.json` and
+    // `settings.json` are two edits to one document there. Several keys in one file are not a
+    // collision, so each file is counted once.
+    let mut destinations: Vec<crate::paths::PackagePath> = Vec::new();
+    for step in &bridge.install {
+        let (path, _) = step.writes();
+        if !destinations.contains(path) {
+            destinations.push(path.clone());
+        }
+    }
     for collision in find_collisions(&destinations) {
         report.push(Finding::at(
             FindingCode::BridgeRecipeInvalid,

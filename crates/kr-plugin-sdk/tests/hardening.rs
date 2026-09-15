@@ -39,6 +39,40 @@ fn the_written_package_is_the_one_the_fixtures_use() {
 
 #[cfg(unix)]
 #[test]
+fn a_parent_directory_link_cannot_redirect_the_walk() {
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let outside = temporary.path().join("outside");
+    std::fs::create_dir_all(outside.join("nested")).expect("the outside tree creates");
+    std::fs::write(outside.join("nested/secret.txt"), "not ours").expect("the file writes");
+
+    let package = temporary.path().join("package");
+    write_valid_package(&package);
+    // A directory inside the package that points at a tree outside it. The walk is anchored to the
+    // package's own directory handle, so the link is reported rather than descended into.
+    std::os::unix::fs::symlink(&outside, package.join("assets")).expect("the link is made");
+
+    let validated = validate_package_directory(&package);
+    assert!(validated.report.has(FindingCode::NotARegularFile));
+    assert!(
+        !validated
+            .report
+            .findings
+            .iter()
+            .any(|finding| finding.detail.contains("not ours")),
+        "the walk read something outside the package"
+    );
+    if let Some(package) = validated.package {
+        for file in &package.files {
+            assert!(
+                !file.path.as_str().starts_with("assets/"),
+                "the walk descended into the link"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn a_symbolic_link_is_rejected_rather_than_followed() {
     let temporary = tempfile::tempdir().expect("a temporary directory");
     let outside = temporary.path().join("outside.json");
