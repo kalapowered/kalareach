@@ -1,0 +1,227 @@
+{
+  "budget": {
+    "alert_bytes": 1073152,
+    "cell_attribute_bytes": 96,
+    "cell_content_bytes": 256,
+    "cell_slot_bytes": 64,
+    "cell_text_bytes": 64,
+    "cell_text_heap_bytes": 32,
+    "link_envelope_bytes": 17137960,
+    "row_cache_bytes": 8388608,
+    "row_slot_bytes": 288,
+    "scrollback_rows": 3500,
+    "session_bytes": 67108864,
+    "title_bytes": 46064
+  },
+  "cases": [
+    {
+      "admitted": true,
+      "budget": 67108864,
+      "covers": "KR-REQ-08.72 the invisible default 120x40",
+      "footprint": {
+        "alerts": 1073152,
+        "cell_content": 2457600,
+        "cell_slots": 614400,
+        "links": 17137960,
+        "row_arrays": 1031040,
+        "titles": 46064,
+        "total": 22360216
+      },
+      "id": "default_invisible_size",
+      "requested": {
+        "cells": 4800,
+        "cols": 120,
+        "rows": 40
+      }
+    },
+    {
+      "admitted": true,
+      "budget": 67108864,
+      "covers": "KR-REQ-08.79 a geometry that fits",
+      "footprint": {
+        "alerts": 1073152,
+        "cell_content": 983040,
+        "cell_slots": 245760,
+        "links": 17137960,
+        "row_arrays": 1021824,
+        "titles": 46064,
+        "total": 20507800
+      },
+      "id": "ordinary_terminal",
+      "requested": {
+        "cells": 1920,
+        "cols": 80,
+        "rows": 24
+      }
+    },
+    {
+      "admitted": true,
+      "budget": 67108864,
+      "covers": "KR-REQ-08.79 the largest grid that fits",
+      "footprint": {
+        "alerts": 1073152,
+        "cell_content": 37879808,
+        "cell_slots": 9469952,
+        "links": 17137960,
+        "row_arrays": 1164672,
+        "titles": 46064,
+        "total": 66771608
+      },
+      "id": "largest_square_that_fits",
+      "requested": {
+        "cells": 73984,
+        "cols": 272,
+        "rows": 272
+      }
+    },
+    {
+      "admitted": false,
+      "code": "RESOURCE_UNAVAILABLE",
+      "covers": "KR-REQ-08.79 rejection before allocation",
+      "id": "smallest_square_that_does_not",
+      "message": "geometry 273x273 is 74529 cells, which needs 67120984 bytes of the 67108864-byte session budget",
+      "requested": {
+        "cells": 74529,
+        "cols": 273,
+        "rows": 273
+      }
+    },
+    {
+      "admitted": true,
+      "budget": 67108864,
+      "covers": "KR-REQ-08.79 the largest grid that fits",
+      "footprint": {
+        "alerts": 1073152,
+        "cell_content": 37748736,
+        "cell_slots": 9437184,
+        "links": 17137960,
+        "row_arrays": 1028736,
+        "titles": 46064,
+        "total": 66471832
+      },
+      "id": "widest_grid_that_fits",
+      "requested": {
+        "cells": 73728,
+        "cols": 2048,
+        "rows": 36
+      }
+    },
+    {
+      "admitted": false,
+      "code": "RESOURCE_UNAVAILABLE",
+      "covers": "KR-REQ-08.79 rejection before allocation",
+      "id": "widest_grid_that_does_not",
+      "message": "geometry 2048x37 is 75776 cells, which needs 67783128 bytes of the 67108864-byte session budget",
+      "requested": {
+        "cells": 75776,
+        "cols": 2048,
+        "rows": 37
+      }
+    },
+    {
+      "admitted": false,
+      "code": "RESOURCE_UNAVAILABLE",
+      "covers": "KR-REQ-08.71 262,144 cells is a dimension bound",
+      "id": "cell_maximum_is_a_dimension_bound",
+      "message": "geometry 2048x128 is 262144 cells, which needs 187111064 bytes of the 67108864-byte session budget",
+      "requested": {
+        "cells": 262144,
+        "cols": 2048,
+        "rows": 128
+      }
+    },
+    {
+      "admitted": false,
+      "code": "INVALID_ARGUMENT",
+      "covers": "KR-REQ-08.71 all three constraints apply at once",
+      "id": "beyond_the_cell_bound",
+      "message": "geometry 2048x1024 violates cells: columns 1..=2048, rows 1..=1024, cells 1..=262144",
+      "requested": {
+        "cells": 2097152,
+        "cols": 2048,
+        "rows": 1024
+      }
+    },
+    {
+      "admitted": true,
+      "budget": 67108864,
+      "covers": "KR-REQ-08.70 an owner resize the session can hold",
+      "footprint": {
+        "alerts": 1073152,
+        "cell_content": 983040,
+        "cell_slots": 245760,
+        "links": 17137960,
+        "row_arrays": 1021824,
+        "titles": 46064,
+        "total": 20507800
+      },
+      "id": "resize_that_fits",
+      "requested": {
+        "cells": 1920,
+        "cols": 80,
+        "rows": 24
+      },
+      "resize": {
+        "admitted": true,
+        "budget": 67108864,
+        "footprint": {
+          "alerts": 1073152,
+          "cell_content": 5120000,
+          "cell_slots": 1280000,
+          "links": 17137960,
+          "row_arrays": 1036800,
+          "titles": 46064,
+          "total": 25693976
+        },
+        "requested": {
+          "cells": 10000,
+          "cols": 200,
+          "rows": 50
+        },
+        "size_after": {
+          "cells": 10000,
+          "cols": 200,
+          "rows": 50
+        }
+      }
+    },
+    {
+      "admitted": true,
+      "budget": 67108864,
+      "covers": "KR-REQ-08.79 a resize refused before allocation",
+      "footprint": {
+        "alerts": 1073152,
+        "cell_content": 983040,
+        "cell_slots": 245760,
+        "links": 17137960,
+        "row_arrays": 1021824,
+        "titles": 46064,
+        "total": 20507800
+      },
+      "id": "resize_that_does_not_fit",
+      "requested": {
+        "cells": 1920,
+        "cols": 80,
+        "rows": 24
+      },
+      "resize": {
+        "admitted": false,
+        "code": "RESOURCE_UNAVAILABLE",
+        "message": "geometry 2048x128 is 262144 cells, which needs 187111064 bytes of the 67108864-byte session budget",
+        "requested": {
+          "cells": 262144,
+          "cols": 2048,
+          "rows": 128
+        },
+        "size_after": {
+          "cells": 1920,
+          "cols": 80,
+          "rows": 24
+        }
+      }
+    }
+  ],
+  "description": "Geometry admission against the session budget. A geometry is checked against the three dimension constraints first, and then against what both screen buffers can hold at that size. The 262,144-cell maximum is a dimension bound; the budget decides which of those grids a session can actually be given.",
+  "name": "admission",
+  "profile": "kr-vt/1"
+}

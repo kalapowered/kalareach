@@ -630,6 +630,180 @@ pub const SNAPSHOT_CASES: &[GridCase] = &[
     },
 ];
 
+/// One geometry-admission case.
+///
+/// Section 8 bounds a geometry twice. The three dimension constraints say what a request may ask
+/// for, and the session budget says what this session can hold, which is the smaller of the two at
+/// every size that matters. A case records which bound answered.
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionCase {
+    /// Stable identifier.
+    pub id: &'static str,
+    /// The requirement the case pins.
+    pub covers: &'static str,
+    /// The geometry a session is created at.
+    pub cols: u32,
+    /// Rows of that geometry.
+    pub rows: u32,
+    /// A geometry the session is then resized to, for the cases that are about a resize.
+    pub resize: Option<(u32, u32)>,
+}
+
+/// The geometry-admission cases: grids that fit, the boundary in each direction, and the grids the
+/// dimension bound allows that the budget does not.
+pub const ADMISSION_CASES: &[AdmissionCase] = &[
+    AdmissionCase {
+        id: "default_invisible_size",
+        covers: "KR-REQ-08.72 the invisible default 120x40",
+        cols: 120,
+        rows: 40,
+        resize: None,
+    },
+    AdmissionCase {
+        id: "ordinary_terminal",
+        covers: "KR-REQ-08.79 a geometry that fits",
+        cols: 80,
+        rows: 24,
+        resize: None,
+    },
+    AdmissionCase {
+        id: "largest_square_that_fits",
+        covers: "KR-REQ-08.79 the largest grid that fits",
+        cols: 272,
+        rows: 272,
+        resize: None,
+    },
+    AdmissionCase {
+        id: "smallest_square_that_does_not",
+        covers: "KR-REQ-08.79 rejection before allocation",
+        cols: 273,
+        rows: 273,
+        resize: None,
+    },
+    AdmissionCase {
+        id: "widest_grid_that_fits",
+        covers: "KR-REQ-08.79 the largest grid that fits",
+        cols: 2_048,
+        rows: 36,
+        resize: None,
+    },
+    AdmissionCase {
+        id: "widest_grid_that_does_not",
+        covers: "KR-REQ-08.79 rejection before allocation",
+        cols: 2_048,
+        rows: 37,
+        resize: None,
+    },
+    AdmissionCase {
+        id: "cell_maximum_is_a_dimension_bound",
+        covers: "KR-REQ-08.71 262,144 cells is a dimension bound",
+        // Every one of the three dimension constraints is satisfied, and the budget still refuses
+        // it: two buffers of 262,144 cells, each cell holding what a cell may hold, come to far
+        // more than the session budget.
+        cols: 2_048,
+        rows: 128,
+        resize: None,
+    },
+    AdmissionCase {
+        id: "beyond_the_cell_bound",
+        covers: "KR-REQ-08.71 all three constraints apply at once",
+        cols: 2_048,
+        rows: 1_024,
+        resize: None,
+    },
+    AdmissionCase {
+        id: "resize_that_fits",
+        covers: "KR-REQ-08.70 an owner resize the session can hold",
+        cols: 80,
+        rows: 24,
+        resize: Some((200, 50)),
+    },
+    AdmissionCase {
+        id: "resize_that_does_not_fit",
+        covers: "KR-REQ-08.79 a resize refused before allocation",
+        cols: 80,
+        rows: 24,
+        resize: Some((2_048, 128)),
+    },
+];
+
+/// Admits one case and records which bound answered.
+#[must_use]
+pub fn summarise_admission(case: &AdmissionCase) -> Value {
+    let config = EngineConfig::DEFAULT;
+    let requested = GridSize::new(case.cols, case.rows);
+    let created = Engine::new(EngineConfig {
+        size: requested,
+        ..config
+    });
+    let mut value = match created {
+        Err(error) => json!({
+            "requested": size_value(requested),
+            "admitted": false,
+            "code": error.code().as_str(),
+            "message": error.to_string(),
+        }),
+        Ok(engine) => admitted_value(&engine, requested),
+    };
+    let Some((cols, rows)) = case.resize else {
+        return value;
+    };
+    let target = GridSize::new(cols, rows);
+    let mut engine = Engine::new(EngineConfig {
+        size: requested,
+        ..config
+    })
+    .unwrap_or_else(|error| panic!("engine: {error}"));
+    let outcome = match engine.resize(target, 0) {
+        Err(error) => json!({
+            "requested": size_value(target),
+            "admitted": false,
+            "code": error.code().as_str(),
+            "message": error.to_string(),
+            // A refused resize leaves the grid where it was, so the size after it is the old one.
+            "size_after": size_value(engine.grid().size()),
+        }),
+        Ok(()) => {
+            let mut resized = admitted_value(&engine, target);
+            if let Some(object) = resized.as_object_mut() {
+                object.insert("size_after".to_owned(), size_value(engine.grid().size()));
+            }
+            resized
+        }
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("resize".to_owned(), outcome);
+    }
+    value
+}
+
+/// Records a geometry that was admitted, with the footprint it reserved.
+fn admitted_value(engine: &Engine, size: GridSize) -> Value {
+    let reserved = engine.budget().reserved();
+    json!({
+        "requested": size_value(size),
+        "admitted": true,
+        "footprint": {
+            "cell_slots": reserved.cell_slots,
+            "cell_content": reserved.cell_content,
+            "row_arrays": reserved.row_arrays,
+            "links": reserved.links,
+            "titles": reserved.titles,
+            "alerts": reserved.alerts,
+            "total": reserved.total(),
+        },
+        "budget": engine.budget().limits().session_bytes,
+    })
+}
+
+fn size_value(size: GridSize) -> Value {
+    json!({
+        "cols": size.cols,
+        "rows": size.rows,
+        "cells": u64::from(size.cols) * u64::from(size.rows),
+    })
+}
+
 /// Records the rows of one buffer.
 fn row_values(rows: &[crate::grid::GridRow]) -> Vec<Value> {
     rows.iter()

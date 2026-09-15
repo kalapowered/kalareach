@@ -421,16 +421,19 @@ impl Engine {
     /// still joins it. This releases that scalar. The session loop calls it when a read returns
     /// nothing, and a snapshot calls it itself, so a quiet stream never leaves a character held.
     ///
-    /// The resident state is measured here too. This is the moment a caller asks what the session
-    /// is holding, and it is the moment the screen is settled, so a figure taken here is the whole
-    /// of what is on it rather than most of it.
+    /// The resident state is measured here too, after the held scalar has been applied. This is
+    /// the moment a caller asks what the session is holding, and it is the moment the screen is
+    /// settled, so a figure taken here is the whole of what is on it rather than most of it.
     pub fn quiesce(&mut self, now_ms: u64) -> FeedOutcome {
-        self.measure_now = true;
         let mut events = core::mem::take(&mut self.scratch);
         events.clear();
         self.lexer.flush_tail(&mut events);
-        let outcome = self.consume(&events, now_ms);
+        let mut outcome = self.consume(&events, now_ms);
         self.scratch = events;
+        self.measured_rows = self.grid.scrollback_rows();
+        self.measure_now = false;
+        self.measure_now_unconditionally(now_ms);
+        outcome.resident_pressure = self.resident_pressure();
         outcome
     }
 

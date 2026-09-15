@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use kr_term::conformance::{
-    BROKER_CASES, BYTE_POLICY_CASES, CLASS_CASES, Case, GridCase, SNAPSHOT_CASES, WIDTH_CASES, hex,
-    summarise, summarise_grid,
+    ADMISSION_CASES, AdmissionCase, BROKER_CASES, BYTE_POLICY_CASES, CLASS_CASES, Case, GridCase,
+    SNAPSHOT_CASES, WIDTH_CASES, hex, summarise, summarise_admission, summarise_grid,
 };
 use kr_term::profile::{CAPABILITIES, DA1_PARAMS, DA2_PARAMS, WITHHELD};
 use kr_term::terminfo;
@@ -25,6 +25,7 @@ fn main() -> ExitCode {
         ("broker.json", broker()),
         ("width.json", width()),
         ("snapshot.json", snapshot()),
+        ("admission.json", admission()),
         ("profile.json", profile()),
         ("terminfo-xterm-256color.json", terminfo_database()),
     ];
@@ -147,6 +148,44 @@ fn snapshot() -> Value {
         "description": "Snapshots taken mid-output and at alternate-screen transitions, with the \
                         hyperlink ranges a reconnection restores as inert metadata.",
         "cases": SNAPSHOT_CASES.iter().map(grid_entry).collect::<Vec<_>>(),
+    })
+}
+
+fn admission_entry(case: &AdmissionCase) -> Value {
+    let mut value = summarise_admission(case);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("id".to_owned(), json!(case.id));
+        object.insert("covers".to_owned(), json!(case.covers));
+    }
+    value
+}
+
+fn admission() -> Value {
+    let limits = kr_term::budget::BudgetLimits::DEFAULT;
+    let grid = kr_term::grid::GridConfig::DEFAULT;
+    json!({
+        "name": "admission",
+        "profile": "kr-vt/1",
+        "description": "Geometry admission against the session budget. A geometry is checked \
+                        against the three dimension constraints first, and then against what both \
+                        screen buffers can hold at that size. The 262,144-cell maximum is a \
+                        dimension bound; the budget decides which of those grids a session can \
+                        actually be given.",
+        "budget": {
+            "session_bytes": limits.session_bytes,
+            "row_cache_bytes": limits.row_cache_bytes,
+            "cell_slot_bytes": kr_term::budget::CELL_OVERHEAD_BYTES,
+            "cell_content_bytes": kr_term::budget::cell_content_bytes(grid.cell_bytes as u64),
+            "cell_text_bytes": grid.cell_bytes,
+            "cell_attribute_bytes": kr_term::grid::CELL_ATTRIBUTE_BYTES,
+            "cell_text_heap_bytes": kr_term::grid::CELL_TEXT_HEAP_BYTES,
+            "row_slot_bytes": kr_term::grid::ROW_SLOT_BYTES,
+            "scrollback_rows": grid.scrollback_rows,
+            "link_envelope_bytes": limits.link_envelope(),
+            "title_bytes": kr_term::title::MAX_RESIDENT_BYTES,
+            "alert_bytes": kr_term::grid::ALERT_LIST_BYTES,
+        },
+        "cases": ADMISSION_CASES.iter().map(admission_entry).collect::<Vec<_>>(),
     })
 }
 

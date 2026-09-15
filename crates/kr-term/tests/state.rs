@@ -104,8 +104,14 @@ fn the_budget_refuses_before_it_allocates() {
     else {
         panic!("a geometry that does not fit is refused as an admission failure: {error}");
     };
-    assert_eq!(cells, 10_000, "the refusal names the cells that were asked for");
-    assert!(footprint > limit, "the refusal names what the cells would cost");
+    assert_eq!(
+        cells, 10_000,
+        "the refusal names the cells that were asked for"
+    );
+    assert!(
+        footprint > limit,
+        "the refusal names what the cells would cost"
+    );
     assert_eq!(
         error.code(),
         kr_protocol::error::ErrorCode::ResourceUnavailable,
@@ -1070,7 +1076,10 @@ fn printing_into_an_admitted_screen_stays_inside_its_reservation() {
             "a measurement found more than the geometry reserved"
         );
     }
-    assert!(engine.budget().usage().screens() > 0, "the cells hold what was printed");
+    assert!(
+        engine.budget().usage().screens() > 0,
+        "the cells hold what was printed"
+    );
     assert!(!engine.budget().session_over_budget());
 }
 
@@ -1672,5 +1681,334 @@ fn an_embedded_control_reaches_a_delta() {
     assert!(
         delta.charsets.is_some(),
         "the character set the control selected travels with the delta"
+    );
+}
+
+// ------------------------------------------------------- admission and the charges it replaces
+
+/// A geometry inside the three dimension constraints that this session cannot hold is refused
+/// before anything is allocated for it, and the two bounds are told apart by the code they carry.
+#[test]
+fn the_dimension_bound_and_the_budget_bound_are_told_apart() {
+    // Every dimension constraint is satisfied: 2,048 columns, 128 rows, and exactly the 262,144
+    // cells section 8 allows. Two buffers of those cells hold far more than the session budget.
+    let refused = Engine::new(EngineConfig {
+        size: GridSize::new(MAX_COLS, MAX_CELLS / MAX_COLS),
+        ..EngineConfig::DEFAULT
+    })
+    .expect_err("the largest grid the dimensions allow does not fit the budget");
+    assert!(matches!(refused, TermError::Admission { cells, .. } if cells == u64::from(MAX_CELLS)));
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::ResourceUnavailable
+    );
+
+    let invalid = Engine::new(EngineConfig {
+        size: GridSize::new(MAX_COLS, MAX_ROWS),
+        ..EngineConfig::DEFAULT
+    })
+    .expect_err("2,048 by 1,024 is outside the cell bound");
+    assert!(matches!(invalid, TermError::Geometry { .. }));
+    assert_eq!(
+        invalid.code(),
+        kr_protocol::error::ErrorCode::InvalidArgument
+    );
+}
+
+/// A resize the session cannot hold leaves the grid, the reservation and the projection alone.
+#[test]
+fn a_resize_that_does_not_fit_changes_nothing() {
+    let mut engine = engine();
+    let before = engine.grid().size();
+    let reserved = engine.budget().reserved();
+    let error = engine
+        .resize(GridSize::new(MAX_COLS, MAX_CELLS / MAX_COLS), 0)
+        .expect_err("the new screens do not fit");
+    assert_eq!(
+        error.code(),
+        kr_protocol::error::ErrorCode::ResourceUnavailable
+    );
+    assert_eq!(engine.grid().size(), before, "the grid is unchanged");
+    assert_eq!(
+        engine.budget().reserved(),
+        reserved,
+        "the reservation is unchanged"
+    );
+}
+
+/// Text arriving for an admitted screen is never refused: every cell can hold what a cell may
+/// hold, in both buffers, and the reservation already paid for it.
+#[test]
+fn text_for_an_admitted_screen_is_never_refused() {
+    let size = GridSize::new(24, 6);
+    let mut engine = Engine::new(EngineConfig {
+        size,
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // The worst case a cell can reach: true colour, so the cell keeps an allocation of its own,
+    // and a cluster long enough to reach the per-cell content bound, so its text is on the heap.
+    let mut cell = String::from("e");
+    for _ in 0..24 {
+        cell.push('\u{301}');
+    }
+    let mut input = String::from("\x1b[38;2;10;20;30m");
+    for _ in 0..(size.cols * size.rows) {
+        input.push_str(&cell);
+    }
+    // Both buffers, because the reservation covers both.
+    for buffer in ["", "\x1b[?1049h"] {
+        engine.feed(buffer.as_bytes(), 0);
+        engine.feed(input.as_bytes(), 0);
+        engine.quiesce(0);
+        assert_eq!(
+            engine.budget().excess(),
+            0,
+            "a full screen measured more than the geometry reserved for it"
+        );
+        assert!(!engine.budget().session_over_budget());
+    }
+    assert!(
+        engine.budget().usage().screens() > 0,
+        "both buffers hold what was printed into them"
+    );
+}
+
+/// A cell whose text is too big to live inside the cell keeps a header on the heap, and the
+/// measurement counts it.
+#[test]
+fn a_cell_with_its_text_on_the_heap_is_charged_for_the_header() {
+    fn content(cell: &str) -> u64 {
+        let mut engine = Engine::new(EngineConfig {
+            size: GridSize::new(4, 2),
+            ..EngineConfig::DEFAULT
+        })
+        .expect("engine");
+        engine.feed(cell.as_bytes(), 0);
+        engine.quiesce(0);
+        engine.grid().buffer_bytes().content[0]
+    }
+
+    // One combining mark keeps the cell's text inside the cell; four take it past a machine word.
+    let inside = "e\u{301}";
+    let on_the_heap = "e\u{301}\u{302}\u{303}\u{304}";
+    assert!(on_the_heap.len() >= size_of::<u64>());
+    let grew = content(on_the_heap) - content(inside);
+    let text = 2 * (on_the_heap.len() - inside.len()) as u64;
+    assert_eq!(
+        grew,
+        text + kr_term::grid::CELL_TEXT_HEAP_BYTES,
+        "the header the text keeps on the heap is counted as well as the bytes"
+    );
+}
+
+/// The array a screen keeps its rows in is reserved with the scrollback slots it can grow to, so
+/// an empty row and the slot it sits in are not free.
+#[test]
+fn the_row_arrays_are_reserved_with_their_scrollback() {
+    let budget = SessionBudget::new();
+    let grid = kr_term::grid::GridConfig::DEFAULT;
+    let footprint = budget.footprint(GridSize::new(80, 24), grid.scrollback_rows, 64);
+    assert_eq!(
+        footprint.row_arrays,
+        (24 + grid.scrollback_rows as u64 + 24) * kr_term::grid::ROW_SLOT_BYTES,
+        "the primary buffer's array holds the screen and the scrollback; the alternate keeps no \
+         history"
+    );
+    let taller = budget.footprint(GridSize::new(80, 48), grid.scrollback_rows, 64);
+    assert!(
+        taller.row_arrays > footprint.row_arrays,
+        "a taller screen has more rows to keep"
+    );
+
+    // A session of empty rows still holds the array they sit in, so it is charged for it.
+    let engine = Engine::new(EngineConfig {
+        size: GridSize::new(80, 24),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    assert!(engine.budget().reserved().row_arrays > 0);
+}
+
+/// A title is applied inside room the geometry already reserved, and the stack is charged for the
+/// room it grew to rather than for the entries left on it.
+#[test]
+fn the_title_stack_is_charged_for_the_room_it_grew_to() {
+    let mut engine = engine();
+    let long = "t".repeat(kr_term::title::MAX_TITLE_BYTES);
+    let mut input = String::new();
+    for _ in 0..kr_term::title::MAX_DEPTH {
+        input.push_str(&format!("\x1b]0;{long}\x07\x1b[22t"));
+    }
+    engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+    let full = engine.budget().usage().titles;
+    assert!(full > 0, "the titles and the stack are resident state");
+    assert!(
+        full <= engine.budget().reserved().titles,
+        "a full stack of the longest titles measured {full} against a reservation of {}",
+        engine.budget().reserved().titles
+    );
+
+    // Popping every entry leaves the array it grew to, so the charge does not fall back to nothing.
+    let mut popping = String::new();
+    for _ in 0..kr_term::title::MAX_DEPTH {
+        popping.push_str("\x1b[23t");
+    }
+    engine.feed(popping.as_bytes(), 0);
+    engine.quiesce(0);
+    assert_eq!(engine.budget().excess(), 0);
+    assert!(
+        engine.budget().usage().titles >= kr_term::title::MAX_DEPTH as u64,
+        "the stack still holds the room it grew to"
+    );
+}
+
+/// A resize moves rows between the screen and the history, and the two are charged to different
+/// bounds, so both are measured again where the rows move.
+#[test]
+fn a_resize_moves_the_charges_with_the_rows() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(40, 8),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    for index in 0..64u32 {
+        engine.feed(
+            format!("\x1b[41mrow {index} with some content\r\n").as_bytes(),
+            0,
+        );
+    }
+    engine.quiesce(0);
+    let before = engine.budget().usage().rows;
+    assert!(before > 0, "the rows that scrolled off are in the cache");
+
+    // Fewer rows on the screen means more rows in the history, and the cache is charged for them
+    // at the resize rather than at whichever read comes next.
+    engine.resize(GridSize::new(40, 4), 0).expect("admitted");
+    assert_eq!(
+        engine.budget().usage().rows,
+        engine.grid().history_bytes(),
+        "the cache holds what the rows cost immediately after the resize"
+    );
+    assert!(
+        engine.budget().usage().rows > before,
+        "the rows the screen gave up are charged to the cache"
+    );
+    assert_eq!(engine.budget().excess(), 0);
+
+    // And back the other way: a taller screen takes rows out of the history.
+    let taller = engine.budget().usage().rows;
+    engine.resize(GridSize::new(40, 12), 0).expect("admitted");
+    assert_eq!(
+        engine.budget().usage().rows,
+        engine.grid().history_bytes(),
+        "the cache holds what the rows cost immediately after the resize"
+    );
+    assert!(
+        engine.budget().usage().rows < taller,
+        "the rows the screen took back are no longer the cache's"
+    );
+}
+
+/// A hyperlink the pen alone holds, or one a saved cursor carries, is on no row and is still
+/// resident state.
+#[test]
+fn a_link_no_row_holds_is_measured() {
+    // Opened over an empty screen: the pen holds it and nothing has been printed inside it.
+    let mut pen = engine();
+    pen.feed(b"\x1b]8;;https://example.invalid/pen\x1b\\", 0);
+    pen.quiesce(0);
+    assert!(
+        pen.grid().buffer_bytes().links > 0,
+        "the link the pen is inside is held by the pen"
+    );
+
+    // Saved with the cursor and then closed: no row holds it, and the saved cursor still does.
+    let mut saved = engine();
+    saved.feed(
+        b"\x1b]8;;https://example.invalid/saved\x1b\\\x1b7\x1b]8;;\x1b\\",
+        0,
+    );
+    saved.quiesce(0);
+    assert!(
+        saved.grid().buffer_bytes().links > 0,
+        "the link the saved cursor carries is held by the saved cursor"
+    );
+    assert_eq!(saved.budget().excess(), 0);
+}
+
+/// Eviction lands under the bound in one pass, however unlike the rows are.
+#[test]
+fn eviction_lands_under_the_bound_in_one_pass() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(2_048, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // Rows of wildly different sizes, so a row count worked out from their average would land on
+    // the wrong side of the bound.
+    let mut input = String::new();
+    for index in 0..600u32 {
+        if index.is_multiple_of(8) {
+            input.push_str("\x1b[38;2;10;20;30m");
+            for _ in 0..2_048 {
+                input.push('\u{754c}');
+            }
+        } else {
+            input.push('x');
+        }
+        input.push_str("\r\n");
+    }
+    engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+
+    let limit = engine.budget().limits().row_cache_bytes;
+    assert!(
+        engine.grid().history_bytes() <= limit,
+        "the rows left after one pass cost {} bytes against a {limit}-byte bound",
+        engine.grid().history_bytes()
+    );
+    assert_eq!(engine.budget().usage().rows, engine.grid().history_bytes());
+    assert!(!engine.budget().row_cache_over_budget());
+}
+
+/// The measurement is exact, not an estimate: a screen of identical cells costs what those cells
+/// cost, counted one by one.
+#[test]
+fn a_screen_of_known_cells_measures_what_those_cells_cost() {
+    let size = GridSize::new(4, 2);
+    let mut engine = Engine::new(EngineConfig {
+        size,
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // One cell: an 'e' with four combining marks, in true colour. Nine bytes of text, which is
+    // past a machine word, so the text is on the heap behind a header; and a colour the packed
+    // form on the cell cannot hold, so the cell keeps an allocation for its attributes.
+    let cell = "e\u{301}\u{302}\u{303}\u{304}";
+    assert_eq!(cell.len(), 9);
+    let mut input = String::from("\x1b[38;2;10;20;30m");
+    for _ in 0..(size.cols * size.rows) {
+        input.push_str(cell);
+    }
+    engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+
+    let cells = u64::from(size.cols * size.rows);
+    let expected = cells
+        * (2 * cell.len() as u64
+            + kr_term::grid::CELL_ATTRIBUTE_BYTES
+            + kr_term::grid::CELL_TEXT_HEAP_BYTES);
+    assert_eq!(
+        engine.grid().buffer_bytes().content[0],
+        expected,
+        "the text at twice what it holds, the attribute allocation of every cell, and the header \
+         each cell's text keeps on the heap"
+    );
+    assert_eq!(engine.budget().usage().screen_content[0], expected);
+    assert!(
+        expected <= engine.budget().reserved().cell_content,
+        "a full screen of the most expensive cell there is fits what its geometry reserved"
     );
 }

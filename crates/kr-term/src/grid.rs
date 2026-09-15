@@ -1257,8 +1257,7 @@ impl CanonicalGrid {
             }
         }
         let active = self.content_showing(self.terminal.screen(), &mut seen, &mut links);
-        let inactive =
-            self.content_showing(self.terminal.inactive_screen(), &mut seen, &mut links);
+        let inactive = self.content_showing(self.terminal.inactive_screen(), &mut seen, &mut links);
         let content = if self.alternate_active() {
             [inactive, active]
         } else {
@@ -1440,15 +1439,13 @@ fn link_object_bytes(link: &Hyperlink) -> u64 {
 /// The table keeps its entries in nodes that hold several of them and are allocated whole, so an
 /// entry is charged for the slot it takes, for the room beside it the node is holding empty, and
 /// for the pointer the node above keeps to it.
-pub const LINK_TABLE_ENTRY_BYTES: u64 =
-    (2 * size_of::<String>() + 2 * size_of::<usize>()) as u64;
+pub const LINK_TABLE_ENTRY_BYTES: u64 = (2 * size_of::<String>() + 2 * size_of::<usize>()) as u64;
 
 /// What the first node of the table of distinct hyperlink targets costs.
 ///
 /// A node holds several entries and is allocated whole, so the first target to arrive pays for a
 /// node that is almost all empty.
-pub const LINK_TABLE_NODE_BYTES: u64 =
-    (11 * size_of::<String>() + 4 * size_of::<usize>()) as u64;
+pub const LINK_TABLE_NODE_BYTES: u64 = (11 * size_of::<String>() + 4 * size_of::<usize>()) as u64;
 
 /// What the table of distinct hyperlink targets costs for `target`.
 ///

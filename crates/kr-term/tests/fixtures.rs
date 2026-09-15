@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use kr_term::class::SequenceClass;
 use kr_term::conformance::{
-    BROKER_CASES, BYTE_POLICY_CASES, CLASS_CASES, Case, SNAPSHOT_CASES, WIDTH_CASES, summarise,
-    summarise_grid,
+    ADMISSION_CASES, BROKER_CASES, BYTE_POLICY_CASES, CLASS_CASES, Case, SNAPSHOT_CASES,
+    WIDTH_CASES, summarise, summarise_admission, summarise_grid,
 };
 use serde_json::Value;
 
@@ -94,6 +94,80 @@ fn snapshot_fixture_is_current() {
     let fixture = load("snapshot.json");
     for case in SNAPSHOT_CASES {
         assert_case_matches(find(&fixture, case.id), &summarise_grid(case), case.id);
+    }
+}
+
+#[test]
+fn admission_fixture_is_current() {
+    let fixture = load("admission.json");
+    assert_eq!(
+        cases_of(&fixture).len(),
+        ADMISSION_CASES.len(),
+        "admission.json has a different number of cases than the corpus"
+    );
+    for case in ADMISSION_CASES {
+        assert_case_matches(find(&fixture, case.id), &summarise_admission(case), case.id);
+    }
+}
+
+/// Every admitted geometry fits the budget, every refused one names the bound that refused it, and
+/// the two bounds are told apart: dimensions outside the three constraints are a malformed request,
+/// and a geometry inside them that this session cannot hold is a resource that is not available.
+#[test]
+fn every_admission_case_names_the_bound_that_answered() {
+    let fixture = load("admission.json");
+    let budget = fixture["budget"]["session_bytes"]
+        .as_u64()
+        .expect("the fixture records the budget");
+    for case in cases_of(&fixture) {
+        let id = case["id"].as_str().unwrap_or_default();
+        for step in [Some(case), case.get("resize")].into_iter().flatten() {
+            if step["admitted"] == Value::Bool(true) {
+                let total = step["footprint"]["total"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("case {id} records no footprint"));
+                assert!(
+                    total <= budget,
+                    "case {id} was admitted at {total} bytes against a {budget}-byte budget"
+                );
+                continue;
+            }
+            let code = step["code"].as_str().unwrap_or_default();
+            assert!(
+                code == "RESOURCE_UNAVAILABLE" || code == "INVALID_ARGUMENT",
+                "case {id} was refused as {code}"
+            );
+            let cells = step["requested"]["cells"].as_u64().unwrap_or_default();
+            let dimension_bound = cells > 262_144
+                || step["requested"]["cols"].as_u64().unwrap_or_default() > 2_048
+                || step["requested"]["rows"].as_u64().unwrap_or_default() > 1_024;
+            let expected = if dimension_bound {
+                "INVALID_ARGUMENT"
+            } else {
+                "RESOURCE_UNAVAILABLE"
+            };
+            assert_eq!(code, expected, "case {id} was refused as the wrong kind");
+        }
+    }
+}
+
+/// A refused resize changes nothing: the session keeps the geometry it had.
+#[test]
+fn a_refused_resize_keeps_the_geometry_it_had() {
+    let fixture = load("admission.json");
+    for case in cases_of(&fixture) {
+        let Some(resize) = case.get("resize") else {
+            continue;
+        };
+        if resize["admitted"] == Value::Bool(true) {
+            assert_eq!(resize["size_after"], resize["requested"]);
+            continue;
+        }
+        assert_eq!(
+            resize["size_after"], case["requested"],
+            "case {} kept the wrong geometry after a refused resize",
+            case["id"]
+        );
     }
 }
 
