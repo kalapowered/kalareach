@@ -124,9 +124,9 @@ fn a_clipboard_read_is_answered_empty_without_asking_anyone() {
         outcome.side_effects.is_empty(),
         "the default read consults no client"
     );
-    let replies = engine.lane_mut().drain(LaneGate::default(), 4096);
+    let replies = engine.lane_mut().drain(LaneGate::default(), 4096, 0);
     assert_eq!(replies.len(), 1);
-    assert_eq!(replies[0].bytes, b"\x1b]52;c;\x1b\\");
+    assert_eq!(replies[0].bytes(), b"\x1b]52;c;\x1b\\");
 }
 
 #[test]
@@ -322,13 +322,13 @@ fn win32_input_mode_terminates_at_its_boundary() {
     // And it reports that honestly when asked.
     let replies = windows
         .lane_mut()
-        .drain(kr_term::lane::LaneGate::default(), 4096);
+        .drain(kr_term::lane::LaneGate::default(), 4096, 0);
     assert!(replies.is_empty());
     windows.feed(b"\x1b[?9001$p", 0);
     let replies = windows
         .lane_mut()
-        .drain(kr_term::lane::LaneGate::default(), 4096);
-    assert_eq!(replies[0].bytes, b"\x1b[?9001;1$y");
+        .drain(kr_term::lane::LaneGate::default(), 4096, 0);
+    assert_eq!(replies[0].bytes(), b"\x1b[?9001;1$y");
 }
 
 /// The title stack is the session's own and cannot reach past it.
@@ -390,4 +390,140 @@ fn diagnostics_never_touch_the_output_stream() {
         "the cursor advances by the input only"
     );
     assert_eq!(engine.grid().writer_log().bytes, 0);
+}
+
+// ------------------------------------------- behaviour the review found wrong
+
+/// Title stack operations are the session's own and never reach the outer terminal's stack.
+#[test]
+fn title_stack_operations_are_not_forwarded() {
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    let outcome = engine.feed(b"\x1b]2;inner\x07\x1b[22t\x1b[23t", 0);
+    // The title itself travels, so an attach client can set the outer title under its own policy.
+    assert!(!outcome.forward.is_empty());
+    // The push and the pop do not.
+    let forwarded: u64 = outcome.forward.iter().map(|span| span.len()).sum();
+    assert_eq!(
+        forwarded,
+        b"\x1b]2;inner\x07".len() as u64,
+        "only the OSC 2 sequence is forwarded, not the stack operations"
+    );
+}
+
+/// A title may contain semicolons, and all of it is the title.
+#[test]
+fn a_title_keeps_everything_after_its_selector() {
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.feed(b"\x1b]2;one;two;three\x07", 0);
+    assert_eq!(engine.titles().window(), "one;two;three");
+}
+
+/// A soft reset returns the primary screen and resets the projection with it.
+#[test]
+fn a_soft_reset_returns_the_primary_screen() {
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.feed(b"\x1b[?1049h", 0);
+    assert!(engine.grid().alternate_active());
+    assert!(engine.modes().is_set(kr_term::modes::ModeKind::Dec, 1049));
+
+    let outcome = engine.feed(b"\x1b[!p", 0);
+    assert!(
+        !engine.grid().alternate_active(),
+        "the grid is back on the primary screen"
+    );
+    assert!(
+        !engine.modes().is_set(kr_term::modes::ModeKind::Dec, 1049),
+        "and the tracked mode agrees with it"
+    );
+    assert!(outcome.projection_reset, "a client is told to start again");
+}
+
+/// A combined mode request keeps the modes that are not the backend's business.
+#[test]
+fn a_combined_request_containing_win32_input_keeps_its_other_modes() {
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    let outcome = engine.feed(b"\x1b[?9001;1049h", 0);
+    assert!(
+        engine.grid().alternate_active(),
+        "the alternate-screen half of the request still happened"
+    );
+    assert!(
+        !engine.modes().is_set(kr_term::modes::ModeKind::Dec, 9001),
+        "a Unix backend does not enter win32 input mode"
+    );
+    assert!(
+        outcome.forward.is_empty(),
+        "the request never travels onwards, because it names mode 9001"
+    );
+}
+
+/// The keypad state has one owner, whichever sequence set it.
+#[test]
+fn the_keypad_state_has_one_owner() {
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.feed(b"\x1b=", 0);
+    assert!(engine.modes().keypad_application());
+    assert!(engine.modes().is_set(kr_term::modes::ModeKind::Dec, 66));
+
+    engine.feed(b"\x1b[?66l", 0);
+    assert!(!engine.modes().keypad_application());
+}
+
+/// A parameter no grid could act on is clamped before anything tries.
+#[test]
+fn an_enormous_parameter_is_bounded_before_the_grid_sees_it() {
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    let started = std::time::Instant::now();
+    // Forward tabulation, insert characters and repeat: each one loops per unit in the reducer.
+    engine.feed(b"\x1b[4294967295I\x1b[4294967295@\x1b[4294967295b", 0);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a few bytes of input must not buy unbounded work"
+    );
+}
+
+/// Shell-integration sequences produce untrusted observations rather than authority.
+#[test]
+fn shell_integration_produces_untrusted_observations() {
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    let outcome = engine.feed(
+        b"\x1b]7;file://host/tmp\x1b\\\x1b]133;A\x1b\\\x1b]1337;CurrentDir=/srv\x1b\\",
+        0,
+    );
+    let sources: Vec<kr_term::engine::ObservationSource> = outcome
+        .observations
+        .iter()
+        .map(|observation| observation.source)
+        .collect();
+    assert_eq!(
+        sources,
+        vec![
+            kr_term::engine::ObservationSource::WorkingDirectory,
+            kr_term::engine::ObservationSource::PromptBoundary,
+            kr_term::engine::ObservationSource::TerminalMetadata,
+        ]
+    );
+    assert_eq!(outcome.observations[0].value, "file://host/tmp");
+}
+
+/// The session's hyperlink table is bounded, and passing the bound is visible.
+#[test]
+fn the_hyperlink_table_is_bounded() {
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    let limit = engine.budget().limits().unique_links;
+    let mut input = Vec::new();
+    for index in 0..limit + 16 {
+        input.extend_from_slice(
+            format!("\x1b]8;;https://example.invalid/{index}\x1b\\x\x1b]8;;\x1b\\").as_bytes(),
+        );
+    }
+    let outcome = engine.feed(&input, 0);
+    assert!(
+        outcome
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::ResidentStateTruncated),
+        "passing the bound is reported out of band"
+    );
+    assert!(engine.budget().truncations() > 0);
 }

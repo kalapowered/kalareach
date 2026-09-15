@@ -13,12 +13,12 @@
 //! they agree by construction about where every sequence begins and ends.
 
 use vtparse::CsiParam as VtCsiParam;
-use wezterm_escape_parser::csi::CSI;
+use wezterm_escape_parser::csi::{CSI, DecPrivateMode, Mode, TerminalMode};
 use wezterm_escape_parser::esc::Esc;
 use wezterm_escape_parser::osc::OperatingSystemCommand;
 use wezterm_escape_parser::{Action, ControlCode};
 
-use crate::classify::CsiView;
+use crate::classify::{CsiView, MAX_CSI_PARAM};
 use crate::event::{CsiParam, Event, EventKind};
 
 /// The result of adapting one event.
@@ -71,6 +71,7 @@ pub fn adapt(event: &Event) -> Adapted {
         EventKind::Esc {
             intermediate,
             final_byte,
+            ..
         } => {
             let esc = Esc::parse(*intermediate, *final_byte);
             let unrecognised = matches!(esc, Esc::Unspecified { .. });
@@ -85,20 +86,28 @@ pub fn adapt(event: &Event) -> Adapted {
             final_byte,
         } => {
             let vt: Vec<VtCsiParam> = params.iter().copied().map(to_vt).collect();
-            let actions: Vec<Action> = CSI::parse(&vt, *truncated, char::from(*final_byte))
+            let parsed: Vec<Action> = CSI::parse(&vt, *truncated, char::from(*final_byte))
                 .map(Action::CSI)
                 .collect();
-            let unrecognised = actions.is_empty()
-                || actions
-                    .iter()
-                    .any(|action| matches!(action, Action::CSI(CSI::Unspecified(_))));
+            let empty = parsed.is_empty();
+            // A mode the profile owns is dropped rather than handed on. The engine tracks it, and
+            // the grid has nothing to do with it.
+            let actions: Vec<Action> = parsed
+                .into_iter()
+                .filter(|action| !is_profile_owned_mode(action))
+                .collect();
+            let unrecognised = empty || actions.iter().any(action_is_unrecognised);
             Adapted {
                 actions,
                 unrecognised,
             }
         }
         EventKind::Osc { parts, .. } => {
-            let borrowed: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            // The payload is rendered, so it is sanitised before the grid sees it: invalid UTF-8
+            // becomes U+FFFD and a control scalar is dropped. The original bytes are still never
+            // forwarded, because a terminal would frame them differently than this engine did.
+            let sanitised: Vec<Vec<u8>> = parts.iter().map(|part| sanitise(part)).collect();
+            let borrowed: Vec<&[u8]> = sanitised.iter().map(Vec::as_slice).collect();
             let osc = OperatingSystemCommand::parse(&borrowed);
             let unrecognised = matches!(osc, OperatingSystemCommand::Unspecified(_));
             Adapted {
@@ -114,6 +123,15 @@ pub fn adapt(event: &Event) -> Adapted {
         | EventKind::CsiIgnored { .. } => Adapted::default(),
     }
 }
+
+/// DEC private modes the profile owns rather than the canonical grid.
+///
+/// Each of these changes what a keyboard or mouse encoder produces and nothing about the screen:
+/// 66 is the numeric keypad mode, 67 decides what the backarrow key sends, 1007 decides whether
+/// wheel events become arrow keys on the alternate screen, and 1034 decides whether a meta key
+/// sends an escape prefix. The profile advertises them, tracks them and hands them to the input
+/// encoders, which is what section 8 asks for, so the grid library is not expected to know them.
+pub const PROFILE_OWNED_DEC_MODES: &[u16] = &[66, 67, 1007, 1034];
 
 /// Whether the profile owns this sequence outright, so the grid library is not expected to know it.
 ///
@@ -135,9 +153,71 @@ fn profile_owned(kind: &EventKind) -> bool {
     }
 }
 
+/// Makes a control-string payload safe to render.
+///
+/// Invalid UTF-8 becomes U+FFFD, which is what the byte policy says malformed text renders as, and
+/// a control scalar is dropped rather than painted. A payload that needed sanitising is one whose
+/// original bytes are never forwarded, so the two halves cannot diverge.
+fn sanitise(part: &[u8]) -> Vec<u8> {
+    if crate::event::bytes_are_direct_safe(part) {
+        return part.to_vec();
+    }
+    String::from_utf8_lossy(part)
+        .chars()
+        .filter(|scalar| !scalar.is_control() && !('\u{80}'..='\u{9f}').contains(scalar))
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// Whether an action is a set or reset of a mode the profile owns.
+fn is_profile_owned_mode(action: &Action) -> bool {
+    let Action::CSI(CSI::Mode(mode)) = action else {
+        return false;
+    };
+    let (Mode::SetDecPrivateMode(value) | Mode::ResetDecPrivateMode(value)) = mode else {
+        return false;
+    };
+    match value {
+        DecPrivateMode::Unspecified(code) => PROFILE_OWNED_DEC_MODES.contains(code),
+        DecPrivateMode::Code(_) => false,
+    }
+}
+
+/// Whether the grid library failed to understand an action, at any nesting.
+///
+/// Checking only the outer action would miss a recognised container holding an unspecified value,
+/// which is exactly how an unsupported mode reaches the reducer looking like a supported one.
+fn action_is_unrecognised(action: &Action) -> bool {
+    match action {
+        Action::CSI(CSI::Unspecified(_)) => true,
+        Action::CSI(CSI::Mode(mode)) => match mode {
+            Mode::SetDecPrivateMode(value)
+            | Mode::ResetDecPrivateMode(value)
+            | Mode::SaveDecPrivateMode(value)
+            | Mode::RestoreDecPrivateMode(value)
+            | Mode::QueryDecPrivateMode(value) => {
+                matches!(value, DecPrivateMode::Unspecified(_))
+            }
+            Mode::SetMode(value) | Mode::ResetMode(value) | Mode::QueryMode(value) => {
+                matches!(value, TerminalMode::Unspecified(_))
+            }
+            Mode::XtermKeyMode { .. } => false,
+        },
+        Action::Esc(Esc::Unspecified { .. }) => true,
+        Action::OperatingSystemCommand(osc) => {
+            matches!(**osc, OperatingSystemCommand::Unspecified(_))
+        }
+        _ => false,
+    }
+}
+
+/// Clamps a parameter to the largest value the canonical grid can act on.
+///
+/// The reducer loops once per unit for repeats, tabs and insertions, so an unclamped parameter
+/// turns five bytes of input into hours of work.
 fn to_vt(param: CsiParam) -> VtCsiParam {
     match param {
-        CsiParam::Integer(value) => VtCsiParam::Integer(value),
+        CsiParam::Integer(value) => VtCsiParam::Integer(value.clamp(0, MAX_CSI_PARAM)),
         CsiParam::Punct(byte) => VtCsiParam::P(byte),
     }
 }

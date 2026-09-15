@@ -225,6 +225,51 @@
           "text": ""
         }
       ]
+    },
+    {
+      "active_buffer": "Primary",
+      "at_ground": true,
+      "cols": 12,
+      "covers": "KR-REQ-08.18 DECSTR returns the primary screen",
+      "cursor": {
+        "col": 3,
+        "row": 0,
+        "visible": true
+      },
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "hyperlinks": [],
+      "id": "soft_reset_from_alternate",
+      "input": "7072696d6172790d0a1b5b3f3130343968616c741b5b2170",
+      "output_cursor": 24,
+      "projection_generation": 3,
+      "rows": 4,
+      "screen": [
+        {
+          "cells": 7,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": "primary"
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 3,
+          "text": ""
+        }
+      ]
     }
   ],
   "description": "Snapshots taken mid-output and at alternate-screen transitions, with the hyperlink ranges a reconnection restores as inert metadata.",

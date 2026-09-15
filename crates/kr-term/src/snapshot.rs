@@ -38,7 +38,12 @@ pub struct CursorState {
     /// The DECSCUSR style number.
     pub style: u32,
     /// Whether the next printable character wraps before it is placed.
-    pub pending_wrap: bool,
+    ///
+    /// `None` means the pinned grid library does not expose it. See the narrow patch recorded in
+    /// [`crate::unicode::LIBRARY`]: until it lands, a reconnecting client re-derives the pending
+    /// wrap from the next character it places, which costs that character's position and nothing
+    /// else.
+    pub pending_wrap: Option<bool>,
 }
 
 /// A saved cursor, from DECSC or the alternate-buffer switch.
@@ -50,6 +55,22 @@ pub struct SavedCursor {
     pub col: u32,
     /// Zero-based row.
     pub row: u32,
+    /// Whether the saved cursor had a pending wrap.
+    pub pending_wrap: bool,
+}
+
+/// The keyboard negotiation a reconnecting client has to be put back into.
+///
+/// An input encoder that does not know which protocol is active sends bytes the application does
+/// not accept, which is exactly the failure `input.acquire` exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardSnapshot {
+    /// The `modifyOtherKeys` level.
+    pub modify_other_keys: u8,
+    /// The active Kitty keyboard flags, when the protocol is in use.
+    pub kitty_flags: Option<u8>,
+    /// The Kitty keyboard flag stack, oldest first.
+    pub kitty_stack: Vec<u8>,
 }
 
 /// The scroll region.
@@ -113,6 +134,16 @@ pub struct PaletteSnapshot {
     pub foreground: Rgb,
     /// The default background.
     pub background: Rgb,
+    /// The cursor colour.
+    pub cursor: Rgb,
+    /// The mouse pointer foreground.
+    pub pointer_foreground: Rgb,
+    /// The mouse pointer background.
+    pub pointer_background: Rgb,
+    /// The selection background.
+    pub selection_background: Rgb,
+    /// The selection foreground.
+    pub selection_foreground: Rgb,
     /// The indexed colours that differ from the profile default, by index.
     pub overrides: Vec<(u8, Rgb)>,
 }
@@ -145,8 +176,11 @@ pub struct Snapshot {
     pub viewport: Viewport,
     /// The cursor.
     pub cursor: CursorState,
-    /// Saved cursors.
-    pub saved_cursors: Vec<SavedCursor>,
+    /// The saved cursor of the active buffer.
+    ///
+    /// `None` means the pinned grid library does not expose it; see the narrow patch recorded in
+    /// [`crate::unicode::LIBRARY`].
+    pub saved_cursor: Option<SavedCursor>,
     /// The scroll region.
     pub margins: Margins,
     /// The current graphic rendition.
@@ -159,6 +193,8 @@ pub struct Snapshot {
     pub modes: Vec<ModeEntry>,
     /// Whether the keypad is in application mode.
     pub keypad_application: bool,
+    /// The keyboard protocol an input encoder has to reproduce.
+    pub keyboard: KeyboardSnapshot,
     /// The current titles.
     pub title: TitleEntry,
     /// The virtual title stack, oldest first.
@@ -191,10 +227,14 @@ pub struct Delta {
     pub rows: Vec<GridRow>,
     /// The cursor after the update.
     pub cursor: CursorState,
-    /// Modes that changed.
+    /// Modes that changed since the base.
     pub modes: Vec<ModeEntry>,
-    /// The titles, when they changed.
+    /// The titles, when they changed since the base.
     pub title: Option<TitleEntry>,
+    /// The palette, when it changed since the base.
+    pub palette: Option<PaletteSnapshot>,
+    /// The canonical dimensions, when they changed since the base.
+    pub dimensions: Option<GridSize>,
 }
 
 impl Delta {
@@ -264,6 +304,11 @@ pub enum RestoreOp {
     SetKeypad {
         /// Whether application mode is on.
         application: bool,
+    },
+    /// Set the keyboard protocol an input encoder must produce.
+    SetKeyboard {
+        /// The negotiated state.
+        keyboard: KeyboardSnapshot,
     },
     /// Set the tab stops.
     SetTabStops {
@@ -341,6 +386,9 @@ pub fn restoration_operations(snapshot: &Snapshot) -> Vec<RestoreOp> {
     ops.push(RestoreOp::SetKeypad {
         application: snapshot.keypad_application,
     });
+    ops.push(RestoreOp::SetKeyboard {
+        keyboard: snapshot.keyboard.clone(),
+    });
     ops.push(RestoreOp::SetTabStops {
         columns: snapshot.tab_stops.clone(),
     });
@@ -365,8 +413,8 @@ pub fn restoration_operations(snapshot: &Snapshot) -> Vec<RestoreOp> {
     ops.push(RestoreOp::SetRendition {
         rendition: snapshot.rendition,
     });
-    for cursor in &snapshot.saved_cursors {
-        ops.push(RestoreOp::SetSavedCursor { cursor: *cursor });
+    if let Some(cursor) = snapshot.saved_cursor {
+        ops.push(RestoreOp::SetSavedCursor { cursor });
     }
     ops.push(RestoreOp::SetCursor {
         cursor: snapshot.cursor,

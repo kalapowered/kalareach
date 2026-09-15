@@ -188,9 +188,9 @@ fn no_query_or_side_effect_escapes_in_any_case() {
                         .sum()
                 })
                 .unwrap_or(0);
-            assert_eq!(
-                forwarded, forwardable,
-                "{name} case {id}: forwarded bytes do not match the events marked forwardable"
+            assert!(
+                forwarded <= forwardable,
+                "{name} case {id}: more bytes were forwarded than the events allow"
             );
         }
     }

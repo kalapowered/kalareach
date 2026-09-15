@@ -16,6 +16,7 @@
 //! * The Unicode model is pinned rather than defaulted, so the width of a cell is a property of
 //!   the profile and not of whatever the library's default happened to be that month.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use wezterm_term::color::ColorPalette;
@@ -85,9 +86,16 @@ pub enum GridAlert {
     Unexpected(String),
 }
 
+/// How many alerts are held before the oldest is dropped.
+///
+/// Alerts are a diagnostic channel. A program that changes its title in a loop must not be able to
+/// grow this list, so the newest ones win and the drops are counted.
+const MAX_ALERTS: usize = 256;
+
 #[derive(Debug, Default)]
 struct AlertCollector {
     alerts: Arc<Mutex<Vec<GridAlert>>>,
+    dropped: Arc<AtomicUsize>,
 }
 
 impl AlertHandler for AlertCollector {
@@ -102,6 +110,10 @@ impl AlertHandler for AlertCollector {
             other => GridAlert::Unexpected(format!("{other:?}")),
         };
         if let Ok(mut alerts) = self.alerts.lock() {
+            if alerts.len() >= MAX_ALERTS {
+                alerts.remove(0);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
             alerts.push(record);
         }
     }
@@ -130,12 +142,23 @@ impl Default for GridConfig {
     }
 }
 
+/// The configuration the grid library reads, with the parts that change at runtime.
+///
+/// The scrollback size is one of those. Section 8 bounds the historical row cache in bytes, and the
+/// library bounds it in rows, so the engine converts: when the retained rows pass the byte bound it
+/// lowers the row count here and bumps the generation, and the library evicts on its next append.
 #[derive(Debug)]
 struct KrVtConfiguration {
     config: GridConfig,
+    scrollback_rows: AtomicUsize,
+    generation: AtomicUsize,
 }
 
 impl TerminalConfiguration for KrVtConfiguration {
+    fn generation(&self) -> usize {
+        self.generation.load(Ordering::Relaxed)
+    }
+
     fn color_palette(&self) -> ColorPalette {
         // The canonical palette lives in the engine, because a query must be answered from session
         // state rather than from the grid's rendering defaults.
@@ -143,7 +166,7 @@ impl TerminalConfiguration for KrVtConfiguration {
     }
 
     fn scrollback_size(&self) -> usize {
-        self.config.scrollback_rows
+        self.scrollback_rows.load(Ordering::Relaxed)
     }
 
     fn unicode_version(&self) -> UnicodeVersion {
@@ -273,6 +296,8 @@ pub struct CanonicalGrid {
     terminal: Terminal,
     writer_log: Arc<Mutex<WriterLog>>,
     alerts: Arc<Mutex<Vec<GridAlert>>>,
+    alerts_dropped: Arc<AtomicUsize>,
+    configuration: Arc<KrVtConfiguration>,
     size: GridSize,
     config: GridConfig,
     unrecognised: u64,
@@ -300,9 +325,15 @@ impl CanonicalGrid {
         let cost = budget.check_geometry(size)?;
         let writer_log = Arc::new(Mutex::new(WriterLog::default()));
         let alerts = Arc::new(Mutex::new(Vec::new()));
+        let alerts_dropped = Arc::new(AtomicUsize::new(0));
+        let configuration = Arc::new(KrVtConfiguration {
+            config,
+            scrollback_rows: AtomicUsize::new(config.scrollback_rows),
+            generation: AtomicUsize::new(1),
+        });
         let mut terminal = Terminal::new(
             to_library_size(size),
-            Arc::new(KrVtConfiguration { config }),
+            Arc::clone(&configuration) as Arc<dyn TerminalConfiguration + Send + Sync>,
             crate::profile::PROFILE_NAME,
             &crate::profile::PROFILE_REVISION.to_string(),
             Box::new(SilentWriter {
@@ -311,12 +342,15 @@ impl CanonicalGrid {
         );
         terminal.set_notification_handler(Box::new(AlertCollector {
             alerts: Arc::clone(&alerts),
+            dropped: Arc::clone(&alerts_dropped),
         }));
         budget.commit_geometry(cost);
         Ok(Self {
             terminal,
             writer_log,
             alerts,
+            alerts_dropped,
+            configuration,
             size,
             config,
             unrecognised: 0,
@@ -327,10 +361,15 @@ impl CanonicalGrid {
     ///
     /// An event of any class other than `D` or `M` produces no actions, so the reducer cannot apply
     /// a sequence the policy layer rejected even if it is handed one.
+    ///
+    /// An event the library does not recognise is not applied either. A half-understood sequence is
+    /// worse than a consumed one: the canonical grid would do something the physical terminal on
+    /// the other side would not, or the other way round.
     pub fn apply(&mut self, event: &Event) -> Adapted {
         let adapted = adapt(event);
         if adapted.unrecognised {
             self.unrecognised = self.unrecognised.saturating_add(1);
+            return adapted;
         }
         if !adapted.actions.is_empty() {
             self.terminal.perform_actions(adapted.actions.clone());
@@ -364,6 +403,65 @@ impl CanonicalGrid {
             .unwrap_or_default()
     }
 
+    /// How many alerts were dropped because the bounded list was full.
+    #[must_use]
+    pub fn alerts_dropped(&self) -> usize {
+        self.alerts_dropped.load(Ordering::Relaxed)
+    }
+
+    /// The library's change counter, which a delta uses as its base.
+    #[must_use]
+    pub fn sequence_number(&self) -> usize {
+        self.terminal.current_seqno()
+    }
+
+    /// The stable identifiers of visible rows that changed since `seqno`.
+    #[must_use]
+    pub fn changed_rows_since(&self, seqno: usize) -> Vec<i64> {
+        let (oldest, newest) = self.stable_range();
+        let top = newest.saturating_sub(i64::from(self.size.rows)).max(oldest);
+        let range = isize::try_from(top).unwrap_or(0)..isize::try_from(newest).unwrap_or(0);
+        self.terminal
+            .screen()
+            .get_changed_stable_rows(range, seqno)
+            .into_iter()
+            .map(|row| i64::try_from(row).unwrap_or(0))
+            .collect()
+    }
+
+    /// The current graphic rendition.
+    #[must_use]
+    pub fn pen(&self) -> Rendition {
+        rendition_of(&self.terminal.pen())
+    }
+
+    /// Lowers the scrollback row count so the retained rows fit the byte bound.
+    ///
+    /// Returns whether the bound bound. The library evicts as it appends, so this converges over
+    /// the next few rows rather than dropping everything at once.
+    pub fn enforce_row_cache(&mut self, bytes: u64, limit: u64) -> bool {
+        if bytes <= limit {
+            return false;
+        }
+        let rows = self.terminal.screen().scrollback_rows().max(1);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the quotient of two byte counts times a row count stays inside usize here"
+        )]
+        let target = ((rows as u64).saturating_mul(limit) / bytes.max(1)) as usize;
+        let current = self.configuration.scrollback_rows.load(Ordering::Relaxed);
+        let next = target.max(self.size.rows as usize).min(current);
+        if next < current {
+            self.configuration
+                .scrollback_rows
+                .store(next, Ordering::Relaxed);
+            self.configuration
+                .generation
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }
+
     /// The current size.
     #[must_use]
     pub const fn size(&self) -> GridSize {
@@ -390,6 +488,12 @@ impl CanonicalGrid {
     #[must_use]
     pub fn alternate_active(&self) -> bool {
         self.terminal.is_alt_screen_active()
+    }
+
+    /// Whether origin mode is on, which makes a cursor report relative to the margins.
+    #[must_use]
+    pub fn origin_mode(&self) -> bool {
+        self.terminal.dec_origin_mode_enabled()
     }
 
     /// The cursor position, zero-based.

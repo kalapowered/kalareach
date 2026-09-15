@@ -17,7 +17,6 @@
   "device_attributes": {
     "primary": [
       62,
-      1,
       22
     ],
     "secondary": [
@@ -28,15 +27,32 @@
     "tertiary_unit_id": "4B520001"
   },
   "grid_library": {
+    "direct_mode_constraints": [
+      "A grapheme cluster takes one cell. A ZWJ emoji sequence occupies two cells even though the profile does not advertise mode 2027, and a terminal without it would draw four. A physical profile qualified for direct mode has to cluster the same way.",
+      "A wide cell may overhang the right margin. Writing a two-cell character in the last column leaves a row one cell wider than the grid and sets the pending wrap, where xterm blanks the last column and wraps the character. A projected renderer clips or safely replaces the overhanging cell."
+    ],
     "notes": [
       "The revision accepts already-parsed actions, so the engine parses once and the library never re-frames a byte. That is what makes a second parse unnecessary rather than merely discouraged.",
       "The width model is configuration, not a fork: generation 9 with narrow ambiguous characters is exactly the pinned kr-vt/1 model.",
       "Grapheme clustering, in-band resize and DECCOLM never reach the library, because the policy layer classifies them before the reducer sees anything. The library's own support for them is therefore not part of the profile.",
       "Raster graphics are disabled in configuration and no image sequence is ever forwarded, so the library's sixel, iTerm2 and Kitty image paths stay unreachable.",
-      "The library is built with a writer that accepts no bytes. Every reply comes from the query broker, and the fixtures fail if the library ever writes one."
+      "The library is built with a writer that accepts no bytes. Every reply comes from the query broker, and the fixtures fail if the library ever writes one.",
+      "A sequence the library marks unspecified, at any nesting, is not applied and not forwarded. The mapping is therefore checked by what the library does with it rather than by whether it parsed.",
+      "The library clusters the text of one call to its action interface, so the engine holds the final scalar of a text run until it knows what follows. Without that, the same bytes would produce different screens depending on where a read happened to split them."
     ],
-    "patch_required": false,
     "repository": "https://github.com/wezterm/wezterm",
+    "required_patch": [
+      {
+        "interim": "the snapshot carries None and a reconnecting client re-derives it from the next character it places",
+        "reason": "section 8 lists pending wrap among the state a snapshot restores",
+        "state": "TerminalState::pending_wrap()"
+      },
+      {
+        "interim": "the snapshot carries None; a restored session behaves as though nothing was saved until the application saves again",
+        "reason": "section 8 lists saved cursors among the state a snapshot restores",
+        "state": "TerminalState::saved_cursor() as a shared reference with public fields"
+      }
+    ],
     "revision": "699fd77b44641c43476c945054cfae6518dbd632"
   },
   "identity": "KalaReach(kr-vt/1)",
@@ -115,6 +131,10 @@
     {
       "feature": "selective-erase",
       "reason": "DECSCA is not implemented, so DA1 does not claim it"
+    },
+    {
+      "feature": "132-column-mode",
+      "reason": "DECCOLM belongs to the geometry owner, so DA1 does not claim it"
     },
     {
       "feature": "title-reporting",

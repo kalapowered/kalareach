@@ -45,7 +45,7 @@ pub(crate) const STRINGS: &[StringCapability] = &[
     StringCapability {
         name: "Cs",
         value: "\x1b]12;%p1%s\x07",
-        expansion: "\x1b]12;2\x07",
+        expansion: "\x1b]12;#123456\x07",
         direction: Direction::Output,
     },
     StringCapability {
@@ -76,12 +76,6 @@ pub(crate) const STRINGS: &[StringCapability] = &[
         name: "Se",
         value: "\x1b[0 q",
         expansion: "\x1b[0 q",
-        direction: Direction::Output,
-    },
-    StringCapability {
-        name: "Setulc",
-        value: "\x1b[58::2::%p1%{65536}%/%d::%p1%{256}%/%{255}%&%d::%p1%{255}%&%d%;m",
-        expansion: "\x1b[58::2::0::255::128m",
         direction: Direction::Output,
     },
     StringCapability {
@@ -1412,7 +1406,7 @@ pub(crate) const STRINGS: &[StringCapability] = &[
     },
     StringCapability {
         name: "u8",
-        value: "\x1b[?62;1;22c",
+        value: "\x1b[?62;22c",
         expansion: "",
         direction: Direction::Report,
     },

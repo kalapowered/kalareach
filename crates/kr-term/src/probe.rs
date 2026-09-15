@@ -40,7 +40,29 @@ pub enum ProbeItem {
     DeviceAttributes,
 }
 
+/// Whether an unanswered question fails the attach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeRequirement {
+    /// The attach fails without this answer.
+    Required,
+    /// Silence is an answer: the terminal does not have the feature.
+    ///
+    /// This is safe only because the terminator comes last. Once primary device attributes arrive,
+    /// every earlier answer has either arrived or is never coming, so an unanswered optional
+    /// question is a fact about the terminal rather than a reply still in flight.
+    Optional,
+}
+
 impl ProbeItem {
+    /// Whether the attach fails without this answer.
+    #[must_use]
+    pub const fn requirement(self) -> ProbeRequirement {
+        match self {
+            Self::DeviceAttributes => ProbeRequirement::Required,
+            _ => ProbeRequirement::Optional,
+        }
+    }
+
     /// The bytes that ask this question.
     #[must_use]
     pub const fn request(self) -> &'static [u8] {
@@ -186,7 +208,7 @@ impl ProbeSession {
     /// # Errors
     ///
     /// Fails when the terminator never arrived, which is the only thing that proves no further
-    /// answer is in flight.
+    /// answer is in flight, and when a required answer is missing.
     pub fn finish(self, now_ms: u64) -> Result<ProbeOutcome> {
         if !self.complete {
             return Err(TermError::ProbeFailed {
@@ -197,8 +219,22 @@ impl ProbeSession {
                 },
             });
         }
+        let missing: Vec<ProbeItem> = PROBE_SET
+            .iter()
+            .copied()
+            .filter(|item| !self.answers.contains_key(item))
+            .collect();
+        if missing
+            .iter()
+            .any(|item| item.requirement() == ProbeRequirement::Required)
+        {
+            return Err(TermError::ProbeFailed {
+                reason: ProbeFailure::NoTerminator,
+            });
+        }
         Ok(ProbeOutcome {
             answers: self.answers,
+            unanswered: missing,
         })
     }
 
@@ -227,6 +263,7 @@ impl ProbeSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeOutcome {
     answers: BTreeMap<ProbeItem, ProbeAnswer>,
+    unanswered: Vec<ProbeItem>,
 }
 
 impl ProbeOutcome {
@@ -240,6 +277,15 @@ impl ProbeOutcome {
     #[must_use]
     pub fn answers(&self) -> &BTreeMap<ProbeItem, ProbeAnswer> {
         &self.answers
+    }
+
+    /// The optional questions the terminal did not answer.
+    ///
+    /// Each one is a feature the saved profile must not claim. Silence here is evidence, because
+    /// the terminator arrived after it.
+    #[must_use]
+    pub fn unanswered(&self) -> &[ProbeItem] {
+        &self.unanswered
     }
 
     /// The session palette this probe supports, when the terminal shared its colours.
@@ -310,7 +356,11 @@ fn interpret(event: &Event) -> Option<(ProbeItem, ProbeAnswer)> {
                         u8::try_from(csi.first_or(0).clamp(0, i64::from(u8::MAX))).unwrap_or(0),
                     ),
                 )),
-                (Some(b'?'), b'p') if csi.intermediates == *b"$" => {
+                // A DECRQM reply is DECRPM: `CSI ? mode ; status $ y`.
+                (Some(b'?'), b'y') if csi.intermediates == *b"$" => {
+                    if csi.number(0) != Some(i64::from(crate::classify::MODE_SYNCHRONISED_OUTPUT)) {
+                        return None;
+                    }
                     let status = csi.number(1).unwrap_or(0);
                     Some((
                         ProbeItem::SynchronisedOutput,

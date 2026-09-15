@@ -4,15 +4,26 @@
 //! table in section 8 and the code below can be read side by side. The order of the functions
 //! follows the order of the rows.
 //!
-//! Two rules hold everywhere:
+//! Three rules hold everywhere:
 //!
 //! * A sequence that no row names is `X`. An unknown CSI set/reset/SGR final is not "probably
 //!   harmless"; it is consumed until a profile revision gives it a class.
+//! * Recognising a final byte or an OSC number is not enough. A row covers the *qualified* forms of
+//!   its sequence, so an unsupported parameter, subcommand, resource or flag falls through to `X`
+//!   rather than travelling on inside a sequence that looks familiar.
 //! * A class never depends on who is attached, what the physical terminal is, or what was observed
 //!   earlier in the stream. Routing and policy depend on those; classification does not.
 
 use crate::class::SequenceClass;
 use crate::event::{CsiParam, DirectDisposition, EventKind};
+
+/// The largest value a control-sequence parameter may carry into the canonical grid.
+///
+/// A parameter is a repeat count, a column, a row or a tab stop, and the grid is at most 2,048 by
+/// 1,024. A larger value cannot mean more work that anyone wants done, but a reducer that loops
+/// once per unit would happily try: `CSI 4294967295 I` is five bytes of input and billions of
+/// iterations of work. Clamping bounds that before anything reaches the grid.
+pub const MAX_CSI_PARAM: i64 = 65_535;
 
 /// The parts of a control sequence the table is written in terms of.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,7 +33,14 @@ pub struct CsiView {
     /// The intermediate bytes, in source order.
     pub intermediates: Vec<u8>,
     /// The numeric parameter slots, `None` where a slot was left empty.
+    ///
+    /// A slot holds the *leading* value of its colon sublist, because that is the one the table is
+    /// written in terms of. [`Self::sub_parameters`] says whether any sublist was present at all.
     pub numbers: Vec<Option<i64>>,
+    /// Whether any slot carried a colon sublist or a misplaced private marker.
+    pub sub_parameters: bool,
+    /// Whether the parser dropped part of the sequence before it could be classified.
+    pub truncated: bool,
     /// The final byte.
     pub final_byte: u8,
 }
@@ -31,6 +49,12 @@ impl CsiView {
     /// Splits a parameter list into the shape the table is written in.
     #[must_use]
     pub fn new(params: &[CsiParam], final_byte: u8) -> Self {
+        Self::with_truncation(params, final_byte, false)
+    }
+
+    /// Splits a parameter list, carrying through whether the parser truncated the sequence.
+    #[must_use]
+    pub fn with_truncation(params: &[CsiParam], final_byte: u8, truncated: bool) -> Self {
         let mut rest = params;
         let mut private = None;
         if let Some(CsiParam::Punct(byte @ 0x3c..=0x3f)) = rest.first() {
@@ -45,19 +69,26 @@ impl CsiView {
         let mut numbers = Vec::new();
         let mut slot: Option<i64> = None;
         let mut slot_open = false;
+        let mut sub_parameters = false;
         for param in rest {
             match param {
                 CsiParam::Integer(value) => {
-                    slot = Some(*value);
+                    // The leading value of a slot is the one the table names. A later value in the
+                    // same slot belongs to a colon sublist and never replaces it.
+                    if slot.is_none() {
+                        slot = Some(*value);
+                    }
                     slot_open = true;
                 }
                 CsiParam::Punct(b';') => {
                     numbers.push(slot.take());
                     slot_open = false;
                 }
-                // A colon sublist belongs to the slot it qualifies; only the leading value matters
-                // to classification.
-                CsiParam::Punct(_) => {}
+                // A colon sublist, or a private marker somewhere other than the front.
+                CsiParam::Punct(_) => {
+                    sub_parameters = true;
+                    slot_open = true;
+                }
             }
         }
         if slot_open || !numbers.is_empty() {
@@ -67,6 +98,8 @@ impl CsiView {
             private,
             intermediates,
             numbers,
+            sub_parameters,
+            truncated,
             final_byte,
         }
     }
@@ -81,6 +114,13 @@ impl CsiView {
     #[must_use]
     pub fn first_or(&self, default: i64) -> i64 {
         self.number(0).unwrap_or(default)
+    }
+
+    /// Whether every numeric slot is present and inside `range`.
+    fn all_numbers_in(&self, range: core::ops::RangeInclusive<i64>) -> bool {
+        self.numbers
+            .iter()
+            .all(|slot| slot.is_none_or(|value| range.contains(&value)))
     }
 }
 
@@ -105,6 +145,11 @@ pub const MODE_INBAND_RESIZE: u16 = 2048;
 pub const MODE_WIN32_INPUT: u16 = 9001;
 /// DEC mode 3, DECCOLM. Geometry belongs to the size owner, so a set or reset is `X`.
 pub const MODE_DECCOLM: u16 = 3;
+/// DEC mode 2026, synchronised output, which the profile advertises and a probe asks about.
+pub const MODE_SYNCHRONISED_OUTPUT: u16 = 2026;
+
+/// The `modifyOtherKeys` resource kr-vt/1 qualifies. xterm defines several; only this one is input.
+pub const MODIFY_OTHER_KEYS_RESOURCE: i64 = 4;
 
 /// Assigns the normative class of one lexed sequence.
 #[must_use]
@@ -117,11 +162,20 @@ pub fn classify(kind: &EventKind) -> SequenceClass {
         EventKind::Control { byte } => classify_control(*byte),
         EventKind::Esc {
             intermediate,
+            extra_intermediates,
             final_byte,
-        } => classify_esc(*intermediate, *final_byte),
+        } => {
+            if *extra_intermediates {
+                SequenceClass::Extension
+            } else {
+                classify_esc(*intermediate, *final_byte)
+            }
+        }
         EventKind::Csi {
-            params, final_byte, ..
-        } => classify_csi(&CsiView::new(params, *final_byte)),
+            params,
+            truncated,
+            final_byte,
+        } => classify_csi(&CsiView::with_truncation(params, *final_byte, *truncated)),
         EventKind::Osc { selector, parts } => classify_osc(*selector, parts),
         EventKind::Dcs {
             params,
@@ -156,8 +210,9 @@ pub fn classify_control(byte: u8) -> SequenceClass {
 #[must_use]
 pub fn classify_esc(intermediate: Option<u8>, final_byte: u8) -> SequenceClass {
     match (intermediate, final_byte) {
-        // DEC character sets: ESC ( ) * + <designator>.
-        (Some(b'(' | b')' | b'*' | b'+'), 0x30..=0x7e) => SequenceClass::Display,
+        // DEC character sets. Only G0 and G1 are designated: the canonical grid implements those
+        // two, and a G2 or G3 designation it would ignore is an extension, not a display change.
+        (Some(b'(' | b')'), 0x30..=0x7e) => SequenceClass::Display,
         // DECALN, the screen alignment pattern.
         (Some(b'#'), b'8') => SequenceClass::Display,
         // ESC % G selects UTF-8, which kr-vt/1 already is. Any other designation would leave the
@@ -165,7 +220,6 @@ pub fn classify_esc(intermediate: Option<u8>, final_byte: u8) -> SequenceClass {
         (Some(b'%'), b'G') => SequenceClass::Mode,
         (None, b'7' | b'8') => SequenceClass::Display,
         (None, b'D' | b'E' | b'M') => SequenceClass::Display,
-        (None, b'N' | b'O' | b'n' | b'o') => SequenceClass::Display,
         // Row 3: HTS, RIS, DECKPAM and DECKPNM.
         (None, b'H') => SequenceClass::Mode,
         (None, b'c') => SequenceClass::Mode,
@@ -179,6 +233,16 @@ pub fn classify_esc(intermediate: Option<u8>, final_byte: u8) -> SequenceClass {
 /// The control-sequence rows of the table.
 #[must_use]
 pub fn classify_csi(csi: &CsiView) -> SequenceClass {
+    // A sequence the parser could not keep whole is not a shorter sequence. The part it dropped
+    // could have carried a mode the profile refuses.
+    if csi.truncated {
+        return SequenceClass::Extension;
+    }
+    // A colon sublist belongs to SGR and nowhere else in this profile. `CSI ? 3 : 7 h` is not a
+    // request to set mode 7.
+    if csi.sub_parameters && csi.final_byte != b'm' {
+        return SequenceClass::Extension;
+    }
     match (csi.private, csi.intermediates.as_slice(), csi.final_byte) {
         // Row: DA1, DA2 and DA3.
         (None, [], b'c') | (Some(b'>' | b'='), [], b'c') => SequenceClass::Query,
@@ -195,11 +259,12 @@ pub fn classify_csi(csi: &CsiView) -> SequenceClass {
         // Row: window manipulation. Geometry reports are Q, the title stack is M, and every
         // physical resize or window request is X.
         (None, [], b't') => window_op_class(csi),
-        // Row: modifyOtherKeys. The `>` spelling sets it, the `?` spelling asks.
-        (Some(b'>'), [], b'm') => SequenceClass::Mode,
+        // Row: modifyOtherKeys. Only resource 4 at level 0, 1 or 2 is qualified input; any other
+        // resource is an xterm setting this profile does not implement.
+        (Some(b'>'), [], b'm') => modify_other_keys_class(csi),
         (Some(b'?'), [], b'm') => SequenceClass::Query,
         // Row: Kitty keyboard negotiation. Push, pop and set are M; the query is Q.
-        (Some(b'>' | b'<' | b'='), [], b'u') => SequenceClass::Mode,
+        (Some(b'>' | b'<' | b'='), [], b'u') => kitty_class(csi),
         (Some(b'?'), [], b'u') => SequenceClass::Query,
         // Row 1: cursor movement, erasure, insertion, deletion, scrolling and SGR.
         (
@@ -220,8 +285,14 @@ pub fn classify_csi(csi: &CsiView) -> SequenceClass {
         }
         // Row 1: saved cursors and margins.
         (None, [], b'r' | b's' | b'u') => SequenceClass::Display,
-        // Row 3: tab stops.
-        (None, [], b'g') => SequenceClass::Mode,
+        // Row 3: tab stops. Only "clear this stop" and "clear every stop" are implemented.
+        (None, [], b'g') => {
+            if matches!(csi.first_or(0), 0 | 3) {
+                SequenceClass::Mode
+            } else {
+                SequenceClass::Extension
+            }
+        }
         // Row 3: DECSTR, the soft reset.
         (None, [b'!'], b'p') => SequenceClass::Mode,
         // Row 1: DECSCUSR.
@@ -271,25 +342,118 @@ fn dec_mode_class(csi: &CsiView) -> SequenceClass {
     SequenceClass::Mode
 }
 
+fn modify_other_keys_class(csi: &CsiView) -> SequenceClass {
+    match csi.numbers.len() {
+        // `CSI > m` resets every resource to its initial value.
+        0 => SequenceClass::Mode,
+        // `CSI > Pp m` resets one resource.
+        1 => {
+            if csi.number(0) == Some(MODIFY_OTHER_KEYS_RESOURCE) {
+                SequenceClass::Mode
+            } else {
+                SequenceClass::Extension
+            }
+        }
+        2 => {
+            let resource = csi.number(0);
+            let level = csi.number(1).unwrap_or(0);
+            if resource == Some(MODIFY_OTHER_KEYS_RESOURCE) && (0..=2).contains(&level) {
+                SequenceClass::Mode
+            } else {
+                SequenceClass::Extension
+            }
+        }
+        _ => SequenceClass::Extension,
+    }
+}
+
+fn kitty_class(csi: &CsiView) -> SequenceClass {
+    let qualified = i64::from(crate::modes::KITTY_QUALIFIED_FLAGS);
+    match csi.private {
+        // Push: one flag set, and only flags the profile advertises. A flag the input encoders
+        // cannot produce must not reach the application or the terminal.
+        Some(b'>') => {
+            if csi.numbers.len() <= 1 && csi.first_or(0) & !qualified == 0 {
+                SequenceClass::Mode
+            } else {
+                SequenceClass::Extension
+            }
+        }
+        // Pop: a count.
+        Some(b'<') => {
+            if csi.numbers.len() <= 1 {
+                SequenceClass::Mode
+            } else {
+                SequenceClass::Extension
+            }
+        }
+        // Set: flags plus the set, or, and mode.
+        Some(b'=') => {
+            let flags_ok = csi.first_or(0) & !qualified == 0;
+            let mode_ok = matches!(csi.number(1).unwrap_or(1), 1..=3);
+            if csi.numbers.len() <= 2 && flags_ok && mode_ok {
+                SequenceClass::Mode
+            } else {
+                SequenceClass::Extension
+            }
+        }
+        _ => SequenceClass::Extension,
+    }
+}
+
 fn window_op_class(csi: &CsiView) -> SequenceClass {
     match csi.first_or(0) {
         // Geometry and window-state reports.
         11 | 13 | 14 | 15 | 16 | 18 | 19 => SequenceClass::Query,
-        // The virtualised title stack.
-        22 | 23 => SequenceClass::Mode,
+        // The virtualised title stack. The second parameter selects which title.
+        22 | 23 => {
+            if csi.numbers.len() <= 2 && csi.all_numbers_in(0..=23) {
+                SequenceClass::Mode
+            } else {
+                SequenceClass::Extension
+            }
+        }
         // Everything else asks for a physical window change, or reports a title.
         _ => SequenceClass::Extension,
     }
 }
 
 /// Whether an OSC 133 subcommand is one of the documented prompt and command boundaries.
-fn osc133_is_documented(sub: &[u8]) -> bool {
-    matches!(sub, b"A" | b"B" | b"C" | b"D" | b"P")
+fn osc133_class(parts: &[Vec<u8>]) -> SequenceClass {
+    let Some(sub) = parts.get(1) else {
+        return SequenceClass::Extension;
+    };
+    match sub.as_slice() {
+        b"A" | b"B" | b"C" | b"D" => SequenceClass::Display,
+        // The property form carries one documented key. An unknown property is an extension.
+        b"P" => match parts.get(2) {
+            Some(property) if property.starts_with(b"Cwd=") => SequenceClass::Display,
+            _ => SequenceClass::Extension,
+        },
+        _ => SequenceClass::Extension,
+    }
 }
 
 /// Whether an OSC 633 subcommand is one of the documented shell-integration boundaries.
-fn osc633_is_documented(sub: &[u8]) -> bool {
-    matches!(sub, b"A" | b"B" | b"C" | b"D" | b"E" | b"P")
+fn osc633_class(parts: &[Vec<u8>]) -> SequenceClass {
+    let Some(sub) = parts.get(1) else {
+        return SequenceClass::Extension;
+    };
+    match sub.as_slice() {
+        b"A" | b"B" | b"C" | b"D" | b"E" => SequenceClass::Display,
+        b"P" => match parts.get(2) {
+            Some(property)
+                if property.starts_with(b"Cwd=")
+                    || property.starts_with(b"IsWindows=")
+                    || property.starts_with(b"Task=")
+                    || property.starts_with(b"ContinuationPrompt=") =>
+            {
+                SequenceClass::Display
+            }
+            _ => SequenceClass::Extension,
+        },
+        _ => SequenceClass::Extension,
+    }
 }
 
 /// Whether an OSC 1337 subcommand is one of the documented metadata keys.
@@ -298,6 +462,39 @@ fn osc1337_is_documented(body: &[u8]) -> bool {
         || body.starts_with(b"CurrentDir=")
         || body.starts_with(b"RemoteHost=")
         || body.starts_with(b"ShellIntegrationVersion=")
+}
+
+/// OSC 9 carries two conventions: a progress report under subcommand `4`, and a notification body
+/// otherwise. Any other numeric subcommand belongs to a convention kr-vt/1 has not qualified.
+fn osc9_class(parts: &[Vec<u8>]) -> SequenceClass {
+    let Some(sub) = parts.get(1) else {
+        return SequenceClass::Extension;
+    };
+    if sub.as_slice() == b"4" {
+        // States 0 to 4: none, determinate, error, indeterminate and paused.
+        let state = parts
+            .get(2)
+            .and_then(|part| core::str::from_utf8(part).ok())
+            .and_then(|text| text.parse::<u8>().ok());
+        return match state {
+            Some(0..=4) | None => SequenceClass::SideEffect,
+            Some(_) => SequenceClass::Extension,
+        };
+    }
+    let numeric = !sub.is_empty() && sub.iter().all(u8::is_ascii_digit);
+    if numeric {
+        SequenceClass::Extension
+    } else {
+        SequenceClass::SideEffect
+    }
+}
+
+/// Whether an OSC colour selector names a colour the canonical palette represents.
+///
+/// The Tektronix colours do not, so asking about one or setting one is an extension rather than a
+/// colour the session owns and could answer for.
+fn osc_colour_is_qualified(selector: u32) -> bool {
+    crate::palette::DynamicColour::from_selector(selector).is_some()
 }
 
 /// The operating-system-command rows of the table.
@@ -310,7 +507,7 @@ pub fn classify_osc(selector: Option<u32>, parts: &[Vec<u8>]) -> SequenceClass {
     match selector {
         // Row: OSC 0, 1 and 2 track the application title.
         0..=2 => SequenceClass::Mode,
-        // Row: the palette. `?` asks, anything else mutates.
+        // Row: the palette. `?` asks, anything else mutates. A request may pair several.
         4 => {
             if has_query {
                 SequenceClass::Query
@@ -341,7 +538,9 @@ pub fn classify_osc(selector: Option<u32>, parts: &[Vec<u8>]) -> SequenceClass {
         }
         // Row: the dynamic colours.
         10..=19 => {
-            if has_query {
+            if !osc_colour_is_qualified(selector) {
+                SequenceClass::Extension
+            } else if has_query {
                 SequenceClass::Query
             } else {
                 SequenceClass::Mode
@@ -350,17 +549,18 @@ pub fn classify_osc(selector: Option<u32>, parts: &[Vec<u8>]) -> SequenceClass {
         // Row: OSC 52 clipboard access.
         52 => SequenceClass::SideEffect,
         // Row: the palette and dynamic-colour resets.
-        104 | 110..=119 => SequenceClass::Mode,
+        104 => SequenceClass::Mode,
+        110..=119 => {
+            if osc_colour_is_qualified(selector - 100) {
+                SequenceClass::Mode
+            } else {
+                SequenceClass::Extension
+            }
+        }
         // Row: OSC 133 shell integration.
-        133 => match parts.get(1) {
-            Some(sub) if osc133_is_documented(sub) => SequenceClass::Display,
-            _ => SequenceClass::Extension,
-        },
+        133 => osc133_class(parts),
         // Row: OSC 633 shell integration.
-        633 => match parts.get(1) {
-            Some(sub) if osc633_is_documented(sub) => SequenceClass::Display,
-            _ => SequenceClass::Extension,
-        },
+        633 => osc633_class(parts),
         // Row: OSC 1337 metadata. File, clipboard, launch and proprietary queries are X.
         1337 => match parts.get(1) {
             Some(body) if osc1337_is_documented(body) => SequenceClass::Display,
@@ -370,66 +570,58 @@ pub fn classify_osc(selector: Option<u32>, parts: &[Vec<u8>]) -> SequenceClass {
     }
 }
 
-/// OSC 9 carries two conventions: a progress report under subcommand `4`, and a notification body
-/// otherwise. Any other numeric subcommand belongs to a convention kr-vt/1 has not qualified.
-fn osc9_class(parts: &[Vec<u8>]) -> SequenceClass {
-    let Some(sub) = parts.get(1) else {
-        return SequenceClass::Extension;
-    };
-    if sub.as_slice() == b"4" {
-        return SequenceClass::SideEffect;
-    }
-    let numeric = !sub.is_empty() && sub.iter().all(u8::is_ascii_digit);
-    if numeric {
-        SequenceClass::Extension
-    } else {
-        SequenceClass::SideEffect
-    }
-}
-
 /// The device-control rows of the table.
 #[must_use]
 pub fn classify_dcs(params: &[CsiParam], intermediates: &[u8], final_byte: u8) -> SequenceClass {
     match (intermediates, final_byte) {
-        // Row: DECRQSS and XTGETTCAP.
-        ([b'$'], b'q') | ([b'+'], b'q') => SequenceClass::Query,
+        // Row: DECRQSS and XTGETTCAP. Neither takes parameters.
+        ([b'$'], b'q') | ([b'+'], b'q') if params.is_empty() => SequenceClass::Query,
         // Row: sixel and every other device-control string, including DECUDK.
-        _ => {
-            let _ = params;
-            SequenceClass::Extension
+        _ => SequenceClass::Extension,
+    }
+}
+
+/// Whether a sequence is one the profile handles itself rather than passing on.
+///
+/// The virtualised title stack is the clearest case. Section 8 requires push and pop to be
+/// virtualised so that they cannot consume the attach client's saved outer title, and forwarding
+/// the raw bytes would do exactly that. The ConPTY win32 input mode is the other: it stops at the
+/// backend that owns it and is never broadcast to a remote client.
+fn stops_here(kind: &EventKind) -> bool {
+    let EventKind::Csi {
+        params,
+        truncated,
+        final_byte,
+    } = kind
+    else {
+        return false;
+    };
+    let csi = CsiView::with_truncation(params, *final_byte, *truncated);
+    match csi.final_byte {
+        b't' => matches!(csi.first_or(0), 22 | 23),
+        b'h' | b'l' => {
+            csi.private == Some(b'?') && csi.numbers.contains(&Some(i64::from(MODE_WIN32_INPUT)))
         }
+        _ => false,
     }
 }
 
 /// What direct mode may do with the original bytes of an event.
 ///
-/// The byte policy has exactly two reasons to withhold bytes from a physical terminal: the engine
-/// answered or consumed the sequence, or the bytes are not valid UTF-8 in a UTF-8 profile.
+/// The byte policy has three reasons to withhold bytes from a physical terminal: the engine
+/// answered or consumed the sequence, the profile handles the sequence itself, or the bytes are not
+/// something a UTF-8 terminal would frame the way this engine framed them.
 #[must_use]
 pub fn disposition(
     kind: &EventKind,
     class: SequenceClass,
-    eight_bit_introducer: bool,
+    needs_projection: bool,
 ) -> DirectDisposition {
-    if !class.reaches_grid() {
+    if !class.reaches_grid() || stops_here(kind) {
         return DirectDisposition::Withhold;
     }
-    if eight_bit_introducer || matches!(kind, EventKind::Replacement { .. }) {
+    if needs_projection || matches!(kind, EventKind::Replacement { .. }) {
         return DirectDisposition::RequireProjection;
-    }
-    // Its own row: the ConPTY win32 input mode is terminated at the boundary that owns it and is
-    // never broadcast to a remote client.
-    if let EventKind::Csi {
-        params, final_byte, ..
-    } = kind
-    {
-        let csi = CsiView::new(params, *final_byte);
-        if csi.private == Some(b'?')
-            && matches!(csi.final_byte, b'h' | b'l')
-            && csi.numbers.contains(&Some(i64::from(MODE_WIN32_INPUT)))
-        {
-            return DirectDisposition::Withhold;
-        }
     }
     DirectDisposition::Forward
 }

@@ -5,7 +5,7 @@
       "diagnostics": [],
       "events": [
         {
-          "bytes": "68656c6c6f",
+          "bytes": "68656c6c",
           "class": "D",
           "disposition": "Forward",
           "eight_bit": false,
@@ -14,6 +14,19 @@
           "passthrough_depth": 0,
           "span": [
             0,
+            4
+          ]
+        },
+        {
+          "bytes": "6f",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            4,
             5
           ]
         }
@@ -21,6 +34,10 @@
       "forward": [
         [
           0,
+          4
+        ],
+        [
+          4,
           5
         ]
       ],
@@ -39,7 +56,7 @@
       "diagnostics": [],
       "events": [
         {
-          "bytes": "e4b8ade69687",
+          "bytes": "e4b8ad",
           "class": "D",
           "disposition": "Forward",
           "eight_bit": false,
@@ -48,6 +65,19 @@
           "passthrough_depth": 0,
           "span": [
             0,
+            3
+          ]
+        },
+        {
+          "bytes": "e69687",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            3,
             6
           ]
         }
@@ -55,6 +85,10 @@
       "forward": [
         [
           0,
+          3
+        ],
+        [
+          3,
           6
         ]
       ],
@@ -1147,7 +1181,7 @@
       "projection_required_at": null,
       "refusals": [],
       "responses": [
-        "1b5b3f36323b313b323263"
+        "1b5b3f36323b323263"
       ],
       "side_effects": []
     },
@@ -1183,7 +1217,7 @@
       "projection_required_at": null,
       "refusals": [],
       "responses": [
-        "1b5b3f36323b313b323263"
+        "1b5b3f36323b323263"
       ],
       "side_effects": []
     },
@@ -1291,7 +1325,7 @@
       "projection_required_at": null,
       "refusals": [],
       "responses": [
-        "1b5b3f36323b313b323263"
+        "1b5b3f36323b323263"
       ],
       "side_effects": []
     },
@@ -2104,7 +2138,7 @@
         {
           "bytes": "1b5b323274",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -2130,7 +2164,7 @@
         {
           "bytes": "1b5b323374",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -2144,7 +2178,11 @@
       "forward": [
         [
           0,
-          26
+          8
+        ],
+        [
+          13,
+          21
         ]
       ],
       "grid_unrecognised": 0,
@@ -2164,7 +2202,7 @@
         {
           "bytes": "1b5b323374",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -2177,7 +2215,7 @@
         {
           "bytes": "1b5b323374",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -2190,7 +2228,7 @@
         {
           "bytes": "1b5b323374",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -2201,12 +2239,7 @@
           ]
         }
       ],
-      "forward": [
-        [
-          0,
-          15
-        ]
-      ],
+      "forward": [],
       "grid_unrecognised": 0,
       "grid_writes": 0,
       "ground_after": true,
@@ -3074,7 +3107,7 @@
       "projection_required_at": null,
       "refusals": [],
       "responses": [
-        "1b50302b723761376137611b5c"
+        "1b50302b723741374137411b5c"
       ],
       "side_effects": []
     },
@@ -3733,7 +3766,20 @@
           ]
         },
         {
-          "bytes": "726564",
+          "bytes": "7265",
+          "class": "D",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": false,
+          "kind": "text",
+          "passthrough_depth": 1,
+          "span": [
+            0,
+            18
+          ]
+        },
+        {
+          "bytes": "64",
           "class": "D",
           "disposition": "RequireProjection",
           "eight_bit": false,
@@ -3753,6 +3799,450 @@
       "id": "tmux_passthrough",
       "input": "1b50746d75783b1b1b5b33316d7265641b5c",
       "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.20 malformed mode parameters",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "physical-window-request"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3f333a3768",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            7
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "dec_mode_colon_sublist",
+      "input": "1b5b3f333a3768",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.26 combined mode request",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3f393030313b3130343968",
+          "class": "M",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            13
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "dec_mode_mixed_with_9001",
+      "input": "1b5b3f393030313b3130343968",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.22 unqualified resource",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3e323b316d",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            7
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "modify_other_keys_unknown_resource",
+      "input": "1b5b3e323b316d",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.22 unqualified flags",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3e313675",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            6
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "kitty_unqualified_flags",
+      "input": "1b5b3e313675",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.18 unsupported TBC variant",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3267",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            4
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "tab_clear_unsupported",
+      "input": "1b5b3267",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.16 unsupported designation",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b2a30",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "esc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            3
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "charset_g2_designation",
+      "input": "1b2a30",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.16 extra intermediates",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b282442",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "esc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            4
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "esc_extra_intermediates",
+      "input": "1b282442",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.27 title payload",
+      "diagnostics": [],
+      "events": [
+        {
+          "bytes": "1b5d323b6f6e653b74776f3b746872656507",
+          "class": "M",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            18
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          18
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "title_with_semicolons",
+      "input": "1b5d323b6f6e653b74776f3b746872656507",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.30 mixed colour request",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5d343b313b236666303030303b323b3f1b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            19
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "palette_mixed_operations",
+      "input": "1b5d343b313b236666303030303b323b3f1b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5d343b323b7267623a303030302f636463642f303030301b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.30 dynamic colour list",
+      "diagnostics": [],
+      "events": [
+        {
+          "bytes": "1b5d31303b233131323233333b233434353536361b5c",
+          "class": "M",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            22
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          22
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "dynamic_colour_list",
+      "input": "1b5d31303b233131323233333b233434353536361b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.30 unqualified colour selector",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5d31353b3f1b5c",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            8
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "tektronix_colour",
+      "input": "1b5d31353b3f1b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.31 unknown subcommand",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5d393b373b781b5c",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            9
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "osc9_unknown_subcommand",
+      "input": "1b5d393b373b781b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.33 unknown property",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5d3133333b503b5365637265743d311b5c",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            18
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "osc133_unknown_property",
+      "input": "1b5d3133333b503b5365637265743d311b5c",
+      "projection_required_at": null,
       "refusals": [],
       "responses": [],
       "side_effects": []

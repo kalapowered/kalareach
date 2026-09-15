@@ -33,6 +33,18 @@ fn classes(events: &[Event]) -> String {
     events.iter().map(|event| event.class.letter()).collect()
 }
 
+/// The text of every text event, concatenated.
+///
+/// A text run ends at the end of a read and holds its last scalar back for a possible combining
+/// mark, so the number of text events depends on where the reads fell. The content does not.
+fn text(events: &[Event]) -> Vec<u8> {
+    events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Text { .. }))
+        .flat_map(|event| event.raw().to_vec())
+        .collect()
+}
+
 fn spans_cover(input: &[u8], events: &[Event]) {
     let mut next = 0u64;
     for event in events {
@@ -110,9 +122,14 @@ fn a_multi_byte_scalar_split_across_reads_is_one_text_event() {
     assert!(!lexer.at_ground(), "the parser is not on ground mid-scalar");
     lexer.feed(b"\xb8", &mut events);
     lexer.feed(b"\xad", &mut events);
+    assert!(
+        events.is_empty(),
+        "the scalar is held back in case a combining mark follows"
+    );
+    assert!(lexer.at_ground(), "a held tail is still a ground boundary");
+    lexer.flush_tail(&mut events);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].raw(), "\u{4e2d}".as_bytes());
-    assert!(lexer.at_ground());
 }
 
 #[test]
@@ -130,15 +147,16 @@ fn ground_is_false_inside_an_incomplete_sequence() {
 #[test]
 fn an_incomplete_scalar_at_closure_becomes_one_replacement() {
     let events = lex(b"ok\xe2\x82");
-    assert_eq!(classes(&events), "DD");
+    assert_eq!(text(&events), b"ok");
+    let last = events.last().expect("an event");
     assert!(matches!(
-        events[1].kind,
+        last.kind,
         EventKind::Replacement {
             cause: ReplacementCause::IncompleteAtClosure,
             count: 1
         }
     ));
-    assert_eq!(events[1].disposition, DirectDisposition::RequireProjection);
+    assert_eq!(last.disposition, DirectDisposition::RequireProjection);
 }
 
 #[test]
@@ -160,9 +178,12 @@ fn an_incomplete_control_string_at_closure_is_discarded() {
 fn a_continuation_byte_inside_a_scalar_is_not_a_control() {
     // U+00DC is 0xC3 0x9C. The second byte is the 8-bit string terminator.
     let events = lex("\u{00dc}ber".as_bytes());
-    assert_eq!(classes(&events), "D");
-    assert_eq!(events[0].raw(), "\u{00dc}ber".as_bytes());
-    assert_eq!(events[0].disposition, DirectDisposition::Forward);
+    assert_eq!(text(&events), "\u{00dc}ber".as_bytes());
+    assert!(
+        events
+            .iter()
+            .all(|event| event.disposition == DirectDisposition::Forward)
+    );
 }
 
 /// The same byte inside a title does not end the string either.
@@ -200,7 +221,7 @@ fn an_encoded_c1_scalar_is_replaced_and_never_executed() {
     ));
     // What follows is ordinary text, not a control sequence.
     assert!(matches!(events[1].kind, EventKind::Text { .. }));
-    assert_eq!(events[1].raw(), b"31m");
+    assert_eq!(text(&events), b"31m");
 }
 
 #[test]
@@ -248,12 +269,14 @@ fn an_oversized_payload_suffix_does_not_execute() {
     input.extend_from_slice(b"\x1b[2J\x1b[31m");
     input.extend_from_slice(b"\x1b\\after");
     let events = lex(&input);
-    assert_eq!(
-        classes(&events),
-        "XD",
+    assert!(matches!(events[0].kind, EventKind::Discarded { .. }));
+    assert!(
+        events[1..]
+            .iter()
+            .all(|event| matches!(event.kind, EventKind::Text { .. })),
         "only the discard and the trailing text should appear"
     );
-    assert_eq!(events[1].raw(), b"after");
+    assert_eq!(text(&events), b"after");
 }
 
 #[test]
@@ -273,22 +296,30 @@ fn osc52_has_its_own_larger_bound() {
 }
 
 #[test]
-fn a_string_with_no_terminator_stops_at_the_resynchronisation_window() {
+fn an_unterminated_oversized_string_never_executes_its_payload() {
     let limits = LexLimits {
         max_control_string: 32,
-        resync_window: 64,
         ..LexLimits::DEFAULT
     };
     let mut lexer = Lexer::with_limits(limits);
     let mut events = Vec::new();
-    let payload: Vec<u8> = std::iter::repeat_n(b'x', 500).collect();
     lexer.feed(b"\x1b]0;", &mut events);
+    // Past the bound the string is discarded in constant memory. A control sequence buried in the
+    // payload is payload, not a sequence: an elapsed byte count does not make a safe boundary, so
+    // the parser never invents one.
+    let mut payload: Vec<u8> = std::iter::repeat_n(b'x', 200).collect();
+    payload.extend_from_slice(b"\x1b[2J\x1b]52;c;c2VjcmV0");
+    payload.extend(std::iter::repeat_n(b'x', 200));
     lexer.feed(&payload, &mut events);
-    assert_eq!(
-        events[0].class,
-        SequenceClass::Extension,
-        "the string gave up inside the window"
+    assert!(
+        events.is_empty(),
+        "the string has not ended, so nothing has been dispatched"
     );
+    assert!(!lexer.at_ground());
+
+    // It ends where the application says it ends, and the payload was payload throughout.
+    lexer.feed(b"\x1b\\after", &mut events);
+    lexer.close(&mut events);
     assert!(matches!(
         events[0].kind,
         EventKind::Discarded {
@@ -296,13 +327,13 @@ fn a_string_with_no_terminator_stops_at_the_resynchronisation_window() {
             ..
         }
     ));
-    // Giving up resynchronises to ground, so what follows is ordinary output rather than more of a
-    // string that was never going to end. The discarded payload is not re-injected.
-    assert!(lexer.at_ground());
+    assert_eq!(events[0].class, SequenceClass::Extension);
+    assert_eq!(text(&events), b"after");
     assert!(
         events[1..]
             .iter()
-            .all(|event| matches!(event.kind, EventKind::Text { .. }))
+            .all(|event| matches!(event.kind, EventKind::Text { .. })),
+        "nothing from the discarded payload was executed"
     );
 }
 
@@ -313,20 +344,24 @@ fn cancel_and_substitute_abort_a_string() {
         input.push(terminator);
         input.extend_from_slice(b"text");
         let events = lex(&input);
-        assert_eq!(classes(&events), "XD");
-        assert_eq!(events[1].raw(), b"text");
+        assert!(matches!(events[0].kind, EventKind::Discarded { .. }));
+        assert_eq!(text(&events), b"text");
     }
 }
 
 #[test]
 fn tmux_passthrough_is_decoded_and_reclassified() {
     let events = lex(b"\x1bPtmux;\x1b\x1b[31mred\x1b\\");
-    assert_eq!(classes(&events), "DD");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.class == SequenceClass::Display)
+    );
     for event in &events {
         assert_eq!(event.passthrough_depth, 1);
         assert_eq!(event.disposition, DirectDisposition::RequireProjection);
     }
-    assert_eq!(events[1].raw(), b"red");
+    assert_eq!(text(&events), b"red");
 }
 
 #[test]
@@ -438,4 +473,175 @@ fn ground_after_marks_a_safe_handoff_point() {
         !lexer.at_ground(),
         "the trailing partial sequence is pending"
     );
+}
+
+// ------------------------------------------------- framing the review found wrong
+
+/// `ESC ESC` is payload only inside a tmux envelope.
+///
+/// A general doubling rule would let a title hide a clipboard write: the engine would frame the
+/// whole thing as one title and forward its bytes, and the terminal on the other side would end
+/// the title at the escape and run the clipboard write.
+#[test]
+fn escape_doubling_outside_tmux_abandons_the_string() {
+    let events = lex(b"\x1b]2;x\x1b\x1b]52;c;c2VjcmV0\x07");
+    assert_eq!(
+        classes(&events),
+        "XXS",
+        "the title is abandoned, twice, then OSC 52 is routed"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.disposition != DirectDisposition::Forward),
+        "nothing here reaches a terminal"
+    );
+}
+
+/// A control-string payload a terminal would frame differently is never forwarded.
+#[test]
+fn a_payload_that_is_not_plain_text_requires_projection() {
+    for input in [
+        &b"\x1b]2;x\x9c\x9b6n\x07"[..],
+        b"\x1b]2;x\x0cy\x07",
+        b"\x1b]2;x\xff\x07",
+    ] {
+        let events = lex(input);
+        assert_eq!(
+            events[0].disposition,
+            DirectDisposition::RequireProjection,
+            "{input:?} must not travel to a terminal"
+        );
+    }
+    // A payload that is plain text still travels.
+    let events = lex("\x1b]2;\u{00dc}ber\x07".as_bytes());
+    assert_eq!(events[0].disposition, DirectDisposition::Forward);
+}
+
+/// An incomplete prelude is bounded: past the retention bound the parser stops keeping bytes.
+#[test]
+fn an_incomplete_prelude_is_bounded() {
+    let limits = LexLimits {
+        max_sequence_bytes: 64,
+        ..LexLimits::DEFAULT
+    };
+    let mut lexer = Lexer::with_limits(limits);
+    let mut events = Vec::new();
+    lexer.feed(b"\x1b[", &mut events);
+    let digits: Vec<u8> = std::iter::repeat_n(b'1', 100_000).collect();
+    lexer.feed(&digits, &mut events);
+    assert!(events.is_empty(), "the sequence has not ended");
+    assert_eq!(
+        lexer.pending_len(),
+        100_002,
+        "the span still covers every byte"
+    );
+    lexer.feed(b"m", &mut events);
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0].raw().len() <= 64,
+        "retained {} bytes, which is past the bound",
+        events[0].raw().len()
+    );
+    assert_eq!(events[0].span.len(), 100_003);
+    assert_eq!(
+        events[0].class,
+        SequenceClass::Extension,
+        "a sequence the parser could not keep whole is an extension"
+    );
+}
+
+/// A control byte inside a prelude is consumed, and the sequence still completes.
+#[test]
+fn an_embedded_control_byte_does_not_abandon_a_sequence() {
+    let events = lex(b"\x1b[5\x00;3H");
+    assert_eq!(classes(&events), "D");
+    let EventKind::Csi { params, .. } = &events[0].kind else {
+        panic!("expected a control sequence");
+    };
+    let numbers: Vec<i64> = params.iter().filter_map(|p| p.integer()).collect();
+    assert_eq!(numbers, vec![5, 3], "the parameters survived the NUL");
+}
+
+/// Escape intermediates do not leak from one sequence into the next.
+#[test]
+fn escape_intermediates_do_not_leak() {
+    let events = lex(b"\x1b(B\x1b)0");
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[0].kind,
+        EventKind::Esc {
+            intermediate: Some(b'('),
+            final_byte: b'B',
+            ..
+        }
+    ));
+    assert!(
+        matches!(
+            events[1].kind,
+            EventKind::Esc {
+                intermediate: Some(b')'),
+                final_byte: b'0',
+                ..
+            }
+        ),
+        "the second designation is G1, not another G0: {:?}",
+        events[1].kind
+    );
+}
+
+/// A colon sublist is SGR and nowhere else, so it never turns one mode into another.
+#[test]
+fn a_colon_sublist_outside_sgr_is_an_extension() {
+    // The leading value is mode 3, which the profile refuses. Reading the trailing value instead
+    // would turn a refused mode into an approved one.
+    let events = lex(b"\x1b[?3:7h");
+    assert_eq!(classes(&events), "X");
+    // SGR keeps its sublists.
+    let events = lex(b"\x1b[4:3m");
+    assert_eq!(classes(&events), "D");
+}
+
+/// Text is clustered the same way however the reads fall.
+#[test]
+fn clustering_does_not_depend_on_read_boundaries() {
+    fn screen(chunks: &[&[u8]]) -> (u32, String) {
+        let mut engine = kr_term::engine::Engine::new(kr_term::engine::EngineConfig {
+            size: kr_term::budget::GridSize::new(20, 3),
+            ..kr_term::engine::EngineConfig::DEFAULT
+        })
+        .expect("engine");
+        for chunk in chunks {
+            engine.feed(chunk, 0);
+        }
+        engine.quiesce(0);
+        let view = kr_term::snapshot::Viewport {
+            top_row: 0,
+            rows: 3,
+            left_col: 0,
+            cols: 20,
+        };
+        let snapshot = engine.snapshot(view, 0);
+        let text: String = snapshot.rows[0]
+            .runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect();
+        (snapshot.cursor.col, text)
+    }
+
+    for whole in [
+        "e\u{0301}X".as_bytes(),
+        "\u{1f469}\u{200d}\u{1f4bb}X".as_bytes(),
+        "a\u{0308}\u{0323}b".as_bytes(),
+    ] {
+        let together = screen(&[whole]);
+        for split in 1..whole.len() {
+            let apart = screen(&[&whole[..split], &whole[split..]]);
+            assert_eq!(
+                together, apart,
+                "splitting {whole:?} at {split} changed the screen"
+            );
+        }
+    }
 }

@@ -87,14 +87,6 @@
         "D"
       ],
       "direction": "output",
-      "name": "Setulc",
-      "supported": true
-    },
-    {
-      "classes": [
-        "D"
-      ],
-      "direction": "output",
       "name": "Smulx",
       "supported": true
     },
@@ -1654,7 +1646,7 @@
     },
     {
       "direction": "output",
-      "expansion": "1b5d31323b3207",
+      "expansion": "1b5d31323b2331323334353607",
       "name": "Cs",
       "value": "1b5d31323b257031257307"
     },
@@ -1687,12 +1679,6 @@
       "expansion": "1b5b302071",
       "name": "Se",
       "value": "1b5b302071"
-    },
-    {
-      "direction": "output",
-      "expansion": "1b5b35383a3a323a3a303a3a3235353a3a3132386d",
-      "name": "Setulc",
-      "value": "1b5b35383a3a323a3a257031257b36353533367d252f25643a3a257031257b3235367d252f257b3235357d252625643a3a257031257b3235357d25262564253b6d"
     },
     {
       "direction": "output",
@@ -3024,7 +3010,7 @@
       "direction": "report",
       "expansion": "",
       "name": "u8",
-      "value": "1b5b3f36323b313b323263"
+      "value": "1b5b3f36323b323263"
     },
     {
       "direction": "output",

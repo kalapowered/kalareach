@@ -32,7 +32,7 @@
       "projection_required_at": null,
       "refusals": [],
       "responses": [
-        "1b5b3f36323b313b323263"
+        "1b5b3f36323b323263"
       ],
       "side_effects": []
     },
@@ -960,7 +960,7 @@
       "responses": [
         "1b50312b72353434453d373837343635373236443244333233353336363336463643364637321b5c",
         "1b50312b72353436333d33311b5c",
-        "1b50302b72376137611b5c"
+        "1b50302b72374137411b5c"
       ],
       "side_effects": []
     },
@@ -1298,6 +1298,122 @@
       "refusals": [],
       "responses": [
         "1b5d35323b633b1b5c"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-001 KR-REQ-08.21",
+      "diagnostics": [
+        {
+          "at": 15,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b333b313272",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            7
+          ]
+        },
+        {
+          "bytes": "1b5b3f3668",
+          "class": "M",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            7,
+            12
+          ]
+        },
+        {
+          "bytes": "1b5b48",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            12,
+            15
+          ]
+        },
+        {
+          "bytes": "1b5b366e",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            15,
+            19
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          15
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "cpr_under_origin_mode",
+      "input": "1b5b333b3132721b5b3f36681b5b481b5b366e",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b5b313b3152"
+      ],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-REQ-08.35 bounded failure reply",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "query-answered"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b502b713064306134313432343332311b5c",
+          "class": "Q",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "dcs",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            18
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "xtgettcap_unprintable_name",
+      "input": "1b502b713064306134313432343332311b5c",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [
+        "1b50302b721b5c"
       ],
       "side_effects": []
     }

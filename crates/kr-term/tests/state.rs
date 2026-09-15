@@ -114,7 +114,8 @@ fn a_snapshot_carries_the_state_a_reconnection_needs() {
         b"\x1b]2;session\x07\x1b[?1049h\x1b[?2004h\x1b[3;12r\x1b=hello",
         0,
     );
-    let snapshot = engine.snapshot(viewport(&engine));
+    let view = viewport(&engine);
+    let snapshot = engine.snapshot(view, 0);
     assert_eq!(snapshot.active_buffer, ActiveBuffer::Alternate);
     assert_eq!(snapshot.title.window, "session");
     assert!(snapshot.keypad_application);
@@ -143,7 +144,8 @@ fn restoration_never_replays_a_side_effect() {
         b"\x07\x1b]52;c;c2VjcmV0\x1b\\\x1b]9;done\x1b\\\x1b[c\x1b]8;;https://example.invalid/\x1b\\link\x1b]8;;\x1b\\",
         0,
     );
-    let snapshot = engine.snapshot(viewport(&engine));
+    let view = viewport(&engine);
+    let snapshot = engine.snapshot(view, 0);
     let operations = restoration_operations(&snapshot);
     assert!(!operations.is_empty());
     for operation in &operations {
@@ -154,6 +156,7 @@ fn restoration_never_replays_a_side_effect() {
             | RestoreOp::SetPalette { .. }
             | RestoreOp::SetMode { .. }
             | RestoreOp::SetKeypad { .. }
+            | RestoreOp::SetKeyboard { .. }
             | RestoreOp::SetTabStops { .. }
             | RestoreOp::SetCharsets { .. }
             | RestoreOp::SetMargins { .. }
@@ -192,15 +195,38 @@ fn a_buffer_switch_advances_the_projection_generation() {
     assert!(engine.projection_generation() > before);
 }
 
+/// A delta carries what changed since the base the client holds, and refuses a base it has lost.
 #[test]
-fn a_delta_that_does_not_match_the_held_cursor_is_refused() {
+fn a_delta_names_its_base_and_carries_only_what_changed() {
     let mut engine = engine();
-    engine.feed(b"hello", 0);
-    let delta: Delta = engine.delta(engine.output_cursor());
-    assert!(delta.check_base(engine.output_cursor()).is_ok());
-    let error = delta
-        .check_base(engine.output_cursor() - 1)
-        .expect_err("gap");
+    engine.feed(b"first line\r\n", 0);
+    let base = engine.output_cursor();
+
+    // Nothing has changed since the base, so the delta is empty but valid.
+    let delta: Delta = engine.delta(base).expect("the base is inside the window");
+    assert_eq!(delta.base_cursor, base);
+    assert!(delta.rows.is_empty());
+
+    // One more line changes one row, and a mode change travels with it.
+    engine.feed(b"\x1b[?25lsecond", 0);
+    let delta = engine.delta(base).expect("still inside the window");
+    assert!(!delta.rows.is_empty(), "the changed row is carried");
+    assert!(
+        delta
+            .modes
+            .iter()
+            .any(|entry| entry.mode == 25 && !entry.enabled),
+        "the mode change travels with it"
+    );
+    assert_eq!(delta.next_cursor, engine.output_cursor());
+
+    // A base the engine no longer holds is refused.
+    let error = engine.delta(base + 1).expect_err("gap");
+    assert!(matches!(error, TermError::CursorGap { .. }));
+
+    // So is a base from before a projection reset.
+    engine.feed(b"\x1b[?1049h", 0);
+    let error = engine.delta(base).expect_err("the projection was reset");
     assert!(matches!(error, TermError::CursorGap { .. }));
 }
 
@@ -382,13 +408,15 @@ fn the_palette_source_is_recorded_and_survives_a_snapshot() {
         ..EngineConfig::DEFAULT
     })
     .expect("engine");
-    let snapshot = engine.snapshot(viewport(&engine));
+    let view = viewport(&engine);
+    let snapshot = engine.snapshot(view, 0);
     assert_eq!(snapshot.palette.source, PaletteSource::LightPreset);
     engine.adopt_palette(kr_term::palette::Palette::from_client_preference(
         Rgb::new(1, 2, 3),
         Rgb::new(4, 5, 6),
     ));
-    let snapshot = engine.snapshot(viewport(&engine));
+    let view = viewport(&engine);
+    let snapshot = engine.snapshot(view, 0);
     assert_eq!(snapshot.palette.source, PaletteSource::ClientPreference);
     assert_eq!(snapshot.palette.foreground, Rgb::new(1, 2, 3));
 }
@@ -421,12 +449,12 @@ fn the_database_agrees_with_the_responder() {
     engine.feed(b"\x1b[c", 0);
     let replies = engine
         .lane_mut()
-        .drain(kr_term::lane::LaneGate::default(), 4096);
+        .drain(kr_term::lane::LaneGate::default(), 4096, 0);
     let expected = terminfo::strings()
         .iter()
         .find(|cap| cap.name == "u8")
         .expect("u8 is advertised");
-    assert_eq!(replies[0].bytes, expected.value.as_bytes());
+    assert_eq!(replies[0].bytes(), expected.value.as_bytes());
 
     let u9 = terminfo::strings()
         .iter()
@@ -465,4 +493,107 @@ fn hex_round_trips_through_the_capability_encoding() {
     }
     assert_eq!(terminfo::from_hex(b"abc"), None, "odd length is not hex");
     assert_eq!(terminfo::from_hex(b"zz"), None, "non-hex is not hex");
+}
+
+/// A snapshot carries the keyboard negotiation an input encoder has to reproduce.
+#[test]
+fn a_snapshot_carries_the_keyboard_protocol() {
+    let mut engine = engine();
+    engine.feed(b"\x1b[>4;2m\x1b[>1u\x1b[>3u", 0);
+    let view = viewport(&engine);
+    let snapshot = engine.snapshot(view, 0);
+    assert_eq!(snapshot.keyboard.modify_other_keys, 2);
+    assert_eq!(snapshot.keyboard.kitty_flags, Some(3));
+    assert_eq!(
+        snapshot.keyboard.kitty_stack.len(),
+        2,
+        "the flag stack survives with it"
+    );
+    assert!(
+        restoration_operations(&snapshot)
+            .iter()
+            .any(|op| matches!(op, RestoreOp::SetKeyboard { .. }))
+    );
+}
+
+/// A snapshot carries the current rendition rather than a default.
+#[test]
+fn a_snapshot_carries_the_current_rendition() {
+    let mut engine = engine();
+    engine.feed(b"\x1b[1;4;31mtext", 0);
+    let view = viewport(&engine);
+    let snapshot = engine.snapshot(view, 0);
+    assert!(snapshot.rendition.bold);
+    assert_eq!(
+        snapshot.rendition.underline,
+        kr_term::grid::UnderlineStyle::Single
+    );
+    assert_eq!(
+        snapshot.rendition.foreground,
+        kr_term::grid::Colour::Indexed(1)
+    );
+}
+
+/// A snapshot carries every dynamic colour, not only the foreground and background.
+#[test]
+fn a_snapshot_carries_the_whole_palette() {
+    let mut engine = engine();
+    engine.feed(b"\x1b]12;#010203\x1b\\\x1b]17;#040506\x1b\\", 0);
+    let view = viewport(&engine);
+    let snapshot = engine.snapshot(view, 0);
+    assert_eq!(snapshot.palette.cursor, Rgb::new(1, 2, 3));
+    assert_eq!(snapshot.palette.selection_background, Rgb::new(4, 5, 6));
+}
+
+/// A probe that never answers a required question fails the attach.
+#[test]
+fn a_probe_without_its_required_answer_fails() {
+    // Device attributes is the only required answer, and it is also the terminator, so a probe
+    // that finishes without it has already failed on the terminator.
+    let required: Vec<ProbeItem> = PROBE_SET
+        .iter()
+        .copied()
+        .filter(|item| item.requirement() == kr_term::probe::ProbeRequirement::Required)
+        .collect();
+    assert_eq!(required, vec![ProbeItem::DeviceAttributes]);
+
+    // A terminal that answers nothing else still completes, because the terminator proves the
+    // silence was an answer.
+    let (mut session, _) = ProbeSession::start(0, InputContext::Clean).expect("clean stream");
+    session.observe(b"\x1b[?62;22c", 10).expect("terminator");
+    let outcome = session.finish(20).expect("complete");
+    assert!(
+        outcome.unanswered().contains(&ProbeItem::Version),
+        "the unanswered questions are named, so the profile does not claim them"
+    );
+    assert!(outcome.adopt_palette().is_none());
+}
+
+/// The synchronised-output probe reads a real DECRPM reply.
+#[test]
+fn the_probe_reads_a_mode_report_in_its_real_form() {
+    let (mut session, _) = ProbeSession::start(0, InputContext::Clean).expect("clean stream");
+    session
+        .observe(b"\x1b[?2026;2$y\x1b[?62;22c", 10)
+        .expect("answers");
+    let outcome = session.finish(20).expect("complete");
+    assert_eq!(
+        outcome.answer(ProbeItem::SynchronisedOutput),
+        Some(&kr_term::probe::ProbeAnswer::ModeStatus(2))
+    );
+}
+
+/// The alert list the grid library fills is bounded.
+#[test]
+fn the_alert_list_is_bounded() {
+    let mut engine = engine();
+    let mut input = Vec::new();
+    for index in 0..2_000 {
+        input.extend_from_slice(format!("\x1b]2;title {index}\x07").as_bytes());
+    }
+    engine.feed(&input, 0);
+    assert!(
+        engine.grid().alerts_dropped() > 0,
+        "a program that renames itself in a loop cannot grow the list"
+    );
 }

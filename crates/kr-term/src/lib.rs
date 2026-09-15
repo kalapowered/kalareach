@@ -54,16 +54,19 @@
 //! let mut engine = Engine::new(EngineConfig::default())?;
 //!
 //! // Ordinary output is display: the grid tracks it and the original bytes may be forwarded.
-//! let outcome = engine.feed(b"hello", 0);
-//! assert_eq!(outcome.forward.len(), 1);
+//! // The last scalar of a run waits to see whether a combining mark follows, so a settled screen
+//! // needs `quiesce`; the session loop calls it when the stream goes quiet.
+//! engine.feed(b"hello", 0);
+//! let settled = engine.quiesce(0);
+//! assert_eq!(settled.forward.len(), 1);
 //!
 //! // A query stops here. The application gets an answer; no attached terminal sees the question.
 //! let outcome = engine.feed(b"\x1b[c", 0);
 //! assert!(outcome.forward.is_empty());
 //! assert_eq!(outcome.responses, 1);
 //!
-//! let replies = engine.lane_mut().drain(LaneGate::default(), 4096);
-//! assert_eq!(replies[0].bytes, b"\x1b[?62;1;22c");
+//! let replies = engine.lane_mut().drain(LaneGate::default(), 4096, 0);
+//! assert_eq!(replies[0].bytes(), b"\x1b[?62;22c");
 //! # Ok::<(), kr_term::error::TermError>(())
 //! ```
 

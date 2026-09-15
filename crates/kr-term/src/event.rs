@@ -124,6 +124,11 @@ pub enum EventKind {
     Esc {
         /// The intermediate byte, when present.
         intermediate: Option<u8>,
+        /// Whether more intermediate bytes followed the first.
+        ///
+        /// kr-vt/1 qualifies escape sequences with at most one intermediate, so a sequence with
+        /// more is an extension rather than a shorter sequence with the extras dropped.
+        extra_intermediates: bool,
         /// The final byte.
         final_byte: u8,
     },
@@ -132,6 +137,9 @@ pub enum EventKind {
         /// Parameters in source order, with the intermediates appended as punctuation.
         params: Vec<CsiParam>,
         /// Whether the parameter list hit its bound and lost items.
+        ///
+        /// A truncated list is not a shorter sequence. The dropped items could have carried a mode
+        /// the profile refuses, so the whole sequence is an extension.
         truncated: bool,
         /// The final byte.
         final_byte: u8,
@@ -175,6 +183,39 @@ pub enum EventKind {
         /// How many payload bytes were seen before the string was abandoned.
         payload_len: usize,
     },
+}
+
+impl EventKind {
+    /// Whether the original bytes of this event are safe to write to a UTF-8 terminal.
+    ///
+    /// A control string carries an arbitrary payload, and a payload that is not valid UTF-8, or
+    /// that contains a control scalar, would be framed differently by a physical terminal than it
+    /// was framed here. Such bytes are never forwarded.
+    #[must_use]
+    pub fn payload_is_direct_safe(&self) -> bool {
+        match self {
+            Self::Osc { parts, .. } => parts.iter().all(|part| bytes_are_direct_safe(part)),
+            Self::Dcs { payload, .. } | Self::OtherString { payload, .. } => {
+                bytes_are_direct_safe(payload)
+            }
+            _ => true,
+        }
+    }
+}
+
+/// Whether a control-string payload can travel to a physical terminal unchanged.
+///
+/// It has to be valid UTF-8, because kr-vt/1 is a UTF-8 profile, and it has to be free of control
+/// scalars, because a terminal that decodes one would end the string somewhere other than where
+/// this engine ended it.
+#[must_use]
+pub fn bytes_are_direct_safe(bytes: &[u8]) -> bool {
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return false;
+    };
+    !text
+        .chars()
+        .any(|scalar| scalar.is_control() || ('\u{80}'..='\u{9f}').contains(&scalar))
 }
 
 /// How the original bytes of an event may be treated in direct mode.

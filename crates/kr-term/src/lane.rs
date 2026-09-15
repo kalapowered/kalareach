@@ -4,22 +4,28 @@
 //! never acquires one, and it never looks like a device, a paste or a root command. Only the query
 //! broker can put anything here, and the lane keeps replies in the order their queries arrived.
 //!
-//! The lane is bounded in three ways at once, because a query flood is an ordinary thing for a
-//! misbehaving program to do: one reply has a maximum size, the queue has a maximum size, and
-//! there is a refill budget per second. When any of them binds, the lane says so out of band and
+//! The lane is bounded four ways at once, because a query flood is an ordinary thing for a
+//! misbehaving program to do: one reply has a maximum size, the queue has a maximum size, there is
+//! a refill budget per second, and a reply that has waited too long is dropped rather than written
+//! into a conversation that has moved on. When any of them binds, the lane says so out of band and
 //! sheds load in a stated order. It never grows without bound, never starves human input and never
 //! forwards a query onwards as a way of avoiding the work.
+//!
+//! The lane holds replies; the session loop delivers them. [`LaneGate`] carries what the loop knows
+//! about the write it is about to make, so a reply cannot land inside an unfinished bracketed paste
+//! or split a recognised human input frame.
 //!
 //! Nothing here is history. A reply that was never drained is dropped when the lane resets, and a
 //! reconnecting client is never sent a reply or a probe answer from before it arrived.
 
 use std::collections::VecDeque;
 
-/// Which query a reply answers.
+/// Which query a reply answers, and about what.
 ///
-/// The kind exists so the lane can coalesce while it is shedding load. Two answers of a kind whose
-/// value comes only from current state carry the same information, so keeping the newer one loses
-/// nothing; a kind whose answers are a sequence, such as a cursor report, is never coalesced.
+/// The subject is part of the kind because the lane coalesces while it is shedding load. Two
+/// answers about the same subject carry the same information, so keeping the newer one loses
+/// nothing; two answers about different modes, or two cursor reports, are different answers and are
+/// never collapsed into each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ResponseKind {
     /// Primary device attributes.
@@ -28,22 +34,22 @@ pub enum ResponseKind {
     DeviceAttributes2,
     /// Tertiary device attributes.
     DeviceAttributes3,
-    /// A device status report that is not a cursor position.
-    DeviceStatus,
+    /// A device status report, identified by the status it reports on.
+    DeviceStatus(u16),
     /// A cursor position report.
     CursorPosition,
-    /// A mode report.
-    ModeReport,
-    /// A window or geometry report.
-    GeometryReport,
-    /// A setting report.
-    SettingReport,
-    /// A terminfo capability report.
-    Capability,
-    /// A colour report.
-    Colour,
-    /// The keyboard protocol state.
-    KeyboardProtocol,
+    /// A mode report, identified by the mode.
+    ModeReport(u16),
+    /// A window or geometry report, identified by the window operation.
+    GeometryReport(u16),
+    /// A setting report, identified by a key derived from the setting name.
+    SettingReport(u32),
+    /// A terminfo capability report, identified by a key derived from the capability name.
+    Capability(u32),
+    /// A colour report, identified by its selector: an OSC number, or `0x1000 + index`.
+    Colour(u32),
+    /// The keyboard protocol state, identified by the protocol asked about.
+    KeyboardProtocol(u8),
     /// The terminal identity.
     Version,
     /// A clipboard answer.
@@ -51,7 +57,22 @@ pub enum ResponseKind {
 }
 
 impl ResponseKind {
+    /// A stable key for a name, used to tell two capability or setting reports apart.
+    #[must_use]
+    pub fn name_key(name: &[u8]) -> u32 {
+        // FNV-1a. It only has to separate names inside one queue, not resist anything.
+        let mut hash: u32 = 0x811c_9dc5;
+        for byte in name {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        hash
+    }
+
     /// Whether two pending answers of this kind may be collapsed into the newer one.
+    ///
+    /// A cursor report is a sequence rather than a fact, and a clipboard answer belongs to the
+    /// request that asked for it, so neither is ever collapsed.
     #[must_use]
     pub const fn coalescable(self) -> bool {
         !matches!(self, Self::CursorPosition | Self::Clipboard)
@@ -59,20 +80,57 @@ impl ResponseKind {
 }
 
 /// One reply waiting to go to the application.
+///
+/// Replies are built inside this crate, by the query broker. Anything outside it can read a reply
+/// and write it, and cannot invent one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
-    /// The exact bytes.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
+    kind: ResponseKind,
+    query_at: u64,
+    expires_at_ms: u64,
+}
+
+impl Response {
+    /// Builds a reply. Only the query broker calls this.
+    pub(crate) const fn new(kind: ResponseKind, query_at: u64, bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            kind,
+            query_at,
+            expires_at_ms: 0,
+        }
+    }
+
+    /// The exact bytes to write.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Which query this answers.
-    pub kind: ResponseKind,
+    #[must_use]
+    pub const fn kind(&self) -> ResponseKind {
+        self.kind
+    }
+
     /// Output-stream offset of the query that caused it, so the ordering is checkable.
-    pub query_at: u64,
+    #[must_use]
+    pub const fn query_at(&self) -> u64 {
+        self.query_at
+    }
+
+    /// When this reply stops being worth writing.
+    #[must_use]
+    pub const fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
 }
 
 /// How the lane is shedding load.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaneDegradation {
-    /// Replies collapsed into a later reply of the same kind.
+    /// Replies collapsed into a later reply about the same subject.
     pub coalesced: u64,
     /// Replies dropped because the queue was full.
     pub dropped: u64,
@@ -80,29 +138,43 @@ pub struct LaneDegradation {
     pub over_budget: u64,
     /// Replies refused because they were larger than one reply may be.
     pub oversized: u64,
+    /// Replies dropped because they waited past their deadline.
+    pub expired: u64,
 }
 
 impl LaneDegradation {
     /// Whether anything has actually been shed.
     #[must_use]
     pub const fn is_degraded(self) -> bool {
-        self.coalesced > 0 || self.dropped > 0 || self.over_budget > 0 || self.oversized > 0
+        self.coalesced > 0
+            || self.dropped > 0
+            || self.over_budget > 0
+            || self.oversized > 0
+            || self.expired > 0
     }
 }
 
 /// What the session loop knows about the write it is about to make.
+///
+/// The loop owns delivery; the lane owns the bounds. These flags are how the loop says that this is
+/// not a moment when a reply may be written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LaneGate {
     /// Whether a bracketed paste is open and unterminated.
     pub paste_open: bool,
     /// Whether the backend is qualified to take a reply inside an open paste.
     pub backend_handles_paste_interleave: bool,
+    /// Whether a recognised human input frame is part way through being delivered.
+    pub human_frame_open: bool,
 }
 
 impl LaneGate {
     /// Whether a reply may be written right now.
     #[must_use]
     pub const fn allows_write(self) -> bool {
+        if self.human_frame_open {
+            return false;
+        }
         !self.paste_open || self.backend_handles_paste_interleave
     }
 }
@@ -116,6 +188,8 @@ pub struct LaneLimits {
     pub max_queue_bytes: usize,
     /// Replies per second, which is also the burst size.
     pub responses_per_second: u32,
+    /// How long a reply may wait before it stops being worth writing.
+    pub reply_deadline_ms: u64,
 }
 
 impl LaneLimits {
@@ -123,10 +197,14 @@ impl LaneLimits {
     ///
     /// The per-reply bound is 8 KiB. The largest reply the broker can build is an XTGETTCAP answer
     /// for a long capability list, and the terminfo responder bounds that list well below this.
+    ///
+    /// The deadline is two seconds. An application that asked a question and has not had the answer
+    /// in two seconds has either given up or moved on, and writing then is worse than not writing.
     pub const DEFAULT: Self = Self {
         max_response_bytes: 8 * 1024,
         max_queue_bytes: 128 * 1024,
         responses_per_second: 256,
+        reply_deadline_ms: 2_000,
     };
 }
 
@@ -164,12 +242,7 @@ impl ResponseLane {
             tokens: limits.responses_per_second,
             last_refill_ms: 0,
             limits,
-            degradation: LaneDegradation {
-                coalesced: 0,
-                dropped: 0,
-                over_budget: 0,
-                oversized: 0,
-            },
+            degradation: LaneDegradation::default(),
             delivered: 0,
         }
     }
@@ -207,7 +280,7 @@ impl ResponseLane {
     /// Offers a reply to the lane. Returns whether it was accepted.
     ///
     /// This is the only way anything reaches the lane, and the broker is the only caller.
-    pub fn offer(&mut self, response: Response, now_ms: u64) -> bool {
+    pub(crate) fn offer(&mut self, mut response: Response, now_ms: u64) -> bool {
         if response.bytes.len() > self.limits.max_response_bytes {
             self.degradation.oversized += 1;
             return false;
@@ -224,6 +297,7 @@ impl ResponseLane {
                 return false;
             }
         }
+        response.expires_at_ms = now_ms.saturating_add(self.limits.reply_deadline_ms);
         self.tokens -= 1;
         self.queued_bytes += response.bytes.len();
         self.queue.push_back(response);
@@ -233,16 +307,27 @@ impl ResponseLane {
     /// Takes replies to write, up to `max_bytes`.
     ///
     /// The caller passes its own byte budget so that draining the lane can never crowd out the
-    /// human input the same loop is delivering. While a bracketed paste is open and the backend is
-    /// not qualified to interleave, nothing is taken at all.
-    pub fn drain(&mut self, gate: LaneGate, max_bytes: usize) -> Vec<Response> {
+    /// human input the same loop is delivering. A reply that does not fit the remaining budget
+    /// stays where it is, including the first one: a budget of zero takes nothing.
+    ///
+    /// A reply that has waited past its deadline is dropped here rather than written, and the drop
+    /// shows up in the degradation record.
+    pub fn drain(&mut self, gate: LaneGate, max_bytes: usize, now_ms: u64) -> Vec<Response> {
         if !gate.allows_write() {
             return Vec::new();
         }
         let mut out = Vec::new();
         let mut taken = 0usize;
         while let Some(front) = self.queue.front() {
-            if !out.is_empty() && taken + front.bytes.len() > max_bytes {
+            if front.expires_at_ms != 0 && now_ms > front.expires_at_ms {
+                let Some(expired) = self.queue.pop_front() else {
+                    break;
+                };
+                self.queued_bytes -= expired.bytes.len();
+                self.degradation.expired += 1;
+                continue;
+            }
+            if taken + front.bytes.len() > max_bytes {
                 break;
             }
             let Some(response) = self.queue.pop_front() else {
@@ -252,9 +337,6 @@ impl ResponseLane {
             taken += response.bytes.len();
             self.delivered += 1;
             out.push(response);
-            if taken >= max_bytes {
-                break;
-            }
         }
         out
     }
@@ -275,6 +357,7 @@ impl ResponseLane {
             dropped: 0,
             over_budget: 0,
             oversized: 0,
+            expired: 0,
         };
     }
 
@@ -305,7 +388,7 @@ impl ResponseLane {
         self.last_refill_ms = now_ms;
     }
 
-    /// Collapses an earlier pending reply of the same kind, when the kind allows it.
+    /// Collapses an earlier pending reply about the same subject.
     fn shed_for(&mut self, incoming: &Response) {
         if !incoming.kind.coalescable() {
             return;

@@ -187,8 +187,13 @@ fn profile() -> Value {
         "grid_library": {
             "repository": LIBRARY.repository,
             "revision": LIBRARY.revision,
-            "patch_required": LIBRARY.patch_required,
             "notes": LIBRARY.notes,
+            "direct_mode_constraints": LIBRARY.direct_mode_constraints,
+            "required_patch": LIBRARY.required_patch.iter().map(|patch| json!({
+                "state": patch.state,
+                "reason": patch.reason,
+                "interim": patch.interim,
+            })).collect::<Vec<_>>(),
         },
     })
 }

@@ -206,7 +206,7 @@
           ]
         },
         {
-          "bytes": "33316d",
+          "bytes": "3331",
           "class": "D",
           "disposition": "Forward",
           "eight_bit": false,
@@ -215,6 +215,19 @@
           "passthrough_depth": 0,
           "span": [
             2,
+            4
+          ]
+        },
+        {
+          "bytes": "6d",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            4,
             5
           ]
         }
@@ -222,6 +235,10 @@
       "forward": [
         [
           2,
+          4
+        ],
+        [
+          4,
           5
         ]
       ],
@@ -802,7 +819,7 @@
           ]
         },
         {
-          "bytes": "72657374",
+          "bytes": "726573",
           "class": "D",
           "disposition": "Forward",
           "eight_bit": false,
@@ -811,6 +828,19 @@
           "passthrough_depth": 0,
           "span": [
             9,
+            12
+          ]
+        },
+        {
+          "bytes": "74",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "text",
+          "passthrough_depth": 0,
+          "span": [
+            12,
             13
           ]
         }
@@ -818,6 +848,10 @@
       "forward": [
         [
           9,
+          12
+        ],
+        [
+          12,
           13
         ]
       ],
@@ -890,6 +924,202 @@
       "id": "passthrough_depth_two",
       "input": "1b50746d75783b1b1b50746d75783b1b1b1b1b5b33316d1b1b5c1b5c",
       "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 raw C1 inside a payload",
+      "diagnostics": [],
+      "events": [
+        {
+          "bytes": "1b5d323b789c9b366e07",
+          "class": "M",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            10
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "title_payload_with_raw_c1",
+      "input": "1b5d323b789c9b366e07",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 control scalar inside a payload",
+      "diagnostics": [],
+      "events": [
+        {
+          "bytes": "1b5d323b780c7907",
+          "class": "M",
+          "disposition": "RequireProjection",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            8
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "title_payload_with_c0",
+      "input": "1b5d323b780c7907",
+      "projection_required_at": 0,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 escape doubling is tmux only",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "abandoned-control-string"
+        },
+        {
+          "at": 6,
+          "kind": "side-effect-without-destination"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5d323b78",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "discarded:Osc:Cancelled",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            5
+          ]
+        },
+        {
+          "bytes": "1b",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "discarded:ControlSequence:Cancelled",
+          "passthrough_depth": 0,
+          "span": [
+            5,
+            6
+          ]
+        },
+        {
+          "bytes": "1b5d35323b633b6332566a636d563007",
+          "class": "S",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "osc",
+          "passthrough_depth": 0,
+          "span": [
+            6,
+            22
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "escape_doubling_outside_tmux",
+      "input": "1b5d323b781b1b5d35323b633b6332566a636d563007",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": [
+        {
+          "at": 6,
+          "destination": "host-event",
+          "kind": "clipboard-write"
+        }
+      ]
+    },
+    {
+      "covers": "KR-ACC-024 embedded control byte",
+      "diagnostics": [],
+      "events": [
+        {
+          "bytes": "1b5b35003b3348",
+          "class": "D",
+          "disposition": "Forward",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            7
+          ]
+        }
+      ],
+      "forward": [
+        [
+          0,
+          7
+        ]
+      ],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "c0_inside_control_sequence",
+      "input": "1b5b35003b3348",
+      "projection_required_at": null,
+      "refusals": [],
+      "responses": [],
+      "side_effects": []
+    },
+    {
+      "covers": "KR-ACC-024 bounded retention",
+      "diagnostics": [
+        {
+          "at": 0,
+          "kind": "unclassified-sequence"
+        }
+      ],
+      "events": [
+        {
+          "bytes": "1b5b3131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131",
+          "class": "X",
+          "disposition": "Withhold",
+          "eight_bit": false,
+          "ground_after": true,
+          "kind": "csi",
+          "passthrough_depth": 0,
+          "span": [
+            0,
+            259
+          ]
+        }
+      ],
+      "forward": [],
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "ground_after": true,
+      "id": "oversized_sequence_prelude",
+      "input": "1b5b313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131316d",
+      "projection_required_at": null,
       "refusals": [],
       "responses": [],
       "side_effects": []

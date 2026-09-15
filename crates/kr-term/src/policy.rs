@@ -99,7 +99,10 @@ impl Policy {
     pub fn decide(&self, event: &Event) -> Outcome {
         match event.class {
             SequenceClass::Display | SequenceClass::Mode => self.decide_grid(event),
+            // A query is answered here and travels no further. It is still tracked, because a
+            // colour request may pair mutations with its questions and the mutations are real.
             SequenceClass::Query => Outcome {
+                track: true,
                 answer: true,
                 diagnostic: Some((DiagnosticKind::QueryAnswered, describe(event))),
                 ..Outcome::withheld(DirectDisposition::Withhold)
@@ -113,34 +116,16 @@ impl Policy {
     }
 
     fn decide_grid(&self, event: &Event) -> Outcome {
-        if let EventKind::Csi {
-            params, final_byte, ..
-        } = &event.kind
-        {
-            let csi = CsiView::new(params, *final_byte);
-            if csi.private == Some(b'?')
-                && matches!(csi.final_byte, b'h' | b'l')
-                && csi.numbers.contains(&Some(9001))
-            {
-                // The worker owns its ConPTY, so it records what that backend asked for and
-                // encodes input accordingly. On a Unix backend the request means nothing. Either
-                // way the sequence stops here and is never broadcast to a remote client.
-                return match self.backend {
-                    Backend::ConPty => Outcome {
-                        track: true,
-                        ..Outcome::withheld(DirectDisposition::Withhold)
-                    },
-                    Backend::UnixPty => Outcome {
-                        diagnostic: Some((
-                            DiagnosticKind::UnclassifiedSequence,
-                            "win32 input mode has no meaning on a Unix backend".to_owned(),
-                        )),
-                        ..Outcome::withheld(DirectDisposition::Withhold)
-                    },
-                };
-            }
-        }
         let mut diagnostic = None;
+        // The ConPTY win32 input mode is real on the backend that owns it and meaningless anywhere
+        // else. Either way the classifier has already marked its bytes as stopping here, so the
+        // rest of a combined request keeps working while this one mode goes no further.
+        if self.backend == Backend::UnixPty && requests_win32_input(event) {
+            diagnostic = Some((
+                DiagnosticKind::UnclassifiedSequence,
+                "win32 input mode has no meaning on a Unix backend".to_owned(),
+            ));
+        }
         if event.eight_bit_introducer {
             diagnostic = Some((DiagnosticKind::RawC1Control, describe(event)));
         } else if matches!(event.kind, EventKind::Replacement { .. }) {
@@ -310,6 +295,22 @@ impl Policy {
             ..Outcome::withheld(DirectDisposition::Withhold)
         }
     }
+}
+
+/// Whether an event asks for the ConPTY win32 input mode.
+fn requests_win32_input(event: &Event) -> bool {
+    let EventKind::Csi {
+        params, final_byte, ..
+    } = &event.kind
+    else {
+        return false;
+    };
+    let csi = CsiView::new(params, *final_byte);
+    csi.private == Some(b'?')
+        && matches!(csi.final_byte, b'h' | b'l')
+        && csi
+            .numbers
+            .contains(&Some(i64::from(crate::classify::MODE_WIN32_INPUT)))
 }
 
 fn parse_u8(part: &[u8]) -> Option<u8> {

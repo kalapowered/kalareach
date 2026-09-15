@@ -133,6 +133,10 @@ impl ModeState {
                 match self.dec.get_mut(&mode) {
                     Some(slot) => {
                         *slot = enabled;
+                        // DECNKM is the other spelling of the keypad state.
+                        if mode == 66 {
+                            self.keypad_application = enabled;
+                        }
                         true
                     }
                     None => false,
@@ -196,9 +200,10 @@ impl ModeState {
         self.keypad_application
     }
 
-    /// Records DECKPAM or DECKPNM.
-    pub const fn set_keypad_application(&mut self, application: bool) {
+    /// Records DECKPAM, DECKPNM or DEC mode 66, which all name the same state.
+    pub fn set_keypad_application(&mut self, application: bool) {
         self.keypad_application = application;
+        self.dec.insert(66, application);
     }
 
     /// Whether the ConPTY win32 input mode is on for the owned backend.
@@ -285,23 +290,34 @@ impl ModeState {
         *self = Self::new();
     }
 
-    /// Applies a soft reset. DECSTR leaves the buffer choice and the keyboard protocol alone.
+    /// Applies a soft reset.
+    ///
+    /// DECSTR returns the primary screen, which is what the canonical grid does, so the tracked
+    /// buffer modes go with it. The backend's own input mode survives, because DECSTR comes from
+    /// the application and the backend is not the application.
     pub fn soft_reset(&mut self) {
-        let keyboard = (
-            self.kitty_flags,
-            self.kitty_stack.clone(),
-            self.modify_other_keys,
-        );
-        let alternate = self.is_set(ModeKind::Dec, 1049) || self.is_set(ModeKind::Dec, 47);
         let win32 = self.win32_input;
         *self = Self::new();
-        self.kitty_flags = keyboard.0;
-        self.kitty_stack = keyboard.1;
-        self.modify_other_keys = keyboard.2;
         self.win32_input = win32;
-        if alternate {
-            self.set(ModeKind::Dec, 1049, true);
-        }
+    }
+
+    /// The Kitty keyboard flag stack, oldest first, for a snapshot.
+    #[must_use]
+    pub fn kitty_stack(&self) -> &[u8] {
+        &self.kitty_stack
+    }
+
+    /// Restores the keyboard negotiation state from a snapshot.
+    pub fn restore_keyboard(
+        &mut self,
+        modify_other_keys: u8,
+        kitty_flags: Option<u8>,
+        kitty_stack: Vec<u8>,
+    ) {
+        self.modify_other_keys = modify_other_keys.min(2);
+        self.kitty_flags = kitty_flags.map(|flags| flags & KITTY_QUALIFIED_FLAGS);
+        self.kitty_stack = kitty_stack;
+        self.kitty_stack.truncate(KITTY_STACK_DEPTH);
     }
 
     /// Every tracked mode and its value, for a snapshot.

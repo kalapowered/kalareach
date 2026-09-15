@@ -161,29 +161,68 @@ pub fn from_hex(text: &[u8]) -> Option<Vec<u8>> {
 /// replies.
 pub const MAX_REQUEST_NAMES: usize = 32;
 
+/// The longest capability name the responder will name back.
+///
+/// Terminfo names are short. A longer one cannot match anything, and echoing it would let an
+/// application choose how many bytes the trusted lane carries.
+pub const MAX_REQUEST_NAME_BYTES: usize = 32;
+
+/// One reply to one requested capability name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityReply {
+    /// The name the reply is about, as the database or the request spells it.
+    pub name: String,
+    /// The exact reply bytes.
+    pub bytes: Vec<u8>,
+}
+
 /// Builds the replies to one XTGETTCAP request.
 ///
 /// Each name gets its own reply: `DCS 1 + r name=value ST` when the database has it, and
-/// `DCS 0 + r name ST` when it does not. A name that is not valid hex gets the failure reply for
-/// the bytes as they arrived.
+/// `DCS 0 + r name ST` when it does not.
+///
+/// A request names capabilities in hex, and the responder repeats the name. A name that is not
+/// valid hex, or is longer than a capability name can be, is answered with the bare failure reply
+/// rather than repeated: an application must not be able to choose the bytes that travel on the
+/// trusted lane.
 #[must_use]
-pub fn xtgettcap_replies(payload: &[u8]) -> Vec<Vec<u8>> {
+pub fn xtgettcap_replies(payload: &[u8]) -> Vec<CapabilityReply> {
     payload
         .split(|byte| *byte == b';')
         .take(MAX_REQUEST_NAMES)
         .map(|encoded| {
-            let Some(decoded) = from_hex(encoded) else {
-                return failure_reply(encoded);
+            let Some(name) = validated_name(encoded) else {
+                return CapabilityReply {
+                    name: String::new(),
+                    bytes: bare_failure_reply(),
+                };
             };
-            let Ok(name) = core::str::from_utf8(&decoded) else {
-                return failure_reply(encoded);
-            };
-            match lookup(name) {
-                Some(value) => success_reply(name, &value.bytes()),
-                None => failure_reply(encoded),
+            match lookup(&name) {
+                Some(value) => CapabilityReply {
+                    bytes: success_reply(&name, &value.bytes()),
+                    name,
+                },
+                None => CapabilityReply {
+                    bytes: failure_reply(&name),
+                    name,
+                },
             }
         })
         .collect()
+}
+
+/// Decodes a requested name, refusing anything a capability name could not be.
+fn validated_name(encoded: &[u8]) -> Option<String> {
+    if encoded.len() > MAX_REQUEST_NAME_BYTES * 2 {
+        return None;
+    }
+    let decoded = from_hex(encoded)?;
+    let name = String::from_utf8(decoded).ok()?;
+    let printable = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b';' && byte != b'=');
+    printable.then_some(name)
 }
 
 fn success_reply(name: &str, value: &[u8]) -> Vec<u8> {
@@ -196,12 +235,16 @@ fn success_reply(name: &str, value: &[u8]) -> Vec<u8> {
     out
 }
 
-fn failure_reply(encoded_name: &[u8]) -> Vec<u8> {
+fn failure_reply(name: &str) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1bP0+r");
-    out.extend_from_slice(encoded_name);
+    out.extend_from_slice(to_hex(name.as_bytes()).as_bytes());
     out.extend_from_slice(b"\x1b\\");
     out
+}
+
+fn bare_failure_reply() -> Vec<u8> {
+    b"\x1bP0+r\x1b\\".to_vec()
 }
 
 /// What the class-coverage check found for one capability.
@@ -213,15 +256,23 @@ pub struct Coverage {
     pub direction: Direction,
     /// The classes its expansion produced, in order.
     pub classes: Vec<SequenceClass>,
-    /// Whether every class is one the profile supports.
+    /// Whether this check examined the capability at all.
+    pub checked: bool,
+    /// Whether the capability lexes into supported classes and actions the canonical grid knows.
     pub supported: bool,
 }
 
-/// Lexes every advertised output capability and reports the classes it produces.
+/// Lexes every advertised output capability and reports what the engine does with it.
 ///
-/// A capability is covered when its expansion produces at least one event and no event is `X`. An
-/// `X` here means the database advertises something the profile would consume with a diagnostic,
-/// which is exactly the inconsistency section 8 forbids.
+/// A capability is covered when its expansion produces at least one event, no event is `X`, and the
+/// canonical grid recognises every action the approved events adapt to. The second half is what
+/// makes this a check rather than a formality: a capability can lex into a perfectly ordinary
+/// control sequence that the grid then does not understand, and advertising that is the same
+/// inconsistency as advertising an `X`.
+///
+/// A capability the terminal never reads is not classified here. An input capability is a key
+/// encoding and a report capability is the documented shape of a reply, and neither appears in the
+/// application's output stream; `checked` says which entries this check actually examined.
 #[must_use]
 pub fn coverage() -> Vec<Coverage> {
     data::STRINGS
@@ -232,6 +283,7 @@ pub fn coverage() -> Vec<Coverage> {
                     name: cap.name,
                     direction: cap.direction,
                     classes: Vec::new(),
+                    checked: false,
                     supported: true,
                 };
             }
@@ -240,11 +292,16 @@ pub fn coverage() -> Vec<Coverage> {
             lexer.feed(cap.expansion.as_bytes(), &mut events);
             lexer.close(&mut events);
             let classes: Vec<SequenceClass> = events.iter().map(|event| event.class).collect();
-            let supported = !classes.is_empty() && !classes.contains(&SequenceClass::Extension);
+            let recognised = events
+                .iter()
+                .all(|event| !crate::adapter::adapt(event).unrecognised);
+            let supported =
+                !classes.is_empty() && !classes.contains(&SequenceClass::Extension) && recognised;
             Coverage {
                 name: cap.name,
                 direction: cap.direction,
                 classes,
+                checked: true,
                 supported,
             }
         })

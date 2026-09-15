@@ -40,6 +40,16 @@ pub struct GridCase {
     pub input: &'static [u8],
 }
 
+/// A control sequence whose prelude passes the retention bound.
+///
+/// The parser keeps its framing state and the span length and stops retaining bytes, so a stream of
+/// digits after `CSI` cannot make it allocate.
+pub const OVERSIZED_PRELUDE: &[u8] = b"\x1b[\
+1111111111111111111111111111111111111111111111111111111111111111\
+1111111111111111111111111111111111111111111111111111111111111111\
+1111111111111111111111111111111111111111111111111111111111111111\
+1111111111111111111111111111111111111111111111111111111111111111m";
+
 /// The class-table cases, in the order of the rows in section 8.
 pub const CLASS_CASES: &[Case] = &[
     Case { id: "text_ascii", covers: "KR-REQ-08.16 row text", input: b"hello" },
@@ -127,6 +137,19 @@ pub const CLASS_CASES: &[Case] = &[
     Case { id: "scrolling_and_sgr", covers: "KR-REQ-08.16 row scrolling and SGR", input: b"\x1b[2S\x1b[1T\x1b[1;31;48;5;20m" },
     Case { id: "saved_cursor_and_margins", covers: "KR-REQ-08.16 row saved cursors and margins", input: b"\x1b7\x1b[2;20r\x1b[?69h\x1b[3;40s\x1b8" },
     Case { id: "tmux_passthrough", covers: "KR-REQ-08.12 tmux passthrough", input: b"\x1bPtmux;\x1b\x1b[31mred\x1b\\" },
+    Case { id: "dec_mode_colon_sublist", covers: "KR-REQ-08.20 malformed mode parameters", input: b"\x1b[?3:7h" },
+    Case { id: "dec_mode_mixed_with_9001", covers: "KR-REQ-08.26 combined mode request", input: b"\x1b[?9001;1049h" },
+    Case { id: "modify_other_keys_unknown_resource", covers: "KR-REQ-08.22 unqualified resource", input: b"\x1b[>2;1m" },
+    Case { id: "kitty_unqualified_flags", covers: "KR-REQ-08.22 unqualified flags", input: b"\x1b[>16u" },
+    Case { id: "tab_clear_unsupported", covers: "KR-REQ-08.18 unsupported TBC variant", input: b"\x1b[2g" },
+    Case { id: "charset_g2_designation", covers: "KR-REQ-08.16 unsupported designation", input: b"\x1b*0" },
+    Case { id: "esc_extra_intermediates", covers: "KR-REQ-08.16 extra intermediates", input: b"\x1b($B" },
+    Case { id: "title_with_semicolons", covers: "KR-REQ-08.27 title payload", input: b"\x1b]2;one;two;three\x07" },
+    Case { id: "palette_mixed_operations", covers: "KR-REQ-08.30 mixed colour request", input: b"\x1b]4;1;#ff0000;2;?\x1b\\" },
+    Case { id: "dynamic_colour_list", covers: "KR-REQ-08.30 dynamic colour list", input: b"\x1b]10;#112233;#445566\x1b\\" },
+    Case { id: "tektronix_colour", covers: "KR-REQ-08.30 unqualified colour selector", input: b"\x1b]15;?\x1b\\" },
+    Case { id: "osc9_unknown_subcommand", covers: "KR-REQ-08.31 unknown subcommand", input: b"\x1b]9;7;x\x1b\\" },
+    Case { id: "osc133_unknown_property", covers: "KR-REQ-08.33 unknown property", input: b"\x1b]133;P;Secret=1\x1b\\" },
 ];
 
 /// The byte-policy and fuzzing cases named by KR-ACC-024.
@@ -225,6 +248,31 @@ pub const BYTE_POLICY_CASES: &[Case] = &[
         id: "passthrough_depth_two",
         covers: "KR-ACC-024 nested passthrough",
         input: b"\x1bPtmux;\x1b\x1bPtmux;\x1b\x1b\x1b\x1b[31m\x1b\x1b\\\x1b\\",
+    },
+    Case {
+        id: "title_payload_with_raw_c1",
+        covers: "KR-ACC-024 raw C1 inside a payload",
+        input: b"\x1b]2;x\x9c\x9b6n\x07",
+    },
+    Case {
+        id: "title_payload_with_c0",
+        covers: "KR-ACC-024 control scalar inside a payload",
+        input: b"\x1b]2;x\x0cy\x07",
+    },
+    Case {
+        id: "escape_doubling_outside_tmux",
+        covers: "KR-ACC-024 escape doubling is tmux only",
+        input: b"\x1b]2;x\x1b\x1b]52;c;c2VjcmV0\x07",
+    },
+    Case {
+        id: "c0_inside_control_sequence",
+        covers: "KR-ACC-024 embedded control byte",
+        input: b"\x1b[5\x00;3H",
+    },
+    Case {
+        id: "oversized_sequence_prelude",
+        covers: "KR-ACC-024 bounded retention",
+        input: OVERSIZED_PRELUDE,
     },
 ];
 
@@ -385,6 +433,16 @@ pub const BROKER_CASES: &[Case] = &[
         covers: "KR-REQ-08.32",
         input: b"\x1b]52;c;?\x1b\\",
     },
+    Case {
+        id: "cpr_under_origin_mode",
+        covers: "KR-ACC-001 KR-REQ-08.21",
+        input: b"\x1b[3;12r\x1b[?6h\x1b[H\x1b[6n",
+    },
+    Case {
+        id: "xtgettcap_unprintable_name",
+        covers: "KR-REQ-08.35 bounded failure reply",
+        input: b"\x1bP+q0d0a41424321\x1b\\",
+    },
 ];
 
 /// The width-model cases section 8 names for direct qualification.
@@ -498,6 +556,13 @@ pub const SNAPSHOT_CASES: &[GridCase] = &[
         rows: 4,
         input: b"text\x1b[1;3",
     },
+    GridCase {
+        id: "soft_reset_from_alternate",
+        covers: "KR-REQ-08.18 DECSTR returns the primary screen",
+        cols: 12,
+        rows: 4,
+        input: b"primary\r\n\x1b[?1049halt\x1b[!p",
+    },
 ];
 
 /// Runs one case through a fresh engine and records what happened.
@@ -523,7 +588,7 @@ pub fn summarise_with(input: &[u8], size: GridSize) -> Value {
 
     let outcome = engine.feed(input, 0);
     let closing = engine.close(0);
-    let responses = engine.lane_mut().drain(LaneGate::default(), 1 << 20);
+    let responses = engine.lane_mut().drain(LaneGate::default(), 1 << 20, 0);
 
     let event_values: Vec<Value> = events.iter().map(event_value).collect();
     let forward: Vec<Value> = outcome
@@ -565,7 +630,7 @@ pub fn summarise_with(input: &[u8], size: GridSize) -> Value {
         "events": event_values,
         "forward": forward,
         "projection_required_at": outcome.projection_required_at,
-        "responses": responses.iter().map(|r| hex(&r.bytes)).collect::<Vec<_>>(),
+        "responses": responses.iter().map(|r| hex(r.bytes())).collect::<Vec<_>>(),
         "side_effects": side_effects,
         "refusals": refusals,
         "diagnostics": diagnostics,
@@ -590,7 +655,7 @@ pub fn summarise_grid(case: &GridCase) -> Value {
         left_col: 0,
         cols: case.cols,
     };
-    let snapshot = engine.snapshot(viewport);
+    let snapshot = engine.snapshot(viewport, 0);
     let rows: Vec<Value> = snapshot
         .rows
         .iter()

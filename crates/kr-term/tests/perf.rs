@@ -97,7 +97,7 @@ fn drain(stream: &[u8], drain_replies: bool) -> Run {
         peak_lane_bytes = peak_lane_bytes.max(engine.lane().queued_bytes());
         peak_pending_events = peak_pending_events.max(outcome.events);
         if drain_replies {
-            engine.lane_mut().drain(LaneGate::default(), 8 * 1024);
+            engine.lane_mut().drain(LaneGate::default(), 8 * 1024, 0);
         }
     }
     let elapsed = started.elapsed();
@@ -204,7 +204,7 @@ fn sustained_output_stays_inside_the_row_cache_bound() {
     let stream = build_stream(STREAM_BYTES / 2);
     for (index, chunk) in stream.chunks(CHUNK_BYTES).enumerate() {
         engine.feed(chunk, index as u64);
-        engine.lane_mut().drain(LaneGate::default(), 8 * 1024);
+        engine.lane_mut().drain(LaneGate::default(), 8 * 1024, 0);
     }
     let usage = engine.budget().usage();
     let limits = engine.budget().limits();

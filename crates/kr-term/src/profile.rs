@@ -28,13 +28,14 @@ pub const DA3_UNIT_ID: &str = "4B520001";
 /// Primary device attributes, as the parameter list of the `CSI ? ... c` reply.
 ///
 /// * `62` — VT220-class device, the level the profile implements.
-/// * `1` — 132-column mode, which the canonical grid supports as an ordinary resize.
 /// * `22` — ANSI colour.
 ///
-/// Two absences are deliberate. Sixel (`4`) is missing because terminal raster graphics stay
-/// disabled, and selective erase (`6`) is missing because nothing in the profile implements DECSCA;
-/// an application that asks is told no rather than left to find out by trying.
-pub const DA1_PARAMS: &[u16] = &[62, 1, 22];
+/// Three absences are deliberate. Sixel (`4`) is missing because terminal raster graphics stay
+/// disabled. Selective erase (`6`) is missing because nothing in the profile implements DECSCA.
+/// And 132-column mode (`1`) is missing because DECCOLM belongs to the geometry owner: the profile
+/// reports mode 3 permanently reset, so claiming the capability would be claiming something an
+/// application cannot then use.
+pub const DA1_PARAMS: &[u16] = &[62, 22];
 
 /// Secondary device attributes: device class, firmware revision and cartridge.
 ///
@@ -149,6 +150,10 @@ pub const WITHHELD: &[Withheld] = &[
     Withheld {
         feature: "selective-erase",
         reason: "DECSCA is not implemented, so DA1 does not claim it",
+    },
+    Withheld {
+        feature: "132-column-mode",
+        reason: "DECCOLM belongs to the geometry owner, so DA1 does not claim it",
     },
     Withheld {
         feature: "title-reporting",
