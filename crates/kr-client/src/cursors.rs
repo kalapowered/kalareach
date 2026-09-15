@@ -28,6 +28,12 @@ pub struct StreamCursors {
     applied: BTreeMap<StreamId, EventSequence>,
     /// Streams whose partial state is no longer usable. They need a snapshot before anything else.
     needs_snapshot: std::collections::BTreeSet<StreamId>,
+    /// The contiguous run of events that arrived on a stream while it was waiting for a snapshot.
+    ///
+    /// Events keep arriving while a snapshot is being prepared, and they are the history that
+    /// follows it. Keeping their first and last sequence is what lets an installed snapshot tell
+    /// whether they continue it, instead of discarding them and treating the next one as a gap.
+    since_discard: BTreeMap<StreamId, (EventSequence, EventSequence)>,
 }
 
 impl StreamCursors {
@@ -68,8 +74,26 @@ impl StreamCursors {
         let stream_id = &notification.stream_id;
         let sequence = notification.sequence.get();
         if self.needs_snapshot.contains(stream_id) {
-            // Nothing is tracked while a snapshot is owed; the events are still delivered, because
-            // a consumer that is rebuilding wants to see them, but they establish no position.
+            // The events are still delivered, because a consumer that is rebuilding wants to see
+            // them, and they establish no position until a snapshot says where they belong. Their
+            // contiguous run is remembered so that snapshot can place them.
+            match self.since_discard.get(stream_id).copied() {
+                Some((first, last)) if sequence == last.get().saturating_add(1) => {
+                    self.since_discard
+                        .insert(stream_id.clone(), (first, notification.sequence));
+                }
+                Some(_) => {
+                    // A hole inside the run makes the whole run unusable: nothing after it can be
+                    // placed, so the snapshot will stand on its own.
+                    self.since_discard.remove(stream_id);
+                }
+                None => {
+                    self.since_discard.insert(
+                        stream_id.clone(),
+                        (notification.sequence, notification.sequence),
+                    );
+                }
+            }
             return Delivery::NeedsSnapshot;
         }
         let next = self
@@ -83,6 +107,10 @@ impl StreamCursors {
             self.needs_snapshot.insert(stream_id.clone());
             self.received.remove(stream_id);
             self.applied.remove(stream_id);
+            self.since_discard.insert(
+                stream_id.clone(),
+                (notification.sequence, notification.sequence),
+            );
             return Delivery::Gap {
                 expected: EventSequence::new(next),
                 received: notification.sequence,
@@ -116,10 +144,20 @@ impl StreamCursors {
     /// backwards here. Moving it back would make the next event look like a gap.
     pub fn installed_snapshot(&mut self, stream_id: &StreamId, sequence: EventSequence) {
         self.needs_snapshot.remove(stream_id);
+        // Events that arrived while the snapshot was being prepared continue it when their run
+        // starts at the sequence after its base. Then the received position is the end of that run,
+        // and the next event is contiguous rather than a gap. A run that starts anywhere else says
+        // nothing about this snapshot, and the snapshot stands alone.
+        let queued = self
+            .since_discard
+            .remove(stream_id)
+            .filter(|(first, _)| first.get() == sequence.get().saturating_add(1))
+            .map(|(_, last)| last);
+        let received = queued.unwrap_or(sequence);
         let received = self
             .received
             .get(stream_id)
-            .map_or(sequence, |held| held.max(&sequence).to_owned());
+            .map_or(received, |held| held.max(&received).to_owned());
         self.received.insert(stream_id.clone(), received);
         let applied = self
             .applied
@@ -134,6 +172,7 @@ impl StreamCursors {
     pub fn discard(&mut self, stream_id: &StreamId) {
         self.received.remove(stream_id);
         self.applied.remove(stream_id);
+        self.since_discard.remove(stream_id);
         self.needs_snapshot.insert(stream_id.clone());
     }
 
@@ -141,6 +180,7 @@ impl StreamCursors {
     pub fn discard_all(&mut self) {
         self.received.clear();
         self.applied.clear();
+        self.since_discard.clear();
         self.needs_snapshot.clear();
     }
 
@@ -434,6 +474,46 @@ mod tests {
         let cursors = StreamCursors::new();
         let restoration = Restoration::start(stream("session:1"), &cursors);
         assert_eq!(restoration.step(), RestorationStep::SubscribeFromStart);
+    }
+
+    #[test]
+    fn events_that_arrive_during_a_resynchronisation_continue_its_snapshot() {
+        let mut cursors = StreamCursors::new();
+        let stream_id = stream("session:1");
+        cursors.discard(&stream_id);
+
+        // Two events arrive while the snapshot is being prepared.
+        assert_eq!(
+            cursors.accept(&event(&stream_id, 11)),
+            Delivery::NeedsSnapshot
+        );
+        assert_eq!(
+            cursors.accept(&event(&stream_id, 12)),
+            Delivery::NeedsSnapshot
+        );
+
+        // The snapshot's base is 10, so those two continue it and 13 is the next event, not a gap.
+        cursors.installed_snapshot(&stream_id, EventSequence::new(10));
+        cursors.applied(&stream_id, EventSequence::new(12));
+        assert_eq!(cursors.accept(&event(&stream_id, 13)), Delivery::Received);
+        assert_eq!(cursors.position(&stream_id), Some(EventSequence::new(12)));
+    }
+
+    #[test]
+    fn a_snapshot_that_the_queued_events_do_not_continue_stands_alone() {
+        let mut cursors = StreamCursors::new();
+        let stream_id = stream("session:1");
+        cursors.discard(&stream_id);
+        cursors.accept(&event(&stream_id, 11));
+        cursors.accept(&event(&stream_id, 12));
+
+        // A base of 8 leaves a hole at 9 and 10, so the queued events say nothing about it.
+        cursors.installed_snapshot(&stream_id, EventSequence::new(8));
+        assert_eq!(cursors.position(&stream_id), Some(EventSequence::new(8)));
+        assert!(matches!(
+            cursors.accept(&event(&stream_id, 12)),
+            Delivery::Gap { .. }
+        ));
     }
 
     #[test]

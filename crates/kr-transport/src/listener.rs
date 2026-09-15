@@ -140,6 +140,8 @@ struct AdmissionTokens {
 }
 
 impl AdmissionRate {
+    /// Creates a bucket. A zero refill is no rate limit at all rather than a bucket that never
+    /// refills, which would stop the host admitting anything after its first burst.
     fn new(burst: u32, refill: Duration) -> Self {
         Self {
             burst: burst.max(1),
@@ -157,8 +159,11 @@ impl AdmissionRate {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.refill.is_zero() {
+            return true;
+        }
         let elapsed = state.last_refill.elapsed();
-        if self.refill > Duration::ZERO {
+        {
             let earned = u32::try_from(elapsed.as_nanos() / self.refill.as_nanos().max(1))
                 .unwrap_or(u32::MAX);
             if earned > 0 {
@@ -196,6 +201,11 @@ pub trait HostHandler: PairedDirectory + Send + Sync + 'static {
     /// The listener has already proved both authorisation keys, allocated the connection identity,
     /// issued the first action window and started the keepalive. What is left is the host's own:
     /// reading requests, checking authority and answering.
+    ///
+    /// This future is dropped when the control stream ends, which is a cancellation: destructors
+    /// run, but nothing after an outstanding `await` finishes. Work that must complete — a durable
+    /// commit, a dispatch marker — belongs to an owner that outlives the connection, not to this
+    /// future.
     fn serve(self: Arc<Self>, session: AuthorisedSession) -> BoxFuture<'static, ()>;
 
     /// Called when a connection's control stream ends.
@@ -210,10 +220,15 @@ pub trait HostHandler: PairedDirectory + Send + Sync + 'static {
 ///
 /// The writer is shared, because the keepalive and the window renewal send on the same stream the
 /// host answers requests on. The reader is not: exactly one task reads a stream.
+///
+/// Both directions report their end to the connection's supervisor. Section 23 gives the control
+/// stream's failure a consequence — every data stream revoked, remote lease renewal stopped — and
+/// that consequence cannot wait for a handler that may be blocked on a worker.
 #[derive(Debug)]
 pub struct ControlChannel {
     writer: Arc<Mutex<FrameWriter>>,
     reader: FrameReader,
+    lost: Arc<tokio::sync::Notify>,
 }
 
 impl ControlChannel {
@@ -224,16 +239,27 @@ impl ControlChannel {
     /// Returns a framing error when the frame exceeds the control bound, and a stream error when
     /// the stream has ended.
     pub async fn send(&self, frame: &ControlFrame) -> Result<()> {
-        self.writer.lock().await.write_message(frame).await
+        let outcome = self.writer.lock().await.write_message(frame).await;
+        if outcome.is_err() {
+            self.lost.notify_waiters();
+        }
+        outcome
     }
 
     /// Reads the next control frame, or `None` when the peer ended the stream.
+    ///
+    /// The end of the stream, however it comes, is reported to the connection's supervisor before
+    /// this returns.
     ///
     /// # Errors
     ///
     /// Returns a framing error when the frame is refused.
     pub async fn recv(&mut self) -> Result<Option<ControlFrame>> {
-        self.reader.read_message().await
+        let outcome = self.reader.read_message().await;
+        if !matches!(outcome, Ok(Some(_))) {
+            self.lost.notify_waiters();
+        }
+        outcome
     }
 
     /// Returns a handle that can send without holding the channel.
@@ -241,6 +267,7 @@ impl ControlChannel {
     pub fn sender(&self) -> ControlSender {
         ControlSender {
             writer: Arc::clone(&self.writer),
+            lost: Arc::clone(&self.lost),
         }
     }
 }
@@ -249,16 +276,23 @@ impl ControlChannel {
 #[derive(Clone, Debug)]
 pub struct ControlSender {
     writer: Arc<Mutex<FrameWriter>>,
+    lost: Arc<tokio::sync::Notify>,
 }
 
 impl ControlSender {
     /// Sends one control frame.
     ///
+    /// A failure is reported to the connection's supervisor before it is returned.
+    ///
     /// # Errors
     ///
     /// As [`ControlChannel::send`].
     pub async fn send(&self, frame: &ControlFrame) -> Result<()> {
-        self.writer.lock().await.write_message(frame).await
+        let outcome = self.writer.lock().await.write_message(frame).await;
+        if outcome.is_err() {
+            self.lost.notify_waiters();
+        }
+        outcome
     }
 }
 
@@ -561,13 +595,20 @@ async fn serve_authorised<H: HostHandler>(
     });
     let streams = Arc::new(StreamRegistry::with_limits(
         connection_id,
-        Arc::new(StreamBudget::new(state.config.bulk_limits)),
+        Arc::new(StreamBudget::new(
+            state
+                .config
+                .bulk_limits
+                .negotiated(authorised.selection.limits),
+        )),
         Some(hook),
         authorised.selection.limits,
     ));
+    let lost = Arc::new(tokio::sync::Notify::new());
     let control = ControlChannel {
         writer: Arc::new(Mutex::new(authorised.control_writer)),
         reader: authorised.control_reader,
+        lost: Arc::clone(&lost),
     };
     // While this flag is set the keepalive may issue a window. The guard clears it before it
     // retires the connection, and the keepalive retires any window it issued after the flag was
@@ -620,12 +661,16 @@ async fn serve_authorised<H: HostHandler>(
         action_window: authorised.action_window,
         clock: Arc::clone(&state.clock),
     };
-    // The handler is raced against the connection itself. A control stream that fails — because its
-    // writer failed, because the peer went away, or because anything else closed the connection —
-    // ends the session here rather than waiting for a handler that may be blocked on a worker.
+    // The handler is raced against the control stream and against the connection. Whichever ends
+    // first ends the session: a control stream that failed, or whose peer closed its send
+    // direction, has the consequence section 23 gives it straight away rather than waiting for a
+    // handler that may be blocked on a worker.
+    let control_lost = lost.notified();
+    tokio::pin!(control_lost);
     let served = Arc::clone(&state.handler).serve(session);
     tokio::select! {
         () = served => {}
+        () = &mut control_lost => {}
         _ = connection.closed() => {}
     }
     drop(cleanup);

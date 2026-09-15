@@ -93,6 +93,26 @@ impl Default for BulkLimits {
     }
 }
 
+impl BulkLimits {
+    /// Returns these limits held to what the connection negotiated.
+    ///
+    /// A peer that declared a smaller send queue than the protocol default is held to what it
+    /// declared, less the control reserve, so bulk traffic never fills the budget that peer said it
+    /// would accept.
+    #[must_use]
+    pub fn negotiated(self, limits: kr_protocol::hello::ReceiveLimits) -> Self {
+        let declared = usize::try_from(limits.max_send_queue_bytes.get()).unwrap_or(usize::MAX);
+        let ceiling = declared
+            .saturating_sub(CONTROL_RESERVE_BYTES)
+            .max(1)
+            .min(self.max_queued_bytes);
+        Self {
+            max_queued_bytes: ceiling,
+            ..self
+        }
+    }
+}
+
 /// Tracks what the bulk streams of one connection are using.
 ///
 /// A budget is shared by every task that writes on the connection, so it locks. The critical
@@ -284,6 +304,27 @@ mod tests {
         drop(first);
         assert_eq!(budget.queued_bytes(), 0);
         let _second = budget.reserve(1000).expect("the whole budget at once");
+    }
+
+    #[test]
+    fn a_smaller_negotiated_send_budget_lowers_the_bulk_ceiling() {
+        use kr_protocol::hello::ReceiveLimits;
+        use kr_protocol::scalars::U64;
+        let negotiated = ReceiveLimits {
+            max_send_queue_bytes: U64::new(2 * 1024 * 1024),
+            ..ReceiveLimits::default()
+        };
+        let limits = BulkLimits::default().negotiated(negotiated);
+        assert_eq!(limits.max_queued_bytes, 1024 * 1024);
+        // A larger declaration never raises the ceiling above the protocol default.
+        let generous = ReceiveLimits {
+            max_send_queue_bytes: U64::new(64 * 1024 * 1024),
+            ..ReceiveLimits::default()
+        };
+        assert_eq!(
+            BulkLimits::default().negotiated(generous).max_queued_bytes,
+            BulkLimits::default().max_queued_bytes
+        );
     }
 
     #[test]

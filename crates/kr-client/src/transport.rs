@@ -109,7 +109,9 @@ impl NetworkTransport {
         let authorised = handshake::connect(&connection, identity, host_record).await?;
         let streams = Arc::new(StreamRegistry::with_limits(
             authorised.connection_id,
-            Arc::new(StreamBudget::new(bulk_limits)),
+            Arc::new(StreamBudget::new(
+                bulk_limits.negotiated(authorised.selection.limits),
+            )),
             None,
             authorised.selection.limits,
         ));

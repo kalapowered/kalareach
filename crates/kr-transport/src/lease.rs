@@ -348,9 +348,15 @@ impl LeaseIssuer {
     /// The worker keeps whatever remains of its current lease and then stops dispatching; renewal
     /// resumes only when it acknowledges the current revision again. Nothing here kills a healthy
     /// shell.
-    pub fn stop_renewal(&self, session_id: SessionId) {
+    pub fn stop_renewal(&self, session_id: SessionId, binding: WorkerBinding) {
         let mut state = self.lock();
         let worker = state.workers.entry(session_id).or_default();
+        if binding != worker.binding {
+            // The loss belongs to a control path that has already been replaced. Fencing the
+            // replacement because its predecessor died would stop a worker that is perfectly
+            // healthy, and a late notification is exactly how that happens.
+            return;
+        }
         worker.fenced = true;
         worker.lease = None;
         // The binding advances, so an acknowledgement still travelling over the lost path arrives
@@ -550,7 +556,7 @@ mod tests {
             .expect("an issued lease");
         assert_eq!(issuer.current_lease(session(1)), Some(lease));
 
-        issuer.stop_renewal(session(1));
+        issuer.stop_renewal(session(1), binding);
         assert!(issuer.is_fenced(session(1)));
         assert_eq!(issuer.current_lease(session(1)), None);
         assert_eq!(
@@ -595,6 +601,17 @@ mod tests {
 
         // The revision in force, over the binding in force, is.
         issuer.acknowledge(session(1), rebound, AuthorityRevision::new(3));
+        assert!(
+            issuer
+                .renew(session(1), ControllerGeneration::new(7), &clock)
+                .expect("a decision")
+                .is_ok()
+        );
+
+        // A loss notification that belongs to the replaced path fences nothing: the worker is
+        // speaking over a healthy binding, and stopping it would be the opposite of the rule.
+        issuer.stop_renewal(session(1), binding);
+        assert!(!issuer.is_fenced(session(1)));
         assert!(
             issuer
                 .renew(session(1), ControllerGeneration::new(7), &clock)

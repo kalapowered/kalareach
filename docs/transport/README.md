@@ -163,12 +163,15 @@ surface's trait. The transport is the door, not the ceremony behind it.
 Version 1 accepts no application mutation in QUIC 0-RTT — not just no pairing mutation. Three rules
 enforce it, and the order matters because the first one is what makes the others truthful.
 
-* **The host knows whether a stream carried early data.** QUIC marks a stream as early data only
-  when it is accepted while the handshake is still running, so the listener accepts the first
+* **The host asks whether a stream carried early data.** QUIC marks a stream as early data only when
+  it is accepted while the handshake is still running, so the listener accepts the first
   bidirectional stream from the 0-RTT connection and only then waits for the handshake to complete.
   Nothing is *read* before that wait, so no frame is ever acted on before the peer's endpoint
-  identity is authenticated; what the early accept buys is an honest answer to "did this arrive as
-  early data".
+  identity is authenticated. The answer is not certain, though: if the connection's driver finishes
+  the handshake before the listener's task accepts the buffered stream, early data arrives marked as
+  ordinary. Closing that window needs an upstream change — the relay-and-transport dependency sets
+  the server's TLS early-data size to its maximum and exposes no way to refuse it — so a host that
+  requires the guarantee absolutely pins a build that sets it to zero.
 * **An authorised connection never carries early data.** A handshake stream that arrived as early
   data is refused with `PERMISSION_DENIED` before the proof exchange, and so is a data stream. This
   costs nothing: a KalaReach endpoint keeps no TLS session tickets, so this product's own client
@@ -206,9 +209,16 @@ without a transfer.
 
 Bulk streams are bounded three times. The connection's own QUIC send window is 8 MiB, which is
 section 9's bounded send queue per peer enforced by the transport rather than only by the
-application's accounting. Within that, at most 4 bulk streams may be open and at most 7 MiB may be
-in flight across them, so a mebibyte of the send budget is never occupied by a transfer and a
-keystroke or a receipt always has somewhere to go.
+application's accounting. Within that, at most 4 bulk streams may be open, and the application hands
+the connection at most 7 MiB of bulk data at once, lowered further when the peer negotiated a
+smaller send queue. Control and input are written at a higher stream priority, so the connection
+sends them first whenever it has capacity.
+
+What that does not do is reserve capacity inside QUIC: bytes the connection has accepted but not yet
+had acknowledged still occupy the window, and the transport has no way to observe when they drain.
+A sustained transfer can therefore fill the window, and a control write then waits for the peer to
+acknowledge rather than for a scheduler decision. Bounding that properly needs per-stream send
+accounting the transport crate does not expose.
 
 The negotiated limits are in force as well as the stream kind's ceilings. A peer that declared it
 could receive less than the kind allows is held to what it declared, in both directions, and a frame
@@ -301,17 +311,19 @@ window changes the payload digest, so it is never an automatic retry.
 
 ### The continuous clock
 
-Every deadline in the transport is measured on a suspend-aware continuous clock. Neither standard
-clock is one: the monotonic clock stops while the machine is suspended, so a five-second lease would
-outlive a suspension of any length, and the wall clock can be stepped in either direction, so it can
-be stopped by anything that can step it.
+Every deadline in the transport is measured on a suspend-aware continuous clock. The standard
+library offers no clock that is one everywhere: `Instant` is whatever its platform's monotonic
+source is, and on Linux that excludes suspended time, so a five-second lease would outlive a
+suspension of any length; `SystemTime` keeps running across a suspension but can be stepped in
+either direction, so it can be stopped by anything that can step it.
 
 The default implementation therefore reads the operating system's own continuous clock —
 `CLOCK_BOOTTIME` on Linux, Android and OpenBSD, and `mach_continuous_time` on Apple platforms —
 which is monotonic *and* includes suspended time. No arithmetic of ours stands between the kernel's
-answer and a deadline. On a platform with no continuous source the crate falls back to the ordinary
-monotonic clock, which excludes suspension; a host that ships a qualified platform time adapter
-supplies it through the `ContinuousClock` trait instead of using the default.
+answer and a deadline. On platforms the crate does not name it falls back to `Instant`, and whether
+that includes suspended time is the platform's answer rather than this crate's; a host there
+supplies a qualified platform time adapter through the `ContinuousClock` trait, and until it does,
+expiry rests on a clock this build has not qualified.
 
 ## The remote dispatch lease
 
@@ -332,6 +344,20 @@ confirmed ended. Cutting a network path or waiting for a lease timer is not comp
 paused worker could already be inside a dispatch transition.
 
 ## Wiring a host
+
+### What the host owes
+
+Two contracts the transport cannot keep for the host:
+
+* **Admission and revocation.** The handshake re-reads the paired record as late as the exchange
+  allows, but a revocation that lands between that check and the first protected read is the host's
+  to fence. The host makes its final record validation and its own registration of the connection
+  atomic with its authority store, and keeps that registration revocable for the life of the
+  session. Section 9's dispatch barrier covers a worker's dispatch; it does not cover a read or a
+  subscription on a connection that was authorised a moment before a device was revoked.
+* **Work that must complete.** `HostHandler::serve` is dropped when the control stream ends, which
+  is a cancellation: destructors run, but nothing after an outstanding `await` finishes. A durable
+  commit or a dispatch marker belongs to an owner that outlives the connection.
 
 A host joins the network with one call:
 

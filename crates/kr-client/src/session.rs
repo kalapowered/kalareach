@@ -64,10 +64,23 @@ struct Waiters {
 }
 
 /// What this client knows about its own mutations.
+///
+/// `correlations` is what lets the reader settle an action whose caller has gone: a correlated
+/// answer names a request, and only this map knows which action that request carried.
 #[derive(Clone, Debug, Default)]
 struct Outcomes {
     receipts: ReceiptTracker,
     submitted: BTreeSet<ActionId>,
+    correlations: HashMap<RequestId, ActionId>,
+}
+
+impl Outcomes {
+    /// Settles the action one correlated answer belongs to, if it is still pending.
+    fn settle(&mut self, request_id: RequestId) {
+        if let Some(action_id) = self.correlations.remove(&request_id) {
+            self.submitted.remove(&action_id);
+        }
+    }
 }
 
 /// The shared state of one connection.
@@ -348,17 +361,25 @@ impl Session {
         // recorded. A frame that cannot be sent was never sent, so it is a definite failure rather
         // than an unknown outcome.
         let frame = ControlFrame::Mutation(Box::new(mutation));
+        // The bound in force is the smaller of the stream kind's ceiling and what the peer
+        // negotiated, which is exactly what the writer will apply.
         let bound = usize::try_from(self.transport.limits().max_control_frame_len.get())
             .unwrap_or(usize::MAX)
-            .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN);
+            .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN)
+            .min(kr_protocol::frame::StreamKind::Control.max_payload_len());
         kr_cbor::to_canonical_vec_within(
             &frame,
             &kr_cbor::Limits::DEFAULT.with_max_message_len(bound),
         )?;
 
         // Recorded before the send: once the frame is on the wire the host may dispatch it, and a
-        // client that cannot name the action cannot ask what happened to it.
-        self.state.outcomes.lock().await.submitted.insert(action_id);
+        // client that cannot name the action cannot ask what happened to it. The correlation goes
+        // in at the same time, so the reader can settle this action even if this caller goes away.
+        {
+            let mut outcomes = self.state.outcomes.lock().await;
+            outcomes.submitted.insert(action_id);
+            outcomes.correlations.insert(request_id, action_id);
+        }
         if self.transport.send(&frame).await.is_err() {
             // The frame may or may not have reached the host, so the action stays on the pending
             // list and the caller is told the outcome is unknown.
@@ -500,6 +521,10 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) {
     match frame {
         ControlFrame::Response(response) => {
             let request_id = response.request_id;
+            // A correlated answer is definite, whichever way it went: the host reached a decision
+            // about whatever this request carried. Settling it here rather than in the caller means
+            // a caller that has gone away does not leave its action pending for ever.
+            state.outcomes.lock().await.settle(request_id);
             state.answer(request_id, Answer::Response(response));
         }
         ControlFrame::Receipt(answer) => {
@@ -508,6 +533,7 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) {
             {
                 let mut outcomes = state.outcomes.lock().await;
                 outcomes.receipts.record(receipt.clone());
+                outcomes.correlations.remove(&request_id);
                 if receipt.state.is_terminal() {
                     outcomes.submitted.remove(&receipt.action_id);
                 }
