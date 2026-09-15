@@ -1,0 +1,32 @@
+[package]
+name = "kr-controller"
+description = "The KalaReach control daemon: the environment registry, create admission, worker supervision and the local service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kr-controller"
+path = "src/bin/kr-controller.rs"
+
+[dependencies]
+clap.workspace = true
+kr-cbor.workspace = true
+kr-crypto.workspace = true
+kr-ipc.workspace = true
+kr-protocol.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+rustix = { workspace = true, features = ["fs", "process"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+kr-ipc = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

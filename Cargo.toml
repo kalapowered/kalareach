@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/kr-cbor",
     "crates/kr-client",
+    "crates/kr-controller",
     "crates/kr-crypto",
     "crates/kr-ipc",
     "crates/kr-pairing",
@@ -40,6 +41,7 @@ iroh-relay = { version = "=1.2.0", default-features = false }
 keyring = "=4.2.0"
 kr-cbor = { path = "crates/kr-cbor", version = "=0.1.0" }
 kr-client = { path = "crates/kr-client", version = "=0.1.0" }
+kr-controller = { path = "crates/kr-controller", version = "=0.1.0" }
 kr-crypto = { path = "crates/kr-crypto", version = "=0.1.0" }
 kr-ipc = { path = "crates/kr-ipc", version = "=0.1.0" }
 kr-pairing = { path = "crates/kr-pairing", version = "=0.1.0" }
