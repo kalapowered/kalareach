@@ -86,10 +86,7 @@ impl FrameWriter {
             len: encoded.len(),
             limit: MAX_STREAM_HEADER_LEN,
         })?;
-        let mut framed = Vec::with_capacity(FRAME_LENGTH_PREFIX_LEN + encoded.len());
-        framed.extend_from_slice(&length.to_be_bytes());
-        framed.extend_from_slice(&encoded);
-        self.write_all(&framed).await
+        self.write_framed(&length.to_be_bytes(), &encoded).await
     }
 
     /// Serialises and writes one message.
@@ -124,8 +121,13 @@ impl FrameWriter {
             }
             .into());
         }
-        let framed = self.codec.encode(payload)?;
-        self.write_all(&framed).await
+        // The prefix and the payload are written as they are, rather than copied into a third
+        // buffer. A frame the caller already holds is not duplicated to be sent.
+        let length = u32::try_from(payload.len()).map_err(|_| FrameError::PayloadTooLarge {
+            len: payload.len(),
+            limit: self.max_payload,
+        })?;
+        self.write_framed(&length.to_be_bytes(), payload).await
     }
 
     /// Writes a complete frame, refusing to continue a stream a cancelled write left in pieces.
@@ -134,7 +136,8 @@ impl FrameWriter {
     /// through leaves a prefix of one frame on the stream, and the next frame written after it
     /// would be read as the rest of that one. The flag below is set before the write and cleared
     /// only when it finishes, so an interrupted stream is reset rather than silently corrupted.
-    async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+    /// Writes one frame's prefix and payload, in that order and as one unit.
+    async fn write_framed(&mut self, prefix: &[u8], payload: &[u8]) -> Result<()> {
         if self.interrupted {
             self.reset();
             return Err(TransportError::Stream(
@@ -142,11 +145,18 @@ impl FrameWriter {
             ));
         }
         self.interrupted = true;
-        let outcome = self
+        let mut outcome = self
             .stream
-            .write_all(bytes)
+            .write_all(prefix)
             .await
             .map_err(|error| TransportError::Stream(error.to_string()));
+        if outcome.is_ok() {
+            outcome = self
+                .stream
+                .write_all(payload)
+                .await
+                .map_err(|error| TransportError::Stream(error.to_string()));
+        }
         self.interrupted = false;
         outcome
     }

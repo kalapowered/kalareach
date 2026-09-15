@@ -20,6 +20,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind};
 use kr_protocol::hello::ReceiveLimits;
 use kr_protocol::ids::ConnectionId;
+use kr_protocol::limits::MAX_STREAM_HEADER_LEN;
 
 use crate::codec::{FrameReader, FrameWriter};
 use crate::error::{Result, TransportError};
@@ -432,7 +433,13 @@ impl StreamRegistry {
         let (send, recv) = self.quic_until_revoked(connection.open_bi()).await?;
         let mut writer = FrameWriter::new(send, header.kind).with_max_payload(limit);
         writer.set_priority(priority_of(header.kind));
+        // The header is bytes handed to the connection like any other, so a bulk stream charges it.
+        let header_charge = match class_of(header.kind) {
+            StreamClass::Bulk => Some(self.state.budget.reserve(MAX_STREAM_HEADER_LEN)?),
+            _ => None,
+        };
         self.until_revoked(writer.write_header(&header)).await?;
+        drop(header_charge);
         let reader = FrameReader::new(recv, header.kind).with_max_payload(limit);
         let (handle, registration) = self.register(header.kind)?;
         Ok(DataStream {

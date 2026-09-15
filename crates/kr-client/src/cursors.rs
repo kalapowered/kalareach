@@ -78,6 +78,11 @@ impl StreamCursors {
             // them, and they establish no position until a snapshot says where they belong. Their
             // contiguous run is remembered so that snapshot can place them.
             match self.since_discard.get(stream_id).copied() {
+                Some((first, last)) if sequence >= first.get() && sequence <= last.get() => {
+                    // Already inside the run. A repeat is not a hole, and treating it as one would
+                    // throw away a perfectly good run because the host sent something twice.
+                    let _ = (first, last);
+                }
                 Some((first, last)) if sequence == last.get().saturating_add(1) => {
                     self.since_discard
                         .insert(stream_id.clone(), (first, notification.sequence));
@@ -510,8 +515,9 @@ mod tests {
         let mut cursors = StreamCursors::new();
         let stream_id = stream("session:1");
         cursors.discard(&stream_id);
+        // A repeat at the end of the run, which is where a duplicate would do the most damage.
         cursors.accept(&event(&stream_id, 11));
-        cursors.accept(&event(&stream_id, 11));
+        cursors.accept(&event(&stream_id, 12));
         cursors.accept(&event(&stream_id, 12));
 
         // The snapshot's base is 11, which the run already carried. Event 12 still continues it.

@@ -228,7 +228,7 @@ pub trait HostHandler: PairedDirectory + Send + Sync + 'static {
 pub struct ControlChannel {
     writer: Arc<Mutex<FrameWriter>>,
     frames: tokio::sync::mpsc::Receiver<ControlFrame>,
-    lost: Arc<tokio::sync::Notify>,
+    lost: Arc<ControlLoss>,
 }
 
 impl ControlChannel {
@@ -241,7 +241,7 @@ impl ControlChannel {
     pub async fn send(&self, frame: &ControlFrame) -> Result<()> {
         let outcome = self.writer.lock().await.write_message(frame).await;
         if outcome.is_err() {
-            self.lost.notify_waiters();
+            self.lost.declare();
         }
         outcome
     }
@@ -270,7 +270,7 @@ impl ControlChannel {
 #[derive(Clone, Debug)]
 pub struct ControlSender {
     writer: Arc<Mutex<FrameWriter>>,
-    lost: Arc<tokio::sync::Notify>,
+    lost: Arc<ControlLoss>,
 }
 
 impl ControlSender {
@@ -284,7 +284,7 @@ impl ControlSender {
     pub async fn send(&self, frame: &ControlFrame) -> Result<()> {
         let outcome = self.writer.lock().await.write_message(frame).await;
         if outcome.is_err() {
-            self.lost.notify_waiters();
+            self.lost.declare();
         }
         outcome
     }
@@ -598,7 +598,7 @@ async fn serve_authorised<H: HostHandler>(
         Some(hook),
         authorised.selection.limits,
     ));
-    let lost = Arc::new(tokio::sync::Notify::new());
+    let lost = Arc::new(ControlLoss::default());
     let (frames_in, frames) = tokio::sync::mpsc::channel(CONTROL_QUEUE_DEPTH);
     let control = ControlChannel {
         writer: Arc::new(Mutex::new(authorised.control_writer)),
@@ -668,12 +668,10 @@ async fn serve_authorised<H: HostHandler>(
     // first ends the session: a control stream that failed, or whose peer closed its send
     // direction, has the consequence section 23 gives it straight away rather than waiting for a
     // handler that may be blocked on a worker.
-    let control_lost = lost.notified();
-    tokio::pin!(control_lost);
     let served = Arc::clone(&state.handler).serve(session);
     tokio::select! {
         () = served => {}
-        () = &mut control_lost => {}
+        () = lost.happened() => {}
         _ = connection.closed() => {}
     }
     drop(cleanup);
@@ -712,6 +710,42 @@ impl Drop for ConnectionCleanup {
     }
 }
 
+/// Whether one connection's control stream has ended.
+///
+/// A notification alone would not do: the reader task starts before the supervisor waits, so a
+/// stream that ends immediately would fire into an empty room. The flag is the durable half, and a
+/// waiter checks it before and after it parks.
+#[derive(Debug, Default)]
+struct ControlLoss {
+    lost: std::sync::atomic::AtomicBool,
+    woken: tokio::sync::Notify,
+}
+
+impl ControlLoss {
+    fn declare(&self) {
+        self.lost.store(true, std::sync::atomic::Ordering::Release);
+        self.woken.notify_waiters();
+    }
+
+    fn has_happened(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Resolves as soon as the control stream has ended, whenever that was.
+    async fn happened(&self) {
+        loop {
+            let waiting = self.woken.notified();
+            if self.has_happened() {
+                return;
+            }
+            waiting.await;
+            if self.has_happened() {
+                return;
+            }
+        }
+    }
+}
+
 /// How many control frames the connection holds for a handler that has not read them yet.
 ///
 /// Section 9's rule for a slow peer applies to a slow handler too: it is told, rather than allowed
@@ -727,7 +761,7 @@ async fn control_read_loop(
     mut reader: FrameReader,
     frames: tokio::sync::mpsc::Sender<ControlFrame>,
     connection: Connection,
-    lost: Arc<tokio::sync::Notify>,
+    lost: Arc<ControlLoss>,
 ) {
     while let Ok(Some(frame)) = reader.read_message::<ControlFrame>().await {
         match frames.try_send(frame) {
@@ -739,7 +773,7 @@ async fn control_read_loop(
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
         }
     }
-    lost.notify_waiters();
+    lost.declare();
 }
 
 /// The QUIC application error code an unpaired connection is closed with when pairing is not open.

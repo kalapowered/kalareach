@@ -9,11 +9,12 @@
 //! bulk stream, or a write that would push the queue past its ceiling, before anything is sent.
 //! One keystroke behind a file transfer is the case both exist for.
 //!
-//! What the budget counts is what the application has handed the connection and not yet finished
-//! writing, framing included. What it cannot count is what the connection has accepted and the peer
-//! has not yet acknowledged: QUIC holds those bytes in the connection's send window, and nothing
-//! iroh exposes says when they leave it. Priority is what keeps control ahead of bulk while the
-//! window has capacity; the budget is what stops the application filling it faster than it drains.
+//! What the budget counts is what the application is handing the connection at this moment: each
+//! bulk frame, its length prefix and its stream header included, for as long as its write is in
+//! progress. What it does not count is what the connection has already accepted and the peer has
+//! not yet acknowledged: QUIC holds those bytes in the connection's send window, and nothing iroh
+//! exposes says when they leave it. Priority is what keeps control ahead of bulk while the window
+//! has capacity. Neither mechanism reserves capacity inside the window itself.
 
 use std::sync::{Arc, Mutex};
 

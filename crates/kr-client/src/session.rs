@@ -76,6 +76,12 @@ pub struct SubmittedAction {
     pub method: Method,
     /// The exact subject it named.
     pub target: ActionTarget,
+    /// The parameters it carried.
+    ///
+    /// Two calls of the same method on the same subject differ only here — two renames of one
+    /// session to two labels, say — so without this a caller could not tell which of its own
+    /// uncertain actions is which.
+    pub params: ParamsValue,
     /// The request it was sent as, which correlates the host's answer.
     pub request_id: RequestId,
 }
@@ -118,8 +124,9 @@ impl Outcomes {
 /// How many of this client's actions may be unresolved at once.
 ///
 /// An unresolved action is one whose outcome nobody knows, and section 9 forbids forgetting one.
-/// The bound is what stops "never forget" becoming "grow for ever": a client that has this many
-/// uncertain actions has a host it cannot reach, and submitting more would only add to the pile.
+/// The bound is what stops "never forget" becoming "grow for ever". A client reaches it through
+/// accepted actions whose receipts have not settled as much as through a host it cannot reach, and
+/// either way submitting more would only add to the pile.
 pub const MAX_UNRESOLVED_ACTIONS: usize = 1024;
 
 /// The shared state of one connection.
@@ -384,6 +391,7 @@ impl Session {
         let request_id = self.next_request_id();
         let waiter = self.register(request_id)?;
         let target_record = target.clone();
+        let params_record = ParamsValue::from_typed(params)?;
         let mutation = MutationRequest {
             request_id,
             method: method.into(),
@@ -394,7 +402,7 @@ impl Session {
             expected: ParamsValue::from_typed(expected)?,
             action_window_id,
             requested_ttl_ms: requested_ttl,
-            params: ParamsValue::from_typed(params)?,
+            params: params_record.clone(),
         };
 
         // The frame is built and checked against the negotiated bound *before* the action is
@@ -419,6 +427,7 @@ impl Session {
             action_id,
             method,
             target: target_record,
+            params: params_record,
             request_id,
         })?;
         if self.transport.send(&frame).await.is_err() {
