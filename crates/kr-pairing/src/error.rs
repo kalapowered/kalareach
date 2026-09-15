@@ -46,6 +46,13 @@ pub enum PairingError {
     #[error("the invitation was already committed")]
     AlreadyCommitted,
 
+    /// A pairing mutation arrived in QUIC early data.
+    ///
+    /// Version 1 accepts no application mutation in 0-RTT, and a pairing mutation least of all:
+    /// early data is replayable by anyone who captured it.
+    #[error("a pairing mutation cannot arrive in early data")]
+    EarlyData,
+
     /// The host's failed-confirmation allowance for this invitation ran out.
     #[error("the invitation has no confirmation attempts left")]
     AttemptsExhausted,
@@ -162,6 +169,7 @@ impl PairingError {
             | Self::ContextMismatch { .. }
             | Self::EndpointMismatch { .. }
             | Self::ReplayedSequence { .. }
+            | Self::EarlyData
             | Self::WrongPhase { .. } => ErrorCode::PairingAuthFailed,
             Self::Expired => ErrorCode::PairingExpired,
             Self::Consumed { .. } | Self::CandidateLocked | Self::AlreadyCommitted => {
@@ -178,16 +186,6 @@ impl PairingError {
             Self::Store { .. } => ErrorCode::StorageUnavailable,
             Self::Crypto(_) | Self::Encoding(_) => ErrorCode::PairingAuthFailed,
         }
-    }
-
-    /// Returns true when this failure consumed one of the host's password-guess allowance.
-    ///
-    /// Only a confirmation tag that actually verified and did not match counts. A malformed
-    /// message, a transport failure or an abandoned candidate consumes rate and slot budgets
-    /// instead, because it produced no password confirmation result at all.
-    #[must_use]
-    pub const fn consumes_guess_allowance(&self) -> bool {
-        matches!(self, Self::AuthenticationFailed)
     }
 }
 
@@ -208,30 +206,9 @@ mod tests {
                 expected: "a",
                 actual: "b",
             },
+            PairingError::EarlyData,
         ] {
             assert_eq!(error.code(), ErrorCode::PairingAuthFailed, "{error}");
-        }
-    }
-
-    #[test]
-    fn only_a_verified_wrong_tag_consumes_the_guess_allowance() {
-        assert!(PairingError::AuthenticationFailed.consumes_guess_allowance());
-        for error in [
-            PairingError::MalformedCode,
-            PairingError::RendezvousUnavailable {
-                reason: "no route".to_owned(),
-            },
-            PairingError::RendezvousConfiguration {
-                reason: "no origin".to_owned(),
-            },
-            PairingError::TooLarge {
-                what: "a frame",
-                limit: 1,
-                actual: 2,
-            },
-            PairingError::Expired,
-        ] {
-            assert!(!error.consumes_guess_allowance(), "{error}");
         }
     }
 

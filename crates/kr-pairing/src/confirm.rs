@@ -15,7 +15,7 @@
 //! rights-enlarging confirmation. [`SensitiveAction`] lists only the actions that do, so a caller
 //! cannot ask for a confirmation of something that should never have needed one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{self, SigningTranscript};
@@ -30,7 +30,7 @@ use kr_protocol::scalars::{
 };
 
 use crate::error::{PairingError, Result};
-use crate::platform::{OwnerConfirmation, PairingClock};
+use crate::platform::{BootIdentity, OwnerConfirmation, PairingClock};
 
 /// How long a confirmation challenge stays open, in milliseconds.
 ///
@@ -185,9 +185,23 @@ pub fn verify_confirmation(
 ///
 /// User-presence verification and the challenge-consumption transition are both part of the host's
 /// acceptance record, so consumption happens here and exactly once.
+///
+/// The deadline this enforces is the host's own, on the monotonic clock and tied to the boot it
+/// was issued in. The `expires_at_ms` inside the request is the same interval expressed on the
+/// wall clock, which is what a signer and a paired owner device can read; it is not what the host
+/// trusts, because moving the wall clock backwards would otherwise reopen every challenge that
+/// had run out. A reboot ends every outstanding challenge, which is also correct: nothing resumes
+/// a ceremony across one.
 #[derive(Debug, Default)]
 pub struct ConfirmationLedger {
-    outstanding: BTreeSet<[u8; 16]>,
+    outstanding: BTreeMap<[u8; 16], ChallengeDeadline>,
+}
+
+/// When one outstanding challenge stops being answerable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChallengeDeadline {
+    monotonic_ms: u64,
+    boot_identity: BootIdentity,
 }
 
 impl ConfirmationLedger {
@@ -197,27 +211,51 @@ impl ConfirmationLedger {
         Self::default()
     }
 
-    /// Records a challenge the host has just issued.
-    pub fn issue(&mut self, request: &OwnerConfirmationRequest) {
-        self.outstanding
-            .insert(*request.confirmation_id.get().as_bytes());
+    /// Records a challenge the host has just issued, with the deadline the host will enforce.
+    pub fn issue(&mut self, request: &OwnerConfirmationRequest, clock: &dyn PairingClock) {
+        self.outstanding.insert(
+            *request.confirmation_id.get().as_bytes(),
+            ChallengeDeadline {
+                monotonic_ms: clock
+                    .monotonic_ms()
+                    .saturating_add(CONFIRMATION_LIFETIME_MS),
+                boot_identity: clock.boot_identity(),
+            },
+        );
     }
 
-    /// Consumes a challenge, which succeeds exactly once.
+    /// Consumes a challenge, which succeeds exactly once and only before its deadline.
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::OwnerConfirmationRequired`] when the challenge was never issued or
-    /// has already been used.
-    pub fn consume(&mut self, request: &OwnerConfirmationRequest) -> Result<()> {
-        if self
+    /// Returns [`PairingError::OwnerConfirmationRequired`] when the challenge was never issued,
+    /// has already been used, has run out, or belongs to an earlier boot.
+    pub fn consume(
+        &mut self,
+        request: &OwnerConfirmationRequest,
+        clock: &dyn PairingClock,
+    ) -> Result<()> {
+        let Some(deadline) = self
             .outstanding
             .remove(request.confirmation_id.get().as_bytes())
+        else {
+            return Err(PairingError::OwnerConfirmationRequired);
+        };
+        if deadline.boot_identity != clock.boot_identity()
+            || clock.monotonic_ms() >= deadline.monotonic_ms
         {
-            Ok(())
-        } else {
-            Err(PairingError::OwnerConfirmationRequired)
+            // It is removed either way: an expired challenge is spent, not retryable.
+            return Err(PairingError::OwnerConfirmationRequired);
         }
+        Ok(())
+    }
+
+    /// Drops every challenge that has run out, which a host does periodically.
+    pub fn expire(&mut self, clock: &dyn PairingClock) {
+        let now = clock.monotonic_ms();
+        let boot = clock.boot_identity();
+        self.outstanding
+            .retain(|_, deadline| deadline.boot_identity == boot && now < deadline.monotonic_ms);
     }
 
     /// Returns how many challenges are outstanding.
@@ -231,6 +269,59 @@ impl ConfirmationLedger {
     pub fn is_empty(&self) -> bool {
         self.outstanding.is_empty()
     }
+}
+
+/// Verifies a proof and consumes the challenge it answers, in that order.
+///
+/// This is the only way the pairing flows accept a confirmation. Verifying first means a caller
+/// cannot burn an owner's outstanding challenge by submitting rubbish, and consuming second means
+/// one ceremony authorises exactly one action: a proof replayed at the next sensitive step finds
+/// nothing outstanding.
+///
+/// The caller still checks that the challenge describes the action it is about to take. A
+/// confirmation of *something* is not a confirmation of *this*, which is why the action and the
+/// digest are compared by [`require_action`] before the proof is accepted.
+///
+/// # Errors
+///
+/// Returns [`PairingError::OwnerConfirmationRequired`] or [`PairingError::AuthenticationFailed`].
+pub fn accept_confirmation(
+    ledger: &mut ConfirmationLedger,
+    clock: &dyn PairingClock,
+    request: &OwnerConfirmationRequest,
+    proof: &OwnerConfirmationProof,
+    signer: &AuthorisationKey,
+    enrolment: HostEnrolment,
+) -> Result<()> {
+    verify_confirmation(clock, request, proof, signer, enrolment)?;
+    ledger.consume(request, clock)
+}
+
+/// Checks that a challenge describes the action a caller is about to take.
+///
+/// # Errors
+///
+/// Returns [`PairingError::OwnerConfirmationRequired`] when the action or the digest differs.
+pub fn require_action(
+    request: &OwnerConfirmationRequest,
+    action: SensitiveAction,
+    action_digest: Digest256,
+) -> Result<()> {
+    if request.action != action || request.action_digest != action_digest {
+        return Err(PairingError::OwnerConfirmationRequired);
+    }
+    Ok(())
+}
+
+/// Returns the digest of any canonical-CBOR value, which a challenge names as its action digest.
+///
+/// # Errors
+///
+/// Returns an encoding error when the value is outside KR-CBOR-1.
+pub fn action_digest<T: serde::Serialize>(value: &T) -> Result<Digest256> {
+    Ok(Digest256::from_bytes(kr_cbor::sha256(
+        &kr_cbor::to_canonical_vec(value)?,
+    )))
 }
 
 #[cfg(test)]
@@ -471,14 +562,152 @@ mod tests {
         let mut ledger = ConfirmationLedger::new();
         let challenge = request(&clock);
         assert!(ledger.is_empty());
-        ledger.issue(&challenge);
+        ledger.issue(&challenge, &clock);
         assert_eq!(ledger.len(), 1);
-        assert!(ledger.consume(&challenge).is_ok());
+        assert!(ledger.consume(&challenge, &clock).is_ok());
         assert!(matches!(
-            ledger.consume(&challenge),
+            ledger.consume(&challenge, &clock),
             Err(PairingError::OwnerConfirmationRequired)
         ));
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn a_challenge_runs_out_on_the_monotonic_clock() {
+        let clock = TestClock::new();
+        let mut ledger = ConfirmationLedger::new();
+        let challenge = request(&clock);
+        ledger.issue(&challenge, &clock);
+
+        // Winding the wall clock back does not reopen it: the host's deadline is monotonic.
+        clock.skew_wall_clock(-(2 * CONFIRMATION_LIFETIME_MS as i64));
+        clock.advance(CONFIRMATION_LIFETIME_MS);
+        assert!(matches!(
+            ledger.consume(&challenge, &clock),
+            Err(PairingError::OwnerConfirmationRequired)
+        ));
+        assert!(ledger.is_empty(), "an expired challenge is spent, not held");
+    }
+
+    #[test]
+    fn a_reboot_ends_every_outstanding_challenge() {
+        let clock = TestClock::new();
+        let mut ledger = ConfirmationLedger::new();
+        let challenge = request(&clock);
+        ledger.issue(&challenge, &clock);
+        clock.reboot(4);
+        assert!(matches!(
+            ledger.consume(&challenge, &clock),
+            Err(PairingError::OwnerConfirmationRequired)
+        ));
+    }
+
+    #[test]
+    fn expiring_drops_only_what_has_run_out() {
+        let clock = TestClock::new();
+        let mut ledger = ConfirmationLedger::new();
+        let early = request(&clock);
+        ledger.issue(&early, &clock);
+        clock.advance(CONFIRMATION_LIFETIME_MS - 1);
+        let late = request(&clock);
+        ledger.issue(&late, &clock);
+        clock.advance(1);
+        ledger.expire(&clock);
+        assert_eq!(ledger.len(), 1);
+        assert!(ledger.consume(&late, &clock).is_ok());
+    }
+
+    #[test]
+    fn a_proof_is_accepted_once_and_the_action_must_match() {
+        let clock = TestClock::new();
+        let owner = DeviceKeys::generate().expect("keys");
+        let mut ledger = ConfirmationLedger::new();
+        let challenge = request(&clock);
+        ledger.issue(&challenge, &clock);
+        let proof = sign_confirmation(
+            &owner.authorisation,
+            &challenge,
+            ConfirmationChannel::OwnerDevicePresence,
+        )
+        .expect("a proof");
+
+        // The challenge is for ConfirmDevice over digest [1; 32].
+        assert!(matches!(
+            require_action(
+                &challenge,
+                SensitiveAction::EnlargeGrant,
+                Digest256::from_bytes([1; 32])
+            ),
+            Err(PairingError::OwnerConfirmationRequired)
+        ));
+        assert!(matches!(
+            require_action(
+                &challenge,
+                SensitiveAction::ConfirmDevice,
+                Digest256::from_bytes([2; 32])
+            ),
+            Err(PairingError::OwnerConfirmationRequired)
+        ));
+        assert!(
+            require_action(
+                &challenge,
+                SensitiveAction::ConfirmDevice,
+                Digest256::from_bytes([1; 32])
+            )
+            .is_ok()
+        );
+
+        assert!(
+            accept_confirmation(
+                &mut ledger,
+                &clock,
+                &challenge,
+                &proof,
+                owner.authorisation.public(),
+                HostEnrolment::Enrolled,
+            )
+            .is_ok()
+        );
+        // Replaying the same proof at the next sensitive step finds nothing outstanding.
+        assert!(matches!(
+            accept_confirmation(
+                &mut ledger,
+                &clock,
+                &challenge,
+                &proof,
+                owner.authorisation.public(),
+                HostEnrolment::Enrolled,
+            ),
+            Err(PairingError::OwnerConfirmationRequired)
+        ));
+    }
+
+    #[test]
+    fn a_rubbish_proof_does_not_burn_an_outstanding_challenge() {
+        let clock = TestClock::new();
+        let owner = DeviceKeys::generate().expect("keys");
+        let impostor = DeviceKeys::generate().expect("keys");
+        let mut ledger = ConfirmationLedger::new();
+        let challenge = request(&clock);
+        ledger.issue(&challenge, &clock);
+        let forged = sign_confirmation(
+            &impostor.authorisation,
+            &challenge,
+            ConfirmationChannel::OwnerDevicePresence,
+        )
+        .expect("a proof");
+        assert!(
+            accept_confirmation(
+                &mut ledger,
+                &clock,
+                &challenge,
+                &forged,
+                owner.authorisation.public(),
+                HostEnrolment::Enrolled,
+            )
+            .is_err()
+        );
+        assert_eq!(ledger.len(), 1, "the owner's challenge is still answerable");
     }
 
     #[test]

@@ -357,6 +357,18 @@ export type PairStatus =
       }
     }
   | {
+      locked: {
+        /**
+         * The candidate that holds it.
+         */
+        attempt_id: string
+        /**
+         * A UTC timestamp in milliseconds, as a decimal string in JSON.
+         */
+        expires_at_ms: string
+      }
+    }
+  | {
       awaiting_approval: {
         /**
          * The candidate's attempt.

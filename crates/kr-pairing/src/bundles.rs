@@ -18,12 +18,13 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::secret::SymmetricKey;
 use kr_crypto::sign::{self, SigningTranscript};
 use kr_protocol::ids::PairingSequence;
+use kr_protocol::pairing::DevicePublicKeys;
 use kr_protocol::pairing::{
     BundleDirection, BundleMessageType, CLIENT_BUNDLE_DOMAIN, ClientBundle, HOST_BUNDLE_DOMAIN,
     HostBundle, MAX_PAIRING_EXCHANGE_LEN, MAX_PAIRING_FRAME_LEN, SignedClientBundle,
     SignedHostBundle, bundle_aad,
 };
-use kr_protocol::scalars::{AuthorisationKey, Digest256, Nonce192};
+use kr_protocol::scalars::{AuthorisationKey, Digest256, EndpointKey, Nonce192};
 
 use crate::error::{PairingError, Result};
 
@@ -128,17 +129,74 @@ impl ExchangeBudget {
     }
 }
 
+/// Checks that a bundle's declared endpoint is the transport key it also declares.
+///
+/// Section 10 pairs an endpoint identity with a complete purpose-key bundle whose transport member
+/// *is* that endpoint. Letting the two differ would give a candidate two identities: one the
+/// connection authenticates and one the device record is written from, and a later connection to
+/// the second would be to a device nobody proved possession of. The check runs on both sides: a
+/// signer cannot build an inconsistent bundle and a receiver will not accept one.
+///
+/// It also rejects a bundle that reuses one key under two purposes, because purpose separation is
+/// what stops a transport key being usable as an authorisation key.
+///
+/// # Errors
+///
+/// Returns [`PairingError::ContextMismatch`].
+pub fn require_consistent_host_bundle(bundle: &HostBundle) -> Result<()> {
+    require_consistent_keys(
+        &bundle.keys,
+        &bundle.endpoint_id,
+        "the endpoint a host bundle declares, which is not its own transport key",
+    )
+}
+
+/// Checks the same of a client bundle.
+///
+/// # Errors
+///
+/// Returns [`PairingError::ContextMismatch`].
+pub fn require_consistent_client_bundle(bundle: &ClientBundle) -> Result<()> {
+    require_consistent_keys(
+        &bundle.keys,
+        &bundle.endpoint_id,
+        "the endpoint a client bundle declares, which is not its own transport key",
+    )
+}
+
+/// Checks a declared endpoint against a key bundle, whichever side declared them.
+///
+/// # Errors
+///
+/// Returns [`PairingError::ContextMismatch`].
+pub fn require_consistent_keys(
+    keys: &DevicePublicKeys,
+    endpoint_id: &EndpointKey,
+    mismatch: &'static str,
+) -> Result<()> {
+    if !keys.purposes_are_distinct() {
+        return Err(PairingError::ContextMismatch {
+            what: "the key purposes of a bundle, two of which share a key",
+        });
+    }
+    if keys.transport != *endpoint_id {
+        return Err(PairingError::ContextMismatch { what: mismatch });
+    }
+    Ok(())
+}
+
 /// Signs a host bundle over `CBOR(["kr-pair/host-bundle/1", bundle, T])`.
 ///
 /// # Errors
 ///
-/// Returns an encoding error when the bundle is outside KR-CBOR-1, and a library error when
-/// libsodium fails.
+/// Returns [`PairingError::ContextMismatch`] when the bundle's endpoint is not its own transport
+/// key, an encoding error when it is outside KR-CBOR-1, and a library error when libsodium fails.
 pub fn sign_host_bundle(
     key: &AuthorisationKeyPair,
     bundle: HostBundle,
     transcript: Digest256,
 ) -> Result<SignedHostBundle> {
+    require_consistent_host_bundle(&bundle)?;
     let signature = sign::sign(
         key,
         &bundle_transcript(HOST_BUNDLE_DOMAIN, &bundle, transcript)?,
@@ -154,13 +212,14 @@ pub fn sign_host_bundle(
 ///
 /// # Errors
 ///
-/// Returns an encoding error when the bundle is outside KR-CBOR-1, and a library error when
-/// libsodium fails.
+/// Returns [`PairingError::ContextMismatch`] when the bundle's endpoint is not its own transport
+/// key, an encoding error when it is outside KR-CBOR-1, and a library error when libsodium fails.
 pub fn sign_client_bundle(
     key: &AuthorisationKeyPair,
     bundle: ClientBundle,
     transcript: Digest256,
 ) -> Result<SignedClientBundle> {
+    require_consistent_client_bundle(&bundle)?;
     let signature = sign::sign(
         key,
         &bundle_transcript(CLIENT_BUNDLE_DOMAIN, &bundle, transcript)?,
@@ -188,6 +247,7 @@ pub fn verify_host_bundle(signed: &SignedHostBundle, transcript: Digest256) -> R
             what: "the transcript a host bundle names",
         });
     }
+    require_consistent_host_bundle(&signed.bundle)?;
     verify_bundle_signature(
         HOST_BUNDLE_DOMAIN,
         &signed.bundle,
@@ -208,6 +268,7 @@ pub fn verify_client_bundle(signed: &SignedClientBundle, transcript: Digest256) 
             what: "the transcript a client bundle names",
         });
     }
+    require_consistent_client_bundle(&signed.bundle)?;
     verify_bundle_signature(
         CLIENT_BUNDLE_DOMAIN,
         &signed.bundle,
@@ -582,12 +643,56 @@ mod tests {
         let impostor = DeviceKeys::generate().expect("keys");
         let mut signed = sign_host_bundle(&keys.authorisation, host_bundle(&keys), transcript())
             .expect("a signed bundle");
-        // Declaring another device's keys under this bundle breaks the signature, because the
-        // signature covers the declaration and is checked against the declared key.
+        // Declaring another device's keys under this bundle leaves the endpoint disagreeing with
+        // the transport key, which is refused before the signature is even considered.
         signed.bundle.keys = impostor.public_keys();
         assert!(matches!(
             verify_host_bundle(&signed, transcript()),
+            Err(PairingError::ContextMismatch { .. })
+        ));
+        // Substituting the endpoint too makes the bundle self-consistent, and then the signature
+        // is what refuses it: it covers the declaration and is checked against the declared key.
+        signed.bundle.endpoint_id = *impostor.transport.public();
+        assert!(matches!(
+            verify_host_bundle(&signed, transcript()),
             Err(PairingError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn a_bundle_must_declare_its_own_transport_key_as_its_endpoint() {
+        let keys = DeviceKeys::generate().expect("keys");
+        let impostor = DeviceKeys::generate().expect("keys");
+
+        let mut bundle = host_bundle(&keys);
+        bundle.endpoint_id = *impostor.transport.public();
+        assert!(
+            matches!(
+                sign_host_bundle(&keys.authorisation, bundle, transcript()),
+                Err(PairingError::ContextMismatch { .. })
+            ),
+            "a signer cannot build an inconsistent bundle either"
+        );
+
+        let mut bundle = client_bundle(&keys);
+        bundle.endpoint_id = *impostor.transport.public();
+        assert!(matches!(
+            sign_client_bundle(&keys.authorisation, bundle, transcript()),
+            Err(PairingError::ContextMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_bundle_that_reuses_one_key_under_two_purposes_is_refused() {
+        let keys = DeviceKeys::generate().expect("keys");
+        let mut bundle = client_bundle(&keys);
+        // The notification-preview key becomes the stored-envelope key: one key, two purposes.
+        bundle.keys.notification_preview = kr_protocol::scalars::NotificationPreviewKey::from_bytes(
+            *bundle.keys.stored_envelope.as_bytes(),
+        );
+        assert!(matches!(
+            sign_client_bundle(&keys.authorisation, bundle, transcript()),
+            Err(PairingError::ContextMismatch { .. })
         ));
     }
 }

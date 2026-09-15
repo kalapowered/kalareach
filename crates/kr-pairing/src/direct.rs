@@ -21,17 +21,22 @@ use kr_crypto::sign::{self, SigningTranscript};
 use kr_crypto::{constant_time_eq, kdf};
 use kr_protocol::ids::{AttemptId, DeviceId, GrantId, InvitationId};
 use kr_protocol::pairing::{
-    DIRECT_DOMAIN, DevicePublicKeys, DirectChallenge, DirectQrPayload, DirectRedeemProof,
-    DirectTranscript, INVITATION_LIFETIME_MS, NetworkConfig, PairStatus, PairingConsumedReason,
+    ClientBundle, DIRECT_DOMAIN, DevicePublicKeys, DirectChallenge, DirectQrPayload,
+    DirectRedeemProof, DirectTranscript, INVITATION_LIFETIME_MS, PairStatus, PairingConsumedReason,
     ProposedGrant, QrPayload, direct_verification_value,
 };
 use kr_protocol::scalars::{
     Digest256, EndpointKey, Mac256, Nonce256, SecretBytes32, TimestampMs, Uuid,
 };
 
+use crate::bundles;
+use crate::confirm::ConfirmationLedger;
 use crate::error::{PairingError, Result};
-use crate::host::OwnerContext;
-use crate::platform::{InvitationRecord, InvitationState, InvitationStore, LivePeer, PairingClock};
+use crate::host::{HostIdentity, OwnerApproval, OwnerContext, confirm_action_digest};
+use crate::platform::{
+    InvitationRecord, InvitationState, InvitationStore, LivePeer, PairingClock, PairingCommitment,
+    require_completed_handshake,
+};
 
 /// The candidate a direct redemption locked.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,21 +49,11 @@ pub struct DirectCandidate {
     pub transcript_digest: Digest256,
     /// The eight hexadecimal characters both devices display.
     pub verification_value: String,
-}
-
-/// What a direct confirmation committed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DirectCommit {
-    /// The attempt that was approved.
-    pub attempt_id: AttemptId,
-    /// The device record the host created.
-    pub device_id: DeviceId,
-    /// The grant the host issued.
-    pub grant_id: GrantId,
-    /// The candidate's complete purpose-key bundle.
-    pub client_keys: DevicePublicKeys,
-    /// The grant the invitation proposed, unchanged.
-    pub proposed_grant: ProposedGrant,
+    /// What the candidate declared about itself, in the shape a device record is written from.
+    ///
+    /// The two entry modes produce the same thing here, so a caller writes one device record from
+    /// either route. The display members are display text; the authority is the key bundle.
+    pub client_bundle: ClientBundle,
 }
 
 /// The host's side of one direct invitation.
@@ -67,44 +62,49 @@ pub struct DirectInvitation<S: InvitationStore, C: PairingClock> {
     clock: C,
     record: InvitationRecord,
     secret: Secret<32>,
-    host_endpoint: EndpointKey,
-    host_keys: DevicePublicKeys,
-    host_key_revision: kr_protocol::ids::DeviceKeyRevision,
-    network_config: NetworkConfig,
+    host: HostIdentity,
     proposed_grant: ProposedGrant,
     issuing_owner: OwnerContext,
     expires_at_ms: TimestampMs,
     /// The outstanding challenge. A challenge is single use and expires with the invitation.
     challenge: Option<Nonce256>,
     candidate: Option<DirectCandidate>,
-    committed: Option<DirectCommit>,
+    /// Set when a durable write failed. The invitation serves nobody afterwards.
+    fenced: bool,
 }
 
 impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     /// Issues a direct invitation and persists its record.
     ///
+    /// Issuing a persistent pairing invitation needs a fresh owner confirmation bound to the
+    /// rights being proposed, the same as the short-code route: the QR carries the full secret, so
+    /// producing one is handing out the invitation itself.
+    ///
     /// # Errors
     ///
-    /// Returns [`PairingError::Store`] or a crypto error.
-    #[allow(clippy::too_many_arguments)]
+    /// Returns [`PairingError::OwnerConfirmationRequired`] without a valid single-use
+    /// confirmation, [`PairingError::Store`] when the record cannot be persisted, and a crypto
+    /// error when libsodium is unavailable.
     pub fn issue(
         store: S,
         clock: C,
-        host_endpoint: EndpointKey,
-        host_keys: DevicePublicKeys,
-        host_key_revision: kr_protocol::ids::DeviceKeyRevision,
-        network_config: NetworkConfig,
+        host: HostIdentity,
         proposed_grant: ProposedGrant,
-        issuing_owner: OwnerContext,
+        approval: &OwnerApproval<'_>,
+        ledger: &mut ConfirmationLedger,
     ) -> Result<Self> {
+        approval.accept_issue(ledger, &clock, &proposed_grant)?;
+        bundles::require_consistent_keys(
+            &host.keys,
+            &host.endpoint_id,
+            "the endpoint a host declares, which is not its own transport key",
+        )?;
         let mut identity = [0u8; 16];
         kr_crypto::random_bytes(&mut identity)?;
         let record = InvitationRecord {
             invitation_id: InvitationId::new(Uuid::from_bytes(identity)),
-            // A direct invitation has no rendezvous record, so it has no locator to reserve. The
-            // field is part of the shared record shape; the value is the one a QR carries instead.
-            locator: kr_protocol::pairing::Locator::new("1111")
-                .expect("a placeholder locator is alphabet characters"),
+            // A direct invitation has no rendezvous record, so there is no locator to reserve.
+            locator: None,
             state: InvitationState::Open,
             failed_confirmations: 0,
             deadline_monotonic_ms: clock.monotonic_ms().saturating_add(INVITATION_LIFETIME_MS),
@@ -113,21 +113,19 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         store.save(&record)?;
         let expires_at_ms =
             TimestampMs::new(clock.wall_clock_ms().saturating_add(INVITATION_LIFETIME_MS));
+        let issuing_owner = approval.owner.clone();
         Ok(Self {
             store,
             clock,
             record,
             secret: Secret::random()?,
-            host_endpoint,
-            host_keys,
-            host_key_revision,
-            network_config,
+            host,
             proposed_grant,
             issuing_owner,
             expires_at_ms,
             challenge: None,
             candidate: None,
-            committed: None,
+            fenced: false,
         })
     }
 
@@ -139,8 +137,8 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     pub fn qr_payload(&self) -> QrPayload {
         QrPayload::Direct(Box::new(DirectQrPayload {
             invitation_id: self.record.invitation_id,
-            endpoint_id: self.host_endpoint,
-            network_config: self.network_config.clone(),
+            endpoint_id: self.host.endpoint_id,
+            network_config: self.host.network_config.clone(),
             secret: SecretBytes32::from_bytes(*self.secret.expose()),
             proposed_grant: self.proposed_grant.clone(),
             expires_at_ms: self.expires_at_ms,
@@ -153,19 +151,10 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         self.record.invitation_id
     }
 
-    /// Returns the record as it is persisted.
+    /// Returns the record as this host last read or wrote it.
     #[must_use]
     pub const fn record(&self) -> &InvitationRecord {
         &self.record
-    }
-
-    /// Replaces the persisted record, for a caller that shares one record across both entry modes.
-    ///
-    /// An invitation may offer a short code and a direct QR. Both routes then read and write one
-    /// candidate and consumption record, so a candidate already awaiting approval is not replaced
-    /// by the other route.
-    pub fn adopt_record(&mut self, record: InvitationRecord) {
-        self.record = record;
     }
 
     /// Issues a fresh single-use challenge and returns it with the host's complete key bundle.
@@ -176,8 +165,9 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     /// # Errors
     ///
     /// Returns [`PairingError::Expired`], [`PairingError::Consumed`],
-    /// [`PairingError::CandidateLocked`] or a crypto error.
-    pub fn issue_challenge(&mut self) -> Result<DirectChallenge> {
+    /// [`PairingError::CandidateLocked`], [`PairingError::EarlyData`] or a crypto error.
+    pub fn issue_challenge(&mut self, live_peer: &dyn LivePeer) -> Result<DirectChallenge> {
+        require_completed_handshake(live_peer)?;
         self.require_open()?;
         let mut nonce = [0u8; 32];
         kr_crypto::random_bytes(&mut nonce)?;
@@ -188,9 +178,9 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         Ok(DirectChallenge {
             invitation_id: self.record.invitation_id,
             host_nonce,
-            host_keys: self.host_keys,
-            device_key_revision: self.host_key_revision,
-            endpoint_id: self.host_endpoint,
+            host_keys: self.host.keys,
+            device_key_revision: self.host.device_key_revision,
+            endpoint_id: self.host.endpoint_id,
             expires_at_ms: self.expires_at_ms,
         })
     }
@@ -199,7 +189,8 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::ContextMismatch`] for a stale or unknown challenge,
+    /// Returns [`PairingError::EarlyData`] for a redemption in 0-RTT,
+    /// [`PairingError::ContextMismatch`] for a stale or unknown challenge,
     /// [`PairingError::EndpointMismatch`] when the submitted endpoint is not the live peer, and
     /// [`PairingError::AuthenticationFailed`] when either proof fails.
     pub fn redeem(
@@ -208,6 +199,7 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         client_endpoint: &EndpointKey,
         live_peer: &dyn LivePeer,
     ) -> Result<DirectCandidate> {
+        require_completed_handshake(live_peer)?;
         self.require_open()?;
         if proof.invitation_id != self.record.invitation_id {
             return Err(PairingError::ContextMismatch {
@@ -230,17 +222,19 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         if live_peer.live_endpoint()? != *client_endpoint {
             return Err(PairingError::EndpointMismatch { side: "client" });
         }
-        if !proof.client_keys.purposes_are_distinct() {
-            return Err(PairingError::ContextMismatch {
-                what: "a candidate's key purposes, two of which share a key",
-            });
-        }
+        // And the key bundle must declare that same endpoint as its transport key, so the device
+        // record is written for the device that actually proved possession of the secret.
+        bundles::require_consistent_keys(
+            &proof.client_keys,
+            client_endpoint,
+            "the endpoint a redemption declares, which is not its own transport key",
+        )?;
 
         let transcript = DirectTranscript {
             invitation_id: self.record.invitation_id,
-            host_endpoint_id: self.host_endpoint,
+            host_endpoint_id: self.host.endpoint_id,
             client_endpoint_id: *client_endpoint,
-            host_keys: self.host_keys,
+            host_keys: self.host.keys,
             client_keys: proof.client_keys,
             proposed_grant_digest: proposed_grant_digest(&self.proposed_grant)?,
             host_nonce: expected,
@@ -270,35 +264,49 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
                 &transcript.to_canonical_bytes(),
             )),
             verification_value: direct_verification_value(&transcript),
+            client_bundle: ClientBundle {
+                endpoint_id: *client_endpoint,
+                keys: proof.client_keys,
+                device_key_revision: proof.device_key_revision,
+                device_name: proof.device_name.clone(),
+                platform: proof.platform,
+            },
             transcript,
         };
-        self.record.state = InvitationState::AwaitingApproval { attempt_id };
-        self.store.save(&self.record)?;
+        // The lock is persisted before the candidate is told it holds the invitation.
+        let mut record = self.record.clone();
+        record.state = InvitationState::Locked { attempt_id };
+        self.persist(record)?;
         self.candidate = Some(candidate.clone());
         Ok(candidate)
     }
 
     /// Commits the device record, the grant and the consumed invitation after the owner approves.
     ///
+    /// Confirming a new device is a sensitive action, so this needs a fresh single-use owner
+    /// confirmation naming the digest of the exact transcript and key bundle the owner was shown.
+    /// The three writes are one store transaction and success is reported only after it returns.
+    ///
     /// # Errors
     ///
-    /// Returns [`PairingError::NotIssuingOwner`], [`PairingError::WrongPhase`] or
-    /// [`PairingError::ContextMismatch`] when the owner names another transcript or another
-    /// client-key digest.
+    /// Returns [`PairingError::NotIssuingOwner`], [`PairingError::OwnerConfirmationRequired`],
+    /// [`PairingError::WrongPhase`], [`PairingError::Store`] or [`PairingError::ContextMismatch`]
+    /// when the owner names another transcript or another client-key digest.
     pub fn confirm(
         &mut self,
-        owner: &OwnerContext,
+        approval: &OwnerApproval<'_>,
+        ledger: &mut ConfirmationLedger,
         transcript_digest: Digest256,
         client_key_digest: Digest256,
         device_id: DeviceId,
         grant_id: GrantId,
-    ) -> Result<DirectCommit> {
-        if owner != &self.issuing_owner {
+    ) -> Result<PairingCommitment> {
+        if approval.owner != &self.issuing_owner {
             return Err(PairingError::NotIssuingOwner);
         }
-        if let Some(committed) = self.committed.clone() {
+        if let Some(committed) = self.store.commitment(self.record.invitation_id)? {
             // An idempotent retry retrieves the committed result; it cannot change the submitted
-            // keys or the proposed rights.
+            // keys or the proposed rights, and it works after a restart.
             return Ok(committed);
         }
         self.require_open()?;
@@ -318,18 +326,36 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
                 what: "the client key digest the owner approved",
             });
         }
-        let commit = DirectCommit {
+        approval.accept_confirm_device(
+            ledger,
+            &self.clock,
+            confirm_action_digest(transcript_digest, client_key_digest),
+        )?;
+
+        let commitment = PairingCommitment {
+            invitation_id: self.record.invitation_id,
             attempt_id: candidate.attempt_id,
             device_id,
             grant_id,
             client_keys: candidate.transcript.client_keys,
+            client_bundle: Some(candidate.client_bundle.clone()),
             proposed_grant: self.proposed_grant.clone(),
+            verification_value: candidate.verification_value.clone(),
+            committed_at_ms: TimestampMs::new(self.clock.wall_clock_ms()),
         };
-        self.record.state = InvitationState::Committed;
-        self.store.save(&self.record)?;
-        self.challenge = None;
-        self.committed = Some(commit.clone());
-        Ok(commit)
+        let mut record = self.record.clone();
+        record.state = InvitationState::Committed;
+        match self.store.commit(&record, &commitment) {
+            Ok(()) => {
+                self.record = record;
+                self.challenge = None;
+                Ok(commitment)
+            }
+            Err(error) => {
+                self.fenced = true;
+                Err(error)
+            }
+        }
     }
 
     /// Consumes the invitation without a grant.
@@ -346,51 +372,79 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
 
     /// Reports the invitation's state.
     ///
-    /// A candidate sees only its own attempt, the issuing owner sees everything, and neither sees
-    /// secret material.
+    /// A candidate sees only its own attempt, and must ask from the endpoint its own redemption
+    /// declared. The issuing owner sees everything. Neither sees secret material.
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::NotIssuingOwner`] when the viewer is neither.
+    /// Returns [`PairingError::NotIssuingOwner`] when the viewer is neither, and
+    /// [`PairingError::EarlyData`] for a candidate asking in 0-RTT.
     pub fn status(&mut self, viewer: DirectStatusViewer<'_>) -> Result<PairStatus> {
+        // Reading the record rather than remembering it: the other entry mode may have consumed or
+        // locked this invitation since the last transition here.
+        if let Some(record) = self.store.load(self.record.invitation_id)? {
+            self.record = record;
+        }
         if self.is_expired() {
             self.consume(PairingConsumedReason::Expired)?;
         }
+        let committed = self.store.commitment(self.record.invitation_id)?;
         let permitted = match viewer {
             DirectStatusViewer::IssuingOwner(owner) => owner == &self.issuing_owner,
-            DirectStatusViewer::Candidate(attempt_id) => self
-                .candidate
-                .as_ref()
-                .is_some_and(|candidate| candidate.attempt_id == attempt_id),
+            DirectStatusViewer::Candidate {
+                attempt_id,
+                live_peer,
+            } => {
+                require_completed_handshake(live_peer)?;
+                let endpoint = live_peer.live_endpoint()?;
+                committed.as_ref().map_or_else(
+                    || {
+                        self.candidate.as_ref().is_some_and(|candidate| {
+                            candidate.attempt_id == attempt_id
+                                && candidate.transcript.client_endpoint_id == endpoint
+                        })
+                    },
+                    |committed| {
+                        committed.attempt_id == attempt_id
+                            && committed.client_keys.transport == endpoint
+                    },
+                )
+            }
         };
         if !permitted {
             return Err(PairingError::NotIssuingOwner);
         }
+        if let Some(committed) = committed {
+            return Ok(PairStatus::Committed {
+                device_id: committed.device_id,
+                grant_id: committed.grant_id,
+            });
+        }
         Ok(match self.record.state {
             InvitationState::Open => PairStatus::Open {
+                // A direct invitation has no password to guess, so it has no guess allowance.
                 remaining_confirmations: 0,
                 expires_at_ms: self.expires_at_ms,
             },
-            InvitationState::AwaitingApproval { attempt_id } => {
-                let candidate = self.candidate.as_ref().ok_or(PairingError::WrongPhase {
-                    expected: "owner approval",
-                    actual: "an invitation with no locked candidate",
-                })?;
-                PairStatus::AwaitingApproval {
+            InvitationState::Locked { attempt_id } => match self.candidate.as_ref() {
+                Some(candidate) if candidate.attempt_id == attempt_id => {
+                    PairStatus::AwaitingApproval {
+                        attempt_id,
+                        verification_value: candidate.verification_value.clone(),
+                        expires_at_ms: self.expires_at_ms,
+                    }
+                }
+                // The other entry mode's candidate, or one from before a restart. There is no
+                // verification value to show for it here, and it is not open either.
+                _ => PairStatus::Locked {
                     attempt_id,
-                    verification_value: candidate.verification_value.clone(),
                     expires_at_ms: self.expires_at_ms,
-                }
-            }
+                },
+            },
             InvitationState::Committed => {
-                let committed = self.committed.as_ref().ok_or(PairingError::WrongPhase {
-                    expected: "a committed pairing",
-                    actual: "an invitation with no committed result",
-                })?;
-                PairStatus::Committed {
-                    device_id: committed.device_id,
-                    grant_id: committed.grant_id,
-                }
+                return Err(PairingError::Store {
+                    reason: "a committed invitation has no commitment record".to_owned(),
+                });
             }
             InvitationState::Consumed { reason } => PairStatus::Consumed { reason },
         })
@@ -401,7 +455,18 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             || self.clock.monotonic_ms() >= self.record.deadline_monotonic_ms
     }
 
+    /// Reloads the authoritative record and checks the invitation.
     fn require_open(&mut self) -> Result<()> {
+        if self.fenced {
+            return Err(PairingError::Store {
+                reason: "this invitation was fenced by a failed write".to_owned(),
+            });
+        }
+        // One invitation may offer a short code and a direct QR. The store is the authority, so
+        // both routes read one candidate and one consumption and neither replaces the other's.
+        if let Some(record) = self.store.load(self.record.invitation_id)? {
+            self.record = record;
+        }
         if let InvitationState::Consumed { reason } = self.record.state {
             return Err(PairingError::Consumed { reason });
         }
@@ -412,15 +477,32 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             self.consume(PairingConsumedReason::Expired)?;
             return Err(PairingError::Expired);
         }
-        // A candidate already awaiting approval is not replaced, by this route or the other. A
-        // record that says a candidate holds it while this flow has none is the other route's
-        // candidate.
-        if matches!(self.record.state, InvitationState::AwaitingApproval { .. })
-            && self.candidate.is_none()
+        // A candidate already holds the invitation and is not replaced, by this route or the
+        // other. A record that says one holds it while this flow has none is the other route's.
+        if let Some(attempt_id) = self.record.state.locked_attempt()
+            && self
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.attempt_id)
+                != Some(attempt_id)
         {
             return Err(PairingError::CandidateLocked);
         }
         Ok(())
+    }
+
+    /// Writes a record and adopts it, fencing the invitation when the write fails.
+    fn persist(&mut self, record: InvitationRecord) -> Result<()> {
+        match self.store.save(&record) {
+            Ok(()) => {
+                self.record = record;
+                Ok(())
+            }
+            Err(error) => {
+                self.fenced = true;
+                Err(error)
+            }
+        }
     }
 
     fn consume(&mut self, reason: PairingConsumedReason) -> Result<()> {
@@ -428,8 +510,9 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             self.record.state,
             InvitationState::Consumed { .. } | InvitationState::Committed
         ) {
-            self.record.state = InvitationState::Consumed { reason };
-            self.store.save(&self.record)?;
+            let mut record = self.record.clone();
+            record.state = InvitationState::Consumed { reason };
+            self.persist(record)?;
         }
         self.challenge = None;
         Ok(())
@@ -437,12 +520,26 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
 }
 
 /// Who is asking for a direct invitation's status.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub enum DirectStatusViewer<'a> {
     /// The owner that issued it.
     IssuingOwner(&'a OwnerContext),
-    /// The candidate, on its own authenticated endpoint.
-    Candidate(AttemptId),
+    /// The candidate, which must ask from the endpoint its redemption declared.
+    Candidate {
+        /// Its attempt.
+        attempt_id: AttemptId,
+        /// The live connection it is asking over.
+        live_peer: &'a dyn LivePeer,
+    },
+}
+
+impl core::fmt::Debug for DirectStatusViewer<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::IssuingOwner(owner) => write!(formatter, "IssuingOwner({owner:?})"),
+            Self::Candidate { attempt_id, .. } => write!(formatter, "Candidate({attempt_id:?})"),
+        }
+    }
 }
 
 /// Returns the digest of a proposed grant, which `D` names rather than embedding.
@@ -478,6 +575,7 @@ pub fn redeem_proof(
     challenge: &DirectChallenge,
     authorisation: &AuthorisationKeyPair,
     candidate: &CandidateIdentity,
+    live_peer: &dyn LivePeer,
 ) -> Result<(DirectRedeemProof, DirectTranscript)> {
     let CandidateIdentity {
         keys: client_keys,
@@ -500,6 +598,24 @@ pub fn redeem_proof(
             what: "the host endpoint a challenge comes from",
         });
     }
+    // And the connection this arrived on must be to that endpoint. Without this the candidate
+    // would send its proof, which carries the invitation secret's tag, to whichever peer it
+    // happened to reach: a relay or a discovery answer that pointed elsewhere would be enough.
+    require_completed_handshake(live_peer)?;
+    if live_peer.live_endpoint()? != payload.endpoint_id {
+        return Err(PairingError::EndpointMismatch { side: "host" });
+    }
+    // The host's key bundle must declare that endpoint as its own transport key.
+    bundles::require_consistent_keys(
+        &challenge.host_keys,
+        &challenge.endpoint_id,
+        "the endpoint a host challenge declares, which is not its own transport key",
+    )?;
+    bundles::require_consistent_keys(
+        &candidate.keys,
+        &candidate.endpoint_id,
+        "the endpoint a candidate declares, which is not its own transport key",
+    )?;
     if challenge.expires_at_ms != payload.expires_at_ms {
         return Err(PairingError::ContextMismatch {
             what: "the expiry a challenge names",

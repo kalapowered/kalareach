@@ -32,10 +32,10 @@ request, a URL, a log or an analytics event; `ShortCode`, `CodeSecret`, `Generat
 | 3 | The candidate makes a 128-bit attempt identity and a 256-bit nonce; the host admits the attempt under its budget and makes its own nonce. Both devices build the context `C` themselves and reject an inconsistent one. |
 | 4 | The host is role A and calls `start_a`; the candidate is role B and calls `start_b`. Both pass the same two identities, host first, and the six characters. Each sends its library message unchanged and calls `finish` exactly once. |
 | 5 | `T = SHA256(CBOR([C, message_A, message_B]))`. HKDF-SHA256 with the shared key as input key material and `T` as salt derives five 32-byte keys under five literal information strings. |
-| 6 | The candidate sends `HMAC-SHA256(client-confirm-key, T)`. The host verifies it in constant time and answers with `HMAC-SHA256(host-confirm-key, T)`. The candidate verifies that **before** it trusts any host metadata. |
+| 6 | The candidate sends `HMAC-SHA256(client-confirm-key, T)`. The host verifies it in constant time. A tag that matches **locks the invitation to that candidate**, persisted before the host answers with `HMAC-SHA256(host-confirm-key, T)`; the competing candidates are cancelled there. The candidate verifies the host's tag **before** it trusts any host metadata. |
 | 7 | The two bundles are exchanged under the directional keys with fresh nonces, sequence numbers and deterministic-CBOR additional data. Each device signs its own bundle and `T`. |
 | 8 | The candidate connects to the endpoint the authenticated bundle pinned. `pair.finish` carries the identities, `T`, both bundle hashes and a tag under the iroh-bind key whose input includes both endpoint identities. Each side checks the live peer against the authenticated bundle. |
-| 9 | Only then does the issuing device show the owner the new device, the proposed permissions and the eight-hex verification value. `pair.confirm` names the exact transcript and client bundle hash. |
+| 9 | Only then does the issuing device show the owner the new device, the proposed permissions and the eight-hex verification value. `pair.confirm` needs a fresh owner confirmation naming the exact transcript and client bundle hash, and commits the device record, the grant and the consumed invitation in one store transaction. |
 
 The confirmation tags are not decoration: receiving a key from `finish` does not establish that the
 peer entered the same password. That is why `finish` succeeds for two different passwords and the
@@ -51,18 +51,41 @@ local configuration error and an abandoned candidate consume rate and slot budge
 none of them produced a password confirmation result. The count is persisted before the failure is
 reported, so a host that dies there comes back having spent the guess.
 
-A successful `pair.finish` locks the invitation to that candidate and cancels the others. Denial,
+The lock is at the PAKE, not at `pair.finish`: a matching confirmation tag locks the invitation to
+that candidate and cancels the others before the host answers. Leaving it open until `finish` would
+let a second candidate keep guessing against an invitation someone had already proved. Denial,
 expiry, cancellation and five failures each consume it; a new invitation needs another owner action.
-A host restart cancels every unfinished invitation, because a candidate's attempt state lives only
-in memory and nothing can resume it — consumed records and failure counts survive.
+A host restart cancels every unfinished invitation, a locked one included, because a candidate's
+attempt state lives only in memory and nothing can resume it — consumed records and failure counts
+survive.
+
+Each candidate also has ten seconds to finish its handshake. A slot that runs out frees itself and
+charges no guess, and `abort` frees one on request, so four silent candidates cannot hold the room
+shut for the invitation's whole five minutes.
+
+Every durable decision is written before it is acted on, and a write that fails **fences** the
+invitation: it serves nobody until a restart cancels it. Handing a spent guess back is the one
+outcome that must not happen, so a host that cannot record one stops instead.
+
+The store is the authority on the record. Both entry modes reload it before every transition and
+write it back, so an invitation that offers a short code and a direct QR has one candidate and one
+consumption whichever route reaches it first.
 
 **The candidate** permits five attempts per entered code, and never retries a failed key
 confirmation automatically. The counter is keyed by an HMAC of the configured origin and the
 normalised full code under a distinct random local key from secure storage, never a transport or
 control key, and never by the service-supplied identity or expiry. Its five-minute window starts at
 local first entry on monotonic time and the boot identity; the count survives an application
-restart, an operating-system reboot expires an unfinished entry, and an exhausted or expired entry
-leaves a tombstone for 24 hours so another advertised expiry cannot reset it.
+restart, and an operating-system reboot expires an unfinished entry. Expiring is not forgetting: a
+reboot and a window that ran out both leave the same 24-hour tombstone as exhaustion does, so a
+device cannot buy five more guesses by restarting and another advertised expiry cannot reset the
+counter. The tombstone's retention is on the wall clock, because a monotonic deadline from the
+previous boot means nothing after one.
+
+The whole rule is one pure function applied inside the store's own lock, so the read, the decision
+and the write are one transition: two entries of the same code cannot both see four attempts and
+both proceed. The tag is computed over a buffer that clears itself, so the code does not reach an
+encoder's internal copies.
 
 The two counters are separate by design. The host's bound is not an aggregate across clients:
 reusing one code on several devices increases the total guessing opportunities, and each device
@@ -90,6 +113,16 @@ proposed_grant_digest, host_nonce, client_nonce, expires_at])`. The candidate su
 `HMAC-SHA256(invitation_secret, D)` **and** an Ed25519 signature over `D`: the tag proves possession
 and the signature binds the key-purpose declarations. The host requires the submitted endpoint to
 equal the live authenticated peer before it locks anything.
+
+The candidate checks the connection too: it refuses to send a proof unless the live authenticated
+peer is the endpoint the QR pinned, and refuses to send one at all over a connection still in early
+data. Without that check a relay or a discovery answer pointing elsewhere would be enough to collect
+the tag over the invitation secret. Every mutation on both sides is refused in QUIC 0-RTT, because
+early data is replayable by anything that captured it.
+
+Both routes also require a declared endpoint to **be** the declared transport key, in the two
+bundles and in the direct proof. Letting them differ would give a device two identities: one the
+connection authenticates and one the device record is written from.
 
 A challenge is single use and expires with the invitation; issuing another retires the first. The
 verification value is the first eight hexadecimal characters of
@@ -137,8 +170,20 @@ how the confirmation was obtained.
 
 A session, plugin or contact-tool channel is refused outright. The interactive controlling terminal
 is the initial local bootstrap exception and nothing more: afterwards a host with no
-user-presence-capable signer and no separately paired owner refuses rather than downgrading. The
-challenge is consumed exactly once, which is part of the host's acceptance record.
+user-presence-capable signer and no separately paired owner refuses rather than downgrading.
+
+The challenge is consumed exactly once, which is part of the host's acceptance record. Verification
+comes first and consumption second, so rubbish cannot burn an owner's outstanding challenge and a
+proof replayed at the next sensitive step finds nothing outstanding. The deadline the host enforces
+is monotonic and tied to the boot the challenge was issued in; the `expires_at_ms` inside the
+request is the same interval on the wall clock, for the signer to read. Winding the wall clock back
+therefore reopens nothing, and a reboot ends every outstanding challenge.
+
+Both flows depend on this rather than describing it. `HostInvitation::issue` and
+`DirectInvitation::issue` require a confirmation naming `issue_invitation` and the digest of the
+exact proposed grant; `confirm` on either requires one naming `confirm_device` and the digest of the
+exact transcript and candidate the owner was shown, so a confirmation obtained for one candidate
+cannot approve another.
 
 ## The PAKE profile
 
@@ -154,6 +199,11 @@ version 0.4.0, with explicit A and B roles.
   longer ad hoc shared secret is not an automatic security-equivalent substitution.
 - No PAKE is implemented here. Malformed messages, a wrong role and invalid group elements are all
   rejected through the library's own error path.
+- `spake2::Password` does not clear itself. The six characters therefore live in a heap buffer the
+  library owns until it is dropped, which this crate cannot reach. Everything on this side of the
+  boundary — `CodeSecret`, `GeneratedCode`, `EnteredCode`, the shared key and the five derived keys
+  — zeroises. Closing this needs a change in the dependency, so it belongs to the same release gate
+  as the profile itself.
 
 The review artefact must cover the exact source and dependency hashes and build configurations:
 role and transcript binding, element validation, the confirmation and HKDF domains, RNG failure,
@@ -167,8 +217,12 @@ verification values and the `pair.finish` inputs. What it does not fix is decide
 owner-confirmation, key-identifier, revocation and authority domain strings; the element order
 inside the additional data, the finish tag and `D`; the positional key array inside `D`; and the
 canonical `XXXX-XXX-XXX` spelling a QR payload carries. That module's own table lists each one with
-the reason. The confirmation lifetime, two minutes, is the other one: section 10 says "short
-expiry" without a number.
+the reason. Two intervals are decided here instead, because section 10 gives neither a number:
+
+| Decision | Value | Why |
+| --- | --- | --- |
+| Owner-confirmation lifetime | 2 minutes | Section 10 says "short expiry". Long enough for a native ceremony on an unlocked device, short enough that a captured challenge is useless later. |
+| Candidate handshake deadline | 10 seconds | Far more than a PAKE and two bundles need over any working link, and short enough that four candidates cannot hold the four slots shut for five minutes. |
 
 ## Vectors
 

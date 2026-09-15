@@ -6,16 +6,22 @@
 //! Cloudflare `PairingRoom` client, the controller's databases and the companion application's
 //! native ceremonies can be written against a fixed contract.
 //!
-//! Each trait has an in-test implementation in this module's tests and in the state machines'
-//! tests. None of them is a default: a host that forgets to supply one does not compile.
+//! Two of the contracts are about atomicity rather than about mechanism, because the rules they
+//! carry cannot be enforced from here:
+//!
+//! * [`InvitationStore::commit`] writes the device record, the grant, the consumed invitation and
+//!   the security event in one transaction. A pairing reports success only after it returns.
+//! * [`ClientBudgetStore::update`] applies one read-modify-write to a code's counter atomically. A
+//!   separate read and write would let two entries of the same code both see four attempts.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use kr_crypto::secret::SymmetricKey;
-use kr_protocol::ids::{AttemptId, InvitationId};
+use kr_protocol::ids::{AttemptId, DeviceId, GrantId, InvitationId};
 use kr_protocol::pairing::{
-    Locator, OwnerConfirmationProof, OwnerConfirmationRequest, RendezvousOrigin,
+    ClientBundle, DevicePublicKeys, Locator, OwnerConfirmationProof, OwnerConfirmationRequest,
+    ProposedGrant, RendezvousOrigin,
 };
 use kr_protocol::scalars::{Digest256, EndpointKey, Mac256, TimestampMs};
 
@@ -25,17 +31,16 @@ use crate::error::{PairingError, Result};
 ///
 /// Section 10 keys the client's attempt window by monotonic time *and* the boot identity, because
 /// a monotonic clock restarts at a reboot: without the identity, a reboot would make an old
-/// deadline look like a future one. A reboot expires an unfinished entry, and this is how the
-/// state machine notices.
+/// deadline look like a future one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BootIdentity(pub [u8; 32]);
 
-/// A monotonic clock, its boot identity, and the wall clock for absolute wire deadlines.
+/// A monotonic clock, its boot identity, and the wall clock.
 ///
-/// Deadlines inside this crate are monotonic. The wall clock appears only in objects that leave
-/// the host, where an absolute time is the only thing another device can read, and it is never
-/// what a host trusts: "the host deadline remains authoritative even if the service lies about
-/// expiry", and clock uncertainty cannot extend an invitation.
+/// Deadlines *within* one boot are monotonic, because a wall clock that moves must not extend an
+/// invitation. Retention that has to outlive a reboot is on the wall clock, because a monotonic
+/// value from another boot means nothing; a wall clock that runs backwards only lengthens such a
+/// retention, which is the safe direction.
 pub trait PairingClock {
     /// Returns milliseconds on a monotonic, suspend-aware clock.
     fn monotonic_ms(&self) -> u64;
@@ -43,8 +48,22 @@ pub trait PairingClock {
     /// Returns the identity of this boot.
     fn boot_identity(&self) -> BootIdentity;
 
-    /// Returns the wall clock in UTC milliseconds, for an absolute expiry another device reads.
+    /// Returns the wall clock in UTC milliseconds.
     fn wall_clock_ms(&self) -> u64;
+}
+
+impl<T: PairingClock + ?Sized> PairingClock for &T {
+    fn monotonic_ms(&self) -> u64 {
+        (**self).monotonic_ms()
+    }
+
+    fn boot_identity(&self) -> BootIdentity {
+        (**self).boot_identity()
+    }
+
+    fn wall_clock_ms(&self) -> u64 {
+        (**self).wall_clock_ms()
+    }
 }
 
 /// What a rendezvous lookup returns.
@@ -61,8 +80,8 @@ pub struct LocatorRecord {
 
 /// A reserved locator and the token that controls its record.
 ///
-/// The service stores the locator, the invitation identity, the expiry and a hash of this token.
-/// A request that modifies the record proves possession of the token, and the token controls only
+/// The service stores the locator, the invitation identity, the expiry and a hash of this token. A
+/// request that modifies the record proves possession of the token, and the token controls only
 /// the rendezvous record: it confers nothing about the invitation, which the host owns.
 #[derive(Debug)]
 pub struct LocatorReservation {
@@ -112,8 +131,8 @@ pub trait RendezvousClient {
     /// Looks a locator up at the configured origin.
     ///
     /// Only the four locator characters travel. An unknown locator answers with the same socket
-    /// admission, timeout and error shape as a known one, so this never becomes a cheap
-    /// existence oracle.
+    /// admission, timeout and error shape as a known one, so this never becomes a cheap existence
+    /// oracle.
     ///
     /// # Errors
     ///
@@ -123,15 +142,15 @@ pub trait RendezvousClient {
 
 /// The durable record of one invitation.
 ///
-/// Section 10 requires the failure count and the invitation state to survive a restart, and a
-/// consumed record to stay consumed. A host restart cancels an unfinished invitation, which the
-/// state machine does when it loads one.
+/// It is the single authority on an invitation's state, which matters when one invitation offers
+/// both entry modes: each flow reloads it before every transition and writes it back, so the two
+/// routes share one candidate and one consumption.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvitationRecord {
     /// The invitation.
     pub invitation_id: InvitationId,
-    /// The locator the service reserved.
-    pub locator: Locator,
+    /// The locator the service reserved, for a short-code invitation.
+    pub locator: Option<Locator>,
     /// The state it is in.
     pub state: InvitationState,
     /// How many client confirmation tags have verified and failed.
@@ -147,8 +166,11 @@ pub struct InvitationRecord {
 pub enum InvitationState {
     /// Open, with no candidate holding it.
     Open,
-    /// One candidate holds it and owner approval is pending.
-    AwaitingApproval {
+    /// One candidate holds it.
+    ///
+    /// Section 10 locks the invitation at successful PAKE, before the owner is asked, and cancels
+    /// the competing candidates then.
+    Locked {
         /// The candidate that holds it.
         attempt_id: AttemptId,
     },
@@ -159,6 +181,44 @@ pub enum InvitationState {
         /// Why.
         reason: kr_protocol::pairing::PairingConsumedReason,
     },
+}
+
+impl InvitationState {
+    /// Returns the candidate holding the invitation, when one does.
+    #[must_use]
+    pub const fn locked_attempt(self) -> Option<AttemptId> {
+        match self {
+            Self::Locked { attempt_id } => Some(attempt_id),
+            _ => None,
+        }
+    }
+}
+
+/// What one completed pairing wrote.
+///
+/// Section 10 commits the device record, the grant and the consumed-invitation state atomically,
+/// and every completed pairing produces a durable attention and security event. All of that is one
+/// transaction, and this is its content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingCommitment {
+    /// The invitation that produced it.
+    pub invitation_id: InvitationId,
+    /// The candidate that was approved.
+    pub attempt_id: AttemptId,
+    /// The device record the host created.
+    pub device_id: DeviceId,
+    /// The grant the host issued.
+    pub grant_id: GrantId,
+    /// The candidate's complete purpose-key bundle.
+    pub client_keys: DevicePublicKeys,
+    /// The candidate's display bundle, for a short-code pairing. Display text, never authority.
+    pub client_bundle: Option<ClientBundle>,
+    /// The rights the invitation proposed, unchanged.
+    pub proposed_grant: ProposedGrant,
+    /// The value both devices displayed, recorded so the security event can name it.
+    pub verification_value: String,
+    /// When the host committed it, in UTC milliseconds.
+    pub committed_at_ms: TimestampMs,
 }
 
 /// Where the host keeps invitation state across a restart.
@@ -177,6 +237,27 @@ pub trait InvitationStore {
     ///
     /// Returns [`PairingError::Store`].
     fn load(&self, invitation_id: InvitationId) -> Result<Option<InvitationRecord>>;
+
+    /// Writes the record and the commitment in **one** transaction.
+    ///
+    /// The device record, the grant, the consumed invitation and the security event are one
+    /// transition, and a pairing reports success only after this returns. An implementation that
+    /// wrote them separately would let a crash leave a device with no grant, a grant with no
+    /// device, or a completed pairing with no security event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::Store`] when the transaction does not commit.
+    fn commit(&self, record: &InvitationRecord, commitment: &PairingCommitment) -> Result<()>;
+
+    /// Reads the commitment of an invitation that was committed.
+    ///
+    /// A transport retry retrieves the committed result through this, including after a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::Store`].
+    fn commitment(&self, invitation_id: InvitationId) -> Result<Option<PairingCommitment>>;
 
     /// Returns every invitation this host has not finished.
     ///
@@ -198,29 +279,23 @@ impl<T: InvitationStore + ?Sized> InvitationStore for &T {
         (**self).load(invitation_id)
     }
 
+    fn commit(&self, record: &InvitationRecord, commitment: &PairingCommitment) -> Result<()> {
+        (**self).commit(record, commitment)
+    }
+
+    fn commitment(&self, invitation_id: InvitationId) -> Result<Option<PairingCommitment>> {
+        (**self).commitment(invitation_id)
+    }
+
     fn unfinished(&self) -> Result<Vec<InvitationRecord>> {
         (**self).unfinished()
     }
 }
 
-impl<T: PairingClock + ?Sized> PairingClock for &T {
-    fn monotonic_ms(&self) -> u64 {
-        (**self).monotonic_ms()
-    }
-
-    fn boot_identity(&self) -> BootIdentity {
-        (**self).boot_identity()
-    }
-
-    fn wall_clock_ms(&self) -> u64 {
-        (**self).wall_clock_ms()
-    }
-}
-
 /// The client's durable record for one entered code.
 ///
-/// It is keyed by an HMAC of the configured origin and the normalised code under a distinct random
-/// local key, never by the service-supplied invitation identity or expiry. A service that
+/// It is keyed by an HMAC of the configured origin and the normalised full code under a distinct
+/// random local key, never by the service-supplied invitation identity or expiry. A service that
 /// advertises a new identity for the same code therefore cannot reset the counter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientAttemptRecord {
@@ -230,8 +305,11 @@ pub struct ClientAttemptRecord {
     pub first_entry_monotonic_ms: u64,
     /// The boot that monotonic value belongs to.
     pub boot_identity: BootIdentity,
-    /// When the record may be forgotten, on the monotonic clock. A tombstone outlives the window.
-    pub retain_until_monotonic_ms: u64,
+    /// When the record may be forgotten, on the **wall** clock.
+    ///
+    /// A tombstone outlives a reboot, and a monotonic value cannot: it restarts. A wall clock that
+    /// runs backwards only lengthens the retention.
+    pub retain_until_wall_ms: u64,
     /// True once the code is spent, so a later entry is refused rather than restarted.
     pub exhausted: bool,
 }
@@ -249,33 +327,64 @@ pub trait ClientBudgetStore {
     /// Returns [`PairingError::Store`].
     fn budget_key(&self) -> Result<SymmetricKey>;
 
-    /// Reads the record for one code key.
+    /// Applies one read-modify-write to a code's record, atomically.
+    ///
+    /// The implementation reads the current record, calls `decide` once, and persists whatever it
+    /// returns before any other caller can read the same key. Two entries of the same code
+    /// therefore cannot both see four attempts and both proceed. A `decide` that returns an error
+    /// leaves the stored record untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `decide` returns, and [`PairingError::Store`] when the transaction fails.
+    fn update(
+        &self,
+        code_key: &Mac256,
+        decide: &dyn Fn(Option<ClientAttemptRecord>) -> Result<ClientAttemptRecord>,
+    ) -> Result<ClientAttemptRecord>;
+
+    /// Reads the record for one code key, without changing it.
     ///
     /// # Errors
     ///
     /// Returns [`PairingError::Store`].
     fn load(&self, code_key: &Mac256) -> Result<Option<ClientAttemptRecord>>;
 
-    /// Writes the record for one code key.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PairingError::Store`].
-    fn save(&self, code_key: &Mac256, record: &ClientAttemptRecord) -> Result<()>;
-
     /// Drops records whose retention has ended.
     ///
     /// # Errors
     ///
     /// Returns [`PairingError::Store`].
-    fn expire(&self, now_monotonic_ms: u64, boot_identity: BootIdentity) -> Result<()>;
+    fn expire(&self, now_wall_ms: u64) -> Result<()>;
 }
 
-/// The identity of the peer on the connection a step arrived on.
+impl<T: ClientBudgetStore + ?Sized> ClientBudgetStore for &T {
+    fn budget_key(&self) -> Result<SymmetricKey> {
+        (**self).budget_key()
+    }
+
+    fn update(
+        &self,
+        code_key: &Mac256,
+        decide: &dyn Fn(Option<ClientAttemptRecord>) -> Result<ClientAttemptRecord>,
+    ) -> Result<ClientAttemptRecord> {
+        (**self).update(code_key, decide)
+    }
+
+    fn load(&self, code_key: &Mac256) -> Result<Option<ClientAttemptRecord>> {
+        (**self).load(code_key)
+    }
+
+    fn expire(&self, now_wall_ms: u64) -> Result<()> {
+        (**self).expire(now_wall_ms)
+    }
+}
+
+/// The transport peer a pairing step arrived on.
 ///
 /// Section 10 requires the host to check that the live iroh peer equals the authenticated client
-/// endpoint, and the client to check the host likewise. Neither check can read the connection from
-/// here, so both ask this.
+/// endpoint, and the client to check the host likewise. It also refuses a pairing mutation in QUIC
+/// 0-RTT data, which a state machine cannot see either, so the transport says so here.
 pub trait LivePeer {
     /// Returns the endpoint identity of the authenticated transport peer.
     ///
@@ -284,6 +393,24 @@ pub trait LivePeer {
     /// Returns an error when there is no authenticated peer, which is itself a failure: a pairing
     /// mutation never arrives outside one.
     fn live_endpoint(&self) -> Result<EndpointKey>;
+
+    /// Returns true when this step arrived in early data, before the handshake completed.
+    ///
+    /// Version 1 accepts no application mutation in QUIC 0-RTT, and a pairing mutation least of
+    /// all: early data is replayable by anyone who captured it.
+    fn arrived_in_early_data(&self) -> bool;
+}
+
+/// Checks that a step may change state at all.
+///
+/// # Errors
+///
+/// Returns [`PairingError::EarlyData`] when the step arrived before the handshake completed.
+pub fn require_completed_handshake(peer: &dyn LivePeer) -> Result<()> {
+    if peer.arrived_in_early_data() {
+        return Err(PairingError::EarlyData);
+    }
+    Ok(())
 }
 
 /// The protected user-verification ceremony.
@@ -328,6 +455,8 @@ impl TestClock {
     }
 
     /// Reboots: the monotonic clock restarts and the boot identity changes.
+    ///
+    /// The wall clock does not, which is what a real reboot does too.
     pub fn reboot(&self, identity: u8) {
         *self.monotonic_ms.lock().expect("a test clock") = 0;
         *self.boot.lock().expect("a test clock") = BootIdentity([identity; 32]);
@@ -363,8 +492,15 @@ impl PairingClock for TestClock {
 /// An in-memory invitation store for tests, which can also be made to fail.
 #[derive(Debug, Default)]
 pub struct TestInvitationStore {
-    records: Mutex<BTreeMap<InvitationId, InvitationRecord>>,
+    state: Mutex<TestInvitationState>,
     failing: Mutex<bool>,
+    failing_writes: Mutex<bool>,
+}
+
+#[derive(Debug, Default)]
+struct TestInvitationState {
+    records: BTreeMap<InvitationId, InvitationRecord>,
+    commitments: BTreeMap<InvitationId, PairingCommitment>,
 }
 
 impl TestInvitationStore {
@@ -374,17 +510,26 @@ impl TestInvitationStore {
         Self::default()
     }
 
-    /// Makes every operation fail, so a test can check that a failed write stops a step.
+    /// Makes every operation fail, so a test can check that a failed read stops a step.
     pub fn set_failing(&self, failing: bool) {
         *self.failing.lock().expect("a test store") = failing;
+    }
+
+    /// Makes writes fail while reads keep working, which is the interesting half.
+    ///
+    /// A host that can read its record and cannot write it is the case that decides whether a
+    /// spent guess comes back: the decision is made and cannot be recorded.
+    pub fn set_failing_writes(&self, failing: bool) {
+        *self.failing_writes.lock().expect("a test store") = failing;
     }
 
     /// Returns a copy of the stored records, which is what survives a restart.
     #[must_use]
     pub fn snapshot(&self) -> Vec<InvitationRecord> {
-        self.records
+        self.state
             .lock()
             .expect("a test store")
+            .records
             .values()
             .cloned()
             .collect()
@@ -398,14 +543,25 @@ impl TestInvitationStore {
         }
         Ok(())
     }
+
+    fn check_write(&self) -> Result<()> {
+        self.check()?;
+        if *self.failing_writes.lock().expect("a test store") {
+            return Err(PairingError::Store {
+                reason: "the test store cannot write".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl InvitationStore for TestInvitationStore {
     fn save(&self, record: &InvitationRecord) -> Result<()> {
-        self.check()?;
-        self.records
+        self.check_write()?;
+        self.state
             .lock()
             .expect("a test store")
+            .records
             .insert(record.invitation_id, record.clone());
         Ok(())
     }
@@ -413,9 +569,32 @@ impl InvitationStore for TestInvitationStore {
     fn load(&self, invitation_id: InvitationId) -> Result<Option<InvitationRecord>> {
         self.check()?;
         Ok(self
-            .records
+            .state
             .lock()
             .expect("a test store")
+            .records
+            .get(&invitation_id)
+            .cloned())
+    }
+
+    fn commit(&self, record: &InvitationRecord, commitment: &PairingCommitment) -> Result<()> {
+        self.check_write()?;
+        // One lock over both maps: the record and the commitment appear together or not at all.
+        let mut state = self.state.lock().expect("a test store");
+        state.records.insert(record.invitation_id, record.clone());
+        state
+            .commitments
+            .insert(commitment.invitation_id, commitment.clone());
+        Ok(())
+    }
+
+    fn commitment(&self, invitation_id: InvitationId) -> Result<Option<PairingCommitment>> {
+        self.check()?;
+        Ok(self
+            .state
+            .lock()
+            .expect("a test store")
+            .commitments
             .get(&invitation_id)
             .cloned())
     }
@@ -423,14 +602,15 @@ impl InvitationStore for TestInvitationStore {
     fn unfinished(&self) -> Result<Vec<InvitationRecord>> {
         self.check()?;
         Ok(self
-            .records
+            .state
             .lock()
             .expect("a test store")
+            .records
             .values()
             .filter(|record| {
                 matches!(
                     record.state,
-                    InvitationState::Open | InvitationState::AwaitingApproval { .. }
+                    InvitationState::Open | InvitationState::Locked { .. }
                 )
             })
             .cloned()
@@ -476,6 +656,18 @@ impl ClientBudgetStore for TestClientBudgetStore {
         Ok(self.key.clone())
     }
 
+    fn update(
+        &self,
+        code_key: &Mac256,
+        decide: &dyn Fn(Option<ClientAttemptRecord>) -> Result<ClientAttemptRecord>,
+    ) -> Result<ClientAttemptRecord> {
+        // The lock is held across the decision, which is the whole point of this method.
+        let mut records = self.records.lock().expect("a test store");
+        let updated = decide(records.get(code_key.as_bytes()).cloned())?;
+        records.insert(*code_key.as_bytes(), updated.clone());
+        Ok(updated)
+    }
+
     fn load(&self, code_key: &Mac256) -> Result<Option<ClientAttemptRecord>> {
         Ok(self
             .records
@@ -485,24 +677,53 @@ impl ClientBudgetStore for TestClientBudgetStore {
             .cloned())
     }
 
-    fn save(&self, code_key: &Mac256, record: &ClientAttemptRecord) -> Result<()> {
+    fn expire(&self, now_wall_ms: u64) -> Result<()> {
         self.records
             .lock()
             .expect("a test store")
-            .insert(*code_key.as_bytes(), record.clone());
+            .retain(|_, record| record.retain_until_wall_ms > now_wall_ms);
         Ok(())
     }
+}
 
-    fn expire(&self, now_monotonic_ms: u64, boot_identity: BootIdentity) -> Result<()> {
-        self.records
+/// A live peer a test sets by hand.
+#[derive(Debug)]
+pub struct TestLivePeer {
+    endpoint: Mutex<Option<EndpointKey>>,
+    early_data: Mutex<bool>,
+}
+
+impl TestLivePeer {
+    /// Creates a peer with the given endpoint identity, past its handshake.
+    #[must_use]
+    pub fn new(endpoint: EndpointKey) -> Self {
+        Self {
+            endpoint: Mutex::new(Some(endpoint)),
+            early_data: Mutex::new(false),
+        }
+    }
+
+    /// Replaces the endpoint, so a test can substitute a different peer.
+    pub fn set(&self, endpoint: Option<EndpointKey>) {
+        *self.endpoint.lock().expect("a test peer") = endpoint;
+    }
+
+    /// Says whether this peer's steps arrive in early data.
+    pub fn set_early_data(&self, early: bool) {
+        *self.early_data.lock().expect("a test peer") = early;
+    }
+}
+
+impl LivePeer for TestLivePeer {
+    fn live_endpoint(&self) -> Result<EndpointKey> {
+        self.endpoint
             .lock()
-            .expect("a test store")
-            .retain(|_, record| {
-                // A record from another boot is expired: its monotonic values mean nothing now.
-                record.boot_identity == boot_identity
-                    && record.retain_until_monotonic_ms > now_monotonic_ms
-            });
-        Ok(())
+            .expect("a test peer")
+            .ok_or(PairingError::EndpointMismatch { side: "transport" })
+    }
+
+    fn arrived_in_early_data(&self) -> bool {
+        *self.early_data.lock().expect("a test peer")
     }
 }
 
@@ -616,32 +837,6 @@ impl RendezvousHost for TestRendezvousHost {
     }
 }
 
-/// A live peer a test sets by hand.
-#[derive(Debug)]
-pub struct TestLivePeer(Mutex<Option<EndpointKey>>);
-
-impl TestLivePeer {
-    /// Creates a peer with the given endpoint identity.
-    #[must_use]
-    pub fn new(endpoint: EndpointKey) -> Self {
-        Self(Mutex::new(Some(endpoint)))
-    }
-
-    /// Replaces the endpoint, so a test can substitute a different peer.
-    pub fn set(&self, endpoint: Option<EndpointKey>) {
-        *self.0.lock().expect("a test peer") = endpoint;
-    }
-}
-
-impl LivePeer for TestLivePeer {
-    fn live_endpoint(&self) -> Result<EndpointKey> {
-        self.0
-            .lock()
-            .expect("a test peer")
-            .ok_or(PairingError::EndpointMismatch { side: "transport" })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,9 +847,15 @@ mod tests {
         clock.advance(5_000);
         assert_eq!(clock.monotonic_ms(), 5_000);
         let before = clock.boot_identity();
+        let wall = clock.wall_clock_ms();
         clock.reboot(1);
         assert_eq!(clock.monotonic_ms(), 0);
         assert_ne!(clock.boot_identity(), before);
+        assert_eq!(
+            clock.wall_clock_ms(),
+            wall,
+            "a reboot does not reset the wall clock"
+        );
     }
 
     #[test]
@@ -678,26 +879,37 @@ mod tests {
     }
 
     #[test]
-    fn the_client_store_forgets_a_record_from_another_boot() {
+    fn the_client_store_keeps_a_tombstone_across_a_reboot() {
         let store = TestClientBudgetStore::new().expect("a store");
         let key = Mac256::from_bytes([1; 32]);
         store
-            .save(
-                &key,
-                &ClientAttemptRecord {
-                    attempts: 1,
+            .update(&key, &|_| {
+                Ok(ClientAttemptRecord {
+                    attempts: 5,
                     first_entry_monotonic_ms: 0,
                     boot_identity: BootIdentity([0; 32]),
-                    retain_until_monotonic_ms: 1_000_000,
-                    exhausted: false,
-                },
-            )
+                    retain_until_wall_ms: 1_000_000,
+                    exhausted: true,
+                })
+            })
             .expect("a write");
+        // Retention is on the wall clock, so a reboot does not drop it.
+        store.expire(999_999).expect("an expiry sweep");
         assert_eq!(store.len(), 1);
-        store
-            .expire(0, BootIdentity([9; 32]))
-            .expect("an expiry sweep");
+        store.expire(1_000_000).expect("an expiry sweep");
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn an_update_that_refuses_leaves_the_record_untouched() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let key = Mac256::from_bytes([1; 32]);
+        assert!(
+            store
+                .update(&key, &|_| Err(PairingError::ClientAttemptsExhausted))
+                .is_err()
+        );
+        assert!(store.load(&key).expect("a read").is_none());
     }
 
     #[test]
@@ -714,10 +926,21 @@ mod tests {
     fn a_missing_live_peer_is_a_mismatch_rather_than_a_pass() {
         let peer = TestLivePeer::new(EndpointKey::from_bytes([1; 32]));
         assert!(peer.live_endpoint().is_ok());
+        assert!(require_completed_handshake(&peer).is_ok());
         peer.set(None);
         assert!(matches!(
             peer.live_endpoint(),
             Err(PairingError::EndpointMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_step_in_early_data_changes_nothing() {
+        let peer = TestLivePeer::new(EndpointKey::from_bytes([1; 32]));
+        peer.set_early_data(true);
+        assert!(matches!(
+            require_completed_handshake(&peer),
+            Err(PairingError::EarlyData)
         ));
     }
 }

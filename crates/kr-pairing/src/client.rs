@@ -17,8 +17,14 @@
 //! * a new manual attempt keeps that budget until it expires, and an exhausted entry needs a newly
 //!   issued code.
 //!
+//! "Expires an unfinished entry" is not "forgets it". A reboot ends the window and leaves a
+//! tombstone, exactly as running out of time does; the tombstone's retention is on the wall clock,
+//! because a monotonic deadline from the previous boot means nothing after one.
+//!
 //! The candidate also verifies the host's confirmation tag **before** it trusts any host metadata.
 //! Until then the invitation identity and the expiry the service returned are the service's word.
+
+use core::cell::Cell;
 
 use kr_crypto::kdf;
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -31,11 +37,12 @@ use kr_protocol::pairing::{
 use kr_protocol::scalars::{Digest256, EndpointKey, Mac256, Nonce256};
 
 use crate::bundles::{self, BundleFrame, ExchangeBudget};
-use crate::code::EnteredCode;
+use crate::code::{CodeSecret, EnteredCode};
 use crate::error::{PairingError, Result};
-use crate::host::{new_attempt_id, new_nonce};
+use crate::host::{HANDSHAKE_DEADLINE_MS, new_attempt_id, new_nonce};
 use crate::platform::{
-    ClientAttemptRecord, ClientBudgetStore, LivePeer, LocatorRecord, PairingClock, RendezvousClient,
+    BootIdentity, ClientAttemptRecord, ClientBudgetStore, LivePeer, LocatorRecord, PairingClock,
+    RendezvousClient, require_completed_handshake,
 };
 use crate::spake::{Role, SpakeState};
 use crate::transcript::AttemptKeys;
@@ -49,6 +56,9 @@ pub const CLIENT_BUDGET_DOMAIN: &str = "kr-pair/client-budget/1";
 
 /// Returns the counter key for one origin and one entered code.
 ///
+/// The message the tag covers is assembled by hand into a buffer that clears itself: the code is
+/// in it, and handing it to an encoder would copy it into buffers no caller can reach.
+///
 /// # Errors
 ///
 /// Returns [`PairingError::Store`] when the local key cannot be read.
@@ -58,21 +68,29 @@ pub fn budget_key(
     code: &EnteredCode,
 ) -> Result<Mac256> {
     let key = store.budget_key()?;
-    // The origin and the code are both inside the tag: the same ten characters at two origins are
-    // two entries, because they are two different invitations.
-    let message = kr_cbor::encode(&kr_cbor::signing_value(
+    // `CBOR([domain, origin, code])`, written out so the code reaches no encoder. The origin and
+    // the code are both inside the tag: the same ten characters at two origins are two entries,
+    // because they are two different invitations.
+    let mut message = zeroize::Zeroizing::new(Vec::with_capacity(128));
+    message.push(0x83);
+    message.extend_from_slice(&kr_cbor::encode(&kr_cbor::CanonicalValue::text(
         CLIENT_BUDGET_DOMAIN,
-        vec![
-            kr_cbor::CanonicalValue::text(origin.as_str()),
-            kr_cbor::CanonicalValue::text(code.normalised()),
-        ],
-    ));
+    )));
+    message.extend_from_slice(&kr_cbor::encode(&kr_cbor::CanonicalValue::text(
+        origin.as_str(),
+    )));
+    let normalised = code.normalised().as_bytes();
+    message.push(0x60 | u8::try_from(normalised.len()).expect("ten characters fit in a byte"));
+    message.extend_from_slice(normalised);
     Ok(kdf::hmac_sha256(&key, &message))
 }
 
 /// Charges one attempt against this device's budget for a code.
 ///
-/// Returns how many attempts are left after this one.
+/// Returns how many attempts are left after this one. The read, the decision and the write are one
+/// atomic transition through [`ClientBudgetStore::update`], so two entries of the same code cannot
+/// both see four attempts and both proceed. A refusal is a write too: the window running out and a
+/// reboot both leave a tombstone, recorded inside the same transition.
 ///
 /// # Errors
 ///
@@ -86,63 +104,87 @@ pub fn charge_attempt(
 ) -> Result<u32> {
     let now = clock.monotonic_ms();
     let boot = clock.boot_identity();
-    store.expire(now, boot)?;
+    let wall = clock.wall_clock_ms();
+    store.expire(wall)?;
 
     let key = budget_key(store, origin, code)?;
-    let mut record = match store.load(&key)? {
-        Some(record) if record.boot_identity != boot => {
-            // A reboot expires an unfinished entry: its monotonic values belong to another boot,
-            // and a tombstone that outlived the reboot is gone with it.
-            fresh_record(now, boot)
-        }
-        Some(record) if record.exhausted => {
-            // The tombstone is the point: another advertised expiry does not reset the counter.
-            return Err(PairingError::ClientAttemptsExhausted);
-        }
-        Some(record)
-            if now.saturating_sub(record.first_entry_monotonic_ms) >= INVITATION_LIFETIME_MS =>
-        {
-            // The window ran out. The entry becomes a tombstone rather than a fresh start.
-            let mut spent = record;
-            spent.exhausted = true;
-            spent.retain_until_monotonic_ms = now.saturating_add(CLIENT_TOMBSTONE_MS);
-            store.save(&key, &spent)?;
-            return Err(PairingError::ClientAttemptsExhausted);
-        }
-        Some(record) => record,
-        None => fresh_record(now, boot),
-    };
-
-    if record.attempts >= MAX_CLIENT_ATTEMPTS {
-        record.exhausted = true;
-        record.retain_until_monotonic_ms = now.saturating_add(CLIENT_TOMBSTONE_MS);
-        store.save(&key, &record)?;
+    // The decision runs inside the store's lock, so this is how its outcome gets out. The store
+    // may call the closure more than once while it retries; the last call is the one it wrote.
+    let permitted = Cell::new(false);
+    let record = store.update(&key, &|current| {
+        let (next, allowed) = next_record(current, now, boot, wall);
+        permitted.set(allowed);
+        Ok(next)
+    })?;
+    if !permitted.get() {
         return Err(PairingError::ClientAttemptsExhausted);
     }
-    record.attempts += 1;
-    let remaining = MAX_CLIENT_ATTEMPTS - record.attempts;
-    if remaining == 0 {
-        record.exhausted = true;
-    }
-    // A tombstone outlives the window, so an exhausted or expired entry is still refused a day
-    // later.
-    record.retain_until_monotonic_ms = record
-        .first_entry_monotonic_ms
-        .saturating_add(INVITATION_LIFETIME_MS)
-        .saturating_add(CLIENT_TOMBSTONE_MS);
-    store.save(&key, &record)?;
-    Ok(remaining)
+    Ok(MAX_CLIENT_ATTEMPTS.saturating_sub(record.attempts))
 }
 
-fn fresh_record(now: u64, boot: crate::platform::BootIdentity) -> ClientAttemptRecord {
+/// Decides what one code's record becomes, and whether the attempt may proceed.
+///
+/// This is the whole budget rule in one pure function. Every path returns a record to write: a
+/// refusal that left nothing behind would let the next entry start the five minutes again.
+fn next_record(
+    current: Option<ClientAttemptRecord>,
+    now: u64,
+    boot: BootIdentity,
+    wall: u64,
+) -> (ClientAttemptRecord, bool) {
+    let Some(record) = current else {
+        return (charge(fresh(now, boot, wall), wall), true);
+    };
+    if record.exhausted {
+        // Spent. Another advertised expiry does not reset the counter, and neither does anything
+        // else: an exhausted entry needs a newly issued code.
+        return (record, false);
+    }
+    // A reboot ends the window, and so does running out of time. Either way the entry becomes a
+    // tombstone rather than a fresh start, so a device cannot buy five more guesses by restarting.
+    if record.boot_identity != boot
+        || now.saturating_sub(record.first_entry_monotonic_ms) >= INVITATION_LIFETIME_MS
+        || record.attempts >= MAX_CLIENT_ATTEMPTS
+    {
+        return (tombstone(record, wall), false);
+    }
+    (charge(record, wall), true)
+}
+
+/// Returns the record a first entry creates.
+const fn fresh(now: u64, boot: BootIdentity, wall: u64) -> ClientAttemptRecord {
     ClientAttemptRecord {
         attempts: 0,
         first_entry_monotonic_ms: now,
         boot_identity: boot,
-        retain_until_monotonic_ms: now
+        retain_until_wall_ms: wall,
+        exhausted: false,
+    }
+}
+
+/// Adds one attempt to a record and extends its retention.
+fn charge(record: ClientAttemptRecord, wall: u64) -> ClientAttemptRecord {
+    let attempts = record.attempts.saturating_add(1);
+    ClientAttemptRecord {
+        attempts,
+        exhausted: attempts >= MAX_CLIENT_ATTEMPTS,
+        // A spent entry outlives its window by the tombstone period.
+        retain_until_wall_ms: wall
             .saturating_add(INVITATION_LIFETIME_MS)
             .saturating_add(CLIENT_TOMBSTONE_MS),
-        exhausted: false,
+        ..record
+    }
+}
+
+/// Marks a record spent and keeps it for the tombstone period.
+///
+/// The retention is on the wall clock on purpose: a monotonic deadline from the previous boot
+/// means nothing after one, and the tombstone has to survive exactly that.
+fn tombstone(record: ClientAttemptRecord, wall: u64) -> ClientAttemptRecord {
+    ClientAttemptRecord {
+        exhausted: true,
+        retain_until_wall_ms: wall.saturating_add(CLIENT_TOMBSTONE_MS),
+        ..record
     }
 }
 
@@ -157,6 +199,8 @@ enum ClientPhase {
     Confirmed,
     /// The host's bundle is in.
     HostBundleReceived,
+    /// The attempt is over: it failed, expired or completed. Nothing resumes it.
+    Finished,
 }
 
 impl ClientPhase {
@@ -166,6 +210,7 @@ impl ClientPhase {
             Self::AwaitingHostConfirmation => "the host's confirmation tag",
             Self::Confirmed => "the bundle exchange",
             Self::HostBundleReceived => "pair.finish",
+            Self::Finished => "nothing: this attempt is over",
         }
     }
 }
@@ -184,10 +229,15 @@ pub struct ClientAdmission {
 
 /// One candidate's attempt at one code.
 ///
-/// `Debug` names the phase and nothing else: the attempt holds the five derived keys, and a
-/// derived rendering would put them where a log can find them.
+/// The code's secret is bound at creation, so a later step cannot substitute another code against
+/// the budget this attempt charged. Every failure is terminal: there is no automatic retry after a
+/// failed key confirmation, and another attempt charges the budget again.
+///
+/// `Debug` names the phase and nothing else: the attempt holds the code secret and the five
+/// derived keys, and a derived rendering would put them where a log can find them.
 pub struct ClientAttempt {
     context: PairingContext,
+    secret: CodeSecret,
     phase: ClientPhase,
     spake: Option<SpakeState>,
     transcript: Option<Digest256>,
@@ -197,6 +247,8 @@ pub struct ClientAttempt {
     host_bundle_hash: Option<Digest256>,
     client_bundle_hash: Option<Digest256>,
     remaining_attempts: u32,
+    deadline_monotonic_ms: u64,
+    boot_identity: BootIdentity,
 }
 
 impl core::fmt::Debug for ClientAttempt {
@@ -242,6 +294,7 @@ impl ClientAttempt {
         };
         let attempt = Self {
             context,
+            secret: code.secret().clone(),
             phase: ClientPhase::AwaitingHostPake,
             spake: None,
             transcript: None,
@@ -251,6 +304,10 @@ impl ClientAttempt {
             host_bundle_hash: None,
             client_bundle_hash: None,
             remaining_attempts,
+            // The candidate's own handshake deadline. The host has one too, and neither extends it
+            // on progress.
+            deadline_monotonic_ms: clock.monotonic_ms().saturating_add(HANDSHAKE_DEADLINE_MS),
+            boot_identity: clock.boot_identity(),
         };
         let admission = ClientAdmission {
             attempt_id: attempt.context.attempt_id,
@@ -262,21 +319,30 @@ impl ClientAttempt {
     /// Records the host's nonce and produces the candidate's PAKE message.
     ///
     /// The candidate builds `C` itself from its own configured origin and its own nonce; the host
-    /// nonce and the attempt identity are the only members either side takes from the other, and
-    /// both are covered by the transcript that the confirmation tags authenticate.
+    /// nonce is the only member it takes from the other side, and it is covered by the transcript
+    /// the confirmation tags authenticate.
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::WrongPhase`] when the attempt has moved on.
-    pub fn with_host_nonce(&mut self, host_nonce: Nonce256, code: &EnteredCode) -> Result<Vec<u8>> {
-        if self.phase != ClientPhase::AwaitingHostPake || self.spake.is_some() {
+    /// Returns [`PairingError::WrongPhase`] when the attempt has moved on or already produced a
+    /// message, and [`PairingError::Expired`] past its handshake deadline.
+    pub fn with_host_nonce(
+        &mut self,
+        host_nonce: Nonce256,
+        clock: &dyn PairingClock,
+    ) -> Result<Vec<u8>> {
+        self.require_phase(ClientPhase::AwaitingHostPake, clock)?;
+        if self.spake.is_some() {
+            // One exchange per attempt. Starting another would run a second guess against the
+            // budget this attempt already charged.
+            self.phase = ClientPhase::Finished;
             return Err(PairingError::WrongPhase {
                 expected: ClientPhase::AwaitingHostPake.as_str(),
-                actual: self.phase.as_str(),
+                actual: "an attempt that has already produced its message",
             });
         }
         self.context.host_nonce = host_nonce;
-        let spake = SpakeState::start(Role::Client, &self.context, code.secret());
+        let spake = SpakeState::start(Role::Client, &self.context, &self.secret);
         let message = spake.message().to_vec();
         self.spake = Some(spake);
         Ok(message)
@@ -294,28 +360,37 @@ impl ClientAttempt {
         self.remaining_attempts
     }
 
+    /// Returns true when the attempt is over.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.phase == ClientPhase::Finished
+    }
+
     /// Takes the host's PAKE message and returns the candidate's confirmation tag.
     ///
     /// The candidate confirms first, which is the order section 10 fixes.
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::WrongPhase`] or [`PairingError::AuthenticationFailed`].
-    pub fn receive_host_pake(&mut self, host_message: &[u8]) -> Result<Mac256> {
-        if self.phase != ClientPhase::AwaitingHostPake {
+    /// Returns [`PairingError::WrongPhase`], [`PairingError::Expired`] or
+    /// [`PairingError::AuthenticationFailed`], after which the attempt is over.
+    pub fn receive_host_pake(
+        &mut self,
+        host_message: &[u8],
+        clock: &dyn PairingClock,
+    ) -> Result<Mac256> {
+        self.require_phase(ClientPhase::AwaitingHostPake, clock)?;
+        let Some(spake) = self.spake.take() else {
+            self.phase = ClientPhase::Finished;
             return Err(PairingError::WrongPhase {
                 expected: ClientPhase::AwaitingHostPake.as_str(),
-                actual: self.phase.as_str(),
+                actual: "an attempt with no message of its own",
             });
-        }
-        let spake = self.spake.take().ok_or(PairingError::WrongPhase {
-            expected: ClientPhase::AwaitingHostPake.as_str(),
-            actual: self.phase.as_str(),
-        })?;
+        };
         let client_message = spake.message().to_vec();
-        let shared = spake.finish(host_message)?;
+        let shared = self.terminal(spake.finish(host_message))?;
         let transcript = self.context.transcript(host_message, &client_message);
-        let keys = AttemptKeys::derive(shared.expose(), transcript)?;
+        let keys = self.terminal(AttemptKeys::derive(shared.expose(), transcript))?;
         let tag = keys.client_confirmation(transcript);
         self.transcript = Some(transcript);
         self.keys = Some(keys);
@@ -331,21 +406,23 @@ impl ClientAttempt {
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::WrongPhase`] or [`PairingError::AuthenticationFailed`].
-    pub fn verify_host_confirmation(&mut self, tag: &Mac256) -> Result<()> {
-        if self.phase != ClientPhase::AwaitingHostConfirmation {
-            return Err(PairingError::WrongPhase {
-                expected: ClientPhase::AwaitingHostConfirmation.as_str(),
-                actual: self.phase.as_str(),
-            });
-        }
+    /// Returns [`PairingError::WrongPhase`], [`PairingError::Expired`] or
+    /// [`PairingError::AuthenticationFailed`].
+    pub fn verify_host_confirmation(
+        &mut self,
+        tag: &Mac256,
+        clock: &dyn PairingClock,
+    ) -> Result<()> {
+        self.require_phase(ClientPhase::AwaitingHostConfirmation, clock)?;
         let (Some(keys), Some(transcript)) = (self.keys.as_ref(), self.transcript) else {
+            self.phase = ClientPhase::Finished;
             return Err(PairingError::WrongPhase {
                 expected: ClientPhase::AwaitingHostConfirmation.as_str(),
-                actual: self.phase.as_str(),
+                actual: "an attempt with no derived keys",
             });
         };
-        keys.verify_host_confirmation(transcript, tag)?;
+        let outcome = keys.verify_host_confirmation(transcript, tag);
+        self.terminal(outcome)?;
         self.phase = ClientPhase::Confirmed;
         Ok(())
     }
@@ -354,38 +431,37 @@ impl ClientAttempt {
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::WrongPhase`], [`PairingError::ReplayedSequence`],
-    /// [`PairingError::TooLarge`], [`PairingError::AuthenticationFailed`] or
-    /// [`PairingError::ContextMismatch`] when the bundle answers another invitation.
-    pub fn open_host_bundle(&mut self, frame: &BundleFrame) -> Result<SignedHostBundle> {
-        if self.phase != ClientPhase::Confirmed {
-            return Err(PairingError::WrongPhase {
-                expected: ClientPhase::Confirmed.as_str(),
-                actual: self.phase.as_str(),
-            });
-        }
+    /// Returns [`PairingError::WrongPhase`], [`PairingError::Expired`],
+    /// [`PairingError::ReplayedSequence`], [`PairingError::TooLarge`],
+    /// [`PairingError::AuthenticationFailed`] or [`PairingError::ContextMismatch`] when the bundle
+    /// answers another invitation or declares an endpoint that is not its own transport key.
+    pub fn open_host_bundle(
+        &mut self,
+        frame: &BundleFrame,
+        clock: &dyn PairingClock,
+    ) -> Result<SignedHostBundle> {
+        self.require_phase(ClientPhase::Confirmed, clock)?;
         let (Some(keys), Some(transcript)) = (self.keys.as_ref(), self.transcript) else {
+            self.phase = ClientPhase::Finished;
             return Err(PairingError::WrongPhase {
                 expected: ClientPhase::Confirmed.as_str(),
-                actual: self.phase.as_str(),
+                actual: "an attempt with no derived keys",
             });
         };
-        let signed: SignedHostBundle = bundles::open_bundle(
+        let opened = bundles::open_bundle::<SignedHostBundle>(
             &keys.host_to_client,
             transcript,
             BundleMessageType::HostBundle,
             &mut self.budget,
             frame,
-        )?;
-        bundles::verify_host_bundle(&signed, transcript)?;
+        );
+        let signed = self.terminal(opened)?;
+        let verified = bundles::verify_host_bundle(&signed, transcript);
+        self.terminal(verified)?;
         if signed.bundle.invitation_id != self.context.invitation_id {
+            self.phase = ClientPhase::Finished;
             return Err(PairingError::ContextMismatch {
                 what: "the invitation a host bundle answers",
-            });
-        }
-        if !signed.bundle.keys.purposes_are_distinct() {
-            return Err(PairingError::ContextMismatch {
-                what: "a host's key purposes, two of which share a key",
             });
         }
         self.host_bundle_hash = Some(bundles::bundle_hash(&signed.bundle)?);
@@ -398,24 +474,24 @@ impl ClientAttempt {
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::WrongPhase`], an encoding error or a library error.
+    /// Returns [`PairingError::WrongPhase`], [`PairingError::Expired`],
+    /// [`PairingError::ContextMismatch`] when the bundle's endpoint is not its own transport key,
+    /// an encoding error or a library error.
     pub fn seal_client_bundle(
         &mut self,
         authorisation: &AuthorisationKeyPair,
         bundle: ClientBundle,
+        clock: &dyn PairingClock,
     ) -> Result<BundleFrame> {
-        if self.phase != ClientPhase::HostBundleReceived {
-            return Err(PairingError::WrongPhase {
-                expected: ClientPhase::HostBundleReceived.as_str(),
-                actual: self.phase.as_str(),
-            });
-        }
+        self.require_phase(ClientPhase::HostBundleReceived, clock)?;
         let (Some(keys), Some(transcript)) = (self.keys.as_ref(), self.transcript) else {
+            self.phase = ClientPhase::Finished;
             return Err(PairingError::WrongPhase {
                 expected: ClientPhase::HostBundleReceived.as_str(),
-                actual: self.phase.as_str(),
+                actual: "an attempt with no derived keys",
             });
         };
+        bundles::require_consistent_client_bundle(&bundle)?;
         let signed = bundles::sign_client_bundle(authorisation, bundle, transcript)?;
         self.client_bundle_hash = Some(bundles::bundle_hash(&signed.bundle)?);
         bundles::seal_bundle(
@@ -434,12 +510,16 @@ impl ClientAttempt {
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::WrongPhase`] and [`PairingError::EndpointMismatch`].
+    /// Returns [`PairingError::WrongPhase`], [`PairingError::Expired`],
+    /// [`PairingError::EarlyData`] and [`PairingError::EndpointMismatch`].
     pub fn finish_request(
-        &self,
+        &mut self,
         live_peer: &dyn LivePeer,
         client_endpoint: &EndpointKey,
+        clock: &dyn PairingClock,
     ) -> Result<PairFinishRequest> {
+        self.require_phase(ClientPhase::HostBundleReceived, clock)?;
+        require_completed_handshake(live_peer)?;
         let (
             Some(keys),
             Some(transcript),
@@ -454,12 +534,14 @@ impl ClientAttempt {
             self.client_bundle_hash,
         )
         else {
+            self.phase = ClientPhase::Finished;
             return Err(PairingError::WrongPhase {
                 expected: ClientPhase::HostBundleReceived.as_str(),
-                actual: self.phase.as_str(),
+                actual: "an attempt with no exchanged bundles",
             });
         };
         if live_peer.live_endpoint()? != host_bundle.bundle.endpoint_id {
+            self.phase = ClientPhase::Finished;
             return Err(PairingError::EndpointMismatch { side: "host" });
         }
         let message = finish_mac_input(
@@ -502,6 +584,39 @@ impl ClientAttempt {
         };
         Ok(verification_value(transcript, host, client))
     }
+
+    /// Ends the attempt, so nothing resumes it after a disconnection or a timeout.
+    pub fn abandon(&mut self) {
+        self.phase = ClientPhase::Finished;
+    }
+
+    /// Checks the phase and the handshake deadline, ending the attempt when either fails.
+    fn require_phase(&mut self, expected: ClientPhase, clock: &dyn PairingClock) -> Result<()> {
+        if self.phase != expected {
+            let actual = self.phase.as_str();
+            self.phase = ClientPhase::Finished;
+            return Err(PairingError::WrongPhase {
+                expected: expected.as_str(),
+                actual,
+            });
+        }
+        // A reboot invalidates the deadline, and no progress message extends it.
+        if clock.boot_identity() != self.boot_identity
+            || clock.monotonic_ms() >= self.deadline_monotonic_ms
+        {
+            self.phase = ClientPhase::Finished;
+            return Err(PairingError::Expired);
+        }
+        Ok(())
+    }
+
+    /// Ends the attempt when `outcome` failed.
+    fn terminal<T>(&mut self, outcome: Result<T>) -> Result<T> {
+        if outcome.is_err() {
+            self.phase = ClientPhase::Finished;
+        }
+        outcome
+    }
 }
 
 #[cfg(test)]
@@ -519,18 +634,23 @@ mod tests {
         EnteredCode::parse("aB3x-Yz7-9Qw").expect("a code")
     }
 
+    /// Charges an attempt against the default origin.
+    fn charge(store: &TestClientBudgetStore, clock: &TestClock, code: &EnteredCode) -> Result<u32> {
+        charge_attempt(store, clock, &origin(), code)
+    }
+
     #[test]
     fn a_device_gets_five_attempts_per_code() {
         let store = TestClientBudgetStore::new().expect("a store");
         let clock = TestClock::new();
         for expected in (0..MAX_CLIENT_ATTEMPTS).rev() {
             assert_eq!(
-                charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt"),
+                charge(&store, &clock, &code()).expect("an attempt"),
                 expected
             );
         }
         assert!(matches!(
-            charge_attempt(&store, &clock, &origin(), &code()),
+            charge(&store, &clock, &code()),
             Err(PairingError::ClientAttemptsExhausted)
         ));
     }
@@ -539,11 +659,11 @@ mod tests {
     fn the_counter_survives_a_restart_and_is_not_keyed_by_the_service() {
         let store = TestClientBudgetStore::new().expect("a store");
         let clock = TestClock::new();
-        charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt");
+        charge(&store, &clock, &code()).expect("an attempt");
         // A "restart" is a new state machine over the same store: the record is what carries the
         // count, and nothing the service said is part of its key.
         assert_eq!(
-            charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt"),
+            charge(&store, &clock, &code()).expect("an attempt"),
             MAX_CLIENT_ATTEMPTS - 2
         );
     }
@@ -554,9 +674,9 @@ mod tests {
         let clock = TestClock::new();
         let elsewhere = RendezvousOrigin::new("https://elsewhere.example").expect("an origin");
         for _ in 0..MAX_CLIENT_ATTEMPTS {
-            charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt");
+            charge(&store, &clock, &code()).expect("an attempt");
         }
-        assert!(charge_attempt(&store, &clock, &origin(), &code()).is_err());
+        assert!(charge(&store, &clock, &code()).is_err());
         assert_eq!(
             charge_attempt(&store, &clock, &elsewhere, &code()).expect("an attempt"),
             MAX_CLIENT_ATTEMPTS - 1
@@ -569,9 +689,9 @@ mod tests {
         let clock = TestClock::new();
         let grouped = EnteredCode::parse("aB3x-Yz7-9Qw").expect("a code");
         let spaced = EnteredCode::parse(" aB3x Yz7 9Qw ").expect("a code");
-        charge_attempt(&store, &clock, &origin(), &grouped).expect("an attempt");
+        charge(&store, &clock, &grouped).expect("an attempt");
         assert_eq!(
-            charge_attempt(&store, &clock, &origin(), &spaced).expect("an attempt"),
+            charge(&store, &clock, &spaced).expect("an attempt"),
             MAX_CLIENT_ATTEMPTS - 2
         );
     }
@@ -580,14 +700,14 @@ mod tests {
     fn the_window_starts_at_first_entry_and_a_tombstone_outlives_it() {
         let store = TestClientBudgetStore::new().expect("a store");
         let clock = TestClock::new();
-        charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt");
+        charge(&store, &clock, &code()).expect("an attempt");
 
         clock.advance(INVITATION_LIFETIME_MS - 1);
-        assert!(charge_attempt(&store, &clock, &origin(), &code()).is_ok());
+        assert!(charge(&store, &clock, &code()).is_ok());
 
         clock.advance(1);
         assert!(matches!(
-            charge_attempt(&store, &clock, &origin(), &code()),
+            charge(&store, &clock, &code()),
             Err(PairingError::ClientAttemptsExhausted)
         ));
 
@@ -595,7 +715,28 @@ mod tests {
         // reset the counter.
         clock.advance(CLIENT_TOMBSTONE_MS - 1);
         assert!(matches!(
-            charge_attempt(&store, &clock, &origin(), &code()),
+            charge(&store, &clock, &code()),
+            Err(PairingError::ClientAttemptsExhausted)
+        ));
+    }
+
+    #[test]
+    fn a_reboot_expires_the_entry_and_leaves_a_tombstone() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let clock = TestClock::new();
+        charge(&store, &clock, &code()).expect("an attempt");
+        charge(&store, &clock, &code()).expect("an attempt");
+
+        clock.reboot(9);
+        // A reboot ends the window. It does not hand back the three remaining attempts.
+        assert!(matches!(
+            charge(&store, &clock, &code()),
+            Err(PairingError::ClientAttemptsExhausted)
+        ));
+        // And the tombstone outlives the reboot, because its retention is on the wall clock.
+        clock.advance(CLIENT_TOMBSTONE_MS - 1);
+        assert!(matches!(
+            charge(&store, &clock, &code()),
             Err(PairingError::ClientAttemptsExhausted)
         ));
     }
@@ -605,26 +746,13 @@ mod tests {
         let store = TestClientBudgetStore::new().expect("a store");
         let clock = TestClock::new();
         for _ in 0..MAX_CLIENT_ATTEMPTS {
-            charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt");
+            charge(&store, &clock, &code()).expect("an attempt");
         }
-        assert!(charge_attempt(&store, &clock, &origin(), &code()).is_err());
-        clock.advance(INVITATION_LIFETIME_MS + CLIENT_TOMBSTONE_MS);
+        assert!(charge(&store, &clock, &code()).is_err());
+        clock.advance(INVITATION_LIFETIME_MS + CLIENT_TOMBSTONE_MS + 1);
         // The record is gone, so an entirely new code entry starts fresh. The invitation itself
         // is long expired by then, which is what makes this safe.
-        assert!(charge_attempt(&store, &clock, &origin(), &code()).is_ok());
-    }
-
-    #[test]
-    fn a_reboot_expires_an_unfinished_entry() {
-        let store = TestClientBudgetStore::new().expect("a store");
-        let clock = TestClock::new();
-        charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt");
-        charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt");
-        clock.reboot(9);
-        assert_eq!(
-            charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt"),
-            MAX_CLIENT_ATTEMPTS - 1
-        );
+        assert!(charge(&store, &clock, &code()).is_ok());
     }
 
     #[test]
@@ -651,9 +779,52 @@ mod tests {
         let (attempt, admission, record) =
             ClientAttempt::start(&store, &clock, &rendezvous, &origin(), &code())
                 .expect("an attempt");
-        assert_eq!(admission.attempt_id, attempt.context().attempt_id);
         assert_eq!(rendezvous.looked_up(), vec!["aB3x".to_owned()]);
+        assert_eq!(admission.attempt_id, attempt.context().attempt_id);
         assert_eq!(attempt.context().invitation_id, record.invitation_id);
         assert_eq!(attempt.remaining_attempts(), MAX_CLIENT_ATTEMPTS - 1);
+        assert!(!attempt.is_finished());
+    }
+
+    #[test]
+    fn an_attempt_cannot_start_a_second_exchange() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let clock = TestClock::new();
+        let rendezvous = TestClient::new(LocatorRecord {
+            invitation_id: InvitationId::new(Uuid::from_bytes([1; 16])),
+            advertised_expires_at_ms: TimestampMs::new(9_999),
+        });
+        let (mut attempt, _, _) =
+            ClientAttempt::start(&store, &clock, &rendezvous, &origin(), &code())
+                .expect("an attempt");
+        assert!(
+            attempt
+                .with_host_nonce(Nonce256::from_bytes([1; 32]), &clock)
+                .is_ok()
+        );
+        assert!(matches!(
+            attempt.with_host_nonce(Nonce256::from_bytes([2; 32]), &clock),
+            Err(PairingError::WrongPhase { .. })
+        ));
+        assert!(attempt.is_finished());
+    }
+
+    #[test]
+    fn an_attempt_expires_at_its_handshake_deadline() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let clock = TestClock::new();
+        let rendezvous = TestClient::new(LocatorRecord {
+            invitation_id: InvitationId::new(Uuid::from_bytes([1; 16])),
+            advertised_expires_at_ms: TimestampMs::new(9_999),
+        });
+        let (mut attempt, _, _) =
+            ClientAttempt::start(&store, &clock, &rendezvous, &origin(), &code())
+                .expect("an attempt");
+        clock.advance(HANDSHAKE_DEADLINE_MS);
+        assert!(matches!(
+            attempt.with_host_nonce(Nonce256::from_bytes([1; 32]), &clock),
+            Err(PairingError::Expired)
+        ));
+        assert!(attempt.is_finished());
     }
 }

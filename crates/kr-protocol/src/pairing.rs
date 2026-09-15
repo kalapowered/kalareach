@@ -2054,6 +2054,18 @@ pub enum PairStatus {
         /// When the invitation expires, in UTC milliseconds.
         expires_at_ms: TimestampMs,
     },
+    /// A candidate holds the invitation and is still proving itself.
+    ///
+    /// A successful PAKE locks the invitation to that candidate at once, before the bundles are
+    /// exchanged and before the owner is asked. There is no verification value yet, because the
+    /// value covers both bundle hashes; reporting `open` here would say another candidate could
+    /// still take the invitation, which is no longer true.
+    Locked {
+        /// The candidate that holds it.
+        attempt_id: AttemptId,
+        /// When the invitation expires, in UTC milliseconds.
+        expires_at_ms: TimestampMs,
+    },
     /// A candidate holds the invitation and owner approval is pending.
     AwaitingApproval {
         /// The candidate's attempt.

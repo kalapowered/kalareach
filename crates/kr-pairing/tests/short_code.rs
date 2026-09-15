@@ -3,11 +3,20 @@
 //! Every dependency is an in-test implementation of the traits in `kr_pairing::platform`: no
 //! network, no disk, no real clock. What is exercised is the protocol.
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+
 use kr_crypto::keys::DeviceKeys;
 use kr_pairing::PairingError;
 use kr_pairing::client::ClientAttempt;
 use kr_pairing::code::EnteredCode;
-use kr_pairing::host::{HostInvitation, OwnerContext, cancel_unfinished_invitations};
+use kr_pairing::confirm::{
+    ConfirmationLedger, HostEnrolment, request_confirmation, sign_confirmation,
+};
+use kr_pairing::host::{
+    HANDSHAKE_DEADLINE_MS, HostIdentity, HostInvitation, InvitationProposal, OwnerApproval,
+    OwnerContext, StatusViewer, cancel_unfinished_invitations, confirm_action_digest,
+};
 use kr_pairing::platform::{
     InvitationState, LocatorRecord, TestClient, TestClientBudgetStore, TestClock,
     TestInvitationStore, TestLivePeer, TestRendezvousHost,
@@ -16,12 +25,14 @@ use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
 use kr_protocol::ids::{ActorId, DeviceId, DeviceKeyRevision, GrantId};
 use kr_protocol::pairing::{
-    ClientBundle, DeviceName, DevicePlatform, HostBundle, INVITATION_LIFETIME_MS,
-    MAX_CONFIRMATION_FAILURES, NetworkConfig, PairStatus, PairingConsumedReason, ProposedGrant,
-    RendezvousOrigin,
+    ClientBundle, ConfirmationChannel, DeviceName, DevicePlatform, INVITATION_LIFETIME_MS,
+    MAX_CONFIRMATION_FAILURES, NetworkConfig, OwnerConfirmationProof, OwnerConfirmationRequest,
+    PairStatus, PairingConsumedReason, ProposedGrant, RendezvousOrigin, SensitiveAction,
 };
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
+use kr_protocol::scalars::{
+    AuthorisationKey, CanonicalSet, Digest256, EndpointKey, Nullable, TimestampMs, Uuid,
+};
 
 fn origin() -> RendezvousOrigin {
     RendezvousOrigin::new("https://reach.kala.to").expect("an origin")
@@ -53,26 +64,6 @@ fn proposal() -> ProposedGrant {
     }
 }
 
-fn host_bundle(
-    keys: &DeviceKeys,
-    invitation_id: kr_protocol::ids::InvitationId,
-    device_id: DeviceId,
-) -> HostBundle {
-    HostBundle {
-        invitation_id,
-        device_id,
-        device_key_revision: DeviceKeyRevision::new(1),
-        endpoint_id: *keys.transport.public(),
-        keys: keys.public_keys(),
-        network_config: NetworkConfig {
-            relay_urls: Vec::new(),
-            discovery_origins: Vec::new(),
-            direct_addresses: Vec::new(),
-        },
-        proposed_grant: proposal(),
-    }
-}
-
 fn client_bundle(keys: &DeviceKeys) -> ClientBundle {
     ClientBundle {
         endpoint_id: *keys.transport.public(),
@@ -80,6 +71,28 @@ fn client_bundle(keys: &DeviceKeys) -> ClientBundle {
         device_key_revision: DeviceKeyRevision::new(1),
         device_name: DeviceName::new("A phone").expect("a name"),
         platform: DevicePlatform::Ios,
+    }
+}
+
+/// One owner confirmation, issued and signed, ready to be presented.
+struct Approval {
+    request: OwnerConfirmationRequest,
+    proof: OwnerConfirmationProof,
+}
+
+impl Approval {
+    fn by<'a>(
+        &'a self,
+        owner: &'a OwnerContext,
+        signer: &'a AuthorisationKey,
+    ) -> OwnerApproval<'a> {
+        OwnerApproval {
+            owner,
+            signer,
+            enrolment: HostEnrolment::Enrolled,
+            request: &self.request,
+            proof: &self.proof,
+        }
     }
 }
 
@@ -91,9 +104,12 @@ struct Harness {
     store: TestInvitationStore,
     clock: TestClock,
     service: TestRendezvousHost,
+    ledger: RefCell<ConfirmationLedger>,
     host_keys: DeviceKeys,
     client_keys: DeviceKeys,
+    owner_keys: DeviceKeys,
     host_device_id: DeviceId,
+    issuing_owner: OwnerContext,
 }
 
 type Host<'a> = HostInvitation<&'a TestInvitationStore, &'a TestClock>;
@@ -104,30 +120,89 @@ impl Harness {
             store: TestInvitationStore::new(),
             clock: TestClock::new(),
             service: TestRendezvousHost::new(),
+            ledger: RefCell::new(ConfirmationLedger::new()),
             host_keys: DeviceKeys::generate().expect("keys"),
             client_keys: DeviceKeys::generate().expect("keys"),
+            owner_keys: DeviceKeys::generate().expect("keys"),
             host_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
+            issuing_owner: owner(1),
         }
     }
 
+    fn signer(&self) -> &AuthorisationKey {
+        self.owner_keys.authorisation.public()
+    }
+
+    fn identity(&self) -> HostIdentity {
+        HostIdentity {
+            device_id: self.host_device_id,
+            endpoint_id: *self.host_keys.transport.public(),
+            keys: self.host_keys.public_keys(),
+            device_key_revision: DeviceKeyRevision::new(1),
+            network_config: NetworkConfig {
+                relay_urls: Vec::new(),
+                discovery_origins: Vec::new(),
+                direct_addresses: Vec::new(),
+            },
+        }
+    }
+
+    /// Runs the ceremony: issues a challenge, records it and signs a proof for it.
+    fn approval(&self, action: SensitiveAction, digest: Digest256) -> Approval {
+        let request = request_confirmation(
+            &self.clock,
+            action,
+            digest,
+            None,
+            BTreeSet::new(),
+            self.host_device_id,
+            *self.host_keys.transport.public(),
+        )
+        .expect("a challenge");
+        self.ledger.borrow_mut().issue(&request, &self.clock);
+        let proof = sign_confirmation(
+            &self.owner_keys.authorisation,
+            &request,
+            ConfirmationChannel::OwnerDevicePresence,
+        )
+        .expect("a proof");
+        Approval { request, proof }
+    }
+
+    fn issue_approval(&self) -> Approval {
+        self.approval(
+            SensitiveAction::IssueInvitation,
+            kr_pairing::confirm::action_digest(&proposal()).expect("a digest"),
+        )
+    }
+
     fn issue(&self) -> Host<'_> {
+        let approval = self.issue_approval();
         HostInvitation::issue(
             &self.store,
             &self.clock,
             &self.service,
-            origin(),
-            proposal(),
-            owner(1),
-            self.host_device_id,
-            *self.host_keys.transport.public(),
+            InvitationProposal {
+                origin: origin(),
+                host: self.identity(),
+                proposed_grant: proposal(),
+            },
+            &approval.by(&self.issuing_owner, self.signer()),
+            &mut self.ledger.borrow_mut(),
         )
         .expect("an invitation")
+    }
+
+    fn client_peer(&self) -> TestLivePeer {
+        TestLivePeer::new(*self.client_keys.transport.public())
+    }
+
+    fn host_peer(&self) -> TestLivePeer {
+        TestLivePeer::new(*self.host_keys.transport.public())
     }
 }
 
 /// Runs a complete exchange with `entered` as the code the candidate typed.
-///
-/// Returns the host, the candidate and what the candidate saw, so a test can assert on any step.
 fn run_exchange(
     harness: &Harness,
     host: &mut Host<'_>,
@@ -142,37 +217,65 @@ fn run_exchange(
         ClientAttempt::start(&budget, &harness.clock, &service, &origin(), entered)?;
 
     let host_pake = host.admit(admission.attempt_id, admission.client_nonce)?;
-    let client_pake =
-        client.with_host_nonce(host.context(admission.attempt_id)?.host_nonce, entered)?;
+    let client_pake = client.with_host_nonce(
+        host.context(admission.attempt_id)?.host_nonce,
+        &harness.clock,
+    )?;
 
     host.receive_client_pake(admission.attempt_id, &client_pake)?;
-    let client_tag = client.receive_host_pake(&host_pake)?;
-    let host_tag = host.verify_client_confirmation(admission.attempt_id, &client_tag)?;
-    client.verify_host_confirmation(&host_tag)?;
+    let client_tag = client.receive_host_pake(&host_pake, &harness.clock)?;
+    let confirmation = host.verify_client_confirmation(admission.attempt_id, &client_tag)?;
+    client.verify_host_confirmation(&confirmation.host_tag, &harness.clock)?;
 
-    let host_frame = host.seal_host_bundle(
-        admission.attempt_id,
-        &harness.host_keys.authorisation,
-        host_bundle(
-            &harness.host_keys,
-            host.invitation_id(),
-            harness.host_device_id,
-        ),
-    )?;
-    client.open_host_bundle(&host_frame)?;
+    let host_frame =
+        host.seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation)?;
+    client.open_host_bundle(&host_frame, &harness.clock)?;
     let client_frame = client.seal_client_bundle(
         &harness.client_keys.authorisation,
         client_bundle(&harness.client_keys),
+        &harness.clock,
     )?;
     host.open_client_bundle(admission.attempt_id, &client_frame)?;
 
-    let host_peer = TestLivePeer::new(*harness.host_keys.transport.public());
-    let request = client.finish_request(&host_peer, harness.client_keys.transport.public())?;
-    let client_peer = TestLivePeer::new(*harness.client_keys.transport.public());
+    let host_peer = harness.host_peer();
+    let request = client.finish_request(
+        &host_peer,
+        harness.client_keys.transport.public(),
+        &harness.clock,
+    )?;
+    let client_peer = harness.client_peer();
     let locked = host.finish(&request, &client_peer)?;
     let client_value = client.verification_value()?;
     assert_eq!(locked.verification_value, client_value);
     Ok((client, client_value))
+}
+
+/// Returns the transcript and client bundle hash a locked candidate produced.
+fn locked_values(host: &Host<'_>) -> (Digest256, Digest256) {
+    (
+        host.locked_transcript().expect("a locked transcript"),
+        host.locked_client_bundle_hash()
+            .expect("a hash")
+            .expect("a locked candidate"),
+    )
+}
+
+/// Approves the candidate the host currently holds, as the owner that issued the invitation.
+fn approve(harness: &Harness, host: &mut Host<'_>) -> Result<(), PairingError> {
+    let (transcript, client_hash) = locked_values(host);
+    let approval = harness.approval(
+        SensitiveAction::ConfirmDevice,
+        confirm_action_digest(transcript, client_hash),
+    );
+    host.confirm(
+        &approval.by(&harness.issuing_owner, harness.signer()),
+        &mut harness.ledger.borrow_mut(),
+        transcript,
+        client_hash,
+        DeviceId::new(Uuid::from_bytes([9; 16])),
+        GrantId::new(Uuid::from_bytes([8; 16])),
+    )?;
+    Ok(())
 }
 
 #[test]
@@ -186,7 +289,7 @@ fn a_complete_pairing_commits_the_device_and_the_proposed_grant() {
     assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
 
     let status = host
-        .status(kr_pairing::host::StatusViewer::IssuingOwner(&owner(1)))
+        .status(StatusViewer::IssuingOwner(&harness.issuing_owner))
         .expect("a status");
     let PairStatus::AwaitingApproval {
         verification_value, ..
@@ -197,35 +300,113 @@ fn a_complete_pairing_commits_the_device_and_the_proposed_grant() {
     assert_eq!(verification_value, value);
 
     // The owner approves the exact transcript and client bundle hash it was shown.
-    let locked = locked_values(&host);
+    let (transcript, client_hash) = locked_values(&host);
+    let approval = harness.approval(
+        SensitiveAction::ConfirmDevice,
+        confirm_action_digest(transcript, client_hash),
+    );
     let committed = host
         .confirm(
-            &owner(1),
-            locked.0,
-            locked.1,
+            &approval.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
+            transcript,
+            client_hash,
             DeviceId::new(Uuid::from_bytes([9; 16])),
             GrantId::new(Uuid::from_bytes([8; 16])),
         )
         .expect("a commitment");
     assert_eq!(committed.proposed_grant, proposal());
+    assert_eq!(committed.verification_value, value);
+    assert_eq!(
+        committed.client_keys,
+        harness.client_keys.public_keys(),
+        "the device record is written from the bundle the candidate signed"
+    );
     assert_eq!(host.record().state, InvitationState::Committed);
+
+    // The commitment is in the store, so a restarted host answers the retry from there.
+    let stored =
+        kr_pairing::platform::InvitationStore::commitment(&&harness.store, host.invitation_id())
+            .expect("a read")
+            .expect("a commitment");
+    assert_eq!(stored, committed);
 }
 
-/// Returns the transcript and client bundle hash a locked candidate produced.
-///
-/// This is what the issuing device shows the owner, and what the owner names back.
-fn locked_values(
-    host: &Host<'_>,
-) -> (
-    kr_protocol::scalars::Digest256,
-    kr_protocol::scalars::Digest256,
-) {
-    (
-        host.locked_transcript().expect("a locked transcript"),
-        host.locked_client_bundle_hash()
-            .expect("a hash")
-            .expect("a locked candidate"),
-    )
+#[test]
+fn a_successful_confirmation_locks_the_invitation_before_any_bundle() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+
+    // A second candidate takes a slot first, so there is something to cancel.
+    let bystander = kr_pairing::host::new_attempt_id().expect("an attempt");
+    host.admit(bystander, kr_pairing::host::new_nonce().expect("a nonce"))
+        .expect("a slot");
+
+    let budget = TestClientBudgetStore::new().expect("a store");
+    let service = TestClient::new(LocatorRecord {
+        invitation_id: host.invitation_id(),
+        advertised_expires_at_ms: TimestampMs::new(0),
+    });
+    let (mut client, admission, _) =
+        ClientAttempt::start(&budget, &harness.clock, &service, &origin(), &entered)
+            .expect("an attempt");
+    let host_pake = host
+        .admit(admission.attempt_id, admission.client_nonce)
+        .expect("a slot");
+    let client_pake = client
+        .with_host_nonce(
+            host.context(admission.attempt_id)
+                .expect("a context")
+                .host_nonce,
+            &harness.clock,
+        )
+        .expect("a message");
+    host.receive_client_pake(admission.attempt_id, &client_pake)
+        .expect("a message");
+    let client_tag = client
+        .receive_host_pake(&host_pake, &harness.clock)
+        .expect("a tag");
+
+    assert_eq!(host.record().state, InvitationState::Open);
+    let confirmation = host
+        .verify_client_confirmation(admission.attempt_id, &client_tag)
+        .expect("a tag");
+
+    // The lock is in place before the bundles are exchanged, and the competitor is gone.
+    assert_eq!(
+        host.record().state,
+        InvitationState::Locked {
+            attempt_id: admission.attempt_id
+        }
+    );
+    assert_eq!(confirmation.cancelled, vec![bystander]);
+    assert_eq!(host.live_candidates(), 1);
+    // It is persisted, not just remembered.
+    let stored = kr_pairing::platform::InvitationStore::load(&&harness.store, host.invitation_id())
+        .expect("a read")
+        .expect("a record");
+    assert_eq!(
+        stored.state,
+        InvitationState::Locked {
+            attempt_id: admission.attempt_id
+        }
+    );
+
+    // And no further candidate is admitted while it holds the invitation.
+    assert!(matches!(
+        host.admit(
+            kr_pairing::host::new_attempt_id().expect("an attempt"),
+            kr_pairing::host::new_nonce().expect("a nonce")
+        ),
+        Err(PairingError::CandidateLocked)
+    ));
+
+    // The owner sees a locked invitation, with no verification value to show yet.
+    let status = host
+        .status(StatusViewer::IssuingOwner(&harness.issuing_owner))
+        .expect("a status");
+    assert!(matches!(status, PairStatus::Locked { .. }));
 }
 
 #[test]
@@ -273,12 +454,30 @@ fn a_wrong_code_exhausts_five_guesses_and_the_count_survives_a_restart() {
 }
 
 #[test]
+fn a_write_that_fails_while_spending_a_guess_fences_the_invitation() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let wrong = EnteredCode::parse("aB3x-Yz7-9Qw").expect("a code");
+
+    harness.store.set_failing_writes(true);
+    let error = run_exchange(&harness, &mut host, &wrong).expect_err("the write fails");
+    assert!(matches!(error, PairingError::Store { .. }), "{error}");
+    // The guess was not recorded, so the invitation is not served again: handing the guess back is
+    // the one outcome that must not happen.
+    harness.store.set_failing_writes(false);
+    let right = EnteredCode::parse(&host.code().display_text()).expect("the code");
+    assert!(matches!(
+        run_exchange(&harness, &mut host, &right),
+        Err(PairingError::Store { .. })
+    ));
+}
+
+#[test]
 fn concurrent_candidates_share_one_allowance() {
     let harness = Harness::new();
     let mut host = harness.issue();
     let wrong = EnteredCode::parse("aB3x-Yz7-9Qw").expect("a code");
 
-    // Four candidates take a slot each, and the guesses they spend come out of one count.
     for _ in 0..MAX_CONFIRMATION_FAILURES - 1 {
         let _ = run_exchange(&harness, &mut host, &wrong);
     }
@@ -288,6 +487,62 @@ fn concurrent_candidates_share_one_allowance() {
     assert!(matches!(
         run_exchange(&harness, &mut host, &wrong),
         Err(PairingError::Consumed { .. })
+    ));
+}
+
+#[test]
+fn a_stalled_candidate_frees_its_slot_and_charges_no_guess() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+
+    for _ in 0..kr_pairing::host::MAX_CANDIDATES {
+        host.admit(
+            kr_pairing::host::new_attempt_id().expect("an attempt"),
+            kr_pairing::host::new_nonce().expect("a nonce"),
+        )
+        .expect("a slot");
+    }
+    assert!(matches!(
+        host.admit(
+            kr_pairing::host::new_attempt_id().expect("an attempt"),
+            kr_pairing::host::new_nonce().expect("a nonce")
+        ),
+        Err(PairingError::TooLarge { .. })
+    ));
+
+    // Ten seconds later those four have run out of handshake time and the room is free again.
+    harness.clock.advance(HANDSHAKE_DEADLINE_MS);
+    host.admit(
+        kr_pairing::host::new_attempt_id().expect("an attempt"),
+        kr_pairing::host::new_nonce().expect("a nonce"),
+    )
+    .expect("a slot");
+    assert_eq!(host.live_candidates(), 1);
+    assert_eq!(
+        host.remaining_confirmations(),
+        MAX_CONFIRMATION_FAILURES,
+        "walking away is not a guess"
+    );
+}
+
+#[test]
+fn an_aborted_candidate_frees_its_slot_and_a_locked_one_cannot_be_aborted() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let attempt = kr_pairing::host::new_attempt_id().expect("an attempt");
+    host.admit(attempt, kr_pairing::host::new_nonce().expect("a nonce"))
+        .expect("a slot");
+    assert_eq!(host.live_candidates(), 1);
+    host.abort(attempt).expect("a free slot");
+    assert_eq!(host.live_candidates(), 0);
+    assert_eq!(host.remaining_confirmations(), MAX_CONFIRMATION_FAILURES);
+
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+    run_exchange(&harness, &mut host, &entered).expect("a pairing");
+    let locked = host.locked_attempt().expect("a locked candidate");
+    assert!(matches!(
+        host.abort(locked),
+        Err(PairingError::CandidateLocked)
     ));
 }
 
@@ -318,12 +573,14 @@ fn a_malicious_service_cannot_extend_the_deadline_or_forge_an_invitation() {
             host.context(admission.attempt_id)
                 .expect("a context")
                 .host_nonce,
-            &entered,
+            &harness.clock,
         )
         .expect("a message");
     host.receive_client_pake(admission.attempt_id, &client_pake)
         .expect("the candidate's message");
-    let client_tag = client.receive_host_pake(&host_pake).expect("a tag");
+    let client_tag = client
+        .receive_host_pake(&host_pake, &harness.clock)
+        .expect("a tag");
     // The contexts differ in the invitation identity, so the tags do not match.
     assert!(matches!(
         host.verify_client_confirmation(admission.attempt_id, &client_tag),
@@ -407,6 +664,25 @@ fn a_host_restart_cancels_unfinished_invitations_and_keeps_consumed_state() {
 }
 
 #[test]
+fn a_locked_candidate_is_swept_by_a_restart_like_any_other() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+    run_exchange(&harness, &mut host, &entered).expect("a pairing");
+    assert!(host.locked_attempt().is_some());
+
+    let cancelled = cancel_unfinished_invitations(&harness.store).expect("a sweep");
+    assert_eq!(cancelled, vec![host.invitation_id()]);
+    // The next transition reads the record the sweep wrote rather than its own memory.
+    assert!(matches!(
+        approve(&harness, &mut host),
+        Err(PairingError::Consumed {
+            reason: PairingConsumedReason::HostRestarted
+        })
+    ));
+}
+
+#[test]
 fn a_substituted_endpoint_at_finish_is_rejected() {
     let harness = Harness::new();
     let mut host = harness.issue();
@@ -428,57 +704,128 @@ fn a_substituted_endpoint_at_finish_is_rejected() {
             host.context(admission.attempt_id)
                 .expect("a context")
                 .host_nonce,
-            &entered,
+            &harness.clock,
         )
         .expect("a message");
     host.receive_client_pake(admission.attempt_id, &client_pake)
         .expect("a message");
-    let client_tag = client.receive_host_pake(&host_pake).expect("a tag");
-    let host_tag = host
+    let client_tag = client
+        .receive_host_pake(&host_pake, &harness.clock)
+        .expect("a tag");
+    let confirmation = host
         .verify_client_confirmation(admission.attempt_id, &client_tag)
         .expect("a tag");
     client
-        .verify_host_confirmation(&host_tag)
+        .verify_host_confirmation(&confirmation.host_tag, &harness.clock)
         .expect("confirmed");
 
     let host_frame = host
-        .seal_host_bundle(
-            admission.attempt_id,
-            &harness.host_keys.authorisation,
-            host_bundle(
-                &harness.host_keys,
-                host.invitation_id(),
-                harness.host_device_id,
-            ),
-        )
+        .seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation)
         .expect("a frame");
-    client.open_host_bundle(&host_frame).expect("a bundle");
+    client
+        .open_host_bundle(&host_frame, &harness.clock)
+        .expect("a bundle");
     let client_frame = client
         .seal_client_bundle(
             &harness.client_keys.authorisation,
             client_bundle(&harness.client_keys),
+            &harness.clock,
         )
         .expect("a frame");
     host.open_client_bundle(admission.attempt_id, &client_frame)
         .expect("a bundle");
 
     // The candidate checks the host it reached against the authenticated bundle.
-    let wrong_host = TestLivePeer::new(kr_protocol::scalars::EndpointKey::from_bytes([0xaa; 32]));
+    let wrong_host = TestLivePeer::new(EndpointKey::from_bytes([0xaa; 32]));
     assert!(matches!(
-        client.finish_request(&wrong_host, harness.client_keys.transport.public()),
+        client.finish_request(
+            &wrong_host,
+            harness.client_keys.transport.public(),
+            &harness.clock
+        ),
         Err(PairingError::EndpointMismatch { side: "host" })
     ));
+    assert!(client.is_finished(), "a mismatch ends the attempt");
+}
 
-    // And the host checks the candidate it is talking to against the bundle it authenticated.
-    let host_peer = TestLivePeer::new(*harness.host_keys.transport.public());
+#[test]
+fn the_host_checks_the_candidate_it_is_talking_to_and_refuses_early_data() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+
+    let budget = TestClientBudgetStore::new().expect("a store");
+    let service = TestClient::new(LocatorRecord {
+        invitation_id: host.invitation_id(),
+        advertised_expires_at_ms: TimestampMs::new(0),
+    });
+    let (mut client, admission, _) =
+        ClientAttempt::start(&budget, &harness.clock, &service, &origin(), &entered)
+            .expect("an attempt");
+    let host_pake = host
+        .admit(admission.attempt_id, admission.client_nonce)
+        .expect("admitted");
+    let client_pake = client
+        .with_host_nonce(
+            host.context(admission.attempt_id)
+                .expect("a context")
+                .host_nonce,
+            &harness.clock,
+        )
+        .expect("a message");
+    host.receive_client_pake(admission.attempt_id, &client_pake)
+        .expect("a message");
+    let client_tag = client
+        .receive_host_pake(&host_pake, &harness.clock)
+        .expect("a tag");
+    let confirmation = host
+        .verify_client_confirmation(admission.attempt_id, &client_tag)
+        .expect("a tag");
+    client
+        .verify_host_confirmation(&confirmation.host_tag, &harness.clock)
+        .expect("confirmed");
+    let host_frame = host
+        .seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation)
+        .expect("a frame");
+    client
+        .open_host_bundle(&host_frame, &harness.clock)
+        .expect("a bundle");
+    let client_frame = client
+        .seal_client_bundle(
+            &harness.client_keys.authorisation,
+            client_bundle(&harness.client_keys),
+            &harness.clock,
+        )
+        .expect("a frame");
+    host.open_client_bundle(admission.attempt_id, &client_frame)
+        .expect("a bundle");
+
+    let host_peer = harness.host_peer();
     let request = client
-        .finish_request(&host_peer, harness.client_keys.transport.public())
+        .finish_request(
+            &host_peer,
+            harness.client_keys.transport.public(),
+            &harness.clock,
+        )
         .expect("a request");
-    let impostor = TestLivePeer::new(kr_protocol::scalars::EndpointKey::from_bytes([0xbb; 32]));
+
+    let impostor = TestLivePeer::new(EndpointKey::from_bytes([0xbb; 32]));
     assert!(matches!(
         host.finish(&request, &impostor),
         Err(PairingError::EndpointMismatch { side: "client" })
     ));
+
+    // The same request in 0-RTT is refused whatever endpoint it came from: early data is
+    // replayable by anything that captured it.
+    let replayed = harness.client_peer();
+    replayed.set_early_data(true);
+    assert!(matches!(
+        host.finish(&request, &replayed),
+        Err(PairingError::EarlyData)
+    ));
+
+    let client_peer = harness.client_peer();
+    host.finish(&request, &client_peer).expect("a pairing");
 }
 
 #[test]
@@ -488,10 +835,16 @@ fn only_the_issuing_owner_confirms_or_cancels() {
     let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
     run_exchange(&harness, &mut host, &entered).expect("a pairing");
     let (transcript, client_hash) = locked_values(&host);
+    let approval = harness.approval(
+        SensitiveAction::ConfirmDevice,
+        confirm_action_digest(transcript, client_hash),
+    );
+    let stranger = owner(2);
 
     assert!(matches!(
         host.confirm(
-            &owner(2),
+            &approval.by(&stranger, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
             transcript,
             client_hash,
             DeviceId::new(Uuid::from_bytes([9; 16])),
@@ -500,21 +853,112 @@ fn only_the_issuing_owner_confirms_or_cancels() {
         Err(PairingError::NotIssuingOwner)
     ));
     assert!(matches!(
-        host.cancel(&owner(2)),
+        host.cancel(&stranger),
         Err(PairingError::NotIssuingOwner)
     ));
 
     // Approving a different transcript is refused: the owner approves what it was shown.
     assert!(matches!(
         host.confirm(
-            &owner(1),
-            kr_protocol::scalars::Digest256::from_bytes([0xcc; 32]),
+            &approval.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
+            Digest256::from_bytes([0xcc; 32]),
             client_hash,
             DeviceId::new(Uuid::from_bytes([9; 16])),
             GrantId::new(Uuid::from_bytes([8; 16])),
         ),
         Err(PairingError::ContextMismatch { .. })
     ));
+}
+
+#[test]
+fn issuing_and_confirming_both_need_a_fresh_single_use_confirmation() {
+    let harness = Harness::new();
+
+    // A confirmation for another action does not issue an invitation.
+    let wrong_action = harness.approval(
+        SensitiveAction::EnlargeGrant,
+        kr_pairing::confirm::action_digest(&proposal()).expect("a digest"),
+    );
+    assert!(matches!(
+        HostInvitation::issue(
+            &harness.store,
+            &harness.clock,
+            &harness.service,
+            InvitationProposal {
+                origin: origin(),
+                host: harness.identity(),
+                proposed_grant: proposal(),
+            },
+            &wrong_action.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
+        ),
+        Err(PairingError::OwnerConfirmationRequired)
+    ));
+
+    // Nor does one signed by anybody but the enrolled owner.
+    let impostor = DeviceKeys::generate().expect("keys");
+    let good = harness.issue_approval();
+    assert!(matches!(
+        HostInvitation::issue(
+            &harness.store,
+            &harness.clock,
+            &harness.service,
+            InvitationProposal {
+                origin: origin(),
+                host: harness.identity(),
+                proposed_grant: proposal(),
+            },
+            &good.by(&harness.issuing_owner, impostor.authorisation.public()),
+            &mut harness.ledger.borrow_mut(),
+        ),
+        Err(PairingError::OwnerConfirmationRequired)
+    ));
+    // That challenge is still answerable: rubbish does not burn it.
+    let mut host = HostInvitation::issue(
+        &harness.store,
+        &harness.clock,
+        &harness.service,
+        InvitationProposal {
+            origin: origin(),
+            host: harness.identity(),
+            proposed_grant: proposal(),
+        },
+        &good.by(&harness.issuing_owner, harness.signer()),
+        &mut harness.ledger.borrow_mut(),
+    )
+    .expect("an invitation");
+
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+    run_exchange(&harness, &mut host, &entered).expect("a pairing");
+    let (transcript, client_hash) = locked_values(&host);
+
+    // A confirmation naming another candidate does not approve this one.
+    let elsewhere = harness.approval(
+        SensitiveAction::ConfirmDevice,
+        confirm_action_digest(Digest256::from_bytes([3; 32]), client_hash),
+    );
+    assert!(matches!(
+        host.confirm(
+            &elsewhere.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
+            transcript,
+            client_hash,
+            DeviceId::new(Uuid::from_bytes([9; 16])),
+            GrantId::new(Uuid::from_bytes([8; 16])),
+        ),
+        Err(PairingError::OwnerConfirmationRequired)
+    ));
+
+    approve(&harness, &mut host).expect("a commitment");
+    // Two challenges were never answered, because the proofs presented for them named another
+    // action. They stay answerable until they run out, and then they are gone.
+    assert_eq!(harness.ledger.borrow().len(), 2);
+    harness
+        .clock
+        .advance(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS);
+    harness.ledger.borrow_mut().expire(&harness.clock);
+    assert!(harness.ledger.borrow().is_empty());
 }
 
 #[test]
@@ -527,14 +971,26 @@ fn a_transport_retry_retrieves_the_committed_result() {
 
     let device_id = DeviceId::new(Uuid::from_bytes([9; 16]));
     let grant_id = GrantId::new(Uuid::from_bytes([8; 16]));
+    let first_approval = harness.approval(
+        SensitiveAction::ConfirmDevice,
+        confirm_action_digest(transcript, client_hash),
+    );
     let first = host
-        .confirm(&owner(1), transcript, client_hash, device_id, grant_id)
+        .confirm(
+            &first_approval.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
+            transcript,
+            client_hash,
+            device_id,
+            grant_id,
+        )
         .expect("a commitment");
     // A retry with different identities still returns the committed result: it cannot replace the
     // public keys or the grant.
     let second = host
         .confirm(
-            &owner(1),
+            &first_approval.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
             transcript,
             client_hash,
             DeviceId::new(Uuid::from_bytes([0xdd; 16])),
@@ -545,25 +1001,79 @@ fn a_transport_retry_retrieves_the_committed_result() {
 }
 
 #[test]
-fn a_candidate_sees_only_its_own_status_and_never_a_secret() {
+fn a_commitment_that_cannot_be_written_is_not_reported_as_a_pairing() {
     let harness = Harness::new();
     let mut host = harness.issue();
     let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
     run_exchange(&harness, &mut host, &entered).expect("a pairing");
-    let InvitationState::AwaitingApproval { attempt_id } = host.record().state else {
-        panic!("a candidate holds it");
-    };
 
+    harness.store.set_failing_writes(true);
+    assert!(matches!(
+        approve(&harness, &mut host),
+        Err(PairingError::Store { .. })
+    ));
+    harness.store.set_failing_writes(false);
+    assert_eq!(
+        kr_pairing::platform::InvitationStore::commitment(&&harness.store, host.invitation_id())
+            .expect("a read"),
+        None,
+        "nothing was written, so nothing is reported"
+    );
+}
+
+#[test]
+fn a_candidate_sees_only_its_own_status_from_its_own_endpoint() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+    run_exchange(&harness, &mut host, &entered).expect("a pairing");
+    let attempt_id = host.locked_attempt().expect("a candidate holds it");
+
+    let peer = harness.client_peer();
     let status = host
-        .status(kr_pairing::host::StatusViewer::Candidate(attempt_id))
+        .status(StatusViewer::Candidate {
+            attempt_id,
+            live_peer: &peer,
+        })
         .expect("a status");
     let rendered = format!("{status:?}");
     assert!(!rendered.contains(&*host.code().display_text()));
     assert!(!rendered.contains(&*host.code().secret().expose_text()));
 
+    // Knowing the attempt identity is not enough: the asker must be that endpoint.
+    let impostor = TestLivePeer::new(EndpointKey::from_bytes([0x77; 32]));
+    assert!(matches!(
+        host.status(StatusViewer::Candidate {
+            attempt_id,
+            live_peer: &impostor,
+        }),
+        Err(PairingError::NotIssuingOwner)
+    ));
+
     let stranger = kr_pairing::host::new_attempt_id().expect("an attempt");
     assert!(matches!(
-        host.status(kr_pairing::host::StatusViewer::Candidate(stranger)),
+        host.status(StatusViewer::Candidate {
+            attempt_id: stranger,
+            live_peer: &peer,
+        }),
+        Err(PairingError::NotIssuingOwner)
+    ));
+
+    // After the commitment the answer comes from the store, so it survives the attempts being
+    // cleared, and it is still only for that candidate on its own endpoint.
+    approve(&harness, &mut host).expect("a commitment");
+    assert!(matches!(
+        host.status(StatusViewer::Candidate {
+            attempt_id,
+            live_peer: &peer,
+        }),
+        Ok(PairStatus::Committed { .. })
+    ));
+    assert!(matches!(
+        host.status(StatusViewer::Candidate {
+            attempt_id,
+            live_peer: &impostor,
+        }),
         Err(PairingError::NotIssuingOwner)
     ));
 }

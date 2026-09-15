@@ -3315,6 +3315,34 @@
         },
         {
           "additionalProperties": false,
+          "description": "A candidate holds the invitation and is still proving itself.\n\nA successful PAKE locks the invitation to that candidate at once, before the bundles are\nexchanged and before the owner is asked. There is no verification value yet, because the\nvalue covers both bundle hashes; reporting `open` here would say another candidate could\nstill take the invitation, which is no longer true.",
+          "properties": {
+            "locked": {
+              "additionalProperties": false,
+              "properties": {
+                "attempt_id": {
+                  "$ref": "#/$defs/AttemptId",
+                  "description": "The candidate that holds it."
+                },
+                "expires_at_ms": {
+                  "$ref": "#/$defs/TimestampMs",
+                  "description": "When the invitation expires, in UTC milliseconds."
+                }
+              },
+              "required": [
+                "attempt_id",
+                "expires_at_ms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "locked"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "A candidate holds the invitation and owner approval is pending.",
           "properties": {
             "awaiting_approval": {
