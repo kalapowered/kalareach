@@ -154,6 +154,64 @@ impl Pty {
             .map_err(|error| WorkerError::pty("write to the pseudo-terminal", error))
     }
 
+    /// Returns the process group the terminal currently has in the foreground.
+    ///
+    /// This changes with every command an interactive shell runs, so it is read now rather than
+    /// remembered from when the shell started.
+    #[must_use]
+    pub fn foreground_group(&self) -> Option<i32> {
+        foreground_group(self.master.as_ref())
+    }
+
+    /// Sends the terminal's interrupt to the group it has in the foreground.
+    ///
+    /// The foreground group is the one the terminal itself would signal when the interrupt key is
+    /// pressed, and for an interactive shell running a command that is the command's group, not
+    /// the shell's. Signalling the shell's group instead would interrupt the shell and leave the
+    /// command running, which is the opposite of what the key does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the terminal will not name a foreground group, so the caller can fall
+    /// back to the group it does know.
+    #[cfg(unix)]
+    pub fn interrupt_foreground(&self) -> Result<()> {
+        let group = self.foreground_group().ok_or_else(|| {
+            WorkerError::pty(
+                "interrupt the foreground application",
+                "the terminal did not name a foreground process group",
+            )
+        })?;
+        let pid = rustix::process::Pid::from_raw(group).ok_or_else(|| {
+            WorkerError::pty(
+                "interrupt the foreground application",
+                "the foreground group is not a valid identifier",
+            )
+        })?;
+        match rustix::process::kill_process_group(pid, rustix::process::Signal::INT) {
+            Ok(()) => Ok(()),
+            // The group is already gone, which is the outcome the caller wanted.
+            Err(error) if error == rustix::io::Errno::SRCH => Ok(()),
+            Err(error) => Err(WorkerError::pty(
+                "interrupt the foreground application",
+                error,
+            )),
+        }
+    }
+
+    /// Sends the terminal's interrupt to the group it has in the foreground.
+    ///
+    /// # Errors
+    ///
+    /// Always returns an error: a Windows console pseudo-terminal has no foreground process group.
+    #[cfg(not(unix))]
+    pub fn interrupt_foreground(&self) -> Result<()> {
+        Err(WorkerError::pty(
+            "interrupt the foreground application",
+            "a console pseudo-terminal has no foreground process group",
+        ))
+    }
+
     /// Changes the terminal's geometry and notifies the foreground application.
     ///
     /// # Errors
@@ -245,7 +303,10 @@ impl RootShell {
         self.signal_group(Signal::Kill)
     }
 
-    /// Sends the terminal's interrupt to the foreground process group.
+    /// Sends the terminal's interrupt to the root shell's own process group.
+    ///
+    /// This is the fallback. The interrupt normally goes to the terminal's *foreground* group,
+    /// which [`Pty::interrupt_foreground`] reads from the terminal itself.
     ///
     /// # Errors
     ///

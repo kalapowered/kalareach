@@ -196,8 +196,10 @@ impl OutputHub {
         oldest_retained_cursor: u64,
     ) {
         if let Some(subscriber) = self.subscribers.get_mut(&attachment_id) {
+            // The same accounting rule as an overflow. Bytes already queued still belong to the
+            // subscriber and it releases them as it reads; zeroing the counter here would make
+            // every one of those releases subtract from nothing.
             subscriber.resynchronising = true;
-            subscriber.queued.store(0, Ordering::Release);
             let _ = subscriber
                 .sender
                 .send(OutputDelivery::Resync(ResyncRequired {

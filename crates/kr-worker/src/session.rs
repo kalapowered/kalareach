@@ -111,7 +111,7 @@ pub struct Session {
     application_state: Option<ApplicationState>,
     closing_reason: Option<ClosureReason>,
     created_at_ms: TimestampMs,
-    pending_input: Vec<Vec<u8>>,
+    pending_input: Vec<InputBatch>,
     owned: Option<OwnedProcesses>,
     root_exit: Option<ShellExit>,
 }
@@ -378,8 +378,21 @@ impl Session {
     ///
     /// Returns an error when the attachment is unknown.
     pub fn detach(&mut self, attachment_id: AttachmentId) -> Result<SessionDetachResult> {
-        // Undelivered input from the removed attachment goes with it; nothing is replayed.
+        // Undelivered input from the removed attachment goes with it; nothing is replayed. A paste
+        // it had open is closed first, so the application is not left inside a bracketed paste
+        // whose source has gone.
+        let held = self.lease.holder() == Some(attachment_id);
+        let epoch = self.lease.epoch();
         self.lease.release_attachment(attachment_id);
+        if held {
+            let framing = self.framer.close_for_takeover();
+            if let Some(terminator) = framing.terminator {
+                self.pending_input.push(InputBatch {
+                    epoch,
+                    bytes: terminator.to_vec(),
+                });
+            }
+        }
         self.hub.unsubscribe(attachment_id);
         let change = self.attachments.detach(attachment_id)?;
         if change.resize_required && self.state.is_running() {
@@ -488,12 +501,18 @@ impl Session {
         }
         // An interrupted paste is closed before the new lease writes, so the application never
         // sees a paste finished under a different actor.
+        let previous_epoch = self.lease.epoch();
         let framing = self.framer.close_for_takeover();
         let mut discarded = self.lease.acquire(attachment_id, connection_id);
         discarded += framing.discarded_prefix.len() as u64;
         let closed_open_paste = framing.terminator.is_some();
         if let Some(terminator) = framing.terminator {
-            self.pending_input.push(terminator.to_vec());
+            // The terminator belongs to the paste the previous lease opened, so it is written
+            // under the epoch that opened it rather than the one taking over.
+            self.pending_input.push(InputBatch {
+                epoch: previous_epoch,
+                bytes: terminator.to_vec(),
+            });
         }
         Ok(InputAcquireResult {
             lease: self.lease.to_wire(),
@@ -515,7 +534,16 @@ impl Session {
         self.lease
             .release(attachment_id, epoch)
             .ok_or(WorkerError::LeaseLost)?;
-        self.framer.close_for_takeover();
+        // A paste this lease opened is closed as it goes. Leaving it open would put the
+        // application into a bracketed paste that nothing was ever going to end, so the next
+        // keystroke would arrive inside somebody else's paste.
+        let framing = self.framer.close_for_takeover();
+        if let Some(terminator) = framing.terminator {
+            self.pending_input.push(InputBatch {
+                epoch,
+                bytes: terminator.to_vec(),
+            });
+        }
         Ok(self.lease.to_wire())
     }
 
@@ -550,7 +578,10 @@ impl Session {
         }
         let outcome = self.framer.push(bytes, now);
         if !outcome.forward.is_empty() {
-            self.pending_input.push(outcome.forward.clone());
+            self.pending_input.push(InputBatch {
+                epoch,
+                bytes: outcome.forward.clone(),
+            });
         }
         Ok(InputAccepted {
             forwarded_bytes: outcome.forward.len() as u64,
@@ -564,10 +595,11 @@ impl Session {
     /// The timer runs whether or not more input arrives, so a lone Escape is never waiting for
     /// another keystroke.
     pub fn expire_paste_prefix(&mut self, now: Instant) -> usize {
+        let epoch = self.lease.epoch();
         match self.framer.expire(now) {
             Some(bytes) if !bytes.is_empty() => {
                 let len = bytes.len();
-                self.pending_input.push(bytes);
+                self.pending_input.push(InputBatch { epoch, bytes });
                 len
             }
             _ => 0,
@@ -597,13 +629,27 @@ impl Session {
         if self.lease.holder() != Some(attachment_id) || self.lease.epoch() != epoch {
             return Err(WorkerError::LeaseLost);
         }
+        // The terminal's own foreground group first, because that is what the interrupt key
+        // reaches. The root shell's group is the fallback for a terminal that will not say.
+        if self.pty.interrupt_foreground().is_ok() {
+            return Ok(());
+        }
         let shell = self.shell.as_mut().ok_or(WorkerError::SessionClosed)?;
         shell.interrupt()
     }
 
-    /// Takes the bytes waiting to be written to the pseudo-terminal.
-    pub fn take_pending_input(&mut self) -> Vec<Vec<u8>> {
+    /// Takes the batches waiting to be written to the pseudo-terminal.
+    pub fn take_pending_input(&mut self) -> Vec<InputBatch> {
         std::mem::take(&mut self.pending_input)
+    }
+
+    /// Returns the epoch a batch must carry to still be written.
+    ///
+    /// Everything queued under an earlier epoch is stale. A takeover, a release, a detach or a
+    /// close moves this, and the writer drops whatever it is still holding from before.
+    #[must_use]
+    pub fn input_fence(&self) -> u64 {
+        self.lease.epoch()
     }
 
     /// Subscribes an attachment to output.
@@ -644,6 +690,13 @@ impl Session {
     pub fn ingest_output(&mut self, bytes: &[u8]) -> Vec<AttachmentId> {
         if bytes.is_empty() {
             return Vec::new();
+        }
+        // The application is the only thing that decides whether bracketed paste is on, and it says
+        // so on this stream. Watching for it here is what connects the recogniser to the terminal
+        // it is recognising for; without it the recogniser would hold delimiters no application
+        // had asked for, or miss the ones it had.
+        if let Some(enabled) = crate::input::bracketed_paste_mode(bytes) {
+            self.framer.set_bracketed_paste(enabled);
         }
         let cursor = self.history.append(bytes);
         let shared = Arc::new(bytes.to_vec());
@@ -977,6 +1030,19 @@ impl Session {
             Err(WorkerError::SessionClosed)
         }
     }
+}
+
+/// One ordered batch of input, and the lease epoch it was accepted under.
+///
+/// The epoch is what makes a takeover able to discard bytes it has already handed to the writer: a
+/// batch whose epoch is behind the session's fence belongs to a lease that no longer holds input,
+/// and writing it would put one actor's keystrokes into another's command line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputBatch {
+    /// The lease epoch this batch was accepted under.
+    pub epoch: u64,
+    /// The bytes, exactly as they arrived.
+    pub bytes: Vec<u8>,
 }
 
 /// What accepting input produced.

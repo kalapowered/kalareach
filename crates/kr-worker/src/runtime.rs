@@ -16,7 +16,7 @@ use kr_protocol::session::{ClosureReason, ClosureRecord, SessionState};
 use tokio::sync::{Notify, mpsc};
 
 use crate::error::{Result, WorkerError};
-use crate::session::{CloseAcceptance, DRAIN_PERIOD, GRACE_PERIOD, Session};
+use crate::session::{CloseAcceptance, DRAIN_PERIOD, GRACE_PERIOD, InputBatch, Session};
 
 /// How many read batches may wait for ingestion before the read loop slows down.
 pub const READ_QUEUE_DEPTH: usize = 64;
@@ -31,9 +31,10 @@ pub const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 #[derive(Debug)]
 pub struct SessionRuntime {
     session: Arc<Mutex<Session>>,
-    input: mpsc::UnboundedSender<Vec<u8>>,
+    input: mpsc::UnboundedSender<InputBatch>,
     wake: Arc<Notify>,
     closed: Arc<Notify>,
+    fence: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SessionRuntime {
@@ -46,7 +47,10 @@ impl SessionRuntime {
         let reader = session.output_reader()?;
         let mut writer = session.input_writer()?;
         let session = Arc::new(Mutex::new(session));
-        let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<InputBatch>();
+        // What the writer compares every batch against. A takeover, a release, a detach or a close
+        // moves the session's lease epoch, and this is how that reaches bytes already handed over.
+        let fence = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // Bounded on purpose. Section 9 says a slow *client* must never hold the read loop, and it
         // also says the worker honours the operating system's own backpressure when parsing itself
         // cannot keep up, and never drops parser input. A bounded handoff does both: clients are
@@ -87,9 +91,16 @@ impl SessionRuntime {
             }
         });
 
+        let writer_fence = Arc::clone(&fence);
         std::thread::spawn(move || {
-            while let Some(bytes) = input_receiver.blocking_recv() {
-                if std::io::Write::write_all(&mut writer, &bytes).is_err() {
+            while let Some(batch) = input_receiver.blocking_recv() {
+                // Stale bytes are dropped here rather than written. A takeover that only stopped
+                // *new* input would still let the previous holder's last keystrokes land in the
+                // new holder's command line.
+                if batch.epoch < writer_fence.load(std::sync::atomic::Ordering::Acquire) {
+                    continue;
+                }
+                if std::io::Write::write_all(&mut writer, &batch.bytes).is_err() {
                     break;
                 }
                 let _ = std::io::Write::flush(&mut writer);
@@ -101,6 +112,7 @@ impl SessionRuntime {
             input: input_sender.clone(),
             wake: Arc::clone(&wake),
             closed: Arc::clone(&closed),
+            fence: Arc::clone(&fence),
         };
 
         let ingest_session = Arc::clone(&session);
@@ -131,6 +143,7 @@ impl SessionRuntime {
         let monitor_closed = Arc::clone(&closed);
         let monitor_input = input_sender.clone();
         let monitor_wake = Arc::clone(&wake);
+        let monitor_fence = Arc::clone(&fence);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(CHILD_POLL_INTERVAL).await;
@@ -161,6 +174,7 @@ impl SessionRuntime {
                         input: monitor_input.clone(),
                         wake: Arc::clone(&monitor_wake),
                         closed: Arc::clone(&monitor_closed),
+                        fence: Arc::clone(&monitor_fence),
                     };
                     CloseGate {
                         runtime: Arc::new(runtime),
@@ -192,8 +206,8 @@ impl SessionRuntime {
                         }
                         if let Ok(mut session) = timer_session.lock() {
                             session.expire_paste_prefix(Instant::now());
-                            for bytes in session.take_pending_input() {
-                                let _ = timer_input.send(bytes);
+                            for batch in session.take_pending_input() {
+                                let _ = timer_input.send(batch);
                             }
                         }
                     }
@@ -221,10 +235,23 @@ impl SessionRuntime {
     ///
     /// Call this after any operation that can produce input bytes.
     pub fn flush_input(&self) {
-        let pending = {
-            let mut session = self.session();
-            session.take_pending_input()
-        };
+        let mut session = self.session();
+        let pending = session.take_pending_input();
+        // Sent while the session is still held, so two callers cannot interleave their batches:
+        // the order bytes reach the terminal in is the order they were accepted in.
+        self.fence
+            .store(session.input_fence(), std::sync::atomic::Ordering::Release);
+        self.send_input(pending);
+    }
+
+    /// Writes the batches a caller produced while it was holding the session.
+    ///
+    /// The fence moves first, so a batch the caller's own operation invalidated is dropped by the
+    /// writer rather than written.
+    pub fn flush_locked(&self, session: &mut Session) {
+        let pending = session.take_pending_input();
+        self.fence
+            .store(session.input_fence(), std::sync::atomic::Ordering::Release);
         self.send_input(pending);
     }
 
@@ -232,9 +259,9 @@ impl SessionRuntime {
     ///
     /// A mutation runs inside the session's serial boundary, so it cannot take the lock again to
     /// flush. It hands the batches out instead, and this sends them once the boundary is over.
-    pub fn send_input(&self, batches: Vec<Vec<u8>>) {
-        for bytes in batches {
-            let _ = self.input.send(bytes);
+    pub fn send_input(&self, batches: Vec<InputBatch>) {
+        for batch in batches {
+            let _ = self.input.send(batch);
         }
         // A new held prefix needs the timer to look again.
         self.wake.notify_waiters();

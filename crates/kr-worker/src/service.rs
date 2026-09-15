@@ -251,28 +251,56 @@ impl WorkerService {
                 continue;
             }
             if let Some((attachment_id, mut stream)) = state.subscribed.take() {
+                // A connection has one delivery task. Replacing one without cancelling its
+                // predecessor would leave two tasks writing the same stream identifier down the
+                // same connection.
+                if let Some(previous) = state.delivery.take() {
+                    previous.abort();
+                }
                 let sender = Arc::clone(&writer);
                 let stream_id = state.stream_id.clone();
-                let replay_from = state.replay_from.take();
+                let replay = state.replay.take();
                 let runtime = Arc::clone(self.runtime());
                 let task = tokio::spawn(async move {
                     let mut sequence = 0_u64;
-                    // The retained range between the requested cursor and the live edge is sent
-                    // before live output, so a reconnecting client sees one ordered stream rather
-                    // than a hole it never learns about.
-                    if let Some(mut cursor) = replay_from {
-                        loop {
+                    // The retained range is replayed up to the cursor the subscription was taken
+                    // at, and no further. Reading to a moving end would send bytes that the live
+                    // queue is also about to send, so the client would see them twice and its
+                    // cursor would move backwards at the handover.
+                    let live_from = replay.map_or(0, |replay| replay.to);
+                    if let Some(replay) = replay {
+                        let mut cursor = replay.from;
+                        while cursor < replay.to {
                             let page = {
                                 let session = runtime.session();
                                 session.history_page(cursor, MAX_REPLAY_PAGE_BYTES)
                             };
                             let Ok(page) = page else { break };
+                            // A gap in the retained range is part of the stream, not a detail to
+                            // drop: the client has to know its view is not continuous.
+                            if let Some(gap) = page.gap.as_ref()
+                                && let Some(notification) =
+                                    notification(&stream_id, sequence, "session.gap", gap)
+                            {
+                                sequence += 1;
+                                let mut sender = sender.lock().await;
+                                if sender.write_message(&notification).await.is_err() {
+                                    return;
+                                }
+                            }
                             if page.bytes.is_empty() {
                                 break;
                             }
+                            let start = page.from_cursor.get();
+                            let available = page.bytes.as_slice();
+                            // The last page is trimmed at the boundary, so replay ends exactly
+                            // where the live queue begins.
+                            let keep = usize::try_from(replay.to.saturating_sub(start))
+                                .unwrap_or(available.len())
+                                .min(available.len());
                             let event = OutputEvent {
-                                cursor: page.from_cursor,
-                                bytes: page.bytes.clone(),
+                                cursor: U64::new(start),
+                                bytes: kr_protocol::scalars::Bytes::new(available[..keep].to_vec()),
                             };
                             let Some(notification) =
                                 notification(&stream_id, sequence, "session.output", &event)
@@ -285,20 +313,34 @@ impl WorkerService {
                                 return;
                             }
                             drop(sender);
-                            cursor = page.next_cursor.get();
+                            cursor = page.next_cursor.get().max(start + keep as u64);
                         }
                     }
                     while let Some(delivery) = stream.recv().await {
                         let notification = match delivery {
-                            OutputDelivery::Bytes { cursor, bytes } => notification(
-                                &stream_id,
-                                sequence,
-                                "session.output",
-                                &OutputEvent {
-                                    cursor: U64::new(cursor),
-                                    bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
-                                },
-                            ),
+                            OutputDelivery::Bytes { cursor, bytes } => {
+                                // Anything the replay already covered is dropped here rather than
+                                // sent again; a batch that straddles the boundary is trimmed to
+                                // the part that follows it.
+                                let end = cursor + bytes.len() as u64;
+                                if end <= live_from {
+                                    continue;
+                                }
+                                let skip = usize::try_from(live_from.saturating_sub(cursor))
+                                    .unwrap_or(0)
+                                    .min(bytes.len());
+                                notification(
+                                    &stream_id,
+                                    sequence,
+                                    "session.output",
+                                    &OutputEvent {
+                                        cursor: U64::new(cursor + skip as u64),
+                                        bytes: kr_protocol::scalars::Bytes::new(
+                                            bytes[skip..].to_vec(),
+                                        ),
+                                    },
+                                )
+                            }
                             OutputDelivery::Resync(marker) => {
                                 notification(&stream_id, sequence, "session.resync", &marker)
                             }
@@ -944,7 +986,6 @@ impl WorkerService {
         let (value, after) = outcome?;
         match after {
             AfterEffect::None => {}
-            AfterEffect::Input(pending) => self.runtime.send_input(pending),
             AfterEffect::Close(gate) => state.close_gate = Some((mutation.action_id, gate)),
         }
         Ok(value)
@@ -1325,6 +1366,9 @@ impl WorkerService {
             .from_cursor
             .as_ref()
             .map_or_else(|| session.output_cursor(), |cursor| cursor.get());
+        // The cursor the subscription was taken at, read under the same lock that started the
+        // live queue. Replay ends here and the live queue begins here, so the two meet exactly.
+        let live_from = session.output_cursor();
         let oldest = session.snapshot().oldest_retained_cursor.get();
         let gap = (from < oldest).then_some(kr_protocol::recovery::HistoryGap {
             from_cursor: U64::new(from),
@@ -1333,7 +1377,10 @@ impl WorkerService {
         let replay_from = from.max(oldest);
         drop(session);
         state.subscribed = Some((params.attachment_id, stream));
-        state.replay_from = Some(replay_from);
+        state.replay = Some(ReplayRange {
+            from: replay_from,
+            to: live_from,
+        });
         encode(&EventsSubscribeResult {
             stream_id: state.stream_id.clone(),
             from_cursor: U64::new(from.max(oldest)),
@@ -1383,7 +1430,7 @@ impl WorkerService {
     ) -> Result<ParamsValue> {
         let params: InputWriteParams = parse(params)?;
         Self::check_attachment(state, params.attachment_id)?;
-        let (accepted, pending) = {
+        let accepted = {
             let mut session = self.runtime.session();
             Self::check_session(&session, params.session_id)?;
             Self::check_capability(&session, params.attachment_id, AttachmentCapability::Input)?;
@@ -1394,10 +1441,11 @@ impl WorkerService {
                 params.bytes.as_slice(),
                 std::time::Instant::now(),
             )?;
-            let pending = session.take_pending_input();
-            (accepted, pending)
+            // Handed to the writer while the session is still held, so two writers cannot
+            // interleave their batches after releasing the lock.
+            self.runtime.flush_locked(&mut session);
+            accepted
         };
-        self.runtime.send_input(pending);
         state.input_sequence = params.sequence.get();
         encode(&InputWriteResult {
             sequence: params.sequence,
@@ -1484,17 +1532,14 @@ impl WorkerService {
                     state.connection_id,
                     params.expected_epoch.as_ref().map(|epoch| epoch.get()),
                 )?;
-                let pending = session.take_pending_input();
-                Ok((encode(&result)?, AfterEffect::Input(pending)))
+                self.runtime.flush_locked(session);
+                Ok((encode(&result)?, AfterEffect::None))
             }
             Method::InputRelease => {
                 let params: InputReleaseParams = parse(params)?;
                 let lease = session.release_input(params.attachment_id, params.epoch.get())?;
-                let pending = session.take_pending_input();
-                Ok((
-                    encode(&InputLeaseResult { lease })?,
-                    AfterEffect::Input(pending),
-                ))
+                self.runtime.flush_locked(session);
+                Ok((encode(&InputLeaseResult { lease })?, AfterEffect::None))
             }
             Method::InputInterrupt => {
                 let params: InputInterruptParams = parse(params)?;
@@ -1545,6 +1590,15 @@ impl WorkerService {
             ))),
         }
     }
+}
+
+/// The retained range one subscription replays before its live output begins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayRange {
+    /// The first cursor to send.
+    pub from: u64,
+    /// The cursor the subscription was taken at. Replay stops here and live output starts here.
+    pub to: u64,
 }
 
 /// What decides whether a mutation may be admitted for the first time.
@@ -1681,8 +1735,8 @@ pub struct ConnectionState {
     pub pending_delivery: Option<(kr_protocol::ids::ActionId, crate::runtime::PendingDelivery)>,
     /// A generation challenge waiting to be sent after the current reply.
     pub pending_challenge: Option<ControlMessage>,
-    /// Where a new subscription replays retained output from before live output resumes.
-    pub replay_from: Option<u64>,
+    /// The retained range a new subscription replays before live output resumes.
+    pub replay: Option<ReplayRange>,
     /// The delivery task this connection owns, cancelled when the connection goes.
     pub delivery: Option<tokio::task::JoinHandle<()>>,
     /// The host-issued principal this connection acts under.
@@ -1721,7 +1775,7 @@ impl ConnectionState {
             close_gate: None,
             pending_delivery: None,
             pending_challenge: None,
-            replay_from: None,
+            replay: None,
             delivery: None,
             actor_id: ActorId::new(format!("local:{}", peer.uid))
                 .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal")),
@@ -1785,8 +1839,6 @@ fn failure(request_id: RequestId, error: &ProtocolError) -> ControlMessage {
 pub enum AfterEffect {
     /// Nothing.
     None,
-    /// Bytes to write to the pseudo-terminal.
-    Input(Vec<Vec<u8>>),
     /// A termination sequence to start once the acceptance has reached the requester.
     Close(crate::runtime::CloseGate),
 }
