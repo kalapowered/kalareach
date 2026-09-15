@@ -52,11 +52,17 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
-      - name: Generated schema is current
+      - name: Generated protocol schema is current
         run: cargo run --locked -p kr-protocol --bin kr-protocol-gen -- --check
 
       - name: Cryptography vectors are current
         run: cargo run --locked -p kr-crypto --bin kr-crypto-vectors -- --check
+
+      - name: Generated plugin SDK schema, WIT package and fixtures are current
+        run: cargo run --locked -p kr-plugin-sdk --bin kr-plugin-sdk-gen -- --check
+
+      - name: Fixture packages validate
+        run: cargo run --locked -p kr-plugin-sdk --bin kr-plugin-sandbox -- fixtures/plugins/valid/example-declarative
 
   typescript:
     name: typescript
@@ -78,6 +84,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Generated types are current
+        run: pnpm -r generate:check
 
       - name: Test
         run: pnpm -r test
