@@ -1,0 +1,229 @@
+{
+  "name": "map-ordering",
+  "description": "Canonical map key ordering. Keys sort by the bytewise order of the complete encoded key, which for text keys means length first and then content.",
+  "note": "Values use the fixture description grammar documented in docs/protocol/README.md: {\"int\": decimal string}, {\"bytes\": hex}, {\"text\": string}, {\"bool\": bool}, {\"null\": true}, {\"array\": [value]}, {\"map\": [[key, value]]}. Map entries are listed in source order; a conforming encoder sorts them into canonical key order.",
+  "cases": [
+    {
+      "id": "map_empty",
+      "description": "An empty map.",
+      "value": {
+        "map": []
+      },
+      "hex": "a0"
+    },
+    {
+      "id": "map_single",
+      "description": "One entry.",
+      "value": {
+        "map": [
+          [
+            "a",
+            {
+              "int": "1"
+            }
+          ]
+        ]
+      },
+      "hex": "a1616101"
+    },
+    {
+      "id": "map_shorter_key_first",
+      "description": "Keys are sorted by the bytewise order of the complete encoded key, so the shorter key sorts first even though 'aa' < 'z' when the key text alone is compared. This is the case where ordering the raw key text disagrees with ordering the encoded keys.",
+      "value": {
+        "map": [
+          [
+            "aa",
+            {
+              "int": "2"
+            }
+          ],
+          [
+            "z",
+            {
+              "int": "1"
+            }
+          ]
+        ]
+      },
+      "hex": "a2617a0162616102"
+    },
+    {
+      "id": "map_same_length_bytewise",
+      "description": "Keys of equal length compare bytewise.",
+      "value": {
+        "map": [
+          [
+            "b",
+            {
+              "int": "2"
+            }
+          ],
+          [
+            "a",
+            {
+              "int": "1"
+            }
+          ]
+        ]
+      },
+      "hex": "a2616101616202"
+    },
+    {
+      "id": "map_empty_key_first",
+      "description": "The empty key has the shortest encoding and sorts first.",
+      "value": {
+        "map": [
+          [
+            "a",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "",
+            {
+              "int": "0"
+            }
+          ]
+        ]
+      },
+      "hex": "a26000616101"
+    },
+    {
+      "id": "map_head_boundary",
+      "description": "A 23-byte key encodes its length in the head byte and a 24-byte key does not, so the 23-byte key sorts first whatever its content.",
+      "value": {
+        "map": [
+          [
+            "bbbbbbbbbbbbbbbbbbbbbbbb",
+            {
+              "int": "2"
+            }
+          ],
+          [
+            "zzzzzzzzzzzzzzzzzzzzzzz",
+            {
+              "int": "1"
+            }
+          ]
+        ]
+      },
+      "hex": "a2777a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a01781862626262626262626262626262626262626262626262626202"
+    },
+    {
+      "id": "map_case_sensitive",
+      "description": "Upper-case letters sort before lower-case ones; no case folding.",
+      "value": {
+        "map": [
+          [
+            "a",
+            {
+              "int": "2"
+            }
+          ],
+          [
+            "A",
+            {
+              "int": "1"
+            }
+          ]
+        ]
+      },
+      "hex": "a2614101616102"
+    },
+    {
+      "id": "map_non_ascii_key",
+      "description": "A one-byte ASCII key sorts before a two-byte UTF-8 key of one character.",
+      "value": {
+        "map": [
+          [
+            "é",
+            {
+              "int": "2"
+            }
+          ],
+          [
+            "z",
+            {
+              "int": "1"
+            }
+          ]
+        ]
+      },
+      "hex": "a2617a0162c3a902"
+    },
+    {
+      "id": "map_nested_ordering",
+      "description": "Nested maps are ordered independently.",
+      "value": {
+        "map": [
+          [
+            "outer_b",
+            {
+              "map": [
+                [
+                  "bb",
+                  {
+                    "int": "2"
+                  }
+                ],
+                [
+                  "a",
+                  {
+                    "int": "1"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "a",
+            {
+              "int": "0"
+            }
+          ]
+        ]
+      },
+      "hex": "a2616100676f757465725f62a261610162626202"
+    },
+    {
+      "id": "map_many_keys",
+      "description": "Ordering across several length classes at once.",
+      "value": {
+        "map": [
+          [
+            "zzz",
+            {
+              "int": "3"
+            }
+          ],
+          [
+            "",
+            {
+              "int": "0"
+            }
+          ],
+          [
+            "m",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "aa",
+            {
+              "int": "2"
+            }
+          ],
+          [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            {
+              "int": "4"
+            }
+          ]
+        ]
+      },
+      "hex": "a56000616d0162616102637a7a7a03781e61616161616161616161616161616161616161616161616161616161616104"
+    }
+  ]
+}

@@ -1,0 +1,379 @@
+{
+  "name": "invalid",
+  "description": "Every representation the KR-CBOR-1 profile forbids, with the rule a conforming decoder must report. Rule names match CborError::rule in Rust and the error classes in the TypeScript package.",
+  "note": "Cases with a 'limits' object are decoded with those limits merged over the defaults; every other case uses the default limits.",
+  "cases": [
+    {
+      "id": "empty_input",
+      "description": "No bytes at all.",
+      "hex": "",
+      "rule": "empty_input"
+    },
+    {
+      "id": "indefinite_text",
+      "description": "Indefinite-length text string.",
+      "hex": "7f616161616161ff",
+      "rule": "indefinite_length"
+    },
+    {
+      "id": "indefinite_bytes",
+      "description": "Indefinite-length byte string.",
+      "hex": "5f4101ff",
+      "rule": "indefinite_length"
+    },
+    {
+      "id": "indefinite_array",
+      "description": "Indefinite-length array.",
+      "hex": "9f0102ff",
+      "rule": "indefinite_length"
+    },
+    {
+      "id": "indefinite_map",
+      "description": "Indefinite-length map.",
+      "hex": "bf616101ff",
+      "rule": "indefinite_length"
+    },
+    {
+      "id": "break_alone",
+      "description": "A break code outside any indefinite item.",
+      "hex": "ff",
+      "rule": "break_outside_indefinite"
+    },
+    {
+      "id": "non_shortest_uint_1",
+      "description": "24 encoded with a one-byte argument holding 23.",
+      "hex": "1817",
+      "rule": "non_shortest_integer"
+    },
+    {
+      "id": "non_shortest_uint_2",
+      "description": "23 encoded with a two-byte argument.",
+      "hex": "190017",
+      "rule": "non_shortest_integer"
+    },
+    {
+      "id": "non_shortest_uint_2_boundary",
+      "description": "255 encoded with a two-byte argument.",
+      "hex": "1900ff",
+      "rule": "non_shortest_integer"
+    },
+    {
+      "id": "non_shortest_uint_4",
+      "description": "65535 encoded with a four-byte argument.",
+      "hex": "1a0000ffff",
+      "rule": "non_shortest_integer"
+    },
+    {
+      "id": "non_shortest_uint_8",
+      "description": "2^32-1 encoded with an eight-byte argument.",
+      "hex": "1b00000000ffffffff",
+      "rule": "non_shortest_integer"
+    },
+    {
+      "id": "non_shortest_nint",
+      "description": "-24 encoded with a one-byte argument.",
+      "hex": "3817",
+      "rule": "non_shortest_integer"
+    },
+    {
+      "id": "non_shortest_text_len",
+      "description": "A one-byte text string with a one-byte length argument.",
+      "hex": "780161",
+      "rule": "non_shortest_length"
+    },
+    {
+      "id": "non_shortest_bytes_len",
+      "description": "A one-byte byte string with a one-byte length argument.",
+      "hex": "580101",
+      "rule": "non_shortest_length"
+    },
+    {
+      "id": "non_shortest_array_len",
+      "description": "A one-member array with a one-byte length argument.",
+      "hex": "980101",
+      "rule": "non_shortest_length"
+    },
+    {
+      "id": "non_shortest_map_len",
+      "description": "A one-entry map with a one-byte length argument.",
+      "hex": "b801616101",
+      "rule": "non_shortest_length"
+    },
+    {
+      "id": "float16",
+      "description": "Half-precision float.",
+      "hex": "f93c00",
+      "rule": "float"
+    },
+    {
+      "id": "float32",
+      "description": "Single-precision float.",
+      "hex": "fa3f800000",
+      "rule": "float"
+    },
+    {
+      "id": "float64",
+      "description": "Double-precision float.",
+      "hex": "fb3ff0000000000000",
+      "rule": "float"
+    },
+    {
+      "id": "float_in_map",
+      "description": "A float inside an otherwise valid map.",
+      "hex": "a16161fb3ff0000000000000",
+      "rule": "float"
+    },
+    {
+      "id": "undefined",
+      "description": "The undefined simple value.",
+      "hex": "f7",
+      "rule": "undefined"
+    },
+    {
+      "id": "simple_16",
+      "description": "Simple value 16.",
+      "hex": "f0",
+      "rule": "simple_value"
+    },
+    {
+      "id": "simple_255",
+      "description": "Simple value 255 with a one-byte argument.",
+      "hex": "f8ff",
+      "rule": "simple_value"
+    },
+    {
+      "id": "tag_datetime",
+      "description": "Tag 0 wrapping a date string.",
+      "hex": "c07818323032362d30392d31355431303a30303a30302e3030305a",
+      "rule": "tag"
+    },
+    {
+      "id": "tag_bignum",
+      "description": "Tag 2 wrapping a positive bignum.",
+      "hex": "c24101",
+      "rule": "tag"
+    },
+    {
+      "id": "tag_in_array",
+      "description": "A tag nested inside an array.",
+      "hex": "81c24101",
+      "rule": "tag"
+    },
+    {
+      "id": "duplicate_key",
+      "description": "The same key twice.",
+      "hex": "a2616101616102",
+      "rule": "duplicate_key"
+    },
+    {
+      "id": "duplicate_key_non_ascii",
+      "description": "The same non-ASCII key twice.",
+      "hex": "a262c3a90162c3a902",
+      "rule": "duplicate_key"
+    },
+    {
+      "id": "unsorted_keys_length",
+      "description": "'aa' before 'z': ordering the key text disagrees with ordering the encoded keys, and the encoded keys decide.",
+      "hex": "a262616101617a02",
+      "rule": "unsorted_map_keys"
+    },
+    {
+      "id": "unsorted_keys_bytewise",
+      "description": "'b' before 'a' at equal length.",
+      "hex": "a2616201616102",
+      "rule": "unsorted_map_keys"
+    },
+    {
+      "id": "unsorted_keys_head_boundary",
+      "description": "A 24-byte key before a 23-byte key.",
+      "hex": "a2781862626262626262626262626262626262626262626262626201777a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a02",
+      "rule": "unsorted_map_keys"
+    },
+    {
+      "id": "integer_map_key",
+      "description": "An integer map key.",
+      "hex": "a10101",
+      "rule": "non_text_map_key"
+    },
+    {
+      "id": "bytes_map_key",
+      "description": "A byte-string map key.",
+      "hex": "a1416101",
+      "rule": "non_text_map_key"
+    },
+    {
+      "id": "array_map_key",
+      "description": "An array map key.",
+      "hex": "a18101",
+      "rule": "non_text_map_key"
+    },
+    {
+      "id": "invalid_utf8_truncated",
+      "description": "A truncated two-byte UTF-8 sequence.",
+      "hex": "62c328",
+      "rule": "invalid_utf8"
+    },
+    {
+      "id": "invalid_utf8_surrogate",
+      "description": "A UTF-8 encoded lone surrogate.",
+      "hex": "63eda080",
+      "rule": "invalid_utf8"
+    },
+    {
+      "id": "invalid_utf8_overlong",
+      "description": "An overlong encoding of U+002F.",
+      "hex": "62c0af",
+      "rule": "invalid_utf8"
+    },
+    {
+      "id": "invalid_utf8_key",
+      "description": "An invalid UTF-8 map key.",
+      "hex": "a162c32801",
+      "rule": "invalid_utf8"
+    },
+    {
+      "id": "trailing_bytes_scalar",
+      "description": "A second object after the first.",
+      "hex": "0101",
+      "rule": "trailing_bytes"
+    },
+    {
+      "id": "trailing_bytes_after_map",
+      "description": "A trailing byte after an empty map.",
+      "hex": "a000",
+      "rule": "trailing_bytes"
+    },
+    {
+      "id": "truncated_head",
+      "description": "A head that promises an argument byte that is missing.",
+      "hex": "18",
+      "rule": "unexpected_end"
+    },
+    {
+      "id": "truncated_text",
+      "description": "A two-byte text string with one body byte.",
+      "hex": "6261",
+      "rule": "unexpected_end"
+    },
+    {
+      "id": "truncated_array",
+      "description": "A three-member array with two members.",
+      "hex": "830102",
+      "rule": "unexpected_end"
+    },
+    {
+      "id": "truncated_map_value",
+      "description": "A map entry without its value.",
+      "hex": "a16161",
+      "rule": "unexpected_end"
+    },
+    {
+      "id": "reserved_ai_28",
+      "description": "Additional information 28 is reserved.",
+      "hex": "1c",
+      "rule": "reserved_additional_info"
+    },
+    {
+      "id": "reserved_ai_29",
+      "description": "Additional information 29 is reserved.",
+      "hex": "1d",
+      "rule": "reserved_additional_info"
+    },
+    {
+      "id": "reserved_ai_30",
+      "description": "Additional information 30 is reserved.",
+      "hex": "1e",
+      "rule": "reserved_additional_info"
+    },
+    {
+      "id": "reserved_ai_31_uint",
+      "description": "Additional information 31 on major type 0 is ill-formed.",
+      "hex": "1f",
+      "rule": "reserved_additional_info"
+    },
+    {
+      "id": "huge_bytes_length",
+      "description": "A byte string declaring 2^64-1 bytes. The length is rejected against the configured limit before any allocation.",
+      "hex": "5bffffffffffffffff",
+      "rule": "length_limit"
+    },
+    {
+      "id": "huge_text_length",
+      "description": "A text string declaring 2^64-1 bytes.",
+      "hex": "7bffffffffffffffff",
+      "rule": "length_limit"
+    },
+    {
+      "id": "huge_array_count",
+      "description": "An array declaring 2^64-1 members.",
+      "hex": "9bffffffffffffffff",
+      "rule": "collection_limit"
+    },
+    {
+      "id": "huge_map_count",
+      "description": "A map declaring 2^64-1 entries.",
+      "hex": "bbffffffffffffffff",
+      "rule": "collection_limit"
+    },
+    {
+      "id": "declared_length_beyond_input",
+      "description": "A byte string whose declared length is inside the limit but longer than the remaining input.",
+      "hex": "5901000000000000000000",
+      "rule": "unexpected_end"
+    },
+    {
+      "id": "depth_limit",
+      "description": "Five levels of nesting against a depth limit of four.",
+      "hex": "8181818100",
+      "rule": "depth_limit",
+      "limits": {
+        "max_depth": 4
+      }
+    },
+    {
+      "id": "count_limit",
+      "description": "Four values against an item limit of three.",
+      "hex": "83010203",
+      "rule": "count_limit",
+      "limits": {
+        "max_items": 3
+      }
+    },
+    {
+      "id": "collection_limit",
+      "description": "Three members against a collection limit of two.",
+      "hex": "83010203",
+      "rule": "collection_limit",
+      "limits": {
+        "max_collection_len": 2
+      }
+    },
+    {
+      "id": "message_too_large",
+      "description": "Three bytes against a message limit of two.",
+      "hex": "820102",
+      "rule": "input_too_large",
+      "limits": {
+        "max_message_len": 2
+      }
+    },
+    {
+      "id": "text_limit",
+      "description": "A four-byte text string against a text limit of three.",
+      "hex": "6461626364",
+      "rule": "length_limit",
+      "limits": {
+        "max_text_len": 3
+      }
+    },
+    {
+      "id": "bytes_limit",
+      "description": "A four-byte byte string against a byte-string limit of three.",
+      "hex": "4401020304",
+      "rule": "length_limit",
+      "limits": {
+        "max_bytes_len": 3
+      }
+    }
+  ]
+}

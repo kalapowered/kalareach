@@ -1,0 +1,164 @@
+{
+  "name": "digests",
+  "description": "Canonical bytes, their SHA-256 digests and domain-separated signing input.",
+  "note": "Values use the fixture description grammar documented in docs/protocol/README.md: {\"int\": decimal string}, {\"bytes\": hex}, {\"text\": string}, {\"bool\": bool}, {\"null\": true}, {\"array\": [value]}, {\"map\": [[key, value]]}. Map entries are listed in source order; a conforming encoder sorts them into canonical key order.",
+  "digest_cases": [
+    {
+      "id": "signed_mutation_object",
+      "description": "A complete mutation object in canonical form with its SHA-256 digest. The digest covers method and version, grant, complete target, preconditions, action ID, freshness window, TTL and parameters.",
+      "value": {
+        "map": [
+          [
+            "action_id",
+            {
+              "bytes": "e52e8d1a68184be7b4b8f93a8b1c0c6d"
+            }
+          ],
+          [
+            "action_window_id",
+            {
+              "text": "host-issued-window-id"
+            }
+          ],
+          [
+            "expected",
+            {
+              "map": [
+                [
+                  "approval_request_id",
+                  {
+                    "text": "upstream-opaque-request-id"
+                  }
+                ],
+                [
+                  "request_revision",
+                  {
+                    "int": "3"
+                  }
+                ],
+                [
+                  "state",
+                  {
+                    "text": "pending"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "grant_id",
+            {
+              "bytes": "39a6b26ee8fd4e0c9a378f3dc4911641"
+            }
+          ],
+          [
+            "method",
+            {
+              "text": "agent.approval.respond"
+            }
+          ],
+          [
+            "method_version",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "params",
+            {
+              "map": [
+                [
+                  "decision",
+                  {
+                    "text": "deny"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "requested_ttl_ms",
+            {
+              "int": "120000"
+            }
+          ],
+          [
+            "target",
+            {
+              "map": [
+                [
+                  "agent_binding_revision",
+                  {
+                    "int": "2"
+                  }
+                ],
+                [
+                  "application_instance_id",
+                  {
+                    "bytes": "4fe334a4e9344bb881c7568252d9cd84"
+                  }
+                ],
+                [
+                  "environment_id",
+                  {
+                    "bytes": "3de5e6cbbf2149c18d34b9a8729539da"
+                  }
+                ],
+                [
+                  "session_epoch",
+                  {
+                    "int": "1"
+                  }
+                ],
+                [
+                  "session_id",
+                  {
+                    "bytes": "b4a1bc38157d4e84bf521137b15b462b"
+                  }
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "hex": "a9666d6574686f64766167656e742e617070726f76616c2e726573706f6e6466706172616d73a1686465636973696f6e6464656e7966746172676574a56a73657373696f6e5f696450b4a1bc38157d4e84bf521137b15b462b6d73657373696f6e5f65706f6368016e656e7669726f6e6d656e745f6964503de5e6cbbf2149c18d34b9a8729539da766167656e745f62696e64696e675f7265766973696f6e02776170706c69636174696f6e5f696e7374616e63655f6964504fe334a4e9344bb881c7568252d9cd84686578706563746564a36573746174656770656e64696e6770726571756573745f7265766973696f6e0373617070726f76616c5f726571756573745f6964781a757073747265616d2d6f70617175652d726571756573742d6964686772616e745f69645039a6b26ee8fd4e0c9a378f3dc491164169616374696f6e5f696450e52e8d1a68184be7b4b8f93a8b1c0c6d6e6d6574686f645f76657273696f6e0170616374696f6e5f77696e646f775f696475686f73742d6973737565642d77696e646f772d6964707265717565737465645f74746c5f6d731a0001d4c0",
+      "sha256": "62a6fec2e1d6b1a3c2a8f6521559c5ed504e188e40306c4dfd796483a4745113"
+    }
+  ],
+  "signing_input_cases": [
+    {
+      "id": "pair_verify_1",
+      "description": "A domain-separated signing input: CBOR([domain, element, ...]).",
+      "domain": "kr-pair/verify/1",
+      "elements": [
+        {
+          "bytes": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        },
+        {
+          "bytes": "1b4f0e9851971998e732078544c96b36c3d01cedf7caa332359d6f1d83567014"
+        },
+        {
+          "bytes": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752"
+        }
+      ],
+      "value": {
+        "array": [
+          {
+            "text": "kr-pair/verify/1"
+          },
+          {
+            "bytes": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+          },
+          {
+            "bytes": "1b4f0e9851971998e732078544c96b36c3d01cedf7caa332359d6f1d83567014"
+          },
+          {
+            "bytes": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752"
+          }
+        ]
+      },
+      "hex": "84706b722d706169722f7665726966792f3158209f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a0858201b4f0e9851971998e732078544c96b36c3d01cedf7caa332359d6f1d83567014582060303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752",
+      "sha256": "05145f616742202f157cdd3e4627a3d7533a4913883fc6280335830a37b2597e"
+    }
+  ]
+}

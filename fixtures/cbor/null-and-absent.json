@@ -1,0 +1,88 @@
+{
+  "name": "null-and-absent",
+  "description": "Absent fields and explicit nulls are different objects with different digests.",
+  "note": "Values use the fixture description grammar documented in docs/protocol/README.md: {\"int\": decimal string}, {\"bytes\": hex}, {\"text\": string}, {\"bool\": bool}, {\"null\": true}, {\"array\": [value]}, {\"map\": [[key, value]]}. Map entries are listed in source order; a conforming encoder sorts them into canonical key order.",
+  "digests": {
+    "field_absent_sha256": "eb989b4a620fd259ae02181bdab4fc3eb6dc6b45eb7322999bb1416bce318926",
+    "field_null_sha256": "bfd7beace7181e19881c77b78b511579aed410297b13c09fa1c366aebb33b9c0"
+  },
+  "cases": [
+    {
+      "id": "field_absent",
+      "description": "The optional field is not present.",
+      "value": {
+        "map": [
+          [
+            "a",
+            {
+              "int": "1"
+            }
+          ]
+        ]
+      },
+      "hex": "a1616101"
+    },
+    {
+      "id": "field_null",
+      "description": "The same object with an explicit null. Null is a value, not an omission: the bytes and the digest differ from field_absent.",
+      "value": {
+        "map": [
+          [
+            "a",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "b",
+            {
+              "null": true
+            }
+          ]
+        ]
+      },
+      "hex": "a26161016162f6"
+    },
+    {
+      "id": "null_only",
+      "description": "A map whose single value is null.",
+      "value": {
+        "map": [
+          [
+            "a",
+            {
+              "null": true
+            }
+          ]
+        ]
+      },
+      "hex": "a16161f6"
+    },
+    {
+      "id": "null_in_array",
+      "description": "Null inside an array.",
+      "value": {
+        "array": [
+          {
+            "int": "1"
+          },
+          {
+            "null": true
+          },
+          {
+            "bool": false
+          }
+        ]
+      },
+      "hex": "8301f6f4"
+    },
+    {
+      "id": "top_level_null",
+      "description": "A top-level null.",
+      "value": {
+        "null": true
+      },
+      "hex": "f6"
+    }
+  ]
+}

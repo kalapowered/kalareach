@@ -1,0 +1,159 @@
+{
+  "name": "strings",
+  "description": "Text and byte strings, including non-ASCII text that proves no normalisation or case folding happens.",
+  "note": "Values use the fixture description grammar documented in docs/protocol/README.md: {\"int\": decimal string}, {\"bytes\": hex}, {\"text\": string}, {\"bool\": bool}, {\"null\": true}, {\"array\": [value]}, {\"map\": [[key, value]]}. Map entries are listed in source order; a conforming encoder sorts them into canonical key order.",
+  "cases": [
+    {
+      "id": "text_empty",
+      "description": "An empty text string.",
+      "value": {
+        "text": ""
+      },
+      "hex": "60"
+    },
+    {
+      "id": "text_ascii",
+      "description": "A short ASCII string.",
+      "value": {
+        "text": "kalareach"
+      },
+      "hex": "696b616c617265616368"
+    },
+    {
+      "id": "text_len_23",
+      "description": "23 bytes is the last length carried in the head byte.",
+      "value": {
+        "text": "aaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "hex": "776161616161616161616161616161616161616161616161"
+    },
+    {
+      "id": "text_len_24",
+      "description": "24 bytes is the first length needing a one-byte argument.",
+      "value": {
+        "text": "aaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "hex": "7818616161616161616161616161616161616161616161616161"
+    },
+    {
+      "id": "text_nfc",
+      "description": "U+00E9 as one precomposed code point.",
+      "value": {
+        "text": "café"
+      },
+      "hex": "65636166c3a9"
+    },
+    {
+      "id": "text_nfd",
+      "description": "The same word decomposed. No normalisation is performed, so these two cases have different bytes and different digests.",
+      "value": {
+        "text": "café"
+      },
+      "hex": "6663616665cc81"
+    },
+    {
+      "id": "text_sharp_s",
+      "description": "German sharp s stays distinct from SS and ss; no case folding.",
+      "value": {
+        "text": "straße"
+      },
+      "hex": "6773747261c39f65"
+    },
+    {
+      "id": "text_upper",
+      "description": "Upper case of the same word.",
+      "value": {
+        "text": "STRASSE"
+      },
+      "hex": "6753545241535345"
+    },
+    {
+      "id": "text_rtl",
+      "description": "Right-to-left script.",
+      "value": {
+        "text": "مرحبا"
+      },
+      "hex": "6ad985d8b1d8add8a8d8a7"
+    },
+    {
+      "id": "text_emoji_zwj",
+      "description": "A zero-width-joiner emoji sequence stays one byte-distinct string.",
+      "value": {
+        "text": "👩‍💻"
+      },
+      "hex": "6bf09f91a9e2808df09f92bb"
+    },
+    {
+      "id": "text_cjk",
+      "description": "Three-byte UTF-8 sequences.",
+      "value": {
+        "text": "你好世界"
+      },
+      "hex": "6ce4bda0e5a5bde4b896e7958c"
+    },
+    {
+      "id": "text_astral",
+      "description": "Four-byte UTF-8 sequences.",
+      "value": {
+        "text": "𝄞😀"
+      },
+      "hex": "68f09d849ef09f9880"
+    },
+    {
+      "id": "bytes_empty",
+      "description": "An empty byte string.",
+      "value": {
+        "bytes": ""
+      },
+      "hex": "40"
+    },
+    {
+      "id": "bytes_short",
+      "description": "A short byte string.",
+      "value": {
+        "bytes": "010203"
+      },
+      "hex": "43010203"
+    },
+    {
+      "id": "bytes_uuid",
+      "description": "A UUID travels as a 16-byte string, never as text or a tag.",
+      "value": {
+        "bytes": "b4a1bc38157d4e84bf521137b15b462b"
+      },
+      "hex": "50b4a1bc38157d4e84bf521137b15b462b"
+    },
+    {
+      "id": "bytes_len_23",
+      "description": "23 bytes is the last length carried in the head byte.",
+      "value": {
+        "bytes": "ababababababababababababababababababababababab"
+      },
+      "hex": "57ababababababababababababababababababababababab"
+    },
+    {
+      "id": "bytes_len_24",
+      "description": "24 bytes is the first length needing a one-byte argument.",
+      "value": {
+        "bytes": "abababababababababababababababababababababababab"
+      },
+      "hex": "5818abababababababababababababababababababababababab"
+    },
+    {
+      "id": "bytes_invalid_utf8",
+      "description": "Raw terminal bytes need not be valid UTF-8 and travel as a byte string.",
+      "value": {
+        "bytes": "fffefd80"
+      },
+      "hex": "44fffefd80"
+    },
+    {
+      "id": "bytes_256",
+      "description": "256 bytes needs a two-byte length argument.",
+      "value": {
+        "bytes": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+      },
+      "hex": "5901005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+    }
+  ]
+}

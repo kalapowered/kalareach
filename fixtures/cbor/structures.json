@@ -1,0 +1,219 @@
+{
+  "name": "structures",
+  "description": "Arrays, booleans and nesting.",
+  "note": "Values use the fixture description grammar documented in docs/protocol/README.md: {\"int\": decimal string}, {\"bytes\": hex}, {\"text\": string}, {\"bool\": bool}, {\"null\": true}, {\"array\": [value]}, {\"map\": [[key, value]]}. Map entries are listed in source order; a conforming encoder sorts them into canonical key order.",
+  "cases": [
+    {
+      "id": "array_empty",
+      "description": "An empty array.",
+      "value": {
+        "array": []
+      },
+      "hex": "80"
+    },
+    {
+      "id": "array_scalars",
+      "description": "Mixed scalars in an array.",
+      "value": {
+        "array": [
+          {
+            "int": "1"
+          },
+          {
+            "text": "two"
+          },
+          {
+            "bool": true
+          },
+          {
+            "null": true
+          },
+          {
+            "bytes": "03"
+          }
+        ]
+      },
+      "hex": "85016374776ff5f64103"
+    },
+    {
+      "id": "bool_false",
+      "description": "False.",
+      "value": {
+        "bool": false
+      },
+      "hex": "f4"
+    },
+    {
+      "id": "bool_true",
+      "description": "True.",
+      "value": {
+        "bool": true
+      },
+      "hex": "f5"
+    },
+    {
+      "id": "nested_document",
+      "description": "A representative nested object.",
+      "value": {
+        "map": [
+          [
+            "target",
+            {
+              "map": [
+                [
+                  "session_epoch",
+                  {
+                    "int": "1"
+                  }
+                ],
+                [
+                  "session_id",
+                  {
+                    "bytes": "b4a1bc38157d4e84bf521137b15b462b"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "params",
+            {
+              "map": [
+                [
+                  "decision",
+                  {
+                    "text": "deny"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "method_version",
+            {
+              "int": "1"
+            }
+          ]
+        ]
+      },
+      "hex": "a366706172616d73a1686465636973696f6e6464656e7966746172676574a26a73657373696f6e5f696450b4a1bc38157d4e84bf521137b15b462b6d73657373696f6e5f65706f6368016e6d6574686f645f76657273696f6e01"
+    },
+    {
+      "id": "array_depth_8",
+      "description": "Eight levels of nesting, inside the default depth limit of 32.",
+      "value": {
+        "array": [
+          {
+            "array": [
+              {
+                "array": [
+                  {
+                    "array": [
+                      {
+                        "array": [
+                          {
+                            "array": [
+                              {
+                                "array": [
+                                  {
+                                    "int": "0"
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "hex": "8181818181818100"
+    },
+    {
+      "id": "array_24_items",
+      "description": "24 members needs a one-byte length argument.",
+      "value": {
+        "array": [
+          {
+            "int": "0"
+          },
+          {
+            "int": "1"
+          },
+          {
+            "int": "2"
+          },
+          {
+            "int": "3"
+          },
+          {
+            "int": "4"
+          },
+          {
+            "int": "5"
+          },
+          {
+            "int": "6"
+          },
+          {
+            "int": "7"
+          },
+          {
+            "int": "8"
+          },
+          {
+            "int": "9"
+          },
+          {
+            "int": "10"
+          },
+          {
+            "int": "11"
+          },
+          {
+            "int": "12"
+          },
+          {
+            "int": "13"
+          },
+          {
+            "int": "14"
+          },
+          {
+            "int": "15"
+          },
+          {
+            "int": "16"
+          },
+          {
+            "int": "17"
+          },
+          {
+            "int": "18"
+          },
+          {
+            "int": "19"
+          },
+          {
+            "int": "20"
+          },
+          {
+            "int": "21"
+          },
+          {
+            "int": "22"
+          },
+          {
+            "int": "23"
+          }
+        ]
+      },
+      "hex": "9818000102030405060708090a0b0c0d0e0f1011121314151617"
+    }
+  ]
+}
