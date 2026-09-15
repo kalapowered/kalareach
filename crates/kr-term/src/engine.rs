@@ -422,6 +422,10 @@ impl Engine {
     /// still joins it. This releases that scalar. The session loop calls it when a read returns
     /// nothing, and a snapshot calls it itself, so a quiet stream never leaves a character held.
     pub fn quiesce(&mut self, now_ms: u64) -> FeedOutcome {
+        // A quiet stream is the moment to look at what is resident: nothing else is happening, and
+        // a session that has stopped printing would otherwise hold whatever it had until it printed
+        // again.
+        self.measure_now = true;
         let mut events = core::mem::take(&mut self.scratch);
         events.clear();
         self.lexer.flush_tail(&mut events);
@@ -646,6 +650,9 @@ impl Engine {
             if decision.apply_to_grid {
                 self.grid.apply(&inner);
                 self.revision = self.next_revision();
+                // A control can select a character set or move a margin as readily as a sequence
+                // can, and a delta has to carry that for a client to repaint from.
+                self.presentation_revision = self.next_revision();
             }
             if let Some(kind) = decision.side_effect {
                 outcome.side_effects.push(SideEffect {
@@ -750,14 +757,17 @@ impl Engine {
             self.budget.record_truncation();
             return true;
         }
-        self.budget
-            .add_screen_links(self.grid.alternate_active(), resident);
+        let alternate = self.grid.alternate_active();
+        self.budget.add_screen_links(alternate, resident);
         if self.links.contains(&uri) {
             return false;
         }
         let cost = uri.len() as u64;
         if self.links.len() >= self.budget.limits().unique_links || !self.budget.metadata_fits(cost)
         {
+            // The link is refused after all, so what was reserved for it is given back rather than
+            // left to be corrected at the next measurement.
+            self.budget.release_screen_links(alternate, resident);
             self.budget.record_truncation();
             return true;
         }
@@ -810,8 +820,10 @@ impl Engine {
         self.measure_now = false;
         self.budget
             .set_screen_links(self.grid.alternate_active(), self.grid.screen_link_bytes());
-        self.budget
-            .set_screen_content(self.grid.screen_content_bytes());
+        self.budget.set_screen_content(
+            self.grid.alternate_active(),
+            self.grid.screen_content_bytes(),
+        );
         self.measured_rows = rows;
         if self.grid.alternate_active() {
             return;
@@ -941,7 +953,7 @@ impl Engine {
                 b'c' => {
                     // A reset empties both screens, so what they were holding is no longer held.
                     self.budget.clear_screen_links();
-                    self.budget.set_screen_content(0);
+                    self.budget.clear_screen_content();
                     self.measure_now = true;
                     self.modes.full_reset();
                     self.titles = TitleState::new();

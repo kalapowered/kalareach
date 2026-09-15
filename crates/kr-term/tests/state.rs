@@ -1196,3 +1196,45 @@ fn a_reset_releases_what_the_buffers_held() {
         "both screens were emptied"
     );
 }
+
+/// Nothing that arrives after the terminator is an answer.
+#[test]
+fn a_probe_ignores_answers_behind_its_terminator() {
+    let (mut session, _) = ProbeSession::start(
+        0,
+        InputContext::Clean,
+        &[ProbeItem::Foreground, ProbeItem::DeviceAttributes],
+    )
+    .expect("clean stream");
+    session
+        .observe(b"\x1b[?62;22c\x1b]10;rgb:ffff/0000/0000\x1b\\", 10)
+        .expect("observed");
+    let error = session
+        .finish(20)
+        .expect_err("the colour answered after the terminator");
+    assert!(matches!(
+        error,
+        TermError::ProbeFailed {
+            reason: ProbeFailure::MissingAnswer
+        }
+    ));
+}
+
+/// A control inside a sequence can change what a repaint needs, so a delta carries it.
+#[test]
+fn an_embedded_control_reaches_a_delta() {
+    let mut engine = engine();
+    engine.feed(b"\x1b)0", 0);
+    let view = viewport(&engine);
+    let (snapshot, _) = engine.snapshot(view, 0);
+    engine.feed(b"\x1b[\x0e6n", 0);
+    engine.quiesce(0);
+    assert!(engine.grid().shift_out());
+    let delta = engine
+        .delta(snapshot.output_cursor, snapshot.projection_generation)
+        .expect("inside the window");
+    assert!(
+        delta.charsets.is_some(),
+        "the character set the control selected travels with the delta"
+    );
+}

@@ -1234,10 +1234,10 @@ fn link_object_bytes(link: &Hyperlink) -> u64 {
 }
 
 /// What one link object costs beyond its strings.
-const LINK_OBJECT_BYTES: u64 = 320;
+const LINK_OBJECT_BYTES: u64 = 512;
 
 /// What one link parameter costs beyond its key and value.
-const PARAMETER_OVERHEAD_BYTES: u64 = 64;
+const PARAMETER_OVERHEAD_BYTES: u64 = 128;
 
 fn to_library_size(size: GridSize) -> TerminalSize {
     TerminalSize {

@@ -129,8 +129,9 @@ pub struct BudgetUsage {
     pub rows: u64,
     /// Bytes held by the hyperlink and title tables.
     pub metadata: u64,
-    /// Bytes of encoded content the rows that are showing hold, beyond the fixed per-cell cost.
-    pub screen_content: u64,
+    /// Bytes of encoded content each buffer's rows hold beyond the fixed per-cell cost, primary
+    /// first.
+    pub screen_content: [u64; 2],
     /// Bytes held by the hyperlinks of each buffer's rows, primary first.
     ///
     /// Both, because the buffer that is not showing still holds its links: charging only the active
@@ -145,7 +146,8 @@ impl BudgetUsage {
         self.screens
             + self.rows
             + self.metadata
-            + self.screen_content
+            + self.screen_content[0]
+            + self.screen_content[1]
             + self.screen_links[0]
             + self.screen_links[1]
     }
@@ -163,7 +165,7 @@ pub struct SessionBudget {
 ///
 /// Used to decide whether a geometry change fits, before it is applied. The figure counts the
 /// scalar, the attribute set and the per-cell bookkeeping the pinned grid library keeps.
-pub const CELL_OVERHEAD_BYTES: u64 = 32;
+pub const CELL_OVERHEAD_BYTES: u64 = 64;
 
 impl SessionBudget {
     /// Builds a budget with the section 8 bounds.
@@ -181,7 +183,7 @@ impl SessionBudget {
                 screens: 0,
                 rows: 0,
                 metadata: 0,
-                screen_content: 0,
+                screen_content: [0, 0],
                 screen_links: [0, 0],
             },
             truncations: 0,
@@ -228,7 +230,8 @@ impl SessionBudget {
         let cost = Self::screens_cost(size);
         let other = self.usage.rows
             + self.usage.metadata
-            + self.usage.screen_content
+            + self.usage.screen_content[0]
+            + self.usage.screen_content[1]
             + self.usage.screen_links[0]
             + self.usage.screen_links[1];
         if cost + other > self.limits.session_bytes {
@@ -278,14 +281,25 @@ impl SessionBudget {
         self.usage.metadata = bytes;
     }
 
-    /// Records what the content of the rows that are showing costs.
-    pub const fn set_screen_content(&mut self, bytes: u64) {
-        self.usage.screen_content = bytes;
+    /// Records what one buffer's content costs.
+    pub const fn set_screen_content(&mut self, alternate: bool, bytes: u64) {
+        self.usage.screen_content[alternate as usize] = bytes;
+    }
+
+    /// Clears the recorded content cost of both buffers, after a reset emptied them.
+    pub const fn clear_screen_content(&mut self) {
+        self.usage.screen_content = [0, 0];
     }
 
     /// Clears the recorded cost of both buffers' hyperlinks, after a reset emptied them.
     pub const fn clear_screen_links(&mut self) {
         self.usage.screen_links = [0, 0];
+    }
+
+    /// Gives back what was reserved for a link that was refused after all.
+    pub const fn release_screen_links(&mut self, alternate: bool, bytes: u64) {
+        let slot = alternate as usize;
+        self.usage.screen_links[slot] = self.usage.screen_links[slot].saturating_sub(bytes);
     }
 
     /// Records what one buffer's hyperlinks cost.

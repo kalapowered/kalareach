@@ -182,11 +182,19 @@ impl ProbeSession {
         let mut events = Vec::new();
         self.lexer.feed(bytes, &mut events);
         for event in &events {
-            if let Some((item, answer)) = interpret(event) {
-                self.answers.insert(item, answer);
-                if item == ProbeItem::DeviceAttributes {
-                    self.complete = true;
-                }
+            let Some((item, answer)) = interpret(event) else {
+                continue;
+            };
+            // Nothing after the terminator is an answer. The terminator is what proves no earlier
+            // answer is still in flight, so anything that arrives behind it is a reply to something
+            // else or a terminal answering out of order, and neither is evidence about a
+            // capability.
+            if self.complete {
+                continue;
+            }
+            self.answers.insert(item, answer);
+            if item == ProbeItem::DeviceAttributes {
+                self.complete = true;
             }
         }
         Ok(if self.complete {

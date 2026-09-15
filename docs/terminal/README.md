@@ -573,8 +573,8 @@ the whole link, and the object behind that reference costs far more than its tar
 what is counted is the object: each distinct one on a row, once. Counting only the characters would
 let an application hold tens of megabytes inside a budget that said it was using nothing.
 
-Each buffer's links are counted separately and charged together, because the buffer that is not
-showing still holds its own. A link's cost is reserved when it is applied rather than noticed at the
+Each buffer's links and its cell content are counted separately and charged together, because the
+buffer that is not showing still holds its own. A link's cost is reserved when it is applied rather than noticed at the
 next measurement: one read can carry a session's worth of links, and a bound that is only checked
 afterwards is not a bound. A link that will not fit is refused, and refusing one ends the link that
 was open, because the text that belonged to the refused link must not end up inside the previous
