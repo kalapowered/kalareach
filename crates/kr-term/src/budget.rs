@@ -92,6 +92,8 @@ pub struct BudgetLimits {
     pub cell_bytes: u64,
     /// Distinct hyperlink targets one session keeps resident.
     pub unique_links: usize,
+    /// Bytes one hyperlink may hold, parameters and target together.
+    pub link_bytes: usize,
     /// Rows in one history page.
     pub history_page_rows: usize,
     /// Bytes in one history page.
@@ -106,6 +108,7 @@ impl BudgetLimits {
         session_bytes: 64 * 1024 * 1024,
         cell_bytes: 64,
         unique_links: 4_096,
+        link_bytes: 2_048,
         history_page_rows: 1_000,
         history_page_bytes: 1024 * 1024,
     };

@@ -201,6 +201,9 @@ const ROW_CACHE_INTERVAL: u32 = 64;
 /// count says.
 const ROW_CACHE_ROW_STEP: usize = 32;
 
+/// How many times eviction re-measures before leaving the rest to the next read.
+const EVICTION_PASSES: u32 = 4;
+
 /// How many rows a history page builds at a time before checking its byte bound.
 const PAGE_BATCH_ROWS: usize = 32;
 
@@ -230,6 +233,7 @@ pub struct Engine {
     dimensions_revision: u64,
     presentation_revision: u64,
     measured_rows: usize,
+    measure_now: bool,
     dropped_marks: u64,
     keyboard_revision: u64,
     feeds: u32,
@@ -270,6 +274,7 @@ impl Engine {
             dimensions_revision: 0,
             presentation_revision: 0,
             measured_rows: 0,
+            measure_now: false,
             dropped_marks: 0,
             keyboard_revision: 0,
             feeds: 0,
@@ -445,6 +450,12 @@ impl Engine {
             let decision = self.policy.decide(event);
             let mut disposition = decision.disposition;
             if decision.apply_to_grid {
+                // The primary buffer's rows are not reachable while the alternate buffer is
+                // showing, so they are measured before the switch rather than after it.
+                if !self.grid.alternate_active() && enters_alternate(&event.kind) {
+                    self.measure_now = true;
+                    self.enforce_resident_state(now_ms);
+                }
                 if self.link_budget_exceeded(event) {
                     self.diagnostics.record(
                         DiagnosticKind::ResidentStateTruncated,
@@ -670,6 +681,14 @@ impl Engine {
         }
         let parameters = String::from_utf8_lossy(&parts[1]).into_owned();
         let uri = format!("{parameters};{}", String::from_utf8_lossy(&uri));
+        // One link has a length bound of its own, separate from how many distinct links a session
+        // keeps. Every cell inside a link holds a reference to it, so an application that opens a
+        // link with a megabyte of identifier in it once a row would hold a megabyte a row, and the
+        // table of distinct targets would count that as one link.
+        if uri.len() > self.budget.limits().link_bytes {
+            self.budget.record_truncation();
+            return true;
+        }
         if self.links.contains(&uri) {
             return false;
         }
@@ -722,16 +741,29 @@ impl Engine {
     fn enforce_resident_state(&mut self, now_ms: u64) {
         let rows = self.grid.scrollback_rows();
         let grew = rows.abs_diff(self.measured_rows) >= ROW_CACHE_ROW_STEP;
-        if !grew && !self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) {
+        if !grew && !self.measure_now && !self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) {
             return;
         }
+        self.measure_now = false;
         self.measured_rows = rows;
         if self.grid.alternate_active() {
             return;
         }
-        let bytes = self.grid.history_bytes();
+        let mut bytes = self.grid.history_bytes();
         let limit = self.budget.limits().row_cache_bytes;
-        if self.grid.enforce_row_cache(bytes, limit) {
+        let mut evicted = false;
+        // The row count to keep is worked out from the average cost of a row, and the rows are not
+        // all the same size, so one pass can land just over the bound. A few passes converge; the
+        // count is bounded so a pathological row cannot make this loop.
+        for _ in 0..EVICTION_PASSES {
+            if !self.grid.enforce_row_cache(bytes, limit) {
+                break;
+            }
+            evicted = true;
+            bytes = self.grid.history_bytes();
+        }
+        if evicted {
+            self.measured_rows = self.grid.scrollback_rows();
             self.diagnostics.record(
                 DiagnosticKind::ResidentStateTruncated,
                 self.lexer.offset(),
@@ -761,14 +793,13 @@ impl Engine {
             generation: self.projection_generation,
             revisions: self.revisions(),
         };
-        if self.checkpoints.back() == Some(&checkpoint) {
-            return;
-        }
-        // A cursor can repeat while the screen moves on, because a held cluster keeps the committed
-        // cursor still. The newest checkpoint for a cursor is the one a delta is built against, so
-        // an older one with the same cursor is replaced rather than kept.
+        // A cursor can repeat while the screen moves on: a held cell keeps the committed cursor
+        // still, and state can change with no bytes at all. The earliest state seen at a cursor is
+        // the one kept, because a delta built against a later one would leave out everything that
+        // happened in between, and a client that already has some of what a delta carries loses
+        // nothing by being told again.
         if self.checkpoints.back().map(|last| last.cursor) == Some(checkpoint.cursor) {
-            self.checkpoints.pop_back();
+            return;
         }
         if self.checkpoints.len() == REPLAY_WINDOW {
             self.checkpoints.pop_front();
@@ -1140,6 +1171,7 @@ impl Engine {
             },
             title_stack: self.titles.entries().to_vec(),
             hyperlinks: hyperlinks_of(&rows),
+            hyperlink: self.grid.pen_hyperlink(),
             palette: self.palette_snapshot(),
             rows,
             // Not reachable on the pinned grid library; see `crate::unicode::LIBRARY`.
@@ -1307,6 +1339,10 @@ impl Engine {
                 .then(|| self.palette_snapshot()),
             dimensions: (self.dimensions_revision > base.revisions.dimensions)
                 .then(|| self.grid.size()),
+            title_stack: (self.title_revision > base.revisions.title)
+                .then(|| self.titles.entries().to_vec()),
+            hyperlink: (self.presentation_revision > base.revisions.presentation)
+                .then(|| self.grid.pen_hyperlink()),
         })
     }
 
@@ -1396,6 +1432,24 @@ impl Engine {
     pub fn diagnostic_totals(&self) -> Vec<(DiagnosticKind, u64)> {
         self.diagnostics.totals()
     }
+}
+
+/// Whether a sequence switches to the alternate buffer.
+fn enters_alternate(kind: &EventKind) -> bool {
+    let EventKind::Csi {
+        params,
+        final_byte: b'h',
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    let csi = crate::classify::CsiView::new(params, b'h');
+    csi.private == Some(b'?')
+        && csi
+            .numbers
+            .iter()
+            .any(|slot| matches!(slot, Some(47 | 1047 | 1049)))
 }
 
 /// Whether a sequence restores a saved cursor, directly or as part of leaving a buffer.

@@ -718,6 +718,15 @@ impl CanonicalGrid {
         rendition_of(&self.terminal.pen())
     }
 
+    /// The hyperlink the next character printed would belong to.
+    #[must_use]
+    pub fn pen_hyperlink(&self) -> Option<String> {
+        self.terminal
+            .pen()
+            .hyperlink()
+            .map(|link| link.uri().to_owned())
+    }
+
     /// Lowers the scrollback row count so the retained rows fit the byte bound.
     ///
     /// Returns whether the cache was over its bound. The library evicts as it appends, so the
@@ -733,7 +742,12 @@ impl CanonicalGrid {
             clippy::cast_possible_truncation,
             reason = "the quotient of two byte counts times a row count stays inside usize here"
         )]
-        let target = ((rows as u64).saturating_mul(limit) / bytes.max(1)) as usize;
+        // Aim a little under the bound rather than exactly at it. The row count is worked out from
+        // the average cost of a row, the rows are not all the same size, and the visible rows are
+        // measured but are not part of the scrollback the count bounds, so aiming exactly at the
+        // bound lands just above it.
+        let target =
+            ((rows as u64).saturating_mul(limit) * 9 / (bytes.max(1).saturating_mul(10))) as usize;
         let current = self.configuration.scrollback_rows.load(Ordering::Relaxed);
         let next = target.max(self.size.rows as usize).min(current);
         if next < current {
@@ -744,7 +758,22 @@ impl CanonicalGrid {
                 .generation
                 .fetch_add(1, Ordering::Relaxed);
         }
+        self.trim_scrollback();
         true
+    }
+
+    /// Drops the rows that are now past the scrollback bound, without waiting for more output.
+    ///
+    /// The library evicts while it scrolls, so a session that has stopped printing would otherwise
+    /// hold everything it had until it printed again. Scrolling by nothing does the eviction and
+    /// leaves the screen alone: no row moves, none is compressed, and none is added.
+    fn trim_scrollback(&mut self) {
+        let rows = i64::from(self.size.rows);
+        let seqno = self.terminal.current_seqno();
+        let bidi = self.configuration.bidi_mode();
+        self.terminal
+            .screen_mut()
+            .scroll_up(&(0..rows), 0, seqno, CellAttributes::blank(), bidi);
     }
 
     /// The current size.

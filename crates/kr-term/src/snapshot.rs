@@ -214,6 +214,12 @@ pub struct Snapshot {
     pub title_stack: Vec<SavedTitle>,
     /// Hyperlink ranges in the rows carried here.
     pub hyperlinks: Vec<HyperlinkRange>,
+    /// The hyperlink the next character printed would belong to.
+    ///
+    /// An application can open a link and print nothing before a client reconnects, and the link
+    /// belongs to what it prints next. Without this the reconnecting client would leave that text
+    /// outside the link.
+    pub hyperlink: Option<String>,
     /// The palette.
     pub palette: PaletteSnapshot,
     /// The rows of the active buffer, with stable identifiers and wrap markers.
@@ -268,6 +274,13 @@ pub struct Delta {
     pub palette: Option<PaletteSnapshot>,
     /// The canonical dimensions, when they changed since the base.
     pub dimensions: Option<GridSize>,
+    /// The virtual title stack, when the titles changed since the base.
+    pub title_stack: Option<Vec<SavedTitle>>,
+    /// The hyperlink the next character would be part of, when the presentation state changed.
+    ///
+    /// `Some(None)` is an open link that closed. Without this a reconnecting client cannot put the
+    /// next live character inside the link the application opened before it arrived.
+    pub hyperlink: Option<Option<String>>,
 }
 
 impl Delta {
@@ -277,8 +290,10 @@ impl Delta {
     ///
     /// Returns [`TermError::CursorGap`] when it does not, which the caller answers with a fresh
     /// snapshot.
-    pub const fn check_base(&self, held: u64) -> Result<()> {
-        if self.base_cursor == held {
+    pub const fn check_base(&self, held: u64, generation: u64) -> Result<()> {
+        // The generation is part of the base. A projection reset can happen without a byte
+        // arriving, so the same cursor can name two different screens.
+        if self.base_cursor == held && self.projection_generation == generation {
             return Ok(());
         }
         Err(TermError::CursorGap {
@@ -384,6 +399,17 @@ pub enum RestoreOp {
         cursor: SavedCursor,
     },
     /// Set the titles and the virtual stack.
+    /// Opens the hyperlink the next character belongs to, or closes the open one.
+    SetHyperlink {
+        /// The target, or nothing when no link is open.
+        uri: Option<String>,
+    },
+    /// Paints a row of the buffer that is not active.
+    PaintInactiveRow {
+        /// The row.
+        row: GridRow,
+    },
+    /// Restores the titles and the virtual title stack.
     SetTitle {
         /// The current titles.
         title: TitleEntry,
@@ -431,6 +457,13 @@ pub fn restoration_operations(snapshot: &Snapshot) -> Vec<RestoreOp> {
     ops.push(RestoreOp::SetMargins {
         margins: snapshot.margins,
     });
+    // The buffer that is not showing is painted first, so that leaving the active buffer later
+    // finds it as it was.
+    if let Some(rows) = &snapshot.inactive_rows {
+        for row in rows {
+            ops.push(RestoreOp::PaintInactiveRow { row: row.clone() });
+        }
+    }
     for row in &snapshot.rows {
         ops.push(RestoreOp::PaintRow { row: row.clone() });
     }
@@ -445,6 +478,9 @@ pub fn restoration_operations(snapshot: &Snapshot) -> Vec<RestoreOp> {
     });
     ops.push(RestoreOp::SetRendition {
         rendition: snapshot.rendition,
+    });
+    ops.push(RestoreOp::SetHyperlink {
+        uri: snapshot.hyperlink.clone(),
     });
     if let Some(cursor) = snapshot.saved_cursor {
         ops.push(RestoreOp::SetSavedCursor { cursor });

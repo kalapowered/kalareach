@@ -169,7 +169,9 @@ fn restoration_never_replays_a_side_effect() {
             | RestoreOp::SetCharsets { .. }
             | RestoreOp::SetMargins { .. }
             | RestoreOp::PaintRow { .. }
+            | RestoreOp::PaintInactiveRow { .. }
             | RestoreOp::RecordHyperlink { .. }
+            | RestoreOp::SetHyperlink { .. }
             | RestoreOp::SetRendition { .. }
             | RestoreOp::SetCursor { .. }
             | RestoreOp::SetSavedCursor { .. }
@@ -862,34 +864,44 @@ fn one_large_read_is_measured_before_the_next_one() {
         input.extend(std::iter::repeat_n(b'x', 2048));
         input.extend_from_slice(b"\r\n");
     }
-    let outcome = engine.feed(&input, 0);
+    engine.feed(&input, 0);
     assert_eq!(
         engine.budget().usage().rows,
         engine.grid().history_bytes(),
         "the budget knows what the rows cost after the read that made them"
     );
     assert!(
-        outcome.resident_pressure.row_cache,
-        "and says the cache is over its bound while it is"
+        engine.budget().usage().rows <= kr_term::budget::BudgetLimits::DEFAULT.row_cache_bytes,
+        "the rows past the bound are gone, without waiting for more output"
     );
 }
 
 /// A hyperlink costs what the whole link costs, identifier included.
 #[test]
 fn hyperlink_identifiers_are_counted() {
-    let mut engine = engine();
+    let mut counted = engine();
     let mut input = Vec::new();
     for index in 0..8u32 {
         input.extend_from_slice(b"\x1b]8;id=");
-        input.extend(std::iter::repeat_n(b'a', 4096));
+        input.extend(std::iter::repeat_n(b'a', 256));
         input.extend_from_slice(index.to_string().as_bytes());
         input.extend_from_slice(b";https://example.invalid/\x1b\\X");
     }
-    engine.feed(&input, 0);
+    counted.feed(&input, 0);
     assert!(
-        engine.budget().usage().metadata > 8 * 4096,
+        counted.budget().usage().metadata > 8 * 256,
         "the identifiers are counted, not just the targets"
     );
+
+    // One link is bounded on its own, because every cell inside it holds a reference to it.
+    let mut oversized = engine();
+    let mut input = b"\x1b]8;id=".to_vec();
+    input.extend(std::iter::repeat_n(b'a', 8192));
+    input.extend_from_slice(b";https://example.invalid/\x1b\\X");
+    let outcome = oversized.feed(&input, 0);
+    assert!(outcome.forward.is_empty());
+    assert!(oversized.budget().truncations() > 0);
+    assert_eq!(oversized.budget().usage().metadata, 0);
 }
 
 /// A cell that reaches its content bound says so rather than losing marks quietly.
