@@ -188,15 +188,19 @@ A data frame is a four-byte unsigned big-endian length followed by one KR-CBOR-1
 is validated before the payload is read or allocated. A zero length is invalid, because a
 KR-CBOR-1 object is at least one byte.
 
-| Stream kind | Maximum frame payload |
+| Stream kind | Maximum complete frame |
 | --- | --- |
 | `control` | 1 MiB |
 | `terminal_output` | 1 MiB |
 | `semantic_updates` | 1 MiB |
 | `terminal_input` | 64 KiB |
-| `attachment_chunks` | 1 MiB chunk plus 4 KiB of metadata |
+| `attachment_chunks` | 1 MiB chunk plus 4 KiB of metadata and framing |
 
-The attachment bound is a property of the stream kind, which is how the larger limit stays
+Each bound covers the bytes that go on the wire, length prefix included, so the largest payload is
+the bound less four. The attachment allowance says so outright, and counting the prefix everywhere
+keeps a payload inside the maximum message size as well.
+
+The bound is a property of the stream kind, which is how the larger attachment limit stays
 unavailable on a control stream.
 
 ## Envelopes

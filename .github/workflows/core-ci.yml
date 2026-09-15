@@ -45,13 +45,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Generated schema is current
-        run: cargo run -p kr-protocol --bin kr-protocol-gen -- --check
+        run: cargo run --locked -p kr-protocol --bin kr-protocol-gen -- --check
 
   typescript:
     name: typescript
