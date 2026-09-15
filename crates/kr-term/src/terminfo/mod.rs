@@ -10,6 +10,9 @@
 //! diagnostic is not advertised, which is why this database is not the stock entry.
 
 mod data;
+mod expand;
+
+pub use expand::{Param, expand};
 
 use crate::class::SequenceClass;
 use crate::event::Event;
@@ -39,8 +42,8 @@ pub struct StringCapability {
     pub name: &'static str,
     /// The capability value, with padding directives removed and escapes decoded.
     pub value: &'static str,
-    /// The value expanded for one representative parameter set. Empty for a non-output capability.
-    pub expansion: &'static str,
+    /// One representative parameter set, which the coverage check expands `value` with.
+    pub arguments: &'static [Param],
     /// What kind of capability this is.
     pub direction: Direction,
 }
@@ -254,10 +257,14 @@ pub struct Coverage {
     pub name: &'static str,
     /// What kind of capability it is.
     pub direction: Direction,
+    /// The bytes its own value produced for the representative arguments.
+    pub expansion: Vec<u8>,
     /// The classes its expansion produced, in order.
     pub classes: Vec<SequenceClass>,
     /// Whether this check examined the capability at all.
     pub checked: bool,
+    /// Whether the policy layer refused what the expansion asked for.
+    pub refused: bool,
     /// Whether the capability lexes into supported classes and actions the canonical grid knows.
     pub supported: bool,
 }
@@ -282,26 +289,41 @@ pub fn coverage() -> Vec<Coverage> {
                 return Coverage {
                     name: cap.name,
                     direction: cap.direction,
+                    expansion: Vec::new(),
                     classes: Vec::new(),
                     checked: false,
+                    refused: false,
                     supported: true,
                 };
             }
+            let expansion = expand::expand(cap.value, cap.arguments);
             let mut lexer = Lexer::new();
             let mut events: Vec<Event> = Vec::new();
-            lexer.feed(cap.expansion.as_bytes(), &mut events);
+            lexer.feed(&expansion, &mut events);
             lexer.close(&mut events);
             let classes: Vec<SequenceClass> = events.iter().map(|event| event.class).collect();
+            let context = crate::adapter::AdaptContext { rows: 24, cols: 80 };
             let recognised = events
                 .iter()
-                .all(|event| !crate::adapter::adapt(event).unrecognised);
-            let supported =
-                !classes.is_empty() && !classes.contains(&SequenceClass::Extension) && recognised;
+                .all(|event| !crate::adapter::adapt(event, context).unrecognised);
+            // Recognising a sequence is not the same as acting on it. A capability whose own
+            // representative arguments the policy layer refuses is advertising something this
+            // profile will not do, which is the same inconsistency as advertising an `X`.
+            let policy = crate::policy::Policy::DEFAULT;
+            let refused = events
+                .iter()
+                .any(|event| policy.decide(event).refusal.is_some());
+            let supported = !classes.is_empty()
+                && !classes.contains(&SequenceClass::Extension)
+                && recognised
+                && !refused;
             Coverage {
                 name: cap.name,
                 direction: cap.direction,
+                expansion,
                 classes,
                 checked: true,
+                refused,
                 supported,
             }
         })

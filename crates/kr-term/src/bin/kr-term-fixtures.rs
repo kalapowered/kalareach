@@ -205,7 +205,10 @@ fn terminfo_database() -> Value {
             json!({
                 "name": entry.name,
                 "direction": format!("{:?}", entry.direction).to_lowercase(),
+                "expansion": hex(&entry.expansion),
                 "classes": entry.classes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "checked": entry.checked,
+                "refused": entry.refused,
                 "supported": entry.supported,
             })
         })
@@ -226,7 +229,10 @@ fn terminfo_database() -> Value {
             "name": cap.name,
             "direction": format!("{:?}", cap.direction).to_lowercase(),
             "value": hex(cap.value.as_bytes()),
-            "expansion": hex(cap.expansion.as_bytes()),
+            "arguments": cap.arguments.iter().map(|argument| match argument {
+                terminfo::Param::Number(value) => json!({ "number": value }),
+                terminfo::Param::Text(text) => json!({ "text": text }),
+            }).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "coverage": coverage,
     })
