@@ -74,6 +74,9 @@
       "id": "status.refresh",
       "label": "Refresh status",
       "effect": "shell.exec",
+      "implementation": {
+        "type": "presentation"
+      },
       "parameters": {
         "parameters": [
           {

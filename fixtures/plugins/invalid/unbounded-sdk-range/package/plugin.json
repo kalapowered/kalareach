@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "display_name": "Example declarative package",
   "description": "Recognises the example agent and presents its status with one declarative control.",
-  "sdk_range": "*",
+  "sdk_range": ">=0.1.0",
   "wit_range": ">=0.1.0, <0.2.0",
   "source": {
     "repository": "https://github.com/kalapowered/kalareach-plugins",
@@ -74,6 +74,9 @@
       "id": "status.refresh",
       "label": "Refresh status",
       "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
       "parameters": {
         "parameters": [
           {

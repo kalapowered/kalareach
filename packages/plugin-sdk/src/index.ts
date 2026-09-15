@@ -21,24 +21,7 @@ const Ajv2020 = ajv2020.default
 import contract from '../schema/package-contract.json' with { type: 'json' }
 import schema from '../schema/kalareach-plugin-sdk.schema.json' with { type: 'json' }
 
-export type {
-  ActionDeclaration,
-  CapabilityEvidence,
-  CapabilityRequest,
-  CatalogueIndex,
-  ConnectorManifest,
-  Control,
-  DocumentNode,
-  IndexEntry,
-  InstanceLimits,
-  MatchRule,
-  PayloadRef,
-  PluginManifest,
-  PresentationManifest,
-  PublisherRecord,
-  RepositoryBudgets,
-  UnsupportedNode
-} from './generated/plugin-sdk.js'
+export type * from './generated/plugin-sdk.js'
 
 import type {
   CatalogueIndex,
@@ -68,7 +51,12 @@ export const defaultRepositoryCeiling: readonly string[] = contract.default_repo
 /** The document node kinds a client renders. Anything else is unsupported content. */
 export const documentNodeKinds: readonly string[] = contract.document_node_kinds
 
-/** The per-instance execution limits from the package contract. */
+/**
+ * The per-instance execution limits from the package contract.
+ *
+ * Byte counts and durations are decimal strings, as section 4 requires of every unsigned 64-bit
+ * value in the JSON representation. Read them with `BigInt` where the exact value matters.
+ */
 export const instanceLimits = contract.instance_limits
 
 /** The default repository budgets from the package contract. */
@@ -98,6 +86,34 @@ export type SchemaResult<T> =
   | { readonly ok: false; readonly problems: readonly SchemaProblem[] }
 
 const ajv = new Ajv2020({ allErrors: true, strict: false })
+
+/**
+ * The exact range each Rust integer type accepts.
+ *
+ * The schema carries these as a `format`, which a validator ignores unless it is told what the
+ * format means. Without them a document could declare a 33-bit count, pass validation here, and
+ * then be rejected by the host that actually reads it.
+ */
+const integerFormats: Record<string, { min: number; max: number }> = {
+  uint8: { min: 0, max: 255 },
+  uint16: { min: 0, max: 65535 },
+  uint32: { min: 0, max: 4294967295 },
+  uint64: { min: 0, max: Number.MAX_SAFE_INTEGER },
+  uint: { min: 0, max: Number.MAX_SAFE_INTEGER },
+  int8: { min: -128, max: 127 },
+  int16: { min: -32768, max: 32767 },
+  int32: { min: -2147483648, max: 2147483647 },
+  int64: { min: Number.MIN_SAFE_INTEGER, max: Number.MAX_SAFE_INTEGER }
+}
+
+for (const [name, range] of Object.entries(integerFormats)) {
+  ajv.addFormat(name, {
+    type: 'number',
+    validate: (value: number) =>
+      Number.isInteger(value) && value >= range.min && value <= range.max
+  })
+}
+
 ajv.addSchema(schema, 'kalareach-plugin-sdk')
 
 const validators = new Map<string, ValidateFunction>()

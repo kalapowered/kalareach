@@ -74,6 +74,19 @@
       "id": "status.refresh",
       "label": "Refresh status",
       "effect": "terminal.input",
+      "implementation": {
+        "type": "terminal_text",
+        "template": [
+          {
+            "type": "literal",
+            "text": "status "
+          },
+          {
+            "type": "parameter",
+            "parameter": "detail"
+          }
+        ]
+      },
       "parameters": {
         "parameters": [
           {

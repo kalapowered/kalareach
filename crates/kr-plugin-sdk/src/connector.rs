@@ -17,6 +17,8 @@
 //!   process or a filesystem path the broker would then open.
 
 use kr_protocol::scalars::Nullable;
+
+use crate::scalars::U64;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -89,30 +91,39 @@ pub enum Framing {
     /// One JSON document per line.
     LineDelimitedJson {
         /// Maximum bytes in one line.
-        max_message_bytes: u64,
+        max_message_bytes: U64,
     },
     /// A header block with a content length, then the body.
     ContentLength {
         /// The header that carries the length.
         length_header: String,
         /// Maximum bytes in one body.
-        max_message_bytes: u64,
+        max_message_bytes: U64,
     },
     /// A big-endian length prefix, then the body.
     LengthPrefixed {
         /// Width of the length prefix in bytes.
         prefix_bytes: u8,
         /// Maximum bytes in one body.
-        max_message_bytes: u64,
+        max_message_bytes: U64,
     },
     /// Server-sent events.
     ServerSentEvents {
         /// Maximum bytes in one event.
-        max_message_bytes: u64,
+        max_message_bytes: U64,
     },
 }
 
 impl Framing {
+    /// The smallest and largest message size a framing may declare.
+    ///
+    /// A framing that accepts nothing cannot carry a message, and one that accepts more than the
+    /// control frame limit describes a stream the broker would not read anyway.
+    pub const MESSAGE_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1..=(16 * 1024 * 1024);
+
+    /// The prefix widths a length-prefixed framing may declare.
+    pub const PREFIX_WIDTHS: &'static [u8] = &[1, 2, 4, 8];
+
     /// Returns the maximum bytes one framed message may carry.
     #[must_use]
     pub const fn max_message_bytes(&self) -> u64 {
@@ -124,7 +135,7 @@ impl Framing {
             | Self::LengthPrefixed {
                 max_message_bytes, ..
             }
-            | Self::ServerSentEvents { max_message_bytes } => *max_message_bytes,
+            | Self::ServerSentEvents { max_message_bytes } => max_message_bytes.get(),
         }
     }
 }
@@ -254,6 +265,9 @@ pub struct ConnectorManifest {
 }
 
 impl ConnectorManifest {
+    /// The manifest format version this crate reads and writes.
+    pub const CURRENT_VERSION: u32 = 1;
+
     /// Returns what the table says a method does.
     ///
     /// A method the table does not list is [`MethodClass::UNCLASSIFIED`], which is
@@ -294,7 +308,7 @@ mod tests {
             },
             transport: BrokerTransport::Stdio,
             framing: Framing::LineDelimitedJson {
-                max_message_bytes: 1_048_576,
+                max_message_bytes: U64::new(1_048_576),
             },
             request_id_path: FieldPath {
                 segments: vec![FieldSegment::Member {

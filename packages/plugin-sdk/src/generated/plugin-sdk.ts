@@ -15,6 +15,10 @@ export type DisabledReason = string
  */
 export type PayloadDigest = string
 /**
+ * Current evidence for a versioned capability. Never permission.
+ */
+export type CapabilityRevision = string
+/**
  * A plugin identifier from its manifest.
  */
 export type PluginId = string
@@ -189,6 +193,7 @@ export type Predicate1 =
        */
       state:
         | 'qualified_available'
+        | 'version_qualified'
         | 'missing_installation'
         | 'permission_required'
         | 'incompatible'
@@ -301,6 +306,7 @@ export type Predicate =
        */
       state:
         | 'qualified_available'
+        | 'version_qualified'
         | 'missing_installation'
         | 'permission_required'
         | 'incompatible'
@@ -362,6 +368,24 @@ export type Predicate =
       op: 'flag'
     }
 /**
+ * One piece of a terminal text template.
+ */
+export type TextSegment =
+  | {
+      /**
+       * The text.
+       */
+      text: string
+      type: 'literal'
+    }
+  | {
+      /**
+       * The parameter supplying the value.
+       */
+      parameter: string
+      type: 'parameter'
+    }
+/**
  * One edit a native bridge installation makes.
  *
  * A recipe lists exact files, configuration edits, hashes, version requirements and the
@@ -400,6 +424,36 @@ export type BridgeStep =
       value: string
     }
 /**
+ * One edit a native bridge removal undoes.
+ *
+ * Removal has its own vocabulary because it is not installation run backwards. Deleting a file the
+ * recipe installed is safe; deleting a file it edited is not. Each step names exactly what it
+ * undoes, so unrelated settings survive.
+ */
+export type BridgeRemoval =
+  | {
+      /**
+       * The path under the application's documented plugin directory.
+       */
+      destination: string
+      /**
+       * The digest the recipe installed.
+       */
+      digest: string
+      type: 'remove_file'
+    }
+  | {
+      /**
+       * The configuration file under the application's documented directory.
+       */
+      file: string
+      /**
+       * The key path, as dotted members.
+       */
+      key: string
+      type: 'remove_configuration_key'
+    }
+/**
  * The stable identifier of one control.
  */
 export type ControlId = string
@@ -429,6 +483,7 @@ export type BrokerTransport =
  */
 export type CapabilityState =
   | 'qualified_available'
+  | 'version_qualified'
   | 'missing_installation'
   | 'permission_required'
   | 'incompatible'
@@ -492,6 +547,15 @@ export type FindingCode =
   | 'connector_plugin_mismatch'
   | 'unknown_effect_class'
   | 'unknown_capability'
+  | 'name_not_utf8'
+  | 'duplicate_member'
+  | 'payload_role_invalid'
+  | 'implementation_mismatch'
+  | 'implementation_unsatisfied'
+  | 'bridge_recipe_invalid'
+  | 'duplicate_element_id'
+  | 'control_parameters_widen'
+  | 'qualification_invalid'
 /**
  * How messages are separated on the wire.
  */
@@ -500,7 +564,7 @@ export type Framing =
       /**
        * Maximum bytes in one line.
        */
-      max_message_bytes: number
+      max_message_bytes: string
       type: 'line_delimited_json'
     }
   | {
@@ -511,14 +575,14 @@ export type Framing =
       /**
        * Maximum bytes in one body.
        */
-      max_message_bytes: number
+      max_message_bytes: string
       type: 'content_length'
     }
   | {
       /**
        * Maximum bytes in one body.
        */
-      max_message_bytes: number
+      max_message_bytes: string
       /**
        * Width of the length prefix in bytes.
        */
@@ -529,7 +593,7 @@ export type Framing =
       /**
        * Maximum bytes in one event.
        */
-      max_message_bytes: number
+      max_message_bytes: string
       type: 'server_sent_events'
     }
 /**
@@ -756,7 +820,7 @@ export interface CapabilityEvidence {
    */
   observed_at: string
   /**
-   * The current revision of this record.
+   * Current evidence for a versioned capability. Never permission.
    */
   revision: string
   /**
@@ -768,6 +832,7 @@ export interface CapabilityEvidence {
    */
   state:
     | 'qualified_available'
+    | 'version_qualified'
     | 'missing_installation'
     | 'permission_required'
     | 'incompatible'
@@ -784,6 +849,14 @@ export interface SubjectIdentity {
    */
   binary_digest: PayloadDigest | null
   /**
+   * The binding the evidence was gathered through, where a live binding gathered it.
+   *
+   * An installed upgrade does not invalidate an old running process's correctly pinned
+   * identity, which is only expressible if the record names the binding rather than the
+   * package.
+   */
+  binding_revision: CapabilityRevision | null
+  /**
    * The digest of that package's manifest.
    */
   package_digest: PayloadDigest | null
@@ -791,6 +864,10 @@ export interface SubjectIdentity {
    * The package the evidence is about, where it is about one.
    */
   plugin_id: PluginId | null
+  /**
+   * The digest of the signed qualification profile the evidence came from, where one did.
+   */
+  profile_digest: PayloadDigest | null
   /**
    * The publisher whose signed record supplied the evidence, where one did.
    */
@@ -874,6 +951,13 @@ export interface IndexEntry {
    */
   manifest_digest: string
   /**
+   * The exact length of the manifest.
+   *
+   * The manifest does not declare itself, so its length is here. A host checks a declared size
+   * before it downloads, and the manifest is the first thing it downloads.
+   */
+  manifest_size_bytes: string
+  /**
    * The applications the package recognises.
    */
   match_rules: MatchRule[]
@@ -898,6 +982,10 @@ export interface IndexEntry {
    */
   publisher_id: string
   /**
+   * What the publisher qualified this release against.
+   */
+  qualification: QualificationResult[]
+  /**
    * The revocation record, where this release has one.
    */
   revocation: RevocationRecord | null
@@ -907,7 +995,7 @@ export interface IndexEntry {
   sdk_range: string
   source: SourcePin
   /**
-   * The sum of every payload size.
+   * The sum of every payload size and the manifest's own length.
    */
   total_size_bytes: string
   /**
@@ -1021,6 +1109,58 @@ export interface PlatformSupport {
   os: 'linux' | 'mac_os' | 'windows'
 }
 /**
+ * One compatibility result the catalogue carries about a package.
+ *
+ * Section 25 stores compatibility results beside the manifests and hashes. Section 11 ships that
+ * qualification data as signed, immutable catalogue artefacts, separately from host binaries, so
+ * updating it cannot create new primitive effects, raise a grant or turn an old live binding into
+ * a different version.
+ *
+ * A result says how a version behaved where it was tested. It is not permission, and it is not a
+ * live binding: a host still probes, still checks its grant and still rechecks the capability
+ * revision on every action.
+ */
+export interface QualificationResult {
+  /**
+   * The versioned capability the result is about.
+   */
+  capability_id: string
+  /**
+   * An exact semantic version, such as 1.4.0 or 2.0.0-rc.1.
+   */
+  capability_version: string
+  /**
+   * A SHA-256 digest as 64 lower-case hexadecimal characters.
+   */
+  profile_digest: string
+  /**
+   * Where the result came from.
+   */
+  source: 'host_probe' | 'live_binding' | 'signed_record' | 'package_declaration'
+  /**
+   * What the result is.
+   *
+   * A catalogue result can report that a version was qualified or that it is incompatible. It
+   * cannot report that a capability is available on a host it has never seen.
+   */
+  state:
+    | 'qualified_available'
+    | 'version_qualified'
+    | 'missing_installation'
+    | 'permission_required'
+    | 'incompatible'
+    | 'temporarily_unavailable'
+    | 'not_tested'
+  /**
+   * What a person reads about it.
+   */
+  statement: string
+  /**
+   * A short display name. One line, no control or bidirectional characters.
+   */
+  subject: string
+}
+/**
  * A revocation record.
  *
  * A revoked package stops new bindings. An active binding receives a warning and follows the
@@ -1089,7 +1229,7 @@ export interface ConnectorManifest {
         /**
          * Maximum bytes in one line.
          */
-        max_message_bytes: number
+        max_message_bytes: string
         type: 'line_delimited_json'
       }
     | {
@@ -1100,14 +1240,14 @@ export interface ConnectorManifest {
         /**
          * Maximum bytes in one body.
          */
-        max_message_bytes: number
+        max_message_bytes: string
         type: 'content_length'
       }
     | {
         /**
          * Maximum bytes in one body.
          */
-        max_message_bytes: number
+        max_message_bytes: string
         /**
          * Width of the length prefix in bytes.
          */
@@ -1118,7 +1258,7 @@ export interface ConnectorManifest {
         /**
          * Maximum bytes in one event.
          */
-        max_message_bytes: number
+        max_message_bytes: string
         type: 'server_sent_events'
       }
   /**
@@ -1314,12 +1454,12 @@ export interface DocumentNode {
               /**
                * Completed units.
                */
-              completed: number
+              completed: string
               kind: 'determinate'
               /**
                * Total units.
                */
-              total: number
+              total: string
             }
           | {
               kind: 'indeterminate'
@@ -1334,10 +1474,7 @@ export interface DocumentNode {
     | {
         fields: ParameterSchema
         kind: 'form'
-        /**
-         * The action the completed form invokes.
-         */
-        submit_action_id: string
+        submit: Control
         /**
          * A short display name. One line, no control or bidirectional characters.
          */
@@ -1356,7 +1493,7 @@ export interface DocumentNode {
         /**
          * Its size in bytes.
          */
-        size_bytes: number
+        size_bytes: string
       }
     | {
         /**
@@ -1373,14 +1510,14 @@ export interface DocumentNode {
         session_id: string
       }
     | {
-        control: Control
+        control: Control1
         kind: 'action_button'
       }
     | {
         /**
          * The controls.
          */
-        controls: Control1[]
+        controls: Control2[]
         kind: 'action_group'
         /**
          * A short display name. One line, no control or bidirectional characters.
@@ -1391,14 +1528,11 @@ export interface DocumentNode {
         /**
          * The controls.
          */
-        controls: Control1[]
+        controls: Control2[]
         kind: 'command_palette'
       }
     | {
-        /**
-         * The action that receives the completed handle.
-         */
-        action_id: string
+        contribute: Control3
         kind: 'attachment_entry'
         /**
          * A short display name. One line, no control or bidirectional characters.
@@ -1513,7 +1647,11 @@ export interface ParameterChoice {
   label: string
 }
 /**
- * The control.
+ * The control that submits the completed form.
+ *
+ * Submission is an action invocation like any other, so it carries a control rather than
+ * a bare action name: the same label, icon, accessible description, priority, visibility
+ * and disabled reason every other way of invoking an action carries.
  */
 export interface Control {
   /**
@@ -1580,6 +1718,7 @@ export interface Control {
          */
         state:
           | 'qualified_available'
+          | 'version_qualified'
           | 'missing_installation'
           | 'permission_required'
           | 'incompatible'
@@ -1735,6 +1874,7 @@ export interface Control {
          */
         state:
           | 'qualified_available'
+          | 'version_qualified'
           | 'missing_installation'
           | 'permission_required'
           | 'incompatible'
@@ -1809,7 +1949,7 @@ export interface ParameterSchema1 {
   parameters: ParameterDeclaration[]
 }
 /**
- * One declarative control.
+ * The control.
  */
 export interface Control1 {
   /**
@@ -1876,6 +2016,7 @@ export interface Control1 {
          */
         state:
           | 'qualified_available'
+          | 'version_qualified'
           | 'missing_installation'
           | 'permission_required'
           | 'incompatible'
@@ -2031,6 +2172,579 @@ export interface Control1 {
          */
         state:
           | 'qualified_available'
+          | 'version_qualified'
+          | 'missing_installation'
+          | 'permission_required'
+          | 'incompatible'
+          | 'temporarily_unavailable'
+          | 'not_tested'
+      }
+    | {
+        op: 'grant'
+        /**
+         * The right.
+         */
+        right:
+          | 'session.view'
+          | 'terminal.input'
+          | 'terminal.geometry'
+          | 'terminal.geometry.transfer'
+          | 'terminal.palette'
+          | 'agent.prompt'
+          | 'agent.cancel'
+          | 'agent.approval.respond'
+          | 'question.respond'
+          | 'files.read'
+          | 'files.upload'
+          | 'files.apply_diff'
+          | 'project.create'
+          | 'workspace.manage'
+          | 'changeset.create'
+          | 'session.create'
+          | 'session.rename'
+          | 'session.close'
+          | 'session.share'
+          | 'automation.manage'
+          | 'host.manage'
+      }
+    | {
+        op: 'binding'
+        /**
+         * The state.
+         */
+        state: 'bound' | 'upstream_busy' | 'awaiting_person' | 'disabled' | 'native_only_volatile'
+      }
+    | {
+        /**
+         * The node.
+         */
+        node_id: string
+        op: 'node_present'
+      }
+    | {
+        /**
+         * The fact.
+         */
+        flag:
+          | 'pending_approval'
+          | 'draft_not_empty'
+          | 'compact_layout'
+          | 'transfer_in_progress'
+          | 'holds_input_lease'
+        op: 'flag'
+      }
+}
+/**
+ * One declarative control.
+ */
+export interface Control2 {
+  /**
+   * The description a screen reader announces.
+   */
+  accessible_description: string
+  /**
+   * The registered action this control invokes.
+   */
+  action_id: string
+  /**
+   * The reason shown while the control is disabled.
+   */
+  disabled_reason: DisabledReason | null
+  /**
+   * When the control is present but not usable.
+   */
+  enabled_when:
+    | {
+        op: 'always'
+      }
+    | {
+        op: 'never'
+      }
+    | {
+        op: 'not'
+        term: Predicate1
+      }
+    | {
+        op: 'all'
+        /**
+         * The terms.
+         */
+        terms: Predicate[]
+      }
+    | {
+        op: 'any'
+        /**
+         * The terms.
+         */
+        terms: Predicate[]
+      }
+    | {
+        /**
+         * The capability.
+         */
+        capability:
+          | 'metadata.match'
+          | 'presentation.declarative'
+          | 'broker.semantic_events'
+          | 'terminal.stream'
+          | 'terminal.transcript_tail'
+          | 'terminal.input'
+          | 'filesystem.read'
+          | 'network.outbound'
+          | 'process.observe'
+          | 'upstream.action'
+          | 'approval.decode'
+          | 'approval.respond'
+          | 'native_bridge.install'
+        op: 'capability'
+        /**
+         * The state it must be in.
+         */
+        state:
+          | 'qualified_available'
+          | 'version_qualified'
+          | 'missing_installation'
+          | 'permission_required'
+          | 'incompatible'
+          | 'temporarily_unavailable'
+          | 'not_tested'
+      }
+    | {
+        op: 'grant'
+        /**
+         * The right.
+         */
+        right:
+          | 'session.view'
+          | 'terminal.input'
+          | 'terminal.geometry'
+          | 'terminal.geometry.transfer'
+          | 'terminal.palette'
+          | 'agent.prompt'
+          | 'agent.cancel'
+          | 'agent.approval.respond'
+          | 'question.respond'
+          | 'files.read'
+          | 'files.upload'
+          | 'files.apply_diff'
+          | 'project.create'
+          | 'workspace.manage'
+          | 'changeset.create'
+          | 'session.create'
+          | 'session.rename'
+          | 'session.close'
+          | 'session.share'
+          | 'automation.manage'
+          | 'host.manage'
+      }
+    | {
+        op: 'binding'
+        /**
+         * The state.
+         */
+        state: 'bound' | 'upstream_busy' | 'awaiting_person' | 'disabled' | 'native_only_volatile'
+      }
+    | {
+        /**
+         * The node.
+         */
+        node_id: string
+        op: 'node_present'
+      }
+    | {
+        /**
+         * The fact.
+         */
+        flag:
+          | 'pending_approval'
+          | 'draft_not_empty'
+          | 'compact_layout'
+          | 'transfer_in_progress'
+          | 'holds_input_lease'
+        op: 'flag'
+      }
+  /**
+   * The standard icon.
+   */
+  icon:
+    | 'play'
+    | 'stop'
+    | 'pause'
+    | 'check'
+    | 'cross'
+    | 'retry'
+    | 'open'
+    | 'copy'
+    | 'attachment'
+    | 'file'
+    | 'folder'
+    | 'diff'
+    | 'terminal'
+    | 'tool'
+    | 'warning'
+    | 'info'
+    | 'error'
+    | 'settings'
+    | 'search'
+    | 'person'
+    | 'question'
+    | 'send'
+  /**
+   * The stable identifier.
+   */
+  id: string
+  /**
+   * A short display name. One line, no control or bidirectional characters.
+   */
+  label: string
+  parameters: ParameterSchema1
+  /**
+   * How prominently a client presents it.
+   */
+  priority: 'primary' | 'secondary' | 'overflow' | 'destructive'
+  /**
+   * The revision of this control.
+   */
+  revision: string
+  /**
+   * One term of a visibility predicate.
+   */
+  visible_when:
+    | {
+        op: 'always'
+      }
+    | {
+        op: 'never'
+      }
+    | {
+        op: 'not'
+        term: Predicate1
+      }
+    | {
+        op: 'all'
+        /**
+         * The terms.
+         */
+        terms: Predicate[]
+      }
+    | {
+        op: 'any'
+        /**
+         * The terms.
+         */
+        terms: Predicate[]
+      }
+    | {
+        /**
+         * The capability.
+         */
+        capability:
+          | 'metadata.match'
+          | 'presentation.declarative'
+          | 'broker.semantic_events'
+          | 'terminal.stream'
+          | 'terminal.transcript_tail'
+          | 'terminal.input'
+          | 'filesystem.read'
+          | 'network.outbound'
+          | 'process.observe'
+          | 'upstream.action'
+          | 'approval.decode'
+          | 'approval.respond'
+          | 'native_bridge.install'
+        op: 'capability'
+        /**
+         * The state it must be in.
+         */
+        state:
+          | 'qualified_available'
+          | 'version_qualified'
+          | 'missing_installation'
+          | 'permission_required'
+          | 'incompatible'
+          | 'temporarily_unavailable'
+          | 'not_tested'
+      }
+    | {
+        op: 'grant'
+        /**
+         * The right.
+         */
+        right:
+          | 'session.view'
+          | 'terminal.input'
+          | 'terminal.geometry'
+          | 'terminal.geometry.transfer'
+          | 'terminal.palette'
+          | 'agent.prompt'
+          | 'agent.cancel'
+          | 'agent.approval.respond'
+          | 'question.respond'
+          | 'files.read'
+          | 'files.upload'
+          | 'files.apply_diff'
+          | 'project.create'
+          | 'workspace.manage'
+          | 'changeset.create'
+          | 'session.create'
+          | 'session.rename'
+          | 'session.close'
+          | 'session.share'
+          | 'automation.manage'
+          | 'host.manage'
+      }
+    | {
+        op: 'binding'
+        /**
+         * The state.
+         */
+        state: 'bound' | 'upstream_busy' | 'awaiting_person' | 'disabled' | 'native_only_volatile'
+      }
+    | {
+        /**
+         * The node.
+         */
+        node_id: string
+        op: 'node_present'
+      }
+    | {
+        /**
+         * The fact.
+         */
+        flag:
+          | 'pending_approval'
+          | 'draft_not_empty'
+          | 'compact_layout'
+          | 'transfer_in_progress'
+          | 'holds_input_lease'
+        op: 'flag'
+      }
+}
+/**
+ * One declarative control.
+ */
+export interface Control3 {
+  /**
+   * The description a screen reader announces.
+   */
+  accessible_description: string
+  /**
+   * The registered action this control invokes.
+   */
+  action_id: string
+  /**
+   * The reason shown while the control is disabled.
+   */
+  disabled_reason: DisabledReason | null
+  /**
+   * When the control is present but not usable.
+   */
+  enabled_when:
+    | {
+        op: 'always'
+      }
+    | {
+        op: 'never'
+      }
+    | {
+        op: 'not'
+        term: Predicate1
+      }
+    | {
+        op: 'all'
+        /**
+         * The terms.
+         */
+        terms: Predicate[]
+      }
+    | {
+        op: 'any'
+        /**
+         * The terms.
+         */
+        terms: Predicate[]
+      }
+    | {
+        /**
+         * The capability.
+         */
+        capability:
+          | 'metadata.match'
+          | 'presentation.declarative'
+          | 'broker.semantic_events'
+          | 'terminal.stream'
+          | 'terminal.transcript_tail'
+          | 'terminal.input'
+          | 'filesystem.read'
+          | 'network.outbound'
+          | 'process.observe'
+          | 'upstream.action'
+          | 'approval.decode'
+          | 'approval.respond'
+          | 'native_bridge.install'
+        op: 'capability'
+        /**
+         * The state it must be in.
+         */
+        state:
+          | 'qualified_available'
+          | 'version_qualified'
+          | 'missing_installation'
+          | 'permission_required'
+          | 'incompatible'
+          | 'temporarily_unavailable'
+          | 'not_tested'
+      }
+    | {
+        op: 'grant'
+        /**
+         * The right.
+         */
+        right:
+          | 'session.view'
+          | 'terminal.input'
+          | 'terminal.geometry'
+          | 'terminal.geometry.transfer'
+          | 'terminal.palette'
+          | 'agent.prompt'
+          | 'agent.cancel'
+          | 'agent.approval.respond'
+          | 'question.respond'
+          | 'files.read'
+          | 'files.upload'
+          | 'files.apply_diff'
+          | 'project.create'
+          | 'workspace.manage'
+          | 'changeset.create'
+          | 'session.create'
+          | 'session.rename'
+          | 'session.close'
+          | 'session.share'
+          | 'automation.manage'
+          | 'host.manage'
+      }
+    | {
+        op: 'binding'
+        /**
+         * The state.
+         */
+        state: 'bound' | 'upstream_busy' | 'awaiting_person' | 'disabled' | 'native_only_volatile'
+      }
+    | {
+        /**
+         * The node.
+         */
+        node_id: string
+        op: 'node_present'
+      }
+    | {
+        /**
+         * The fact.
+         */
+        flag:
+          | 'pending_approval'
+          | 'draft_not_empty'
+          | 'compact_layout'
+          | 'transfer_in_progress'
+          | 'holds_input_lease'
+        op: 'flag'
+      }
+  /**
+   * The standard icon.
+   */
+  icon:
+    | 'play'
+    | 'stop'
+    | 'pause'
+    | 'check'
+    | 'cross'
+    | 'retry'
+    | 'open'
+    | 'copy'
+    | 'attachment'
+    | 'file'
+    | 'folder'
+    | 'diff'
+    | 'terminal'
+    | 'tool'
+    | 'warning'
+    | 'info'
+    | 'error'
+    | 'settings'
+    | 'search'
+    | 'person'
+    | 'question'
+    | 'send'
+  /**
+   * The stable identifier.
+   */
+  id: string
+  /**
+   * A short display name. One line, no control or bidirectional characters.
+   */
+  label: string
+  parameters: ParameterSchema1
+  /**
+   * How prominently a client presents it.
+   */
+  priority: 'primary' | 'secondary' | 'overflow' | 'destructive'
+  /**
+   * The revision of this control.
+   */
+  revision: string
+  /**
+   * One term of a visibility predicate.
+   */
+  visible_when:
+    | {
+        op: 'always'
+      }
+    | {
+        op: 'never'
+      }
+    | {
+        op: 'not'
+        term: Predicate1
+      }
+    | {
+        op: 'all'
+        /**
+         * The terms.
+         */
+        terms: Predicate[]
+      }
+    | {
+        op: 'any'
+        /**
+         * The terms.
+         */
+        terms: Predicate[]
+      }
+    | {
+        /**
+         * The capability.
+         */
+        capability:
+          | 'metadata.match'
+          | 'presentation.declarative'
+          | 'broker.semantic_events'
+          | 'terminal.stream'
+          | 'terminal.transcript_tail'
+          | 'terminal.input'
+          | 'filesystem.read'
+          | 'network.outbound'
+          | 'process.observe'
+          | 'upstream.action'
+          | 'approval.decode'
+          | 'approval.respond'
+          | 'native_bridge.install'
+        op: 'capability'
+        /**
+         * The state it must be in.
+         */
+        state:
+          | 'qualified_available'
+          | 'version_qualified'
           | 'missing_installation'
           | 'permission_required'
           | 'incompatible'
@@ -2099,7 +2813,7 @@ export interface InstanceLimits {
   /**
    * The window the fault count is measured over.
    */
-  fault_window_ms: number
+  fault_window_ms: string
   /**
    * Faults within `fault_window_ms` that disable the binding.
    */
@@ -2107,27 +2821,27 @@ export interface InstanceLimits {
   /**
    * Deadline in milliseconds for `decode-request` and `encode-response`.
    */
-  interpretation_deadline_ms: number
+  interpretation_deadline_ms: string
   /**
    * Linear memory in bytes.
    */
-  memory_bytes: number
+  memory_bytes: string
   /**
    * Deadline in milliseconds for `observe` and `prepare-action`.
    */
-  observation_deadline_ms: number
+  observation_deadline_ms: string
   /**
    * Size in bytes of the bounded observation queue.
    */
-  observation_queue_bytes: number
+  observation_queue_bytes: string
   /**
    * Maximum bytes one call may return.
    */
-  output_bytes_per_call: number
+  output_bytes_per_call: string
   /**
    * Deadline in milliseconds for `snapshot`.
    */
-  snapshot_deadline_ms: number
+  snapshot_deadline_ms: string
 }
 /**
  * The `plugin.json` manifest.
@@ -2226,10 +2940,60 @@ export interface ActionDeclaration {
    */
   id: string
   /**
+   * How it becomes an effect.
+   */
+  implementation:
+    | {
+        type: 'presentation'
+      }
+    | {
+        type: 'component'
+      }
+    | {
+        /**
+         * Which declared parameter supplies each field of the request.
+         */
+        bindings: ParameterBinding[]
+        /**
+         * The method, as the connector table names it.
+         */
+        method: string
+        type: 'upstream_method'
+      }
+    | {
+        type: 'upstream_cancel'
+      }
+    | {
+        /**
+         * The template.
+         */
+        template: TextSegment[]
+        type: 'terminal_text'
+      }
+  /**
    * The label a person reads.
    */
   label: string
   parameters: ParameterSchema2
+}
+/**
+ * One declared parameter bound to a field of an upstream request.
+ */
+export interface ParameterBinding {
+  field: FieldPath3
+  /**
+   * The declared parameter supplying the value.
+   */
+  parameter: string
+}
+/**
+ * Where the value goes in the upstream request.
+ */
+export interface FieldPath3 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
 }
 /**
  * The parameters it accepts.
@@ -2263,9 +3027,9 @@ export interface AttachmentContribution {
    */
   insertion: 'native_composer' | 'upstream_upload' | 'terminal_draft_path'
   /**
-   * Maximum bytes per attachment for the selected upstream model.
+   * Maximum bytes per attachment the bound upstream execution accepts.
    */
-  max_bytes: number
+  max_bytes: string
   /**
    * Maximum attachments per draft.
    */
@@ -2295,9 +3059,12 @@ export interface NativeBridge {
    */
   install: BridgeStep[]
   /**
-   * What removal does, in the order it is applied.
+   * What removal undoes, in the order it is applied.
+   *
+   * Every install step has a removal step. A recipe that installs something it cannot remove is
+   * a recipe that leaves the application changed after the package is gone.
    */
-  remove: BridgeStep[]
+  remove: BridgeRemoval[]
 }
 /**
  * Where the source came from.
@@ -2361,15 +3128,15 @@ export interface RepositoryBudgets {
   /**
    * Maximum bytes of catalogue metadata.
    */
-  metadata_bytes: number
+  metadata_bytes: string
   /**
    * Maximum number of index entries.
    */
-  metadata_entries: number
+  metadata_entries: string
   /**
    * Maximum bytes of cached payloads.
    */
-  payload_cache_bytes: number
+  payload_cache_bytes: string
 }
 /**
  * A node whose kind this build does not know.
@@ -2444,6 +3211,15 @@ export interface Finding {
     | 'connector_plugin_mismatch'
     | 'unknown_effect_class'
     | 'unknown_capability'
+    | 'name_not_utf8'
+    | 'duplicate_member'
+    | 'payload_role_invalid'
+    | 'implementation_mismatch'
+    | 'implementation_unsatisfied'
+    | 'bridge_recipe_invalid'
+    | 'duplicate_element_id'
+    | 'control_parameters_widen'
+    | 'qualification_invalid'
   /**
    * What exactly is wrong.
    */

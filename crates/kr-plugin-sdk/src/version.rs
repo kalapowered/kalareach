@@ -23,6 +23,12 @@ pub const WIT_VERSION: &str = "0.1.0";
 /// The pattern an exact semantic version matches, from the semantic versioning specification.
 pub const VERSION_PATTERN: &str = r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$";
 
+/// Maximum length in bytes of a version or a range.
+pub const MAX_VERSION_LEN: usize = 64;
+
+/// Maximum length in bytes of a version range.
+pub const MAX_RANGE_LEN: usize = 128;
+
 /// An exact semantic version.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -35,6 +41,11 @@ impl PackageVersion {
     ///
     /// Returns [`semver::Error`] when the text is not a semantic version.
     pub fn parse(text: &str) -> Result<Self, semver::Error> {
+        if text.len() > MAX_VERSION_LEN {
+            // `semver::Error` has no public constructor, so the bound is expressed as a parse
+            // failure of the over-long text, which is what it is.
+            return Version::parse("").map(Self);
+        }
         Version::parse(text).map(Self)
     }
 
@@ -85,7 +96,7 @@ impl JsonSchema for PackageVersion {
         json_schema!({
             "type": "string",
             "minLength": 5,
-            "maxLength": 64,
+            "maxLength": MAX_VERSION_LEN,
             "pattern": VERSION_PATTERN,
             "description": "An exact semantic version, such as 1.4.0 or 2.0.0-rc.1."
         })
@@ -104,6 +115,9 @@ impl VersionRange {
     ///
     /// Returns [`semver::Error`] when the text is not a version requirement.
     pub fn parse(text: &str) -> Result<Self, semver::Error> {
+        if text.len() > MAX_RANGE_LEN {
+            return VersionReq::parse("!").map(Self);
+        }
         VersionReq::parse(text).map(Self)
     }
 
@@ -113,13 +127,21 @@ impl VersionRange {
         self.0.matches(version.get())
     }
 
-    /// Returns true when the range admits every version, which a package may not declare.
+    /// Returns true when the range admits versions above every one it names.
     ///
-    /// An unbounded range says the package works on hosts that did not exist when it was
-    /// reviewed. The manifest validator rejects it for that reason.
+    /// An unbounded range says the package works on releases that did not exist when it was
+    /// reviewed, and the manifest validator rejects it for that reason. `*` is the obvious form;
+    /// `>=0.1` is the same claim written differently, so the check is for an upper bound rather
+    /// than for a wildcard.
     #[must_use]
     pub fn is_unbounded(&self) -> bool {
-        self.0.comparators.is_empty()
+        use semver::Op;
+        !self.0.comparators.iter().any(|comparator| {
+            matches!(
+                comparator.op,
+                Op::Exact | Op::Less | Op::LessEq | Op::Tilde | Op::Caret | Op::Wildcard
+            )
+        })
     }
 
     /// Returns the underlying requirement.
@@ -163,7 +185,7 @@ impl JsonSchema for VersionRange {
         json_schema!({
             "type": "string",
             "minLength": 1,
-            "maxLength": 128,
+            "maxLength": MAX_RANGE_LEN,
             "description": "A semantic version range, such as '>=0.1, <0.2'. An unbounded range is rejected."
         })
     }

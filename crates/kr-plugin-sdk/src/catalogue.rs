@@ -20,8 +20,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::capability::CapabilityRequest;
+use crate::capability::{CapabilityRequest, CapabilityState, EvidenceSource};
 use crate::digest::{ByteSize, PayloadDigest};
+use crate::ids::CapabilityId;
 use crate::ids::{PluginId, PluginName, PublisherId};
 use crate::matching::{MatchRule, PlatformSupport};
 use crate::plugin::{PayloadRef, PayloadRole, PluginManifest, SourcePin};
@@ -77,6 +78,72 @@ pub struct RevocationRecord {
     pub statement: Summary,
 }
 
+/// One compatibility result the catalogue carries about a package.
+///
+/// Section 25 stores compatibility results beside the manifests and hashes. Section 11 ships that
+/// qualification data as signed, immutable catalogue artefacts, separately from host binaries, so
+/// updating it cannot create new primitive effects, raise a grant or turn an old live binding into
+/// a different version.
+///
+/// A result says how a version behaved where it was tested. It is not permission, and it is not a
+/// live binding: a host still probes, still checks its grant and still rechecks the capability
+/// revision on every action.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct QualificationResult {
+    /// The versioned capability the result is about.
+    pub capability_id: CapabilityId,
+    /// The capability version.
+    pub capability_version: PackageVersion,
+    /// What the publisher qualified the package against.
+    pub subject: Label,
+    /// What the result is.
+    ///
+    /// A catalogue result can report that a version was qualified or that it is incompatible. It
+    /// cannot report that a capability is available on a host it has never seen.
+    pub state: CapabilityState,
+    /// Where the result came from.
+    pub source: EvidenceSource,
+    /// The digest of the signed profile the result came from.
+    pub profile_digest: PayloadDigest,
+    /// What a person reads about it.
+    pub statement: Summary,
+}
+
+/// Why a qualification result may not appear in a catalogue index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum QualificationError {
+    /// The result claimed a host outcome the catalogue cannot know.
+    #[error("a catalogue result cannot claim that a capability is available on a host")]
+    ClaimsHostAvailability,
+    /// The result came from a source the catalogue does not carry.
+    #[error("a catalogue result comes from a signed record, not from {claimed:?}")]
+    WrongSource {
+        /// The source that was claimed.
+        claimed: EvidenceSource,
+    },
+}
+
+impl QualificationResult {
+    /// Checks the rules a catalogue qualification result must satisfy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QualificationError`] when the result claims a host outcome or a source the
+    /// catalogue cannot carry.
+    pub fn validate(&self) -> Result<(), QualificationError> {
+        if self.state.is_usable() {
+            return Err(QualificationError::ClaimsHostAvailability);
+        }
+        if self.source != EvidenceSource::SignedRecord {
+            return Err(QualificationError::WrongSource {
+                claimed: self.source,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// One entry in the catalogue index.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -109,8 +176,15 @@ pub struct IndexEntry {
     pub payloads: Vec<PayloadRef>,
     /// The digest of the manifest itself, which names every other payload.
     pub manifest_digest: PayloadDigest,
-    /// The sum of every payload size.
+    /// The exact length of the manifest.
+    ///
+    /// The manifest does not declare itself, so its length is here. A host checks a declared size
+    /// before it downloads, and the manifest is the first thing it downloads.
+    pub manifest_size_bytes: ByteSize,
+    /// The sum of every payload size and the manifest's own length.
     pub total_size_bytes: ByteSize,
+    /// What the publisher qualified this release against.
+    pub qualification: Vec<QualificationResult>,
     /// Whether the package ships a Wasm component.
     pub has_component: bool,
     /// The revocation record, where this release has one.
@@ -118,9 +192,13 @@ pub struct IndexEntry {
 }
 
 impl IndexEntry {
-    /// Builds an entry from a validated manifest and its digest.
+    /// Builds an entry from a validated manifest, its digest and its exact length.
     #[must_use]
-    pub fn from_manifest(manifest: &PluginManifest, manifest_digest: PayloadDigest) -> Self {
+    pub fn from_manifest(
+        manifest: &PluginManifest,
+        manifest_digest: PayloadDigest,
+        manifest_size_bytes: u64,
+    ) -> Self {
         Self {
             plugin_id: manifest.plugin_id(),
             publisher_id: manifest.publisher_id.clone(),
@@ -136,8 +214,14 @@ impl IndexEntry {
             capabilities: manifest.capabilities.clone(),
             payloads: manifest.payloads.clone(),
             manifest_digest,
-            total_size_bytes: ByteSize::new(manifest.declared_size_bytes()),
+            manifest_size_bytes: ByteSize::new(manifest_size_bytes),
+            total_size_bytes: ByteSize::new(
+                manifest
+                    .declared_size_bytes()
+                    .saturating_add(manifest_size_bytes),
+            ),
             has_component: manifest.has_component(),
+            qualification: Vec::new(),
             revocation: Nullable(None),
         }
     }
@@ -276,6 +360,7 @@ mod tests {
     fn index() -> CatalogueIndex {
         let manifest = example_manifest();
         let digest = PayloadDigest::of(b"manifest");
+        let size = 4_096;
         CatalogueIndex {
             index_version: INDEX_VERSION,
             generation: RepositoryGeneration::new(3),
@@ -286,7 +371,7 @@ mod tests {
                 homepage: "https://reach.kala.to".to_owned(),
                 first_party: true,
             }],
-            entries: vec![IndexEntry::from_manifest(&manifest, digest)],
+            entries: vec![IndexEntry::from_manifest(&manifest, digest, size)],
         }
     }
 
@@ -306,7 +391,8 @@ mod tests {
     fn entry_order_does_not_change_the_bytes() {
         let mut one = index();
         let manifest = example_manifest();
-        let mut second_entry = IndexEntry::from_manifest(&manifest, PayloadDigest::of(b"other"));
+        let mut second_entry =
+            IndexEntry::from_manifest(&manifest, PayloadDigest::of(b"other"), 4_096);
         second_entry.version = PackageVersion::parse("0.2.0").expect("valid version");
         one.entries.push(second_entry.clone());
 
@@ -333,6 +419,34 @@ mod tests {
                 .matching_executable("/usr/local/bin/unrelated")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_catalogue_result_cannot_claim_a_host_outcome() {
+        let result = QualificationResult {
+            capability_id: CapabilityId::new("agent.approval.respond/1").expect("valid id"),
+            capability_version: PackageVersion::parse("1.0.0").expect("valid version"),
+            subject: Label::new("Codex 1.4").expect("valid label"),
+            state: CapabilityState::VersionQualified,
+            source: EvidenceSource::SignedRecord,
+            profile_digest: PayloadDigest::of(b"profile"),
+            statement: Summary::new("Qualified against Codex 1.4").expect("valid statement"),
+        };
+        assert_eq!(result.validate(), Ok(()));
+
+        let mut claiming = result.clone();
+        claiming.state = CapabilityState::QualifiedAvailable;
+        assert_eq!(
+            claiming.validate(),
+            Err(QualificationError::ClaimsHostAvailability)
+        );
+
+        let mut declared = result;
+        declared.source = EvidenceSource::PackageDeclaration;
+        assert!(matches!(
+            declared.validate(),
+            Err(QualificationError::WrongSource { .. })
+        ));
     }
 
     #[test]

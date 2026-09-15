@@ -125,11 +125,17 @@ impl PluginCapability {
         Self::DEFAULT_REPOSITORY_CEILING.contains(&self)
     }
 
-    /// Returns true when granting this capability needs an explicit installation grant.
+    /// Returns true when granting this capability always needs an explicit installation grant.
     ///
-    /// Installing an executable bridge and raising privilege are the two cases section 11 names.
-    /// Everything that runs outside Wasmtime under the application's own permissions is in the
-    /// first case.
+    /// These are the capabilities nobody gets by default under any repository ceiling: an
+    /// executable bridge that runs under the application's own permissions, anything that writes,
+    /// and the trust to interpret or answer native requests.
+    ///
+    /// This is the floor, not the whole rule. Section 11 also requires an explicit grant for any
+    /// *increase* over what was previously granted, which compares two capability sets rather than
+    /// asking about one capability. A host uses [`Self::within_default_ceiling`] and this method to
+    /// decide what a fresh installation needs, and compares against the previous grant to decide
+    /// what an upgrade needs.
     #[must_use]
     pub fn requires_installation_grant(self) -> bool {
         matches!(
@@ -138,6 +144,7 @@ impl PluginCapability {
                 | Self::TerminalInput
                 | Self::FilesystemRead
                 | Self::NetworkOutbound
+                | Self::ApprovalDecode
                 | Self::ApprovalRespond
         )
     }
@@ -210,6 +217,13 @@ pub struct CapabilityRequest {
 pub enum CapabilityState {
     /// Tested here and working.
     QualifiedAvailable,
+    /// This version was qualified, and this host has not been checked.
+    ///
+    /// Signed qualification data ships as immutable catalogue artefacts, separately from host
+    /// binaries. It says how a version behaves. It cannot say that this host has permission or a
+    /// live binding, so it gets its own state rather than borrowing the one that means "works
+    /// here".
+    VersionQualified,
     /// The application, bridge or component is not installed.
     MissingInstallation,
     /// The operating system or the user has not granted the permission it needs.
@@ -225,11 +239,18 @@ pub enum CapabilityState {
 impl CapabilityState {
     /// Returns true when the host may dispatch an action that depends on this capability.
     ///
-    /// Only the qualified state is usable, and being usable still says nothing about authority.
-    /// The grant check happens separately and always.
+    /// Only the host-qualified state is usable. [`Self::VersionQualified`] is not: it describes a
+    /// version, not this machine. Being usable still says nothing about authority, and the grant
+    /// check happens separately and always.
     #[must_use]
     pub const fn is_usable(self) -> bool {
         matches!(self, Self::QualifiedAvailable)
+    }
+
+    /// Returns true when this state reports something working rather than something missing.
+    #[must_use]
+    pub const fn is_positive(self) -> bool {
+        matches!(self, Self::QualifiedAvailable | Self::VersionQualified)
     }
 }
 
@@ -255,6 +276,18 @@ impl EvidenceSource {
     #[must_use]
     pub const fn can_establish_qualified(self) -> bool {
         matches!(self, Self::HostProbe | Self::LiveBinding)
+    }
+
+    /// Returns true when this source can establish that a version was qualified.
+    ///
+    /// A package's own declaration cannot: a package saying its capabilities work is the claim
+    /// under review, not evidence for it.
+    #[must_use]
+    pub const fn can_establish_version_qualified(self) -> bool {
+        matches!(
+            self,
+            Self::HostProbe | Self::LiveBinding | Self::SignedRecord
+        )
     }
 }
 
@@ -289,6 +322,14 @@ pub struct SubjectIdentity {
     pub package_digest: Nullable<PayloadDigest>,
     /// The publisher whose signed record supplied the evidence, where one did.
     pub publisher_id: Nullable<PublisherId>,
+    /// The digest of the signed qualification profile the evidence came from, where one did.
+    pub profile_digest: Nullable<PayloadDigest>,
+    /// The binding the evidence was gathered through, where a live binding gathered it.
+    ///
+    /// An installed upgrade does not invalidate an old running process's correctly pinned
+    /// identity, which is only expressible if the record names the binding rather than the
+    /// package.
+    pub binding_revision: Nullable<CapabilityRevision>,
 }
 
 /// What makes a capability record stale.
@@ -369,6 +410,12 @@ pub enum EvidenceError {
         /// The source that overreached.
         source_name: &'static str,
     },
+    /// A package's own declaration claimed a positive result.
+    #[error("a package declaration cannot establish that a capability was qualified")]
+    DeclaredQualification,
+    /// A signed record named no profile to invalidate it against.
+    #[error("a signed record must name the qualification profile it came from")]
+    MissingProfileIdentity,
     /// An unusable state carried no reason for a person to read.
     #[error("state {state:?} needs a user-facing disabled reason")]
     MissingDisabledReason {
@@ -389,6 +436,17 @@ impl CapabilityEvidence {
     /// establish, when an unusable state carries no user-facing reason, or when nothing would ever
     /// invalidate the record.
     pub fn validate(&self) -> Result<(), EvidenceError> {
+        if self.state == CapabilityState::VersionQualified
+            && !self.source.can_establish_version_qualified()
+        {
+            return Err(EvidenceError::DeclaredQualification);
+        }
+        if self.source == EvidenceSource::SignedRecord
+            && self.state.is_positive()
+            && self.identity.profile_digest.0.is_none()
+        {
+            return Err(EvidenceError::MissingProfileIdentity);
+        }
         if self.state.is_usable() && !self.source.can_establish_qualified() {
             return Err(EvidenceError::UnqualifiedSource {
                 source_name: match self.source {
@@ -430,14 +488,20 @@ mod tests {
                 plugin_id: Nullable(None),
                 package_digest: Nullable(None),
                 publisher_id: Nullable(None),
+                profile_digest: Nullable(match source {
+                    EvidenceSource::SignedRecord => Some(PayloadDigest::of(b"profile")),
+                    _ => None,
+                }),
+                binding_revision: Nullable(None),
             },
             revision: CapabilityRevision::new(4),
             state,
             source,
             invalidated_by: [InvalidationTrigger::BinaryChanged].into_iter().collect(),
-            disabled_reason: Nullable(match state {
-                CapabilityState::QualifiedAvailable => None,
-                _ => Some(DisabledReason::new("Codex is not installed").expect("valid reason")),
+            disabled_reason: Nullable(if state.is_usable() {
+                None
+            } else {
+                Some(DisabledReason::new("Codex is not installed").expect("valid reason"))
             }),
             observed_at: TimestampMs::new(1_760_000_000_000),
         }
@@ -464,6 +528,39 @@ mod tests {
     fn a_signed_record_may_still_report_incompatibility() {
         let record = evidence(CapabilityState::Incompatible, EvidenceSource::SignedRecord);
         assert_eq!(record.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_signed_record_may_report_that_a_version_was_qualified() {
+        let record = evidence(
+            CapabilityState::VersionQualified,
+            EvidenceSource::SignedRecord,
+        );
+        assert_eq!(record.validate(), Ok(()));
+        assert!(!record.state.is_usable());
+        assert!(record.state.is_positive());
+    }
+
+    #[test]
+    fn a_package_declaration_cannot_qualify_itself() {
+        let record = evidence(
+            CapabilityState::VersionQualified,
+            EvidenceSource::PackageDeclaration,
+        );
+        assert_eq!(record.validate(), Err(EvidenceError::DeclaredQualification));
+    }
+
+    #[test]
+    fn a_signed_record_names_the_profile_it_came_from() {
+        let mut record = evidence(
+            CapabilityState::VersionQualified,
+            EvidenceSource::SignedRecord,
+        );
+        record.identity.profile_digest = Nullable(None);
+        assert_eq!(
+            record.validate(),
+            Err(EvidenceError::MissingProfileIdentity)
+        );
     }
 
     #[test]

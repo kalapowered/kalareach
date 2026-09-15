@@ -19,17 +19,18 @@ import {
 import { fixtureNames, readJson, readJsonIfPresent } from './fixtures.js'
 
 describe('the package contract', () => {
-  it('carries the section 11 execution limits', () => {
-    expect(instanceLimits.memory_bytes).toBe(67_108_864)
-    expect(instanceLimits.observation_deadline_ms).toBe(10)
-    expect(instanceLimits.interpretation_deadline_ms).toBe(50)
-    expect(instanceLimits.snapshot_deadline_ms).toBe(100)
-    expect(instanceLimits.output_bytes_per_call).toBe(1_048_576)
-    expect(instanceLimits.observation_queue_bytes).toBe(4_194_304)
+  it('carries the section 11 execution limits as exact decimal strings', () => {
+    expect(instanceLimits.memory_bytes).toBe('67108864')
+    expect(instanceLimits.observation_deadline_ms).toBe('10')
+    expect(instanceLimits.interpretation_deadline_ms).toBe('50')
+    expect(instanceLimits.snapshot_deadline_ms).toBe('100')
+    expect(instanceLimits.output_bytes_per_call).toBe('1048576')
+    expect(instanceLimits.observation_queue_bytes).toBe('4194304')
     expect(instanceLimits.faults_before_disable).toBe(3)
-    expect(repositoryBudgets.metadata_bytes).toBe(67_108_864)
-    expect(repositoryBudgets.metadata_entries).toBe(100_000)
-    expect(repositoryBudgets.payload_cache_bytes).toBe(1_073_741_824)
+    expect(repositoryBudgets.metadata_bytes).toBe('67108864')
+    expect(repositoryBudgets.metadata_entries).toBe('100000')
+    expect(repositoryBudgets.payload_cache_bytes).toBe('1073741824')
+    expect(BigInt(instanceLimits.memory_bytes)).toBe(64n * 1024n * 1024n)
   })
 
   it('names the eight component exports and the four host imports', () => {
@@ -112,6 +113,28 @@ describe('manifest validation', () => {
       } else {
         expect(result.ok).toBe(false)
       }
+    }
+  })
+
+  it('rejects a count no host would accept', () => {
+    const manifest = readJson('valid', 'example-declarative', 'plugin.json') as Record<
+      string,
+      unknown
+    >
+    // 2^32 is one past what a uint32 holds. The schema says uint32 through a format, and the
+    // loader teaches the validator what that format means.
+    const overflowed = JSON.parse(JSON.stringify(manifest)) as Record<string, unknown>
+    ;(overflowed as { manifest_version: number }).manifest_version = 4294967296
+    expect(validatePluginManifest(overflowed).ok).toBe(false)
+  })
+
+  it('keeps a 64-bit byte count exact', () => {
+    const manifest = readJson('valid', 'example-connector', 'plugin.json') as {
+      payloads: Array<{ size_bytes: string }>
+    }
+    for (const payload of manifest.payloads) {
+      expect(typeof payload.size_bytes).toBe('string')
+      expect(BigInt(payload.size_bytes) > 0n).toBe(true)
     }
   })
 

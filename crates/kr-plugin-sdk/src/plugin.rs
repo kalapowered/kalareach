@@ -89,6 +89,55 @@ pub enum BridgeStep {
     },
 }
 
+/// One edit a native bridge removal undoes.
+///
+/// Removal has its own vocabulary because it is not installation run backwards. Deleting a file the
+/// recipe installed is safe; deleting a file it edited is not. Each step names exactly what it
+/// undoes, so unrelated settings survive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BridgeRemoval {
+    /// Delete a file the recipe installed, after checking it is still the bytes it installed.
+    ///
+    /// A file whose digest no longer matches was changed by somebody else, and removal leaves it
+    /// alone and reports it rather than deleting somebody's work.
+    RemoveFile {
+        /// The path under the application's documented plugin directory.
+        destination: PackagePath,
+        /// The digest the recipe installed.
+        digest: PayloadDigest,
+    },
+    /// Remove one key the recipe added, leaving the rest of the file untouched.
+    RemoveConfigurationKey {
+        /// The configuration file under the application's documented directory.
+        file: PackagePath,
+        /// The key path, as dotted members.
+        key: String,
+    },
+}
+
+impl BridgeRemoval {
+    /// Returns the install step this removal undoes, as a path and key pair.
+    #[must_use]
+    pub fn undoes(&self) -> (&PackagePath, Option<&str>) {
+        match self {
+            Self::RemoveFile { destination, .. } => (destination, None),
+            Self::RemoveConfigurationKey { file, key } => (file, Some(key)),
+        }
+    }
+}
+
+impl BridgeStep {
+    /// Returns what this step writes, as a path and key pair.
+    #[must_use]
+    pub fn writes(&self) -> (&PackagePath, Option<&str>) {
+        match self {
+            Self::InstallFile { destination, .. } => (destination, None),
+            Self::AddConfigurationKey { file, key, .. } => (file, Some(key)),
+        }
+    }
+}
+
 /// A native bridge installation recipe.
 ///
 /// Bridge code runs under the application's own permissions, outside Wasmtime. The installation
@@ -102,8 +151,11 @@ pub struct NativeBridge {
     pub application_range: VersionRange,
     /// What installation does.
     pub install: Vec<BridgeStep>,
-    /// What removal does, in the order it is applied.
-    pub remove: Vec<BridgeStep>,
+    /// What removal undoes, in the order it is applied.
+    ///
+    /// Every install step has a removal step. A recipe that installs something it cannot remove is
+    /// a recipe that leaves the application changed after the package is gone.
+    pub remove: Vec<BridgeRemoval>,
     /// What the grant tells the person before they accept it.
     pub grant_statement: Summary,
 }
@@ -188,13 +240,26 @@ impl PluginManifest {
         self.payload(PayloadRole::Component).is_some()
     }
 
-    /// Returns the sum of every declared payload size.
+    /// Returns the sum of every declared payload size, saturating rather than wrapping.
+    ///
+    /// A manifest is untrusted input. Two declared sizes that add past `u64::MAX` would panic in a
+    /// debug build and wrap in a release one, and a wrapped total is a total that passes a budget
+    /// check it should fail.
     #[must_use]
     pub fn declared_size_bytes(&self) -> u64 {
-        self.payloads
-            .iter()
-            .map(|payload| payload.size_bytes.get())
-            .sum()
+        self.payloads.iter().fold(0u64, |total, payload| {
+            total.saturating_add(payload.size_bytes.get())
+        })
+    }
+
+    /// Returns true when any declared size, or their total, is past `limit`.
+    #[must_use]
+    pub fn declares_more_than(&self, limit: u64) -> bool {
+        self.declared_size_bytes() > limit
+            || self
+                .payloads
+                .iter()
+                .any(|payload| payload.size_bytes.get() > limit)
     }
 
     /// Returns true when the package requests the given capability.

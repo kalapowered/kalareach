@@ -1,0 +1,145 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "example-connector",
+  "version": "0.1.0",
+  "display_name": "Example connector package",
+  "description": "Recognises the example agent, reads its protocol through a declarative table and sends prompts.",
+  "sdk_range": ">=0.1.0, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "refs/tags/example-connector-0.1.0"
+  },
+  "match_rules": [
+    {
+      "id": "example-agent",
+      "executable": {
+        "file_stem": "example-agent",
+        "path_suffix": [],
+        "version_range": ">=1.0.0, <2.0.0"
+      },
+      "distribution": {
+        "registry": "npm",
+        "package": "@kalareach/example-agent"
+      },
+      "confidence": "exact"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "connector",
+      "path": "connector.json",
+      "digest": "f95477f1bc335b29eda074fa47cd22df6c0996967ac2f2edcbeb7b60eec39493",
+      "size_bytes": "2017"
+    },
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "0deee388f08586e37025749675638b8ff447943b6ebab8af46829091f434be49",
+      "size_bytes": "2558"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise the example agent from its executable and its package"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Present the prompt form and the current activity"
+    },
+    {
+      "capability": "broker.semantic_events",
+      "reason": "Read turn state from the application's own protocol"
+    },
+    {
+      "capability": "upstream.action",
+      "reason": "Send a prompt the person wrote to the bound application"
+    }
+  ],
+  "actions": [
+    {
+      "id": "prompt.send",
+      "label": "Send prompt",
+      "effect": "upstream.prompt",
+      "implementation": {
+        "type": "upstream_method",
+        "method": "turn.start",
+        "bindings": [
+          {
+            "parameter": "text",
+            "field": {
+              "segments": [
+                {
+                  "type": "member",
+                  "name": "params"
+                },
+                {
+                  "type": "member",
+                  "name": "prompt"
+                }
+              ]
+            }
+          },
+          {
+            "parameter": "queue",
+            "field": {
+              "segments": [
+                {
+                  "type": "member",
+                  "name": "params"
+                },
+                {
+                  "type": "member",
+                  "name": "queue"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "parameters": {
+        "parameters": [
+          {
+            "name": "text",
+            "kind": {
+              "type": "text",
+              "max_length": 8000,
+              "multiline": true
+            },
+            "label": "Prompt",
+            "required": true
+          },
+          {
+            "name": "queue",
+            "kind": {
+              "type": "boolean"
+            },
+            "label": "Queue behind the current turn",
+            "required": false
+          }
+        ]
+      },
+      "description": "Start a turn with the prompt the person wrote",
+      "confirmation_required": false
+    }
+  ],
+  "attachments": null,
+  "native_bridge": null
+}

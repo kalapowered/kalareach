@@ -1,0 +1,6 @@
+{
+  "note": "A native-proxy table that routes one method twice, so a message has two destinations.",
+  "codes": [
+    "connector_table_invalid"
+  ]
+}

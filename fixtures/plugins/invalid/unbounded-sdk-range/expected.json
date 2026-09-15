@@ -1,5 +1,5 @@
 {
-  "note": "An SDK range that admits releases nobody qualified the package against.",
+  "note": "An SDK range with no upper bound, which claims releases nobody qualified the package against.",
   "codes": [
     "unbounded_version_range"
   ]

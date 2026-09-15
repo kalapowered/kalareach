@@ -55,10 +55,16 @@
       "size_bytes": "2421"
     },
     {
-      "role": "presentation",
-      "path": "presentation.json",
-      "digest": "f3992111da3c53b4e58af4fc88f576ba7c0a34590b37cf59116c0874e5568f3b",
-      "size_bytes": "2421"
+      "role": "asset",
+      "path": "assets/notes.md",
+      "digest": "01d42463501b2a58ced89a408a23f98fb2ae6464ff4b205bb6504a3233fbadec",
+      "size_bytes": "36"
+    },
+    {
+      "role": "asset",
+      "path": "assets/notes.md",
+      "digest": "01d42463501b2a58ced89a408a23f98fb2ae6464ff4b205bb6504a3233fbadec",
+      "size_bytes": "36"
     }
   ],
   "capabilities": [
@@ -80,6 +86,9 @@
       "id": "status.refresh",
       "label": "Refresh status",
       "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
       "parameters": {
         "parameters": [
           {

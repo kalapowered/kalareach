@@ -236,3 +236,119 @@ mod tests {
         assert!(Label::new(emoji).is_ok());
     }
 }
+
+/// Literal text a package writes into the terminal.
+///
+/// Printable ASCII, tab and newline only. A terminal template is terminal input, and terminal
+/// input that can carry an escape sequence is a way to drive the terminal from a manifest: move
+/// the cursor, rewrite what a person just read, set a title, or start a query the host would have
+/// to answer. None of that is expressible inside this alphabet.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct TerminalLiteral(String);
+
+impl TerminalLiteral {
+    /// The permitted character count.
+    pub const LIMIT: usize = 1000;
+
+    /// Wraps literal terminal text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError`] when the text is empty, longer than [`Self::LIMIT`] characters, or
+    /// carries anything but printable ASCII, tab and newline.
+    pub fn new(value: impl Into<String>) -> Result<Self, TextError> {
+        let value = value.into();
+        let len = value.chars().count();
+        if len == 0 {
+            return Err(TextError::Empty {
+                kind: "terminal literal",
+            });
+        }
+        if len > Self::LIMIT {
+            return Err(TextError::TooLong {
+                kind: "terminal literal",
+                len,
+                limit: Self::LIMIT,
+            });
+        }
+        if let Some(character) = value
+            .chars()
+            .find(|c| !matches!(c, ' '..='~' | '\t' | '\n'))
+        {
+            return Err(TextError::ForbiddenCharacter {
+                kind: "terminal literal",
+                codepoint: character as u32,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TerminalLiteral {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for TerminalLiteral {
+    type Err = TextError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::new(text)
+    }
+}
+
+impl<'de> Deserialize<'de> for TerminalLiteral {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::new(text).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for TerminalLiteral {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TerminalLiteral".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        "kalareach::TerminalLiteral".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": TerminalLiteral::LIMIT,
+            "pattern": "^[ -~\\t\\n]+$",
+            "description": "Literal text written into the terminal. Printable ASCII, tab and newline only, so a template cannot carry an escape sequence."
+        })
+    }
+}
+
+#[cfg(test)]
+mod terminal_literal_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_a_command_line_and_rejects_an_escape() {
+        assert!(TerminalLiteral::new("status --json\n").is_ok());
+        assert!(TerminalLiteral::new("\t indented\n").is_ok());
+        for escape in ["\u{1b}[2J", "bell\u{7}", "caf\u{e9}", "\u{200B}"] {
+            assert!(
+                matches!(
+                    TerminalLiteral::new(escape),
+                    Err(TextError::ForbiddenCharacter { .. })
+                ),
+                "accepted {escape:?}"
+            );
+        }
+        assert!(TerminalLiteral::new("").is_err());
+    }
+}

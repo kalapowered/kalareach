@@ -45,6 +45,10 @@
           "$ref": "#/$defs/ActionName",
           "description": "The action identifier a control names."
         },
+        "implementation": {
+          "$ref": "#/$defs/ActionImplementation",
+          "description": "How it becomes an effect."
+        },
         "label": {
           "$ref": "#/$defs/Label",
           "description": "The label a person reads."
@@ -58,11 +62,108 @@
         "id",
         "label",
         "effect",
+        "implementation",
         "parameters",
         "description",
         "confirmation_required"
       ],
       "type": "object"
+    },
+    "ActionImplementation": {
+      "description": "How an action becomes an effect.\n\nA package that ships no component still has to say what its controls do, or a vendor could not\nadd a command without a core release. The forms here are declarative and bounded: the broker\nreads them directly, and each one can only reach resources the broker already owns. A package\nwith a component names [`ActionImplementation::Component`] instead, and the component returns a\nplan the broker checks against the same effect class.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The host redraws the package's own document. Nothing leaves the host.",
+          "properties": {
+            "type": {
+              "const": "presentation",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The package's component prepares the effect.\n\nThe component returns a plan; it sends nothing. The broker checks the plan against this\naction's declared effect class before it dispatches.",
+          "properties": {
+            "type": {
+              "const": "component",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The broker sends one routed upstream method with the bound parameters.\n\nThe method must be one the package's connector table routes and classifies, so what the\nbroker sends is something a reviewer read and a publisher qualified.",
+          "properties": {
+            "bindings": {
+              "description": "Which declared parameter supplies each field of the request.",
+              "items": {
+                "$ref": "#/$defs/ParameterBinding"
+              },
+              "type": "array"
+            },
+            "method": {
+              "$ref": "#/$defs/MethodName",
+              "description": "The method, as the connector table names it."
+            },
+            "type": {
+              "const": "upstream_method",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "method",
+            "bindings"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The broker requests cancellation of the bound execution's current turn.",
+          "properties": {
+            "type": {
+              "const": "upstream_cancel",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The broker writes a bounded template into the terminal.",
+          "properties": {
+            "template": {
+              "description": "The template.",
+              "items": {
+                "$ref": "#/$defs/TextSegment"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "terminal_text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "template"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "ActionInvocation": {
       "additionalProperties": false,
@@ -248,9 +349,8 @@
               "type": "string"
             },
             "value": {
-              "description": "The number.",
-              "format": "int64",
-              "type": "integer"
+              "$ref": "#/$defs/SafeInt",
+              "description": "The number."
             }
           },
           "required": [
@@ -364,16 +464,12 @@
           "description": "How the attachment reaches the draft."
         },
         "max_bytes": {
-          "description": "Maximum bytes per attachment for the selected upstream model.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "Maximum bytes per attachment the bound upstream execution accepts."
         },
         "max_count": {
-          "description": "Maximum attachments per draft.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/Count",
+          "description": "Maximum attachments per draft."
         }
       },
       "required": [
@@ -438,6 +534,59 @@
           "const": "native_only_volatile",
           "description": "The host is answering native requests without durable receipt storage.\n\nRich response controls are hidden in this state. The predicate can say so, which is\nclearer to a reader than a control that silently stops working.",
           "type": "string"
+        }
+      ]
+    },
+    "BridgeRemoval": {
+      "description": "One edit a native bridge removal undoes.\n\nRemoval has its own vocabulary because it is not installation run backwards. Deleting a file the\nrecipe installed is safe; deleting a file it edited is not. Each step names exactly what it\nundoes, so unrelated settings survive.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Delete a file the recipe installed, after checking it is still the bytes it installed.\n\nA file whose digest no longer matches was changed by somebody else, and removal leaves it\nalone and reports it rather than deleting somebody's work.",
+          "properties": {
+            "destination": {
+              "$ref": "#/$defs/PackagePath",
+              "description": "The path under the application's documented plugin directory."
+            },
+            "digest": {
+              "$ref": "#/$defs/PayloadDigest",
+              "description": "The digest the recipe installed."
+            },
+            "type": {
+              "const": "remove_file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "destination",
+            "digest"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Remove one key the recipe added, leaving the rest of the file untouched.",
+          "properties": {
+            "file": {
+              "$ref": "#/$defs/PackagePath",
+              "description": "The configuration file under the application's documented directory."
+            },
+            "key": {
+              "description": "The key path, as dotted members.",
+              "type": "string"
+            },
+            "type": {
+              "const": "remove_configuration_key",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "file",
+            "key"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -645,6 +794,11 @@
         {
           "const": "qualified_available",
           "description": "Tested here and working.",
+          "type": "string"
+        },
+        {
+          "const": "version_qualified",
+          "description": "This version was qualified, and this host has not been checked.\n\nSigned qualification data ships as immutable catalogue artefacts, separately from host\nbinaries. It says how a version behaves. It cannot say that this host has permission or a\nlive binding, so it gets its own state rather than borrowing the one that means \"works\nhere\".",
           "type": "string"
         },
         {
@@ -884,25 +1038,27 @@
       "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
       "type": "string"
     },
+    "Count": {
+      "description": "A count of things, from 0 to 4294967295.",
+      "maximum": 4294967295,
+      "minimum": 0,
+      "type": "integer"
+    },
     "DiffFile": {
       "additionalProperties": false,
       "description": "One entry in a diff node.",
       "properties": {
         "added": {
-          "description": "Lines added.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/Count",
+          "description": "Lines added."
         },
         "path": {
           "description": "The path as the upstream reported it.",
           "type": "string"
         },
         "removed": {
-          "description": "Lines removed.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/Count",
+          "description": "Lines removed."
         }
       },
       "required": [
@@ -1511,6 +1667,51 @@
           "const": "unknown_capability",
           "description": "The package requests a capability that is not in the closed vocabulary.",
           "type": "string"
+        },
+        {
+          "const": "name_not_utf8",
+          "description": "A file name is not valid UTF-8.",
+          "type": "string"
+        },
+        {
+          "const": "duplicate_member",
+          "description": "A JSON document repeats a member name.",
+          "type": "string"
+        },
+        {
+          "const": "payload_role_invalid",
+          "description": "A structural payload role is declared at the wrong path or more than once.",
+          "type": "string"
+        },
+        {
+          "const": "implementation_mismatch",
+          "description": "An action's implementation cannot produce the effect class it declares.",
+          "type": "string"
+        },
+        {
+          "const": "implementation_unsatisfied",
+          "description": "An action's implementation refers to something the package does not carry.",
+          "type": "string"
+        },
+        {
+          "const": "bridge_recipe_invalid",
+          "description": "A native bridge recipe is incomplete or refers to something absent.",
+          "type": "string"
+        },
+        {
+          "const": "duplicate_element_id",
+          "description": "Two document nodes or two controls share an identifier.",
+          "type": "string"
+        },
+        {
+          "const": "control_parameters_widen",
+          "description": "A control's parameters do not narrow its action's.",
+          "type": "string"
+        },
+        {
+          "const": "qualification_invalid",
+          "description": "A catalogue qualification result claims something the catalogue cannot know.",
+          "type": "string"
         }
       ]
     },
@@ -1522,10 +1723,8 @@
           "description": "One JSON document per line.",
           "properties": {
             "max_message_bytes": {
-              "description": "Maximum bytes in one line.",
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
+              "$ref": "#/$defs/U64",
+              "description": "Maximum bytes in one line."
             },
             "type": {
               "const": "line_delimited_json",
@@ -1547,10 +1746,8 @@
               "type": "string"
             },
             "max_message_bytes": {
-              "description": "Maximum bytes in one body.",
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
+              "$ref": "#/$defs/U64",
+              "description": "Maximum bytes in one body."
             },
             "type": {
               "const": "content_length",
@@ -1569,10 +1766,8 @@
           "description": "A big-endian length prefix, then the body.",
           "properties": {
             "max_message_bytes": {
-              "description": "Maximum bytes in one body.",
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
+              "$ref": "#/$defs/U64",
+              "description": "Maximum bytes in one body."
             },
             "prefix_bytes": {
               "description": "Width of the length prefix in bytes.",
@@ -1598,10 +1793,8 @@
           "description": "Server-sent events.",
           "properties": {
             "max_message_bytes": {
-              "description": "Maximum bytes in one event.",
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
+              "$ref": "#/$defs/U64",
+              "description": "Maximum bytes in one event."
             },
             "type": {
               "const": "server_sent_events",
@@ -1643,6 +1836,10 @@
           "$ref": "#/$defs/PayloadDigest",
           "description": "The digest of the manifest itself, which names every other payload."
         },
+        "manifest_size_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "The exact length of the manifest.\n\nThe manifest does not declare itself, so its length is here. A host checks a declared size\nbefore it downloads, and the manifest is the first thing it downloads."
+        },
         "match_rules": {
           "description": "The applications the package recognises.",
           "items": {
@@ -1676,6 +1873,13 @@
           "$ref": "#/$defs/PublisherId",
           "description": "The publisher."
         },
+        "qualification": {
+          "description": "What the publisher qualified this release against.",
+          "items": {
+            "$ref": "#/$defs/QualificationResult"
+          },
+          "type": "array"
+        },
         "revocation": {
           "anyOf": [
             {
@@ -1697,7 +1901,7 @@
         },
         "total_size_bytes": {
           "$ref": "#/$defs/U64",
-          "description": "The sum of every payload size."
+          "description": "The sum of every payload size and the manifest's own length."
         },
         "version": {
           "$ref": "#/$defs/PackageVersion",
@@ -1723,7 +1927,9 @@
         "capabilities",
         "payloads",
         "manifest_digest",
+        "manifest_size_bytes",
         "total_size_bytes",
+        "qualification",
         "has_component",
         "revocation"
       ],
@@ -1734,52 +1940,36 @@
       "description": "The complete set of execution limits one component instance runs under.",
       "properties": {
         "fault_window_ms": {
-          "description": "The window the fault count is measured over.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "The window the fault count is measured over."
         },
         "faults_before_disable": {
-          "description": "Faults within `fault_window_ms` that disable the binding.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/Count",
+          "description": "Faults within `fault_window_ms` that disable the binding."
         },
         "interpretation_deadline_ms": {
-          "description": "Deadline in milliseconds for `decode-request` and `encode-response`.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "Deadline in milliseconds for `decode-request` and `encode-response`."
         },
         "memory_bytes": {
-          "description": "Linear memory in bytes.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "Linear memory in bytes."
         },
         "observation_deadline_ms": {
-          "description": "Deadline in milliseconds for `observe` and `prepare-action`.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "Deadline in milliseconds for `observe` and `prepare-action`."
         },
         "observation_queue_bytes": {
-          "description": "Size in bytes of the bounded observation queue.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "Size in bytes of the bounded observation queue."
         },
         "output_bytes_per_call": {
-          "description": "Maximum bytes one call may return.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "Maximum bytes one call may return."
         },
         "snapshot_deadline_ms": {
-          "description": "Deadline in milliseconds for `snapshot`.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "Deadline in milliseconds for `snapshot`."
         }
       },
       "required": [
@@ -1943,9 +2133,9 @@
           "type": "array"
         },
         "remove": {
-          "description": "What removal does, in the order it is applied.",
+          "description": "What removal undoes, in the order it is applied.\n\nEvery install step has a removal step. A recipe that installs something it cannot remove is\na recipe that leaves the application changed after the package is gone.",
           "items": {
-            "$ref": "#/$defs/BridgeStep"
+            "$ref": "#/$defs/BridgeRemoval"
           },
           "type": "array"
         }
@@ -2092,9 +2282,9 @@
               "const": "form",
               "type": "string"
             },
-            "submit_action_id": {
-              "$ref": "#/$defs/ActionName",
-              "description": "The action the completed form invokes."
+            "submit": {
+              "$ref": "#/$defs/Control",
+              "description": "The control that submits the completed form.\n\nSubmission is an action invocation like any other, so it carries a control rather than\na bare action name: the same label, icon, accessible description, priority, visibility\nand disabled reason every other way of invoking an action carries."
             },
             "title": {
               "$ref": "#/$defs/Label",
@@ -2105,7 +2295,7 @@
             "kind",
             "title",
             "fields",
-            "submit_action_id"
+            "submit"
           ],
           "type": "object"
         },
@@ -2126,10 +2316,8 @@
               "description": "Its name."
             },
             "size_bytes": {
-              "description": "Its size in bytes.",
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
+              "$ref": "#/$defs/U64",
+              "description": "Its size in bytes."
             }
           },
           "required": [
@@ -2250,9 +2438,9 @@
           "additionalProperties": false,
           "description": "An entry point for contributing an attachment.",
           "properties": {
-            "action_id": {
-              "$ref": "#/$defs/ActionName",
-              "description": "The action that receives the completed handle."
+            "contribute": {
+              "$ref": "#/$defs/Control",
+              "description": "The control that receives the completed handle."
             },
             "kind": {
               "const": "attachment_entry",
@@ -2266,7 +2454,7 @@
           "required": [
             "kind",
             "label",
-            "action_id"
+            "contribute"
           ],
           "type": "object"
         }
@@ -2301,6 +2489,25 @@
       "minLength": 5,
       "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$",
       "type": "string"
+    },
+    "ParameterBinding": {
+      "additionalProperties": false,
+      "description": "One declared parameter bound to a field of an upstream request.",
+      "properties": {
+        "field": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the value goes in the upstream request."
+        },
+        "parameter": {
+          "$ref": "#/$defs/ParameterName",
+          "description": "The declared parameter supplying the value."
+        }
+      },
+      "required": [
+        "parameter",
+        "field"
+      ],
+      "type": "object"
     },
     "ParameterChoice": {
       "additionalProperties": false,
@@ -2358,10 +2565,8 @@
           "description": "Free text.",
           "properties": {
             "max_length": {
-              "description": "Maximum length in characters.",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
+              "$ref": "#/$defs/Count",
+              "description": "Maximum length in characters."
             },
             "multiline": {
               "description": "Whether the client offers a multi-line field.",
@@ -2384,14 +2589,12 @@
           "description": "A whole number inside an inclusive range.",
           "properties": {
             "maximum": {
-              "description": "Highest accepted value.",
-              "format": "int64",
-              "type": "integer"
+              "$ref": "#/$defs/SafeInt",
+              "description": "Highest accepted value."
             },
             "minimum": {
-              "description": "Lowest accepted value.",
-              "format": "int64",
-              "type": "integer"
+              "$ref": "#/$defs/SafeInt",
+              "description": "Lowest accepted value."
             },
             "type": {
               "const": "integer",
@@ -3011,20 +3214,16 @@
           "description": "A known fraction of a known total.",
           "properties": {
             "completed": {
-              "description": "Completed units.",
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
+              "$ref": "#/$defs/U64",
+              "description": "Completed units."
             },
             "kind": {
               "const": "determinate",
               "type": "string"
             },
             "total": {
-              "description": "Total units.",
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
+              "$ref": "#/$defs/U64",
+              "description": "Total units."
             }
           },
           "required": [
@@ -3138,6 +3337,50 @@
       ],
       "type": "object"
     },
+    "QualificationResult": {
+      "additionalProperties": false,
+      "description": "One compatibility result the catalogue carries about a package.\n\nSection 25 stores compatibility results beside the manifests and hashes. Section 11 ships that\nqualification data as signed, immutable catalogue artefacts, separately from host binaries, so\nupdating it cannot create new primitive effects, raise a grant or turn an old live binding into\na different version.\n\nA result says how a version behaved where it was tested. It is not permission, and it is not a\nlive binding: a host still probes, still checks its grant and still rechecks the capability\nrevision on every action.",
+      "properties": {
+        "capability_id": {
+          "$ref": "#/$defs/CapabilityId",
+          "description": "The versioned capability the result is about."
+        },
+        "capability_version": {
+          "$ref": "#/$defs/PackageVersion",
+          "description": "The capability version."
+        },
+        "profile_digest": {
+          "$ref": "#/$defs/PayloadDigest",
+          "description": "The digest of the signed profile the result came from."
+        },
+        "source": {
+          "$ref": "#/$defs/EvidenceSource",
+          "description": "Where the result came from."
+        },
+        "state": {
+          "$ref": "#/$defs/CapabilityState",
+          "description": "What the result is.\n\nA catalogue result can report that a version was qualified or that it is incompatible. It\ncannot report that a capability is available on a host it has never seen."
+        },
+        "statement": {
+          "$ref": "#/$defs/Summary",
+          "description": "What a person reads about it."
+        },
+        "subject": {
+          "$ref": "#/$defs/Label",
+          "description": "What the publisher qualified the package against."
+        }
+      },
+      "required": [
+        "capability_id",
+        "capability_version",
+        "subject",
+        "state",
+        "source",
+        "profile_digest",
+        "statement"
+      ],
+      "type": "object"
+    },
     "Report": {
       "additionalProperties": false,
       "description": "Everything validation found.",
@@ -3164,22 +3407,16 @@
           "type": "boolean"
         },
         "metadata_bytes": {
-          "description": "Maximum bytes of catalogue metadata.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "Maximum bytes of catalogue metadata."
         },
         "metadata_entries": {
-          "description": "Maximum number of index entries.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "Maximum number of index entries."
         },
         "payload_cache_bytes": {
-          "description": "Maximum bytes of cached payloads.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+          "$ref": "#/$defs/U64",
+          "description": "Maximum bytes of cached payloads."
         }
       },
       "required": [
@@ -3326,6 +3563,12 @@
         }
       ]
     },
+    "SafeInt": {
+      "description": "A signed integer inside the range every supported language represents exactly, -(2^53 - 1) to 2^53 - 1.",
+      "maximum": 9007199254740991,
+      "minimum": -9007199254740991,
+      "type": "integer"
+    },
     "SemanticPriority": {
       "description": "How prominently a client presents a control.\n\nPriority is semantic, not visual: it says how important the action is, and each client decides\nwhat that looks like on its own platform.",
       "oneOf": [
@@ -3419,6 +3662,17 @@
           ],
           "description": "The digest of the tested binary, where the subject is a binary."
         },
+        "binding_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CapabilityRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The binding the evidence was gathered through, where a live binding gathered it.\n\nAn installed upgrade does not invalidate an old running process's correctly pinned\nidentity, which is only expressible if the record names the binding rather than the\npackage."
+        },
         "package_digest": {
           "anyOf": [
             {
@@ -3440,6 +3694,17 @@
             }
           ],
           "description": "The package the evidence is about, where it is about one."
+        },
+        "profile_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PayloadDigest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of the signed qualification profile the evidence came from, where one did."
         },
         "publisher_id": {
           "anyOf": [
@@ -3469,7 +3734,9 @@
         "schema_version",
         "plugin_id",
         "package_digest",
-        "publisher_id"
+        "publisher_id",
+        "profile_digest",
+        "binding_revision"
       ],
       "type": "object"
     },
@@ -3478,6 +3745,56 @@
       "maxLength": 1000,
       "minLength": 1,
       "type": "string"
+    },
+    "TerminalLiteral": {
+      "description": "Literal text written into the terminal. Printable ASCII, tab and newline only, so a template cannot carry an escape sequence.",
+      "maxLength": 1000,
+      "minLength": 1,
+      "pattern": "^[ -~\\t\\n]+$",
+      "type": "string"
+    },
+    "TextSegment": {
+      "description": "One piece of a terminal text template.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Literal text.",
+          "properties": {
+            "text": {
+              "$ref": "#/$defs/TerminalLiteral",
+              "description": "The text."
+            },
+            "type": {
+              "const": "literal",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The value of one declared parameter.\n\nThe host quotes the value for the shell it is writing to. Shell quoting is not assumed to\nbe a composer's syntax, and a package cannot supply quoting of its own.",
+          "properties": {
+            "parameter": {
+              "$ref": "#/$defs/ParameterName",
+              "description": "The parameter supplying the value."
+            },
+            "type": {
+              "const": "parameter",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "parameter"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "TimestampMs": {
       "description": "A UTC timestamp in milliseconds, as a decimal string in JSON.",

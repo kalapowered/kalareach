@@ -1,0 +1,108 @@
+{
+  "manifest_version": 1,
+  "base_revision": "1",
+  "nodes": [
+    {
+      "id": "compose",
+      "revision": "1",
+      "body": {
+        "kind": "form",
+        "title": "Prompt",
+        "fields": {
+          "parameters": [
+            {
+              "name": "text",
+              "kind": {
+                "type": "text",
+                "max_length": 8000,
+                "multiline": true
+              },
+              "label": "Prompt",
+              "required": true
+            },
+            {
+              "name": "queue",
+              "kind": {
+                "type": "boolean"
+              },
+              "label": "Queue behind the current turn",
+              "required": false
+            }
+          ]
+        },
+        "submit": {
+          "id": "send",
+          "revision": "1",
+          "label": "Send prompt",
+          "icon": "send",
+          "accessible_description": "Send the prompt to the bound application",
+          "action_id": "prompt.send",
+          "parameters": {
+            "parameters": [
+              {
+                "name": "text",
+                "kind": {
+                  "type": "text",
+                  "max_length": 8000,
+                  "multiline": true
+                },
+                "label": "Prompt",
+                "required": true
+              },
+              {
+                "name": "queue",
+                "kind": {
+                  "type": "boolean"
+                },
+                "label": "Queue behind the current turn",
+                "required": false
+              }
+            ]
+          },
+          "priority": "primary",
+          "visible_when": {
+            "op": "grant",
+            "right": "agent.prompt"
+          },
+          "enabled_when": {
+            "op": "all",
+            "terms": [
+              {
+                "op": "binding",
+                "state": "bound"
+              },
+              {
+                "op": "not",
+                "term": {
+                  "op": "binding",
+                  "state": "upstream_busy"
+                }
+              }
+            ]
+          },
+          "disabled_reason": "The application is working on the last prompt"
+        }
+      }
+    },
+    {
+      "id": "activity",
+      "revision": "1",
+      "body": {
+        "kind": "progress",
+        "label": "Working",
+        "state": {
+          "kind": "indeterminate"
+        }
+      }
+    }
+  ],
+  "voice": {
+    "status_nodes": [
+      "activity"
+    ],
+    "choice_controls": [
+      "send"
+    ],
+    "detail_nodes": []
+  }
+}

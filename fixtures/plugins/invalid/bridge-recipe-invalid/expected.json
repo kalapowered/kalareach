@@ -1,0 +1,6 @@
+{
+  "note": "A native bridge recipe that installs a file and never removes it.",
+  "codes": [
+    "bridge_recipe_invalid"
+  ]
+}

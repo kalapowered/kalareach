@@ -62,7 +62,10 @@ jobs:
         run: cargo run --locked -p kr-plugin-sdk --bin kr-plugin-sdk-gen -- --check
 
       - name: Fixture packages validate
-        run: cargo run --locked -p kr-plugin-sdk --bin kr-plugin-sandbox -- fixtures/plugins/valid/example-declarative
+        run: |
+          for package in fixtures/plugins/valid/*/; do
+            cargo run --locked -p kr-plugin-sdk --bin kr-plugin-sandbox -- "$package"
+          done
 
   typescript:
     name: typescript

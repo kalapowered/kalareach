@@ -1,0 +1,6 @@
+{
+  "note": "The presentation document declared under a role a host would not look for it under.",
+  "codes": [
+    "payload_role_invalid"
+  ]
+}

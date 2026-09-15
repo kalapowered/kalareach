@@ -65,22 +65,30 @@ fn the_contract_table_carries_the_limits_and_the_vocabularies() {
         .expect("the contract is generated");
     let contract: serde_json::Value = serde_json::from_str(&text).expect("the contract is JSON");
 
-    assert_eq!(contract["instance_limits"]["memory_bytes"], 67_108_864u64);
-    assert_eq!(contract["instance_limits"]["observation_deadline_ms"], 10);
+    // Byte counts and durations travel as decimal strings, so a JavaScript consumer cannot lose
+    // precision reading them.
+    assert_eq!(contract["instance_limits"]["memory_bytes"], "67108864");
+    assert_eq!(contract["instance_limits"]["observation_deadline_ms"], "10");
     assert_eq!(
         contract["instance_limits"]["interpretation_deadline_ms"],
-        50
+        "50"
     );
-    assert_eq!(contract["instance_limits"]["snapshot_deadline_ms"], 100);
+    assert_eq!(contract["instance_limits"]["snapshot_deadline_ms"], "100");
     assert_eq!(
         contract["instance_limits"]["output_bytes_per_call"],
-        1_048_576u64
+        "1048576"
     );
     assert_eq!(
         contract["instance_limits"]["observation_queue_bytes"],
-        4_194_304u64
+        "4194304"
     );
-    assert_eq!(contract["repository_budgets"]["metadata_entries"], 100_000);
+    assert_eq!(contract["instance_limits"]["faults_before_disable"], 3);
+    assert_eq!(contract["repository_budgets"]["metadata_bytes"], "67108864");
+    assert_eq!(contract["repository_budgets"]["metadata_entries"], "100000");
+    assert_eq!(
+        contract["repository_budgets"]["payload_cache_bytes"],
+        "1073741824"
+    );
 
     let exports = contract["wit_package"]["exports"]
         .as_array()

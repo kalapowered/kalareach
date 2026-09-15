@@ -1,0 +1,6 @@
+{
+  "note": "A control that declares a parameter its action does not.",
+  "codes": [
+    "control_parameters_widen"
+  ]
+}

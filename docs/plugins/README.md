@@ -32,8 +32,8 @@ A directory:
 Every file except `plugin.json` is declared in `plugin.json` by path, SHA-256 digest and exact
 length. A file on disk that the manifest does not declare is a finding. A declared file that is
 absent, the wrong length or the wrong digest is a finding. The manifest is the one file that does
-not declare itself: its digest lives in the catalogue index entry that points at it, which is what
-lets a host pin one hash and get the whole package.
+not declare itself: its digest and its length live in the catalogue index entry that points at it,
+which is what lets a host pin one hash and get the whole package.
 
 Most packages ship no Wasm. Match rules, a document and declarative controls are a complete
 package, and that is the point: a vendor can add detection, semantic events and commands without a
@@ -73,15 +73,23 @@ stopping at the first.
 ### Paths
 
 A package path is relative, uses `/` on every platform, and must mean one unambiguous file on
-Linux, macOS and Windows. Rejected: `..` and `.` segments, absolute and drive-prefixed paths,
-backslashes, empty segments, Windows device names (`nul`, `com1`, and the rest, with or without an
-extension), trailing dots and spaces, control characters, and the zero-width and bidirectional
-characters that make one name render as another. A path is at most 512 bytes and 8 segments; a
-segment is at most 128 bytes.
+Linux, macOS and Windows. The alphabet is ASCII letters, digits, `.`, `-` and `_`. A path is at most
+512 bytes and 8 segments; a segment is at most 128 bytes.
 
-Two paths that differ only by case, or only by a trailing dot or space, are treated as a
-collision. macOS and Windows would resolve both to one file, and the package contract does not
-decide which one wins.
+The alphabet is restricted rather than filtered, because the ways two Unicode names become one file
+differ per platform and per volume. A default macOS volume stores a precomposed and a decomposed
+spelling of the same accented word as one file. Windows resolves `COM1`, `COM1.txt` and the
+superscript form `COM` + U+00B9 to the same device. Invisible characters make two names render
+identically. A rule that enumerates those cases is a rule that will be incomplete; none of them can
+happen inside this alphabet, and package paths are internal file names rather than anything a person
+reads.
+
+Also rejected: `..` and `.` segments, segments made only of dots, absolute and drive-prefixed paths,
+backslashes, empty segments, trailing dots, and Windows device names with or without an extension.
+
+Two paths that fold to the same name are a collision, and so is one path that needs a directory
+where another needs a file, such as `Assets` beside `assets/icon.svg`. macOS and Windows cannot hold
+both, and the package contract does not decide which one wins.
 
 ### Match rules
 
@@ -110,7 +118,7 @@ A package asks for capabilities from a closed vocabulary:
 | `terminal.transcript_tail` | no | no |
 | `process.observe` | no | no |
 | `upstream.action` | no | no |
-| `approval.decode` | no | no |
+| `approval.decode` | no | yes |
 | `terminal.input` | no | yes |
 | `filesystem.read` | no | yes |
 | `network.outbound` | no | yes |
@@ -121,8 +129,14 @@ Enrolling a repository sets a ceiling before anything is fetched. The default ce
 three rows: metadata matching, declarative presentation and broker semantic events the actor is
 already authorised to see. That is what stops thousands of passive catalogue downloads from
 becoming thousands of permission prompts. Everything else needs an explicit package or repository
-grant, and a new executable bridge or an increase in privilege needs an explicit installation
 grant.
+
+The last column is a floor rather than the whole rule. It marks the capabilities nobody gets under
+any repository ceiling: an executable bridge that runs under the application's own permissions,
+anything that writes, and the trust to interpret or answer native requests. Section 11 also requires
+an explicit grant for any increase over what was previously granted, which compares two capability
+sets rather than asking about one capability, so an upgrade that asks for more than the last one is
+a new decision even when every capability in it sits in an unmarked row.
 
 Capability evidence is a separate thing with a confusingly similar name. A capability request is
 what a package asks for. A capability evidence record is what a host currently knows about whether
@@ -130,14 +144,24 @@ something works here: the capability and version, the subject environment, appli
 desktop generation, the exact binary, schema, package or profile identity it was gathered against,
 the current state, what would invalidate it, and the reason a person reads when it is unavailable.
 
-States are distinguished because "unavailable" alone sends people to the wrong fix: qualified and
-available, missing installation, permission required, incompatible, temporarily unavailable, and
-not tested.
+States are distinguished because "unavailable" alone sends people to the wrong fix:
 
-Evidence is never authority. A signed compatibility record says how a version behaves; it does not
-say this host has permission, and the validator rejects a signed or declared record that claims a
-capability is qualified here. Only a host probe or a live binding can establish that, and the grant
-check still happens separately on every action.
+| State | What it means |
+| --- | --- |
+| `qualified_available` | Tested here and working |
+| `version_qualified` | This version was qualified; this host has not been checked |
+| `missing_installation` | The application, bridge or component is not installed |
+| `permission_required` | The operating system or the user has not granted a permission |
+| `incompatible` | The installed version cannot support it |
+| `temporarily_unavailable` | It worked before and does not right now |
+| `not_tested` | No evidence has been gathered |
+
+Evidence is never authority. A signed compatibility record says how a version behaves, which is
+`version_qualified`; it does not say this host has permission. The validator rejects a signed or
+declared record that claims `qualified_available`, because only a host probe or a live binding can
+establish that, and it rejects a signed record that names no qualification profile, because a record
+nothing can invalidate is a record that never goes stale. The grant check still happens separately
+on every action.
 
 ## Effect classes
 
@@ -159,7 +183,33 @@ one. The trust to decode is recorded against the publisher and its methods, sepa
 action vocabulary, and answering still needs `agent.approval.respond`.
 
 A control may name only an action the manifest registers, so the class the broker enforces is
-always the one the publisher declared and a reviewer read.
+always the one the publisher declared and the person reviewing the package read.
+
+### Implementations
+
+An action also declares how it becomes an effect, so a package with no component can still do
+something. The forms are declarative and bounded, and each reaches only resources the broker already
+owns:
+
+| Implementation | What the broker does | Effect classes it can produce |
+| --- | --- | --- |
+| `presentation` | Redraws the package's own document | `observe` |
+| `component` | Runs `prepare-action` and checks the plan it returns | any |
+| `upstream_method` | Sends one routed method with the bound parameters | `upstream.prompt`, `upstream.attachment`, `approval.respond` |
+| `upstream_cancel` | Requests cancellation of the current turn | `upstream.cancel` |
+| `terminal_text` | Writes a bounded template into the terminal | `terminal.input` |
+
+`upstream_method` names a method the package's own `connector.json` routes and classifies, so what
+the broker sends is something a publisher qualified. Each binding says which declared parameter
+fills which field of the request, and every required parameter must be bound.
+
+`terminal_text` is a list of literal segments and parameter references. A literal is printable
+ASCII, tab and newline only: a template that could carry an escape sequence would be a way to drive
+the terminal from a manifest. The host quotes each parameter value for the shell it is writing to,
+and a package supplies no quoting of its own.
+
+An implementation that cannot produce the class its action declares is a finding, as is one that
+names a component the package does not ship or a method its connector table does not route.
 
 ### Parameters
 
@@ -167,6 +217,15 @@ An action's parameters are a bounded list rather than an arbitrary JSON Schema: 
 maximum length, an integer with an inclusive range, a boolean, a choice from a fixed list, a
 completed attachment handle, or a reference to a node in the package's own document. At most 16
 parameters, at most 24 choices.
+
+Integers are bounded to the range every supported language represents exactly, from -(2^53 - 1) to
+2^53 - 1. Byte counts and durations travel as decimal strings for the same reason: a value that
+changes when it crosses a language boundary is a value nobody can check.
+
+A control may narrow its action's parameters but never widen them. It may omit an optional one. It
+may not introduce one the action does not declare, change what one accepts, make an optional one
+required, or omit a required one. The host checks every invocation against the action's schema, so a
+control that promises otherwise is a control that fails when somebody uses it.
 
 The bound is what makes the parameter hash in the action token mean something. A callback is bound
 to the actor, the grant, the application and thread revision, the declared action and the hash of
@@ -180,9 +239,19 @@ A package contributes a document, not an interface. The node union is closed:
 `terminal_ref`, `action_button`, `action_group`, `command_palette`, `attachment_entry`.
 
 Every node has a stable identifier and a revision, and the document names the base revision a delta
-applies to. Clients render these with their own standard components. There is no variant that
-carries HTML, CSS, JavaScript, React or a WebView, so a package cannot inject any. Adding a node
-kind is a core version.
+applies to. Identifiers are unique inside a document, for nodes and for controls, because a delta
+that names an ambiguous identifier updates whichever copy a client happened to keep.
+
+Clients render these with their own standard components. There is no variant that carries HTML, CSS,
+JavaScript, React or a WebView, so a package cannot declare any. The `markdown` node is the one place
+a package supplies formatted text, and a client renders it through its own renderer under its own
+safe-rendering rules rather than passing the source through: Markdown permits raw HTML, so the union
+stops a package from declaring markup but not from writing it inside prose. Adding a node kind is a
+core version.
+
+Every way a node invokes an action is a control, including a form's submit and an attachment entry's
+contribution. That is what lets one pass over a document count the controls, check their predicates
+and check their parameters, with nothing invoking an action from outside the count.
 
 A node kind a client does not know renders as an unsupported-content block. The block keeps the
 node's identifier and revision and carries no body, so a newer package cannot reach a hidden action
@@ -284,6 +353,12 @@ implements the `adapter` interface and targets the `plugin` world.
 | `checkpoint` | Returns resumable component state | 100 ms |
 | `restore` | Restores state from a checkpoint | 100 ms |
 
+`prepare-action` receives the invocation's token: the actor, the grant, the binding and thread
+revisions, the declared action and the hash of exactly the parameters a person saw. `encode-response`
+receives the broker's own snapshot of the pending request, so a response can be prepared after a
+component restart and a component cannot answer a request it invented. The broker issues both; a
+component only reads them.
+
 The host supplies four interfaces and nothing else:
 
 - `source-events` reads the immutable bytes behind a handle the host passed to this call. A
@@ -337,8 +412,10 @@ A larger full mirror needs the explicit setting. Exceeding a budget leaves the l
 usable and reports which resource ran out, and a sync never evicts a live-bound or pinned payload
 to finish.
 
-Per package: at most 512 files and 64 MiB, at most 256 document nodes and 128 controls, and at most
-512 classified methods in a connector table.
+Per package: at most 512 files and 64 MiB, at most 1 MiB per manifest, at most 256 document nodes
+and 128 controls, and at most 512 classified methods in a connector table. The package size is
+checked against the directory entries before any file is read, so an oversized package is refused
+rather than loaded.
 
 ## The catalogue index
 
@@ -351,10 +428,19 @@ index. Everything it would only need after deciding, including documentation, as
 component itself, stays behind a content hash until an explicit install, an enable, or an
 already-authorised matching activation asks for it.
 
-An entry adds two things to the manifest it came from: the manifest's own digest, and a revocation
-record when the release has one. A revoked release stops new bindings. An active binding gets a
-warning and follows the administrator's explicit disable policy; it does not change under a live
-request.
+An entry adds four things to the manifest it came from:
+
+- The manifest's own digest and its exact length, because the manifest does not declare itself and a
+  host checks a declared size before it downloads.
+- The qualification results the publisher recorded: which capability, which version, what the result
+  was, and which signed profile it came from. Section 25 stores compatibility results beside the
+  manifests and hashes, and section 11 ships them as signed immutable artefacts separately from host
+  binaries, so updating them cannot create a new primitive effect, raise a grant or turn an old live
+  binding into a different version. A catalogue result can say a version was qualified or that it is
+  incompatible. It cannot say a capability is available on a host it has never seen.
+- A revocation record when the release has one. A revoked release stops new bindings. An active
+  binding gets a warning and follows the administrator's explicit disable policy; it does not change
+  under a live request.
 
 The index renders as canonical JSON: entries sorted by publisher, plugin name and version, object
 keys sorted, no insignificant whitespace, one trailing newline. The same inputs produce the same
@@ -404,6 +490,15 @@ report the same code for the same defect.
 | `connector_plugin_mismatch` | The connector names a different package |
 | `unknown_effect_class` | An effect class outside the closed vocabulary |
 | `unknown_capability` | A capability outside the closed vocabulary |
+| `name_not_utf8` | A file name is not valid UTF-8 |
+| `duplicate_member` | A JSON document repeats a member name |
+| `payload_role_invalid` | A structural payload role is at the wrong path or declared twice |
+| `implementation_mismatch` | An action's implementation cannot produce its effect class |
+| `implementation_unsatisfied` | An implementation names something the package does not carry |
+| `bridge_recipe_invalid` | A native bridge recipe is incomplete or names something absent |
+| `duplicate_element_id` | Two nodes or two controls share an identifier |
+| `control_parameters_widen` | A control's parameters do not narrow its action's |
+| `qualification_invalid` | A qualification result claims something the catalogue cannot know |
 
 ## What a signature does not do
 
@@ -420,14 +515,23 @@ offered decisions, the deadline and the resolution state for inspection.
 
 ## Fixtures
 
-`fixtures/plugins/valid/` holds packages that must validate cleanly. `fixtures/plugins/invalid/`
-holds one directory per defect: a `package/` directory and an `expected.json` naming the exact
-finding codes it must produce. Both Rust and TypeScript read them, so a change that stops detecting
-a defect fails the build.
+`fixtures/plugins/valid/` holds two packages that must validate cleanly: `example-declarative`, with
+no component and one observation action, and `example-connector`, with a native-proxy table and an
+action that sends a routed upstream method.
+
+`fixtures/plugins/invalid/` holds one directory per defect: a `package/` directory and an
+`expected.json` naming the exact finding codes it must produce. The Rust tests validate each package
+and compare the codes. The TypeScript tests check the valid packages against the generated schema,
+and check the invalid ones the schema alone can catch; the rest are Rust-side rules the schema
+cannot express, such as Windows device names, case-folded collisions, predicate depth and action
+registration.
 
 Present defects: unsafe extraction path, case-colliding names, duplicate declared path, undeclared
 size expansion, digest mismatch, undeclared file, unknown effect class, unregistered action, effect
-without capability, unbounded SDK range, undeclared connector table, and an over-deep predicate.
+without capability, unbounded SDK range, undeclared connector table, over-deep predicate, repeated
+JSON member, misplaced payload role, mismatched implementation, unsatisfied implementation,
+incomplete bridge recipe, duplicate element identifier, widened control parameters, ambiguous
+connector table, and an unsupported presentation version.
 
 ## Generation and checking
 

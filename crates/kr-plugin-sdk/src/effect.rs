@@ -10,12 +10,15 @@
 //! answer.
 
 use kr_protocol::scalars::{CanonicalSet, Nullable};
+
+use crate::scalars::{Count, SafeInt, U64};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::capability::PluginCapability;
-use crate::ids::{ActionName, ParameterName};
-use crate::text::{Label, Summary};
+use crate::connector::FieldPath;
+use crate::ids::{ActionName, MethodName, ParameterName};
+use crate::text::{Label, Summary, TerminalLiteral};
 
 pub use kr_protocol::rights::ActionRight;
 
@@ -161,16 +164,16 @@ pub enum ParameterKind {
     /// Free text.
     Text {
         /// Maximum length in characters.
-        max_length: u32,
+        max_length: Count,
         /// Whether the client offers a multi-line field.
         multiline: bool,
     },
     /// A whole number inside an inclusive range.
     Integer {
         /// Lowest accepted value.
-        minimum: i64,
+        minimum: SafeInt,
         /// Highest accepted value.
-        maximum: i64,
+        maximum: SafeInt,
     },
     /// A yes or no.
     Boolean {},
@@ -226,6 +229,139 @@ pub const MAX_PARAMETERS: usize = 16;
 /// Maximum number of choices one choice parameter may offer.
 pub const MAX_PARAMETER_CHOICES: usize = 24;
 
+/// Maximum segments one terminal text template may carry.
+pub const MAX_TEXT_SEGMENTS: usize = 16;
+
+/// One piece of a terminal text template.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TextSegment {
+    /// Literal text.
+    Literal {
+        /// The text.
+        text: TerminalLiteral,
+    },
+    /// The value of one declared parameter.
+    ///
+    /// The host quotes the value for the shell it is writing to. Shell quoting is not assumed to
+    /// be a composer's syntax, and a package cannot supply quoting of its own.
+    Parameter {
+        /// The parameter supplying the value.
+        parameter: ParameterName,
+    },
+}
+
+/// One declared parameter bound to a field of an upstream request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ParameterBinding {
+    /// The declared parameter supplying the value.
+    pub parameter: ParameterName,
+    /// Where the value goes in the upstream request.
+    pub field: FieldPath,
+}
+
+/// How an action becomes an effect.
+///
+/// A package that ships no component still has to say what its controls do, or a vendor could not
+/// add a command without a core release. The forms here are declarative and bounded: the broker
+/// reads them directly, and each one can only reach resources the broker already owns. A package
+/// with a component names [`ActionImplementation::Component`] instead, and the component returns a
+/// plan the broker checks against the same effect class.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActionImplementation {
+    /// The host redraws the package's own document. Nothing leaves the host.
+    Presentation {},
+    /// The package's component prepares the effect.
+    ///
+    /// The component returns a plan; it sends nothing. The broker checks the plan against this
+    /// action's declared effect class before it dispatches.
+    Component {},
+    /// The broker sends one routed upstream method with the bound parameters.
+    ///
+    /// The method must be one the package's connector table routes and classifies, so what the
+    /// broker sends is something a reviewer read and a publisher qualified.
+    UpstreamMethod {
+        /// The method, as the connector table names it.
+        method: MethodName,
+        /// Which declared parameter supplies each field of the request.
+        bindings: Vec<ParameterBinding>,
+    },
+    /// The broker requests cancellation of the bound execution's current turn.
+    UpstreamCancel {},
+    /// The broker writes a bounded template into the terminal.
+    TerminalText {
+        /// The template.
+        template: Vec<TextSegment>,
+    },
+}
+
+impl ActionImplementation {
+    /// Returns the wire name of this form.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Presentation {} => "presentation",
+            Self::Component {} => "component",
+            Self::UpstreamMethod { .. } => "upstream_method",
+            Self::UpstreamCancel {} => "upstream_cancel",
+            Self::TerminalText { .. } => "terminal_text",
+        }
+    }
+
+    /// Returns true when this form can produce the given effect class.
+    ///
+    /// The pairing is what stops a declarative form from reaching an effect it cannot express:
+    /// a terminal template is terminal input and nothing else, and presentation leaves the host
+    /// alone.
+    #[must_use]
+    pub const fn permits(&self, effect: EffectClass) -> bool {
+        match self {
+            Self::Presentation {} => matches!(effect, EffectClass::Observe),
+            Self::Component {} => true,
+            Self::UpstreamMethod { .. } => matches!(
+                effect,
+                EffectClass::UpstreamPrompt
+                    | EffectClass::UpstreamAttachment
+                    | EffectClass::ApprovalRespond
+            ),
+            Self::UpstreamCancel {} => matches!(effect, EffectClass::UpstreamCancel),
+            Self::TerminalText { .. } => matches!(effect, EffectClass::TerminalInput),
+        }
+    }
+
+    /// Returns true when this form needs the package to ship a component.
+    #[must_use]
+    pub const fn needs_component(&self) -> bool {
+        matches!(self, Self::Component {})
+    }
+
+    /// Returns true when this form needs the package to ship a connector table.
+    #[must_use]
+    pub const fn needs_connector(&self) -> bool {
+        matches!(self, Self::UpstreamMethod { .. })
+    }
+
+    /// Returns every declared parameter this form refers to.
+    #[must_use]
+    pub fn referenced_parameters(&self) -> Vec<&ParameterName> {
+        match self {
+            Self::UpstreamMethod { bindings, .. } => {
+                bindings.iter().map(|binding| &binding.parameter).collect()
+            }
+            Self::TerminalText { template } => template
+                .iter()
+                .filter_map(|segment| match segment {
+                    TextSegment::Parameter { parameter } => Some(parameter),
+                    TextSegment::Literal { .. } => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// An action registered in the package manifest.
 ///
 /// Registration is what makes an action invocable. A control may name only a registered action,
@@ -239,6 +375,8 @@ pub struct ActionDeclaration {
     pub label: Label,
     /// What the action does.
     pub effect: EffectClass,
+    /// How it becomes an effect.
+    pub implementation: ActionImplementation,
     /// The parameters it accepts.
     pub parameters: ParameterSchema,
     /// Why the action exists, shown in the installation grant beside its effect class.
@@ -291,7 +429,7 @@ pub enum ArgumentValue {
     /// A number for an [`ParameterKind::Integer`] parameter.
     Integer {
         /// The number.
-        value: i64,
+        value: SafeInt,
     },
     /// A decision for a [`ParameterKind::Boolean`] parameter.
     Boolean {
@@ -392,7 +530,7 @@ fn check_value(
     let name = declaration.name.clone();
     match (&declaration.kind, value) {
         (ParameterKind::Text { max_length, .. }, ArgumentValue::Text { text }) => {
-            if text.chars().count() > *max_length as usize {
+            if text.chars().count() > max_length.get() as usize {
                 return Err(ArgumentError::OutOfBounds { name });
             }
             Ok(())
@@ -426,10 +564,10 @@ fn check_value(
 pub struct AttachmentContribution {
     /// The MIME types the upstream accepts, as exact types or `type/*` families.
     pub accepted_media_types: Vec<String>,
-    /// Maximum bytes per attachment for the selected upstream model.
-    pub max_bytes: u64,
+    /// Maximum bytes per attachment the bound upstream execution accepts.
+    pub max_bytes: U64,
     /// Maximum attachments per draft.
-    pub max_count: u32,
+    pub max_count: Count,
     /// How the attachment reaches the draft.
     pub insertion: AttachmentInsertion,
     /// The external service the bytes are uploaded to, where one is involved.
@@ -516,7 +654,7 @@ mod tests {
                 ParameterDeclaration {
                     name: name("prompt"),
                     kind: ParameterKind::Text {
-                        max_length: 8,
+                        max_length: Count::new(8),
                         multiline: false,
                     },
                     label: Label::new("Prompt").expect("valid label"),

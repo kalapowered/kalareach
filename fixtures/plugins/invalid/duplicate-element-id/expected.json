@@ -1,0 +1,6 @@
+{
+  "note": "Two document nodes that share an identifier.",
+  "codes": [
+    "duplicate_element_id"
+  ]
+}

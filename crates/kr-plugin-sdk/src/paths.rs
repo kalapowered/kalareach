@@ -3,12 +3,19 @@
 //! Section 11 requires the host to reject unsafe extraction paths, links, duplicate or
 //! case-colliding names and undeclared size expansion. This module owns the first three.
 //!
-//! A [`PackagePath`] is a relative POSIX path that stays inside its package on every platform
-//! KalaReach runs on. That is stricter than "no `..`", because a path that is harmless on Linux
-//! can escape or collide on macOS and Windows: `NUL` is a device on Windows, `a.` and `a` are the
-//! same file there, `A` and `a` are the same file on a default macOS volume, and a backslash is a
-//! separator on Windows and an ordinary character elsewhere. The rules below are the intersection
-//! of what all three treat as one unambiguous file.
+//! A [`PackagePath`] is a relative POSIX path that names one unambiguous file on every platform
+//! KalaReach runs on. That is stricter than "no `..`", because a path that is harmless on Linux can
+//! escape or collide on macOS and Windows: `NUL` is a device on Windows, `a.` and `a` are the same
+//! file there, `A` and `a` are the same file on a default macOS volume, `e\u{0301}` and `\u{e9}`
+//! are the same file on a default APFS volume, and a backslash is a separator on Windows and an
+//! ordinary character elsewhere.
+//!
+//! The alphabet is therefore ASCII letters, digits, `.`, `-` and `_`. Restricting it rather than
+//! enumerating the ways Unicode collides is the only version of this rule that stays true: macOS
+//! normalises, Windows resolves device names through their extension and through compatibility
+//! forms such as `COM\u{b9}`, and invisible characters make two different names render
+//! identically. None of that can happen inside this alphabet. Package paths are internal file
+//! names rather than anything a person reads, so the restriction costs nothing.
 
 use core::fmt;
 use core::str::FromStr;
@@ -66,6 +73,12 @@ pub enum PathRejection {
     /// The path contained a backslash, which is a separator on Windows only.
     #[error("the path contains a backslash; package paths use '/' on every platform")]
     Backslash,
+    /// A segment was made only of dots, which no platform treats as an ordinary name.
+    #[error("the segment {segment:?} is only dots")]
+    DotsOnly {
+        /// The offending segment.
+        segment: String,
+    },
     /// The path had an empty segment, from a leading, trailing or doubled separator.
     #[error("the path has an empty segment; separators are single and never leading or trailing")]
     EmptySegment,
@@ -81,17 +94,19 @@ pub enum PathRejection {
         /// The offending segment.
         segment: String,
     },
-    /// A segment carried a character no platform can represent unambiguously.
-    #[error("the segment {segment:?} contains the forbidden character U+{codepoint:04X}")]
+    /// A segment carried a character outside the portable alphabet.
+    #[error(
+        "the segment {segment:?} contains U+{codepoint:04X}; package paths use A-Z, a-z, 0-9, '.', '-' and '_'"
+    )]
     ForbiddenCharacter {
         /// The offending segment.
         segment: String,
         /// The offending code point.
         codepoint: u32,
     },
-    /// A segment ended with a dot or a space, which Windows silently strips.
-    #[error("the segment {segment:?} ends with a dot or space, which Windows strips")]
-    TrailingDotOrSpace {
+    /// A segment ended with a dot, which Windows silently strips.
+    #[error("the segment {segment:?} ends with a dot, which Windows strips")]
+    TrailingDot {
         /// The offending segment.
         segment: String,
     },
@@ -169,18 +184,26 @@ impl PackagePath {
             .expect("a path has a last segment")
     }
 
-    /// Returns the key two paths share when they differ only by case or trailing punctuation.
+    /// Returns the key two paths share when they name one file on a case-insensitive filesystem.
     ///
-    /// Two package paths with the same collision key are the same file after a case-insensitive
-    /// filesystem, or after Windows strips trailing dots and spaces. The package contract treats
-    /// them as a duplicate rather than deciding which one wins.
+    /// Two package paths with the same collision key are the same file on macOS and Windows. The
+    /// package contract treats them as a duplicate rather than deciding which one wins.
     #[must_use]
     pub fn collision_key(&self) -> String {
-        self.0
-            .split('/')
-            .map(|segment| segment.trim_end_matches(['.', ' ']).to_lowercase())
-            .collect::<Vec<_>>()
-            .join("/")
+        self.0.to_ascii_lowercase()
+    }
+
+    /// Returns true when this path needs a directory where `other` needs a file.
+    ///
+    /// `a/b` needs `a` to be a directory and `A` needs it to be a file. One of the two cannot be
+    /// extracted, and which one fails depends on the order a host happens to write them in.
+    #[must_use]
+    pub fn shadows(&self, other: &Self) -> bool {
+        let mine = self.collision_key();
+        let theirs = other.collision_key();
+        mine.len() > theirs.len()
+            && mine.starts_with(&theirs)
+            && mine.as_bytes().get(theirs.len()) == Some(&b'/')
     }
 }
 
@@ -206,18 +229,27 @@ fn check_segment(segment: &str) -> Result<(), PathRejection> {
             segment: segment.to_owned(),
         });
     }
-    if let Some(character) = segment.chars().find(|c| is_forbidden_path_char(*c)) {
+    if let Some(character) = segment.chars().find(|c| !is_portable_path_char(*c)) {
         return Err(PathRejection::ForbiddenCharacter {
             segment: segment.to_owned(),
             codepoint: character as u32,
         });
     }
-    if segment.ends_with('.') || segment.ends_with(' ') {
-        return Err(PathRejection::TrailingDotOrSpace {
+    if segment.chars().all(|character| character == '.') {
+        return Err(PathRejection::DotsOnly {
             segment: segment.to_owned(),
         });
     }
-    let stem = segment.split('.').next().unwrap_or(segment).to_lowercase();
+    if segment.ends_with('.') {
+        return Err(PathRejection::TrailingDot {
+            segment: segment.to_owned(),
+        });
+    }
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or(segment)
+        .to_ascii_lowercase();
     if WINDOWS_DEVICE_NAMES.contains(&stem.as_str()) {
         return Err(PathRejection::WindowsDevice {
             segment: segment.to_owned(),
@@ -227,17 +259,17 @@ fn check_segment(segment: &str) -> Result<(), PathRejection> {
     Ok(())
 }
 
-/// Returns true when a character may never appear in a package path segment.
+/// Returns true when a character may appear in a package path segment.
 ///
-/// The set is the union of what Windows forbids outright, the control characters, and the
-/// invisible and bidirectional characters that let one name render as another.
+/// The alphabet is ASCII letters, digits, `.`, `-` and `_`. Everything outside it is rejected
+/// rather than filtered, because the ways two Unicode names become one file differ per platform
+/// and per volume, and a rule that has to enumerate them is a rule that will be incomplete.
 #[must_use]
-pub fn is_forbidden_path_char(character: char) -> bool {
-    matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
-        || crate::text::is_forbidden_text_char(character)
+pub fn is_portable_path_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
 }
 
-/// A pair of package paths that name the same file on a case-insensitive filesystem.
+/// Two package paths that cannot both exist on a case-insensitive filesystem.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathCollision {
     /// The path seen first.
@@ -246,9 +278,20 @@ pub struct PathCollision {
     pub second: PackagePath,
     /// The key they share.
     pub key: String,
+    /// How they collide.
+    pub kind: CollisionKind,
 }
 
-/// Finds every pair of paths that collide after case folding.
+/// How two package paths collide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollisionKind {
+    /// They fold to the same name.
+    SameFile,
+    /// One needs a directory where the other needs a file.
+    FileAndDirectory,
+}
+
+/// Finds every pair of paths that cannot both exist on a case-insensitive filesystem.
 ///
 /// The result is ordered by the shared key, so a validator reports collisions in the same order on
 /// every run.
@@ -263,13 +306,33 @@ pub fn find_collisions(paths: &[PackagePath]) -> Vec<PathCollision> {
                 first: first.clone(),
                 second: path.clone(),
                 key,
+                kind: CollisionKind::SameFile,
             }),
             None => {
                 seen.insert(key, path.clone());
             }
         }
     }
-    collisions.sort_by(|left, right| left.key.cmp(&right.key));
+    for (index, path) in paths.iter().enumerate() {
+        for other in &paths[index + 1..] {
+            let (file, directory) = if path.shadows(other) {
+                (other, path)
+            } else if other.shadows(path) {
+                (path, other)
+            } else {
+                continue;
+            };
+            collisions.push(PathCollision {
+                first: file.clone(),
+                second: directory.clone(),
+                key: file.collision_key(),
+                kind: CollisionKind::FileAndDirectory,
+            });
+        }
+    }
+    collisions.sort_by(|left, right| {
+        (&left.key, left.second.as_str()).cmp(&(&right.key, right.second.as_str()))
+    });
     collisions
 }
 
@@ -380,16 +443,41 @@ mod tests {
         ));
         assert!(matches!(
             PackagePath::new("assets/icon."),
-            Err(PathRejection::TrailingDotOrSpace { .. })
+            Err(PathRejection::TrailingDot { .. })
         ));
+        for outside in ["assets/icon ", "assets/a:b", "assets/COM\u{b9}.txt"] {
+            assert!(
+                matches!(
+                    PackagePath::new(outside),
+                    Err(PathRejection::ForbiddenCharacter { .. })
+                ),
+                "accepted {outside:?}"
+            );
+        }
         assert!(matches!(
-            PackagePath::new("assets/icon "),
-            Err(PathRejection::TrailingDotOrSpace { .. })
+            PackagePath::new("assets/..."),
+            Err(PathRejection::DotsOnly { .. })
         ));
-        assert!(matches!(
-            PackagePath::new("assets/a:b"),
-            Err(PathRejection::ForbiddenCharacter { .. })
-        ));
+    }
+
+    #[test]
+    fn rejects_everything_outside_the_portable_alphabet() {
+        // Two spellings of the same word that a default macOS volume stores as one file.
+        for outside in [
+            "assets/caf\u{e9}.svg",
+            "assets/cafe\u{301}.svg",
+            "assets/ic\u{34f}on.svg",
+            "assets/\u{1F600}.svg",
+            "assets/my file.svg",
+        ] {
+            assert!(
+                matches!(
+                    PackagePath::new(outside),
+                    Err(PathRejection::ForbiddenCharacter { .. })
+                ),
+                "accepted {outside:?}"
+            );
+        }
     }
 
     #[test]
@@ -413,15 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invisible_characters_in_names() {
-        assert!(matches!(
-            PackagePath::new("assets/ic\u{200B}on.svg"),
-            Err(PathRejection::ForbiddenCharacter { .. })
-        ));
-    }
-
-    #[test]
-    fn finds_case_and_trailing_dot_collisions() {
+    fn finds_case_folded_collisions() {
         let paths = vec![
             path("assets/Icon.svg"),
             path("assets/icon.svg"),
@@ -430,11 +510,27 @@ mod tests {
         let collisions = find_collisions(&paths);
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0].key, "assets/icon.svg");
+        assert_eq!(collisions[0].kind, CollisionKind::SameFile);
+    }
+
+    #[test]
+    fn finds_a_file_that_shadows_another_paths_directory() {
+        let paths = vec![path("Assets"), path("assets/icon.svg")];
+        let collisions = find_collisions(&paths);
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].kind, CollisionKind::FileAndDirectory);
+        assert_eq!(collisions[0].first.as_str(), "Assets");
+        assert_eq!(collisions[0].second.as_str(), "assets/icon.svg");
     }
 
     #[test]
     fn no_collision_between_distinct_names() {
-        let paths = vec![path("a.json"), path("b.json"), path("nested/a.json")];
+        let paths = vec![
+            path("a.json"),
+            path("b.json"),
+            path("nested/a.json"),
+            path("nest/a.json"),
+        ];
         assert!(find_collisions(&paths).is_empty());
     }
 }

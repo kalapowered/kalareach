@@ -1,0 +1,6 @@
+{
+  "note": "An action whose implementation writes to the terminal while it declares an observation.",
+  "codes": [
+    "implementation_mismatch"
+  ]
+}

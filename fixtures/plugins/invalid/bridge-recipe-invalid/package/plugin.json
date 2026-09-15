@@ -1,0 +1,131 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "example-declarative",
+  "version": "0.1.0",
+  "display_name": "Example declarative package",
+  "description": "Recognises the example agent and presents its status with one declarative control.",
+  "sdk_range": ">=0.1.0, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "refs/tags/example-declarative-0.1.0"
+  },
+  "match_rules": [
+    {
+      "id": "example-agent",
+      "executable": {
+        "file_stem": "example-agent",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": {
+        "registry": "npm",
+        "package": "@kalareach/example-agent"
+      },
+      "confidence": "exact"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "f3992111da3c53b4e58af4fc88f576ba7c0a34590b37cf59116c0874e5568f3b",
+      "size_bytes": "2421"
+    },
+    {
+      "role": "native_bridge",
+      "path": "bridge/hook.js",
+      "digest": "31c1cd43139c4b512011c478daf741e8bd3bd6c49db093f55635906a755c64f4",
+      "size_bytes": "30"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise the example agent from its executable name"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Present the application's status and one control"
+    },
+    {
+      "capability": "broker.semantic_events",
+      "reason": "Update the status from events the actor may already see"
+    },
+    {
+      "capability": "native_bridge.install",
+      "reason": "Register the observation hook with the application"
+    }
+  ],
+  "actions": [
+    {
+      "id": "status.refresh",
+      "label": "Refresh status",
+      "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
+      "parameters": {
+        "parameters": [
+          {
+            "name": "detail",
+            "kind": {
+              "type": "choice",
+              "choices": [
+                {
+                  "id": "summary",
+                  "label": "Summary"
+                },
+                {
+                  "id": "full",
+                  "label": "Everything"
+                }
+              ]
+            },
+            "label": "Detail",
+            "required": false
+          }
+        ]
+      },
+      "description": "Read the bound application's status again and redraw it",
+      "confirmation_required": false
+    }
+  ],
+  "attachments": null,
+  "native_bridge": {
+    "application": "Example Agent",
+    "application_range": ">=1.0.0, <2.0.0",
+    "install": [
+      {
+        "type": "install_file",
+        "source": "bridge/hook.js",
+        "destination": "plugins/kalareach.js",
+        "digest": "31c1cd43139c4b512011c478daf741e8bd3bd6c49db093f55635906a755c64f4"
+      }
+    ],
+    "remove": [],
+    "grant_statement": "The hook runs under the application's own permissions, outside the sandbox."
+  }
+}

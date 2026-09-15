@@ -1,6 +1,7 @@
 {
-  "note": "A native-proxy table the package ships but the manifest does not declare. An undeclared file also expands the package past its declared size.",
+  "note": "A native-proxy table the package ships but the manifest does not declare. It also belongs to another package and expands the package past its declared size.",
   "codes": [
+    "connector_plugin_mismatch",
     "connector_undeclared",
     "size_mismatch",
     "undeclared_file"

@@ -18,16 +18,23 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::capability::PluginCapability;
-use crate::connector::{ConnectorManifest, MAX_CLASSIFIED_METHODS, MAX_FIELD_PATH_DEPTH};
+use crate::connector::{
+    ConnectorManifest, FieldPath, Framing, MAX_CLASSIFIED_METHODS, MAX_FIELD_PATH_DEPTH,
+    MethodClass,
+};
 use crate::digest::PayloadDigest;
-use crate::effect::{MAX_PARAMETER_CHOICES, MAX_PARAMETERS, ParameterKind, ParameterSchema};
+use crate::effect::{
+    ActionDeclaration, ActionImplementation, AttachmentInsertion, MAX_PARAMETER_CHOICES,
+    MAX_PARAMETERS, MAX_TEXT_SEGMENTS, ParameterKind, ParameterSchema,
+};
 use crate::ids::ActionName;
+use crate::limits::MANIFEST_BYTES;
 use crate::package::{
     CONNECTOR_FILE, MANIFEST_FILE, MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES, PRESENTATION_FILE,
     Package, PackageFile,
 };
 use crate::paths::{PackagePath, find_collisions};
-use crate::plugin::{PayloadRole, PluginManifest};
+use crate::plugin::{BridgeStep, NativeBridge, PayloadRef, PayloadRole, PluginManifest};
 use crate::presentation::{
     Control, MAX_CONTROLS, MAX_DOCUMENT_NODES, NodeBody, PresentationManifest,
 };
@@ -113,6 +120,24 @@ pub enum FindingCode {
     UnknownEffectClass,
     /// The package requests a capability that is not in the closed vocabulary.
     UnknownCapability,
+    /// A file name is not valid UTF-8.
+    NameNotUtf8,
+    /// A JSON document repeats a member name.
+    DuplicateMember,
+    /// A structural payload role is declared at the wrong path or more than once.
+    PayloadRoleInvalid,
+    /// An action's implementation cannot produce the effect class it declares.
+    ImplementationMismatch,
+    /// An action's implementation refers to something the package does not carry.
+    ImplementationUnsatisfied,
+    /// A native bridge recipe is incomplete or refers to something absent.
+    BridgeRecipeInvalid,
+    /// Two document nodes or two controls share an identifier.
+    DuplicateElementId,
+    /// A control's parameters do not narrow its action's.
+    ControlParametersWiden,
+    /// A catalogue qualification result claims something the catalogue cannot know.
+    QualificationInvalid,
 }
 
 impl FindingCode {
@@ -153,6 +178,15 @@ impl FindingCode {
         Self::ConnectorPluginMismatch,
         Self::UnknownEffectClass,
         Self::UnknownCapability,
+        Self::NameNotUtf8,
+        Self::DuplicateMember,
+        Self::PayloadRoleInvalid,
+        Self::ImplementationMismatch,
+        Self::ImplementationUnsatisfied,
+        Self::BridgeRecipeInvalid,
+        Self::DuplicateElementId,
+        Self::ControlParametersWiden,
+        Self::QualificationInvalid,
     ];
 
     /// Returns the stable wire string.
@@ -194,6 +228,15 @@ impl FindingCode {
             Self::ConnectorPluginMismatch => "connector_plugin_mismatch",
             Self::UnknownEffectClass => "unknown_effect_class",
             Self::UnknownCapability => "unknown_capability",
+            Self::NameNotUtf8 => "name_not_utf8",
+            Self::DuplicateMember => "duplicate_member",
+            Self::PayloadRoleInvalid => "payload_role_invalid",
+            Self::ImplementationMismatch => "implementation_mismatch",
+            Self::ImplementationUnsatisfied => "implementation_unsatisfied",
+            Self::BridgeRecipeInvalid => "bridge_recipe_invalid",
+            Self::DuplicateElementId => "duplicate_element_id",
+            Self::ControlParametersWiden => "control_parameters_widen",
+            Self::QualificationInvalid => "qualification_invalid",
         }
     }
 }
@@ -306,14 +349,43 @@ pub fn validate_package_directory(directory: &Path) -> Validated {
     };
     let presentation =
         read_manifest::<PresentationManifest>(directory, PRESENTATION_FILE, &mut report);
-    let connector_present = directory.join(CONNECTOR_FILE).is_file();
+    let connector_present = files
+        .iter()
+        .any(|file| file.path.as_str() == CONNECTOR_FILE);
     let connector = if connector_present {
         read_manifest::<ConnectorManifest>(directory, CONNECTOR_FILE, &mut report)
     } else {
         None
     };
 
-    check_manifest(&manifest, &mut report);
+    if let Some(presentation) = &presentation
+        && presentation.manifest_version != PresentationManifest::CURRENT_VERSION
+    {
+        report.push(Finding::at(
+            FindingCode::ManifestVersionUnsupported,
+            PRESENTATION_FILE,
+            format!(
+                "manifest version {} is not version {}",
+                presentation.manifest_version,
+                PresentationManifest::CURRENT_VERSION
+            ),
+        ));
+    }
+    if let Some(connector) = &connector
+        && connector.manifest_version != ConnectorManifest::CURRENT_VERSION
+    {
+        report.push(Finding::at(
+            FindingCode::ManifestVersionUnsupported,
+            CONNECTOR_FILE,
+            format!(
+                "manifest version {} is not version {}",
+                connector.manifest_version,
+                ConnectorManifest::CURRENT_VERSION
+            ),
+        ));
+    }
+
+    check_manifest(&manifest, connector.as_ref(), &mut report);
     check_payloads(&manifest, &files, &mut report);
     if let Some(presentation) = &presentation {
         check_presentation(&manifest, presentation, &mut report);
@@ -346,6 +418,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Vec<PackageFile>> {
         return None;
     }
     let mut files = Vec::new();
+    let mut total: u64 = 0;
     let mut queue: Vec<(PathBuf, Vec<String>)> = vec![(directory.to_path_buf(), Vec::new())];
     while let Some((current, prefix)) = queue.pop() {
         let entries = match fs::read_dir(&current) {
@@ -369,7 +442,18 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Vec<PackageFile>> {
                     return None;
                 }
             };
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                report.push(Finding::at(
+                    FindingCode::NameNotUtf8,
+                    format!(
+                        "{}/{}",
+                        prefix.join("/"),
+                        entry.file_name().to_string_lossy()
+                    ),
+                    "a package file name is valid UTF-8; a name that is not cannot be declared",
+                ));
+                continue;
+            };
             let mut segments = prefix.clone();
             segments.push(name.clone());
             let relative = segments.join("/");
@@ -423,6 +507,28 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Vec<PackageFile>> {
                     continue;
                 }
             };
+            // The length comes from the directory entry, so a file is measured against the
+            // package budget before any of it is read into memory.
+            let size_bytes = metadata.len();
+            total = total.saturating_add(size_bytes);
+            if size_bytes > MAX_PACKAGE_BYTES || total > MAX_PACKAGE_BYTES {
+                report.push(Finding::at(
+                    FindingCode::PackageTooLarge,
+                    relative,
+                    format!(
+                        "reading it would take the package past the {MAX_PACKAGE_BYTES} byte limit"
+                    ),
+                ));
+                return Some(files);
+            }
+            if is_manifest_name(path.as_str()) && size_bytes > MANIFEST_BYTES {
+                report.push(Finding::at(
+                    FindingCode::PackageTooLarge,
+                    relative,
+                    format!("a manifest is at most {MANIFEST_BYTES} bytes, not {size_bytes}"),
+                ));
+                continue;
+            }
             match fs::read(entry.path()) {
                 Ok(bytes) => files.push(PackageFile {
                     path,
@@ -476,9 +582,29 @@ fn read_manifest<T: serde::de::DeserializeOwned>(
     name: &str,
     report: &mut Report,
 ) -> Option<T> {
+    let text = read_manifest_text(directory, name, report)?;
+    match serde_json::from_str::<T>(&text) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            report.push(Finding::at(
+                FindingCode::ManifestUnreadable,
+                name,
+                error.to_string(),
+            ));
+            None
+        }
+    }
+}
+
+/// Reads one manifest's text after checking what it is.
+///
+/// The check is by `symlink_metadata` on the exact path about to be read, rather than by trusting
+/// the earlier directory scan. A named pipe called `plugin.json` would block a read forever, and a
+/// symbolic link would read a file outside the package; both are rejected here, before the open.
+fn read_manifest_text(directory: &Path, name: &str, report: &mut Report) -> Option<String> {
     let path = directory.join(name);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             report.push(Finding::at(
                 FindingCode::ManifestMissing,
@@ -496,8 +622,27 @@ fn read_manifest<T: serde::de::DeserializeOwned>(
             return None;
         }
     };
-    match serde_json::from_str::<T>(&text) {
-        Ok(value) => Some(value),
+    if !metadata.is_file() {
+        report.push(Finding::at(
+            FindingCode::NotARegularFile,
+            name,
+            "a manifest is a regular file; a link or a device is not read",
+        ));
+        return None;
+    }
+    if metadata.len() > MANIFEST_BYTES {
+        report.push(Finding::at(
+            FindingCode::PackageTooLarge,
+            name,
+            format!(
+                "a manifest is at most {MANIFEST_BYTES} bytes, not {}",
+                metadata.len()
+            ),
+        ));
+        return None;
+    }
+    match fs::read_to_string(&path) {
+        Ok(text) => Some(text),
         Err(error) => {
             report.push(Finding::at(
                 FindingCode::ManifestUnreadable,
@@ -509,6 +654,83 @@ fn read_manifest<T: serde::de::DeserializeOwned>(
     }
 }
 
+/// Returns true when a path names one of the package's own manifests.
+fn is_manifest_name(path: &str) -> bool {
+    matches!(path, MANIFEST_FILE | PRESENTATION_FILE | CONNECTOR_FILE)
+}
+
+/// Reports every member name a JSON document repeats.
+///
+/// `serde_json::Value` keeps the last of two members with the same name, so a document parsed into
+/// one has already lost the duplicate. A manifest that says `"effect"` twice would then be read as
+/// whichever spelling came last, which is a way to show a reviewer one thing and a host another.
+fn check_duplicate_members(name: &str, text: &str, report: &mut Report) {
+    use serde::de::Deserialize as _;
+
+    #[derive(Debug)]
+    struct Duplicates(Vec<String>);
+
+    impl<'de> serde::de::Deserialize<'de> for Duplicates {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Duplicates;
+
+                fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    formatter.write_str("any JSON value")
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut seen: BTreeSet<String> = BTreeSet::new();
+                    let mut repeated = Vec::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        if !seen.insert(key.clone()) {
+                            repeated.push(key);
+                        }
+                        let nested: Duplicates = map.next_value()?;
+                        repeated.extend(nested.0);
+                    }
+                    Ok(Duplicates(repeated))
+                }
+
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut repeated = Vec::new();
+                    while let Some(nested) = seq.next_element::<Duplicates>()? {
+                        repeated.extend(nested.0);
+                    }
+                    Ok(Duplicates(repeated))
+                }
+
+                fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                    Ok(Duplicates(Vec::new()))
+                }
+            }
+
+            deserializer
+                .deserialize_any(Visitor)
+                .or_else(|_| Ok(Duplicates(Vec::new())))
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let Ok(duplicates) = Duplicates::deserialize(&mut deserializer) else {
+        return;
+    };
+    for member in duplicates.0 {
+        report.push(Finding::at(
+            FindingCode::DuplicateMember,
+            name,
+            format!("the member {member:?} appears more than once"),
+        ));
+    }
+}
+
 /// Reads `plugin.json` in two stages.
 ///
 /// The closed vocabularies and the declared paths are checked against the raw document first, so
@@ -516,14 +738,28 @@ fn read_manifest<T: serde::de::DeserializeOwned>(
 /// in a nested field. A package that fails either check is not parsed further: a manifest whose
 /// paths cannot be trusted is not a manifest a host reads the rest of.
 fn read_plugin_manifest(directory: &Path, report: &mut Report) -> Option<PluginManifest> {
-    let raw = read_manifest::<serde_json::Value>(directory, MANIFEST_FILE, report)?;
+    let text = read_manifest_text(directory, MANIFEST_FILE, report)?;
     let before = report.findings.len();
+    check_duplicate_members(MANIFEST_FILE, &text, report);
+    let raw: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            report.push(Finding::at(
+                FindingCode::ManifestUnreadable,
+                MANIFEST_FILE,
+                error.to_string(),
+            ));
+            return None;
+        }
+    };
     check_declared_paths(&raw, report);
     check_closed_vocabularies(&raw, report);
     if report.findings.len() > before {
         return None;
     }
-    match serde_json::from_value::<PluginManifest>(raw) {
+    // The typed parse reads the original text rather than the value tree, so a repeated member is
+    // a parse error here as well as a finding above.
+    match serde_json::from_str::<PluginManifest>(&text) {
         Ok(manifest) => Some(manifest),
         Err(error) => {
             report.push(Finding::at(
@@ -617,7 +853,11 @@ fn check_closed_vocabularies(value: &serde_json::Value, report: &mut Report) {
     }
 }
 
-fn check_manifest(manifest: &PluginManifest, report: &mut Report) {
+fn check_manifest(
+    manifest: &PluginManifest,
+    connector: Option<&ConnectorManifest>,
+    report: &mut Report,
+) {
     if manifest.manifest_version != PluginManifest::CURRENT_VERSION {
         report.push(Finding::at(
             FindingCode::ManifestVersionUnsupported,
@@ -710,23 +950,282 @@ fn check_manifest(manifest: &PluginManifest, report: &mut Report) {
             ));
         }
         check_parameters(&action.parameters, &format!("action {}", action.id), report);
+        check_implementation(manifest, connector, action, report);
     }
 
-    if manifest.native_bridge.0.is_some()
-        && !manifest.requests(PluginCapability::NativeBridgeInstall)
-    {
+    if let Some(bridge) = &manifest.native_bridge.0 {
+        if !manifest.requests(PluginCapability::NativeBridgeInstall) {
+            report.push(Finding::at(
+                FindingCode::BridgeWithoutCapability,
+                MANIFEST_FILE,
+                "the package installs a native bridge without requesting native_bridge.install",
+            ));
+        }
+        check_bridge(manifest, bridge, report);
+    }
+    if let Some(attachments) = &manifest.attachments.0 {
+        if !manifest.requests(PluginCapability::UpstreamAction) {
+            report.push(Finding::at(
+                FindingCode::AttachmentWithoutCapability,
+                MANIFEST_FILE,
+                "the package contributes attachments without requesting upstream.action",
+            ));
+        }
+        // Writing a path into the terminal draft is terminal input, whatever it is for. Section 11
+        // keeps input authority separate from every other grant, so the capability is separate too.
+        if attachments.insertion == AttachmentInsertion::TerminalDraftPath
+            && !manifest.requests(PluginCapability::TerminalInput)
+        {
+            report.push(Finding::at(
+                FindingCode::AttachmentWithoutCapability,
+                MANIFEST_FILE,
+                "inserting an attachment path into the terminal draft is terminal input; the package does not request terminal.input",
+            ));
+        }
+        if attachments.max_bytes.get() == 0 || attachments.max_count.get() == 0 {
+            report.push(Finding::at(
+                FindingCode::ParameterSchemaInvalid,
+                MANIFEST_FILE,
+                "an attachment contribution that accepts no bytes or no files accepts nothing",
+            ));
+        }
+    }
+}
+
+/// Checks that an action's implementation can produce its effect and reaches only what the package
+/// carries.
+fn check_implementation(
+    manifest: &PluginManifest,
+    connector: Option<&ConnectorManifest>,
+    action: &ActionDeclaration,
+    report: &mut Report,
+) {
+    let implementation = &action.implementation;
+    if !implementation.permits(action.effect) {
         report.push(Finding::at(
-            FindingCode::BridgeWithoutCapability,
+            FindingCode::ImplementationMismatch,
             MANIFEST_FILE,
-            "the package installs a native bridge without requesting native_bridge.install",
+            format!(
+                "the action {} is implemented as {} but declares the effect {}",
+                action.id,
+                implementation.kind(),
+                action.effect
+            ),
         ));
     }
-    if manifest.attachments.0.is_some() && !manifest.requests(PluginCapability::UpstreamAction) {
+    if implementation.needs_component() && !manifest.has_component() {
         report.push(Finding::at(
-            FindingCode::AttachmentWithoutCapability,
+            FindingCode::ImplementationUnsatisfied,
             MANIFEST_FILE,
-            "the package contributes attachments without requesting upstream.action",
+            format!(
+                "the action {} is prepared by a component and the package ships none",
+                action.id
+            ),
         ));
+    }
+    let declared: BTreeSet<&crate::ids::ParameterName> = action
+        .parameters
+        .parameters
+        .iter()
+        .map(|parameter| &parameter.name)
+        .collect();
+    for referenced in implementation.referenced_parameters() {
+        if !declared.contains(referenced) {
+            report.push(Finding::at(
+                FindingCode::ImplementationUnsatisfied,
+                MANIFEST_FILE,
+                format!(
+                    "the action {} refers to the parameter {referenced}, which it does not declare",
+                    action.id
+                ),
+            ));
+        }
+    }
+    match implementation {
+        ActionImplementation::UpstreamMethod { method, bindings } => {
+            match connector {
+                None => report.push(Finding::at(
+                    FindingCode::ImplementationUnsatisfied,
+                    MANIFEST_FILE,
+                    format!(
+                        "the action {} sends the method {method} and the package ships no connector table",
+                        action.id
+                    ),
+                )),
+                Some(connector) => {
+                    if !connector.routes.iter().any(|route| &route.method == method) {
+                        report.push(Finding::at(
+                            FindingCode::ImplementationUnsatisfied,
+                            MANIFEST_FILE,
+                            format!(
+                                "the action {} sends the method {method}, which the connector table does not route",
+                                action.id
+                            ),
+                        ));
+                    }
+                    if connector.classify(method) == MethodClass::Unsupported {
+                        report.push(Finding::at(
+                            FindingCode::ImplementationUnsatisfied,
+                            MANIFEST_FILE,
+                            format!(
+                                "the action {} sends {method}, which the connector table classifies as unsupported",
+                                action.id
+                            ),
+                        ));
+                    }
+                }
+            }
+            let mut bound = BTreeSet::new();
+            for binding in bindings {
+                if !bound.insert(&binding.parameter) {
+                    report.push(Finding::at(
+                        FindingCode::ImplementationUnsatisfied,
+                        MANIFEST_FILE,
+                        format!(
+                            "the action {} binds the parameter {} more than once",
+                            action.id, binding.parameter
+                        ),
+                    ));
+                }
+                check_field_path(&binding.field, &format!("action {}", action.id), report);
+            }
+            for parameter in &action.parameters.parameters {
+                if parameter.required && !bound.contains(&parameter.name) {
+                    report.push(Finding::at(
+                        FindingCode::ImplementationUnsatisfied,
+                        MANIFEST_FILE,
+                        format!(
+                            "the action {} requires the parameter {} and binds it to nothing",
+                            action.id, parameter.name
+                        ),
+                    ));
+                }
+            }
+        }
+        ActionImplementation::TerminalText { template }
+            if template.is_empty() || template.len() > MAX_TEXT_SEGMENTS =>
+        {
+            report.push(Finding::at(
+                FindingCode::ImplementationUnsatisfied,
+                MANIFEST_FILE,
+                format!(
+                    "the action {} has {} template segments; the range is 1 to {MAX_TEXT_SEGMENTS}",
+                    action.id,
+                    template.len()
+                ),
+            ));
+        }
+        _ => {}
+    }
+}
+
+/// Checks a native bridge recipe against the payloads the package declares.
+fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut Report) {
+    if bridge.install.is_empty() {
+        report.push(Finding::at(
+            FindingCode::BridgeRecipeInvalid,
+            MANIFEST_FILE,
+            "a native bridge recipe that installs nothing has nothing to grant",
+        ));
+    }
+    if bridge.application_range.is_unbounded() {
+        report.push(Finding::at(
+            FindingCode::BridgeRecipeInvalid,
+            MANIFEST_FILE,
+            "the bridge's application range admits versions nobody wrote the recipe for",
+        ));
+    }
+    let mut written: BTreeSet<(String, Option<String>)> = BTreeSet::new();
+    for step in &bridge.install {
+        let (path, key) = step.writes();
+        if !written.insert((path.to_string(), key.map(str::to_owned))) {
+            report.push(Finding::at(
+                FindingCode::BridgeRecipeInvalid,
+                MANIFEST_FILE,
+                format!("the recipe writes {path} more than once"),
+            ));
+        }
+        match step {
+            BridgeStep::InstallFile { source, digest, .. } => {
+                match manifest
+                    .payloads
+                    .iter()
+                    .find(|payload| &payload.path == source)
+                {
+                    None => report.push(Finding::at(
+                        FindingCode::BridgeRecipeInvalid,
+                        MANIFEST_FILE,
+                        format!(
+                            "the recipe installs {source}, which the manifest does not declare"
+                        ),
+                    )),
+                    Some(payload) => {
+                        if payload.role != PayloadRole::NativeBridge {
+                            report.push(Finding::at(
+                                FindingCode::BridgeRecipeInvalid,
+                                MANIFEST_FILE,
+                                format!(
+                                    "{source} is installed as a bridge file and declared as {:?}",
+                                    payload.role
+                                ),
+                            ));
+                        }
+                        if &payload.digest != digest {
+                            report.push(Finding::at(
+                                FindingCode::BridgeRecipeInvalid,
+                                MANIFEST_FILE,
+                                format!(
+                                    "the recipe installs {source} as {digest} and the manifest declares {}",
+                                    payload.digest
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            BridgeStep::AddConfigurationKey { file, key, value } => {
+                if key.is_empty() {
+                    report.push(Finding::at(
+                        FindingCode::BridgeRecipeInvalid,
+                        MANIFEST_FILE,
+                        format!("the recipe adds an unnamed key to {file}"),
+                    ));
+                }
+                if serde_json::from_str::<serde_json::Value>(value).is_err() {
+                    report.push(Finding::at(
+                        FindingCode::BridgeRecipeInvalid,
+                        MANIFEST_FILE,
+                        format!("the value the recipe writes to {file} {key} is not JSON"),
+                    ));
+                }
+            }
+        }
+    }
+    let mut undone: BTreeSet<(String, Option<String>)> = BTreeSet::new();
+    for step in &bridge.remove {
+        let (path, key) = step.undoes();
+        undone.insert((path.to_string(), key.map(str::to_owned)));
+    }
+    for (path, key) in &written {
+        if !undone.contains(&(path.clone(), key.clone())) {
+            report.push(Finding::at(
+                FindingCode::BridgeRecipeInvalid,
+                MANIFEST_FILE,
+                match key {
+                    Some(key) => format!("the recipe adds {path} {key} and never removes it"),
+                    None => format!("the recipe installs {path} and never removes it"),
+                },
+            ));
+        }
+    }
+    for (path, key) in &undone {
+        if !written.contains(&(path.clone(), key.clone())) {
+            report.push(Finding::at(
+                FindingCode::BridgeRecipeInvalid,
+                MANIFEST_FILE,
+                format!("the recipe removes {path}, which it never installed"),
+            ));
+        }
     }
 }
 
@@ -767,7 +1266,7 @@ fn check_parameters(schema: &ParameterSchema, owner: &str, report: &mut Report) 
                     format!("{owner} declares an empty range for {}", parameter.name),
                 ));
             }
-            ParameterKind::Text { max_length, .. } if *max_length == 0 => {
+            ParameterKind::Text { max_length, .. } if max_length.get() == 0 => {
                 report.push(Finding::new(
                     FindingCode::ParameterSchemaInvalid,
                     format!(
@@ -844,6 +1343,16 @@ fn check_payloads(manifest: &PluginManifest, files: &[PackageFile], report: &mut
             ));
         }
     }
+    check_payload_roles(manifest, report);
+
+    if manifest.declares_more_than(MAX_PACKAGE_BYTES) {
+        report.push(Finding::at(
+            FindingCode::PackageTooLarge,
+            MANIFEST_FILE,
+            format!("the manifest declares more than the {MAX_PACKAGE_BYTES} byte package limit"),
+        ));
+    }
+
     let declared_total = manifest.declared_size_bytes();
     let actual_total: u64 = files
         .iter()
@@ -856,6 +1365,88 @@ fn check_payloads(manifest: &PluginManifest, files: &[PackageFile], report: &mut
             format!(
                 "the package expands to {actual_total} bytes against {declared_total} declared"
             ),
+        ));
+    }
+}
+
+/// Checks that the structural payload roles sit where the package contract puts them.
+///
+/// A host that asks for the connector payload gets one answer, and validation checks one file. If
+/// a package could declare `connector.json` as an asset and something else as the connector, those
+/// two would be different files.
+fn check_payload_roles(manifest: &PluginManifest, report: &mut Report) {
+    const STRUCTURAL: &[(PayloadRole, &str)] = &[
+        (PayloadRole::Presentation, PRESENTATION_FILE),
+        (PayloadRole::Connector, CONNECTOR_FILE),
+    ];
+    for (role, expected) in STRUCTURAL {
+        let declared: Vec<&PayloadRef> = manifest
+            .payloads
+            .iter()
+            .filter(|payload| payload.role == *role)
+            .collect();
+        if declared.len() > 1 {
+            report.push(Finding::at(
+                FindingCode::PayloadRoleInvalid,
+                MANIFEST_FILE,
+                format!(
+                    "the manifest declares {} payloads with the role {role:?}",
+                    declared.len()
+                ),
+            ));
+        }
+        for payload in declared {
+            if payload.path.as_str() != *expected {
+                report.push(Finding::at(
+                    FindingCode::PayloadRoleInvalid,
+                    payload.path.to_string(),
+                    format!("a payload with the role {role:?} is {expected}"),
+                ));
+            }
+        }
+        for payload in &manifest.payloads {
+            if payload.path.as_str() == *expected && payload.role != *role {
+                report.push(Finding::at(
+                    FindingCode::PayloadRoleInvalid,
+                    payload.path.to_string(),
+                    format!(
+                        "{expected} is declared as {:?} rather than {role:?}",
+                        payload.role
+                    ),
+                ));
+            }
+        }
+    }
+    let components: Vec<&PayloadRef> = manifest
+        .payloads
+        .iter()
+        .filter(|payload| payload.role == PayloadRole::Component)
+        .collect();
+    if components.len() > 1 {
+        report.push(Finding::at(
+            FindingCode::PayloadRoleInvalid,
+            MANIFEST_FILE,
+            "the manifest declares more than one component",
+        ));
+    }
+    for payload in components {
+        if !payload.path.as_str().ends_with(".wasm") {
+            report.push(Finding::at(
+                FindingCode::PayloadRoleInvalid,
+                payload.path.to_string(),
+                "a component is a .wasm file",
+            ));
+        }
+    }
+    if manifest
+        .payloads
+        .iter()
+        .any(|payload| payload.path.as_str() == MANIFEST_FILE)
+    {
+        report.push(Finding::at(
+            FindingCode::PayloadRoleInvalid,
+            MANIFEST_FILE,
+            "the manifest does not declare itself; its digest belongs in the catalogue index entry",
         ));
     }
 }
@@ -879,8 +1470,17 @@ fn check_presentation(
     let mut controls: Vec<&Control> = Vec::new();
     let mut node_ids = BTreeSet::new();
     for node in &presentation.nodes {
-        node_ids.insert(node.id.clone());
+        if !node_ids.insert(node.id.clone()) {
+            report.push(Finding::at(
+                FindingCode::DuplicateElementId,
+                PRESENTATION_FILE,
+                format!("two nodes share the identifier {}", node.id),
+            ));
+        }
         controls.extend(node.body.controls());
+        if let NodeBody::Form { fields, .. } = &node.body {
+            check_parameters(fields, &format!("the form {}", node.id), report);
+        }
         for action_id in node.body.action_ids() {
             if !registered.contains(&action_id) {
                 report.push(Finding::at(
@@ -906,7 +1506,13 @@ fn check_presentation(
     }
     let mut control_ids = BTreeSet::new();
     for control in &controls {
-        control_ids.insert(control.id.clone());
+        if !control_ids.insert(control.id.clone()) {
+            report.push(Finding::at(
+                FindingCode::DuplicateElementId,
+                PRESENTATION_FILE,
+                format!("two controls share the identifier {}", control.id),
+            ));
+        }
         for (name, predicate) in [
             ("visible_when", &control.visible_when),
             ("enabled_when", &control.enabled_when),
@@ -924,6 +1530,13 @@ fn check_presentation(
             &format!("control {}", control.id),
             report,
         );
+        if let Some(action) = manifest
+            .actions
+            .iter()
+            .find(|action| action.id == control.action_id)
+        {
+            check_control_narrows(control, action, report);
+        }
     }
     for node_id in presentation
         .voice
@@ -965,6 +1578,72 @@ fn check_presentation(
     }
 }
 
+/// Checks that a control's parameters narrow its action's rather than widening them.
+///
+/// A control may supply fewer parameters than its action accepts, which is how one action serves
+/// several controls. It may not introduce a parameter the action does not declare, change what one
+/// accepts, or make an optional parameter required, because the host checks the invocation against
+/// the action's schema and a control that promises otherwise produces a control that fails.
+fn check_control_narrows(control: &Control, action: &ActionDeclaration, report: &mut Report) {
+    for parameter in &control.parameters.parameters {
+        match action
+            .parameters
+            .parameters
+            .iter()
+            .find(|declared| declared.name == parameter.name)
+        {
+            None => report.push(Finding::at(
+                FindingCode::ControlParametersWiden,
+                PRESENTATION_FILE,
+                format!(
+                    "the control {} declares the parameter {}, which the action {} does not",
+                    control.id, parameter.name, action.id
+                ),
+            )),
+            Some(declared) => {
+                if declared.kind != parameter.kind {
+                    report.push(Finding::at(
+                        FindingCode::ControlParametersWiden,
+                        PRESENTATION_FILE,
+                        format!(
+                            "the control {} accepts a different value for {} than the action {}",
+                            control.id, parameter.name, action.id
+                        ),
+                    ));
+                }
+                if parameter.required && !declared.required {
+                    report.push(Finding::at(
+                        FindingCode::ControlParametersWiden,
+                        PRESENTATION_FILE,
+                        format!(
+                            "the control {} requires {}, which the action {} treats as optional",
+                            control.id, parameter.name, action.id
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    for declared in &action.parameters.parameters {
+        if declared.required
+            && !control
+                .parameters
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == declared.name)
+        {
+            report.push(Finding::at(
+                FindingCode::ControlParametersWiden,
+                PRESENTATION_FILE,
+                format!(
+                    "the control {} omits {}, which the action {} requires",
+                    control.id, declared.name, action.id
+                ),
+            ));
+        }
+    }
+}
+
 fn check_connector_presence(
     manifest: &PluginManifest,
     connector_present: bool,
@@ -1001,6 +1680,37 @@ fn check_connector_presence(
     }
 }
 
+/// Checks one bounded field path.
+fn check_field_path(path: &FieldPath, owner: &str, report: &mut Report) {
+    if path.segments.is_empty() || path.segments.len() > MAX_FIELD_PATH_DEPTH {
+        report.push(Finding::new(
+            FindingCode::ConnectorTableInvalid,
+            format!(
+                "{owner} has a field path with {} segments; the range is 1 to {MAX_FIELD_PATH_DEPTH}",
+                path.segments.len()
+            ),
+        ));
+    }
+    for segment in &path.segments {
+        if let crate::connector::FieldSegment::Member { name } = segment
+            && name.is_empty()
+        {
+            report.push(Finding::new(
+                FindingCode::ConnectorTableInvalid,
+                format!("{owner} has a field path with an unnamed member"),
+            ));
+        }
+    }
+}
+
+/// Returns true when text is a usable header name.
+fn is_header_name(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_ascii_graphic() && character != ':')
+}
+
 fn check_connector(connector: &ConnectorManifest, report: &mut Report) {
     if connector.methods.len() > MAX_CLASSIFIED_METHODS {
         report.push(Finding::at(
@@ -1016,7 +1726,7 @@ fn check_connector(connector: &ConnectorManifest, report: &mut Report) {
         report.push(Finding::at(
             FindingCode::ConnectorTableInvalid,
             CONNECTOR_FILE,
-            "qualified_range admits every protocol version, including ones nobody tested",
+            "qualified_range admits protocol versions nobody tested",
         ));
     } else if !connector
         .protocol
@@ -1032,27 +1742,89 @@ fn check_connector(connector: &ConnectorManifest, report: &mut Report) {
             ),
         ));
     }
-    for path in [&connector.request_id_path, &connector.method_path] {
-        if path.segments.is_empty() || path.segments.len() > MAX_FIELD_PATH_DEPTH {
+
+    check_field_path(&connector.request_id_path, "the connector table", report);
+    check_field_path(&connector.method_path, "the connector table", report);
+    if let crate::connector::ResponseCorrelation::MatchingId { id_path } =
+        &connector.response_correlation
+    {
+        check_field_path(id_path, "the response correlation", report);
+    }
+
+    let bytes = connector.framing.max_message_bytes();
+    if !Framing::MESSAGE_BYTES_RANGE.contains(&bytes) {
+        report.push(Finding::at(
+            FindingCode::ConnectorTableInvalid,
+            CONNECTOR_FILE,
+            format!(
+                "the framing accepts {bytes} bytes per message; the range is {} to {}",
+                Framing::MESSAGE_BYTES_RANGE.start(),
+                Framing::MESSAGE_BYTES_RANGE.end()
+            ),
+        ));
+    }
+    match &connector.framing {
+        Framing::LengthPrefixed { prefix_bytes, .. }
+            if !Framing::PREFIX_WIDTHS.contains(prefix_bytes) =>
+        {
             report.push(Finding::at(
                 FindingCode::ConnectorTableInvalid,
                 CONNECTOR_FILE,
                 format!(
-                    "a field path has {} segments; the range is 1 to {MAX_FIELD_PATH_DEPTH}",
-                    path.segments.len()
+                    "a length prefix is {:?} bytes wide, not {prefix_bytes}",
+                    Framing::PREFIX_WIDTHS
+                ),
+            ));
+        }
+        Framing::ContentLength { length_header, .. } if !is_header_name(length_header) => {
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                format!("{length_header:?} is not a header name"),
+            ));
+        }
+        _ => {}
+    }
+
+    // One method, one route, one classification. A table that answers a question twice is a table
+    // whose answer depends on which copy a reader happens to look at.
+    let mut routed = BTreeSet::new();
+    let mut wire_names = BTreeSet::new();
+    for route in &connector.routes {
+        if !routed.insert(&route.method) {
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                format!("the table routes {} more than once", route.method),
+            ));
+        }
+        if route.wire_name.is_empty() {
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                format!("the route for {} has no wire name", route.method),
+            ));
+        }
+        if !wire_names.insert(route.wire_name.as_str()) {
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                format!(
+                    "two routes share the wire name {:?}, so a message cannot be routed",
+                    route.wire_name
                 ),
             ));
         }
     }
-    if connector.framing.max_message_bytes() == 0 {
-        report.push(Finding::at(
-            FindingCode::ConnectorTableInvalid,
-            CONNECTOR_FILE,
-            "a framing that accepts no bytes cannot carry a message",
-        ));
-    }
-    let routed: BTreeSet<_> = connector.routes.iter().map(|route| &route.method).collect();
+    let mut classified = BTreeSet::new();
     for entry in &connector.methods {
+        if !classified.insert(&entry.method) {
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                format!("the table classifies {} more than once", entry.method),
+            ));
+        }
         if !routed.contains(&entry.method) {
             report.push(Finding::at(
                 FindingCode::ConnectorMethodUnrouted,
@@ -1060,6 +1832,18 @@ fn check_connector(connector: &ConnectorManifest, report: &mut Report) {
                 format!(
                     "the table classifies {} without routing it, so the classification is never used",
                     entry.method
+                ),
+            ));
+        }
+    }
+    for route in &connector.routes {
+        if !classified.contains(&route.method) {
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                format!(
+                    "the table routes {} without classifying it; an unclassified method is treated as a mutation",
+                    route.method
                 ),
             ));
         }

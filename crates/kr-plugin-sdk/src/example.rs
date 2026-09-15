@@ -13,7 +13,8 @@ use kr_protocol::scalars::Nullable;
 use crate::capability::{CapabilityRequest, PluginCapability};
 use crate::digest::{ByteSize, PayloadDigest};
 use crate::effect::{
-    ActionDeclaration, EffectClass, ParameterDeclaration, ParameterKind, ParameterSchema,
+    ActionDeclaration, ActionImplementation, EffectClass, ParameterDeclaration, ParameterKind,
+    ParameterSchema,
 };
 use crate::ids::{ActionName, ControlId, NodeId, ParameterName, PluginName, PublisherId};
 use crate::matching::{
@@ -214,6 +215,7 @@ pub fn example_manifest_for(presentation_bytes: &[u8]) -> PluginManifest {
             id: ActionName::new("status.refresh").expect("a literal action name"),
             label: label("Refresh status"),
             effect: EffectClass::Observe,
+            implementation: ActionImplementation::Presentation {},
             parameters: ParameterSchema {
                 parameters: vec![ParameterDeclaration {
                     name: ParameterName::new("detail").expect("a literal parameter name"),
@@ -275,6 +277,344 @@ fn render<T: serde::Serialize>(value: &T) -> String {
     let mut text = serde_json::to_string_pretty(value).expect("the example is serialisable");
     text.push('\n');
     text
+}
+
+/// The example connector plugin name.
+pub const CONNECTOR_PLUGIN_NAME: &str = "example-connector";
+
+/// Returns the example connector's presentation document.
+///
+/// # Panics
+///
+/// Panics when a literal in this function is not a valid identifier or label.
+#[must_use]
+pub fn example_connector_presentation() -> PresentationManifest {
+    let send = Control {
+        id: ControlId::new("send").expect("a literal control id"),
+        revision: NodeRevision::new(1),
+        label: label("Send prompt"),
+        icon: StandardIcon::Send,
+        accessible_description: AccessibleDescription::new(
+            "Send the prompt to the bound application",
+        )
+        .expect("a literal description"),
+        action_id: ActionName::new("prompt.send").expect("a literal action name"),
+        parameters: prompt_parameters(),
+        priority: SemanticPriority::Primary,
+        visible_when: Predicate::Grant {
+            right: crate::effect::ActionRight::AgentPrompt,
+        },
+        enabled_when: Predicate::All {
+            terms: vec![
+                Predicate::Binding {
+                    state: BindingState::Bound,
+                },
+                Predicate::Not {
+                    term: Box::new(Predicate::Binding {
+                        state: BindingState::UpstreamBusy,
+                    }),
+                },
+            ],
+        },
+        disabled_reason: Nullable(Some(
+            crate::text::DisabledReason::new("The application is working on the last prompt")
+                .expect("a literal reason"),
+        )),
+    };
+
+    PresentationManifest {
+        manifest_version: 1,
+        base_revision: NodeRevision::new(1),
+        nodes: vec![
+            DocumentNode {
+                id: NodeId::new("compose").expect("a literal node id"),
+                revision: NodeRevision::new(1),
+                body: NodeBody::Form {
+                    title: label("Prompt"),
+                    fields: prompt_parameters(),
+                    submit: send,
+                },
+            },
+            DocumentNode {
+                id: NodeId::new("activity").expect("a literal node id"),
+                revision: NodeRevision::new(1),
+                body: NodeBody::Progress {
+                    label: label("Working"),
+                    state: ProgressState::Indeterminate {},
+                },
+            },
+        ],
+        voice: VoiceProjection {
+            status_nodes: vec![NodeId::new("activity").expect("a literal node id")],
+            choice_controls: vec![ControlId::new("send").expect("a literal control id")],
+            detail_nodes: Vec::new(),
+        },
+    }
+}
+
+fn prompt_parameters() -> ParameterSchema {
+    ParameterSchema {
+        parameters: vec![
+            ParameterDeclaration {
+                name: ParameterName::new("text").expect("a literal parameter name"),
+                kind: ParameterKind::Text {
+                    max_length: crate::scalars::Count::new(8_000),
+                    multiline: true,
+                },
+                label: label("Prompt"),
+                required: true,
+            },
+            ParameterDeclaration {
+                name: ParameterName::new("queue").expect("a literal parameter name"),
+                kind: ParameterKind::Boolean {},
+                label: label("Queue behind the current turn"),
+                required: false,
+            },
+        ],
+    }
+}
+
+fn member(name: &str) -> crate::connector::FieldSegment {
+    crate::connector::FieldSegment::Member {
+        name: name.to_owned(),
+    }
+}
+
+/// Returns the example connector's native-proxy table.
+///
+/// # Panics
+///
+/// Panics when a literal in this function is not a valid identifier.
+#[must_use]
+pub fn example_connector_table() -> crate::connector::ConnectorManifest {
+    use crate::connector::{
+        BrokerTransport, ConnectorManifest, FieldPath, Framing, MethodClass, MethodClassification,
+        ProtocolPin, ResponseCorrelation, Route, RouteDirection,
+    };
+    use crate::ids::MethodName;
+
+    let path = |name: &str| FieldPath {
+        segments: vec![member(name)],
+    };
+
+    ConnectorManifest {
+        manifest_version: 1,
+        plugin_id: crate::ids::plugin_id(
+            &PublisherId::new(PUBLISHER).expect("a literal publisher id"),
+            &PluginName::new(CONNECTOR_PLUGIN_NAME).expect("a literal plugin name"),
+        ),
+        protocol: ProtocolPin {
+            name: "example-agent-rpc".to_owned(),
+            qualified_range: VersionRange::parse(">=1.0.0, <2.0.0").expect("a literal range"),
+            tested_version: PackageVersion::parse("1.2.0").expect("a literal version"),
+        },
+        transport: BrokerTransport::Stdio,
+        framing: Framing::LineDelimitedJson {
+            max_message_bytes: crate::scalars::U64::new(1_048_576),
+        },
+        request_id_path: path("id"),
+        method_path: path("method"),
+        response_correlation: ResponseCorrelation::MatchingId {
+            id_path: path("id"),
+        },
+        routes: vec![
+            Route {
+                method: MethodName::new("turn.start").expect("a literal method name"),
+                wire_name: "turn/start".to_owned(),
+                direction: RouteDirection::HostToUpstream,
+            },
+            Route {
+                method: MethodName::new("turn.cancel").expect("a literal method name"),
+                wire_name: "turn/cancel".to_owned(),
+                direction: RouteDirection::HostToUpstream,
+            },
+            Route {
+                method: MethodName::new("status.read").expect("a literal method name"),
+                wire_name: "status/read".to_owned(),
+                direction: RouteDirection::HostToUpstream,
+            },
+            Route {
+                method: MethodName::new("credential.read").expect("a literal method name"),
+                wire_name: "credential/read".to_owned(),
+                direction: RouteDirection::UpstreamToHost,
+            },
+        ],
+        methods: vec![
+            MethodClassification {
+                method: MethodName::new("turn.start").expect("a literal method name"),
+                class: MethodClass::Mutation,
+                evidence: summary("Starts a turn, which writes to the workspace"),
+            },
+            MethodClassification {
+                method: MethodName::new("turn.cancel").expect("a literal method name"),
+                class: MethodClass::Mutation,
+                evidence: summary("Ends the current turn"),
+            },
+            MethodClassification {
+                method: MethodName::new("status.read").expect("a literal method name"),
+                class: MethodClass::Observation,
+                evidence: summary("Returns the current turn state and nothing else"),
+            },
+            MethodClassification {
+                method: MethodName::new("credential.read").expect("a literal method name"),
+                class: MethodClass::Credential,
+                evidence: summary("Carries the upstream token; the broker keeps it"),
+            },
+        ],
+        volatile_forwarding: false,
+        qualification_note: Nullable(Some(summary(
+            "Qualified against example-agent 1.2.0 with the published protocol reference",
+        ))),
+    }
+}
+
+/// Returns the example connector's manifest for the given payload bytes.
+///
+/// # Panics
+///
+/// Panics when a literal in this function is not a valid identifier or label.
+#[must_use]
+pub fn example_connector_manifest(
+    presentation_bytes: &[u8],
+    connector_bytes: &[u8],
+) -> PluginManifest {
+    use crate::connector::FieldPath;
+    use crate::effect::{ActionImplementation, ParameterBinding};
+    use crate::ids::MethodName;
+
+    PluginManifest {
+        manifest_version: PluginManifest::CURRENT_VERSION,
+        publisher_id: PublisherId::new(PUBLISHER).expect("a literal publisher id"),
+        plugin_name: PluginName::new(CONNECTOR_PLUGIN_NAME).expect("a literal plugin name"),
+        version: PackageVersion::parse("0.1.0").expect("a literal version"),
+        display_name: label("Example connector package"),
+        description: CompactDescription::new(
+            "Recognises the example agent, reads its protocol through a declarative table and sends prompts.",
+        )
+        .expect("a literal description"),
+        sdk_range: VersionRange::parse(">=0.1.0, <0.2.0").expect("a literal range"),
+        wit_range: VersionRange::parse(">=0.1.0, <0.2.0").expect("a literal range"),
+        source: SourcePin {
+            repository: "https://github.com/kalapowered/kalareach-plugins".to_owned(),
+            revision: "refs/tags/example-connector-0.1.0".to_owned(),
+        },
+        match_rules: vec![MatchRule {
+            id: PluginName::new("example-agent").expect("a literal rule id"),
+            executable: ExecutableMatch {
+                file_stem: "example-agent".to_owned(),
+                path_suffix: Vec::new(),
+                version_range: Nullable(Some(
+                    VersionRange::parse(">=1.0.0, <2.0.0").expect("a literal range"),
+                )),
+            },
+            distribution: Nullable(Some(DistributionMatch::Npm {
+                package: "@kalareach/example-agent".to_owned(),
+            })),
+            confidence: MatchConfidence::Exact,
+        }],
+        platforms: vec![
+            PlatformSupport {
+                os: OperatingSystem::Linux,
+                architectures: vec![Architecture::X86_64, Architecture::Aarch64],
+            },
+            PlatformSupport {
+                os: OperatingSystem::MacOs,
+                architectures: vec![Architecture::Aarch64],
+            },
+        ],
+        payloads: vec![
+            PayloadRef {
+                role: PayloadRole::Connector,
+                path: PackagePath::new(crate::package::CONNECTOR_FILE).expect("a literal path"),
+                digest: PayloadDigest::of(connector_bytes),
+                size_bytes: ByteSize::new(connector_bytes.len() as u64),
+            },
+            PayloadRef {
+                role: PayloadRole::Presentation,
+                path: PackagePath::new(PRESENTATION_FILE).expect("a literal path"),
+                digest: PayloadDigest::of(presentation_bytes),
+                size_bytes: ByteSize::new(presentation_bytes.len() as u64),
+            },
+        ],
+        capabilities: vec![
+            CapabilityRequest {
+                capability: PluginCapability::MetadataMatch,
+                reason: summary("Recognise the example agent from its executable and its package"),
+            },
+            CapabilityRequest {
+                capability: PluginCapability::DeclarativePresentation,
+                reason: summary("Present the prompt form and the current activity"),
+            },
+            CapabilityRequest {
+                capability: PluginCapability::BrokerSemanticEvents,
+                reason: summary("Read turn state from the application's own protocol"),
+            },
+            CapabilityRequest {
+                capability: PluginCapability::UpstreamAction,
+                reason: summary("Send a prompt the person wrote to the bound application"),
+            },
+        ],
+        actions: vec![ActionDeclaration {
+            id: ActionName::new("prompt.send").expect("a literal action name"),
+            label: label("Send prompt"),
+            effect: EffectClass::UpstreamPrompt,
+            implementation: ActionImplementation::UpstreamMethod {
+                method: MethodName::new("turn.start").expect("a literal method name"),
+                bindings: vec![
+                    ParameterBinding {
+                        parameter: ParameterName::new("text").expect("a literal parameter name"),
+                        field: FieldPath {
+                            segments: vec![member("params"), member("prompt")],
+                        },
+                    },
+                    ParameterBinding {
+                        parameter: ParameterName::new("queue").expect("a literal parameter name"),
+                        field: FieldPath {
+                            segments: vec![member("params"), member("queue")],
+                        },
+                    },
+                ],
+            },
+            parameters: prompt_parameters(),
+            description: summary("Start a turn with the prompt the person wrote"),
+            confirmation_required: false,
+        }],
+        attachments: Nullable(None),
+        native_bridge: Nullable(None),
+    }
+}
+
+/// Returns the canonical rendering of the example connector's presentation document.
+///
+/// # Panics
+///
+/// Panics when the document cannot be serialised.
+#[must_use]
+pub fn example_connector_presentation_json() -> String {
+    render(&example_connector_presentation())
+}
+
+/// Returns the canonical rendering of the example connector's native-proxy table.
+///
+/// # Panics
+///
+/// Panics when the table cannot be serialised.
+#[must_use]
+pub fn example_connector_table_json() -> String {
+    render(&example_connector_table())
+}
+
+/// Returns the canonical rendering of the example connector's manifest.
+///
+/// # Panics
+///
+/// Panics when the manifest cannot be serialised.
+#[must_use]
+pub fn example_connector_manifest_json() -> String {
+    render(&example_connector_manifest(
+        example_connector_presentation_json().as_bytes(),
+        example_connector_table_json().as_bytes(),
+    ))
 }
 
 #[cfg(test)]

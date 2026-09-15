@@ -37,14 +37,29 @@ fn outputs(out_dir: &Path, fixtures_dir: &Path) -> Vec<(PathBuf, String)> {
         out_dir.join("wit").join(wit::PACKAGE_FILE_NAME),
         wit::PACKAGE.to_owned(),
     ));
-    let package = fixtures_dir.join("valid").join(example::PLUGIN_NAME);
+    let declarative = fixtures_dir.join("valid").join(example::PLUGIN_NAME);
     outputs.push((
-        package.join(package::MANIFEST_FILE),
+        declarative.join(package::MANIFEST_FILE),
         example::example_manifest_json(),
     ));
     outputs.push((
-        package.join(package::PRESENTATION_FILE),
+        declarative.join(package::PRESENTATION_FILE),
         example::example_presentation_json(),
+    ));
+    let connector = fixtures_dir
+        .join("valid")
+        .join(example::CONNECTOR_PLUGIN_NAME);
+    outputs.push((
+        connector.join(package::MANIFEST_FILE),
+        example::example_connector_manifest_json(),
+    ));
+    outputs.push((
+        connector.join(package::PRESENTATION_FILE),
+        example::example_connector_presentation_json(),
+    ));
+    outputs.push((
+        connector.join(package::CONNECTOR_FILE),
+        example::example_connector_table_json(),
     ));
     outputs
 }

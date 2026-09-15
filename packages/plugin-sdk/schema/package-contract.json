@@ -63,7 +63,7 @@
     {
       "capability": "approval.decode",
       "required_right": null,
-      "requires_installation_grant": false,
+      "requires_installation_grant": true,
       "within_default_ceiling": false
     },
     {
@@ -192,18 +192,27 @@
     "connector_undeclared",
     "connector_plugin_mismatch",
     "unknown_effect_class",
-    "unknown_capability"
+    "unknown_capability",
+    "name_not_utf8",
+    "duplicate_member",
+    "payload_role_invalid",
+    "implementation_mismatch",
+    "implementation_unsatisfied",
+    "bridge_recipe_invalid",
+    "duplicate_element_id",
+    "control_parameters_widen",
+    "qualification_invalid"
   ],
   "index_version": 1,
   "instance_limits": {
-    "fault_window_ms": 60000,
+    "fault_window_ms": "60000",
     "faults_before_disable": 3,
-    "interpretation_deadline_ms": 50,
-    "memory_bytes": 67108864,
-    "observation_deadline_ms": 10,
-    "observation_queue_bytes": 4194304,
-    "output_bytes_per_call": 1048576,
-    "snapshot_deadline_ms": 100
+    "interpretation_deadline_ms": "50",
+    "memory_bytes": "67108864",
+    "observation_deadline_ms": "10",
+    "observation_queue_bytes": "4194304",
+    "output_bytes_per_call": "1048576",
+    "snapshot_deadline_ms": "100"
   },
   "manifest_version": 1,
   "package_bounds": {
@@ -220,9 +229,9 @@
   },
   "repository_budgets": {
     "full_offline_mirror": false,
-    "metadata_bytes": 67108864,
-    "metadata_entries": 100000,
-    "payload_cache_bytes": 1073741824
+    "metadata_bytes": "67108864",
+    "metadata_entries": "100000",
+    "payload_cache_bytes": "1073741824"
   },
   "sdk_version": "0.1.0",
   "wit_package": {

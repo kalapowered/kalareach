@@ -1,7 +1,9 @@
 //! The on-disk package layout.
 //!
-//! A package is a directory. `plugin.json` names everything else in it, including itself, so the
-//! manifest digest covers the whole package by transitivity and a host can pin one hash.
+//! A package is a directory. `plugin.json` names every other file in it by digest, so the manifest
+//! digest covers the rest of the package by transitivity. The manifest does not name itself: its
+//! own digest and length live in the catalogue index entry that points at it, which is what a host
+//! pins.
 //!
 //! | File | Required | What it is |
 //! | --- | --- | --- |

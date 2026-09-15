@@ -86,6 +86,9 @@
       "id": "status.refresh",
       "label": "Refresh status",
       "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
       "parameters": {
         "parameters": [
           {

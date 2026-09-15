@@ -29,6 +29,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::scalars::{Count, U64};
+
 /// One mebibyte in bytes.
 pub const MIB: u64 = 1024 * 1024;
 
@@ -79,21 +81,21 @@ pub const MANIFEST_BYTES: u64 = MIB;
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct InstanceLimits {
     /// Linear memory in bytes.
-    pub memory_bytes: u64,
+    pub memory_bytes: U64,
     /// Deadline in milliseconds for `observe` and `prepare-action`.
-    pub observation_deadline_ms: u64,
+    pub observation_deadline_ms: U64,
     /// Deadline in milliseconds for `decode-request` and `encode-response`.
-    pub interpretation_deadline_ms: u64,
+    pub interpretation_deadline_ms: U64,
     /// Deadline in milliseconds for `snapshot`.
-    pub snapshot_deadline_ms: u64,
+    pub snapshot_deadline_ms: U64,
     /// Maximum bytes one call may return.
-    pub output_bytes_per_call: u64,
+    pub output_bytes_per_call: U64,
     /// Size in bytes of the bounded observation queue.
-    pub observation_queue_bytes: u64,
+    pub observation_queue_bytes: U64,
     /// Faults within `fault_window_ms` that disable the binding.
-    pub faults_before_disable: u32,
+    pub faults_before_disable: Count,
     /// The window the fault count is measured over.
-    pub fault_window_ms: u64,
+    pub fault_window_ms: U64,
 }
 
 impl InstanceLimits {
@@ -101,14 +103,14 @@ impl InstanceLimits {
     #[must_use]
     pub const fn defaults() -> Self {
         Self {
-            memory_bytes: INSTANCE_MEMORY_BYTES,
-            observation_deadline_ms: OBSERVATION_DEADLINE_MS,
-            interpretation_deadline_ms: INTERPRETATION_DEADLINE_MS,
-            snapshot_deadline_ms: SNAPSHOT_DEADLINE_MS,
-            output_bytes_per_call: OUTPUT_BYTES_PER_CALL,
-            observation_queue_bytes: OBSERVATION_QUEUE_BYTES,
-            faults_before_disable: FAULTS_BEFORE_DISABLE,
-            fault_window_ms: FAULT_WINDOW_MS,
+            memory_bytes: U64::new(INSTANCE_MEMORY_BYTES),
+            observation_deadline_ms: U64::new(OBSERVATION_DEADLINE_MS),
+            interpretation_deadline_ms: U64::new(INTERPRETATION_DEADLINE_MS),
+            snapshot_deadline_ms: U64::new(SNAPSHOT_DEADLINE_MS),
+            output_bytes_per_call: U64::new(OUTPUT_BYTES_PER_CALL),
+            observation_queue_bytes: U64::new(OBSERVATION_QUEUE_BYTES),
+            faults_before_disable: Count::new(FAULTS_BEFORE_DISABLE),
+            fault_window_ms: U64::new(FAULT_WINDOW_MS),
         }
     }
 }
@@ -124,11 +126,11 @@ impl Default for InstanceLimits {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RepositoryBudgets {
     /// Maximum bytes of catalogue metadata.
-    pub metadata_bytes: u64,
+    pub metadata_bytes: U64,
     /// Maximum number of index entries.
-    pub metadata_entries: u64,
+    pub metadata_entries: U64,
     /// Maximum bytes of cached payloads.
-    pub payload_cache_bytes: u64,
+    pub payload_cache_bytes: U64,
     /// Whether every referenced payload is fetched rather than only what is installed.
     pub full_offline_mirror: bool,
 }
@@ -138,9 +140,9 @@ impl RepositoryBudgets {
     #[must_use]
     pub const fn defaults() -> Self {
         Self {
-            metadata_bytes: METADATA_BUDGET_BYTES,
-            metadata_entries: METADATA_BUDGET_ENTRIES,
-            payload_cache_bytes: PAYLOAD_CACHE_BUDGET_BYTES,
+            metadata_bytes: U64::new(METADATA_BUDGET_BYTES),
+            metadata_entries: U64::new(METADATA_BUDGET_ENTRIES),
+            payload_cache_bytes: U64::new(PAYLOAD_CACHE_BUDGET_BYTES),
             full_offline_mirror: false,
         }
     }
@@ -159,19 +161,19 @@ mod tests {
     #[test]
     fn the_defaults_are_the_specified_numbers() {
         let limits = InstanceLimits::defaults();
-        assert_eq!(limits.memory_bytes, 67_108_864);
-        assert_eq!(limits.observation_deadline_ms, 10);
-        assert_eq!(limits.interpretation_deadline_ms, 50);
-        assert_eq!(limits.snapshot_deadline_ms, 100);
-        assert_eq!(limits.output_bytes_per_call, 1_048_576);
-        assert_eq!(limits.observation_queue_bytes, 4_194_304);
-        assert_eq!(limits.faults_before_disable, 3);
-        assert_eq!(limits.fault_window_ms, 60_000);
+        assert_eq!(limits.memory_bytes.get(), 67_108_864);
+        assert_eq!(limits.observation_deadline_ms.get(), 10);
+        assert_eq!(limits.interpretation_deadline_ms.get(), 50);
+        assert_eq!(limits.snapshot_deadline_ms.get(), 100);
+        assert_eq!(limits.output_bytes_per_call.get(), 1_048_576);
+        assert_eq!(limits.observation_queue_bytes.get(), 4_194_304);
+        assert_eq!(limits.faults_before_disable.get(), 3);
+        assert_eq!(limits.fault_window_ms.get(), 60_000);
 
         let budgets = RepositoryBudgets::defaults();
-        assert_eq!(budgets.metadata_bytes, 67_108_864);
-        assert_eq!(budgets.metadata_entries, 100_000);
-        assert_eq!(budgets.payload_cache_bytes, 1_073_741_824);
+        assert_eq!(budgets.metadata_bytes.get(), 67_108_864);
+        assert_eq!(budgets.metadata_entries.get(), 100_000);
+        assert_eq!(budgets.payload_cache_bytes.get(), 1_073_741_824);
         assert!(!budgets.full_offline_mirror);
     }
 }

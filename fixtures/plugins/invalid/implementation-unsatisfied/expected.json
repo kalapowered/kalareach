@@ -1,0 +1,6 @@
+{
+  "note": "An action that sends an upstream method while the package ships no connector table to route it.",
+  "codes": [
+    "implementation_unsatisfied"
+  ]
+}

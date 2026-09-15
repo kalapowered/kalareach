@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::effect::ParameterSchema;
 use crate::ids::{ActionName, ControlId, NodeId};
 use crate::predicate::Predicate;
+use crate::scalars::{Count, U64};
 use crate::text::{AccessibleDescription, DisabledReason, Label, Summary};
 
 /// The revision of one node or control.
@@ -195,9 +196,9 @@ pub enum ProgressState {
     /// A known fraction of a known total.
     Determinate {
         /// Completed units.
-        completed: u64,
+        completed: U64,
         /// Total units.
-        total: u64,
+        total: U64,
     },
     /// Work is happening and its extent is unknown.
     Indeterminate {},
@@ -214,9 +215,9 @@ pub struct DiffFile {
     /// The path as the upstream reported it.
     pub path: String,
     /// Lines added.
-    pub added: u32,
+    pub added: Count,
     /// Lines removed.
-    pub removed: u32,
+    pub removed: Count,
 }
 
 /// The outcome of a tool call.
@@ -279,8 +280,12 @@ pub enum NodeBody {
         title: Label,
         /// The fields.
         fields: ParameterSchema,
-        /// The action the completed form invokes.
-        submit_action_id: ActionName,
+        /// The control that submits the completed form.
+        ///
+        /// Submission is an action invocation like any other, so it carries a control rather than
+        /// a bare action name: the same label, icon, accessible description, priority, visibility
+        /// and disabled reason every other way of invoking an action carries.
+        submit: Control,
     },
     /// A file the session carries.
     Attachment {
@@ -289,7 +294,7 @@ pub enum NodeBody {
         /// Its name.
         name: Label,
         /// Its size in bytes.
-        size_bytes: u64,
+        size_bytes: U64,
     },
     /// A reference to an approval resource in the ledger.
     ///
@@ -326,8 +331,8 @@ pub enum NodeBody {
     AttachmentEntry {
         /// What it accepts.
         label: Label,
-        /// The action that receives the completed handle.
-        action_id: ActionName,
+        /// The control that receives the completed handle.
+        contribute: Control,
     },
 }
 
@@ -370,10 +375,16 @@ impl NodeBody {
     ];
 
     /// Returns every control this node carries.
+    ///
+    /// Every way a node can invoke an action is a control, so this is the complete list. Nothing
+    /// invokes an action from outside it, which is what lets one pass over the document count the
+    /// controls, check their predicates and check their parameters.
     #[must_use]
     pub fn controls(&self) -> &[Control] {
         match self {
             Self::ActionButton { control } => std::slice::from_ref(control),
+            Self::Form { submit, .. } => std::slice::from_ref(submit),
+            Self::AttachmentEntry { contribute, .. } => std::slice::from_ref(contribute),
             Self::ActionGroup { controls, .. } | Self::CommandPalette { controls } => controls,
             _ => &[],
         }
@@ -382,22 +393,10 @@ impl NodeBody {
     /// Returns every action identifier this node can invoke.
     #[must_use]
     pub fn action_ids(&self) -> Vec<ActionName> {
-        let mut ids: Vec<ActionName> = self
-            .controls()
+        self.controls()
             .iter()
             .map(|control| control.action_id.clone())
-            .collect();
-        match self {
-            Self::Form {
-                submit_action_id, ..
-            }
-            | Self::AttachmentEntry {
-                action_id: submit_action_id,
-                ..
-            } => ids.push(submit_action_id.clone()),
-            _ => {}
-        }
-        ids
+            .collect()
     }
 }
 
@@ -505,6 +504,11 @@ pub struct VoiceProjection {
     pub detail_nodes: Vec<NodeId>,
 }
 
+impl PresentationManifest {
+    /// The manifest format version this crate reads and writes.
+    pub const CURRENT_VERSION: u32 = 1;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +565,24 @@ mod tests {
         };
         let value = serde_json::to_value(&node).expect("serialisable");
         assert_eq!(read_node(&value), Ok(node));
+    }
+
+    #[test]
+    fn a_form_and_an_attachment_entry_carry_controls() {
+        let form = NodeBody::Form {
+            title: Label::new("Ask").expect("valid label"),
+            fields: ParameterSchema::default(),
+            submit: control("submit", "prompt.send"),
+        };
+        assert_eq!(form.controls().len(), 1);
+        assert_eq!(form.action_ids().len(), 1);
+
+        let entry = NodeBody::AttachmentEntry {
+            label: Label::new("Attach").expect("valid label"),
+            contribute: control("attach", "prompt.attach"),
+        };
+        assert_eq!(entry.controls().len(), 1);
+        assert_eq!(entry.action_ids().len(), 1);
     }
 
     #[test]

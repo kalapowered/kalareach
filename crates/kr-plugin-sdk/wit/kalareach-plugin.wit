@@ -70,6 +70,22 @@ interface types {
         value: argument,
     }
 
+    /// A token bound to one invocation.
+    ///
+    /// The host issues it, the component only reads it. It binds the actor, the grant, the
+    /// application and thread revision, the declared action and the hash of exactly the parameters
+    /// a person saw, so a plan prepared under it cannot be replayed under a different actor, a
+    /// different binding or different parameters.
+    record action-token {
+        actor-id: id,
+        grant-id: id,
+        binding-revision: revision,
+        thread-revision: option<revision>,
+        action-id: id,
+        parameter-hash: list<u8>,
+        expires-at: timestamp-ms,
+    }
+
     /// Why a call could not produce a result.
     variant fault {
         /// The input did not match what this component understands.
@@ -198,7 +214,7 @@ interface document {
 
 /// What a component implements.
 interface adapter {
-    use types.{id, revision, effect-class, method-class, named-argument, fault, source-event-handle, native-request-id};
+    use types.{id, revision, timestamp-ms, effect-class, method-class, named-argument, fault, source-event-handle, native-request-id, action-token};
 
     /// The binding this instance serves.
     record binding {
@@ -234,6 +250,22 @@ interface adapter {
         presentation: list<string>,
     }
 
+    /// The broker's own record of one pending native request.
+    ///
+    /// The broker owns this, not the component. An encoder receives the request as the broker
+    /// recorded it when it arrived, so a response can be prepared after a component restart and a
+    /// component cannot answer a request it invented.
+    record request-snapshot {
+        request-id: native-request-id,
+        handle: source-event-handle,
+        method: string,
+        class: method-class,
+        received-at: timestamp-ms,
+        deadline-at: option<timestamp-ms>,
+        offered-decisions: list<id>,
+        binding-revision: revision,
+    }
+
     /// An encoded response, prepared but not sent.
     record encoded-response {
         request-id: native-request-id,
@@ -257,8 +289,10 @@ interface adapter {
 
     /// Turns an invoked control into a proposed effect.
     ///
-    /// Runs under the 10 ms deadline. It returns a plan; it sends nothing.
-    prepare-action: func(action-id: id, arguments: list<named-argument>) -> result<effect-plan, fault>;
+    /// Runs under the 10 ms deadline. It returns a plan; it sends nothing. The token is the
+    /// invocation's authority as the host issued it, and the broker checks the returned plan
+    /// against it again before dispatch.
+    prepare-action: func(token: action-token, arguments: list<named-argument>) -> result<effect-plan, fault>;
 
     /// Interprets an immutable native request into a proposed approval resource.
     ///
@@ -268,11 +302,12 @@ interface adapter {
 
     /// Encodes a validated decision as a response to a pending native request.
     ///
-    /// Runs under the 50 ms deadline and under the `approval.respond` grant. It returns bytes; the
-    /// broker rechecks the pending request, the actor grant and the binding revision, then
-    /// atomically claims and dispatches them. A native answer that arrives during encoding wins,
-    /// and this response returns the resolved state instead.
-    encode-response: func(request-id: native-request-id, decision: id) -> result<encoded-response, fault>;
+    /// Runs under the 50 ms deadline and under the `approval.respond` grant. It receives the
+    /// broker's own snapshot of the pending request and the decision the host validated, and it
+    /// returns bytes. The broker then rechecks the pending request, the actor grant and the
+    /// binding revision, and atomically claims and dispatches them. A native answer that arrives
+    /// during encoding wins, and this response returns the resolved state instead.
+    encode-response: func(request: request-snapshot, decision: id) -> result<encoded-response, fault>;
 
     /// Returns the component's own state so a later instance can resume.
     ///

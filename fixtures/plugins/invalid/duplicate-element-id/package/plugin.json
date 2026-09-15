@@ -1,0 +1,108 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "example-declarative",
+  "version": "0.1.0",
+  "display_name": "Example declarative package",
+  "description": "Recognises the example agent and presents its status with one declarative control.",
+  "sdk_range": ">=0.1.0, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "refs/tags/example-declarative-0.1.0"
+  },
+  "match_rules": [
+    {
+      "id": "example-agent",
+      "executable": {
+        "file_stem": "example-agent",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": {
+        "registry": "npm",
+        "package": "@kalareach/example-agent"
+      },
+      "confidence": "exact"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "3c6edd844b9556bd41ee8c8f35ca6c8a8be7d3055de88c814551b7389a1e384e",
+      "size_bytes": "2621"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise the example agent from its executable name"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Present the application's status and one control"
+    },
+    {
+      "capability": "broker.semantic_events",
+      "reason": "Update the status from events the actor may already see"
+    }
+  ],
+  "actions": [
+    {
+      "id": "status.refresh",
+      "label": "Refresh status",
+      "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
+      "parameters": {
+        "parameters": [
+          {
+            "name": "detail",
+            "kind": {
+              "type": "choice",
+              "choices": [
+                {
+                  "id": "summary",
+                  "label": "Summary"
+                },
+                {
+                  "id": "full",
+                  "label": "Everything"
+                }
+              ]
+            },
+            "label": "Detail",
+            "required": false
+          }
+        ]
+      },
+      "description": "Read the bound application's status again and redraw it",
+      "confirmation_required": false
+    }
+  ],
+  "attachments": null,
+  "native_bridge": null
+}

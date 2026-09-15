@@ -22,8 +22,13 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `docs/plugins/` | The plugin reference |
 
 Rust is canonical. The JSON Schema in `packages/protocol/schema/` and `packages/plugin-sdk/schema/`
-comes from the Rust types, and the TypeScript types come from those schemas. Every step is checked
-in CI, so the two languages cannot drift.
+comes from the Rust types, and the TypeScript types come from those schemas. Every step has a check
+mode that CI runs, so a change on one side that is not carried to the other fails the build.
+
+The generated schema carries the shape of each document, not every rule. Rules a schema cannot
+express, such as Windows device names, case-folded path collisions, predicate depth and whether a
+control names a registered action, are checked by the host and by `kr-plugin-sandbox`.
+[docs/plugins/README.md](docs/plugins/README.md) lists them as finding codes.
 
 ## Build and test
 
@@ -37,6 +42,7 @@ cargo test --workspace
 cargo run -p kr-protocol --bin kr-protocol-gen -- --check
 cargo run -p kr-crypto --bin kr-crypto-vectors -- --check
 cargo run -p kr-plugin-sdk --bin kr-plugin-sdk-gen -- --check
+cargo run -p kr-plugin-sdk --bin kr-plugin-sandbox -- fixtures/plugins/valid/example-declarative
 
 pnpm install --frozen-lockfile
 pnpm -r test

@@ -1,0 +1,109 @@
+{
+  "manifest_version": 1,
+  "base_revision": "1",
+  "nodes": [
+    {
+      "id": "intro",
+      "revision": "1",
+      "body": {
+        "kind": "markdown",
+        "source": "The example package recognises an application and presents its status."
+      }
+    },
+    {
+      "id": "status",
+      "revision": "1",
+      "body": {
+        "kind": "progress",
+        "label": "Waiting for the application",
+        "state": {
+          "kind": "indeterminate"
+        }
+      }
+    },
+    {
+      "id": "controls",
+      "revision": "1",
+      "body": {
+        "kind": "action_group",
+        "label": "Status",
+        "controls": [
+          {
+            "id": "refresh",
+            "revision": "1",
+            "label": "Refresh status",
+            "icon": "retry",
+            "accessible_description": "Read the current status of the bound application again",
+            "action_id": "status.refresh",
+            "parameters": {
+              "parameters": [
+                {
+                  "name": "detail",
+                  "kind": {
+                    "type": "choice",
+                    "choices": [
+                      {
+                        "id": "summary",
+                        "label": "Summary"
+                      },
+                      {
+                        "id": "full",
+                        "label": "Everything"
+                      }
+                    ]
+                  },
+                  "label": "Detail",
+                  "required": false
+                }
+              ]
+            },
+            "priority": "secondary",
+            "visible_when": {
+              "op": "not",
+              "term": {
+                "op": "binding",
+                "state": "disabled"
+              }
+            },
+            "enabled_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "binding",
+                  "state": "bound"
+                },
+                {
+                  "op": "not",
+                  "term": {
+                    "op": "flag",
+                    "flag": "transfer_in_progress"
+                  }
+                }
+              ]
+            },
+            "disabled_reason": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "intro",
+      "revision": "1",
+      "body": {
+        "kind": "markdown",
+        "source": "The example package recognises an application and presents its status."
+      }
+    }
+  ],
+  "voice": {
+    "status_nodes": [
+      "status"
+    ],
+    "choice_controls": [
+      "refresh"
+    ],
+    "detail_nodes": [
+      "intro"
+    ]
+  }
+}

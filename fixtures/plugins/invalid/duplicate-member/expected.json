@@ -1,0 +1,6 @@
+{
+  "note": "A manifest that declares one member twice, so a reader and a host could disagree about it.",
+  "codes": [
+    "duplicate_member"
+  ]
+}

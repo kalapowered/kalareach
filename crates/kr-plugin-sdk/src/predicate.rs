@@ -181,9 +181,11 @@ impl Predicate {
 
     /// Evaluates the predicate against what the host currently knows.
     ///
-    /// Evaluation is total: every predicate returns a decision for every context, and an unknown
-    /// fact is false rather than an error, so a control whose condition cannot be established is
-    /// hidden rather than shown.
+    /// Evaluation is total: every predicate returns a decision for every context, and a fact the
+    /// host has no evidence for is false rather than an error. A package can still show a control
+    /// on an unknown fact by negating it, which is why hiding a control is a courtesy rather than
+    /// a check: the host rechecks the right at dispatch, and a control that appears when it should
+    /// not is a control that then fails.
     #[must_use]
     pub fn evaluate(&self, context: &PredicateContext<'_>) -> bool {
         match self {
@@ -318,6 +320,15 @@ mod tests {
             capability: PluginCapability::ApprovalRespond,
             state: CapabilityState::QualifiedAvailable,
         };
-        assert!(!predicate.evaluate(&context(&[], BindingState::Bound, &[])));
+        let context = context(&[], BindingState::Bound, &[]);
+        assert!(!predicate.evaluate(&context));
+        // Negating an unknown fact shows the control. That is visibility, not authority: the host
+        // checks the grant again when the control is invoked.
+        assert!(
+            Predicate::Not {
+                term: Box::new(predicate)
+            }
+            .evaluate(&context)
+        );
     }
 }
