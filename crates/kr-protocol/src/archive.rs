@@ -9,6 +9,7 @@
 //! This module holds the shapes and their limits. `kr-crypto` performs the encryption, the
 //! wrapping and the signing.
 
+use kr_cbor::{CanonicalValue, CborError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +92,29 @@ pub struct KeyWrapContext {
     pub sender_key_id: KeyId,
     /// The recipient's stored-envelope key.
     pub recipient_key_id: KeyId,
+}
+
+/// Builds the authenticated plaintext of one key wrap: `CBOR([context, object_key])`.
+///
+/// The context carries the format, the purpose, the archive, the generation, the object, the
+/// encrypted-object hash and both key identifiers, so a wrap opened against a different object,
+/// generation or recipient fails to authenticate rather than yielding the wrong key.
+///
+/// The returned buffer holds the object key in the clear. Its caller seals it and then zeroises
+/// it; nothing else may hold on to it.
+///
+/// # Errors
+///
+/// Returns a CBOR error when the context is outside KR-CBOR-1.
+pub fn key_wrap_plaintext(
+    context: &KeyWrapContext,
+    object_key: &[u8; 32],
+) -> Result<Vec<u8>, CborError> {
+    let value = CanonicalValue::Array(vec![
+        kr_cbor::to_canonical_value(context)?,
+        CanonicalValue::bytes(object_key.as_slice()),
+    ]);
+    Ok(kr_cbor::encode(&value))
 }
 
 /// One wrapped object key.

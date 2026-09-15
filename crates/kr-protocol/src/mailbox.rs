@@ -49,6 +49,22 @@ pub enum MailboxPayloadType {
     SyncChange,
 }
 
+impl MailboxPayloadType {
+    /// Returns true when a payload of this type carries authority of its own.
+    ///
+    /// Section 20 requires an authorisation-bearing payload to be signed before encryption, so
+    /// pairwise message authentication never substitutes for an issuer's grant signature. A reader
+    /// that accepts one of these types without verifying the payload's own signature has accepted
+    /// the sender's word for authority the sender may not hold.
+    #[must_use]
+    pub const fn bears_authority(self) -> bool {
+        match self {
+            Self::AuthorityFeedChange | Self::RevocationRequest => true,
+            Self::NotificationPreview | Self::SyncChange => false,
+        }
+    }
+}
+
 /// The authenticated plaintext of one mailbox envelope.
 ///
 /// `crypto_box_easy` authenticates every field below for exactly one recipient. Authorisation-
@@ -194,6 +210,14 @@ mod tests {
         assert_eq!(mailbox_size_bucket(64 * KIB), 64 * KIB);
         assert_eq!(mailbox_size_bucket(64 * KIB + 1), 128 * KIB);
         assert_eq!(mailbox_size_bucket(200 * KIB), 256 * KIB);
+    }
+
+    #[test]
+    fn the_authority_bearing_payload_types_are_the_signed_ones() {
+        assert!(MailboxPayloadType::AuthorityFeedChange.bears_authority());
+        assert!(MailboxPayloadType::RevocationRequest.bears_authority());
+        assert!(!MailboxPayloadType::NotificationPreview.bears_authority());
+        assert!(!MailboxPayloadType::SyncChange.bears_authority());
     }
 
     #[test]
