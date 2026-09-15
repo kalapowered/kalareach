@@ -1,0 +1,573 @@
+//! The input lease, its epochs, and paste-delimiter framing.
+//!
+//! One session has one lease. A takeover is immediate and linearised: the new holder gets a new
+//! epoch, the old holder's undelivered bytes are dropped, and nothing waits for the previous
+//! holder to agree. What has already reached the application cannot be recalled, so the count of
+//! discarded bytes is the honest limit of what a takeover can undo.
+//!
+//! # Why paste framing exists here
+//!
+//! A bracketed paste is `ESC[200~`, the pasted text, then `ESC[201~`. Those delimiters can arrive
+//! split across frames. If the worker did not track them it could hand the second half of a paste
+//! to a different controller's lease, and the application would see a paste that begins under one
+//! actor and ends under another.
+//!
+//! The rules are narrow on purpose:
+//!
+//! * A prefix is held only while bracketed-paste mode is on, or while a paste is already open. A
+//!   lone Escape in an ordinary terminal is forwarded immediately.
+//! * A held prefix keeps its **original** 25 ms deadline. A later frame does not extend it, and
+//!   the timer runs whether or not another byte ever arrives.
+//! * On expiry the held bytes are forwarded unchanged. They were never modified, only delayed.
+//! * A takeover that interrupts an open paste closes it with `ESC[201~` before the new lease
+//!   writes, so the application never sees a paste finished by someone else.
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use kr_protocol::ids::{AttachmentId, ConnectionId, InputLeaseEpoch, InputSequence};
+use kr_protocol::input::InputLeaseState;
+use kr_protocol::scalars::Nullable;
+
+/// The bracketed-paste start delimiter.
+pub const PASTE_START: &[u8] = b"\x1b[200~";
+
+/// The bracketed-paste end delimiter.
+pub const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// How long an incomplete delimiter prefix is held.
+pub const RECOGNISER_DEADLINE: Duration = Duration::from_millis(25);
+
+/// Tracks bracketed-paste framing on the byte stream going to the pseudo-terminal.
+#[derive(Clone, Debug)]
+pub struct PasteFramer {
+    bracketed_paste_enabled: bool,
+    paste_open: bool,
+    held: Vec<u8>,
+    held_since: Option<Instant>,
+}
+
+/// What one push produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FramingOutcome {
+    /// Bytes to forward now, unchanged.
+    pub forward: Vec<u8>,
+    /// How many bytes are held as an incomplete delimiter prefix.
+    pub held: usize,
+    /// When the held prefix must be forwarded even if nothing else arrives.
+    pub deadline: Option<Instant>,
+    /// True when this push completed a paste start delimiter.
+    pub paste_started: bool,
+    /// True when this push completed a paste end delimiter.
+    pub paste_ended: bool,
+}
+
+impl Default for PasteFramer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PasteFramer {
+    /// Builds a framer with bracketed-paste mode off.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            bracketed_paste_enabled: false,
+            paste_open: false,
+            held: Vec::new(),
+            held_since: None,
+        }
+    }
+
+    /// Records whether the application has enabled canonical bracketed-paste mode.
+    pub const fn set_bracketed_paste(&mut self, enabled: bool) {
+        self.bracketed_paste_enabled = enabled;
+    }
+
+    /// Returns true when a paste has started and not yet ended.
+    #[must_use]
+    pub const fn paste_open(&self) -> bool {
+        self.paste_open
+    }
+
+    /// Returns how many bytes are currently held.
+    #[must_use]
+    pub const fn held_len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Returns the deadline of the held prefix, if any.
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
+        self.held_since.map(|since| since + RECOGNISER_DEADLINE)
+    }
+
+    /// Feeds bytes through the recogniser.
+    ///
+    /// The returned bytes are exactly the input, possibly delayed. Nothing is decoded, re-encoded
+    /// or rewritten.
+    pub fn push(&mut self, bytes: &[u8], now: Instant) -> FramingOutcome {
+        let mut pending = std::mem::take(&mut self.held);
+        let held_since = self.held_since.take();
+        pending.extend_from_slice(bytes);
+
+        let mut forward = Vec::with_capacity(pending.len());
+        let mut paste_started = false;
+        let mut paste_ended = false;
+        let mut index = 0;
+
+        while index < pending.len() {
+            let rest = &pending[index..];
+            if self.tracking() {
+                if let Some(delimiter) = complete_delimiter(rest) {
+                    // A completed delimiter is emitted exactly once, and processing continues with
+                    // the bytes after it.
+                    if delimiter == PASTE_START {
+                        self.paste_open = true;
+                        paste_started = true;
+                    } else {
+                        self.paste_open = false;
+                        paste_ended = true;
+                    }
+                    forward.extend_from_slice(delimiter);
+                    index += delimiter.len();
+                    continue;
+                }
+                if is_proper_prefix(rest) {
+                    // Hold the tail and keep the original deadline: a new frame never buys the
+                    // recogniser more time.
+                    self.held = rest.to_vec();
+                    self.held_since = Some(held_since.unwrap_or(now));
+                    break;
+                }
+            }
+            forward.push(pending[index]);
+            index += 1;
+        }
+
+        FramingOutcome {
+            forward,
+            held: self.held.len(),
+            deadline: self.deadline(),
+            paste_started,
+            paste_ended,
+        }
+    }
+
+    /// Forwards a held prefix once its deadline has passed.
+    ///
+    /// The deadline is checked against the clock, not against the arrival of more input, so a lone
+    /// Escape never waits for another keystroke.
+    pub fn expire(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let deadline = self.deadline()?;
+        if now < deadline {
+            return None;
+        }
+        self.held_since = None;
+        Some(std::mem::take(&mut self.held))
+    }
+
+    /// Ends framing for a lease that is going away.
+    ///
+    /// Returns the bytes to write before the next lease's input: an undelivered delimiter prefix
+    /// is discarded rather than forwarded, and an open paste is closed so the application never
+    /// sees it finished under another actor.
+    pub fn close_for_takeover(&mut self) -> TakeoverFraming {
+        let discarded = std::mem::take(&mut self.held);
+        self.held_since = None;
+        let terminator = if self.paste_open {
+            self.paste_open = false;
+            Some(PASTE_END)
+        } else {
+            None
+        };
+        TakeoverFraming {
+            discarded_prefix: discarded,
+            terminator,
+        }
+    }
+
+    const fn tracking(&self) -> bool {
+        self.bracketed_paste_enabled || self.paste_open
+    }
+}
+
+/// What a lease change does to paste framing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TakeoverFraming {
+    /// The incomplete delimiter prefix that was discarded. Its delivery was never completed, so
+    /// the interruption is reported rather than hidden.
+    pub discarded_prefix: Vec<u8>,
+    /// The terminator written to close an open paste, if one was open.
+    pub terminator: Option<&'static [u8]>,
+}
+
+fn complete_delimiter(bytes: &[u8]) -> Option<&'static [u8]> {
+    if bytes.starts_with(PASTE_START) {
+        return Some(PASTE_START);
+    }
+    if bytes.starts_with(PASTE_END) {
+        return Some(PASTE_END);
+    }
+    None
+}
+
+fn is_proper_prefix(bytes: &[u8]) -> bool {
+    let candidate = |delimiter: &[u8]| {
+        bytes.len() < delimiter.len() && delimiter.starts_with(bytes) && !bytes.is_empty()
+    };
+    candidate(PASTE_START) || candidate(PASTE_END)
+}
+
+/// Why a write was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseRefusal {
+    /// The writer's epoch is not the current one. A stale epoch never acquires the lease
+    /// implicitly.
+    LeaseLost,
+    /// The sequence repeated or went backwards on this connection's ordered stream.
+    OutOfOrder {
+        /// The sequence the worker expects next.
+        expected: u64,
+        /// The sequence that arrived.
+        received: u64,
+    },
+}
+
+/// The session's single input lease.
+#[derive(Clone, Debug)]
+pub struct InputLease {
+    epoch: u64,
+    holder: Option<AttachmentId>,
+    connection: Option<ConnectionId>,
+    next_sequence: u64,
+    queued: VecDeque<QueuedInput>,
+    queued_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedInput {
+    epoch: u64,
+    bytes: Vec<u8>,
+}
+
+impl Default for InputLease {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputLease {
+    /// Builds an unheld lease at epoch zero.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            epoch: 0,
+            holder: None,
+            connection: None,
+            next_sequence: 0,
+            queued: VecDeque::new(),
+            queued_bytes: 0,
+        }
+    }
+
+    /// Returns the current epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Returns the current holder.
+    #[must_use]
+    pub const fn holder(&self) -> Option<AttachmentId> {
+        self.holder
+    }
+
+    /// Takes the lease for an attachment, advancing the epoch.
+    ///
+    /// Returns the bytes the previous epoch lost. A takeover does not wait for consent, and it
+    /// cannot undo input an application has already read.
+    pub fn acquire(&mut self, attachment_id: AttachmentId, connection: ConnectionId) -> u64 {
+        let discarded = self.discard_queued();
+        self.epoch += 1;
+        self.holder = Some(attachment_id);
+        self.connection = Some(connection);
+        self.next_sequence = 0;
+        discarded
+    }
+
+    /// Releases the lease held by this attachment at this epoch.
+    ///
+    /// Returns the bytes the released epoch lost, or `None` when the caller does not hold it.
+    pub fn release(&mut self, attachment_id: AttachmentId, epoch: u64) -> Option<u64> {
+        if self.holder != Some(attachment_id) || self.epoch != epoch {
+            return None;
+        }
+        let discarded = self.discard_queued();
+        self.epoch += 1;
+        self.holder = None;
+        self.connection = None;
+        self.next_sequence = 0;
+        Some(discarded)
+    }
+
+    /// Removes the lease if this attachment holds it, as part of a detach.
+    pub fn release_attachment(&mut self, attachment_id: AttachmentId) -> u64 {
+        if self.holder != Some(attachment_id) {
+            return 0;
+        }
+        let discarded = self.discard_queued();
+        self.epoch += 1;
+        self.holder = None;
+        self.connection = None;
+        self.next_sequence = 0;
+        discarded
+    }
+
+    /// Checks a write against the lease and its ordered stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseRefusal::LeaseLost`] for a stale epoch or a caller that does not hold the
+    /// lease, and [`LeaseRefusal::OutOfOrder`] when the sequence does not follow.
+    pub fn accept_write(
+        &mut self,
+        attachment_id: AttachmentId,
+        epoch: u64,
+        sequence: u64,
+    ) -> Result<(), LeaseRefusal> {
+        if self.holder != Some(attachment_id) || self.epoch != epoch {
+            return Err(LeaseRefusal::LeaseLost);
+        }
+        if sequence != self.next_sequence {
+            return Err(LeaseRefusal::OutOfOrder {
+                expected: self.next_sequence,
+                received: sequence,
+            });
+        }
+        self.next_sequence += 1;
+        Ok(())
+    }
+
+    /// Queues bytes for the pseudo-terminal under the current epoch.
+    pub fn enqueue(&mut self, bytes: Vec<u8>) {
+        self.queued_bytes += bytes.len();
+        self.queued.push_back(QueuedInput {
+            epoch: self.epoch,
+            bytes,
+        });
+    }
+
+    /// Takes the next queued write.
+    pub fn dequeue(&mut self) -> Option<Vec<u8>> {
+        let entry = self.queued.pop_front()?;
+        self.queued_bytes -= entry.bytes.len();
+        Some(entry.bytes)
+    }
+
+    /// Returns the bytes waiting to reach the pseudo-terminal.
+    #[must_use]
+    pub const fn queued_bytes(&self) -> usize {
+        self.queued_bytes
+    }
+
+    /// Renders the lease for the wire.
+    #[must_use]
+    pub fn to_wire(&self) -> InputLeaseState {
+        InputLeaseState {
+            epoch: InputLeaseEpoch::new(self.epoch),
+            holder: Nullable(self.holder),
+            connection_id: Nullable(self.connection),
+            next_sequence: InputSequence::new(self.next_sequence),
+        }
+    }
+
+    fn discard_queued(&mut self) -> u64 {
+        let current = self.epoch;
+        let mut discarded = 0_u64;
+        self.queued.retain(|entry| {
+            if entry.epoch == current {
+                discarded += entry.bytes.len() as u64;
+                false
+            } else {
+                true
+            }
+        });
+        self.queued_bytes -= usize::try_from(discarded).unwrap_or(0);
+        discarded
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::scalars::Uuid;
+
+    fn attachment(byte: u8) -> AttachmentId {
+        AttachmentId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    fn connection(byte: u8) -> ConnectionId {
+        ConnectionId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    #[test]
+    fn an_escape_is_forwarded_at_once_when_bracketed_paste_is_off() {
+        let mut framer = PasteFramer::new();
+        let outcome = framer.push(b"\x1b", Instant::now());
+        assert_eq!(outcome.forward, b"\x1b");
+        assert_eq!(outcome.held, 0);
+        assert!(outcome.deadline.is_none());
+    }
+
+    #[test]
+    fn a_lone_escape_is_held_and_then_expires_without_another_key() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        let start = Instant::now();
+        let outcome = framer.push(b"\x1b", start);
+        assert!(outcome.forward.is_empty());
+        assert_eq!(outcome.held, 1);
+        assert_eq!(outcome.deadline, Some(start + RECOGNISER_DEADLINE));
+        assert!(framer.expire(start + Duration::from_millis(24)).is_none());
+        assert_eq!(
+            framer.expire(start + RECOGNISER_DEADLINE),
+            Some(b"\x1b".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_delimiter_split_across_frames_is_recognised_once_with_its_payload_kept() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        let start = Instant::now();
+        let first = framer.push(b"\x1b[20", start);
+        assert!(first.forward.is_empty());
+        assert_eq!(first.held, 4);
+        let second = framer.push(b"0~hello", start + Duration::from_millis(5));
+        assert_eq!(second.forward, b"\x1b[200~hello");
+        assert!(second.paste_started);
+        assert_eq!(second.held, 0);
+        assert!(framer.paste_open());
+    }
+
+    #[test]
+    fn a_later_frame_does_not_extend_the_original_deadline() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        let start = Instant::now();
+        framer.push(b"\x1b", start);
+        // Another byte that still does not complete a delimiter keeps the first deadline.
+        let outcome = framer.push(b"[", start + Duration::from_millis(20));
+        assert_eq!(outcome.deadline, Some(start + RECOGNISER_DEADLINE));
+    }
+
+    #[test]
+    fn every_prefix_length_of_the_start_delimiter_is_held() {
+        for length in 1..PASTE_START.len() {
+            let mut framer = PasteFramer::new();
+            framer.set_bracketed_paste(true);
+            let outcome = framer.push(&PASTE_START[..length], Instant::now());
+            assert!(outcome.forward.is_empty(), "prefix of length {length}");
+            assert_eq!(outcome.held, length);
+        }
+    }
+
+    #[test]
+    fn bytes_that_match_no_delimiter_are_forwarded_unchanged() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        let outcome = framer.push(b"\x1b[A\x1bOB", Instant::now());
+        assert_eq!(outcome.forward, b"\x1b[A\x1bOB");
+        assert_eq!(outcome.held, 0);
+    }
+
+    #[test]
+    fn an_open_paste_is_closed_before_the_next_lease_writes() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        framer.push(b"\x1b[200~part", Instant::now());
+        assert!(framer.paste_open());
+        let framing = framer.close_for_takeover();
+        assert_eq!(framing.terminator, Some(PASTE_END));
+        assert!(!framer.paste_open());
+    }
+
+    #[test]
+    fn an_incomplete_delimiter_is_discarded_on_takeover_rather_than_forwarded() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        framer.push(b"\x1b[20", Instant::now());
+        let framing = framer.close_for_takeover();
+        assert_eq!(framing.discarded_prefix, b"\x1b[20");
+        assert_eq!(framing.terminator, None);
+        assert_eq!(framer.held_len(), 0);
+    }
+
+    #[test]
+    fn a_paste_end_is_still_recognised_after_the_mode_is_disabled_mid_paste() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        framer.push(b"\x1b[200~text", Instant::now());
+        framer.set_bracketed_paste(false);
+        let outcome = framer.push(b"\x1b[201~", Instant::now());
+        assert!(outcome.paste_ended);
+        assert!(!framer.paste_open());
+    }
+
+    #[test]
+    fn a_takeover_advances_the_epoch_and_drops_undelivered_input() {
+        let mut lease = InputLease::new();
+        lease.acquire(attachment(1), connection(1));
+        assert_eq!(lease.epoch(), 1);
+        lease
+            .accept_write(attachment(1), 1, 0)
+            .expect("first write");
+        lease.enqueue(b"hello".to_vec());
+        let discarded = lease.acquire(attachment(2), connection(2));
+        assert_eq!(discarded, 5);
+        assert_eq!(lease.epoch(), 2);
+        assert_eq!(lease.holder(), Some(attachment(2)));
+        assert_eq!(lease.queued_bytes(), 0);
+    }
+
+    #[test]
+    fn a_stale_epoch_is_refused_and_does_not_acquire_implicitly() {
+        let mut lease = InputLease::new();
+        lease.acquire(attachment(1), connection(1));
+        lease.acquire(attachment(2), connection(2));
+        assert_eq!(
+            lease.accept_write(attachment(1), 1, 0),
+            Err(LeaseRefusal::LeaseLost)
+        );
+        assert_eq!(lease.holder(), Some(attachment(2)));
+    }
+
+    #[test]
+    fn input_sequences_must_follow_on_one_connection() {
+        let mut lease = InputLease::new();
+        lease.acquire(attachment(1), connection(1));
+        lease.accept_write(attachment(1), 1, 0).expect("first");
+        assert_eq!(
+            lease.accept_write(attachment(1), 1, 0),
+            Err(LeaseRefusal::OutOfOrder {
+                expected: 1,
+                received: 0
+            })
+        );
+        lease.accept_write(attachment(1), 1, 1).expect("second");
+    }
+
+    #[test]
+    fn a_reconnecting_holder_starts_a_new_stream_rather_than_replaying() {
+        let mut lease = InputLease::new();
+        lease.acquire(attachment(1), connection(1));
+        lease.accept_write(attachment(1), 1, 0).expect("first");
+        // The same attachment on a new connection acquires again and starts from zero.
+        lease.acquire(attachment(1), connection(2));
+        lease
+            .accept_write(attachment(1), 2, 0)
+            .expect("fresh stream");
+    }
+}
