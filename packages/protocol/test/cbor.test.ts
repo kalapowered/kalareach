@@ -55,7 +55,8 @@ describe('invalid.json', () => {
     expect(cases.length).toBeGreaterThanOrEqual(50)
     const covered = new Set(cases.map((entry) => entry.rule))
     for (const rule of CBOR_RULES) {
-      if (rule === 'integer_out_of_range' || rule === 'unrepresentable') {
+      // These two are internal invariants with no reachable input.
+      if (rule === 'integer_out_of_range' || rule === 'non_canonical' || rule === 'unrepresentable') {
         continue
       }
       expect(covered.has(rule), `no fixture covers ${rule}`).toBe(true)
@@ -166,6 +167,55 @@ describe('non-ASCII text', () => {
       bytesToHex(encodeCanonical(parseValue(findCase(document, id).value)))
     expect(bytesFor('text_nfc')).not.toBe(bytesFor('text_nfd'))
     expect(bytesFor('text_sharp_s')).not.toBe(bytesFor('text_upper'))
+  })
+})
+
+describe('value construction', () => {
+  it('rejects a JavaScript number that is not an exact integer', () => {
+    expect(() => krInt(9007199254740993)).toThrowError(/integer_out_of_range/)
+    expect(() => krInt(1.5)).toThrowError(/integer_out_of_range/)
+    expect(krInt(9007199254740993n)).toEqual({ kind: 'int', value: 9007199254740993n })
+  })
+
+  it('rejects an integer outside the 64-bit argument range', () => {
+    expect(() => krInt(2n ** 64n)).toThrowError(/integer_out_of_range/)
+    expect(() => krInt(-(2n ** 64n) - 1n)).toThrowError(/integer_out_of_range/)
+    expect(bytesToHex(encodeCanonical(krInt(-(2n ** 64n))))).toBe('3bffffffffffffffff')
+  })
+
+  it('rejects text with an unpaired surrogate', () => {
+    expect(() => krText('\ud800')).toThrowError(/invalid_utf8/)
+    expect(() => krText('\udc00')).toThrowError(/invalid_utf8/)
+    expect(krText('\ud83d\ude00').kind).toBe('text')
+  })
+
+  it('rejects a hand-built map that is unsorted or has duplicate keys', () => {
+    expect(() =>
+      encodeCanonical({
+        kind: 'map',
+        entries: [
+          ['aa', krInt(1n)],
+          ['z', krInt(2n)]
+        ]
+      })
+    ).toThrowError(/unsorted_map_keys/)
+    expect(() =>
+      encodeCanonical({
+        kind: 'map',
+        entries: [
+          ['a', krInt(1n)],
+          ['a', krInt(2n)]
+        ]
+      })
+    ).toThrowError(/duplicate_key/)
+  })
+
+  it('preserves a byte order mark as an ordinary character', () => {
+    const withMark = encodeCanonical(krText('\ufeffkalareach'))
+    const without = encodeCanonical(krText('kalareach'))
+    expect(bytesToHex(withMark)).not.toBe(bytesToHex(without))
+    const decoded = decodeCanonical(withMark)
+    expect(decoded).toEqual({ kind: 'text', value: '\ufeffkalareach' })
   })
 })
 

@@ -224,6 +224,27 @@
         ]
       },
       "hex": "a56000616d0162616102637a7a7a03781e61616161616161616161616161616161616161616161616161616161616104"
+    },
+    {
+      "id": "map_bom_key",
+      "description": "A key that is exactly U+FEFF encodes as three bytes and is distinct from the empty key. A decoder that strips byte order marks would see a duplicate here.",
+      "value": {
+        "map": [
+          [
+            "﻿",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "",
+            {
+              "int": "0"
+            }
+          ]
+        ]
+      },
+      "hex": "a2600063efbbbf01"
     }
   ]
 }

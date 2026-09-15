@@ -24,19 +24,21 @@
 //! The specification requires maintained encoders plus a strict validator and adaptation layer,
 //! and forbids a new handwritten cryptographic implementation. This crate follows that split:
 //!
-//! * `ciborium`, the maintained implementation, owns the serde work. It turns Rust types into a
-//!   value tree and back. That is the part that benefits from an upstream maintainer: derive
-//!   support, enum representations, borrowed data and the long tail of serde behaviour.
-//! * This crate owns the byte rules. A value tree cannot answer the questions the profile asks —
-//!   whether a length was indefinite, whether an argument used a longer head than necessary,
-//!   whether two keys collided, what order the keys arrived in, whether bytes followed the object.
-//!   A decoder that answers those questions has to read the bytes, so [`decode`] does, and it
-//!   names the broken rule in a typed error. Encoding is the mirror image: [`CanonicalValue`]
-//!   admits only permitted shapes and keeps maps in key order, so [`encode`] is total and its
-//!   output is canonical by construction.
+//! * `ciborium`, the maintained implementation, owns the serde work and writes the bytes. It turns
+//!   Rust types into a value tree and back, and [`encode`] hands it a validated, key-ordered tree
+//!   to serialise. That is the part that benefits from an upstream maintainer: derive support,
+//!   enum representations, borrowed data and the long tail of serde behaviour.
+//! * This crate owns the byte rules on the way in. A value tree cannot answer the questions the
+//!   profile asks: whether a length was indefinite, whether an argument used a longer head than
+//!   necessary, whether two keys collided, what order the keys arrived in, whether bytes followed
+//!   the object. A decoder that answers those questions has to read the bytes, so [`decode`] does,
+//!   and it names the broken rule in a typed error.
+//! * Encoding needs no such reader. [`CanonicalValue`] admits only permitted shapes and keeps maps
+//!   in canonical key order, so a validated tree serialises to canonical bytes. The conformance
+//!   tests check that against the fixture bytes rather than assuming it.
 //!
 //! Neither half re-implements the other. `ciborium` never sees unvalidated bytes and this crate
-//! never re-implements serde.
+//! never re-implements serde or the CBOR writer.
 //!
 //! # Flow
 //!

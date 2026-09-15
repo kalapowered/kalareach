@@ -11,7 +11,7 @@
 import { encode as cborgEncode, rfc8949EncodeOptions } from 'cborg'
 
 import { fail } from './errors.js'
-import type { CanonicalValue } from './value.js'
+import { validateCanonical, type CanonicalValue } from './value.js'
 
 /** Converts a canonical value into the representation `cborg` encodes. */
 function toNative (value: CanonicalValue): unknown {
@@ -35,8 +35,15 @@ function toNative (value: CanonicalValue): unknown {
   }
 }
 
-/** Encodes one value as canonical KR-CBOR-1 bytes. */
+/**
+ * Encodes one value as canonical KR-CBOR-1 bytes.
+ *
+ * The value is validated first, because a caller can build a tree with an object literal rather
+ * than through the constructors. Without that step a duplicate or misordered key would be
+ * flattened by `Map` instead of rejected.
+ */
 export function encodeCanonical (value: CanonicalValue): Uint8Array {
+  validateCanonical(value)
   try {
     return cborgEncode(toNative(value), rfc8949EncodeOptions)
   } catch (error) {

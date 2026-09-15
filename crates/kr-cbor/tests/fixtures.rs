@@ -222,6 +222,9 @@ fn invalid_fixtures_are_rejected_with_the_named_rule() {
     }
 }
 
+/// Rules that describe an internal invariant and have no reachable input.
+const UNREACHABLE_RULES: [&str; 3] = ["integer_out_of_range", "non_canonical", "unrepresentable"];
+
 #[test]
 fn every_error_rule_is_covered_by_a_fixture() {
     let document = load("invalid.json");
@@ -252,6 +255,10 @@ fn every_error_rule_is_covered_by_a_fixture() {
         "collection_limit",
         "length_limit",
     ] {
+        assert!(
+            !UNREACHABLE_RULES.contains(&rule),
+            "{rule} is listed as unreachable"
+        );
         assert!(
             covered.iter().any(|entry| entry == rule),
             "no fixture covers {rule}"

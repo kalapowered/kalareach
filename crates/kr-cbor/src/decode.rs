@@ -6,6 +6,10 @@
 //! argument used a longer head than necessary, whether two keys collided or what order the keys
 //! arrived in. The decoder therefore owns the byte rules and hands a validated tree to the
 //! maintained serde implementation.
+//!
+//! As a last check it re-encodes the tree and requires the input bytes back, so a reader that
+//! normalised something instead of rejecting it fails here rather than producing a signature over
+//! a different value.
 
 use core::cmp::Ordering;
 
@@ -38,6 +42,13 @@ pub fn decode(bytes: &[u8], limits: &Limits) -> Result<CanonicalValue> {
     let remaining = bytes.len() - reader.offset;
     if remaining > 0 {
         return Err(CborError::TrailingBytes { count: remaining });
+    }
+    // Every rule is already checked above, so this should be unreachable. It is here because
+    // canonicity is what signatures rest on: a reader that normalised something instead of
+    // rejecting it would show up as different bytes rather than as a valid signature over the
+    // wrong value.
+    if crate::encode::encode(&value) != bytes {
+        return Err(CborError::NonCanonical);
     }
     Ok(value)
 }
@@ -157,6 +168,24 @@ impl Reader<'_> {
         Ok(usize::try_from(len).expect("checked against a usize limit"))
     }
 
+    /// Checks the depth and item budgets a collection is about to consume.
+    ///
+    /// A collection reserves capacity for its members, so the budget for those members has to be
+    /// checked before the reservation rather than while reading them.
+    fn reserve_items(&self, members: usize, member_depth: usize) -> Result<()> {
+        if member_depth > self.limits.max_depth {
+            return Err(CborError::DepthLimit {
+                limit: self.limits.max_depth,
+            });
+        }
+        if self.items.saturating_add(members) > self.limits.max_items {
+            return Err(CborError::CountLimit {
+                limit: self.limits.max_items,
+            });
+        }
+        Ok(())
+    }
+
     fn read_value(&mut self, depth: usize) -> Result<CanonicalValue> {
         if depth > self.limits.max_depth {
             return Err(CborError::DepthLimit {
@@ -205,6 +234,7 @@ impl Reader<'_> {
             4 => {
                 let argument = self.read_argument(additional, HeadKind::Length, head_offset)?;
                 let len = self.check_collection_len(argument, 1)?;
+                self.reserve_items(len, depth + 1)?;
                 let mut items = Vec::with_capacity(len);
                 for _ in 0..len {
                     items.push(self.read_value(depth + 1)?);
@@ -243,6 +273,8 @@ impl Reader<'_> {
     ) -> Result<CanonicalValue> {
         let argument = self.read_argument(additional, HeadKind::Length, head_offset)?;
         let len = self.check_collection_len(argument, 2)?;
+        // Two items per entry: the key and its value.
+        self.reserve_items(len.saturating_mul(2), depth + 1)?;
         let mut entries: Vec<(String, CanonicalValue)> = Vec::with_capacity(len);
         for _ in 0..len {
             self.count_item()?;
@@ -253,8 +285,22 @@ impl Reader<'_> {
             if key_initial >> 5 != 3 {
                 return Err(CborError::NonTextMapKey { offset: key_offset });
             }
+            let key_additional = key_initial & 0x1f;
+            // A key head carries the same reserved and indefinite rules as any other head, and it
+            // has to be checked here: read_text would otherwise be handed an argument it cannot
+            // read.
+            if key_additional >= 28 {
+                return Err(if key_additional == 31 {
+                    CborError::IndefiniteLength { offset: key_offset }
+                } else {
+                    CborError::ReservedAdditionalInfo {
+                        value: key_additional,
+                        offset: key_offset,
+                    }
+                });
+            }
             self.offset += 1;
-            let key = self.read_text(key_initial & 0x1f, key_offset)?;
+            let key = self.read_text(key_additional, key_offset)?;
             if let Some((previous, _)) = entries.last() {
                 match compare_keys(previous, &key) {
                     Ordering::Less => {}

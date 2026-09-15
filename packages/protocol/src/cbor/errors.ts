@@ -29,6 +29,7 @@ export const CBOR_RULES = [
   'collection_limit',
   'length_limit',
   'integer_out_of_range',
+  'non_canonical',
   'unrepresentable'
 ] as const
 

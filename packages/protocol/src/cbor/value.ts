@@ -36,8 +36,16 @@ export function krBool (value: boolean): CanonicalValue {
   return { kind: 'bool', value }
 }
 
-/** An integer, rejected when it falls outside the 64-bit argument range. */
+/**
+ * An integer, rejected when it falls outside the 64-bit argument range.
+ *
+ * A JavaScript number is accepted only when it is an exact integer. Above 2^53 a number has
+ * already lost digits, so converting it would silently encode a different value.
+ */
 export function krInt (value: bigint | number): CanonicalValue {
+  if (typeof value === 'number' && !Number.isSafeInteger(value)) {
+    fail('integer_out_of_range', `${value} is not an exact integer; pass a bigint`)
+  }
   const big = typeof value === 'bigint' ? value : BigInt(value)
   if (big < INTEGER_MIN || big > INTEGER_MAX) {
     fail('integer_out_of_range', `${big} is outside the 64-bit argument range`)
@@ -50,8 +58,20 @@ export function krBytes (value: Uint8Array): CanonicalValue {
   return { kind: 'bytes', value }
 }
 
-/** A text string. Never normalised or case folded. */
+/** Matches a surrogate code unit that has no partner, which cannot be encoded as UTF-8. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
+/**
+ * A text string. Never normalised or case folded.
+ *
+ * A JavaScript string can hold an unpaired surrogate, which has no UTF-8 encoding. `TextEncoder`
+ * would replace it with U+FFFD, so two different strings could encode to the same bytes. Such a
+ * string is rejected rather than silently repaired.
+ */
 export function krText (value: string): CanonicalValue {
+  if (LONE_SURROGATE.test(value)) {
+    fail('invalid_utf8', 'text contains an unpaired surrogate and has no UTF-8 encoding')
+  }
   return { kind: 'text', value }
 }
 
@@ -168,4 +188,52 @@ export function mapGet (value: CanonicalValue, key: string): CanonicalValue | un
     return undefined
   }
   return value.entries.find((entry) => entry[0] === key)?.[1]
+}
+
+/**
+ * Checks a value that was built by hand rather than decoded.
+ *
+ * The constructors above enforce their own rules, but a caller can also write an object literal,
+ * so the encoder validates the whole tree before handing it over. It checks integer range, text
+ * that has a UTF-8 encoding, and map entries that are in canonical order with no duplicates.
+ */
+export function validateCanonical (value: CanonicalValue): void {
+  switch (value.kind) {
+    case 'null':
+    case 'bool':
+    case 'bytes':
+      return
+    case 'int':
+      if (value.value < INTEGER_MIN || value.value > INTEGER_MAX) {
+        fail('integer_out_of_range', `${value.value} is outside the 64-bit argument range`)
+      }
+      return
+    case 'text':
+      if (LONE_SURROGATE.test(value.value)) {
+        fail('invalid_utf8', 'text contains an unpaired surrogate and has no UTF-8 encoding')
+      }
+      return
+    case 'array':
+      for (const item of value.items) {
+        validateCanonical(item)
+      }
+      return
+    case 'map':
+      for (let index = 0; index < value.entries.length; index += 1) {
+        const [key, entry] = value.entries[index]
+        if (LONE_SURROGATE.test(key)) {
+          fail('invalid_utf8', 'a map key contains an unpaired surrogate')
+        }
+        if (index > 0) {
+          const order = compareKeys(value.entries[index - 1][0], key)
+          if (order === 0) {
+            fail('duplicate_key', `duplicate map key ${JSON.stringify(key)}`)
+          }
+          if (order > 0) {
+            fail('unsorted_map_keys', `map key ${JSON.stringify(key)} is out of canonical order`)
+          }
+        }
+        validateCanonical(entry)
+      }
+  }
 }

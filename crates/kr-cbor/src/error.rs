@@ -175,6 +175,13 @@ pub enum CborError {
         value: i128,
     },
 
+    /// The decoded value does not re-encode to the bytes it came from.
+    ///
+    /// Every rule is checked while reading, so this is unreachable in a correct decoder. It exists
+    /// because canonicity is what signatures rest on.
+    #[error("the decoded value does not re-encode to the input bytes")]
+    NonCanonical,
+
     /// A serde value could not be represented in the KR-CBOR-1 profile.
     #[error("value cannot be represented in KR-CBOR-1: {reason}")]
     Unrepresentable {
@@ -227,6 +234,7 @@ impl CborError {
             Self::CollectionLimit { .. } => "collection_limit",
             Self::LengthLimit { .. } => "length_limit",
             Self::IntegerOutOfRange { .. } => "integer_out_of_range",
+            Self::NonCanonical => "non_canonical",
             Self::Unrepresentable { .. } => "unrepresentable",
             Self::Serialize { .. } => "serialize_failed",
             Self::Deserialize { .. } => "deserialize_failed",

@@ -374,6 +374,42 @@
       "limits": {
         "max_bytes_len": 3
       }
+    },
+    {
+      "id": "map_key_reserved_ai_28",
+      "description": "A map key head with reserved additional information 28.",
+      "hex": "a17c00",
+      "rule": "reserved_additional_info"
+    },
+    {
+      "id": "map_key_reserved_ai_29",
+      "description": "A map key head with reserved additional information 29.",
+      "hex": "a17d00",
+      "rule": "reserved_additional_info"
+    },
+    {
+      "id": "map_key_reserved_ai_30",
+      "description": "A map key head with reserved additional information 30.",
+      "hex": "a17e00",
+      "rule": "reserved_additional_info"
+    },
+    {
+      "id": "map_key_indefinite_text",
+      "description": "An indefinite-length text string used as a map key.",
+      "hex": "a17f00",
+      "rule": "indefinite_length"
+    },
+    {
+      "id": "map_key_integer_ai_31",
+      "description": "A non-text map key whose head also carries additional information 31. The key type is reported first.",
+      "hex": "a11f00",
+      "rule": "non_text_map_key"
+    },
+    {
+      "id": "map_key_indefinite_bytes",
+      "description": "An indefinite-length byte string used as a map key.",
+      "hex": "a15f00",
+      "rule": "non_text_map_key"
     }
   ]
 }

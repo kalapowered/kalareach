@@ -6,14 +6,19 @@
  * was indefinite, whether an argument used a longer head than necessary, whether two keys
  * collided, what order the keys arrived in or whether bytes followed the object.
  *
- * `cborg` is still the library that reads the wire format: after the byte rules pass, the same
- * bytes go through `cborg.decode` with its strict profile as an independent check. Two readers
- * that disagree mean the input is rejected rather than interpreted.
+ * `cborg` is still the library that decides what canonical bytes look like: once the byte rules
+ * pass, the decoded value goes back through `cborg`'s encoder and the result has to equal the
+ * input. That closes the loop, because a reader that quietly normalised something would produce
+ * different bytes on the way out.
+ *
+ * `cborg`'s own decoder is not used for that check. It strips a leading U+FEFF from text strings,
+ * so it reads `"\uFEFF"` and `""` as the same key, which is a different interpretation rather than
+ * a stricter one.
  */
 
-import { decode as cborgDecode } from 'cborg'
+import { fail } from './errors.js'
 
-import { fail, KrCborError } from './errors.js'
+import { encodeCanonical } from './encode.js'
 import { DEFAULT_LIMITS, type Limits } from './limits.js'
 import {
   type CanonicalValue,
@@ -26,7 +31,13 @@ import {
   krMapFromSorted
 } from './value.js'
 
-/** The decode profile handed to `cborg`: definite lengths, shortest forms, no tags, no floats. */
+/**
+ * A strict profile for a consumer that calls `cborg.decode` directly.
+ *
+ * It is not sufficient on its own: it does not check canonical key order, and `cborg` strips a
+ * leading U+FEFF from text strings. Use {@link decodeCanonical} for anything that is signed,
+ * hashed or framed.
+ */
 export const STRICT_CBORG_OPTIONS = Object.freeze({
   strict: true,
   allowIndefinite: false,
@@ -39,7 +50,10 @@ export const STRICT_CBORG_OPTIONS = Object.freeze({
   tags: Object.freeze({})
 })
 
-const decoder = new TextDecoder('utf-8', { fatal: true })
+// ignoreBOM keeps U+FEFF as an ordinary character. Without it TextDecoder removes a leading byte
+// order mark, which would change the string, its length and its position in key order, and would
+// make this decoder disagree with the Rust one.
+const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
 class Reader {
   private offset = 0
@@ -123,6 +137,18 @@ class Reader {
     return Number(declared)
   }
 
+  /**
+   * Checks the depth and item budgets a collection is about to consume, before it is built.
+   */
+  private reserveItems (members: number, memberDepth: number): void {
+    if (memberDepth > this.limits.maxDepth) {
+      fail('depth_limit', `nesting depth exceeds the limit of ${this.limits.maxDepth}`)
+    }
+    if (this.items + members > this.limits.maxItems) {
+      fail('count_limit', `item count exceeds the limit of ${this.limits.maxItems}`)
+    }
+  }
+
   readValue (depth: number): CanonicalValue {
     if (depth > this.limits.maxDepth) {
       fail('depth_limit', `nesting depth exceeds the limit of ${this.limits.maxDepth}`)
@@ -162,6 +188,7 @@ class Reader {
       case 4: {
         const declared = this.readArgument(additional, true, headOffset)
         const length = this.checkCollectionLen(declared, 1)
+        this.reserveItems(length, depth + 1)
         const items: CanonicalValue[] = []
         for (let index = 0; index < length; index += 1) {
           items.push(this.readValue(depth + 1))
@@ -197,6 +224,8 @@ class Reader {
   private readMap (additional: number, headOffset: number, depth: number): CanonicalValue {
     const declared = this.readArgument(additional, true, headOffset)
     const length = this.checkCollectionLen(declared, 2)
+    // Two items per entry: the key and its value.
+    this.reserveItems(length * 2, depth + 1)
     const entries: Array<readonly [string, CanonicalValue]> = []
     for (let index = 0; index < length; index += 1) {
       this.countItem()
@@ -208,8 +237,21 @@ class Reader {
       if (keyInitial >> 5 !== 3) {
         fail('non_text_map_key', 'map keys must be text strings', keyOffset)
       }
+      const keyAdditional = keyInitial & 0x1f
+      // A key head carries the same reserved and indefinite rules as any other head, and it has to
+      // be checked here: readText would otherwise be handed an argument it cannot read.
+      if (keyAdditional >= 28) {
+        if (keyAdditional === 31) {
+          fail('indefinite_length', 'indefinite lengths are forbidden', keyOffset)
+        }
+        fail(
+          'reserved_additional_info',
+          `additional information ${keyAdditional} is reserved`,
+          keyOffset
+        )
+      }
       this.offset += 1
-      const key = this.readText(keyInitial & 0x1f, keyOffset)
+      const key = this.readText(keyAdditional, keyOffset)
       if (entries.length > 0) {
         const previous = entries[entries.length - 1][0]
         const order = compareKeys(previous, key)
@@ -276,21 +318,20 @@ export function decodeCanonical (bytes: Uint8Array, limits: Limits = DEFAULT_LIM
   if (remaining > 0) {
     fail('trailing_bytes', `${remaining} trailing byte(s) after the top-level object`)
   }
-  crossCheck(bytes)
+  assertCanonical(bytes, value)
   return value
 }
 
 /**
- * Runs the maintained library over bytes the byte rules already accepted.
+ * Re-encodes the decoded value and requires the bytes back.
  *
- * It cannot report our rule names, so it never decides which rule failed. It is here so that an
- * input only one of the two readers accepts is rejected instead of interpreted.
+ * Every rule is already checked while reading, so this should be unreachable. It is here because
+ * canonicity is what signatures depend on: a reader that normalised something instead of rejecting
+ * it would show up here as different bytes rather than as a valid signature over the wrong value.
  */
-function crossCheck (bytes: Uint8Array): void {
-  try {
-    cborgDecode(bytes, STRICT_CBORG_OPTIONS)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new KrCborError('unrepresentable', `the maintained decoder rejected these bytes: ${message}`)
+function assertCanonical (bytes: Uint8Array, value: CanonicalValue): void {
+  const reencoded = encodeCanonical(value)
+  if (reencoded.length !== bytes.length || reencoded.some((byte, index) => byte !== bytes[index])) {
+    fail('non_canonical', 'the decoded value does not re-encode to the input bytes')
   }
 }
