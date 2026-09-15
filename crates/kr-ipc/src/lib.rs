@@ -14,6 +14,8 @@
 //! | [`peer`] | Peer-credential authentication of a local caller |
 //! | [`endpoint`] | Binding, connecting and accepting, over Unix sockets or Windows named pipes |
 //! | [`framed`] | The length-delimited KR-CBOR-1 frame codec on a connection |
+//! | [`descriptor`] | Atomic publication, reading and retirement of worker descriptors |
+//! | [`verify`] | The rendezvous, the challenge answer and the controller generation token |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 //!
 //! The `testing` feature adds [`testing::TempHost`], a disposable host tree the other host
@@ -52,6 +54,7 @@
 //! # }
 //! ```
 
+pub mod descriptor;
 pub mod endpoint;
 pub mod error;
 pub mod framed;
@@ -60,6 +63,7 @@ pub mod paths;
 pub mod peer;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod verify;
 
 pub use crate::error::{IpcError, Result};
 
