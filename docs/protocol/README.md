@@ -109,6 +109,13 @@ there because canonicity is what signatures rest on: a reader that normalised so
 rejecting it would show up as different bytes rather than as a valid signature over a different
 value.
 
+Deserialising into a Rust type runs the same check again at the typed level, because serde accepts
+more than one representation of the same value. A unit enum variant, for example, arrives either as
+its name or as a single-entry map holding null; both produce the same value, and only one of them
+is what the type serialises back to. `from_canonical_value` serialises the typed value again and
+requires the value it came from, so exactly one representation of each type is reachable. That is
+what lets a later stage re-encode a decoded object and still get the bytes its signature covers.
+
 `cborg`'s own decoder is not used for that check. It strips a leading U+FEFF from text strings, so
 it reads `"﻿"` and `""` as the same key. That is a different interpretation rather than a
 stricter one, and `fixtures/cbor/map-ordering.json` pins the case.
@@ -296,8 +303,11 @@ Each entry states:
 
 Reading the fields:
 
-- An empty `required_rights` list is not "no check". It means the baseline only: a valid, unexpired,
-  unrevoked grant covering the named environment. Everything else adds to that baseline.
+- An empty `required_rights` list is not "no check". It means scoped read authority and nothing
+  more: a valid, unexpired, unrevoked grant covering the named environment and the named resource.
+  Only reads of host and environment configuration use it. It is not a universal prerequisite:
+  pairing presents a transcript proof, a service method presents a service credential, and a
+  private-IPC method presents its caller token, none of which involve a grant.
 - `required_rights` is an intersection, not a choice. An entry with a condition other than `always`
   applies only when that condition holds, which is how `session.attach` requires `terminal.geometry`
   just for a geometry claim, and how `pair.status` accepts either the candidate's transcript proof
