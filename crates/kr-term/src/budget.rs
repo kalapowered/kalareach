@@ -129,6 +129,8 @@ pub struct BudgetUsage {
     pub rows: u64,
     /// Bytes held by the hyperlink and title tables.
     pub metadata: u64,
+    /// Bytes of encoded content the rows that are showing hold, beyond the fixed per-cell cost.
+    pub screen_content: u64,
     /// Bytes held by the hyperlinks of each buffer's rows, primary first.
     ///
     /// Both, because the buffer that is not showing still holds its links: charging only the active
@@ -140,7 +142,12 @@ impl BudgetUsage {
     /// Total committed bytes.
     #[must_use]
     pub const fn total(self) -> u64 {
-        self.screens + self.rows + self.metadata + self.screen_links[0] + self.screen_links[1]
+        self.screens
+            + self.rows
+            + self.metadata
+            + self.screen_content
+            + self.screen_links[0]
+            + self.screen_links[1]
     }
 }
 
@@ -174,6 +181,7 @@ impl SessionBudget {
                 screens: 0,
                 rows: 0,
                 metadata: 0,
+                screen_content: 0,
                 screen_links: [0, 0],
             },
             truncations: 0,
@@ -220,6 +228,7 @@ impl SessionBudget {
         let cost = Self::screens_cost(size);
         let other = self.usage.rows
             + self.usage.metadata
+            + self.usage.screen_content
             + self.usage.screen_links[0]
             + self.usage.screen_links[1];
         if cost + other > self.limits.session_bytes {
@@ -267,6 +276,16 @@ impl SessionBudget {
     /// Records the current size of the hyperlink and title tables.
     pub const fn set_metadata(&mut self, bytes: u64) {
         self.usage.metadata = bytes;
+    }
+
+    /// Records what the content of the rows that are showing costs.
+    pub const fn set_screen_content(&mut self, bytes: u64) {
+        self.usage.screen_content = bytes;
+    }
+
+    /// Clears the recorded cost of both buffers' hyperlinks, after a reset emptied them.
+    pub const fn clear_screen_links(&mut self) {
+        self.usage.screen_links = [0, 0];
     }
 
     /// Records what one buffer's hyperlinks cost.

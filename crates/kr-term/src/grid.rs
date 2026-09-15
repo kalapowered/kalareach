@@ -16,6 +16,7 @@
 //! * The Unicode model is pinned rather than defaulted, so the width of a cell is a property of
 //!   the profile and not of whatever the library's default happened to be that month.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -373,6 +374,11 @@ pub struct CanonicalGrid {
 /// would have produced had they arrived together.
 #[derive(Debug, Clone)]
 struct TailCell {
+    /// Whether the cell has already reached its content bound.
+    ///
+    /// Once it has, every later mark is dropped too. Keeping some of a group and none of the next
+    /// would make the answer depend on how many marks arrived in each read.
+    full: bool,
     /// The scalars that were printed into the cell.
     text: String,
     /// What the cell holds, which a designated character set can make different from the scalars.
@@ -614,6 +620,7 @@ impl CanonicalGrid {
         };
         let stored = self.cell_text(col, row)?;
         Some(TailCell {
+            full: false,
             text: cell.to_owned(),
             stored,
             width,
@@ -646,6 +653,11 @@ impl CanonicalGrid {
         // A cell has a content bound, and the marks that fit inside it are kept whether they
         // arrived together or one at a time: cutting the whole group because the last one does not
         // fit would make the answer depend on how the reads fell.
+        if tail.full {
+            self.dropped_marks = self.dropped_marks.saturating_add(1);
+            self.tail = Some(tail);
+            return;
+        }
         let room = self.config.cell_bytes.saturating_sub(tail.stored.len());
         let keep = marks
             .char_indices()
@@ -653,10 +665,12 @@ impl CanonicalGrid {
             .map(|(index, scalar)| index + scalar.len_utf8())
             .last()
             .unwrap_or(0);
-        if keep < marks.len() {
+        let full = keep < marks.len();
+        if full {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
         }
         if keep == 0 {
+            self.tail = Some(TailCell { full, ..tail });
             return;
         }
         let marks = &marks[..keep];
@@ -693,6 +707,7 @@ impl CanonicalGrid {
             .cell_text(tail.col, tail.row)
             .unwrap_or_else(|| text.clone());
         self.tail = Some(TailCell {
+            full,
             text: tail.text,
             stored,
             width: tail.width,
@@ -1102,6 +1117,25 @@ impl CanonicalGrid {
     /// This counts the encoded text plus the per-cell bookkeeping the grid keeps for it, because
     /// the bound in section 8 is on resident state rather than on characters.
     #[must_use]
+    pub fn screen_content_bytes(&self) -> u64 {
+        let screen = self.terminal.screen();
+        let history = screen
+            .scrollback_rows()
+            .saturating_sub(self.size.rows as usize);
+        let mut bytes = 0u64;
+        let mut index = 0usize;
+        screen.for_each_phys_line(|_, line| {
+            let counted = index >= history;
+            index += 1;
+            if counted {
+                bytes = bytes.saturating_add(line.as_str().len() as u64);
+            }
+        });
+        bytes
+    }
+
+    /// Bytes the hyperlinks of the rows that are showing cost.
+    #[must_use]
     pub fn screen_link_bytes(&self) -> u64 {
         let screen = self.terminal.screen();
         let history = screen
@@ -1162,19 +1196,15 @@ fn link_bytes(line: &wezterm_term::Line) -> u64 {
     // Every distinct object on the row, not every run of them: one link can be opened once and used
     // in cells that are not next to each other, and charging it again each time would report a row
     // as costing a thousand times what it does.
-    let mut seen: Vec<*const Hyperlink> = Vec::new();
+    let mut seen: BTreeSet<*const Hyperlink> = BTreeSet::new();
     for cell in line.visible_cells() {
         let Some(link) = cell.attrs().hyperlink() else {
             continue;
         };
-        let pointer = Arc::as_ptr(link);
-        if seen.contains(&pointer) {
+        if !seen.insert(Arc::as_ptr(link)) {
             continue;
         }
         bytes = bytes.saturating_add(link_object_bytes(link));
-        if seen.len() < MAX_ROW_LINKS {
-            seen.push(pointer);
-        }
     }
     bytes
 }
@@ -1185,8 +1215,8 @@ fn link_bytes(line: &wezterm_term::Line) -> u64 {
 /// applies a link has to be the cost of the object the grid will build, not the length of what
 /// arrived.
 #[must_use]
-pub fn link_cost(text: &str) -> u64 {
-    LINK_OBJECT_BYTES + text.len() as u64 + PARAMETER_OVERHEAD_BYTES
+pub fn link_cost(text: &str, parameters: usize) -> u64 {
+    LINK_OBJECT_BYTES + text.len() as u64 + parameters as u64 * PARAMETER_OVERHEAD_BYTES
 }
 
 /// What one link object costs, as the pinned library holds it.
@@ -1202,9 +1232,6 @@ fn link_object_bytes(link: &Hyperlink) -> u64 {
         .sum();
     LINK_OBJECT_BYTES + link.uri().len() as u64 + params
 }
-
-/// Distinct links one row is tracked against before the count stops being exact.
-const MAX_ROW_LINKS: usize = 256;
 
 /// What one link object costs beyond its strings.
 const LINK_OBJECT_BYTES: u64 = 320;

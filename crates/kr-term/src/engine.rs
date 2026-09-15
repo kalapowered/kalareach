@@ -240,6 +240,7 @@ pub struct Engine {
     measured_rows: usize,
     measure_now: bool,
     links_seen: u64,
+    title_truncated: bool,
     dropped_marks: u64,
     keyboard_revision: u64,
     feeds: u32,
@@ -283,6 +284,7 @@ impl Engine {
             measured_rows: 0,
             measure_now: false,
             links_seen: 0,
+            title_truncated: false,
             dropped_marks: 0,
             keyboard_revision: 0,
             feeds: 0,
@@ -488,6 +490,7 @@ impl Engine {
                     // that belongs to the refused link inside the previous one, which is worse than
                     // having no link at all. The screens now differ, so the attachment projects.
                     self.grid.close_hyperlink();
+                    self.presentation_revision = self.next_revision();
                     outcome
                         .projection_required_at
                         .get_or_insert(event.span.start());
@@ -566,6 +569,17 @@ impl Engine {
                         "no input lease; recorded as a host event",
                     );
                 }
+            }
+            if core::mem::take(&mut self.title_truncated) {
+                self.diagnostics.record(
+                    DiagnosticKind::ResidentStateTruncated,
+                    event.span.start(),
+                    now_ms,
+                    "the title passed its bound and was cut",
+                );
+                outcome
+                    .projection_required_at
+                    .get_or_insert(event.span.start());
             }
             if let Some(refusal) = decision.refusal {
                 outcome.refusals.push(refusal);
@@ -730,7 +744,8 @@ impl Engine {
         // Every occurrence is another link object the grid holds, whether or not the session has
         // seen the target before, so what it will cost is reserved before it is applied rather than
         // noticed at the next measurement. One read can carry a session's worth of links.
-        let resident = crate::grid::link_cost(&uri);
+        let parameters = parts[1].iter().filter(|byte| **byte == b':').count() + 1;
+        let resident = crate::grid::link_cost(&uri, parameters);
         if !self.budget.metadata_fits(resident) {
             self.budget.record_truncation();
             return true;
@@ -795,6 +810,8 @@ impl Engine {
         self.measure_now = false;
         self.budget
             .set_screen_links(self.grid.alternate_active(), self.grid.screen_link_bytes());
+        self.budget
+            .set_screen_content(self.grid.screen_content_bytes());
         self.measured_rows = rows;
         if self.grid.alternate_active() {
             return;
@@ -922,6 +939,10 @@ impl Engine {
                 ..
             } => match final_byte {
                 b'c' => {
+                    // A reset empties both screens, so what they were holding is no longer held.
+                    self.budget.clear_screen_links();
+                    self.budget.set_screen_content(0);
+                    self.measure_now = true;
                     self.modes.full_reset();
                     self.titles = TitleState::new();
                     self.palette = Palette::new(self.palette.source());
@@ -1059,7 +1080,12 @@ impl Engine {
                     .map(|part| sanitise_text(part))
                     .collect::<Vec<_>>()
                     .join(";");
-                self.titles.set(target, &title);
+                if self.titles.set(target, &title) {
+                    // The session kept less of the title than a terminal reading the same bytes
+                    // would have, so the two now disagree about what the window is called.
+                    self.budget.record_truncation();
+                    self.title_truncated = true;
+                }
                 self.title_revision = self.next_revision();
             }
             104 => {
@@ -1524,7 +1550,9 @@ fn saves_cursor(kind: &EventKind) -> bool {
         } => {
             let csi = crate::classify::CsiView::new(params, *final_byte);
             match csi.final_byte {
-                b's' if csi.private.is_none() && csi.numbers.is_empty() => true,
+                // A save with empty parameter slots is still a save: the slots mean "the default",
+                // which for this sequence is no parameter at all.
+                b's' if csi.private.is_none() && csi.numbers.iter().all(Option::is_none) => true,
                 b'h' if csi.private == Some(b'?') => csi
                     .numbers
                     .iter()

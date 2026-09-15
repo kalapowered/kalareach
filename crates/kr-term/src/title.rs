@@ -102,9 +102,14 @@ impl TitleState {
         self.underflows
     }
 
-    /// Sets a title. A title longer than the per-entry bound is truncated on a character boundary.
-    pub fn set(&mut self, target: TitleTarget, title: &str) {
+    /// Sets a title.
+    ///
+    /// A title longer than the per-entry bound is truncated on a character boundary. Returns
+    /// whether it was, because a terminal reading the same bytes would have kept the whole thing
+    /// and the two would then disagree about what the window is called.
+    pub fn set(&mut self, target: TitleTarget, title: &str) -> bool {
         let value = truncate(title);
+        let truncated = value.len() < title.len();
         match target {
             TitleTarget::Icon => self.current.icon = value,
             TitleTarget::Window => self.current.window = value,
@@ -113,6 +118,7 @@ impl TitleState {
                 self.current.window = value;
             }
         }
+        truncated
     }
 
     /// Pushes the current titles, `CSI 22 t`.

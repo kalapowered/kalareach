@@ -1158,3 +1158,41 @@ fn a_reply_in_the_wrong_shape_does_not_answer_a_probe() {
         ));
     }
 }
+
+/// A title too long to keep is a truncation, not a quiet loss.
+#[test]
+fn a_title_that_does_not_fit_says_so() {
+    let mut engine = engine();
+    let title = "t".repeat(2_048);
+    let outcome = engine.feed(format!("\x1b]2;{title}\x07").as_bytes(), 0);
+    assert!(engine.budget().truncations() > 0);
+    assert!(
+        outcome.projection_required_at.is_some(),
+        "a terminal reading the same bytes kept the whole title"
+    );
+    let view = viewport(&engine);
+    let (snapshot, _) = engine.snapshot(view, 0);
+    assert!(snapshot.title.window.len() < title.len());
+}
+
+/// A reset empties both buffers, so what they were holding is no longer charged.
+#[test]
+fn a_reset_releases_what_the_buffers_held() {
+    let mut engine = engine();
+    let mut input = String::new();
+    for index in 0..64u32 {
+        input.push_str(&format!(
+            "\x1b]8;id=link{index};https://example.invalid/{index}\x1b\\x"
+        ));
+    }
+    engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+    assert!(engine.budget().usage().screen_links[0] > 0);
+    engine.feed(b"\x1bc", 0);
+    engine.quiesce(0);
+    assert_eq!(
+        engine.budget().usage().screen_links,
+        [0, 0],
+        "both screens were emptied"
+    );
+}
