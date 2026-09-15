@@ -30,7 +30,7 @@ use kr_transport::listener::{
 };
 use kr_transport::preauth::PairingSurface;
 use kr_transport::random::fresh_nonce;
-use kr_transport::scheduler::BulkLimits;
+use kr_transport::scheduler::SendLimits;
 use kr_transport::streams::StreamRegistry;
 use support::{Side, epochs, paired_pair};
 use tokio::sync::Mutex;
@@ -166,7 +166,7 @@ async fn a_registered_host_serves_an_authorised_connection_and_ends_it_cleanly()
     let registry = Arc::new(StreamRegistry::new(
         authorised.connection_id,
         Arc::new(kr_transport::scheduler::StreamBudget::new(
-            BulkLimits::default(),
+            SendLimits::default(),
         )),
         None,
     ));

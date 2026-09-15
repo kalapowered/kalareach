@@ -114,6 +114,12 @@ impl FrameWriter {
     /// Returns a framing error when the payload is empty or exceeds this stream kind's bound, and
     /// a stream error when the write fails.
     pub async fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
+        // A zero length is how the peer's decoder is told a frame is malformed, so a frame that
+        // carries nothing is refused here rather than sent and rejected on arrival. Refusing it
+        // before the write keeps a caller's mistake a local error instead of a damaged stream.
+        if payload.is_empty() {
+            return Err(FrameError::EmptyPayload.into());
+        }
         if payload.len() > self.max_payload {
             return Err(FrameError::PayloadTooLarge {
                 len: payload.len(),

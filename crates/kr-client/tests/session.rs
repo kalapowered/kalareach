@@ -31,7 +31,7 @@ use kr_protocol::scalars::{Digest256, DurationMs, EndpointKey, Nullable, Timesta
 use kr_transport::clock::{ContinuousClock, ManualClock};
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{self, Admitted, HostEpochs, LocalIdentity, PairedDirectory};
-use kr_transport::scheduler::BulkLimits;
+use kr_transport::scheduler::SendLimits;
 use kr_transport::window::{ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 use tokio::sync::Mutex;
 
@@ -254,7 +254,7 @@ async fn connect(client: &Side, host: &Side) -> Session {
         direct_addr(host),
         &client.identity,
         &host.record,
-        BulkLimits::default(),
+        SendLimits::default(),
     )
     .await
     .expect("an authorised connection");
@@ -273,7 +273,7 @@ async fn one_connection_carries_one_session() {
             direct_addr(&host),
             &client.identity,
             &host.record,
-            BulkLimits::default(),
+            SendLimits::default(),
         )
         .await
         .expect("an authorised connection"),

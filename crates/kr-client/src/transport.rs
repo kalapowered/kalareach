@@ -24,7 +24,7 @@ use kr_protocol::hello::{ALPN, ActionWindow, ReceiveLimits};
 use kr_protocol::ids::ConnectionId;
 use kr_transport::codec::{FrameReader, FrameWriter};
 use kr_transport::handshake::{self, LocalIdentity};
-use kr_transport::scheduler::{BulkLimits, StreamBudget};
+use kr_transport::scheduler::{SendLimits, StreamBudget};
 use kr_transport::streams::{DataStream, StreamRegistry};
 use tokio::sync::Mutex;
 
@@ -100,7 +100,7 @@ impl NetworkTransport {
         host_addr: impl Into<EndpointAddr>,
         identity: &LocalIdentity,
         host_record: &PairedPeer,
-        bulk_limits: BulkLimits,
+        send_limits: SendLimits,
     ) -> Result<Self> {
         let connection = endpoint
             .connect(host_addr, ALPN)
@@ -110,7 +110,7 @@ impl NetworkTransport {
         let streams = Arc::new(StreamRegistry::with_limits(
             authorised.connection_id,
             Arc::new(StreamBudget::new(
-                bulk_limits.negotiated(authorised.selection.limits),
+                send_limits.negotiated(authorised.selection.limits),
             )),
             None,
             authorised.selection.limits,

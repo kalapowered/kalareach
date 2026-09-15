@@ -24,7 +24,14 @@ use kr_protocol::limits::MAX_STREAM_HEADER_LEN;
 
 use crate::codec::{FrameReader, FrameWriter};
 use crate::error::{Result, TransportError};
-use crate::scheduler::{BulkStreamSlot, StreamBudget, StreamClass, class_of, priority_of};
+use crate::scheduler::{
+    BulkStreamSlot, QueueReservation, StreamBudget, StreamClass, class_of, priority_of,
+};
+
+/// Returns the complete frame size a payload of this length is written as.
+const fn framed_len(payload: usize) -> usize {
+    payload.saturating_add(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN)
+}
 
 /// Why a stream header was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -120,27 +127,42 @@ impl DataStream {
         self.handle.is_revoked()
     }
 
-    /// Writes one message, reserving queue space on a bulk stream first.
+    /// Writes one message, reserving queue space for it first.
+    ///
+    /// The buffer the message is encoded into is itself memory this connection is handing itself,
+    /// so it is reserved for before it exists, at the largest size this stream could produce, and
+    /// the difference goes back as soon as the size is known.
     ///
     /// # Errors
     ///
     /// Returns [`TransportError::ControlLost`] when the stream has been revoked,
-    /// [`TransportError::LimitExceeded`] when a bulk write would exceed the connection's queued
+    /// [`TransportError::LimitExceeded`] when the write would exceed the connection's queued
     /// bytes, and a framing or stream failure otherwise.
     pub async fn write_message<T: serde::Serialize + ?Sized>(&mut self, message: &T) -> Result<()> {
+        if self.handle.is_revoked() {
+            return Err(TransportError::ControlLost);
+        }
+        let bound = self
+            .writer
+            .as_ref()
+            .map_or(self.header.kind.max_payload_len(), FrameWriter::max_payload);
+        let class = class_of(self.header.kind);
+        let mut reservation = self.budget.reserve(
+            class,
+            bound
+                .saturating_add(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN)
+                .min(self.budget.limits().ceiling_for(class)),
+        )?;
         let payload = kr_cbor::to_canonical_vec_within(
             message,
-            &kr_cbor::Limits::DEFAULT.with_max_message_len(
-                self.writer
-                    .as_ref()
-                    .map_or(self.header.kind.max_payload_len(), FrameWriter::max_payload),
-            ),
+            &kr_cbor::Limits::DEFAULT.with_max_message_len(bound),
         )
         .map_err(kr_protocol::frame::FrameError::Cbor)?;
-        self.write_payload(&payload).await
+        reservation.shrink_to(framed_len(payload.len()));
+        self.write_reserved(&payload, reservation).await
     }
 
-    /// Writes one already-canonical payload, reserving queue space on a bulk stream first.
+    /// Writes one already-canonical payload, reserving queue space for it first.
     ///
     /// # Errors
     ///
@@ -149,17 +171,21 @@ impl DataStream {
         if self.handle.is_revoked() {
             return Err(TransportError::ControlLost);
         }
-        // The queue ceiling exists so a transfer cannot consume the whole send budget and leave a
-        // keystroke waiting. It is charged here, where the bytes are actually handed to the
-        // connection, and released when the write completes. The charge covers the complete frame,
-        // its length prefix included, because that is what the connection is given.
-        let framed = payload
-            .len()
-            .saturating_add(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN);
-        let _reservation = match class_of(self.header.kind) {
-            StreamClass::Bulk => Some(self.budget.reserve(framed)?),
-            _ => None,
-        };
+        let reservation = self
+            .budget
+            .reserve(class_of(self.header.kind), framed_len(payload.len()))?;
+        self.write_reserved(payload, reservation).await
+    }
+
+    /// Writes a payload the connection's budget has already admitted.
+    ///
+    /// The reservation is held for as long as the bytes are the connection's to send, and released
+    /// when the write finishes, fails or is revoked.
+    async fn write_reserved(
+        &mut self,
+        payload: &[u8],
+        _reservation: QueueReservation,
+    ) -> Result<()> {
         let writer = self
             .writer
             .as_mut()
@@ -403,7 +429,7 @@ impl StreamRegistry {
         self.state.connection_id
     }
 
-    /// Returns the shared bulk budget.
+    /// Returns the shared send budget.
     #[must_use]
     pub fn budget(&self) -> &Arc<StreamBudget> {
         &self.state.budget
@@ -425,7 +451,8 @@ impl StreamRegistry {
         if self.is_revoked() {
             return Err(TransportError::ControlLost);
         }
-        let bulk_slot = match class_of(header.kind) {
+        let class = class_of(header.kind);
+        let bulk_slot = match class {
             StreamClass::Bulk => Some(self.state.budget.open_bulk()?),
             _ => None,
         };
@@ -433,11 +460,9 @@ impl StreamRegistry {
         let (send, recv) = self.quic_until_revoked(connection.open_bi()).await?;
         let mut writer = FrameWriter::new(send, header.kind).with_max_payload(limit);
         writer.set_priority(priority_of(header.kind));
-        // The header is bytes handed to the connection like any other, so a bulk stream charges it.
-        let header_charge = match class_of(header.kind) {
-            StreamClass::Bulk => Some(self.state.budget.reserve(MAX_STREAM_HEADER_LEN)?),
-            _ => None,
-        };
+        // The header is bytes handed to the connection like any other, so it is charged like any
+        // other.
+        let header_charge = self.state.budget.reserve(class, MAX_STREAM_HEADER_LEN)?;
         self.until_revoked(writer.write_header(&header)).await?;
         drop(header_charge);
         let reader = FrameReader::new(recv, header.kind).with_max_payload(limit);
@@ -667,7 +692,7 @@ mod tests {
         let hook = Arc::new(CountingHook::default());
         let registry = StreamRegistry::new(
             connection_id(1),
-            Arc::new(StreamBudget::new(crate::scheduler::BulkLimits::default())),
+            Arc::new(StreamBudget::new(crate::scheduler::SendLimits::default())),
             Some(hook.clone()),
         );
         let (first, first_registration) = registry
@@ -697,7 +722,7 @@ mod tests {
     fn a_stream_that_ends_normally_leaves_the_registry() {
         let registry = StreamRegistry::new(
             connection_id(1),
-            Arc::new(StreamBudget::new(crate::scheduler::BulkLimits::default())),
+            Arc::new(StreamBudget::new(crate::scheduler::SendLimits::default())),
             None,
         );
         for _ in 0..1_000 {

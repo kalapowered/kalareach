@@ -27,7 +27,7 @@ use kr_protocol::ids::{AttachmentId, ConnectionId, EnvironmentId, SessionId, Tra
 use kr_protocol::scalars::{Nullable, Uuid};
 use kr_transport::clock::ManualClock;
 use kr_transport::handshake::{self, Admitted, PairedDirectory};
-use kr_transport::scheduler::{BulkLimits, StreamBudget};
+use kr_transport::scheduler::{SendLimits, StreamBudget};
 use kr_transport::streams::StreamRegistry;
 use std::sync::Arc;
 use support::{OneDevice, Side, direct_addr, epochs, ledger, paired_pair, windows};
@@ -77,7 +77,7 @@ fn one_device(client: &Side) -> Arc<dyn PairedDirectory> {
 fn registry(connection_id: ConnectionId) -> Arc<StreamRegistry> {
     Arc::new(StreamRegistry::new(
         connection_id,
-        Arc::new(StreamBudget::new(BulkLimits::default())),
+        Arc::new(StreamBudget::new(SendLimits::default())),
         None,
     ))
 }

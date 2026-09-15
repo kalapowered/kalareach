@@ -33,7 +33,7 @@ use crate::endpoint::{KEEPALIVE, bind_listener};
 use crate::error::{Result, TransportError};
 use crate::handshake::{Admitted, HostEpochs, LocalIdentity, PairedDirectory};
 use crate::preauth::{PairingSurface, PreAuthLimits};
-use crate::scheduler::{BulkLimits, StreamBudget};
+use crate::scheduler::{SendLimits, StreamBudget};
 use crate::streams::{RevocationHook, StreamRegistry};
 use crate::window::{ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
@@ -58,7 +58,7 @@ pub struct ListenerConfig {
     /// connection, because an envelope records the generation that admitted it.
     pub controller_generation: ControllerGeneration,
     /// The bulk-stream limits each connection is held to.
-    pub bulk_limits: BulkLimits,
+    pub send_limits: SendLimits,
     /// What an unpaired connection may do.
     pub preauth_limits: PreAuthLimits,
     /// How long an action window lasts, capped at five minutes.
@@ -89,7 +89,7 @@ impl ListenerConfig {
             endpoint,
             epochs,
             controller_generation,
-            bulk_limits: BulkLimits::default(),
+            send_limits: SendLimits::default(),
             preauth_limits: PreAuthLimits::default(),
             action_window_validity: MAX_WINDOW_VALIDITY,
             max_outstanding_challenges: DEFAULT_MAX_OUTSTANDING_CHALLENGES,
@@ -592,7 +592,7 @@ async fn serve_authorised<H: HostHandler>(
         Arc::new(StreamBudget::new(
             state
                 .config
-                .bulk_limits
+                .send_limits
                 .negotiated(authorised.selection.limits),
         )),
         Some(hook),

@@ -207,18 +207,32 @@ another connection is refused, and so is one whose resource does not fit its kin
 stream without a session and attachment, a semantic stream without a session, an attachment stream
 without a transfer.
 
-Bulk streams are bounded three times. The connection's own QUIC send window is 8 MiB, which is
-section 9's bounded send queue per peer enforced by the transport rather than only by the
-application's accounting. Within that, at most 4 bulk streams may be open, and the application hands
-the connection at most 7 MiB of bulk data at once, lowered further when the peer negotiated a
-smaller send queue. Control and input are written at a higher stream priority, so the connection
-sends them first whenever it has capacity.
+The connection's own QUIC send window is 8 MiB, which is section 9's bounded send queue per peer
+enforced by the transport rather than only by the application's accounting. Inside that window the
+application keeps two ceilings of its own:
 
-What that does not do is reserve capacity inside QUIC: bytes the connection has accepted but not yet
-had acknowledged still occupy the window, and the transport has no way to observe when they drain.
-A sustained transfer can therefore fill the window, and a control write then waits for the peer to
-acknowledge rather than for a scheduler decision. Bounding that properly needs per-stream send
-accounting the transport crate does not expose.
+* **The whole connection.** Every data-stream write is charged against a per-connection budget of
+  8 MiB, lowered to whatever the peer declared it would queue. No combination of terminal, semantic
+  and attachment streams can hand the connection more than that at once.
+* **Bulk within it.** At most 4 attachment streams may be open, and they may hand the connection at
+  most 7 MiB at once, so a transfer can never occupy the last mebibyte of the budget and a control
+  frame always has room. Control frames are not charged at all: that mebibyte is what it is for.
+
+A charge covers the complete frame, its length prefix and its stream header included, and it is
+taken before the bytes exist rather than after. A message write reserves at the stream kind's frame
+bound, encodes into that reservation, then returns the difference once the size is known, so a
+connection cannot hold more encoded payloads than its budget while their writes are blocked. A write
+the budget refuses is refused whole: nothing is charged, nothing is sent, and the caller retries.
+
+An empty frame is refused before the write, because a zero length is what the peer's decoder reads
+as a malformed frame. A caller's mistake stays a local error rather than becoming stream damage.
+
+Control and input are written at a higher stream priority, so the connection sends them first
+whenever it has capacity. What that does not do is reserve capacity inside QUIC: bytes the
+connection has accepted but not yet had acknowledged still occupy the window, and the transport has
+no way to observe when they drain. A sustained transfer can therefore fill the window, and a control
+write then waits for the peer to acknowledge rather than for a scheduler decision. Bounding that
+properly needs per-stream send accounting the transport crate does not expose.
 
 The negotiated limits are in force as well as the stream kind's ceilings. A peer that declared it
 could receive less than the kind allows is held to what it declared, in both directions, and a frame

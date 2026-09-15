@@ -32,7 +32,7 @@ use kr_transport::error::TransportError;
 use kr_transport::handshake::{self, Admitted, PairedDirectory};
 use kr_transport::preauth::{self, PairingMethod, PairingSurface, PreAuthLimits};
 use kr_transport::random::fresh_nonce;
-use kr_transport::scheduler::{BulkLimits, StreamBudget};
+use kr_transport::scheduler::{SendLimits, StreamBudget};
 use kr_transport::streams::StreamRegistry;
 use support::{
     NoDevices, OneDevice, Side, direct_addr, epochs, ledger, paired_pair, side, windows,
@@ -529,7 +529,7 @@ async fn a_data_stream_does_not_survive_the_control_stream() {
     let authorised = handshake::connect(&connection, &client.identity, &host.record)
         .await
         .expect("an authorised connection");
-    let client_registry = registry(authorised.connection_id, BulkLimits::default());
+    let client_registry = registry(authorised.connection_id, SendLimits::default());
     let mut client_stream = client_registry
         .open(&connection, terminal_header(authorised.connection_id))
         .await
@@ -539,7 +539,7 @@ async fn a_data_stream_does_not_survive_the_control_stream() {
     let Admitted::Authorised(host_side) = admitted.expect("an admitted connection") else {
         panic!("a paired endpoint is authorised");
     };
-    let host_registry = registry(host_side.connection_id, BulkLimits::default());
+    let host_registry = registry(host_side.connection_id, SendLimits::default());
     let mut host_stream = host_registry
         .accept(&host_connection)
         .await
@@ -597,9 +597,10 @@ async fn a_connection_admits_no_more_bulk_streams_than_it_allows() {
         .expect("an authorised connection");
     let registry = registry(
         authorised.connection_id,
-        BulkLimits {
-            max_streams: 2,
-            max_queued_bytes: 1024,
+        SendLimits {
+            max_bulk_streams: 2,
+            max_bulk_queued_bytes: 1024,
+            max_queued_bytes: 4096,
         },
     );
 
@@ -640,6 +641,116 @@ async fn a_connection_admits_no_more_bulk_streams_than_it_allows() {
 }
 
 #[tokio::test]
+async fn an_empty_frame_is_refused_before_it_damages_the_stream() {
+    // A zero length is what the peer's decoder reads as a malformed frame, so a caller that asks
+    // for an empty frame gets a local error and the stream carries on.
+    let (host, client) = paired_pair().await;
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let client_registry = registry(authorised.connection_id, SendLimits::default());
+    let mut client_stream = client_registry
+        .open(&connection, terminal_header(authorised.connection_id))
+        .await
+        .expect("a data stream");
+
+    let (host_connection, admitted) = accepting.await.expect("the host task");
+    let Admitted::Authorised(host_side) = admitted.expect("an admitted connection") else {
+        panic!("a paired endpoint is authorised");
+    };
+    let host_registry = registry(host_side.connection_id, SendLimits::default());
+    let mut host_stream = host_registry
+        .accept(&host_connection)
+        .await
+        .expect("a data stream");
+
+    let error = client_stream
+        .write_payload(&[])
+        .await
+        .expect_err("an empty frame is refused");
+    assert!(
+        matches!(
+            error,
+            TransportError::Frame(kr_protocol::frame::FrameError::EmptyPayload)
+        ),
+        "an empty frame is a framing error, not a stream failure: {error:?}"
+    );
+
+    // Nothing reached the connection, so the next frame is read as itself.
+    client_stream
+        .write_payload(b"still usable")
+        .await
+        .expect("the stream was not damaged");
+    let delivered = tokio::time::timeout(Duration::from_secs(10), host_stream.read_payload())
+        .await
+        .expect("the frame arrived")
+        .expect("a frame")
+        .expect("the stream did not end");
+    assert_eq!(delivered, b"still usable");
+    drop(host_side);
+}
+
+#[tokio::test]
+async fn every_stream_class_is_charged_against_the_connection_send_budget() {
+    // A terminal stream is interactive, not bulk, and it is still held to what the peer said it
+    // would accept: a write past the whole-connection ceiling is refused before anything is sent.
+    let (host, client) = paired_pair().await;
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let registry = registry(
+        authorised.connection_id,
+        SendLimits {
+            max_bulk_streams: 4,
+            max_bulk_queued_bytes: 1024,
+            max_queued_bytes: 2048,
+        },
+    );
+    let mut stream = registry
+        .open(&connection, terminal_header(authorised.connection_id))
+        .await
+        .expect("a terminal stream");
+
+    let error = stream
+        .write_payload(&vec![0u8; 4096])
+        .await
+        .expect_err("a write past the connection ceiling is refused");
+    assert!(
+        matches!(
+            error,
+            TransportError::LimitExceeded {
+                what: "queued bytes",
+                limit: 2048
+            }
+        ),
+        "{error:?}"
+    );
+    // The refusal charged nothing, so a write inside the ceiling still goes out.
+    assert_eq!(registry.budget().queued_bytes(), 0);
+    stream
+        .write_payload(b"inside the ceiling")
+        .await
+        .expect("a write inside the ceiling");
+    assert_eq!(registry.budget().queued_bytes(), 0);
+
+    let _ = accepting.await.expect("the host task");
+}
+
+#[tokio::test]
 async fn a_stream_header_from_another_connection_is_refused() {
     let (host, client) = paired_pair().await;
     let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
@@ -657,7 +768,7 @@ async fn a_stream_header_from_another_connection_is_refused() {
     let Admitted::Authorised(host_side) = admitted.expect("an admitted connection") else {
         panic!("a paired endpoint is authorised");
     };
-    let host_registry = registry(host_side.connection_id, BulkLimits::default());
+    let host_registry = registry(host_side.connection_id, SendLimits::default());
 
     // A header that names a connection identity the host never allocated.
     let forged = ConnectionId::new(Uuid::from_bytes([0xaa; 16]));
@@ -761,7 +872,7 @@ fn one_device(client: &Side) -> Arc<dyn PairedDirectory> {
     })
 }
 
-fn registry(connection_id: ConnectionId, limits: BulkLimits) -> Arc<StreamRegistry> {
+fn registry(connection_id: ConnectionId, limits: SendLimits) -> Arc<StreamRegistry> {
     Arc::new(StreamRegistry::new(
         connection_id,
         Arc::new(StreamBudget::new(limits)),
