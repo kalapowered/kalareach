@@ -269,7 +269,8 @@ impl WorkerService {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         let (mut reader, writer) = split(connection, StreamKind::Control);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
-        let mut state = ConnectionState::new(connection_id, &peer);
+        let mut state =
+            ConnectionState::new(connection_id, &peer, Arc::new(Mutex::new(Vec::new())));
         // The caller's record is validated and the connection registered in one step. The
         // listener checked the peer when it accepted the connection; this is the final check, and
         // it happens where the registration is written, so nothing can be admitted in between.
@@ -278,12 +279,16 @@ impl WorkerService {
         }
         let registration = self.admit(connection_id);
         let withdrawn = Arc::clone(&registration.withdrawn);
+        state.attachments = Arc::clone(&registration.attachments);
         // Both timers fire once immediately; that first tick is consumed here so a connection is
         // not handed a replacement window before it has read the one in its acknowledgement.
         let mut renewal = tokio::time::interval(WINDOW_RENEWAL);
         renewal.tick().await;
         let mut keepalive = tokio::time::interval(LOCAL_KEEPALIVE);
         keepalive.tick().await;
+        // The withdrawal is a latch rather than a single permit, so this loop acts on it once and
+        // then stops watching it: the connection stays open to refuse the next request.
+        let mut fenced = false;
         loop {
             let message: ControlFrame = tokio::select! {
                 message = reader.read_message::<ControlFrame>() => match message {
@@ -295,15 +300,11 @@ impl WorkerService {
                 // a delivery task streaming this session's output down a connection that no longer
                 // holds authority. The connection itself stays open, so the caller is told why its
                 // next request is refused rather than finding a socket that closed.
-                () = withdrawn.notified() => {
-                    // The delivery task has already been stopped by the withdrawal itself; what is
-                    // left is the attachments it held.
+                () = withdrawn.wait(), if !fenced => {
+                    fenced = true;
+                    // The delivery task and the attachments went with the withdrawal itself. What
+                    // is left is this connection's own handle on the task it started.
                     state.delivery = None;
-                    for attachment_id in state.attachments.drain(..) {
-                        let mut session = self.runtime.session();
-                        let _ = session.detach(attachment_id);
-                        self.runtime.flush_locked(&mut session);
-                    }
                     continue;
                 }
                 // The window is replaced without being asked for, at half its validity. An
@@ -313,16 +314,14 @@ impl WorkerService {
                         break;
                     };
                     let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(window));
-                    let mut sender = writer.lock().await;
-                    if sender.write_message(&renewed).await.is_err() {
+                    if !write_unless_withdrawn(&writer, &renewed, &withdrawn).await {
                         break;
                     }
                     continue;
                 }
                 _ = keepalive.tick(), if state.negotiated => {
                     let beat = ControlFrame::Event(ControlEvent::Keepalive);
-                    let mut sender = writer.lock().await;
-                    if sender.write_message(&beat).await.is_err() {
+                    if !write_unless_withdrawn(&writer, &beat, &withdrawn).await {
                         break;
                     }
                     continue;
@@ -340,9 +339,10 @@ impl WorkerService {
                         gate.release_on_delivery(crate::runtime::ACCEPTANCE_DELIVERY_TIMEOUT),
                     )
                 });
-                let mut sender = writer.lock().await;
-                let written = sender.write_message(&reply).await.is_ok();
-                drop(sender);
+                // The write answers to the withdrawal as well as to the socket. A peer that has
+                // stopped reading would otherwise hold this reply — and with it this connection's
+                // authority — for as long as it stayed away.
+                let written = write_unless_withdrawn(&writer, &reply, &withdrawn).await;
                 if let Some((action_id, delivery)) = armed {
                     if written && state.client_kind == LocalClientKind::Controller {
                         // The requester is not the peer that was just written to: the daemon still
@@ -360,11 +360,10 @@ impl WorkerService {
                 }
                 // A controller announces itself in its hello; the worker answers with a challenge
                 // it will only accept once.
-                if let Some(challenge) = state.pending_challenge.take() {
-                    let mut sender = writer.lock().await;
-                    if sender.write_message(&challenge).await.is_err() {
-                        break;
-                    }
+                if let Some(challenge) = state.pending_challenge.take()
+                    && !write_unless_withdrawn(&writer, &challenge, &withdrawn).await
+                {
+                    break;
                 }
             }
             if state.subscribed.is_none() {
@@ -377,20 +376,21 @@ impl WorkerService {
                 if let Some(previous) = state.delivery.take() {
                     previous.abort();
                 }
-                // And a withdrawn connection starts none at all. The check is made again once the
-                // task exists, because a withdrawal can land between the two.
-                if !self
-                    .admitted
-                    .lock()
-                    .expect("the connection registry is not poisoned")
-                    .contains_key(&connection_id)
-                {
-                    continue;
-                }
+                // And a withdrawn connection starts none at all. The task is created holding a
+                // permit it has to be given before it does anything, and the permit is only sent
+                // once its abort handle is installed in a registration that still stands. The two
+                // are therefore one step: nothing can start delivering between the check and the
+                // moment a withdrawal could stop it.
+                let (start, started) = tokio::sync::oneshot::channel::<()>();
                 let sender = Arc::clone(&writer);
                 let stream_id = state.stream_id.clone();
                 let restoration = state.restoration.take();
                 let task = tokio::spawn(async move {
+                    // Nothing before this line touches the connection. A permit that never arrives
+                    // means the registration was withdrawn while this task was being created.
+                    if started.await.is_err() {
+                        return;
+                    }
                     let mut sequence = 0_u64;
                     // The screen this attachment joins on is the canonical screen as it is now,
                     // drawn from the terminal engine's own state. It is not the raw history.
@@ -487,10 +487,10 @@ impl WorkerService {
                     let _ = attachment_id;
                 });
                 // The registry holds the handle too, so a withdrawal can stop the delivery without
-                // waiting for this loop to come back round. A withdrawal that happened while the
-                // task was being spawned has already removed the registration, and the task is
-                // stopped here instead: otherwise it would deliver this session's output on a
-                // connection whose authority is gone.
+                // waiting for this loop to come back round. Installing the handle and deciding
+                // whether the task may start happen under the registration's own lock, so a
+                // withdrawal either finds the handle and aborts the task, or arrives first and the
+                // permit is never sent.
                 let still_admitted = {
                     let mut held = registration
                         .delivery
@@ -506,7 +506,7 @@ impl WorkerService {
                     }
                     admitted
                 };
-                if still_admitted {
+                if still_admitted && start.send(()).is_ok() {
                     state.delivery = Some(task);
                 } else {
                     task.abort();
@@ -526,7 +526,7 @@ impl WorkerService {
         if let Some(task) = state.delivery.take() {
             task.abort();
         }
-        for attachment_id in state.attachments.drain(..) {
+        for attachment_id in state.take_attachments() {
             let mut session = self.runtime.session();
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
@@ -862,8 +862,9 @@ impl WorkerService {
     /// already been replaced.
     fn admit(&self, connection_id: ConnectionId) -> Registration {
         let registration = Registration {
-            withdrawn: Arc::new(tokio::sync::Notify::new()),
+            withdrawn: Arc::new(Withdrawal::default()),
             delivery: Arc::new(Mutex::new(None)),
+            attachments: Arc::new(Mutex::new(Vec::new())),
         };
         let _authority = self
             .authority
@@ -878,28 +879,43 @@ impl WorkerService {
 
     /// Withdraws one connection's registration.
     ///
-    /// The delivery task is stopped here rather than left for the connection's own loop to notice.
-    /// That loop may be blocked writing to a socket nobody is reading, and a subscription that kept
-    /// delivering this session's output until the peer read again would be exactly the thing the
-    /// withdrawal exists to stop.
+    /// Everything the withdrawal has to end is ended **here**, not left for the connection's own
+    /// loop to notice. That loop may be blocked writing to a socket nobody is reading, and waiting
+    /// for it would leave this session's authority in the hands of a peer that has stopped
+    /// listening, for as long as it cares to:
+    ///
+    /// * the delivery task is aborted, so no more of this session's output is written;
+    /// * the latch is set, so a write already waiting for the peer abandons what it was writing;
+    /// * the attachments are detached, so the connection owns nothing of the session.
     fn withdraw(&self, connection_id: ConnectionId) {
         let held = self
             .admitted
             .lock()
             .expect("the connection registry is not poisoned")
             .remove(&connection_id);
-        if let Some(registration) = held {
-            if let Some(task) = registration
-                .delivery
+        let Some(registration) = held else {
+            return;
+        };
+        if let Some(task) = registration
+            .delivery
+            .lock()
+            .expect("the delivery slot is not poisoned")
+            .take()
+        {
+            task.abort();
+        }
+        registration.withdrawn.set();
+        let held = std::mem::take(
+            &mut *registration
+                .attachments
                 .lock()
-                .expect("the delivery slot is not poisoned")
-                .take()
-            {
-                task.abort();
-            }
-            // A stored permit, so a connection that is not waiting at this instant still learns of
-            // it the moment it next looks.
-            registration.withdrawn.notify_one();
+                .expect("the attachment list is not poisoned"),
+        );
+        for attachment_id in held {
+            let mut session = self.runtime.session();
+            let _ = session.detach(attachment_id);
+            // The fence this detach moved, and any terminator it produced, reach the writer here.
+            self.runtime.flush_locked(&mut session);
         }
     }
 
@@ -1608,7 +1624,7 @@ impl WorkerService {
     /// An attachment identifier is not permission. A connection acts on the attachments it
     /// created, and nothing else.
     fn check_attachment(state: &ConnectionState, attachment_id: AttachmentId) -> Result<()> {
-        if state.attachments.contains(&attachment_id) {
+        if state.holds_attachment(attachment_id) {
             Ok(())
         } else {
             Err(WorkerError::UnknownAttachment {
@@ -1807,7 +1823,7 @@ impl WorkerService {
                 // session.
                 let granted = params.requested.clone();
                 let result = session.attach(&params, granted, attachment_id)?;
-                state.attachments.push(attachment_id);
+                state.add_attachment(attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::SessionDetach => {
@@ -1818,9 +1834,7 @@ impl WorkerService {
                 // that stayed in the session would let bytes already handed to the writer reach the
                 // application after the attachment that sent them had gone.
                 self.runtime.flush_locked(session);
-                state
-                    .attachments
-                    .retain(|attachment| *attachment != params.attachment_id);
+                state.remove_attachment(params.attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::SessionClose => {
@@ -2071,7 +2085,10 @@ pub struct ConnectionState {
     /// The challenge this connection issued to a controller, consumed once.
     pub generation_nonce: Option<Nonce256>,
     /// The attachments this connection owns.
-    pub attachments: Vec<AttachmentId>,
+    ///
+    /// Shared with the connection's registration, so a withdrawal can take them back without
+    /// waiting for this connection's own loop to come back round.
+    pub attachments: Arc<Mutex<Vec<AttachmentId>>>,
     /// The output subscription waiting to be started.
     pub subscribed: Option<(AttachmentId, crate::output::OutputStream)>,
     /// The last input sequence accepted on this connection.
@@ -2096,8 +2113,15 @@ pub struct ConnectionState {
 
 impl ConnectionState {
     /// Builds the state for a fresh connection.
+    ///
+    /// `attachments` is the registration's own list, so what this connection takes and what a
+    /// withdrawal gives back are one list rather than two that can disagree.
     #[must_use]
-    pub fn new(connection_id: ConnectionId, peer: &PeerIdentity) -> Self {
+    pub fn new(
+        connection_id: ConnectionId,
+        peer: &PeerIdentity,
+        attachments: Arc<Mutex<Vec<AttachmentId>>>,
+    ) -> Self {
         Self {
             connection_id,
             negotiated: false,
@@ -2107,7 +2131,7 @@ impl ConnectionState {
             generation: None,
             stream_id: StreamId::new(OUTPUT_STREAM).expect("a valid stream name"),
             generation_nonce: None,
-            attachments: Vec::new(),
+            attachments,
             subscribed: None,
             input_sequence: 0,
             close_gate: None,
@@ -2121,6 +2145,40 @@ impl ConnectionState {
         }
     }
 
+    /// Records an attachment this connection now owns.
+    fn add_attachment(&self, attachment_id: AttachmentId) {
+        self.attachments
+            .lock()
+            .expect("the attachment list is not poisoned")
+            .push(attachment_id);
+    }
+
+    /// Forgets an attachment this connection has given up.
+    fn remove_attachment(&self, attachment_id: AttachmentId) {
+        self.attachments
+            .lock()
+            .expect("the attachment list is not poisoned")
+            .retain(|held| *held != attachment_id);
+    }
+
+    /// Returns whether this connection owns the attachment.
+    fn holds_attachment(&self, attachment_id: AttachmentId) -> bool {
+        self.attachments
+            .lock()
+            .expect("the attachment list is not poisoned")
+            .contains(&attachment_id)
+    }
+
+    /// Takes every attachment this connection still owns.
+    fn take_attachments(&self) -> Vec<AttachmentId> {
+        std::mem::take(
+            &mut *self
+                .attachments
+                .lock()
+                .expect("the attachment list is not poisoned"),
+        )
+    }
+
     fn next_request_id(&mut self) -> RequestId {
         self.next_request += 1;
         RequestId::new(self.next_request)
@@ -2129,12 +2187,56 @@ impl ConnectionState {
 
 /// One connection's registration in the worker's authority store.
 ///
-/// It is what a withdrawal acts on: the notification that ends the connection's own loop, and the
-/// delivery task it started, which is stopped directly rather than when that loop next looks.
+/// It is what a withdrawal acts on, and it holds everything a withdrawal has to end without asking
+/// the connection's own loop to do it: the latch that loop and its writes watch, the delivery task
+/// it started, and the attachments it owns.
 #[derive(Clone, Debug)]
 struct Registration {
-    withdrawn: Arc<tokio::sync::Notify>,
+    withdrawn: Arc<Withdrawal>,
     delivery: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    /// The attachments this connection owns, shared so a withdrawal can take them back itself.
+    attachments: Arc<Mutex<Vec<AttachmentId>>>,
+}
+
+/// A registration's withdrawal, as something every part of a connection can watch at once.
+///
+/// A stored notification permit is answered by exactly one waiter, and a connection has more than
+/// one place that has to react: the loop waiting for the next frame, and a write that is waiting
+/// for a peer which has stopped reading. This is a latch instead. It is set once, it is never
+/// cleared, and every waiter — present and future — observes it.
+#[derive(Debug, Default)]
+struct Withdrawal {
+    withdrawn: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Withdrawal {
+    /// Sets the latch and wakes everything waiting on it.
+    fn set(&self) {
+        self.withdrawn
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Returns whether the registration has been withdrawn.
+    fn is_set(&self) -> bool {
+        self.withdrawn.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Waits until the registration is withdrawn, returning at once if it already has been.
+    async fn wait(&self) {
+        if self.is_set() {
+            return;
+        }
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        // Registered before the second look, so a withdrawal between the two is not missed.
+        notified.as_mut().enable();
+        if self.is_set() {
+            return;
+        }
+        notified.await;
+    }
 }
 
 /// The largest payload one output notification carries.
@@ -2143,6 +2245,30 @@ struct Registration {
 /// rather than filling it exactly. A rendering of a large screen is bigger than one frame, and a
 /// restoration that was written as one frame would simply fail to be written at all.
 pub const MAX_OUTPUT_EVENT_BYTES: usize = 256 * 1024;
+
+/// Writes one frame unless the connection's registration is withdrawn first.
+///
+/// Returns whether the frame reached the peer. A peer that has stopped reading blocks a write for
+/// as long as it likes, and everything this connection still holds — its authority, its
+/// attachments, its subscription — would be held with it. The withdrawal ends the wait instead, and
+/// the caller treats an abandoned write as a connection that has finished.
+async fn write_unless_withdrawn(
+    writer: &Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
+    frame: &ControlFrame,
+    withdrawn: &Withdrawal,
+) -> bool {
+    // The write is polled first, so a frame the peer is ready for still goes: a fenced connection
+    // is told why its next request was refused rather than finding a socket that closed. Only a
+    // write that would *wait* is abandoned, which is the case the withdrawal exists for.
+    tokio::select! {
+        biased;
+        written = async {
+            let mut sender = writer.lock().await;
+            sender.write_message(frame).await.is_ok()
+        } => written,
+        () = withdrawn.wait() => false,
+    }
+}
 
 /// Writes a span of the output stream, in frames the control stream can carry.
 ///

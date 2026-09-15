@@ -667,3 +667,115 @@ async fn a_close_that_reuses_an_earlier_action_identifier_conflicts_rather_than_
         "and a healthy journal is not marked as having failed"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawal_completes_while_the_peer_has_stopped_reading() {
+    // The case the transport's contract is about: a peer that stops reading. Its socket fills, the
+    // worker's write for it waits, and everything that connection still holds — its subscription,
+    // its attachments, its authority — would wait with it. Withdrawal has to end all of that
+    // without asking that peer for anything.
+    let host = host_producing(1, "while true; do printf 'line\\n'; sleep 1; done").await;
+    let mut first = controller_client(&host, 1).await;
+    let attached: kr_protocol::attachment::SessionAttachResult = first
+        .mutate(
+            Method::SessionAttach,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            target(host.environment_id, host.session_id),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attach succeeds")
+        .to_typed()
+        .expect("decodes");
+    let mut streams = kr_protocol::scalars::CanonicalSet::new();
+    streams.insert(kr_protocol::recovery::EventStream::Output);
+    first
+        .request(
+            Method::EventsSubscribe,
+            &kr_protocol::recovery::EventsSubscribeParams {
+                session_id: host.session_id,
+                attachment_id: attached.attachment.attachment_id,
+                streams,
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the subscription succeeds");
+    assert!(
+        output_within(&mut first, std::time::Duration::from_secs(4)).await,
+        "the subscription is delivering before anything is withdrawn"
+    );
+    assert_eq!(
+        host.service.runtime().session().attachments().len(),
+        1,
+        "and the connection owns its attachment"
+    );
+
+    // From here this peer reads nothing, and it keeps asking. The worker answers until the socket
+    // will take no more, and its loop is then inside a write that nobody is going to read.
+    let saturated = saturate(&mut first, host.session_id).await;
+    assert!(
+        saturated,
+        "the peer stopped reading and the worker's replies filled the socket"
+    );
+
+    // A replacement daemon binds the authority, which withdraws the first connection.
+    let mut second = controller_client(&host, 2).await;
+    read_session(&mut second, host.session_id)
+        .await
+        .expect("the replacement connection is served");
+
+    // The attachment goes with the withdrawal, not with the socket.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if host.service.runtime().session().attachments().is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "withdrawal took the connection's attachments back without waiting for its peer"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // And nothing protected reaches that peer afterwards. What was already in the socket is read
+    // off first; after it, the shell is still writing and none of it arrives.
+    while output_within(&mut first, std::time::Duration::from_millis(200)).await {}
+    assert!(
+        !output_within(&mut first, std::time::Duration::from_secs(3)).await,
+        "no output is delivered to a withdrawn connection"
+    );
+}
+
+/// Asks the worker for more than the connection can carry, and stops reading the answers.
+///
+/// Returns whether the pipeline filled: the worker's replies no longer fit in the socket, so its
+/// connection loop is waiting inside a write, and this client's own writes stop going through too.
+async fn saturate(client: &mut LocalClient, session_id: SessionId) -> bool {
+    let params = kr_protocol::envelope::ParamsValue::from_typed(&SessionReadParams { session_id })
+        .expect("encodes");
+    for index in 0..20_000_u64 {
+        let request =
+            kr_protocol::envelope::ControlFrame::Request(kr_protocol::envelope::Request {
+                request_id: kr_protocol::ids::RequestId::new(1_000 + index),
+                method: Method::SessionRead.into(),
+                method_version: kr_protocol::method::MethodVersion::V1,
+                params: params.clone(),
+            });
+        let written = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.writer().write_message(&request),
+        )
+        .await;
+        match written {
+            // This client's own write is now waiting, which means the worker has stopped reading,
+            // which means the worker is waiting inside a write of its own.
+            Err(_) => return true,
+            Ok(Err(_)) => return false,
+            Ok(Ok(())) => {}
+        }
+    }
+    false
+}
