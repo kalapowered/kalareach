@@ -1,0 +1,6 @@
+{
+  "note": "An SDK range that admits releases nobody qualified the package against.",
+  "codes": [
+    "unbounded_version_range"
+  ]
+}

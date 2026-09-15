@@ -1,0 +1,117 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "example-declarative",
+  "version": "0.1.0",
+  "display_name": "Example declarative package",
+  "description": "Recognises the example agent and presents its status with one declarative control.",
+  "sdk_range": ">=0.1.0, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "refs/tags/example-declarative-0.1.0"
+  },
+  "match_rules": [
+    {
+      "id": "example-agent",
+      "executable": {
+        "file_stem": "example-agent",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": {
+        "registry": "npm",
+        "package": "@kalareach/example-agent"
+      },
+      "confidence": "exact"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "f3992111da3c53b4e58af4fc88f576ba7c0a34590b37cf59116c0874e5568f3b",
+      "size_bytes": "2421"
+    },
+    {
+      "role": "asset",
+      "path": "assets/icon.svg",
+      "digest": "fb91f9a03c202c5f160eef644da6f2f704b19ac5c5f8b4c124e1b0b485ad57a0",
+      "size_bytes": "42"
+    },
+    {
+      "role": "asset",
+      "path": "assets/Icon.svg",
+      "digest": "fb91f9a03c202c5f160eef644da6f2f704b19ac5c5f8b4c124e1b0b485ad57a0",
+      "size_bytes": "42"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise the example agent from its executable name"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Present the application's status and one control"
+    },
+    {
+      "capability": "broker.semantic_events",
+      "reason": "Update the status from events the actor may already see"
+    }
+  ],
+  "actions": [
+    {
+      "id": "status.refresh",
+      "label": "Refresh status",
+      "effect": "observe",
+      "parameters": {
+        "parameters": [
+          {
+            "name": "detail",
+            "kind": {
+              "type": "choice",
+              "choices": [
+                {
+                  "id": "summary",
+                  "label": "Summary"
+                },
+                {
+                  "id": "full",
+                  "label": "Everything"
+                }
+              ]
+            },
+            "label": "Detail",
+            "required": false
+          }
+        ]
+      },
+      "description": "Read the bound application's status again and redraw it",
+      "confirmation_required": false
+    }
+  ],
+  "attachments": null,
+  "native_bridge": null
+}

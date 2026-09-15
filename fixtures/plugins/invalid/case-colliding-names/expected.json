@@ -1,0 +1,7 @@
+{
+  "note": "Two declared paths that name one file on a case-insensitive filesystem.",
+  "codes": [
+    "case_colliding_path",
+    "missing_payload"
+  ]
+}

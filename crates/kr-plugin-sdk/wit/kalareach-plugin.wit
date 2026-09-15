@@ -1,0 +1,295 @@
+// The KalaReach plugin component interface.
+//
+// A component implements `adapter` and receives the four host interfaces below. Everything it can
+// reach is in this file: there is no ambient filesystem, network, process or environment access,
+// and no import that sends anything anywhere. A component that wants an effect asks for it by
+// returning a plan, which the broker checks against the action's declared effect class before it
+// does anything.
+//
+// Execution limits per instance: 64 MiB of linear memory; a 10 ms deadline for `observe` and
+// `prepare-action`; 50 ms for `decode-request` and `encode-response`; 100 ms for `snapshot`; and
+// 1 MiB of output per call. Instructions are bounded with fuel and elapsed execution with
+// deadlines; fuel bounds work, it is not a CPU-time measurement. Compilation happens at binding
+// preparation under its own budget, so no call deadline includes a cold compile. Three faults
+// within one minute disable the binding.
+
+package kalareach:plugin@0.1.0;
+
+/// The values every interface in this package exchanges.
+interface types {
+    /// A stable identifier: a node, a control, an action or a package.
+    type id = string;
+
+    /// A monotonic revision.
+    type revision = u64;
+
+    /// Milliseconds since the Unix epoch.
+    type timestamp-ms = u64;
+
+    /// A private broker handle for immutable upstream bytes and their provenance.
+    ///
+    /// The handle is the only way a component refers to a source event. It cannot be constructed
+    /// inside the component, so a component cannot claim bytes it never received.
+    type source-event-handle = string;
+
+    /// A native request identifier as the upstream application spells it.
+    type native-request-id = string;
+
+    /// What an action does. The broker validates the prepared effect against this class.
+    enum effect-class {
+        observe,
+        upstream-prompt,
+        upstream-cancel,
+        upstream-attachment,
+        approval-decode,
+        approval-respond,
+        terminal-input,
+    }
+
+    /// What a native method does to the upstream.
+    enum method-class {
+        observation,
+        mutation,
+        credential,
+        unsupported,
+    }
+
+    /// One supplied action argument.
+    variant argument {
+        text(string),
+        integer(s64),
+        boolean(bool),
+        choice(id),
+        attachment-handle(id),
+        node-ref(id),
+    }
+
+    /// A named action argument.
+    record named-argument {
+        name: id,
+        value: argument,
+    }
+
+    /// Why a call could not produce a result.
+    variant fault {
+        /// The input did not match what this component understands.
+        unreadable(string),
+        /// The component will not act on this input.
+        refused(string),
+        /// The component needs a capability it was not granted.
+        not-permitted(string),
+        /// The component exceeded a bound it is responsible for.
+        exhausted(string),
+    }
+}
+
+/// Immutable source events, scoped to the binding.
+///
+/// A component reads the bytes behind a handle it was given. It cannot enumerate handles, reach a
+/// handle from another binding or another generation, or hold one past the call it arrived in.
+interface source-events {
+    use types.{source-event-handle, timestamp-ms, native-request-id};
+
+    /// What produced a source event.
+    enum provenance {
+        /// A framed message on the connector's own upstream connection.
+        native-protocol,
+        /// A documented machine-readable output stream.
+        machine-output,
+        /// Terminal bytes. Useful content, never native approval authority.
+        terminal-scrape,
+    }
+
+    /// One immutable source event.
+    record source-event {
+        handle: source-event-handle,
+        provenance: provenance,
+        observed-at: timestamp-ms,
+        /// The native request identifier, where the event is a native request.
+        request-id: option<native-request-id>,
+        bytes: list<u8>,
+    }
+
+    /// Reads the event behind a handle the host supplied to this call.
+    read: func(handle: source-event-handle) -> option<source-event>;
+}
+
+/// The bound upstream execution, as facts rather than as a connection.
+///
+/// There is no send function here. A component describes an effect and returns it; the broker
+/// checks the actor, the grant, the binding revision and the effect class, then dispatches. That
+/// is what keeps an observation callback from submitting input because it can read output.
+interface upstream {
+    use types.{id, revision, timestamp-ms};
+
+    /// What the bound execution is doing.
+    enum activity {
+        idle,
+        running,
+        awaiting-person,
+        ended,
+    }
+
+    /// The facts a component may read about the binding.
+    record binding-state {
+        plugin-id: id,
+        binding-revision: revision,
+        activity: activity,
+        /// The upstream thread identifier, where the application exposes one.
+        thread-id: option<id>,
+        /// The upstream turn identifier, where the application exposes one.
+        turn-id: option<id>,
+        updated-at: timestamp-ms,
+    }
+
+    /// Returns the current binding state.
+    state: func() -> binding-state;
+
+    /// Returns the rights the current actor holds, for presenting a usable document.
+    ///
+    /// This is a courtesy, not a check. The broker rechecks every right at dispatch, so a
+    /// component that ignores the answer only produces controls that then fail.
+    held-rights: func() -> list<string>;
+}
+
+/// Completed attachment handles.
+///
+/// Transfer completes before a component sees anything. A component receives the handle and its
+/// declared type and size; it never receives the bytes and never starts an upload.
+interface attachments {
+    use types.{id, timestamp-ms};
+
+    /// One completed attachment.
+    record attachment {
+        attachment-id: id,
+        name: string,
+        media-type: string,
+        size-bytes: u64,
+        completed-at: timestamp-ms,
+    }
+
+    /// Returns the attachments the current draft holds.
+    current: func() -> list<attachment>;
+}
+
+/// Safe document output.
+///
+/// A component emits document nodes from the closed union. It cannot emit markup, styles or
+/// scripts, and the host bounds the total output of one call at 1 MiB.
+interface document {
+    use types.{id, revision};
+
+    /// One node of the portable document union, as canonical JSON for that node.
+    ///
+    /// The host parses it against the union and rejects anything outside it. Emitting a kind this
+    /// host does not know produces an unsupported-content block, which carries no action.
+    record node {
+        node-id: id,
+        node-revision: revision,
+        body-json: string,
+    }
+
+    /// Emits one node into the pending document for this call.
+    emit: func(value: node) -> result<_, string>;
+
+    /// Returns how many output bytes remain in this call's budget.
+    remaining-output-bytes: func() -> u64;
+}
+
+/// What a component implements.
+interface adapter {
+    use types.{id, revision, effect-class, method-class, named-argument, fault, source-event-handle, native-request-id};
+
+    /// The binding this instance serves.
+    record binding {
+        plugin-id: id,
+        binding-revision: revision,
+        /// The executable path the host matched, as the host observed it.
+        executable: string,
+    }
+
+    /// An effect a component proposes.
+    ///
+    /// Proposing is not doing. The broker checks the class against the action's declaration, the
+    /// actor's grant and the binding revision, then claims and dispatches.
+    record effect-plan {
+        action-id: id,
+        class: effect-class,
+        arguments: list<named-argument>,
+    }
+
+    /// A decoded native request.
+    ///
+    /// Decoding proposes a resource from a source event. The broker checks the decoder's role,
+    /// its application binding, the source generation, the schema policy and non-reuse before the
+    /// resource exists, and records the decoder and package hash beside it.
+    record decoded-request {
+        request-id: native-request-id,
+        class: method-class,
+        /// A one-line summary of what answering yes would do.
+        summary: string,
+        /// The decisions the upstream offers, as stable identifiers.
+        decisions: list<id>,
+        /// The document nodes that present the request, as canonical JSON.
+        presentation: list<string>,
+    }
+
+    /// An encoded response, prepared but not sent.
+    record encoded-response {
+        request-id: native-request-id,
+        bytes: list<u8>,
+    }
+
+    /// Prepares the instance for one binding. Called once per binding.
+    bind: func(target: binding) -> result<_, fault>;
+
+    /// Receives one scoped source event and emits document nodes.
+    ///
+    /// Runs under the 10 ms observation deadline. PTY draining, terminal query responses and the
+    /// presentation queues never wait for this call.
+    observe: func(handle: source-event-handle) -> result<_, fault>;
+
+    /// Emits the complete current document.
+    ///
+    /// Runs under the 100 ms snapshot deadline. The host requests a snapshot after an observation
+    /// gap, so this is how a component recovers from a queue overflow.
+    snapshot: func() -> result<_, fault>;
+
+    /// Turns an invoked control into a proposed effect.
+    ///
+    /// Runs under the 10 ms deadline. It returns a plan; it sends nothing.
+    prepare-action: func(action-id: id, arguments: list<named-argument>) -> result<effect-plan, fault>;
+
+    /// Interprets an immutable native request into a proposed approval resource.
+    ///
+    /// Runs under the 50 ms deadline and under the `approval.decode` grant. It returns a
+    /// projection; it sends nothing.
+    decode-request: func(handle: source-event-handle) -> result<decoded-request, fault>;
+
+    /// Encodes a validated decision as a response to a pending native request.
+    ///
+    /// Runs under the 50 ms deadline and under the `approval.respond` grant. It returns bytes; the
+    /// broker rechecks the pending request, the actor grant and the binding revision, then
+    /// atomically claims and dispatches them. A native answer that arrives during encoding wins,
+    /// and this response returns the resolved state instead.
+    encode-response: func(request-id: native-request-id, decision: id) -> result<encoded-response, fault>;
+
+    /// Returns the component's own state so a later instance can resume.
+    ///
+    /// Pending and dispatch state lives in the worker broker, never in the component, so a
+    /// checkpoint carries presentation state and nothing a decision depends on.
+    checkpoint: func() -> result<list<u8>, fault>;
+
+    /// Restores state from a checkpoint this build produced.
+    restore: func(state: list<u8>) -> result<_, fault>;
+}
+
+/// The world a KalaReach plugin component targets.
+world plugin {
+    import source-events;
+    import upstream;
+    import attachments;
+    import document;
+
+    export adapter;
+}

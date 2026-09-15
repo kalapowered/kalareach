@@ -1,0 +1,6 @@
+{
+  "note": "A control that invokes an action the manifest never registers.",
+  "codes": [
+    "action_not_registered"
+  ]
+}

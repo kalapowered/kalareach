@@ -1,0 +1,7 @@
+{
+  "note": "A file in the package directory that the manifest does not declare. An undeclared file also expands the package past its declared size.",
+  "codes": [
+    "size_mismatch",
+    "undeclared_file"
+  ]
+}

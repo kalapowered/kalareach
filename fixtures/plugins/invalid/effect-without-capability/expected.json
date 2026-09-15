@@ -1,0 +1,6 @@
+{
+  "note": "An action that writes to the terminal without requesting the capability to.",
+  "codes": [
+    "effect_without_capability"
+  ]
+}

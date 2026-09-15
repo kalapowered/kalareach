@@ -1,0 +1,6 @@
+{
+  "note": "A payload whose bytes are not the bytes its digest names.",
+  "codes": [
+    "digest_mismatch"
+  ]
+}

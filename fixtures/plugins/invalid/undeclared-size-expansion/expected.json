@@ -1,0 +1,6 @@
+{
+  "note": "A payload that expands far past the length its manifest declares.",
+  "codes": [
+    "size_mismatch"
+  ]
+}

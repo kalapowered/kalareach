@@ -1,0 +1,6 @@
+{
+  "note": "An action that invents an effect class outside the closed vocabulary.",
+  "codes": [
+    "unknown_effect_class"
+  ]
+}

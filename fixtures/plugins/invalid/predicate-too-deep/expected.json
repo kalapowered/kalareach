@@ -1,0 +1,6 @@
+{
+  "note": "A visibility predicate nested past the grammar's depth bound.",
+  "codes": [
+    "predicate_invalid"
+  ]
+}

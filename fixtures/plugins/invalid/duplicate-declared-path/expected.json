@@ -1,0 +1,6 @@
+{
+  "note": "One path declared twice in the manifest.",
+  "codes": [
+    "duplicate_path"
+  ]
+}

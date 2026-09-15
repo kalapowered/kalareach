@@ -1,0 +1,3698 @@
+{
+  "$defs": {
+    "AccessibleDescription": {
+      "description": "The description a screen reader announces. One line, no control or bidirectional characters.",
+      "maxLength": 200,
+      "minLength": 1,
+      "type": "string"
+    },
+    "ActionArgument": {
+      "additionalProperties": false,
+      "description": "One supplied parameter value.",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/ParameterName",
+          "description": "The parameter name."
+        },
+        "value": {
+          "$ref": "#/$defs/ArgumentValue",
+          "description": "The supplied value."
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
+    "ActionDeclaration": {
+      "additionalProperties": false,
+      "description": "An action registered in the package manifest.\n\nRegistration is what makes an action invocable. A control may name only a registered action,\nso the effect class the broker enforces is always the one the publisher declared.",
+      "properties": {
+        "confirmation_required": {
+          "description": "Whether the host asks the person to confirm before dispatch.",
+          "type": "boolean"
+        },
+        "description": {
+          "$ref": "#/$defs/Summary",
+          "description": "Why the action exists, shown in the installation grant beside its effect class."
+        },
+        "effect": {
+          "$ref": "#/$defs/EffectClass",
+          "description": "What the action does."
+        },
+        "id": {
+          "$ref": "#/$defs/ActionName",
+          "description": "The action identifier a control names."
+        },
+        "label": {
+          "$ref": "#/$defs/Label",
+          "description": "The label a person reads."
+        },
+        "parameters": {
+          "$ref": "#/$defs/ParameterSchema",
+          "description": "The parameters it accepts."
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "effect",
+        "parameters",
+        "description",
+        "confirmation_required"
+      ],
+      "type": "object"
+    },
+    "ActionInvocation": {
+      "additionalProperties": false,
+      "description": "An action invocation the host has not yet checked.\n\nThe host rechecks the effect class, the parameters and the grant on every invocation, so a\ncontrol that was visible when it was rendered cannot dispatch after the state it depended on\nchanged.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionName",
+          "description": "The action being invoked."
+        },
+        "arguments": {
+          "description": "The supplied parameter values, keyed by parameter name.",
+          "items": {
+            "$ref": "#/$defs/ActionArgument"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "action_id",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "ActionName": {
+      "description": "An action registered in the package manifest. A control may only name a registered action.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "ActionRight": {
+      "description": "One permitted action in a grant.",
+      "oneOf": [
+        {
+          "const": "session.view",
+          "description": "Observe a session: metadata, filtered history, snapshots and events.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.input",
+          "description": "Send bytes to the terminal. This effectively exposes the shell user's account.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.geometry",
+          "description": "Claim geometry ownership and resize the terminal.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.geometry.transfer",
+          "description": "Hand geometry ownership to another attachment.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.palette",
+          "description": "Set the terminal palette.",
+          "type": "string"
+        },
+        {
+          "const": "agent.prompt",
+          "description": "Submit, queue or steer an upstream agent prompt.",
+          "type": "string"
+        },
+        {
+          "const": "agent.cancel",
+          "description": "Cancel the upstream agent's current turn.",
+          "type": "string"
+        },
+        {
+          "const": "agent.approval.respond",
+          "description": "Answer an upstream agent approval request.",
+          "type": "string"
+        },
+        {
+          "const": "question.respond",
+          "description": "Answer or cancel an agent-to-user question.",
+          "type": "string"
+        },
+        {
+          "const": "files.read",
+          "description": "Read file, diff and change-set content.",
+          "type": "string"
+        },
+        {
+          "const": "files.upload",
+          "description": "Upload attachment bytes into the environment.",
+          "type": "string"
+        },
+        {
+          "const": "files.apply_diff",
+          "description": "Apply or revert a diff against a destination.",
+          "type": "string"
+        },
+        {
+          "const": "project.create",
+          "description": "Initialise, clone or adopt a source repository.",
+          "type": "string"
+        },
+        {
+          "const": "workspace.manage",
+          "description": "Create, remove or materialise a workspace.",
+          "type": "string"
+        },
+        {
+          "const": "changeset.create",
+          "description": "Capture an immutable change set.",
+          "type": "string"
+        },
+        {
+          "const": "session.create",
+          "description": "Create a session.",
+          "type": "string"
+        },
+        {
+          "const": "session.rename",
+          "description": "Rename a session.",
+          "type": "string"
+        },
+        {
+          "const": "session.close",
+          "description": "Close a session.",
+          "type": "string"
+        },
+        {
+          "const": "session.share",
+          "description": "Issue, list and revoke grants that share a session.",
+          "type": "string"
+        },
+        {
+          "const": "automation.manage",
+          "description": "Install, enable, pause and run automation definitions.",
+          "type": "string"
+        },
+        {
+          "const": "host.manage",
+          "description": "Change host configuration: devices, catalogues, plugins and installation state.",
+          "type": "string"
+        }
+      ]
+    },
+    "ApprovalRequestId": {
+      "description": "An upstream approval request identifier. Opaque to KalaReach.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "Architecture": {
+      "description": "A processor architecture a package supports.",
+      "enum": [
+        "x86_64",
+        "aarch64"
+      ],
+      "type": "string"
+    },
+    "ArgumentValue": {
+      "description": "A supplied parameter value.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Text for a [`ParameterKind::Text`] parameter.",
+          "properties": {
+            "text": {
+              "description": "The text.",
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A number for an [`ParameterKind::Integer`] parameter.",
+          "properties": {
+            "type": {
+              "const": "integer",
+              "type": "string"
+            },
+            "value": {
+              "description": "The number.",
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A decision for a [`ParameterKind::Boolean`] parameter.",
+          "properties": {
+            "type": {
+              "const": "boolean",
+              "type": "string"
+            },
+            "value": {
+              "description": "The decision.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A selected choice for a [`ParameterKind::Choice`] parameter.",
+          "properties": {
+            "choice_id": {
+              "$ref": "#/$defs/ParameterName",
+              "description": "The chosen identifier."
+            },
+            "type": {
+              "const": "choice",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "choice_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A completed attachment handle.",
+          "properties": {
+            "handle": {
+              "description": "The opaque handle.",
+              "type": "string"
+            },
+            "type": {
+              "const": "attachment_handle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "handle"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A node in the package's presentation document.",
+          "properties": {
+            "node_id": {
+              "$ref": "#/$defs/NodeId",
+              "description": "The node identifier."
+            },
+            "type": {
+              "const": "node_ref",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "node_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AttachmentContribution": {
+      "additionalProperties": false,
+      "description": "How a package contributes attachments to an upstream draft.\n\nTransfer, draft insertion, submission and upstream acceptance stay separate. The package\ndeclares what it accepts and where anything leaves the host; it never receives the bytes.",
+      "properties": {
+        "accepted_media_types": {
+          "description": "The MIME types the upstream accepts, as exact types or `type/*` families.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "external_destination": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Label"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The external service the bytes are uploaded to, where one is involved.\n\nA destination outside the host is disclosed before anything is submitted, because an\nupload that leaves the machine is not made private by encrypted KalaReach routing."
+        },
+        "insertion": {
+          "$ref": "#/$defs/AttachmentInsertion",
+          "description": "How the attachment reaches the draft."
+        },
+        "max_bytes": {
+          "description": "Maximum bytes per attachment for the selected upstream model.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "description": "Maximum attachments per draft.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "accepted_media_types",
+        "max_bytes",
+        "max_count",
+        "insertion",
+        "external_destination"
+      ],
+      "type": "object"
+    },
+    "AttachmentId": {
+      "description": "One CLI or application attachment, independently of its device.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "AttachmentInsertion": {
+      "description": "How an attachment reaches the upstream draft.",
+      "oneOf": [
+        {
+          "const": "native_composer",
+          "description": "The connector's native composer API takes the handle.",
+          "type": "string"
+        },
+        {
+          "const": "upstream_upload",
+          "description": "The connector's upstream protocol takes an upload reference.",
+          "type": "string"
+        },
+        {
+          "const": "terminal_draft_path",
+          "description": "A path is written into the terminal draft.\n\nShell quoting is not assumed to be the composer's syntax, so the host quotes for the shell\nit is writing to and nothing else.",
+          "type": "string"
+        }
+      ]
+    },
+    "BindingState": {
+      "description": "The state of the binding a control belongs to.",
+      "oneOf": [
+        {
+          "const": "bound",
+          "description": "The package matched an application and is instantiated.",
+          "type": "string"
+        },
+        {
+          "const": "upstream_busy",
+          "description": "The bound upstream execution is running a turn.",
+          "type": "string"
+        },
+        {
+          "const": "awaiting_person",
+          "description": "The bound upstream execution is waiting for a person.",
+          "type": "string"
+        },
+        {
+          "const": "disabled",
+          "description": "The binding is disabled after repeated faults.",
+          "type": "string"
+        },
+        {
+          "const": "native_only_volatile",
+          "description": "The host is answering native requests without durable receipt storage.\n\nRich response controls are hidden in this state. The predicate can say so, which is\nclearer to a reader than a control that silently stops working.",
+          "type": "string"
+        }
+      ]
+    },
+    "BridgeStep": {
+      "description": "One edit a native bridge installation makes.\n\nA recipe lists exact files, configuration edits, hashes, version requirements and the\noperations that remove them again. Unrelated settings are preserved: the recipe names what it\nadds, so removal can name the same thing.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Copy a package file into the application's plugin directory.",
+          "properties": {
+            "destination": {
+              "$ref": "#/$defs/PackagePath",
+              "description": "The path under the application's documented plugin directory."
+            },
+            "digest": {
+              "$ref": "#/$defs/PayloadDigest",
+              "description": "The digest of the installed bytes."
+            },
+            "source": {
+              "$ref": "#/$defs/PackagePath",
+              "description": "The file inside the package."
+            },
+            "type": {
+              "const": "install_file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "source",
+            "destination",
+            "digest"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Add one key to a documented configuration file, leaving the rest untouched.",
+          "properties": {
+            "file": {
+              "$ref": "#/$defs/PackagePath",
+              "description": "The configuration file under the application's documented directory."
+            },
+            "key": {
+              "description": "The key path, as dotted members.",
+              "type": "string"
+            },
+            "type": {
+              "const": "add_configuration_key",
+              "type": "string"
+            },
+            "value": {
+              "description": "The value written, as JSON text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "file",
+            "key",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BrokerTransport": {
+      "description": "How the broker reaches the upstream.\n\nThe broker owns the handle. A connector names the kind and its bounded parameters; the\nexecutable, launch, upstream identity and environment come from the binding the host made, so\na package cannot substitute an arbitrary URL, process or path.",
+      "oneOf": [
+        {
+          "const": "stdio",
+          "description": "JSON-RPC or JSON lines over the bound process's standard streams.",
+          "type": "string"
+        },
+        {
+          "const": "private_socket",
+          "description": "A private Unix socket or named pipe the broker created.",
+          "type": "string"
+        },
+        {
+          "const": "loopback_http",
+          "description": "Loopback HTTP to the bound process's advertised port.",
+          "type": "string"
+        },
+        {
+          "const": "web_socket",
+          "description": "A WebSocket to the bound process.",
+          "type": "string"
+        },
+        {
+          "const": "server_sent_events",
+          "description": "Server-sent events from the bound process.",
+          "type": "string"
+        },
+        {
+          "const": "byte_stream",
+          "description": "A bounded byte stream with the connector's own framing.",
+          "type": "string"
+        }
+      ]
+    },
+    "CapabilityEvidence": {
+      "additionalProperties": false,
+      "description": "One capability evidence record.",
+      "properties": {
+        "capability_id": {
+          "$ref": "#/$defs/CapabilityId",
+          "description": "The versioned capability this record is about."
+        },
+        "capability_version": {
+          "$ref": "#/$defs/PackageVersion",
+          "description": "The capability version."
+        },
+        "disabled_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DisabledReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The user-facing reason, required whenever the state is not usable."
+        },
+        "identity": {
+          "$ref": "#/$defs/SubjectIdentity",
+          "description": "The exact identity the evidence was gathered against."
+        },
+        "invalidated_by": {
+          "description": "What makes it stale.",
+          "items": {
+            "$ref": "#/$defs/InvalidationTrigger"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "observed_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the record was gathered."
+        },
+        "revision": {
+          "$ref": "#/$defs/CapabilityRevision",
+          "description": "The current revision of this record."
+        },
+        "source": {
+          "$ref": "#/$defs/EvidenceSource",
+          "description": "Where the record came from."
+        },
+        "state": {
+          "$ref": "#/$defs/CapabilityState",
+          "description": "The current state."
+        },
+        "subject": {
+          "$ref": "#/$defs/EvidenceSubject",
+          "description": "What the record is about."
+        }
+      },
+      "required": [
+        "capability_id",
+        "capability_version",
+        "subject",
+        "identity",
+        "revision",
+        "state",
+        "source",
+        "invalidated_by",
+        "disabled_reason",
+        "observed_at"
+      ],
+      "type": "object"
+    },
+    "CapabilityId": {
+      "description": "A versioned capability name. Capabilities describe feasibility, never authority.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "CapabilityRequest": {
+      "additionalProperties": false,
+      "description": "A capability a package asks for, with the reason a reviewer and a user read.",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/PluginCapability",
+          "description": "The requested capability."
+        },
+        "reason": {
+          "$ref": "#/$defs/Summary",
+          "description": "Why the package needs it. Shown in the installation grant."
+        }
+      },
+      "required": [
+        "capability",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "CapabilityRevision": {
+      "description": "Current evidence for a versioned capability. Never permission.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "CapabilityState": {
+      "description": "What a host currently knows about one capability on one subject.\n\nRuntime states distinguish the reasons something does not work, because \"unavailable\" alone\nsends a person to the wrong fix.",
+      "oneOf": [
+        {
+          "const": "qualified_available",
+          "description": "Tested here and working.",
+          "type": "string"
+        },
+        {
+          "const": "missing_installation",
+          "description": "The application, bridge or component is not installed.",
+          "type": "string"
+        },
+        {
+          "const": "permission_required",
+          "description": "The operating system or the user has not granted the permission it needs.",
+          "type": "string"
+        },
+        {
+          "const": "incompatible",
+          "description": "The installed version cannot support it.",
+          "type": "string"
+        },
+        {
+          "const": "temporarily_unavailable",
+          "description": "It worked before and does not right now.",
+          "type": "string"
+        },
+        {
+          "const": "not_tested",
+          "description": "No evidence has been gathered.",
+          "type": "string"
+        }
+      ]
+    },
+    "CatalogueIndex": {
+      "additionalProperties": false,
+      "description": "The complete signed metadata snapshot.",
+      "properties": {
+        "entries": {
+          "description": "The entries, ordered by publisher, plugin name and version.",
+          "items": {
+            "$ref": "#/$defs/IndexEntry"
+          },
+          "type": "array"
+        },
+        "generation": {
+          "$ref": "#/$defs/RepositoryGeneration",
+          "description": "The generation this snapshot is.\n\nA generation is what a host pins. Index activation is atomic after metadata verification,\nso a host is always on one whole generation and never on a mixture of two."
+        },
+        "index_version": {
+          "description": "The index format version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "produced_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the snapshot was built."
+        },
+        "publishers": {
+          "description": "The publishers whose packages appear in it.",
+          "items": {
+            "$ref": "#/$defs/PublisherRecord"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "index_version",
+        "generation",
+        "produced_at",
+        "publishers",
+        "entries"
+      ],
+      "type": "object"
+    },
+    "CompactDescription": {
+      "description": "The one-line catalogue description. One line, no control or bidirectional characters.",
+      "maxLength": 200,
+      "minLength": 1,
+      "type": "string"
+    },
+    "ConnectorManifest": {
+      "additionalProperties": false,
+      "description": "The connector manifest.",
+      "properties": {
+        "framing": {
+          "$ref": "#/$defs/Framing",
+          "description": "How messages are separated."
+        },
+        "manifest_version": {
+          "description": "The manifest format version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "method_path": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where a message names its method."
+        },
+        "methods": {
+          "description": "What each method does.",
+          "items": {
+            "$ref": "#/$defs/MethodClassification"
+          },
+          "type": "array"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package this table belongs to."
+        },
+        "protocol": {
+          "$ref": "#/$defs/ProtocolPin",
+          "description": "The upstream protocol this table is qualified against."
+        },
+        "qualification_note": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Summary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the publisher says about the qualification behind this table."
+        },
+        "request_id_path": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where a request carries its identifier."
+        },
+        "response_correlation": {
+          "$ref": "#/$defs/ResponseCorrelation",
+          "description": "How a response is matched to its request."
+        },
+        "routes": {
+          "description": "The routes.",
+          "items": {
+            "$ref": "#/$defs/Route"
+          },
+          "type": "array"
+        },
+        "transport": {
+          "$ref": "#/$defs/BrokerTransport",
+          "description": "How the broker reaches the upstream."
+        },
+        "volatile_forwarding": {
+          "description": "Whether the connector has a tested volatile forwarding mode.\n\nWithout one it is not a resilient managed gateway: on receipt-storage failure its\nunchanged terminal integration is the supported path, and the manifest says so rather than\nletting a reader assume otherwise.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "manifest_version",
+        "plugin_id",
+        "protocol",
+        "transport",
+        "framing",
+        "request_id_path",
+        "method_path",
+        "response_correlation",
+        "routes",
+        "methods",
+        "volatile_forwarding",
+        "qualification_note"
+      ],
+      "type": "object"
+    },
+    "Control": {
+      "additionalProperties": false,
+      "description": "One declarative control.",
+      "properties": {
+        "accessible_description": {
+          "$ref": "#/$defs/AccessibleDescription",
+          "description": "The description a screen reader announces."
+        },
+        "action_id": {
+          "$ref": "#/$defs/ActionName",
+          "description": "The registered action this control invokes."
+        },
+        "disabled_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DisabledReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The reason shown while the control is disabled."
+        },
+        "enabled_when": {
+          "$ref": "#/$defs/Predicate",
+          "description": "When the control is present but not usable."
+        },
+        "icon": {
+          "$ref": "#/$defs/StandardIcon",
+          "description": "The standard icon."
+        },
+        "id": {
+          "$ref": "#/$defs/ControlId",
+          "description": "The stable identifier."
+        },
+        "label": {
+          "$ref": "#/$defs/Label",
+          "description": "The label a person reads."
+        },
+        "parameters": {
+          "$ref": "#/$defs/ParameterSchema",
+          "description": "The parameters this control supplies.\n\nA control may narrow its action's parameters but never widen them. The host checks the\ninvocation against the action's own schema regardless."
+        },
+        "priority": {
+          "$ref": "#/$defs/SemanticPriority",
+          "description": "How prominently a client presents it."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of this control."
+        },
+        "visible_when": {
+          "$ref": "#/$defs/Predicate",
+          "description": "When the control is visible."
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "label",
+        "icon",
+        "accessible_description",
+        "action_id",
+        "parameters",
+        "priority",
+        "visible_when",
+        "enabled_when",
+        "disabled_reason"
+      ],
+      "type": "object"
+    },
+    "ControlId": {
+      "description": "The stable identifier of one control.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "DiffFile": {
+      "additionalProperties": false,
+      "description": "One entry in a diff node.",
+      "properties": {
+        "added": {
+          "description": "Lines added.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "description": "The path as the upstream reported it.",
+          "type": "string"
+        },
+        "removed": {
+          "description": "Lines removed.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "added",
+        "removed"
+      ],
+      "type": "object"
+    },
+    "DisabledReason": {
+      "description": "The user-facing reason something is unavailable. One line, no control or bidirectional characters.",
+      "maxLength": 200,
+      "minLength": 1,
+      "type": "string"
+    },
+    "DistributionMatch": {
+      "description": "How a package recognises the distribution an application was installed from.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "An npm package name.",
+          "properties": {
+            "package": {
+              "description": "The package name.",
+              "type": "string"
+            },
+            "registry": {
+              "const": "npm",
+              "type": "string"
+            }
+          },
+          "required": [
+            "registry",
+            "package"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A PyPI project name.",
+          "properties": {
+            "project": {
+              "description": "The project name.",
+              "type": "string"
+            },
+            "registry": {
+              "const": "py_pi",
+              "type": "string"
+            }
+          },
+          "required": [
+            "registry",
+            "project"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A Homebrew formula or cask.",
+          "properties": {
+            "formula": {
+              "description": "The formula or cask name.",
+              "type": "string"
+            },
+            "registry": {
+              "const": "homebrew",
+              "type": "string"
+            }
+          },
+          "required": [
+            "registry",
+            "formula"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A crates.io crate name.",
+          "properties": {
+            "crate_name": {
+              "description": "The crate name.",
+              "type": "string"
+            },
+            "registry": {
+              "const": "cargo",
+              "type": "string"
+            }
+          },
+          "required": [
+            "registry",
+            "crate_name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A Go module path.",
+          "properties": {
+            "module": {
+              "description": "The module path.",
+              "type": "string"
+            },
+            "registry": {
+              "const": "go_module",
+              "type": "string"
+            }
+          },
+          "required": [
+            "registry",
+            "module"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A Debian or Ubuntu package name.",
+          "properties": {
+            "package": {
+              "description": "The package name.",
+              "type": "string"
+            },
+            "registry": {
+              "const": "deb",
+              "type": "string"
+            }
+          },
+          "required": [
+            "registry",
+            "package"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A macOS application bundle identifier.",
+          "properties": {
+            "bundle_id": {
+              "description": "The bundle identifier.",
+              "type": "string"
+            },
+            "registry": {
+              "const": "mac_bundle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "registry",
+            "bundle_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A Windows package family or product identifier.",
+          "properties": {
+            "package_id": {
+              "description": "The package identifier.",
+              "type": "string"
+            },
+            "registry": {
+              "const": "windows_package",
+              "type": "string"
+            }
+          },
+          "required": [
+            "registry",
+            "package_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A container image reference without a tag.",
+          "properties": {
+            "image": {
+              "description": "The image reference.",
+              "type": "string"
+            },
+            "registry": {
+              "const": "container_image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "registry",
+            "image"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DocumentNode": {
+      "additionalProperties": false,
+      "description": "One document node.",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/NodeBody",
+          "description": "What the node is."
+        },
+        "id": {
+          "$ref": "#/$defs/NodeId",
+          "description": "The stable identifier."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of this node."
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "body"
+      ],
+      "type": "object"
+    },
+    "EffectClass": {
+      "description": "What an action does. The broker validates the prepared effect against this class.",
+      "enum": [
+        "observe",
+        "upstream.prompt",
+        "upstream.cancel",
+        "upstream.attachment",
+        "approval.decode",
+        "approval.respond",
+        "terminal.input"
+      ],
+      "type": "string"
+    },
+    "EnvironmentId": {
+      "description": "One installed OS, distribution or container environment and OS user.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "EvidenceSource": {
+      "description": "Where a capability record came from.",
+      "oneOf": [
+        {
+          "const": "host_probe",
+          "description": "A bounded disclosed probe with declared effects, run on this host.",
+          "type": "string"
+        },
+        {
+          "const": "live_binding",
+          "description": "A live binding that performed the operation on this host.",
+          "type": "string"
+        },
+        {
+          "const": "signed_record",
+          "description": "A signed compatibility record shipped in the catalogue.\n\nThis is evidence about a version. It is not proof that this host has permission, and it\ncannot by itself establish [`CapabilityState::QualifiedAvailable`].",
+          "type": "string"
+        },
+        {
+          "const": "package_declaration",
+          "description": "The package's own declaration, believed only for negative states.",
+          "type": "string"
+        }
+      ]
+    },
+    "EvidenceSubject": {
+      "additionalProperties": false,
+      "description": "What the evidence is about.",
+      "properties": {
+        "application": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Label"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The application the evidence is about, where it is about one."
+        },
+        "desktop_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Label"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The desktop session generation the evidence is bound to, where it is bound to one."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the evidence was gathered in."
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Label"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The terminal profile the evidence is about, where it is about one."
+        }
+      },
+      "required": [
+        "environment_id",
+        "application",
+        "terminal",
+        "desktop_generation"
+      ],
+      "type": "object"
+    },
+    "ExecutableMatch": {
+      "additionalProperties": false,
+      "description": "How an executable is recognised.\n\nThe file stem is the executable's name without a directory or a `.exe` suffix, compared\ncase-insensitively because Windows and macOS compare it that way. A path suffix narrows the\nrule to an installation location; it is a suffix over whole path segments, never a substring.",
+      "properties": {
+        "file_stem": {
+          "description": "The executable's file stem.",
+          "type": "string"
+        },
+        "path_suffix": {
+          "description": "Whole path segments the executable's directory must end with.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "version_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The versions the rule covers, where the host can read a version."
+        }
+      },
+      "required": [
+        "file_stem",
+        "path_suffix",
+        "version_range"
+      ],
+      "type": "object"
+    },
+    "FieldPath": {
+      "additionalProperties": false,
+      "description": "A bounded path into a decoded native message.\n\nThe grammar is member names and array indices only, with no wildcard, no filter and no\nrecursive descent. The broker evaluates it against every framed message on the forwarding\npath, so it must cost a fixed number of lookups.",
+      "properties": {
+        "segments": {
+          "description": "The path segments, from the root of the message.",
+          "items": {
+            "$ref": "#/$defs/FieldSegment"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "segments"
+      ],
+      "type": "object"
+    },
+    "FieldSegment": {
+      "description": "One segment of a [`FieldPath`].",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A member of an object.",
+          "properties": {
+            "name": {
+              "description": "The member name.",
+              "type": "string"
+            },
+            "type": {
+              "const": "member",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An element of an array.",
+          "properties": {
+            "index": {
+              "description": "The zero-based index.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "index",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "index"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "description": "One thing wrong with a package.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/FindingCode",
+          "description": "What kind of thing it is."
+        },
+        "detail": {
+          "description": "What exactly is wrong.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Where in the package it is, where it is in one place.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "FindingCode": {
+      "description": "A stable code for one kind of finding.\n\nCodes are part of the contract: a publisher's build, a catalogue pipeline and a host all\nreport the same code for the same defect, so a fixture can assert on it and a person can look\nit up.",
+      "oneOf": [
+        {
+          "const": "directory_unreadable",
+          "description": "The package directory could not be read.",
+          "type": "string"
+        },
+        {
+          "const": "manifest_missing",
+          "description": "A required manifest was absent.",
+          "type": "string"
+        },
+        {
+          "const": "manifest_unreadable",
+          "description": "A manifest did not parse against the closed schema.",
+          "type": "string"
+        },
+        {
+          "const": "manifest_version_unsupported",
+          "description": "The manifest format version is not the one this build reads.",
+          "type": "string"
+        },
+        {
+          "const": "unsafe_path",
+          "description": "A path in the package is unsafe.",
+          "type": "string"
+        },
+        {
+          "const": "not_a_regular_file",
+          "description": "A directory entry is not a regular file.",
+          "type": "string"
+        },
+        {
+          "const": "case_colliding_path",
+          "description": "Two paths name the same file after case folding.",
+          "type": "string"
+        },
+        {
+          "const": "duplicate_path",
+          "description": "The manifest declares the same path twice.",
+          "type": "string"
+        },
+        {
+          "const": "undeclared_file",
+          "description": "A file is on disk that the manifest does not declare.",
+          "type": "string"
+        },
+        {
+          "const": "missing_payload",
+          "description": "The manifest declares a file that is not on disk.",
+          "type": "string"
+        },
+        {
+          "const": "size_mismatch",
+          "description": "A file's length is not the length the manifest declared.",
+          "type": "string"
+        },
+        {
+          "const": "digest_mismatch",
+          "description": "A file's digest is not the digest the manifest declared.",
+          "type": "string"
+        },
+        {
+          "const": "package_too_large",
+          "description": "The package is larger than one package may be.",
+          "type": "string"
+        },
+        {
+          "const": "too_many_files",
+          "description": "The package holds more files than one package may.",
+          "type": "string"
+        },
+        {
+          "const": "unbounded_version_range",
+          "description": "A version range admits every version.",
+          "type": "string"
+        },
+        {
+          "const": "version_range_excludes_host",
+          "description": "A version range excludes the SDK that would have to run the package.",
+          "type": "string"
+        },
+        {
+          "const": "no_match_rules",
+          "description": "The package declares no match rule, so nothing would ever activate it.",
+          "type": "string"
+        },
+        {
+          "const": "no_platforms",
+          "description": "The package declares no platform, so nothing would ever run it.",
+          "type": "string"
+        },
+        {
+          "const": "duplicate_action_id",
+          "description": "Two actions share an identifier.",
+          "type": "string"
+        },
+        {
+          "const": "action_not_registered",
+          "description": "A control names an action the manifest does not register.",
+          "type": "string"
+        },
+        {
+          "const": "effect_without_capability",
+          "description": "An action declares an effect class whose capability the package does not request.",
+          "type": "string"
+        },
+        {
+          "const": "duplicate_capability",
+          "description": "The package requests the same capability twice.",
+          "type": "string"
+        },
+        {
+          "const": "bridge_without_capability",
+          "description": "The package ships a native bridge without requesting the capability to install one.",
+          "type": "string"
+        },
+        {
+          "const": "attachment_without_capability",
+          "description": "The package contributes attachments without requesting the capability to act upstream.",
+          "type": "string"
+        },
+        {
+          "const": "predicate_invalid",
+          "description": "A visibility predicate breaks the grammar's bounds.",
+          "type": "string"
+        },
+        {
+          "const": "parameter_schema_invalid",
+          "description": "A parameter schema breaks its bounds.",
+          "type": "string"
+        },
+        {
+          "const": "document_too_large",
+          "description": "The presentation document holds more nodes or controls than one document may.",
+          "type": "string"
+        },
+        {
+          "const": "voice_projection_unknown",
+          "description": "The voice projection names a node or control the document does not hold.",
+          "type": "string"
+        },
+        {
+          "const": "connector_table_invalid",
+          "description": "A connector table breaks its bounds.",
+          "type": "string"
+        },
+        {
+          "const": "connector_method_unrouted",
+          "description": "A connector table classifies a method it never routes.",
+          "type": "string"
+        },
+        {
+          "const": "connector_payload_missing",
+          "description": "The manifest declares a connector payload but the package has no connector table.",
+          "type": "string"
+        },
+        {
+          "const": "connector_undeclared",
+          "description": "The package ships a connector table the manifest does not declare.",
+          "type": "string"
+        },
+        {
+          "const": "connector_plugin_mismatch",
+          "description": "The connector belongs to a different package.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_effect_class",
+          "description": "An action declares an effect class that is not in the closed vocabulary.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_capability",
+          "description": "The package requests a capability that is not in the closed vocabulary.",
+          "type": "string"
+        }
+      ]
+    },
+    "Framing": {
+      "description": "How messages are separated on the wire.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One JSON document per line.",
+          "properties": {
+            "max_message_bytes": {
+              "description": "Maximum bytes in one line.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "line_delimited_json",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "max_message_bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A header block with a content length, then the body.",
+          "properties": {
+            "length_header": {
+              "description": "The header that carries the length.",
+              "type": "string"
+            },
+            "max_message_bytes": {
+              "description": "Maximum bytes in one body.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "content_length",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "length_header",
+            "max_message_bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A big-endian length prefix, then the body.",
+          "properties": {
+            "max_message_bytes": {
+              "description": "Maximum bytes in one body.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "prefix_bytes": {
+              "description": "Width of the length prefix in bytes.",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "length_prefixed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "prefix_bytes",
+            "max_message_bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Server-sent events.",
+          "properties": {
+            "max_message_bytes": {
+              "description": "Maximum bytes in one event.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "server_sent_events",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "max_message_bytes"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "IndexEntry": {
+      "additionalProperties": false,
+      "description": "One entry in the catalogue index.",
+      "properties": {
+        "capabilities": {
+          "description": "What it asks to be permitted.",
+          "items": {
+            "$ref": "#/$defs/CapabilityRequest"
+          },
+          "type": "array"
+        },
+        "description": {
+          "$ref": "#/$defs/CompactDescription",
+          "description": "The one-line description offline search reads."
+        },
+        "display_name": {
+          "$ref": "#/$defs/Label",
+          "description": "The name a person reads."
+        },
+        "has_component": {
+          "description": "Whether the package ships a Wasm component.",
+          "type": "boolean"
+        },
+        "manifest_digest": {
+          "$ref": "#/$defs/PayloadDigest",
+          "description": "The digest of the manifest itself, which names every other payload."
+        },
+        "match_rules": {
+          "description": "The applications the package recognises.",
+          "items": {
+            "$ref": "#/$defs/MatchRule"
+          },
+          "type": "array"
+        },
+        "payloads": {
+          "description": "Every payload, by hash and exact size.",
+          "items": {
+            "$ref": "#/$defs/PayloadRef"
+          },
+          "type": "array"
+        },
+        "platforms": {
+          "description": "The platforms it supports.",
+          "items": {
+            "$ref": "#/$defs/PlatformSupport"
+          },
+          "type": "array"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The wire plugin identifier."
+        },
+        "plugin_name": {
+          "$ref": "#/$defs/PluginName",
+          "description": "The plugin name under that publisher."
+        },
+        "publisher_id": {
+          "$ref": "#/$defs/PublisherId",
+          "description": "The publisher."
+        },
+        "revocation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RevocationRecord"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The revocation record, where this release has one."
+        },
+        "sdk_range": {
+          "$ref": "#/$defs/VersionRange",
+          "description": "The SDK versions the package is written against."
+        },
+        "source": {
+          "$ref": "#/$defs/SourcePin",
+          "description": "Where the source came from."
+        },
+        "total_size_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "The sum of every payload size."
+        },
+        "version": {
+          "$ref": "#/$defs/PackageVersion",
+          "description": "This release's version."
+        },
+        "wit_range": {
+          "$ref": "#/$defs/VersionRange",
+          "description": "The WIT package versions its component targets."
+        }
+      },
+      "required": [
+        "plugin_id",
+        "publisher_id",
+        "plugin_name",
+        "version",
+        "display_name",
+        "description",
+        "sdk_range",
+        "wit_range",
+        "source",
+        "match_rules",
+        "platforms",
+        "capabilities",
+        "payloads",
+        "manifest_digest",
+        "total_size_bytes",
+        "has_component",
+        "revocation"
+      ],
+      "type": "object"
+    },
+    "InstanceLimits": {
+      "additionalProperties": false,
+      "description": "The complete set of execution limits one component instance runs under.",
+      "properties": {
+        "fault_window_ms": {
+          "description": "The window the fault count is measured over.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "faults_before_disable": {
+          "description": "Faults within `fault_window_ms` that disable the binding.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "interpretation_deadline_ms": {
+          "description": "Deadline in milliseconds for `decode-request` and `encode-response`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_bytes": {
+          "description": "Linear memory in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observation_deadline_ms": {
+          "description": "Deadline in milliseconds for `observe` and `prepare-action`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observation_queue_bytes": {
+          "description": "Size in bytes of the bounded observation queue.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_bytes_per_call": {
+          "description": "Maximum bytes one call may return.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_deadline_ms": {
+          "description": "Deadline in milliseconds for `snapshot`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "memory_bytes",
+        "observation_deadline_ms",
+        "interpretation_deadline_ms",
+        "snapshot_deadline_ms",
+        "output_bytes_per_call",
+        "observation_queue_bytes",
+        "faults_before_disable",
+        "fault_window_ms"
+      ],
+      "type": "object"
+    },
+    "InvalidationTrigger": {
+      "description": "What makes a capability record stale.",
+      "enum": [
+        "binary_changed",
+        "binding_changed",
+        "schema_changed",
+        "os_permission_changed",
+        "desktop_generation_changed",
+        "profile_changed"
+      ],
+      "type": "string"
+    },
+    "Label": {
+      "description": "A short display name. One line, no control or bidirectional characters.",
+      "maxLength": 80,
+      "minLength": 1,
+      "type": "string"
+    },
+    "MatchConfidence": {
+      "description": "How certain a rule is about what it recognised.",
+      "oneOf": [
+        {
+          "const": "exact",
+          "description": "The rule identifies the application exactly: a bundle identifier, a package name.",
+          "type": "string"
+        },
+        {
+          "const": "inferred",
+          "description": "The rule is a reasonable guess from a name on disk.\n\nAn inferred match is presented as inferred. It never silently wins over a selection the\nuser made.",
+          "type": "string"
+        }
+      ]
+    },
+    "MatchRule": {
+      "additionalProperties": false,
+      "description": "One declarative match rule.",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/MatchConfidence",
+          "description": "How certain the rule is."
+        },
+        "distribution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DistributionMatch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The distribution the application was installed from, where the rule names one."
+        },
+        "executable": {
+          "$ref": "#/$defs/ExecutableMatch",
+          "description": "How the executable is recognised."
+        },
+        "id": {
+          "$ref": "#/$defs/PluginName",
+          "description": "The rule identifier, unique inside the package."
+        }
+      },
+      "required": [
+        "id",
+        "executable",
+        "distribution",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "MethodClass": {
+      "description": "What a native method does to the upstream.",
+      "oneOf": [
+        {
+          "const": "observation",
+          "description": "Reports state without changing it.",
+          "type": "string"
+        },
+        {
+          "const": "mutation",
+          "description": "Changes something.",
+          "type": "string"
+        },
+        {
+          "const": "credential",
+          "description": "Carries a credential. The broker keeps it and never passes it to a component.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported",
+          "description": "The connector states that this method is outside what it can proxy safely.",
+          "type": "string"
+        }
+      ]
+    },
+    "MethodClassification": {
+      "additionalProperties": false,
+      "description": "One entry in the method classification table.",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/MethodClass",
+          "description": "What it does."
+        },
+        "evidence": {
+          "$ref": "#/$defs/Summary",
+          "description": "What the publisher qualified this classification against."
+        },
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The method."
+        }
+      },
+      "required": [
+        "method",
+        "class",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "MethodName": {
+      "description": "A native protocol method name in the connector's classification table.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "NativeBridge": {
+      "additionalProperties": false,
+      "description": "A native bridge installation recipe.\n\nBridge code runs under the application's own permissions, outside Wasmtime. The installation\ngrant states that, which is why the recipe names its steps rather than running a script.",
+      "properties": {
+        "application": {
+          "$ref": "#/$defs/Label",
+          "description": "The application whose documented plugin location is used."
+        },
+        "application_range": {
+          "$ref": "#/$defs/VersionRange",
+          "description": "The application versions the recipe is written for."
+        },
+        "grant_statement": {
+          "$ref": "#/$defs/Summary",
+          "description": "What the grant tells the person before they accept it."
+        },
+        "install": {
+          "description": "What installation does.",
+          "items": {
+            "$ref": "#/$defs/BridgeStep"
+          },
+          "type": "array"
+        },
+        "remove": {
+          "description": "What removal does, in the order it is applied.",
+          "items": {
+            "$ref": "#/$defs/BridgeStep"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "application",
+        "application_range",
+        "install",
+        "remove",
+        "grant_statement"
+      ],
+      "type": "object"
+    },
+    "NodeBody": {
+      "description": "What one document node is.\n\nThe union is closed. Adding a kind is a core version, because every client renders these with\nits own standard components and a client that does not know a kind cannot render it safely.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A message from the upstream execution or the person.",
+          "properties": {
+            "author": {
+              "$ref": "#/$defs/Label",
+              "description": "Who wrote it."
+            },
+            "kind": {
+              "const": "message",
+              "type": "string"
+            },
+            "text": {
+              "$ref": "#/$defs/Summary",
+              "description": "The text."
+            }
+          },
+          "required": [
+            "kind",
+            "author",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Formatted prose.",
+          "properties": {
+            "kind": {
+              "const": "markdown",
+              "type": "string"
+            },
+            "source": {
+              "description": "The Markdown source, rendered by the client's own renderer.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "source"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One upstream tool call.",
+          "properties": {
+            "kind": {
+              "const": "tool",
+              "type": "string"
+            },
+            "name": {
+              "$ref": "#/$defs/Label",
+              "description": "The tool name as the upstream reported it."
+            },
+            "outcome": {
+              "$ref": "#/$defs/ToolOutcome",
+              "description": "Its outcome."
+            },
+            "summary": {
+              "$ref": "#/$defs/Summary",
+              "description": "A one-line summary of what it did."
+            }
+          },
+          "required": [
+            "kind",
+            "name",
+            "outcome",
+            "summary"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A set of file changes.",
+          "properties": {
+            "files": {
+              "description": "The files.",
+              "items": {
+                "$ref": "#/$defs/DiffFile"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "diff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "files"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Work in progress.",
+          "properties": {
+            "kind": {
+              "const": "progress",
+              "type": "string"
+            },
+            "label": {
+              "$ref": "#/$defs/Label",
+              "description": "What is happening."
+            },
+            "state": {
+              "$ref": "#/$defs/ProgressState",
+              "description": "How far along it is."
+            }
+          },
+          "required": [
+            "kind",
+            "label",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A set of fields a person fills in.",
+          "properties": {
+            "fields": {
+              "$ref": "#/$defs/ParameterSchema",
+              "description": "The fields."
+            },
+            "kind": {
+              "const": "form",
+              "type": "string"
+            },
+            "submit_action_id": {
+              "$ref": "#/$defs/ActionName",
+              "description": "The action the completed form invokes."
+            },
+            "title": {
+              "$ref": "#/$defs/Label",
+              "description": "What the form asks for."
+            }
+          },
+          "required": [
+            "kind",
+            "title",
+            "fields",
+            "submit_action_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A file the session carries.",
+          "properties": {
+            "attachment_id": {
+              "$ref": "#/$defs/AttachmentId",
+              "description": "The attachment."
+            },
+            "kind": {
+              "const": "attachment",
+              "type": "string"
+            },
+            "name": {
+              "$ref": "#/$defs/Label",
+              "description": "Its name."
+            },
+            "size_bytes": {
+              "description": "Its size in bytes.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "attachment_id",
+            "name",
+            "size_bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A reference to an approval resource in the ledger.\n\nThe identifier must name a ledger resource. A package cannot create an approval by drawing\none: a pending opaque request is not an actionable approval until its interpretation is\nverified under the granted decoder.",
+          "properties": {
+            "approval_request_id": {
+              "$ref": "#/$defs/ApprovalRequestId",
+              "description": "The ledger resource."
+            },
+            "kind": {
+              "const": "approval_ref",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "approval_request_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A reference to a live terminal.",
+          "properties": {
+            "kind": {
+              "const": "terminal_ref",
+              "type": "string"
+            },
+            "session_id": {
+              "$ref": "#/$defs/SessionId",
+              "description": "The session whose terminal this is."
+            }
+          },
+          "required": [
+            "kind",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One control presented on its own.",
+          "properties": {
+            "control": {
+              "$ref": "#/$defs/Control",
+              "description": "The control."
+            },
+            "kind": {
+              "const": "action_button",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "control"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Several related controls presented together.",
+          "properties": {
+            "controls": {
+              "description": "The controls.",
+              "items": {
+                "$ref": "#/$defs/Control"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "action_group",
+              "type": "string"
+            },
+            "label": {
+              "$ref": "#/$defs/Label",
+              "description": "What the group is for."
+            }
+          },
+          "required": [
+            "kind",
+            "label",
+            "controls"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Controls reachable from the client's command palette.",
+          "properties": {
+            "controls": {
+              "description": "The controls.",
+              "items": {
+                "$ref": "#/$defs/Control"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "command_palette",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "controls"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An entry point for contributing an attachment.",
+          "properties": {
+            "action_id": {
+              "$ref": "#/$defs/ActionName",
+              "description": "The action that receives the completed handle."
+            },
+            "kind": {
+              "const": "attachment_entry",
+              "type": "string"
+            },
+            "label": {
+              "$ref": "#/$defs/Label",
+              "description": "What it accepts."
+            }
+          },
+          "required": [
+            "kind",
+            "label",
+            "action_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "NodeId": {
+      "description": "The stable identifier of one document node.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "OperatingSystem": {
+      "description": "An operating system a package supports.",
+      "enum": [
+        "linux",
+        "mac_os",
+        "windows"
+      ],
+      "type": "string"
+    },
+    "PackagePath": {
+      "description": "A relative POSIX path inside the package. No '..', no absolute or drive-prefixed path, no backslash, no Windows device name, no trailing dot or space, at most 8 segments.",
+      "maxLength": 512,
+      "minLength": 1,
+      "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^\\x00-\\x1F\\x7F/\\\\<>:\"|?*]+(?:/[^\\x00-\\x1F\\x7F/\\\\<>:\"|?*]+)*$",
+      "type": "string"
+    },
+    "PackageVersion": {
+      "description": "An exact semantic version, such as 1.4.0 or 2.0.0-rc.1.",
+      "maxLength": 64,
+      "minLength": 5,
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$",
+      "type": "string"
+    },
+    "ParameterChoice": {
+      "additionalProperties": false,
+      "description": "One choice in a [`ParameterKind::Choice`] parameter.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ParameterName",
+          "description": "The stable identifier submitted with the action."
+        },
+        "label": {
+          "$ref": "#/$defs/Label",
+          "description": "The label a person reads."
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "ParameterDeclaration": {
+      "additionalProperties": false,
+      "description": "One parameter of an action.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ParameterKind",
+          "description": "What it accepts."
+        },
+        "label": {
+          "$ref": "#/$defs/Label",
+          "description": "The label a person reads."
+        },
+        "name": {
+          "$ref": "#/$defs/ParameterName",
+          "description": "The parameter name."
+        },
+        "required": {
+          "description": "Whether the action can be invoked without it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "kind",
+        "label",
+        "required"
+      ],
+      "type": "object"
+    },
+    "ParameterKind": {
+      "description": "What one action parameter accepts.\n\nThe grammar is bounded rather than an arbitrary JSON Schema. A bounded parameter list can be\nchecked completely before dispatch and hashed into the action token, which is what binds a\ncallback to the exact parameters a person saw.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Free text.",
+          "properties": {
+            "max_length": {
+              "description": "Maximum length in characters.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "multiline": {
+              "description": "Whether the client offers a multi-line field.",
+              "type": "boolean"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "max_length",
+            "multiline"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A whole number inside an inclusive range.",
+          "properties": {
+            "maximum": {
+              "description": "Highest accepted value.",
+              "format": "int64",
+              "type": "integer"
+            },
+            "minimum": {
+              "description": "Lowest accepted value.",
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": {
+              "const": "integer",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "minimum",
+            "maximum"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A yes or no.",
+          "properties": {
+            "type": {
+              "const": "boolean",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One of a fixed list.",
+          "properties": {
+            "choices": {
+              "description": "The choices, each a stable identifier and its label.",
+              "items": {
+                "$ref": "#/$defs/ParameterChoice"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "choice",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "choices"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A completed attachment handle from the shared transfer service.\n\nThe package never receives bytes: the transfer completes first and the action receives the\nopaque handle.",
+          "properties": {
+            "type": {
+              "const": "attachment_handle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A node in the package's own presentation document.",
+          "properties": {
+            "type": {
+              "const": "node_ref",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ParameterName": {
+      "description": "The name of one parameter in an action's parameter schema.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "ParameterSchema": {
+      "additionalProperties": false,
+      "description": "The complete parameter list of one action.",
+      "properties": {
+        "parameters": {
+          "description": "The parameters, in the order a client presents them.",
+          "items": {
+            "$ref": "#/$defs/ParameterDeclaration"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "parameters"
+      ],
+      "type": "object"
+    },
+    "PayloadDigest": {
+      "description": "A SHA-256 digest as 64 lower-case hexadecimal characters.",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "PayloadRef": {
+      "additionalProperties": false,
+      "description": "One payload, named by its path, its digest and its exact length.\n\nThe declared size is checked before download and the actual size and digest during processing,\nso a payload cannot expand past what the manifest declared.\n\n`plugin.json` is not listed here. It is the document doing the declaring, so its own digest\nbelongs in the catalogue index entry that points at it, not inside itself.",
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/PayloadDigest",
+          "description": "Its SHA-256 digest."
+        },
+        "path": {
+          "$ref": "#/$defs/PackagePath",
+          "description": "Where it lives in the package."
+        },
+        "role": {
+          "$ref": "#/$defs/PayloadRole",
+          "description": "What the payload is."
+        },
+        "size_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Its exact length in bytes."
+        }
+      },
+      "required": [
+        "role",
+        "path",
+        "digest",
+        "size_bytes"
+      ],
+      "type": "object"
+    },
+    "PayloadRole": {
+      "description": "What one payload in a package is.",
+      "oneOf": [
+        {
+          "const": "connector",
+          "description": "The declarative native-proxy table.",
+          "type": "string"
+        },
+        {
+          "const": "presentation",
+          "description": "The presentation document.",
+          "type": "string"
+        },
+        {
+          "const": "component",
+          "description": "The Wasm component.",
+          "type": "string"
+        },
+        {
+          "const": "asset",
+          "description": "An asset the client renders, such as documentation the package ships.",
+          "type": "string"
+        },
+        {
+          "const": "native_bridge",
+          "description": "A file installed into an application's native plugin or hook location.",
+          "type": "string"
+        },
+        {
+          "const": "skill",
+          "description": "A skill package the host installs for an agent.",
+          "type": "string"
+        },
+        {
+          "const": "fixture",
+          "description": "A conformance fixture the package is tested against.",
+          "type": "string"
+        }
+      ]
+    },
+    "PlatformSupport": {
+      "additionalProperties": false,
+      "description": "One operating system and the architectures a package supports on it.",
+      "properties": {
+        "architectures": {
+          "description": "The architectures supported on it.",
+          "items": {
+            "$ref": "#/$defs/Architecture"
+          },
+          "type": "array"
+        },
+        "os": {
+          "$ref": "#/$defs/OperatingSystem",
+          "description": "The operating system."
+        }
+      },
+      "required": [
+        "os",
+        "architectures"
+      ],
+      "type": "object"
+    },
+    "PluginCapability": {
+      "description": "One capability a package may request. The vocabulary is closed.",
+      "enum": [
+        "metadata.match",
+        "presentation.declarative",
+        "broker.semantic_events",
+        "terminal.stream",
+        "terminal.transcript_tail",
+        "terminal.input",
+        "filesystem.read",
+        "network.outbound",
+        "process.observe",
+        "upstream.action",
+        "approval.decode",
+        "approval.respond",
+        "native_bridge.install"
+      ],
+      "type": "string"
+    },
+    "PluginId": {
+      "description": "A plugin identifier from its manifest.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "PluginManifest": {
+      "additionalProperties": false,
+      "description": "The `plugin.json` manifest.",
+      "properties": {
+        "actions": {
+          "description": "The actions a control may invoke.",
+          "items": {
+            "$ref": "#/$defs/ActionDeclaration"
+          },
+          "type": "array"
+        },
+        "attachments": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachmentContribution"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the package contributes attachments, where it does."
+        },
+        "capabilities": {
+          "description": "What the package asks to be permitted.",
+          "items": {
+            "$ref": "#/$defs/CapabilityRequest"
+          },
+          "type": "array"
+        },
+        "description": {
+          "$ref": "#/$defs/CompactDescription",
+          "description": "The one-line catalogue description."
+        },
+        "display_name": {
+          "$ref": "#/$defs/Label",
+          "description": "The name a person reads."
+        },
+        "manifest_version": {
+          "description": "The manifest format version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "match_rules": {
+          "description": "The applications this package recognises.",
+          "items": {
+            "$ref": "#/$defs/MatchRule"
+          },
+          "type": "array"
+        },
+        "native_bridge": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativeBridge"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The native bridge recipe, where the package installs one."
+        },
+        "payloads": {
+          "description": "Every byte the package consists of.",
+          "items": {
+            "$ref": "#/$defs/PayloadRef"
+          },
+          "type": "array"
+        },
+        "platforms": {
+          "description": "The platforms it supports.",
+          "items": {
+            "$ref": "#/$defs/PlatformSupport"
+          },
+          "type": "array"
+        },
+        "plugin_name": {
+          "$ref": "#/$defs/PluginName",
+          "description": "The plugin name under that publisher. Immutable for the package's life."
+        },
+        "publisher_id": {
+          "$ref": "#/$defs/PublisherId",
+          "description": "The publisher. Immutable for the package's life."
+        },
+        "sdk_range": {
+          "$ref": "#/$defs/VersionRange",
+          "description": "The SDK versions this package is written against."
+        },
+        "source": {
+          "$ref": "#/$defs/SourcePin",
+          "description": "Where the source came from."
+        },
+        "version": {
+          "$ref": "#/$defs/PackageVersion",
+          "description": "This release's version."
+        },
+        "wit_range": {
+          "$ref": "#/$defs/VersionRange",
+          "description": "The WIT package versions this package's component targets.\n\nA package with no component still names the range it was authored against, because the\nmanifest shape it uses comes from the same release."
+        }
+      },
+      "required": [
+        "manifest_version",
+        "publisher_id",
+        "plugin_name",
+        "version",
+        "display_name",
+        "description",
+        "sdk_range",
+        "wit_range",
+        "source",
+        "match_rules",
+        "platforms",
+        "payloads",
+        "capabilities",
+        "actions",
+        "attachments",
+        "native_bridge"
+      ],
+      "type": "object"
+    },
+    "PluginName": {
+      "description": "A package-local plugin identifier, unique under its publisher.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "Predicate": {
+      "description": "One term of a visibility predicate.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Always visible.",
+          "properties": {
+            "op": {
+              "const": "always",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Never visible.",
+          "properties": {
+            "op": {
+              "const": "never",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "True when the inner predicate is false.",
+          "properties": {
+            "op": {
+              "const": "not",
+              "type": "string"
+            },
+            "term": {
+              "$ref": "#/$defs/Predicate",
+              "description": "The inner predicate."
+            }
+          },
+          "required": [
+            "op",
+            "term"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "True when every term is true.",
+          "properties": {
+            "op": {
+              "const": "all",
+              "type": "string"
+            },
+            "terms": {
+              "description": "The terms.",
+              "items": {
+                "$ref": "#/$defs/Predicate"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "op",
+            "terms"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "True when at least one term is true.",
+          "properties": {
+            "op": {
+              "const": "any",
+              "type": "string"
+            },
+            "terms": {
+              "description": "The terms.",
+              "items": {
+                "$ref": "#/$defs/Predicate"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "op",
+            "terms"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "True when the named capability is in the named state.",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/PluginCapability",
+              "description": "The capability."
+            },
+            "op": {
+              "const": "capability",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/CapabilityState",
+              "description": "The state it must be in."
+            }
+          },
+          "required": [
+            "op",
+            "capability",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "True when the actor currently holds the named right.\n\nThis hides a control the actor could not use. It never grants anything: the host checks\nthe right again at dispatch, and a predicate that lies only makes a control appear that\nthen fails the check.",
+          "properties": {
+            "op": {
+              "const": "grant",
+              "type": "string"
+            },
+            "right": {
+              "$ref": "#/$defs/ActionRight",
+              "description": "The right."
+            }
+          },
+          "required": [
+            "op",
+            "right"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "True when the binding is in the named state.",
+          "properties": {
+            "op": {
+              "const": "binding",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/BindingState",
+              "description": "The state."
+            }
+          },
+          "required": [
+            "op",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "True when the named node is present in the current document.",
+          "properties": {
+            "node_id": {
+              "$ref": "#/$defs/NodeId",
+              "description": "The node."
+            },
+            "op": {
+              "const": "node_present",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "node_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "True when the named presentation fact holds.",
+          "properties": {
+            "flag": {
+              "$ref": "#/$defs/PresentationFlag",
+              "description": "The fact."
+            },
+            "op": {
+              "const": "flag",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "flag"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PresentationFlag": {
+      "description": "A fact about the current presentation that a control can depend on.",
+      "oneOf": [
+        {
+          "const": "pending_approval",
+          "description": "A pending approval resource exists in the ledger.",
+          "type": "string"
+        },
+        {
+          "const": "draft_not_empty",
+          "description": "The upstream draft has text in it.",
+          "type": "string"
+        },
+        {
+          "const": "compact_layout",
+          "description": "The client is a small screen.",
+          "type": "string"
+        },
+        {
+          "const": "transfer_in_progress",
+          "description": "The session has an attachment upload in progress.",
+          "type": "string"
+        },
+        {
+          "const": "holds_input_lease",
+          "description": "The person holds the input lease.",
+          "type": "string"
+        }
+      ]
+    },
+    "PresentationManifest": {
+      "additionalProperties": false,
+      "description": "The presentation manifest of one package.",
+      "properties": {
+        "base_revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision this document as a whole is at.\n\nA delta names this revision as its base, so a client knows whether it can apply the delta\nor must ask for a fresh snapshot."
+        },
+        "manifest_version": {
+          "description": "The manifest format version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "nodes": {
+          "description": "The document nodes, in presentation order.",
+          "items": {
+            "$ref": "#/$defs/DocumentNode"
+          },
+          "type": "array"
+        },
+        "voice": {
+          "$ref": "#/$defs/VoiceProjection",
+          "description": "The bounded projection a voice client receives."
+        }
+      },
+      "required": [
+        "manifest_version",
+        "base_revision",
+        "nodes",
+        "voice"
+      ],
+      "type": "object"
+    },
+    "ProgressState": {
+      "description": "How far along a progress node is.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A known fraction of a known total.",
+          "properties": {
+            "completed": {
+              "description": "Completed units.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "determinate",
+              "type": "string"
+            },
+            "total": {
+              "description": "Total units.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "completed",
+            "total"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Work is happening and its extent is unknown.",
+          "properties": {
+            "kind": {
+              "const": "indeterminate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Work finished.",
+          "properties": {
+            "kind": {
+              "const": "complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Work failed.",
+          "properties": {
+            "kind": {
+              "const": "failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ProtocolPin": {
+      "additionalProperties": false,
+      "description": "The upstream protocol a table is pinned to.\n\nA table is qualified against one installed protocol version. It is not carried forward to a\nversion nobody tested, because the classification of a method is exactly the kind of thing a\nprotocol revision changes.",
+      "properties": {
+        "name": {
+          "description": "The protocol name as the vendor publishes it.",
+          "type": "string"
+        },
+        "qualified_range": {
+          "$ref": "#/$defs/VersionRange",
+          "description": "The versions this table was qualified against."
+        },
+        "tested_version": {
+          "$ref": "#/$defs/PackageVersion",
+          "description": "The exact version the publisher tested."
+        }
+      },
+      "required": [
+        "name",
+        "qualified_range",
+        "tested_version"
+      ],
+      "type": "object"
+    },
+    "PublisherId": {
+      "description": "The publisher that signs and maintains a package. Immutable for the package's life.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "PublisherRecord": {
+      "additionalProperties": false,
+      "description": "A publisher record.\n\nPublishers are named in the index so a person can see who signed a package before installing\nit, and so a delegation can be scoped to one publisher's path.",
+      "properties": {
+        "display_name": {
+          "$ref": "#/$defs/Label",
+          "description": "The name a person reads."
+        },
+        "first_party": {
+          "description": "Whether this publisher ships with KalaReach.",
+          "type": "boolean"
+        },
+        "homepage": {
+          "description": "Where the publisher's own source and contact details live.",
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/PublisherId",
+          "description": "The publisher identifier."
+        }
+      },
+      "required": [
+        "id",
+        "display_name",
+        "homepage",
+        "first_party"
+      ],
+      "type": "object"
+    },
+    "Report": {
+      "additionalProperties": false,
+      "description": "Everything validation found.",
+      "properties": {
+        "findings": {
+          "description": "The findings, in the order they were produced.",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "findings"
+      ],
+      "type": "object"
+    },
+    "RepositoryBudgets": {
+      "additionalProperties": false,
+      "description": "The budgets a host sets when it enrols a repository.",
+      "properties": {
+        "full_offline_mirror": {
+          "description": "Whether every referenced payload is fetched rather than only what is installed.",
+          "type": "boolean"
+        },
+        "metadata_bytes": {
+          "description": "Maximum bytes of catalogue metadata.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "metadata_entries": {
+          "description": "Maximum number of index entries.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "payload_cache_bytes": {
+          "description": "Maximum bytes of cached payloads.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "metadata_bytes",
+        "metadata_entries",
+        "payload_cache_bytes",
+        "full_offline_mirror"
+      ],
+      "type": "object"
+    },
+    "RepositoryGeneration": {
+      "description": "The catalogue generation a plugin package was resolved against.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "ResponseCorrelation": {
+      "description": "How a response is matched to its request.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The response repeats the request identifier at a known path.",
+          "properties": {
+            "id_path": {
+              "$ref": "#/$defs/FieldPath",
+              "description": "Where the identifier is in a response."
+            },
+            "type": {
+              "const": "matching_id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id_path"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Responses arrive in request order on a single ordered channel.\n\nThe broker still records each opaque request before forwarding it, so ordering is how a\nreply is matched, not a reason to skip the ledger.",
+          "properties": {
+            "type": {
+              "const": "ordered",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RevocationReason": {
+      "description": "Why a package stops receiving new bindings.",
+      "oneOf": [
+        {
+          "const": "withdrawn",
+          "description": "The publisher withdrew this release.",
+          "type": "string"
+        },
+        {
+          "const": "vulnerable",
+          "description": "The release has a security defect.",
+          "type": "string"
+        },
+        {
+          "const": "key_compromise",
+          "description": "The signing key was compromised.",
+          "type": "string"
+        },
+        {
+          "const": "superseded",
+          "description": "A later release supersedes it and this one should not be installed again.",
+          "type": "string"
+        }
+      ]
+    },
+    "RevocationRecord": {
+      "additionalProperties": false,
+      "description": "A revocation record.\n\nA revoked package stops new bindings. An active binding receives a warning and follows the\nadministrator's explicit disable policy; it does not change under a live request.",
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/RevocationReason",
+          "description": "Why it was revoked."
+        },
+        "revoked_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the revocation was published."
+        },
+        "statement": {
+          "$ref": "#/$defs/Summary",
+          "description": "What a person reads about it."
+        }
+      },
+      "required": [
+        "reason",
+        "revoked_at",
+        "statement"
+      ],
+      "type": "object"
+    },
+    "Route": {
+      "additionalProperties": false,
+      "description": "One route from a native method to the stream that carries it.",
+      "properties": {
+        "direction": {
+          "$ref": "#/$defs/RouteDirection",
+          "description": "The direction the method travels."
+        },
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The method as the table names it."
+        },
+        "wire_name": {
+          "description": "The method name exactly as it appears on the wire.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "wire_name",
+        "direction"
+      ],
+      "type": "object"
+    },
+    "RouteDirection": {
+      "description": "Which way a native method travels.",
+      "oneOf": [
+        {
+          "const": "upstream_to_host",
+          "description": "The application asks KalaReach.",
+          "type": "string"
+        },
+        {
+          "const": "host_to_upstream",
+          "description": "KalaReach asks the application.",
+          "type": "string"
+        },
+        {
+          "const": "bidirectional",
+          "description": "Either side may send it.",
+          "type": "string"
+        }
+      ]
+    },
+    "SemanticPriority": {
+      "description": "How prominently a client presents a control.\n\nPriority is semantic, not visual: it says how important the action is, and each client decides\nwhat that looks like on its own platform.",
+      "oneOf": [
+        {
+          "const": "primary",
+          "description": "The action a person came here to take.",
+          "type": "string"
+        },
+        {
+          "const": "secondary",
+          "description": "A common alternative.",
+          "type": "string"
+        },
+        {
+          "const": "overflow",
+          "description": "Rarely needed; a client may place it behind a menu.",
+          "type": "string"
+        },
+        {
+          "const": "destructive",
+          "description": "Destructive or irreversible; a client presents it as such.",
+          "type": "string"
+        }
+      ]
+    },
+    "SessionId": {
+      "description": "One KalaReach terminal session.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "SourcePin": {
+      "additionalProperties": false,
+      "description": "The publisher's own record of where a package came from.\n\nA reviewed catalogue entry pins the publisher, the source revision and the released package\ndigest. Runtime hosts install that release; they never execute a vendor repository's current\nbranch.",
+      "properties": {
+        "repository": {
+          "description": "Where the source lives.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "The exact revision the package was built from.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "StandardIcon": {
+      "description": "An icon from the standard set every client ships.",
+      "enum": [
+        "play",
+        "stop",
+        "pause",
+        "check",
+        "cross",
+        "retry",
+        "open",
+        "copy",
+        "attachment",
+        "file",
+        "folder",
+        "diff",
+        "terminal",
+        "tool",
+        "warning",
+        "info",
+        "error",
+        "settings",
+        "search",
+        "person",
+        "question",
+        "send"
+      ],
+      "type": "string"
+    },
+    "SubjectIdentity": {
+      "additionalProperties": false,
+      "description": "The exact identity the evidence was gathered against.\n\nAn installed upgrade does not invalidate an old running process's correctly pinned identity,\nwhich is only expressible if the record names the identity rather than the product.",
+      "properties": {
+        "binary_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PayloadDigest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of the tested binary, where the subject is a binary."
+        },
+        "package_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PayloadDigest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of that package's manifest."
+        },
+        "plugin_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The package the evidence is about, where it is about one."
+        },
+        "publisher_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublisherId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The publisher whose signed record supplied the evidence, where one did."
+        },
+        "schema_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PackageVersion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version of the tested schema or protocol, where the subject is one."
+        }
+      },
+      "required": [
+        "binary_digest",
+        "schema_version",
+        "plugin_id",
+        "package_digest",
+        "publisher_id"
+      ],
+      "type": "object"
+    },
+    "Summary": {
+      "description": "The package summary. One line, no control or bidirectional characters.",
+      "maxLength": 1000,
+      "minLength": 1,
+      "type": "string"
+    },
+    "TimestampMs": {
+      "description": "A UTC timestamp in milliseconds, as a decimal string in JSON.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "ToolOutcome": {
+      "description": "The outcome of a tool call.",
+      "oneOf": [
+        {
+          "const": "running",
+          "description": "Running.",
+          "type": "string"
+        },
+        {
+          "const": "succeeded",
+          "description": "Finished successfully.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "Finished with an error.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "Cancelled before it finished.",
+          "type": "string"
+        }
+      ]
+    },
+    "U64": {
+      "description": "An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "UnsupportedNode": {
+      "additionalProperties": false,
+      "description": "A node whose kind this build does not know.\n\nA client renders it as an unsupported-content block. It carries no body and therefore no\naction: a newer package cannot reach a hidden action through a node an older client cannot\nread.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/NodeId",
+          "description": "The stable identifier."
+        },
+        "kind": {
+          "description": "The kind the document claimed, for the unsupported-content block to name.",
+          "type": "string"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of the node that could not be read."
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "VersionRange": {
+      "description": "A semantic version range, such as '>=0.1, <0.2'. An unbounded range is rejected.",
+      "maxLength": 128,
+      "minLength": 1,
+      "type": "string"
+    },
+    "VoiceProjection": {
+      "additionalProperties": false,
+      "description": "What a voice client receives.\n\nVoice gets status, pending choices and references to detail, never the whole document. A\nspoken interface that reads an arbitrary document out loud is both unusable and a disclosure\nnobody asked for.",
+      "properties": {
+        "choice_controls": {
+          "description": "The controls voice offers as choices.",
+          "items": {
+            "$ref": "#/$defs/ControlId"
+          },
+          "type": "array"
+        },
+        "detail_nodes": {
+          "description": "The nodes voice refers to without reading out.",
+          "items": {
+            "$ref": "#/$defs/NodeId"
+          },
+          "type": "array"
+        },
+        "status_nodes": {
+          "description": "The nodes whose status voice announces.",
+          "items": {
+            "$ref": "#/$defs/NodeId"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "status_nodes",
+        "choice_controls",
+        "detail_nodes"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Generated from the Rust types in crates/kr-plugin-sdk. Rust is canonical: edit the Rust types and regenerate. Every property below names one root document; $defs holds the referenced types.",
+  "properties": {
+    "action_invocation": {
+      "$ref": "#/$defs/ActionInvocation"
+    },
+    "capability_evidence": {
+      "$ref": "#/$defs/CapabilityEvidence"
+    },
+    "catalogue_index": {
+      "$ref": "#/$defs/CatalogueIndex"
+    },
+    "connector_manifest": {
+      "$ref": "#/$defs/ConnectorManifest"
+    },
+    "document_node": {
+      "$ref": "#/$defs/DocumentNode"
+    },
+    "index_entry": {
+      "$ref": "#/$defs/IndexEntry"
+    },
+    "instance_limits": {
+      "$ref": "#/$defs/InstanceLimits"
+    },
+    "plugin_manifest": {
+      "$ref": "#/$defs/PluginManifest"
+    },
+    "presentation_manifest": {
+      "$ref": "#/$defs/PresentationManifest"
+    },
+    "publisher_record": {
+      "$ref": "#/$defs/PublisherRecord"
+    },
+    "repository_budgets": {
+      "$ref": "#/$defs/RepositoryBudgets"
+    },
+    "unsupported_node": {
+      "$ref": "#/$defs/UnsupportedNode"
+    },
+    "validation_report": {
+      "$ref": "#/$defs/Report"
+    },
+    "visibility_predicate": {
+      "$ref": "#/$defs/Predicate"
+    },
+    "vocabulary": {
+      "description": "Every closed vocabulary in the package contract. This is a vocabulary rather than a document: it exists so each enumeration has one named type.",
+      "properties": {
+        "architecture": {
+          "$ref": "#/$defs/Architecture"
+        },
+        "binding_state": {
+          "$ref": "#/$defs/BindingState"
+        },
+        "broker_transport": {
+          "$ref": "#/$defs/BrokerTransport"
+        },
+        "capability_state": {
+          "$ref": "#/$defs/CapabilityState"
+        },
+        "effect_class": {
+          "$ref": "#/$defs/EffectClass"
+        },
+        "evidence_source": {
+          "$ref": "#/$defs/EvidenceSource"
+        },
+        "finding_code": {
+          "$ref": "#/$defs/FindingCode"
+        },
+        "framing": {
+          "$ref": "#/$defs/Framing"
+        },
+        "invalidation_trigger": {
+          "$ref": "#/$defs/InvalidationTrigger"
+        },
+        "method_class": {
+          "$ref": "#/$defs/MethodClass"
+        },
+        "operating_system": {
+          "$ref": "#/$defs/OperatingSystem"
+        },
+        "package_path": {
+          "$ref": "#/$defs/PackagePath"
+        },
+        "package_version": {
+          "$ref": "#/$defs/PackageVersion"
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/PayloadDigest"
+        },
+        "payload_role": {
+          "$ref": "#/$defs/PayloadRole"
+        },
+        "plugin_capability": {
+          "$ref": "#/$defs/PluginCapability"
+        },
+        "presentation_flag": {
+          "$ref": "#/$defs/PresentationFlag"
+        },
+        "revocation_reason": {
+          "$ref": "#/$defs/RevocationReason"
+        },
+        "semantic_priority": {
+          "$ref": "#/$defs/SemanticPriority"
+        },
+        "standard_icon": {
+          "$ref": "#/$defs/StandardIcon"
+        },
+        "version_range": {
+          "$ref": "#/$defs/VersionRange"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "title": "KalaReach plugin SDK",
+  "type": "object"
+}

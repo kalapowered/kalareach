@@ -1,0 +1,262 @@
+{
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "required_right": null,
+      "requires_installation_grant": false,
+      "within_default_ceiling": true
+    },
+    {
+      "capability": "presentation.declarative",
+      "required_right": null,
+      "requires_installation_grant": false,
+      "within_default_ceiling": true
+    },
+    {
+      "capability": "broker.semantic_events",
+      "required_right": null,
+      "requires_installation_grant": false,
+      "within_default_ceiling": true
+    },
+    {
+      "capability": "terminal.stream",
+      "required_right": "session.view",
+      "requires_installation_grant": false,
+      "within_default_ceiling": false
+    },
+    {
+      "capability": "terminal.transcript_tail",
+      "required_right": "session.view",
+      "requires_installation_grant": false,
+      "within_default_ceiling": false
+    },
+    {
+      "capability": "terminal.input",
+      "required_right": "terminal.input",
+      "requires_installation_grant": true,
+      "within_default_ceiling": false
+    },
+    {
+      "capability": "filesystem.read",
+      "required_right": "files.read",
+      "requires_installation_grant": true,
+      "within_default_ceiling": false
+    },
+    {
+      "capability": "network.outbound",
+      "required_right": "host.manage",
+      "requires_installation_grant": true,
+      "within_default_ceiling": false
+    },
+    {
+      "capability": "process.observe",
+      "required_right": null,
+      "requires_installation_grant": false,
+      "within_default_ceiling": false
+    },
+    {
+      "capability": "upstream.action",
+      "required_right": "agent.prompt",
+      "requires_installation_grant": false,
+      "within_default_ceiling": false
+    },
+    {
+      "capability": "approval.decode",
+      "required_right": null,
+      "requires_installation_grant": false,
+      "within_default_ceiling": false
+    },
+    {
+      "capability": "approval.respond",
+      "required_right": "agent.approval.respond",
+      "requires_installation_grant": true,
+      "within_default_ceiling": false
+    },
+    {
+      "capability": "native_bridge.install",
+      "required_right": null,
+      "requires_installation_grant": true,
+      "within_default_ceiling": false
+    }
+  ],
+  "default_repository_ceiling": [
+    "metadata.match",
+    "presentation.declarative",
+    "broker.semantic_events"
+  ],
+  "description": "The KalaReach package contract as data. Generated from crates/kr-plugin-sdk; do not edit by hand.",
+  "document_node_kinds": [
+    "message",
+    "markdown",
+    "tool",
+    "diff",
+    "progress",
+    "form",
+    "attachment",
+    "approval_ref",
+    "terminal_ref",
+    "action_button",
+    "action_group",
+    "command_palette",
+    "attachment_entry"
+  ],
+  "effect_classes": [
+    {
+      "effect": "observe",
+      "mutation": false,
+      "required_capability": "broker.semantic_events",
+      "required_rights": [
+        "session.view"
+      ]
+    },
+    {
+      "effect": "upstream.prompt",
+      "mutation": true,
+      "required_capability": "upstream.action",
+      "required_rights": [
+        "agent.prompt"
+      ]
+    },
+    {
+      "effect": "upstream.cancel",
+      "mutation": true,
+      "required_capability": "upstream.action",
+      "required_rights": [
+        "agent.cancel"
+      ]
+    },
+    {
+      "effect": "upstream.attachment",
+      "mutation": true,
+      "required_capability": "upstream.action",
+      "required_rights": [
+        "agent.prompt",
+        "files.upload"
+      ]
+    },
+    {
+      "effect": "approval.decode",
+      "mutation": false,
+      "required_capability": "approval.decode",
+      "required_rights": []
+    },
+    {
+      "effect": "approval.respond",
+      "mutation": true,
+      "required_capability": "approval.respond",
+      "required_rights": [
+        "agent.approval.respond"
+      ]
+    },
+    {
+      "effect": "terminal.input",
+      "mutation": true,
+      "required_capability": "terminal.input",
+      "required_rights": [
+        "terminal.input"
+      ]
+    }
+  ],
+  "finding_codes": [
+    "directory_unreadable",
+    "manifest_missing",
+    "manifest_unreadable",
+    "manifest_version_unsupported",
+    "unsafe_path",
+    "not_a_regular_file",
+    "case_colliding_path",
+    "duplicate_path",
+    "undeclared_file",
+    "missing_payload",
+    "size_mismatch",
+    "digest_mismatch",
+    "package_too_large",
+    "too_many_files",
+    "unbounded_version_range",
+    "version_range_excludes_host",
+    "no_match_rules",
+    "no_platforms",
+    "duplicate_action_id",
+    "action_not_registered",
+    "effect_without_capability",
+    "duplicate_capability",
+    "bridge_without_capability",
+    "attachment_without_capability",
+    "predicate_invalid",
+    "parameter_schema_invalid",
+    "document_too_large",
+    "voice_projection_unknown",
+    "connector_table_invalid",
+    "connector_method_unrouted",
+    "connector_payload_missing",
+    "connector_undeclared",
+    "connector_plugin_mismatch",
+    "unknown_effect_class",
+    "unknown_capability"
+  ],
+  "index_version": 1,
+  "instance_limits": {
+    "fault_window_ms": 60000,
+    "faults_before_disable": 3,
+    "interpretation_deadline_ms": 50,
+    "memory_bytes": 67108864,
+    "observation_deadline_ms": 10,
+    "observation_queue_bytes": 4194304,
+    "output_bytes_per_call": 1048576,
+    "snapshot_deadline_ms": 100
+  },
+  "manifest_version": 1,
+  "package_bounds": {
+    "max_bytes": 67108864,
+    "max_classified_methods": 512,
+    "max_controls": 128,
+    "max_document_nodes": 256,
+    "max_files": 512,
+    "max_parameters": 16
+  },
+  "predicate_bounds": {
+    "max_depth": 4,
+    "max_terms": 8
+  },
+  "repository_budgets": {
+    "full_offline_mirror": false,
+    "metadata_bytes": 67108864,
+    "metadata_entries": 100000,
+    "payload_cache_bytes": 1073741824
+  },
+  "sdk_version": "0.1.0",
+  "wit_package": {
+    "export_interface": "adapter",
+    "exports": [
+      "bind",
+      "observe",
+      "snapshot",
+      "prepare-action",
+      "decode-request",
+      "encode-response",
+      "checkpoint",
+      "restore"
+    ],
+    "imports": [
+      {
+        "interface": "source-events",
+        "purpose": "Immutable source events scoped to the binding, read through a handle the host supplied"
+      },
+      {
+        "interface": "upstream",
+        "purpose": "Facts about the bound execution and the rights the actor holds. There is no send function"
+      },
+      {
+        "interface": "attachments",
+        "purpose": "Completed attachment handles from the shared transfer service, never the bytes"
+      },
+      {
+        "interface": "document",
+        "purpose": "Safe document output from the closed node union, bounded at 1 MiB per call"
+      }
+    ],
+    "name": "kalareach:plugin",
+    "world": "plugin"
+  },
+  "wit_version": "0.1.0"
+}

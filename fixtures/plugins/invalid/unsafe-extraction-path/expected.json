@@ -1,0 +1,6 @@
+{
+  "note": "A payload path that leaves the package directory.",
+  "codes": [
+    "unsafe_path"
+  ]
+}
