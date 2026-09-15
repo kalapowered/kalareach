@@ -127,11 +127,11 @@ impl DataStream {
         self.handle.is_revoked()
     }
 
-    /// Writes one message, reserving queue space for it first.
+    /// Writes one message, reserving queue space for it before it is handed to the connection.
     ///
-    /// The buffer the message is encoded into is itself memory this connection is handing itself,
-    /// so it is reserved for before it exists, at the largest size this stream could produce, and
-    /// the difference goes back as soon as the size is known.
+    /// The message is encoded under the smaller of this stream kind's frame bound and the largest
+    /// frame the connection's budget could ever admit, so a frame the budget would always refuse is
+    /// refused as too large instead of being built and then rejected.
     ///
     /// # Errors
     ///
@@ -142,23 +142,23 @@ impl DataStream {
         if self.handle.is_revoked() {
             return Err(TransportError::ControlLost);
         }
+        let class = class_of(self.header.kind);
         let bound = self
             .writer
             .as_ref()
-            .map_or(self.header.kind.max_payload_len(), FrameWriter::max_payload);
-        let class = class_of(self.header.kind);
-        let mut reservation = self.budget.reserve(
-            class,
-            bound
-                .saturating_add(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN)
-                .min(self.budget.limits().ceiling_for(class)),
-        )?;
+            .map_or(self.header.kind.max_payload_len(), FrameWriter::max_payload)
+            .min(
+                self.budget
+                    .limits()
+                    .ceiling_for(class)
+                    .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
+            );
         let payload = kr_cbor::to_canonical_vec_within(
             message,
             &kr_cbor::Limits::DEFAULT.with_max_message_len(bound),
         )
         .map_err(kr_protocol::frame::FrameError::Cbor)?;
-        reservation.shrink_to(framed_len(payload.len()));
+        let reservation = self.budget.reserve(class, framed_len(payload.len()))?;
         self.write_reserved(&payload, reservation).await
     }
 

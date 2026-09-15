@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
+use kr_cbor::CanonicalValue;
 use kr_crypto::connect::PairedPeer;
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -32,7 +33,7 @@ use kr_transport::error::TransportError;
 use kr_transport::handshake::{self, Admitted, PairedDirectory};
 use kr_transport::preauth::{self, PairingMethod, PairingSurface, PreAuthLimits};
 use kr_transport::random::fresh_nonce;
-use kr_transport::scheduler::{SendLimits, StreamBudget};
+use kr_transport::scheduler::{SendLimits, StreamBudget, StreamClass};
 use kr_transport::streams::StreamRegistry;
 use support::{
     NoDevices, OneDevice, Side, direct_addr, epochs, ledger, paired_pair, side, windows,
@@ -745,6 +746,62 @@ async fn every_stream_class_is_charged_against_the_connection_send_budget() {
         .write_payload(b"inside the ceiling")
         .await
         .expect("a write inside the ceiling");
+    assert_eq!(registry.budget().queued_bytes(), 0);
+
+    let _ = accepting.await.expect("the host task");
+}
+
+#[tokio::test]
+async fn a_message_is_bounded_by_the_ceiling_it_will_be_charged_against() {
+    // A message is encoded under the smallest bound that applies, so a frame the budget would
+    // always refuse never reaches the connection; and a message that does fit is admitted on what
+    // it actually encodes to, not on what its stream kind allows.
+    let (host, client) = paired_pair().await;
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let registry = registry(
+        authorised.connection_id,
+        SendLimits {
+            max_bulk_streams: 4,
+            max_bulk_queued_bytes: 1024,
+            max_queued_bytes: 2048,
+        },
+    );
+    let mut stream = registry
+        .open(&connection, terminal_header(authorised.connection_id))
+        .await
+        .expect("a terminal stream");
+
+    // The stream kind allows a 1 MiB frame; this connection would never admit one.
+    let error = stream
+        .write_message(&ParamsValue::new(CanonicalValue::bytes(vec![0u8; 4096])))
+        .await
+        .expect_err("a frame the budget could never admit is refused");
+    assert!(
+        matches!(error, TransportError::Frame(_)),
+        "an unadmittable frame is refused as too large rather than sent: {error:?}"
+    );
+    assert_eq!(registry.budget().queued_bytes(), 0);
+
+    // A small message is charged for what it encodes to, so it goes out even with most of the
+    // ceiling already spoken for.
+    let held = registry
+        .budget()
+        .reserve(StreamClass::Live, 2000)
+        .expect("another write holding most of the ceiling");
+    stream
+        .write_message(&ParamsValue::new(CanonicalValue::bytes(b"hi".to_vec())))
+        .await
+        .expect("a small message fits what is left");
+    drop(held);
     assert_eq!(registry.budget().queued_bytes(), 0);
 
     let _ = accepting.await.expect("the host task");

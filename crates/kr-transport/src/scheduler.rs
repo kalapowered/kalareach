@@ -2,26 +2,35 @@
 //!
 //! Section 23 asks for two related things: the host's application scheduler prioritises control and
 //! receipts over bulk transfers, and the number and queued bytes of bulk streams are limited so
-//! connection flow control cannot consume the entire send budget.
+//! connection flow control cannot consume the entire send budget. This module is where the
+//! application's half of both lives, and neither half is absolute.
 //!
-//! Only the second lives here in full. Priority is a QUIC stream property, so a class is a number
-//! given to [`crate::codec::FrameWriter::set_priority`], and what that number decides is which
-//! stream the connection sends from while it has capacity. Admission is ours: [`StreamBudget`]
-//! refuses a stream, or a write, that would push a connection past one of its ceilings before
-//! anything is sent. One keystroke behind a file transfer is the case both exist for.
+//! Priority is a QUIC stream property, so a class is a number given to
+//! [`crate::codec::FrameWriter::set_priority`], and what that number decides is which stream the
+//! connection sends from *while it has capacity*. Once the connection's send window is full, a
+//! control frame waits for the peer to acknowledge, not for a scheduler decision. Admission is
+//! ours: [`StreamBudget`] refuses a stream, or a write, that would push a connection past one of
+//! its ceilings before anything is sent. One keystroke behind a file transfer is the case both
+//! exist for.
 //!
 //! Two ceilings, because one would not do the job. Every data-stream write is charged against the
-//! peer's whole send budget, so no combination of streams can exceed what the peer said it would
-//! accept. Bulk writes are charged again against a lower ceiling, so a transfer can never occupy
-//! the last mebibyte of that budget and a control frame always has room. Control frames themselves
-//! are not charged: that mebibyte is what they are for.
+//! peer's whole send budget, so no combination of data streams can hand the connection more than
+//! the peer said it would accept. Bulk writes are charged again against a lower ceiling, which
+//! leaves a mebibyte of that budget that a transfer can never occupy.
 //!
-//! What the budget counts is what the application is handing the connection at this moment: each
-//! frame, its length prefix and its stream header included, for as long as its write is in
-//! progress, and the buffer a message is encoded into while it is being encoded. What it does not
-//! count is what the connection has already accepted and the peer has not yet acknowledged: QUIC
-//! holds those bytes in the connection's send window, and nothing iroh exposes says when they leave
-//! it. Neither mechanism reserves capacity inside the window itself.
+//! What is not charged: control frames. They are written through the connection's single control
+//! writer, which holds its lock across the write, so at most one control frame is outstanding at a
+//! time and the mebibyte above is what it is for. That is an exclusion, not an accounting: a
+//! control write is never refused by this budget.
+//!
+//! What the budget counts is what the application has handed the connection and the connection has
+//! not yet taken: each frame, its length prefix and its stream header included, for as long as its
+//! write is in progress. Two things it does not count. A message's encoding buffer exists for the
+//! length of a synchronous encode before the reservation is taken, so it cannot accumulate across
+//! blocked writes, and what it holds is a value this process already built rather than anything a
+//! peer supplied. And bytes the connection has accepted but the peer has not yet acknowledged sit
+//! in the QUIC send window, where nothing iroh exposes says when they leave. So this bounds what
+//! the application offers the connection; it reserves no capacity inside the window itself.
 
 use std::sync::{Arc, Mutex};
 
@@ -112,10 +121,11 @@ impl Default for SendLimits {
 }
 
 impl SendLimits {
-    /// Returns the largest single reservation a write of `class` can ever make.
+    /// Returns the largest complete frame a write of `class` can ever be admitted with.
     ///
-    /// A write asks for the stream kind's bound before it knows its own size; asking for more than
-    /// the connection could ever admit would refuse it forever, so the ask stops here.
+    /// A message is encoded under this as well as under its stream kind's bound, so a frame the
+    /// budget would refuse however idle the connection is refused as too large instead of being
+    /// built first and rejected after.
     #[must_use]
     pub const fn ceiling_for(&self, class: StreamClass) -> usize {
         match class {
@@ -296,25 +306,6 @@ impl QueueReservation {
     pub const fn bytes(&self) -> usize {
         self.bytes
     }
-
-    /// Lowers the reservation to what the write actually turned out to be.
-    ///
-    /// A message is reserved for at its stream kind's bound *before* it is encoded, because the
-    /// buffer it is encoded into is itself memory the connection's budget is meant to bound. Once
-    /// the size is known the difference goes back. Asking for more than was reserved does nothing.
-    pub fn shrink_to(&mut self, bytes: usize) {
-        if bytes >= self.bytes {
-            return;
-        }
-        let returned = self.bytes - bytes;
-        let mut state = self.budget.lock();
-        state.queued_bytes = state.queued_bytes.saturating_sub(returned);
-        if self.class == StreamClass::Bulk {
-            state.bulk_queued_bytes = state.bulk_queued_bytes.saturating_sub(returned);
-        }
-        drop(state);
-        self.bytes = bytes;
-    }
 }
 
 impl Drop for QueueReservation {
@@ -438,31 +429,6 @@ mod tests {
         }));
         assert!(budget.reserve(StreamClass::Bulk, 200).is_err());
         assert_eq!(budget.queued_bytes(), 0);
-        assert_eq!(budget.bulk_queued_bytes(), 0);
-    }
-
-    #[test]
-    fn a_shrunk_reservation_returns_what_it_did_not_use() {
-        let budget = Arc::new(StreamBudget::new(SendLimits {
-            max_bulk_streams: 4,
-            max_bulk_queued_bytes: 1000,
-            max_queued_bytes: 1000,
-        }));
-        let mut reservation = budget
-            .reserve(StreamClass::Bulk, 1000)
-            .expect("the whole budget");
-        reservation.shrink_to(100);
-        assert_eq!(reservation.bytes(), 100);
-        assert_eq!(budget.queued_bytes(), 100);
-        assert_eq!(budget.bulk_queued_bytes(), 100);
-        // Growing again is not how a reservation works; the ask is ignored.
-        reservation.shrink_to(900);
-        assert_eq!(reservation.bytes(), 100);
-        let _other = budget
-            .reserve(StreamClass::Interactive, 900)
-            .expect("the returned room");
-        drop(reservation);
-        assert_eq!(budget.queued_bytes(), 900);
         assert_eq!(budget.bulk_queued_bytes(), 0);
     }
 

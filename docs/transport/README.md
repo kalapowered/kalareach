@@ -162,7 +162,9 @@ surface's trait. The transport is the door, not the ceremony behind it.
 ### 0-RTT
 
 Version 1 accepts no application mutation in QUIC 0-RTT — not just no pairing mutation. Three rules
-enforce it, and the order matters because the first one is what makes the others truthful.
+enforce it, and the order matters because the first one is what makes the others truthful. The first
+rule is also the one place the build does not reach the guarantee absolutely, and the residual case
+is named rather than glossed.
 
 * **The host asks whether a stream carried early data.** QUIC marks a stream as early data only when
   it is accepted while the handshake is still running, so the listener accepts the first
@@ -174,14 +176,18 @@ enforce it, and the order matters because the first one is what makes the others
   early-data size at its maximum and exposes no way to refuse it. That fixed value stays as it is
   and this build does not fork iroh to change it. The residual case is covered by the layer above:
   the only surface reachable in early data is pairing, and pairing consumes an invitation once, so a
-  replayed early-data frame redeems nothing a second time.
+  replayed early-data frame redeems nothing a second time. What remains is narrow and stated
+  plainly: in that delayed-classification case a first, non-replayed `pair.redeem` or `pair.finish`
+  can be served as though it had arrived after the handshake. Section 23 and KR-ACC-026 are
+  otherwise enforced absolutely, and this is the one exception the build carries.
 * **An authorised connection never carries early data.** A handshake stream that arrived as early
   data is refused with `PERMISSION_DENIED` before the proof exchange, and so is a data stream. This
   costs nothing: a KalaReach endpoint keeps no TLS session tickets, so this product's own client
   cannot offer 0-RTT to anyone.
 * **The pairing surface refuses its own mutations in early data.** `pair.status` is a read and is
-  served; `pair.redeem` and `pair.finish` are writes and are refused. That is the one exception
-  section 23 allows, and it is closed to everything that changes state.
+  served; `pair.redeem` and `pair.finish` are writes and are refused. Pairing is the one surface
+  section 23 lets a 0-RTT connection reach at all, and within it everything that changes state is
+  closed — for every frame the first rule classified correctly.
 
 Authorisation could not complete in 0-RTT in any case: the proof covers the host's fresh challenge,
 which the client learns only after the handshake.
@@ -218,24 +224,36 @@ application keeps two ceilings of its own:
   8 MiB, lowered to whatever the peer declared it would queue. No combination of terminal, semantic
   and attachment streams can hand the connection more than that at once.
 * **Bulk within it.** At most 4 attachment streams may be open, and they may hand the connection at
-  most 7 MiB at once, so a transfer can never occupy the last mebibyte of the budget and a control
-  frame always has room. Control frames are not charged at all: that mebibyte is what it is for.
+  most 7 MiB at once, so a transfer can never occupy the last mebibyte of that budget.
 
-A charge covers the complete frame, its length prefix and its stream header included, and it is
-taken before the bytes exist rather than after. A message write reserves at the stream kind's frame
-bound, encodes into that reservation, then returns the difference once the size is known, so a
-connection cannot hold more encoded payloads than its budget while their writes are blocked. A write
-the budget refuses is refused whole: nothing is charged, nothing is sent, and the caller retries.
+Control frames are outside this accounting entirely: a connection writes them through one control
+writer that holds its lock across the write, so at most one is outstanding at a time, and a control
+write is never refused by the budget. The mebibyte the bulk ceiling leaves is what it is for. What
+it is not is a reservation: other data streams may use it, so "control has room" means the budget
+will not refuse a control write, not that the connection is holding space for one.
+
+A charge covers the complete frame, its length prefix and its stream header included, and it is held
+for as long as the write is in progress, which is what bounds a connection whose writes are all
+blocked. A write the budget refuses is refused whole: nothing is charged, nothing is sent, and the
+caller retries. A message is encoded under the smaller of its stream kind's frame bound and the
+largest frame its class could ever be admitted with, so a frame the budget would always refuse is
+refused as too large rather than built and then rejected.
+
+The encoding buffer itself is not charged. It exists for the length of a synchronous encode before
+the reservation is taken, so it cannot accumulate across blocked writes, and what it holds is a
+value this process already built rather than anything a peer supplied.
 
 An empty frame is refused before the write, because a zero length is what the peer's decoder reads
 as a malformed frame. A caller's mistake stays a local error rather than becoming stream damage.
 
 Control and input are written at a higher stream priority, so the connection sends them first
-whenever it has capacity. What that does not do is reserve capacity inside QUIC: bytes the
-connection has accepted but not yet had acknowledged still occupy the window, and the transport has
-no way to observe when they drain. A sustained transfer can therefore fill the window, and a control
-write then waits for the peer to acknowledge rather than for a scheduler decision. Bounding that
-properly needs per-stream send accounting the transport crate does not expose.
+whenever it has capacity. That priority is conditional, and so is the protection it gives: it
+reserves no capacity inside QUIC. Bytes the connection has accepted but not yet had acknowledged
+still occupy the window, and the transport has no way to observe when they drain. A sustained
+transfer can therefore fill the window, and a control write then waits for the peer to acknowledge
+rather than for a scheduler decision. Section 23's guarantee against flow-control exhaustion holds
+at the application's admission layer, not inside the window; closing the gap needs per-stream send
+accounting the transport crate does not expose.
 
 The negotiated limits are in force as well as the stream kind's ceilings. A peer that declared it
 could receive less than the kind allows is held to what it declared, in both directions, and a frame
