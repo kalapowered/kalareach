@@ -14,15 +14,19 @@
 //! Everything a terminal can be told over its own wire is emitted: the buffer, the palette, the
 //! modes, the keypad and keyboard negotiation, the tab stops, the character sets, the margins, the
 //! rows with their renditions and hyperlinks, the current title, the saved cursor of the buffer
-//! that is showing, and the cursor.
+//! that is showing, the buffer that is not, and the cursor.
 //!
-//! What a byte stream cannot carry is named here rather than approximated, and every one of them
-//! is counted in [`Restoration::carried`] rather than left for a caller to discover:
+//! The buffer that is not showing is painted by switching to it with `?47` and back before the
+//! active buffer is drawn: `?47` moves between the two without clearing either, which `?1047` and
+//! `?1049` do not. A pending wrap is reproduced by drawing the cursor's own row again, because
+//! addressing the cursor clears one and printing into the last column is what sets one.
 //!
-//! * **The buffer that is not showing, and its saved cursor and keyboard negotiation.** Painting
-//!   or saving into it over a byte stream means switching to it and back, and a switch either
-//!   clears the buffer it enters or moves the cursor of the one it leaves. A restoration must not
-//!   disturb the screen it is restoring. A client that holds its own grid has no such constraint.
+//! What a byte stream still cannot carry is named here rather than approximated, and every one of
+//! them is counted in [`Restoration::carried`] rather than left for a caller to discover:
+//!
+//! * **The saved cursor and keyboard negotiation of the buffer that is not showing.** `DECSC` saves
+//!   the state of the buffer in force, and the keyboard stack belongs to one buffer, so installing
+//!   either for the other one means leaving the screen inside the wrong buffer.
 //! * **The virtual title stack.** Pushing it onto the terminal's own stack would grow that stack
 //!   on every repaint and could evict what the person's own terminal had saved. Only the current
 //!   title is set.
@@ -30,11 +34,7 @@
 //!   concerned, so a line the application wrapped is copied as two lines rather than one.
 //! * **The right-hand side of a row wider than the window.** A terminal narrower than the session
 //!   is shown the part it has room for; nothing is reflowed and nothing wraps into the next row.
-//!
-//! Two things the pinned grid library does not expose are missing before this module sees them,
-//! and are recorded in `kr_term::unicode::LIBRARY`: the pending-wrap flag, and the saved cursor of
-//! either buffer. A restoration therefore cannot reproduce a pending wrap, and the saved cursor it
-//! installs is whichever one the snapshot managed to carry.
+//! * **A pending wrap on a row outside the window**, which has no row to draw again.
 
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
 use kr_term::modes::ALTERNATE_BUFFER_MODES;
@@ -43,8 +43,8 @@ use kr_term::sideeffect::{
     ClipboardSelection, NotificationDisplay, NotificationUrgency, Progress, SideEffectKind,
 };
 use kr_term::snapshot::{
-    ActiveBuffer, Charsets, CursorState, KeyboardSnapshot, Margins, PaletteSnapshot, RestoreOp,
-    SavedCursor, Viewport,
+    ActiveBuffer, Charsets, CursorState, Designations, KeyboardSnapshot, Margins, PaletteSnapshot,
+    RestoreOp, SavedCursor, Viewport,
 };
 
 /// What a rendered restoration could not carry.
@@ -62,6 +62,8 @@ pub struct Carried {
     pub soft_wraps: usize,
     /// The keyboard negotiation of the buffer that is not showing.
     pub other_keyboard: bool,
+    /// A pending wrap this restoration could not reproduce.
+    pub pending_wrap: bool,
 }
 
 impl Carried {
@@ -74,6 +76,7 @@ impl Carried {
             && self.clipped_rows == 0
             && self.soft_wraps == 0
             && !self.other_keyboard
+            && !self.pending_wrap
     }
 }
 
@@ -127,6 +130,10 @@ struct Writer {
     link_is_the_snapshots: bool,
     /// The character sets the application had selected, held back until the rows are painted.
     charsets: Option<Charsets>,
+    /// The rows of the buffer that is not showing, held back until the switch can be made.
+    inactive: Vec<GridRow>,
+    /// Every row painted for the active buffer, so the cursor's own row can be drawn again.
+    painted: Vec<GridRow>,
     /// The scroll region, held back until the rows have been painted.
     ///
     /// Every row is addressed absolutely, and an absolute address means something different once
@@ -149,6 +156,8 @@ impl Writer {
             link: None,
             link_is_the_snapshots: false,
             charsets: None,
+            inactive: Vec::new(),
+            painted: Vec::new(),
             margins: None,
             origin_mode: false,
             carried: Carried::default(),
@@ -237,8 +246,17 @@ impl Writer {
             RestoreOp::SetCharsets { charsets } => self.charsets = Some(charsets.clone()),
             // Held back until the rows are painted; see the field's own note.
             RestoreOp::SetMargins { margins } => self.margins = Some(*margins),
-            RestoreOp::PaintInactiveRow { .. } => self.carried.inactive_rows += 1,
-            RestoreOp::PaintRow { row } => self.paint(row),
+            // Held back. The rows of the buffer that is not showing are painted in one run, by
+            // switching to that buffer and back before the active buffer is painted, so the screen
+            // this restoration is drawing is never left half drawn while the other one is filled.
+            RestoreOp::PaintInactiveRow { row } => self.inactive.push(row.clone()),
+            RestoreOp::PaintRow { row } => {
+                self.paint_inactive_buffer();
+                // Every painted row is kept until the cursor names one, because a pending wrap is
+                // reproduced by drawing the cursor's own row again rather than by addressing it.
+                self.painted.push(row.clone());
+                self.paint(row);
+            }
             // Inert metadata. The runs of each row carry the link they belong to, and this writer
             // opens and closes it around them, so a terminal already has every range this names.
             RestoreOp::RecordHyperlink { .. } => {}
@@ -378,17 +396,25 @@ impl Writer {
     /// Rows are painted before this runs, under whatever the terminal already had; the profile's
     /// reset leaves that as ASCII with the shift-out set inactive, which is what canonical text is.
     fn charsets(&mut self, charsets: &Charsets) {
-        if let Some(designation) = designation(&charsets.g0) {
+        self.designations(&Designations {
+            g0: charsets.g0.clone(),
+            g1: charsets.g1.clone(),
+        });
+        self.out.push(if charsets.shift_out { 0x0E } else { 0x0F });
+    }
+
+    /// Writes the character-set designations, leaving the locking shift as it is.
+    fn designations(&mut self, designations: &Designations) {
+        if let Some(byte) = designation(&designations.g0) {
             self.out.push(ESC);
             self.out.push(b'(');
-            self.out.push(designation);
+            self.out.push(byte);
         }
-        if let Some(designation) = designation(&charsets.g1) {
+        if let Some(byte) = designation(&designations.g1) {
             self.out.push(ESC);
             self.out.push(b')');
-            self.out.push(designation);
+            self.out.push(byte);
         }
-        self.out.push(if charsets.shift_out { 0x0E } else { 0x0F });
     }
 
     fn paint(&mut self, row: &GridRow) {
@@ -547,7 +573,9 @@ impl Writer {
         let restore_pen = self.pen.unwrap_or_default();
         let restore_link = self.link.clone();
         self.csi(if cursor.origin_mode { b"?6h" } else { b"?6l" });
-        self.charsets(&cursor.charsets);
+        // A saved cursor carries the designations and not the locking shift, because `DECSC` saves
+        // the designations and a restore leaves whichever set was selected selected.
+        self.designations(&cursor.charsets);
         self.rendition(cursor.rendition);
         match cursor.hyperlink.as_ref() {
             Some(uri) => self.open_link(uri),
@@ -597,6 +625,22 @@ impl Writer {
         self.csi(&style);
         let placed = match (self.line_of_row(cursor.row), self.column_of(cursor.col)) {
             (Some(line), Some(column)) => {
+                // A pending wrap cannot be addressed: every cursor movement clears it. What sets it
+                // is printing into the last column, so the cursor's own row is drawn again and the
+                // cursor is left where that drawing ended.
+                if cursor.pending_wrap {
+                    let own = self
+                        .painted
+                        .iter()
+                        .find(|row| self.line_of(row.stable_id) == Some(line))
+                        .cloned();
+                    if let Some(row) = own {
+                        self.paint(&row);
+                        self.csi(if cursor.visible { b"?25h" } else { b"?25l" });
+                        return;
+                    }
+                    self.carried.pending_wrap = true;
+                }
                 let (line, column) = if self.origin_mode {
                     let top = margins.map_or(0, |margins| margins.top);
                     let left = margins.map_or(0, |margins| margins.left);
@@ -617,6 +661,38 @@ impl Writer {
         } else {
             b"?25l"
         });
+    }
+
+    /// Paints the buffer that is not showing, by switching to it and back.
+    ///
+    /// `?47` switches without clearing either buffer, which `?1047` and `?1049` do not: entering
+    /// through one of those would empty the buffer this is about to fill. Nothing else about the
+    /// screen changes, and the active buffer is painted afterwards.
+    fn paint_inactive_buffer(&mut self) {
+        if self.inactive.is_empty() {
+            return;
+        }
+        let rows = std::mem::take(&mut self.inactive);
+        let active = self.active;
+        // Into the other buffer.
+        self.csi(match active {
+            ActiveBuffer::Primary => b"?47h",
+            ActiveBuffer::Alternate => b"?47l",
+        });
+        self.active = match active {
+            ActiveBuffer::Primary => ActiveBuffer::Alternate,
+            ActiveBuffer::Alternate => ActiveBuffer::Primary,
+        };
+        self.csi(b"2J");
+        for row in &rows {
+            self.paint(row);
+        }
+        // And back, before anything of the active buffer is drawn.
+        self.csi(match active {
+            ActiveBuffer::Primary => b"?47l",
+            ActiveBuffer::Alternate => b"?47h",
+        });
+        self.active = active;
     }
 
     fn install_margins(&mut self, margins: Margins) {
@@ -918,7 +994,7 @@ mod tests {
                     row: 0,
                     visible: true,
                     style: 1,
-                    pending_wrap: None,
+                    pending_wrap: false,
                 },
             },
         ];
@@ -999,7 +1075,7 @@ mod tests {
                     row: 0,
                     visible: true,
                     style: 1,
-                    pending_wrap: None,
+                    pending_wrap: false,
                 },
             }],
             viewport(24, 40),
@@ -1035,7 +1111,7 @@ mod tests {
                     row: 7,
                     visible: true,
                     style: 1,
-                    pending_wrap: None,
+                    pending_wrap: false,
                 },
             },
         ];
@@ -1130,13 +1206,41 @@ mod tests {
     }
 
     #[test]
-    fn the_buffer_that_is_not_showing_is_reported_rather_than_approximated() {
+    fn the_buffer_that_is_not_showing_is_painted_before_the_one_that_is() {
+        // `?47` switches without clearing either buffer, so the screen this restoration is drawing
+        // is never emptied to fill the other one.
+        let operations = vec![
+            RestoreOp::SelectBuffer {
+                buffer: ActiveBuffer::Alternate,
+            },
+            RestoreOp::PaintInactiveRow {
+                row: row(0, 0, "shell"),
+            },
+            RestoreOp::PaintRow {
+                row: row(0, 0, "application"),
+            },
+        ];
+        let rendered = render(&operations, viewport(24, 80));
+        let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+        let into_primary = text
+            .find("\x1b[?47l")
+            .expect("switches to the other buffer");
+        let shell = text.find("shell").expect("the other buffer is painted");
+        let back = text.rfind("\x1b[?47h").expect("switches back");
+        let application = text
+            .find("application")
+            .expect("the active buffer is painted");
+        assert!(into_primary < shell, "{text:?}");
+        assert!(shell < back, "{text:?}");
+        assert!(back < application, "{text:?}");
+        assert_eq!(rendered.carried.inactive_rows, 0);
+    }
+
+    #[test]
+    fn the_saved_cursor_of_the_other_buffer_is_reported_rather_than_approximated() {
         let operations = vec![
             RestoreOp::SelectBuffer {
                 buffer: ActiveBuffer::Primary,
-            },
-            RestoreOp::PaintInactiveRow {
-                row: row(0, 0, "hidden"),
             },
             RestoreOp::SetSavedCursor {
                 cursor: SavedCursor {
@@ -1145,10 +1249,9 @@ mod tests {
                     row: 0,
                     pending_wrap: false,
                     rendition: Rendition::default(),
-                    charsets: Charsets {
-                        g0: "B".to_owned(),
-                        g1: "B".to_owned(),
-                        shift_out: false,
+                    charsets: Designations {
+                        g0: "Ascii".to_owned(),
+                        g1: "Ascii".to_owned(),
                     },
                     origin_mode: false,
                     style: 1,
@@ -1157,9 +1260,33 @@ mod tests {
             },
         ];
         let rendered = render(&operations, viewport(24, 80));
-        assert_eq!(rendered.carried.inactive_rows, 1);
         assert_eq!(rendered.carried.other_saved_cursors, 1);
         assert!(!rendered.carried.complete());
+    }
+
+    #[test]
+    fn a_pending_wrap_is_reproduced_by_drawing_its_row_again() {
+        // Addressing the cursor clears a pending wrap; printing into the last column is what sets
+        // one, so the row the cursor is on is drawn again and the cursor is left where it ended.
+        let operations = vec![
+            RestoreOp::PaintRow {
+                row: row(0, 0, "abcd"),
+            },
+            RestoreOp::SetCursor {
+                cursor: CursorState {
+                    col: 3,
+                    row: 0,
+                    visible: true,
+                    style: 1,
+                    pending_wrap: true,
+                },
+            },
+        ];
+        let rendered = render(&operations, viewport(24, 4));
+        let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
+        assert_eq!(text.matches("abcd").count(), 2, "{text:?}");
+        assert!(text.ends_with("\x1b[?25h"), "{text:?}");
+        assert!(!rendered.carried.pending_wrap);
     }
 
     #[test]

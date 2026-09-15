@@ -170,11 +170,10 @@ member that can ring, copy, notify, download, launch or ask anything. A terminal
 when the history happened does not have the history happen to it.
 
 Rendering a screen back into bytes cannot carry everything a client that holds its own grid could
-apply. What it leaves out is counted rather than assumed away — the buffer that is not showing and
-its saved cursor and keyboard negotiation, the virtual title stack, soft-wrap markers, and the
-right-hand side of a row wider than the window — and `Session::restoration_losses` is the count.
-Two further gaps are missing before the host sees them, and `kr_term::unicode::LIBRARY` records
-them: the pending-wrap flag and the saved cursor of either buffer.
+apply. What it leaves out is counted rather than assumed away — the saved cursor and keyboard
+negotiation of the buffer that is not showing, the virtual title stack, soft-wrap markers, the
+right-hand side of a row wider than the window, and a pending wrap on a row outside that window —
+and `Session::restoration_losses` is the count.
 
 A sequence the profile does not name is consumed rather than forwarded, and the engine counts it;
 `Session::terminal_diagnostics` reports those totals. A side effect that arrives while nothing holds
