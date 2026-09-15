@@ -47,6 +47,7 @@
 //! | [`input`] | The single input lease and the input method group |
 //! | [`recovery`] | Subscriptions, snapshots, history pages and resynchronisation |
 //! | [`hostinfo`] | Host and environment reads, and read-only diagnostics |
+//! | [`worker`] | Worker descriptors, the startup rendezvous, the verify challenge and the generation token |
 //! | [`schema`] | Deterministic JSON Schema and method-table generation |
 //!
 //! # What this crate does not do
@@ -108,3 +109,4 @@ pub mod rights;
 pub mod scalars;
 pub mod schema;
 pub mod session;
+pub mod worker;
