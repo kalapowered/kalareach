@@ -316,6 +316,27 @@ impl AttachmentTable {
         })
     }
 
+    /// Checks a resize without changing anything.
+    ///
+    /// The caller asks the kernel between this and [`AttachmentTable::resize`], so a refused
+    /// terminal operation leaves no record of a size the session never had.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`AttachmentTable::resize`].
+    pub fn check_resize(
+        &self,
+        id: AttachmentId,
+        dimensions: Dimensions,
+        expected_epoch: u64,
+    ) -> Result<()> {
+        dimensions.validate()?;
+        if self.owner != Some(id) || self.epoch != expected_epoch {
+            return Err(WorkerError::NotGeometryOwner);
+        }
+        Ok(())
+    }
+
     /// Changes the canonical geometry at the owner's request.
     ///
     /// # Errors

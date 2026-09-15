@@ -23,13 +23,13 @@ use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::framed::split;
 use kr_ipc::paths::{Endpoint, HostPaths};
 use kr_ipc::verify::WorkerIdentity;
-use kr_protocol::error::ProtocolError;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::ids::{BuildId, EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::local::{ControlMessage, LocalClientKind, LocalHello};
 use kr_protocol::scalars::Uuid;
-use kr_protocol::session::{DisplayNumber, Presentation, SessionCreateParams};
+use kr_protocol::session::{DisplayNumber, Presentation, SessionCreateParams, ShellMode};
 use kr_protocol::worker::{ReservationId, WorkerLaunchSpec, WorkerReady};
 use kr_worker::environment::{ExecutionContext, build as build_environment};
 use kr_worker::history::DEFAULT_RESIDENT_BYTES;
@@ -137,6 +137,36 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let ControlMessage::LaunchSpec(specification) = specification else {
         return Err("the controller did not send a launch specification".into());
     };
+    // The identity this process signed with came from its job definition. A specification that
+    // disagrees with it would leave the signature, the descriptor and the running session
+    // describing different things.
+    if specification.session_id != session_id
+        || specification.environment_id != environment_id
+        || specification.session_epoch != SessionEpoch::V1
+        || specification.display_number.get() != arguments.display
+    {
+        let error = ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "the launch specification does not match the reservation this worker was started for",
+        );
+        writer
+            .write_message(&ControlMessage::WorkerFailed(error))
+            .await?;
+        return Err("the launch specification does not match the reservation".into());
+    }
+    // Managed mode needs a KalaReach-qualified shell package with its reader mailbox and pre-EOF
+    // hook. This worker launches the selected stock shell, which cannot claim that contract, so an
+    // unsupported mode is named rather than silently substituted.
+    if specification.create.shell_mode != ShellMode::NativeCompat {
+        let error = ProtocolError::new(
+            ErrorCode::ShellIntegrationUnsupported,
+            "this host implements the explicitly selected native_compat shell mode; managed mode needs a qualified shell package",
+        );
+        writer
+            .write_message(&ControlMessage::WorkerFailed(error))
+            .await?;
+        return Err("managed shell mode is not available on this host".into());
+    }
 
     let display_number = DisplayNumber::new(arguments.display);
     let endpoint = environment.worker_endpoint(display_number)?;
@@ -171,9 +201,18 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             dimensions: session.geometry().dimensions,
         }
     };
-    writer
+    // A ready report that does not arrive must not end the session. The shell is running, the
+    // endpoint is bound, and the controller recovers by verifying this worker with a challenge
+    // rather than by starting a second one.
+    let ready_reported = writer
         .write_message(&ControlMessage::WorkerReady(ready))
-        .await?;
+        .await
+        .is_ok();
+    if !ready_reported {
+        eprintln!(
+            "kr-worker: the controller did not receive the ready report; the session continues and is recoverable by challenge"
+        );
+    }
     // The rendezvous is finished. Every later conversation with a controller happens on this
     // worker's own endpoint, where it presents a generation token like any other client.
     drop(writer);

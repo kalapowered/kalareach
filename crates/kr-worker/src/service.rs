@@ -27,8 +27,9 @@ use kr_ipc::peer::PeerIdentity;
 use kr_ipc::verify::{GenerationAcceptance, WorkerIdentity, check_generation_token};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
 use kr_protocol::attachment::{
-    AttachmentConfigureParams, AttachmentViewportParams, AttachmentViewportResult, GeometryResult,
-    SessionAttachParams, SessionDetachParams, TerminalGeometryTransferParams, TerminalResizeParams,
+    AttachmentCapability, AttachmentConfigureParams, AttachmentViewportParams,
+    AttachmentViewportResult, GeometryResult, SessionAttachParams, SessionDetachParams,
+    TerminalGeometryTransferParams, TerminalResizeParams,
 };
 use kr_protocol::envelope::{MutationRequest, Outcome, ParamsValue, Request, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -36,14 +37,14 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{
-    ActionWindowId, AttachmentId, ConnectionId, ControllerGeneration, EnvironmentId, RequestId,
-    StreamId,
+    ActionWindowId, ActorId, AttachmentId, ConnectionId, ControllerGeneration, EnvironmentId,
+    RequestId, SessionId, StreamId,
 };
 use kr_protocol::input::{
     InputAcquireParams, InputInterruptParams, InputLeaseResult, InputReleaseParams,
     InputWriteParams, InputWriteResult, InterruptAction,
 };
-use kr_protocol::local::{ControlMessage, LocalHello, LocalHelloAck, LocalRole};
+use kr_protocol::local::{ControlMessage, LocalClientKind, LocalHello, LocalHelloAck, LocalRole};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{
     EventsSnapshotParams, EventsSubscribeParams, EventsSubscribeResult, HistoryPageParams,
@@ -64,6 +65,12 @@ pub const ACTION_WINDOW_MS: u64 = 5 * 60 * 1000;
 
 /// The event stream name output notifications carry.
 pub const OUTPUT_STREAM: &str = "session.output";
+
+/// The largest replay page one notification carries.
+///
+/// A control frame is bounded at 1 MiB including its metadata, so a replay page stays well inside
+/// that rather than filling it exactly.
+pub const MAX_REPLAY_PAGE_BYTES: u64 = 512 * 1024;
 
 /// The worker's endpoint server.
 pub struct WorkerService {
@@ -152,7 +159,7 @@ impl WorkerService {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         let (mut reader, writer) = split(connection, StreamKind::Control);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
-        let mut state = ConnectionState::new(connection_id);
+        let mut state = ConnectionState::new(connection_id, &peer);
         loop {
             let message: ControlMessage = match reader.read_message().await {
                 Ok(message) => message,
@@ -160,9 +167,23 @@ impl WorkerService {
             };
             let reply = self.handle(&mut state, &peer, message).await;
             if let Some(reply) = reply {
-                let mut writer = writer.lock().await;
-                if writer.write_message(&reply).await.is_err() {
+                let mut sender = writer.lock().await;
+                if sender.write_message(&reply).await.is_err() {
                     break;
+                }
+                drop(sender);
+                // Whatever the reply was, it has reached the peer now. A close admitted while
+                // building it may start its termination sequence.
+                if let Some(gate) = state.close_gate.take() {
+                    gate.release();
+                }
+                // A controller announces itself in its hello; the worker answers with a challenge
+                // it will only accept once.
+                if let Some(challenge) = state.pending_challenge.take() {
+                    let mut sender = writer.lock().await;
+                    if sender.write_message(&challenge).await.is_err() {
+                        break;
+                    }
                 }
             }
             if state.subscribed.is_none() {
@@ -171,8 +192,41 @@ impl WorkerService {
             if let Some((attachment_id, mut stream)) = state.subscribed.take() {
                 let sender = Arc::clone(&writer);
                 let stream_id = state.stream_id.clone();
-                tokio::spawn(async move {
+                let replay_from = state.replay_from.take();
+                let runtime = Arc::clone(self.runtime());
+                let task = tokio::spawn(async move {
                     let mut sequence = 0_u64;
+                    // The retained range between the requested cursor and the live edge is sent
+                    // before live output, so a reconnecting client sees one ordered stream rather
+                    // than a hole it never learns about.
+                    if let Some(mut cursor) = replay_from {
+                        loop {
+                            let page = {
+                                let session = runtime.session();
+                                session.history_page(cursor, MAX_REPLAY_PAGE_BYTES)
+                            };
+                            let Ok(page) = page else { break };
+                            if page.bytes.is_empty() {
+                                break;
+                            }
+                            let event = OutputEvent {
+                                cursor: page.from_cursor,
+                                bytes: page.bytes.clone(),
+                            };
+                            let Some(notification) =
+                                notification(&stream_id, sequence, "session.output", &event)
+                            else {
+                                break;
+                            };
+                            sequence += 1;
+                            let mut sender = sender.lock().await;
+                            if sender.write_message(&notification).await.is_err() {
+                                return;
+                            }
+                            drop(sender);
+                            cursor = page.next_cursor.get();
+                        }
+                    }
                     while let Some(delivery) = stream.recv().await {
                         let notification = match delivery {
                             OutputDelivery::Bytes { cursor, bytes } => notification(
@@ -199,10 +253,14 @@ impl WorkerService {
                     }
                     let _ = attachment_id;
                 });
+                state.delivery = Some(task);
             }
         }
-        // A connection that goes away takes its attachments with it. Undelivered input from them
-        // is discarded rather than replayed.
+        // A connection that goes away takes its delivery task and its attachments with it.
+        // Undelivered input from them is discarded rather than replayed.
+        if let Some(task) = state.delivery.take() {
+            task.abort();
+        }
         for attachment_id in state.attachments.drain(..) {
             let mut session = self.runtime.session();
             let _ = session.detach(attachment_id);
@@ -262,6 +320,11 @@ impl WorkerService {
             );
         }
         state.negotiated = true;
+        if hello.client == LocalClientKind::Controller {
+            // A controller has to prove which generation it speaks for before it acts. The
+            // challenge is issued here, bound to this connection, and consumed exactly once.
+            state.pending_challenge = Self::generation_challenge(state);
+        }
         let now = kr_ipc::now_ms();
         ControlMessage::HelloAck(LocalHelloAck {
             selected_version: PROTOCOL_VERSION,
@@ -355,7 +418,7 @@ impl WorkerService {
             Method::EventsSnapshot => self.events_snapshot(&request.params),
             Method::HistoryPage => self.history_page(&request.params),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params),
-            Method::AttachmentViewport => self.attachment_viewport(&request.params),
+            Method::AttachmentViewport => self.attachment_viewport(state, &request.params),
             Method::InputWrite => self.input_write(state, &request.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
@@ -365,6 +428,20 @@ impl WorkerService {
         respond(request.request_id, outcome)
     }
 
+    /// Runs one mutation through the receipt contract.
+    ///
+    /// The order is the one section 9 fixes, and every step of it matters:
+    ///
+    /// 1. The intent is committed before the caller is told it was accepted, so a crash does not
+    ///    lose an action the caller believes the host has.
+    /// 2. An exact duplicate returns the retained receipt and the retained *result*. A retried
+    ///    `session.attach` therefore returns the attachment the first request allocated rather than
+    ///    allocating a second one, and an identifier reused with a different payload is
+    ///    `ID_CONFLICT`.
+    /// 3. Authority and preconditions are revalidated inside the serial path, immediately before
+    ///    the dispatch marker. Durable acceptance does not preserve authority that has since gone.
+    /// 4. The dispatch marker is committed **before** the effect. A failure after it is `unknown`,
+    ///    never `rejected`: nothing here can prove the effect did not happen.
     fn mutation(&self, state: &mut ConnectionState, mutation: &MutationRequest) -> ControlMessage {
         if !state.negotiated {
             return failure(mutation.request_id, &not_negotiated());
@@ -375,22 +452,214 @@ impl WorkerService {
         if !self.reachable(method, mutation.method_version) {
             return failure(mutation.request_id, &unlisted());
         }
-        let outcome = match method {
-            Method::SessionAttach => self.session_attach(state, &mutation.params),
-            Method::SessionDetach => self.session_detach(state, &mutation.params),
-            Method::SessionClose => self.session_close(),
-            Method::AttachmentConfigure => self.attachment_configure(&mutation.params),
-            Method::TerminalResize => self.terminal_resize(&mutation.params),
-            Method::TerminalGeometryTransfer => self.geometry_transfer(&mutation.params),
-            Method::InputAcquire => self.input_acquire(state, &mutation.params),
-            Method::InputRelease => self.input_release(&mutation.params),
-            Method::InputInterrupt => self.input_interrupt(&mutation.params),
+        match self.receipted(state, mutation, method) {
+            Ok(value) => ControlMessage::Response(Response {
+                request_id: mutation.request_id,
+                outcome: Outcome::Ok(value),
+            }),
+            Err(error) => failure(mutation.request_id, &error.to_protocol_error()),
+        }
+    }
+
+    fn receipted(
+        &self,
+        state: &mut ConnectionState,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<ParamsValue> {
+        let actor_id = state.actor_id.clone();
+        let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
+            .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
+        let submission = crate::journal::Submission {
+            actor_id: actor_id.clone(),
+            action_id: mutation.action_id,
+            method: mutation.method.clone(),
+            method_version: mutation.method_version,
+            payload_digest: digest,
+            accepted_deadline_ms: Some(state.accepted_deadline(mutation.requested_ttl_ms.get())),
+            now_ms: kr_ipc::now_ms(),
+        };
+
+        // Storage failure stops an ordinary typed mutation before dispatch. An authorised stop is
+        // the named exception: section 7 requires `session.close` to proceed on current in-memory
+        // authority and report `durability=volatile`.
+        let admission = {
+            let mut session = self.runtime.session();
+            match session.journal_mut() {
+                Some(journal) => Some(journal.accept(&submission)?),
+                None if method == Method::SessionClose => None,
+                None => {
+                    return Err(WorkerError::JournalUnavailable {
+                        detail:
+                            "the session journal is unavailable, so no durable mutation is accepted"
+                                .to_owned(),
+                    });
+                }
+            }
+        };
+
+        if let Some(admission) = admission.as_ref()
+            && admission.deduplicated
+        {
+            let retained = {
+                let mut session = self.runtime.session();
+                match session.journal_mut() {
+                    Some(journal) => journal.read_result(&actor_id, mutation.action_id)?,
+                    None => None,
+                }
+            };
+            if let Some(bytes) = retained {
+                let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
+                    .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
+                return Ok(ParamsValue::new(value));
+            }
+            // The action is known and its result is not available yet, which is the honest answer
+            // rather than performing it a second time.
+            return Err(WorkerError::InvalidArgument(format!(
+                "action {} is already {} and has no retained result",
+                mutation.action_id, admission.receipt.state
+            )));
+        }
+
+        // Revalidate before the marker. Anything that was true at acceptance may not be now.
+        if let Err(error) = self.validate(state, mutation, method) {
+            self.reject(&actor_id, mutation, &error);
+            return Err(error);
+        }
+        if admission.is_some() {
+            let mut session = self.runtime.session();
+            if let Some(journal) = session.journal_mut() {
+                journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())?;
+            }
+        }
+
+        let outcome = self.apply(state, mutation, method);
+        let now = kr_ipc::now_ms();
+        let mut session = self.runtime.session();
+        match (&outcome, session.journal_mut()) {
+            (Ok(value), Some(journal)) => {
+                let bytes = kr_cbor::encode(value.as_value());
+                journal.record_result(&actor_id, mutation.action_id, &bytes)?;
+                journal.complete(
+                    actor_id,
+                    mutation.action_id,
+                    kr_protocol::receipt::ReceiptState::Applied,
+                    None,
+                    now,
+                )?;
+            }
+            (Err(error), Some(journal)) => {
+                // Past the marker there is no rejection. Whether the effect happened cannot be
+                // established from here, so the outcome is recorded as unknown.
+                journal.complete(
+                    actor_id,
+                    mutation.action_id,
+                    kr_protocol::receipt::ReceiptState::Unknown,
+                    Some(error.to_protocol_error()),
+                    now,
+                )?;
+            }
+            (_, None) => {}
+        }
+        outcome
+    }
+
+    fn reject(&self, actor_id: &ActorId, mutation: &MutationRequest, error: &WorkerError) {
+        let mut session = self.runtime.session();
+        if let Some(journal) = session.journal_mut() {
+            let _ = journal.reject(
+                actor_id.clone(),
+                mutation.action_id,
+                kr_protocol::receipt::RejectionReason::AdmissionFailed,
+                Some(error.to_protocol_error()),
+                kr_ipc::now_ms(),
+            );
+        }
+    }
+
+    /// Checks a mutation's target, authority and preconditions without acting on it.
+    fn validate(
+        &self,
+        state: &ConnectionState,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<()> {
+        match method {
+            Method::SessionAttach => {
+                let params: SessionAttachParams = parse(&mutation.params)?;
+                self.check_session(params.session_id)
+            }
+            Method::SessionDetach => {
+                let params: SessionDetachParams = parse(&mutation.params)?;
+                Self::check_attachment(state, params.attachment_id)
+            }
+            Method::SessionClose => {
+                let params: kr_protocol::session::SessionCloseParams = parse(&mutation.params)?;
+                self.check_session(params.session_id)
+            }
+            Method::AttachmentConfigure => {
+                let params: AttachmentConfigureParams = parse(&mutation.params)?;
+                Self::check_attachment(state, params.attachment_id)?;
+                if params.claim_geometry {
+                    self.check_capability(params.attachment_id, AttachmentCapability::Geometry)?;
+                }
+                Ok(())
+            }
+            Method::TerminalResize => {
+                let params: TerminalResizeParams = parse(&mutation.params)?;
+                Self::check_attachment(state, params.attachment_id)?;
+                self.check_capability(params.attachment_id, AttachmentCapability::Geometry)
+            }
+            Method::TerminalGeometryTransfer => {
+                let params: TerminalGeometryTransferParams = parse(&mutation.params)?;
+                Self::check_attachment(state, params.attachment_id)?;
+                self.check_capability(params.attachment_id, AttachmentCapability::Geometry)
+            }
+            Method::InputAcquire => {
+                let params: InputAcquireParams = parse(&mutation.params)?;
+                self.check_session(params.session_id)?;
+                Self::check_attachment(state, params.attachment_id)?;
+                self.check_capability(params.attachment_id, AttachmentCapability::Input)
+            }
+            Method::InputRelease => {
+                let params: InputReleaseParams = parse(&mutation.params)?;
+                self.check_session(params.session_id)?;
+                Self::check_attachment(state, params.attachment_id)
+            }
+            Method::InputInterrupt => {
+                let params: InputInterruptParams = parse(&mutation.params)?;
+                self.check_session(params.session_id)?;
+                Self::check_attachment(state, params.attachment_id)?;
+                self.check_capability(params.attachment_id, AttachmentCapability::Input)
+            }
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a mutation this worker serves",
                 method.as_str()
             ))),
-        };
-        respond(mutation.request_id, outcome)
+        }
+    }
+
+    fn apply(
+        &self,
+        state: &mut ConnectionState,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<ParamsValue> {
+        match method {
+            Method::SessionAttach => self.session_attach(state, &mutation.params),
+            Method::SessionDetach => self.session_detach(state, &mutation.params),
+            Method::SessionClose => self.session_close(state, &mutation.params),
+            Method::AttachmentConfigure => self.attachment_configure(state, &mutation.params),
+            Method::TerminalResize => self.terminal_resize(state, &mutation.params),
+            Method::TerminalGeometryTransfer => self.geometry_transfer(state, &mutation.params),
+            Method::InputAcquire => self.input_acquire(state, &mutation.params),
+            Method::InputRelease => self.input_release(state, &mutation.params),
+            Method::InputInterrupt => self.input_interrupt(state, &mutation.params),
+            _ => Err(WorkerError::InvalidArgument(format!(
+                "{} is not a mutation this worker serves",
+                method.as_str()
+            ))),
+        }
     }
 
     fn reachable(&self, method: Method, version: MethodVersion) -> bool {
@@ -400,8 +669,61 @@ impl WorkerService {
         )
     }
 
+    /// Refuses a request that names a session this worker does not own.
+    ///
+    /// A worker owns exactly one session. A request that arrives on this endpoint naming another
+    /// session is not a request for this session with a typo in it; acting on it would let a
+    /// caller close one session by addressing another.
+    fn check_session(&self, named: SessionId) -> Result<()> {
+        let owned = self.runtime.session().id();
+        if named == owned {
+            Ok(())
+        } else {
+            Err(WorkerError::InvalidArgument(format!(
+                "this endpoint serves session {owned}, not {named}"
+            )))
+        }
+    }
+
+    /// Refuses an operation on an attachment this connection does not own.
+    ///
+    /// An attachment identifier is not permission. A connection acts on the attachments it
+    /// created, and nothing else.
+    fn check_attachment(state: &ConnectionState, attachment_id: AttachmentId) -> Result<()> {
+        if state.attachments.contains(&attachment_id) {
+            Ok(())
+        } else {
+            Err(WorkerError::UnknownAttachment {
+                attachment: attachment_id.to_string(),
+            })
+        }
+    }
+
+    /// Refuses an operation the attachment was not granted.
+    fn check_capability(
+        &self,
+        attachment_id: AttachmentId,
+        capability: AttachmentCapability,
+    ) -> Result<()> {
+        let session = self.runtime.session();
+        let granted = session
+            .attachment_capabilities(attachment_id)
+            .ok_or_else(|| WorkerError::UnknownAttachment {
+                attachment: attachment_id.to_string(),
+            })?;
+        if granted.contains(&capability) {
+            Ok(())
+        } else {
+            Err(WorkerError::InvalidArgument(format!(
+                "this attachment does not hold {}",
+                capability.as_str()
+            )))
+        }
+    }
+
     fn session_read(&self, params: &ParamsValue) -> Result<ParamsValue> {
-        let _params: SessionReadParams = parse(params)?;
+        let params: SessionReadParams = parse(params)?;
+        self.check_session(params.session_id)?;
         let session = self.runtime.session();
         let running = session.state().is_running();
         encode(&SessionReadResult {
@@ -411,12 +733,14 @@ impl WorkerService {
     }
 
     fn events_snapshot(&self, params: &ParamsValue) -> Result<ParamsValue> {
-        let _params: EventsSnapshotParams = parse(params)?;
+        let params: EventsSnapshotParams = parse(params)?;
+        self.check_session(params.session_id)?;
         encode(&self.runtime.session().snapshot())
     }
 
     fn history_page(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let params: HistoryPageParams = parse(params)?;
+        self.check_session(params.session_id)?;
         let page = self
             .runtime
             .session()
@@ -430,6 +754,8 @@ impl WorkerService {
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
         let params: EventsSubscribeParams = parse(params)?;
+        self.check_session(params.session_id)?;
+        Self::check_attachment(state, params.attachment_id)?;
         let mut session = self.runtime.session();
         let stream = session.subscribe(params.attachment_id)?;
         let from = params
@@ -441,8 +767,10 @@ impl WorkerService {
             from_cursor: U64::new(from),
             to_cursor: U64::new(oldest),
         });
+        let replay_from = from.max(oldest);
         drop(session);
         state.subscribed = Some((params.attachment_id, stream));
+        state.replay_from = Some(replay_from);
         encode(&EventsSubscribeResult {
             stream_id: state.stream_id.clone(),
             from_cursor: U64::new(from.max(oldest)),
@@ -451,8 +779,13 @@ impl WorkerService {
         })
     }
 
-    fn attachment_viewport(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    fn attachment_viewport(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
         let params: AttachmentViewportParams = parse(params)?;
+        Self::check_attachment(state, params.attachment_id)?;
         let mut session = self.runtime.session();
         let presentation = session.viewport(params.attachment_id, params.dimensions)?;
         encode(&AttachmentViewportResult {
@@ -467,6 +800,9 @@ impl WorkerService {
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
         let params: InputWriteParams = parse(params)?;
+        self.check_session(params.session_id)?;
+        Self::check_attachment(state, params.attachment_id)?;
+        self.check_capability(params.attachment_id, AttachmentCapability::Input)?;
         let accepted = {
             let mut session = self.runtime.session();
             session.write_input(
@@ -492,6 +828,7 @@ impl WorkerService {
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
         let params: SessionAttachParams = parse(params)?;
+        self.check_session(params.session_id)?;
         let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
         // A local owner attachment receives what it asked for: peer credentials already proved the
         // caller is this user, and the worker's own authority covers its session.
@@ -510,6 +847,7 @@ impl WorkerService {
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
         let params: SessionDetachParams = parse(params)?;
+        Self::check_attachment(state, params.attachment_id)?;
         let result = {
             let mut session = self.runtime.session();
             session.detach(params.attachment_id)?
@@ -520,25 +858,48 @@ impl WorkerService {
         encode(&result)
     }
 
-    fn session_close(&self) -> Result<ParamsValue> {
-        let acceptance = self.runtime.close(ClosureReason::CloseRequested);
+    fn session_close(
+        &self,
+        state: &mut ConnectionState,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::session::SessionCloseParams = parse(params)?;
+        self.check_session(params.session_id)?;
+        let (acceptance, gate) = self.runtime.close(ClosureReason::CloseRequested);
+        // The gate is held until the acceptance has been written. The requester is often a command
+        // running inside the process group this closure is about to stop.
+        state.close_gate = Some(gate);
         encode(&SessionCloseResult {
-            session_id: self.runtime.session().id(),
+            session_id: params.session_id,
             state: acceptance.state,
             durability: acceptance.durability,
             closure: Nullable(acceptance.closure),
         })
     }
 
-    fn attachment_configure(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    fn attachment_configure(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
         let params: AttachmentConfigureParams = parse(params)?;
+        Self::check_attachment(state, params.attachment_id)?;
+        if params.claim_geometry {
+            self.check_capability(params.attachment_id, AttachmentCapability::Geometry)?;
+        }
         let mut session = self.runtime.session();
         let geometry = session.configure(params.attachment_id, params.claim_geometry)?;
         encode(&GeometryResult { geometry })
     }
 
-    fn terminal_resize(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    fn terminal_resize(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
         let params: TerminalResizeParams = parse(params)?;
+        Self::check_attachment(state, params.attachment_id)?;
+        self.check_capability(params.attachment_id, AttachmentCapability::Geometry)?;
         let mut session = self.runtime.session();
         let geometry = session.resize(
             params.attachment_id,
@@ -548,8 +909,14 @@ impl WorkerService {
         encode(&GeometryResult { geometry })
     }
 
-    fn geometry_transfer(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    fn geometry_transfer(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
         let params: TerminalGeometryTransferParams = parse(params)?;
+        Self::check_attachment(state, params.attachment_id)?;
+        self.check_capability(params.attachment_id, AttachmentCapability::Geometry)?;
         let mut session = self.runtime.session();
         let geometry = session
             .transfer_geometry(params.attachment_id, params.expected_geometry_epoch.get())?;
@@ -562,6 +929,9 @@ impl WorkerService {
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
         let params: InputAcquireParams = parse(params)?;
+        self.check_session(params.session_id)?;
+        Self::check_attachment(state, params.attachment_id)?;
+        self.check_capability(params.attachment_id, AttachmentCapability::Input)?;
         let result = {
             let mut session = self.runtime.session();
             session.acquire_input(
@@ -574,15 +944,24 @@ impl WorkerService {
         encode(&result)
     }
 
-    fn input_release(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    fn input_release(&self, state: &ConnectionState, params: &ParamsValue) -> Result<ParamsValue> {
         let params: InputReleaseParams = parse(params)?;
+        self.check_session(params.session_id)?;
+        Self::check_attachment(state, params.attachment_id)?;
         let mut session = self.runtime.session();
         let lease = session.release_input(params.attachment_id, params.epoch.get())?;
         encode(&InputLeaseResult { lease })
     }
 
-    fn input_interrupt(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    fn input_interrupt(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
         let params: InputInterruptParams = parse(params)?;
+        self.check_session(params.session_id)?;
+        Self::check_attachment(state, params.attachment_id)?;
+        self.check_capability(params.attachment_id, AttachmentCapability::Input)?;
         if params.action != InterruptAction::NativeInterrupt {
             return Err(WorkerError::InvalidArgument(
                 "the interrupt method accepts only the configured native interrupt".to_owned(),
@@ -632,13 +1011,28 @@ pub struct ConnectionState {
     pub subscribed: Option<(AttachmentId, crate::output::OutputStream)>,
     /// The last input sequence accepted on this connection.
     pub input_sequence: u64,
+    /// A close that has been admitted and whose acceptance has not yet been written.
+    pub close_gate: Option<crate::runtime::CloseGate>,
+    /// A generation challenge waiting to be sent after the current reply.
+    pub pending_challenge: Option<ControlMessage>,
+    /// Where a new subscription replays retained output from before live output resumes.
+    pub replay_from: Option<u64>,
+    /// The delivery task this connection owns, cancelled when the connection goes.
+    pub delivery: Option<tokio::task::JoinHandle<()>>,
+    /// The host-issued principal this connection acts under.
+    ///
+    /// It is built from the authenticated operating-system caller. A local caller never asserts
+    /// its own provenance and never borrows a device identity.
+    pub actor_id: ActorId,
+    /// When this connection's freshness window expires.
+    pub window_expires_at_ms: u64,
     next_request: u64,
 }
 
 impl ConnectionState {
     /// Builds the state for a fresh connection.
     #[must_use]
-    pub fn new(connection_id: ConnectionId) -> Self {
+    pub fn new(connection_id: ConnectionId, peer: &PeerIdentity) -> Self {
         Self {
             connection_id,
             negotiated: false,
@@ -650,8 +1044,26 @@ impl ConnectionState {
             attachments: Vec::new(),
             subscribed: None,
             input_sequence: 0,
+            close_gate: None,
+            pending_challenge: None,
+            replay_from: None,
+            delivery: None,
+            actor_id: ActorId::new(format!("local:{}", peer.uid))
+                .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal")),
+            window_expires_at_ms: kr_ipc::now_ms().get().saturating_add(ACTION_WINDOW_MS),
             next_request: 0,
         }
+    }
+
+    /// Returns the deadline the host derives for a mutation.
+    ///
+    /// It is the earliest of the window's expiry and the receipt time plus the requested lifetime,
+    /// bounded by the protocol maximum. The client never supplies an authoritative deadline.
+    #[must_use]
+    pub fn accepted_deadline(&self, requested_ttl_ms: u64) -> kr_protocol::scalars::TimestampMs {
+        let requested = requested_ttl_ms.min(kr_protocol::limits::MAX_MUTATION_TTL.get());
+        let from_ttl = kr_ipc::now_ms().get().saturating_add(requested);
+        kr_protocol::scalars::TimestampMs::new(from_ttl.min(self.window_expires_at_ms))
     }
 
     fn next_request_id(&mut self) -> RequestId {

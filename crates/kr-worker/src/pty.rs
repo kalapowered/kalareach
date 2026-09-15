@@ -31,12 +31,23 @@ pub struct ShellCommand {
 }
 
 /// How a root shell ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellExit {
     /// The exit code the shell returned.
     pub code: u32,
-    /// True when a signal ended it rather than a normal return.
-    pub signalled: bool,
+    /// The signal that ended it, named as the platform names it.
+    ///
+    /// A signalled exit has no meaningful numeric code on every platform, so the name is what is
+    /// recorded. Inventing a number here would put a wrong one in the closure record.
+    pub signal: Option<String>,
+}
+
+impl ShellExit {
+    /// Returns true when a signal ended the shell rather than a normal return.
+    #[must_use]
+    pub const fn signalled(&self) -> bool {
+        self.signal.is_some()
+    }
 }
 
 /// The session's pseudo-terminal, created before any shell runs.
@@ -117,7 +128,7 @@ impl Pty {
         Ok(RootShell {
             child,
             identity,
-            process_group: self.master.process_group_leader(),
+            process_group: foreground_group(self.master.as_ref()),
         })
     }
 
@@ -289,7 +300,13 @@ impl RootShell {
                 .child
                 .kill()
                 .map_err(|error| WorkerError::pty("signal the root shell", error)),
-            Signal::Interrupt => Ok(()),
+            // There is no Unix signal to send. The configured console interrupt belongs to the
+            // Windows qualification pass, and reporting success for an action that did not happen
+            // would be worse than saying so.
+            Signal::Interrupt => Err(WorkerError::pty(
+                "interrupt the foreground application",
+                "the Windows console interrupt is not yet qualified",
+            )),
         }
     }
 }
@@ -304,8 +321,20 @@ enum Signal {
 fn exit_from(status: portable_pty::ExitStatus) -> ShellExit {
     ShellExit {
         code: status.exit_code(),
-        signalled: status.signal().is_some(),
+        signal: status.signal().map(ToOwned::to_owned),
     }
+}
+
+#[cfg(unix)]
+fn foreground_group(master: &dyn MasterPty) -> Option<i32> {
+    master.process_group_leader()
+}
+
+#[cfg(not(unix))]
+const fn foreground_group(_master: &dyn MasterPty) -> Option<i32> {
+    // Windows has no process groups on a console pseudo-terminal. Ownership there is the
+    // per-session Job Object, which the Windows qualification pass installs.
+    None
 }
 
 fn pty_size(dimensions: Dimensions) -> PtySize {
@@ -448,7 +477,7 @@ mod tests {
             .expect("launches");
         shell.request_stop().expect("asks");
         let exit = shell.wait().expect("waits");
-        assert!(exit.signalled, "the shell ended on a signal");
+        assert!(exit.signalled(), "the shell ended on a signal");
     }
 
     #[cfg(unix)]
@@ -463,7 +492,7 @@ mod tests {
             .expect("launches");
         shell.force_stop().expect("forces");
         let exit = shell.wait().expect("waits");
-        assert!(exit.signalled);
+        assert!(exit.signalled());
     }
 
     #[cfg(unix)]

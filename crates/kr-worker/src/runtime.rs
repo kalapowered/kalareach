@@ -18,6 +18,12 @@ use tokio::sync::{Notify, mpsc};
 use crate::error::{Result, WorkerError};
 use crate::session::{CloseAcceptance, DRAIN_PERIOD, GRACE_PERIOD, Session};
 
+/// How many read batches may wait for ingestion before the read loop slows down.
+pub const READ_QUEUE_DEPTH: usize = 64;
+
+/// How often the root shell's status is checked, independently of the terminal.
+pub const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// A running session and the tasks around it.
 #[derive(Debug)]
 pub struct SessionRuntime {
@@ -38,7 +44,12 @@ impl SessionRuntime {
         let mut writer = session.input_writer()?;
         let session = Arc::new(Mutex::new(session));
         let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (output_sender, mut output_receiver) = mpsc::unbounded_channel::<ReadEvent>();
+        // Bounded on purpose. Section 9 says a slow *client* must never hold the read loop, and it
+        // also says the worker honours the operating system's own backpressure when parsing itself
+        // cannot keep up, and never drops parser input. A bounded handoff does both: clients are
+        // decoupled by their own queues, and a worker that cannot ingest stops reading rather than
+        // growing without limit or discarding bytes.
+        let (output_sender, mut output_receiver) = mpsc::channel::<ReadEvent>(READ_QUEUE_DEPTH);
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
 
@@ -50,12 +61,12 @@ impl SessionRuntime {
             loop {
                 match std::io::Read::read(&mut reader, &mut buffer) {
                     Ok(0) => {
-                        let _ = output_sender.send(ReadEvent::Ended);
+                        let _ = output_sender.blocking_send(ReadEvent::Ended);
                         break;
                     }
                     Ok(read) => {
                         if output_sender
-                            .send(ReadEvent::Bytes(buffer[..read].to_vec()))
+                            .blocking_send(ReadEvent::Bytes(buffer[..read].to_vec()))
                             .is_err()
                         {
                             break;
@@ -64,8 +75,9 @@ impl SessionRuntime {
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => {
                         // A closed terminal reads as an error on some platforms and as end of file
-                        // on others. Both mean the shell is gone.
-                        let _ = output_sender.send(ReadEvent::Ended);
+                        // on others. Either way the terminal is finished; whether the root shell
+                        // ended is decided by the child monitor, not by this read.
+                        let _ = output_sender.blocking_send(ReadEvent::Ended);
                         break;
                     }
                 }
@@ -99,17 +111,36 @@ impl SessionRuntime {
                         }
                     }
                     ReadEvent::Ended => {
-                        // The terminal closed, so the root shell has ended. Its real status comes
-                        // from the child itself; the session records the closure either way,
-                        // because KalaReach never restarts the shell.
-                        if let Ok(mut session) = ingest_session.lock()
-                            && session.state() != SessionState::Closed
-                        {
-                            session.note_terminal_ended();
-                        }
+                        // The terminal is finished. Whether the root shell has ended is a separate
+                        // question, answered by the child monitor: a descendant can hold the slave
+                        // descriptor open after the shell exits, and a read error is not a death.
                         ingest_closed.notify_waiters();
                         break;
                     }
+                }
+            }
+        });
+
+        // The root shell's status is watched independently of the terminal. An explicit exit, an
+        // end of file at the root prompt and a crash all close the session, and KalaReach never
+        // restarts the shell.
+        let monitor_session = Arc::clone(&session);
+        let monitor_closed = Arc::clone(&closed);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CHILD_POLL_INTERVAL).await;
+                let ended = {
+                    let Ok(mut session) = monitor_session.lock() else {
+                        break;
+                    };
+                    if session.state() == SessionState::Closed {
+                        break;
+                    }
+                    session.poll_root_exit()
+                };
+                if ended {
+                    monitor_closed.notify_waiters();
+                    break;
                 }
             }
         });
@@ -174,40 +205,33 @@ impl SessionRuntime {
         self.wake.notify_waiters();
     }
 
-    /// Begins closure and returns the acceptance before anything is signalled.
+    /// Admits a close and returns the acceptance, before anything is signalled.
     ///
-    /// The grace period, the forced stop and the drain run afterwards, on their own task.
-    pub fn close(self: &Arc<Self>, reason: ClosureReason) -> CloseAcceptance {
+    /// The returned gate starts the termination sequence. The caller releases it **after** the
+    /// acceptance has reached the requester, because the requester is often a command running
+    /// inside the process group that is about to be stopped.
+    pub fn close(self: &Arc<Self>, reason: ClosureReason) -> (CloseAcceptance, CloseGate) {
         let acceptance = {
             let mut session = self.session();
             session.begin_close(reason)
         };
-        if acceptance.initiated {
-            let runtime = Arc::clone(self);
-            tokio::spawn(async move {
-                tokio::time::sleep(GRACE_PERIOD).await;
-                let forced = {
-                    let mut session = runtime.session();
-                    session.force_close().unwrap_or(false)
-                };
-                tokio::time::sleep(DRAIN_PERIOD).await;
-                {
-                    let mut session = runtime.session();
-                    session.finish_close(forced);
-                }
-                runtime.closed.notify_waiters();
-            });
-        }
-        acceptance
+        let gate = CloseGate {
+            runtime: Arc::clone(self),
+            initiated: acceptance.initiated,
+        };
+        (acceptance, gate)
     }
 
     /// Waits until the session has finished closing and returns its record.
     pub async fn wait_closed(&self) -> ClosureRecord {
         loop {
+            // Register interest before looking, so a notification that arrives between the two is
+            // not lost.
+            let notified = self.closed.notified();
             if let Some(record) = self.session().closure().cloned() {
                 return record;
             }
-            self.closed.notified().await;
+            notified.await;
         }
     }
 
@@ -215,6 +239,44 @@ impl SessionRuntime {
     #[must_use]
     pub fn state(&self) -> SessionState {
         self.session().state()
+    }
+}
+
+/// The right to start a session's termination sequence.
+///
+/// Holding one means a close has been admitted and nothing has been signalled yet.
+#[derive(Debug)]
+pub struct CloseGate {
+    runtime: Arc<SessionRuntime>,
+    initiated: bool,
+}
+
+impl CloseGate {
+    /// Starts the grace period, the forced stop and the drain.
+    ///
+    /// Call this only after the acceptance has been written to the requester.
+    pub fn release(self) {
+        if !self.initiated {
+            return;
+        }
+        let runtime = self.runtime;
+        tokio::spawn(async move {
+            {
+                let mut session = runtime.session();
+                let _ = session.request_stop();
+            }
+            tokio::time::sleep(GRACE_PERIOD).await;
+            let forced = {
+                let mut session = runtime.session();
+                session.force_close().unwrap_or(false)
+            };
+            tokio::time::sleep(DRAIN_PERIOD).await;
+            {
+                let mut session = runtime.session();
+                session.finish_close(forced);
+            }
+            runtime.closed.notify_waiters();
+        });
     }
 }
 

@@ -151,9 +151,9 @@ impl OutputHub {
             let queued = subscriber.queued.load(Ordering::Acquire);
             if queued.saturating_add(bytes.len()) > subscriber.limit {
                 subscriber.resynchronising = true;
-                // The queue is abandoned rather than trimmed: a client that receives part of what
-                // it missed would repaint a screen that never existed.
-                subscriber.queued.store(0, Ordering::Release);
+                // Nothing is trimmed and nothing is zeroed here. The subscriber still owns what is
+                // already queued and releases it as it reads; stopping new output is what bounds
+                // the queue. Zeroing the counter would make those later releases underflow it.
                 let marker = ResyncRequired {
                     reason: ResyncReason::SendQueueFull,
                     cursor: U64::new(cursor),

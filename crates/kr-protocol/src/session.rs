@@ -327,8 +327,9 @@ pub struct ClosureRecord {
     pub reason: ClosureReason,
     /// The root shell's exit status, when it exited normally.
     pub root_exit_code: Nullable<U64>,
-    /// The signal that terminated the root shell, when one did.
-    pub root_signal: Nullable<U64>,
+    /// The signal that terminated the root shell, when one did, named as the platform names it.
+    /// The host reports what it was told rather than inventing a number for it.
+    pub root_signal: Nullable<String>,
     /// The owned processes the closure terminated, with their start identities.
     pub terminated: Vec<TerminatedProcess>,
     /// Resources known to survive, such as an explicitly brokered desktop resource.

@@ -292,8 +292,13 @@ impl Session {
         let (attachment, change) =
             self.attachments
                 .attach(params, granted, attachment_id, kr_ipc::now_ms())?;
-        if change.resize_required {
-            self.pty.resize(change.state.dimensions)?;
+        if change.resize_required
+            && let Err(error) = self.pty.resize(change.state.dimensions)
+        {
+            // The kernel refused the size, so the attachment never happened. Undoing it here keeps
+            // the table and the terminal agreeing with each other.
+            let _ = self.attachments.detach(attachment_id);
+            return Err(error);
         }
         Ok(SessionAttachResult {
             attachment,
@@ -365,10 +370,14 @@ impl Session {
         expected_epoch: u64,
     ) -> Result<GeometryState> {
         self.require_running()?;
+        // Ask the kernel first. A table that recorded a size the terminal never took would leave
+        // every attachment drawing at a geometry the application does not have.
+        self.attachments
+            .check_resize(attachment_id, dimensions, expected_epoch)?;
+        self.pty.resize(dimensions)?;
         let change = self
             .attachments
             .resize(attachment_id, dimensions, expected_epoch)?;
-        self.pty.resize(change.state.dimensions)?;
         Ok(change.state)
     }
 
@@ -595,6 +604,17 @@ impl Session {
         );
     }
 
+    /// Returns the capabilities one attachment was granted.
+    #[must_use]
+    pub fn attachment_capabilities(
+        &self,
+        attachment_id: AttachmentId,
+    ) -> Option<CanonicalSet<AttachmentCapability>> {
+        self.attachments
+            .get(attachment_id)
+            .map(|attachment| attachment.granted.clone())
+    }
+
     /// Returns every attachment, for diagnostics and snapshots.
     #[must_use]
     pub fn attachments(&self) -> Vec<AttachmentSummary> {
@@ -637,13 +657,12 @@ impl Session {
                 initiated: false,
             },
             SessionState::Creating | SessionState::Live => {
-                // Atomic: the state changes before anything else, so no input is accepted from
-                // here on and a second request joins this closure instead of starting another.
+                // Atomic admission: the state changes before anything else, so input is rejected
+                // from here on and a second request joins this closure instead of starting a
+                // second one. Nothing is signalled yet. The caller may itself be inside the
+                // process group about to be stopped, and section 7 gives it its acceptance first.
                 self.state = SessionState::Closing;
                 self.closing_reason = Some(reason);
-                if let Some(shell) = self.shell.as_mut() {
-                    let _ = shell.request_stop();
-                }
                 CloseAcceptance {
                     state: SessionState::Closing,
                     durability: self.durability(),
@@ -651,6 +670,22 @@ impl Session {
                     initiated: true,
                 }
             }
+        }
+    }
+
+    /// Asks the owned process group to stop.
+    ///
+    /// This is deliberately separate from [`Session::begin_close`]: the acceptance reaches the
+    /// caller before anything is signalled, because the caller is often a command running inside
+    /// the group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the signal cannot be sent.
+    pub fn request_stop(&mut self) -> Result<()> {
+        match self.shell.as_mut() {
+            Some(shell) => shell.request_stop(),
+            None => Ok(()),
         }
     }
 
@@ -680,6 +715,28 @@ impl Session {
         self.record_closure_with(reason, exit, forced)
     }
 
+    /// Checks whether the root shell has ended, and records the closure if it has.
+    ///
+    /// This watches the child itself rather than the terminal. A descendant can keep the terminal
+    /// open after the shell exits, and a read error on the terminal is not proof of death, so the
+    /// two are observed separately.
+    pub fn poll_root_exit(&mut self) -> bool {
+        if self.state == SessionState::Closed {
+            return true;
+        }
+        let exit = match self.shell.as_mut().map(RootShell::try_wait) {
+            Some(Ok(Some(exit))) => exit,
+            _ => return false,
+        };
+        if self.state == SessionState::Closing {
+            // A closure already under way finishes through its own sequence, which drains output
+            // before it writes the record.
+            return false;
+        }
+        self.note_shell_exit(exit);
+        true
+    }
+
     /// Records that the pseudo-terminal closed, which means the root shell has ended.
     ///
     /// The shell's real status is read from the child rather than assumed, so a shell that was
@@ -691,7 +748,7 @@ impl Session {
             .and_then(|shell| shell.wait().ok())
             .unwrap_or(ShellExit {
                 code: 0,
-                signalled: false,
+                signal: None,
             });
         self.note_shell_exit(exit)
     }
@@ -701,7 +758,7 @@ impl Session {
     /// An explicit `exit`, an end of file at the root prompt or a crash all close the session.
     /// KalaReach never restarts the shell.
     pub fn note_shell_exit(&mut self, exit: ShellExit) -> ClosureRecord {
-        let reason = if exit.signalled {
+        let reason = if exit.signalled() {
             ClosureReason::RootSignal
         } else {
             ClosureReason::RootExit
@@ -744,28 +801,45 @@ impl Session {
             Some(Ok(Some(_))) | None => OwnershipCoverage::Complete,
             _ => OwnershipCoverage::Incomplete,
         };
-        let record = ClosureRecord {
+        let mut record = ClosureRecord {
             session_id: self.config.session_id,
             session_epoch: self.config.session_epoch,
             reason,
             root_exit_code: Nullable(
-                exit.filter(|exit| !exit.signalled)
+                exit.as_ref()
+                    .filter(|exit| !exit.signalled())
                     .map(|exit| U64::new(u64::from(exit.code))),
             ),
-            root_signal: Nullable(
-                exit.filter(|exit| exit.signalled)
-                    .map(|exit| U64::new(u64::from(exit.code))),
-            ),
+            root_signal: Nullable(exit.as_ref().and_then(|exit| exit.signal.as_ref()).cloned()),
             terminated,
             surviving: Vec::new(),
             ownership_coverage: coverage,
             durability: self.durability(),
             closed_at_ms: kr_ipc::now_ms(),
         };
+        record.durability = self.commit_closure(&record);
         self.state = SessionState::Closed;
         self.application_state = None;
         self.closure = Some(record.clone());
         record
+    }
+
+    /// Writes the closure record to the journal and reports whether it was recorded durably.
+    ///
+    /// Storage failure never blocks an authorised stop. What it changes is the answer the host
+    /// gives: a closure that could not be written says `volatile` rather than claiming durability
+    /// it does not have.
+    fn commit_closure(&mut self, record: &ClosureRecord) -> Durability {
+        let Some(journal) = self.journal.as_mut() else {
+            return Durability::Volatile;
+        };
+        match journal.record_closure(record) {
+            Ok(()) => Durability::Durable,
+            Err(error) => {
+                self.journal_failure = Some(error.to_string());
+                Durability::Volatile
+            }
+        }
     }
 
     const fn durability(&self) -> Durability {

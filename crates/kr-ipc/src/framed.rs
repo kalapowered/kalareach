@@ -154,11 +154,23 @@ impl FrameWriter {
     ///
     /// Returns [`IpcError::PeerClosed`] when the peer is gone, or a socket failure.
     pub async fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
-        if self.sent == self.pending.len() {
-            self.pending.clear();
-            self.pending.extend_from_slice(frame);
-            self.sent = 0;
+        if self.sent < self.pending.len() {
+            // A previous write was cancelled part way through. Finishing it first keeps the stream
+            // well formed; the frame the caller just supplied is written after it, never instead
+            // of it.
+            self.drain().await?;
         }
+        self.pending.clear();
+        self.pending.extend_from_slice(frame);
+        self.sent = 0;
+        self.drain().await?;
+        self.half
+            .flush()
+            .await
+            .map_err(|error| IpcError::socket("flush", error))
+    }
+
+    async fn drain(&mut self) -> Result<()> {
         while self.sent < self.pending.len() {
             match self.half.write(&self.pending[self.sent..]).await {
                 Ok(0) => return Err(IpcError::PeerClosed),
@@ -174,12 +186,7 @@ impl FrameWriter {
                 Err(error) => return Err(IpcError::socket("write", error)),
             }
         }
-        self.pending.clear();
-        self.sent = 0;
-        self.half
-            .flush()
-            .await
-            .map_err(|error| IpcError::socket("flush", error))
+        Ok(())
     }
 
     /// Encodes a message into a frame without writing it.

@@ -125,7 +125,17 @@ impl Journal {
                      updated_at_ms        INTEGER NOT NULL,
                      PRIMARY KEY (actor_id, action_id)
                  );
-                 CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts (created_at_ms);",
+                 CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts (created_at_ms);
+                 CREATE TABLE IF NOT EXISTS results (
+                     actor_id  TEXT NOT NULL,
+                     action_id BLOB NOT NULL,
+                     result    BLOB NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS closure (
+                     session_id BLOB PRIMARY KEY,
+                     record     BLOB NOT NULL
+                 );",
             )
             .map_err(unavailable)?;
         let recorded: Option<i64> = self
@@ -133,13 +143,23 @@ impl Journal {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .optional()
             .map_err(unavailable)?;
-        if recorded.is_none() {
-            self.connection
-                .execute(
-                    "INSERT INTO schema_version (version) VALUES (?1)",
-                    params![SCHEMA_VERSION],
-                )
-                .map_err(unavailable)?;
+        match recorded {
+            None => {
+                self.connection
+                    .execute(
+                        "INSERT INTO schema_version (version) VALUES (?1)",
+                        params![SCHEMA_VERSION],
+                    )
+                    .map_err(unavailable)?;
+            }
+            Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) => {
+                // Migrations are forward-only and this build reads one schema. A journal written
+                // by a later build is refused rather than read as though it were this one.
+                return Err(unavailable_detail_owned(format!(
+                    "this journal is at schema version {version}; this build reads {SCHEMA_VERSION}"
+                )));
+            }
         }
         Ok(())
     }
@@ -388,6 +408,94 @@ impl Journal {
         Ok(removed)
     }
 
+    /// Stores the result a duplicate request must receive back.
+    ///
+    /// A retry of `session.attach` has to be given the attachment the first request allocated, not
+    /// a second one. Keeping the result beside the receipt is what makes that possible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn record_result(
+        &mut self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+        result: &[u8],
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO results (actor_id, action_id, result) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (actor_id, action_id) DO UPDATE SET result = excluded.result",
+                params![
+                    actor_id.as_str(),
+                    action_id.get().as_bytes().as_slice(),
+                    result
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Reads the retained result of an action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn read_result(&self, actor_id: &ActorId, action_id: ActionId) -> Result<Option<Vec<u8>>> {
+        self.connection
+            .query_row(
+                "SELECT result FROM results WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(unavailable)
+    }
+
+    /// Records the session's final closure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the record cannot be written.
+    pub fn record_closure(&mut self, record: &kr_protocol::session::ClosureRecord) -> Result<()> {
+        let encoded = kr_cbor::to_canonical_vec(record)
+            .map_err(|error| unavailable_detail_owned(error.to_string()))?;
+        self.connection
+            .execute(
+                "INSERT INTO closure (session_id, record) VALUES (?1, ?2)
+                 ON CONFLICT (session_id) DO UPDATE SET record = excluded.record",
+                params![record.session_id.get().as_bytes().as_slice(), encoded],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Reads a recorded closure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn read_closure(
+        &self,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Result<Option<kr_protocol::session::ClosureRecord>> {
+        let encoded: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT record FROM closure WHERE session_id = ?1",
+                params![session_id.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(unavailable)?;
+        encoded
+            .map(|bytes| {
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                    .map_err(|error| unavailable_detail_owned(error.to_string()))
+            })
+            .transpose()
+    }
+
     /// Returns how many receipts the journal holds.
     ///
     /// # Errors
@@ -515,6 +623,10 @@ fn unavailable_detail(detail: &str) -> WorkerError {
     WorkerError::JournalUnavailable {
         detail: detail.to_owned(),
     }
+}
+
+fn unavailable_detail_owned(detail: String) -> WorkerError {
+    WorkerError::JournalUnavailable { detail }
 }
 
 #[cfg(test)]

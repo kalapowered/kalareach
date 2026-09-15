@@ -92,7 +92,12 @@ impl OutputHistory {
         layout: SpoolLayout,
     ) -> Result<Self> {
         let mut history = Self::in_memory(resident_capacity);
-        history.spool = Some(Spool::open(directory.into(), layout)?);
+        let spool = Spool::open(directory.into(), layout)?;
+        // The cursor continues from what is already retained; it does not restart at zero and
+        // rewrite history a client may already have read.
+        history.next_cursor = spool.next_cursor();
+        history.resident_start = history.next_cursor;
+        history.spool = Some(spool);
         Ok(history)
     }
 
@@ -213,12 +218,44 @@ impl Spool {
     fn open(directory: PathBuf, layout: SpoolLayout) -> Result<Self> {
         std::fs::create_dir_all(&directory)
             .map_err(|error| WorkerError::storage("create the output spool", error))?;
+        // A spool that already has segments is this session's own history from before a restart.
+        // Starting with an empty index would report it as a gap while the bytes sat on disk.
+        let mut segments: Vec<Segment> = Vec::new();
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| WorkerError::storage("read the output spool", error))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| WorkerError::storage("read the output spool", error))?;
+            let path = entry.path();
+            let Some(stem) = path.file_stem().and_then(std::ffi::OsStr::to_str) else {
+                continue;
+            };
+            if path.extension().is_none_or(|extension| extension != "out") {
+                continue;
+            }
+            let Ok(start) = stem.parse::<u64>() else {
+                continue;
+            };
+            let len = entry
+                .metadata()
+                .map_err(|error| WorkerError::storage("read the output spool", error))?
+                .len();
+            segments.push(Segment { start, len, path });
+        }
+        segments.sort_by_key(|segment| segment.start);
+        let total_bytes = segments.iter().map(|segment| segment.len).sum();
         Ok(Self {
             directory,
             layout,
-            segments: VecDeque::new(),
-            total_bytes: 0,
+            segments: segments.into(),
+            total_bytes,
         })
+    }
+
+    fn next_cursor(&self) -> u64 {
+        self.segments
+            .back()
+            .map_or(0, |segment| segment.start + segment.len)
     }
 
     fn oldest_cursor(&self) -> Option<u64> {
