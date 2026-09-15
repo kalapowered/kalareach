@@ -1,0 +1,86 @@
+//! The KalaReach wire contract.
+//!
+//! Rust is canonical. Every wire type lives here as a serde type; the JSON Schema in
+//! `packages/protocol/schema/` and the TypeScript package are generated from these types and
+//! checked in continuous integration, so the two languages cannot drift.
+//!
+//! # Two representations, one contract
+//!
+//! Each type has one canonical wire form and one JSON form:
+//!
+//! * The wire form is KR-CBOR-1 (see the `kr-cbor` crate). Identifiers are 16-byte strings,
+//!   counters are unsigned 64-bit integers, timestamps are integer UTC milliseconds and text is
+//!   valid UTF-8. Signatures and digests always cover these bytes.
+//! * The JSON form is the managed HTTP representation. Identifiers are hyphenated text, opaque
+//!   bytes are unpadded base64url and counters are decimal strings so a JavaScript consumer cannot
+//!   lose precision. Nothing is ever signed from JSON.
+//!
+//! [`scalars`] implements both forms; every other module builds on them.
+//!
+//! # Modules
+//!
+//! | Module | What it holds |
+//! | --- | --- |
+//! | [`scalars`] | Identifier, counter, timestamp and byte-string scalars, and `Nullable` |
+//! | [`ids`] | One type per identifier in the identity and object model |
+//! | [`rights`] | The closed action-right vocabulary |
+//! | [`actor`] | The host-constructed verified actor envelope and its ingress classes |
+//! | [`grant`] | Grants, selectors, history scope, expiry and the delegation rule |
+//! | [`authority`] | The authority vocabulary every method entry is written in |
+//! | [`method`] | The method registry: one exhaustive entry per method, and the deny rule |
+//! | [`envelope`] | Request, mutation, response and notification envelopes |
+//! | [`receipt`] | Receipt states and the transition contract |
+//! | [`error`] | Error codes, retry categories and the error object |
+//! | [`frame`] | Stream headers and the length-delimited frame codec |
+//! | [`hello`] | Version negotiation and the `kr-connect/1` proof transcript |
+//! | [`digest`] | The mutation payload digest |
+//! | [`limits`] | Protocol defaults |
+//! | [`schema`] | Deterministic JSON Schema and method-table generation |
+//!
+//! # What this crate does not do
+//!
+//! It carries no transport, no cryptography and no storage. It defines the types those layers
+//! exchange, the rules a receiver can check without any of them, and the digests they sign.
+//!
+//! # Example
+//!
+//! ```
+//! use kr_protocol::actor::ActorIngress;
+//! use kr_protocol::authority::{AuthorityDecision, DenialReason, EffectClass};
+//! use kr_protocol::method::{MethodVersion, decide};
+//!
+//! // A listed method resolves to its exhaustive authority entry.
+//! let decision = decide("session.read", MethodVersion::V1, ActorIngress::PairedDevice);
+//! let AuthorityDecision::Listed(entry) = decision else {
+//!     unreachable!("session.read is listed");
+//! };
+//! assert_eq!(entry.effect, EffectClass::Read);
+//!
+//! // Anything unlisted is denied, and private IPC methods are unreachable from the network.
+//! assert_eq!(
+//!     decide("host.shutdown", MethodVersion::V1, ActorIngress::PairedDevice),
+//!     AuthorityDecision::Denied(DenialReason::UnlistedMethod)
+//! );
+//! assert_eq!(
+//!     decide("root.editor.enter", MethodVersion::V1, ActorIngress::PairedDevice),
+//!     AuthorityDecision::Denied(DenialReason::ForbiddenIngress {
+//!         ingress: ActorIngress::PairedDevice
+//!     })
+//! );
+//! ```
+
+pub mod actor;
+pub mod authority;
+pub mod digest;
+pub mod envelope;
+pub mod error;
+pub mod frame;
+pub mod grant;
+pub mod hello;
+pub mod ids;
+pub mod limits;
+pub mod method;
+pub mod receipt;
+pub mod rights;
+pub mod scalars;
+pub mod schema;

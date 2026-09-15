@@ -1,0 +1,3210 @@
+{
+  "$defs": {
+    "ActionId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One submitted intent and its receipt, generated as a UUIDv4."
+    },
+    "ActionRight": {
+      "description": "One permitted action in a grant.",
+      "oneOf": [
+        {
+          "const": "session.view",
+          "description": "Observe a session: metadata, filtered history, snapshots and events.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.input",
+          "description": "Send bytes to the terminal. This effectively exposes the shell user's account.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.geometry",
+          "description": "Claim geometry ownership and resize the terminal.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.geometry.transfer",
+          "description": "Hand geometry ownership to another attachment.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.palette",
+          "description": "Set the terminal palette.",
+          "type": "string"
+        },
+        {
+          "const": "agent.prompt",
+          "description": "Submit, queue or steer an upstream agent prompt.",
+          "type": "string"
+        },
+        {
+          "const": "agent.cancel",
+          "description": "Cancel the upstream agent's current turn.",
+          "type": "string"
+        },
+        {
+          "const": "agent.approval.respond",
+          "description": "Answer an upstream agent approval request.",
+          "type": "string"
+        },
+        {
+          "const": "question.respond",
+          "description": "Answer or cancel an agent-to-user question.",
+          "type": "string"
+        },
+        {
+          "const": "files.read",
+          "description": "Read file, diff and change-set content.",
+          "type": "string"
+        },
+        {
+          "const": "files.upload",
+          "description": "Upload attachment bytes into the environment.",
+          "type": "string"
+        },
+        {
+          "const": "files.apply_diff",
+          "description": "Apply or revert a diff against a destination.",
+          "type": "string"
+        },
+        {
+          "const": "project.create",
+          "description": "Initialise, clone or adopt a source repository.",
+          "type": "string"
+        },
+        {
+          "const": "workspace.manage",
+          "description": "Create, remove or materialise a workspace.",
+          "type": "string"
+        },
+        {
+          "const": "changeset.create",
+          "description": "Capture an immutable change set.",
+          "type": "string"
+        },
+        {
+          "const": "session.create",
+          "description": "Create a session.",
+          "type": "string"
+        },
+        {
+          "const": "session.rename",
+          "description": "Rename a session.",
+          "type": "string"
+        },
+        {
+          "const": "session.close",
+          "description": "Close a session.",
+          "type": "string"
+        },
+        {
+          "const": "session.share",
+          "description": "Issue, list and revoke grants that share a session.",
+          "type": "string"
+        },
+        {
+          "const": "automation.manage",
+          "description": "Install, enable, pause and run automation definitions.",
+          "type": "string"
+        },
+        {
+          "const": "host.manage",
+          "description": "Change host configuration: devices, catalogues, plugins and installation state.",
+          "type": "string"
+        }
+      ]
+    },
+    "ActionTarget": {
+      "additionalProperties": false,
+      "description": "The exact subject a mutation names.\n\nA mutation states the environment, and where it applies the session and epoch, the foreground\napplication instance and the agent binding revision. Narrower targets leave the fields that do\nnot apply explicitly null.",
+      "properties": {
+        "agent_binding_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentBindingRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The agent binding revision, present exactly when `application_instance_id` is."
+        },
+        "application_instance_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApplicationInstanceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The foreground application instance, when the effect has one."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns the effect."
+        },
+        "session_epoch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionEpoch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session epoch, present exactly when `session_id` is."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session, when the effect has one."
+        }
+      },
+      "required": [
+        "environment_id",
+        "session_id",
+        "session_epoch",
+        "application_instance_id",
+        "agent_binding_revision"
+      ],
+      "type": "object"
+    },
+    "ActionWindowId": {
+      "description": "A host-issued action window identifier, bound to one authenticated connection and host boot.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "ActorEnvelope": {
+      "additionalProperties": false,
+      "description": "The host-constructed identity of one request.\n\nThe de-duplication key for a mutation is `(actor_id, action_id)`.",
+      "properties": {
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The stable host-issued principal for this actor."
+        },
+        "connection_id": {
+          "$ref": "#/$defs/ConnectionId",
+          "description": "The connection the request arrived on. Closing the control stream revokes every associated\ndata stream."
+        },
+        "controller_generation": {
+          "$ref": "#/$defs/ControllerGeneration",
+          "description": "The controller generation that admitted the connection. Remote dispatch is fenced when this\ngeneration is replaced."
+        },
+        "device_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The paired device, when the ingress is a device."
+        },
+        "grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant the request is being checked against, when one applies."
+        },
+        "grant_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthorityRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The authority revision the grant was validated at."
+        },
+        "ingress": {
+          "$ref": "#/$defs/ActorIngress",
+          "description": "Where the request entered the host."
+        }
+      },
+      "required": [
+        "actor_id",
+        "ingress",
+        "device_id",
+        "grant_id",
+        "grant_revision",
+        "controller_generation",
+        "connection_id"
+      ],
+      "type": "object"
+    },
+    "ActorId": {
+      "description": "A stable host-issued principal for one verified actor. The caller cannot assert it.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "ActorIngress": {
+      "description": "Where a request entered the host.\n\nIngress is part of every authority entry. A method restricted to private IPC is never reachable\nthrough the network or through a plugin component, whatever rights the caller holds.",
+      "oneOf": [
+        {
+          "const": "local_ipc",
+          "description": "An authenticated operating-system caller on a Unix domain socket or a Windows named pipe.\nThe host stamps the freshness context; the caller does not pretend to be a paired device.",
+          "type": "string"
+        },
+        {
+          "const": "paired_device",
+          "description": "A paired device on an authorised iroh connection.",
+          "type": "string"
+        },
+        {
+          "const": "unpaired_peer",
+          "description": "A connection that has not passed device authorisation. It reaches only the bounded\npre-authorisation pairing surface.",
+          "type": "string"
+        },
+        {
+          "const": "workflow",
+          "description": "An automation run acting under an explicit workflow grant on the host.",
+          "type": "string"
+        },
+        {
+          "const": "plugin",
+          "description": "A plugin component calling a host effect from the plugin runtime.",
+          "type": "string"
+        },
+        {
+          "const": "service_client",
+          "description": "An installation or host credential presented at a managed or self-hosted service endpoint.",
+          "type": "string"
+        }
+      ]
+    },
+    "AgentBindingRevision": {
+      "$ref": "#/$defs/U64",
+      "description": "Changes when the active upstream execution owner or selected thread changes."
+    },
+    "ApplicationInstanceId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One foreground application within a terminal session."
+    },
+    "ApprovalRequestId": {
+      "description": "An upstream approval request identifier. Opaque to KalaReach.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "AttachmentId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One CLI or application attachment, independently of its device."
+    },
+    "AuthorityRevision": {
+      "$ref": "#/$defs/U64",
+      "description": "The host's ordered authority revision. Only the host issues its own revisions."
+    },
+    "BootEpoch": {
+      "$ref": "#/$defs/U64",
+      "description": "The host boot epoch, which binds continuous-time deadlines to one boot."
+    },
+    "BuildId": {
+      "description": "A build identifier reported in hello.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "CapabilityId": {
+      "description": "A versioned capability name. Capabilities describe feasibility, never authority.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "CapabilityRequirement": {
+      "description": "Which capability evidence a method requires, and at which revision.\n\nCapabilities describe feasibility. They never create authority.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "No capability evidence beyond the method being listed.",
+          "properties": {
+            "kind": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The named capability must be currently evidenced at the bound revision.",
+          "properties": {
+            "capability_id": {
+              "description": "The capability name.",
+              "type": "string"
+            },
+            "kind": {
+              "const": "required",
+              "type": "string"
+            },
+            "revision": {
+              "$ref": "#/$defs/RevisionBinding",
+              "description": "The revision the evidence is bound to."
+            }
+          },
+          "required": [
+            "kind",
+            "capability_id",
+            "revision"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ClientOffer": {
+      "additionalProperties": false,
+      "description": "The client's complete `hello` offer.",
+      "properties": {
+        "build_id": {
+          "$ref": "#/$defs/BuildId",
+          "description": "The client build identity."
+        },
+        "capabilities": {
+          "description": "The capabilities the client offers.",
+          "items": {
+            "$ref": "#/$defs/CapabilityId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "client_nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "A fresh client nonce."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The client's device identity."
+        },
+        "device_key_revision": {
+          "$ref": "#/$defs/DeviceKeyRevision",
+          "description": "The revision of that device's purpose-separated keys."
+        },
+        "max_receive": {
+          "$ref": "#/$defs/ReceiveLimits",
+          "description": "The client's own receive limits."
+        },
+        "offered_versions": {
+          "description": "Every public protocol version the client offers.",
+          "items": {
+            "$ref": "#/$defs/ProtocolVersion"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "offered_versions",
+        "build_id",
+        "device_id",
+        "device_key_revision",
+        "capabilities",
+        "max_receive",
+        "client_nonce"
+      ],
+      "type": "object"
+    },
+    "ClockEpoch": {
+      "$ref": "#/$defs/U64",
+      "description": "The host clock epoch, advanced when wall-clock trust changes."
+    },
+    "ConfirmationRequirement": {
+      "description": "Whether a method needs a fresh owner confirmation.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "No owner confirmation. Already-authorised restriction, revocation and emergency stop never\nneed a new rights-enlarging confirmation.",
+          "type": "string"
+        },
+        {
+          "const": "always",
+          "description": "A fresh owner confirmation bound to the exact action digest, destination keys and rights,\nhost, nonce and short expiry.",
+          "type": "string"
+        },
+        {
+          "const": "when_enlarging_authority",
+          "description": "A fresh owner confirmation only when the request enlarges persistent authority: a new trust\nroot, a wider capability ceiling or a persistent grant enlargement.",
+          "type": "string"
+        }
+      ]
+    },
+    "ConnectionId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One transport connection, allocated by the host during hello."
+    },
+    "ControllerGeneration": {
+      "$ref": "#/$defs/U64",
+      "description": "The controller's persistent generation, advanced on every controller start."
+    },
+    "DeviceId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One paired device."
+    },
+    "DeviceKeyRevision": {
+      "$ref": "#/$defs/U64",
+      "description": "The revision of a device's purpose-separated public keys."
+    },
+    "DiagnosticId": {
+      "description": "An opaque diagnostic identifier. It carries no protocol meaning.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "Digest256": {
+      "contentEncoding": "base64url",
+      "description": "A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "type": "string"
+    },
+    "DurationMs": {
+      "description": "A duration in milliseconds, as a decimal string in JSON.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "EffectClass": {
+      "description": "Whether a method observes state or changes it.",
+      "oneOf": [
+        {
+          "const": "read",
+          "description": "Observes state. A read never crosses an external-effect boundary and carries no receipt.",
+          "type": "string"
+        },
+        {
+          "const": "write",
+          "description": "Changes state. A write carries an action identifier, a freshness context and a receipt.",
+          "type": "string"
+        }
+      ]
+    },
+    "EndpointKey": {
+      "contentEncoding": "base64url",
+      "description": "A 32-byte iroh endpoint public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "type": "string"
+    },
+    "EnvironmentId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One installed OS, distribution or container environment and OS user."
+    },
+    "EnvironmentSelector": {
+      "description": "Which environments a grant covers.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Every environment on the host.",
+          "properties": {
+            "kind": {
+              "const": "any",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Only the named environments.",
+          "properties": {
+            "environment_ids": {
+              "description": "The permitted environments.",
+              "items": {
+                "$ref": "#/$defs/EnvironmentId"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "kind": {
+              "const": "these",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "environment_ids"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ErrorCode": {
+      "description": "A stable protocol error code.",
+      "oneOf": [
+        {
+          "const": "INVALID_ARGUMENT",
+          "description": "A field is missing, malformed or outside its permitted range.",
+          "type": "string"
+        },
+        {
+          "const": "UNSUPPORTED_SCHEMA",
+          "description": "The negotiated protocol major version, method version or object schema is not supported.",
+          "type": "string"
+        },
+        {
+          "const": "UNSUPPORTED_CAPABILITY",
+          "description": "The requested capability is not offered by this peer or this binding.",
+          "type": "string"
+        },
+        {
+          "const": "PERMISSION_DENIED",
+          "description": "The verified actor does not hold the rights this effect requires, or the effect is not listed.",
+          "type": "string"
+        },
+        {
+          "const": "PAIRING_EXPIRED",
+          "description": "The invitation passed its deadline. A new invitation requires another owner action.",
+          "type": "string"
+        },
+        {
+          "const": "PAIRING_REJECTED",
+          "description": "The issuing owner denied or cancelled the pairing candidate.",
+          "type": "string"
+        },
+        {
+          "const": "PAIRING_AUTH_FAILED",
+          "description": "A pairing confirmation tag or proof did not verify. The cause stays ambiguous.",
+          "type": "string"
+        },
+        {
+          "const": "PAIRING_ATTEMPTS_EXHAUSTED",
+          "description": "The invitation consumed its failed-confirmation allowance.",
+          "type": "string"
+        },
+        {
+          "const": "RENDEZVOUS_UNAVAILABLE",
+          "description": "The configured rendezvous service could not be reached or has no capacity.",
+          "type": "string"
+        },
+        {
+          "const": "RENDEZVOUS_CONFIG_ERROR",
+          "description": "The local rendezvous configuration is wrong, for example an unusable origin.",
+          "type": "string"
+        },
+        {
+          "const": "UNKNOWN_SESSION",
+          "description": "No session with that identity exists in this environment.",
+          "type": "string"
+        },
+        {
+          "const": "AMBIGUOUS_SESSION",
+          "description": "The supplied selector matched more than one session.",
+          "type": "string"
+        },
+        {
+          "const": "AMBIGUOUS_ATTACHMENT",
+          "description": "The supplied selector matched more than one attachment.",
+          "type": "string"
+        },
+        {
+          "const": "TERMINAL_UNAVAILABLE",
+          "description": "No terminal could be opened or the requested terminal is not usable.",
+          "type": "string"
+        },
+        {
+          "const": "TERMINAL_PROBE_FAILED",
+          "description": "The terminal profile probe did not complete, so the capability set is unknown.",
+          "type": "string"
+        },
+        {
+          "const": "INPUT_INCOMPATIBLE",
+          "description": "The client's input encoder cannot produce bytes this terminal profile accepts.",
+          "type": "string"
+        },
+        {
+          "const": "SESSION_CLOSED",
+          "description": "The session has closed. A history request never starts execution.",
+          "type": "string"
+        },
+        {
+          "const": "SESSION_LIMIT",
+          "description": "The environment already holds its maximum number of live or creating sessions.",
+          "type": "string"
+        },
+        {
+          "const": "RESOURCE_UNAVAILABLE",
+          "description": "A required local resource, such as a pseudoterminal or process slot, is unavailable.",
+          "type": "string"
+        },
+        {
+          "const": "HOST_NOT_CONFIGURED",
+          "description": "The per-user controller is not installed or configured; the response names the setup action.",
+          "type": "string"
+        },
+        {
+          "const": "ENVIRONMENT_UNAVAILABLE",
+          "description": "The named execution environment is not running or cannot be reached.",
+          "type": "string"
+        },
+        {
+          "const": "DESKTOP_UNAVAILABLE",
+          "description": "No usable desktop session exists for a request that needs one.",
+          "type": "string"
+        },
+        {
+          "const": "STALE_SESSION",
+          "description": "The named session identity or epoch is no longer current.",
+          "type": "string"
+        },
+        {
+          "const": "LEASE_LOST",
+          "description": "The input lease or dispatch lease is no longer held. Acquire it again explicitly.",
+          "type": "string"
+        },
+        {
+          "const": "GEOMETRY_NOT_OWNER",
+          "description": "The actor is not the current geometry owner for this session.",
+          "type": "string"
+        },
+        {
+          "const": "DRAFT_CONFLICT",
+          "description": "The subject changed under the request: an intervening edit, or a preflight conflict.",
+          "type": "string"
+        },
+        {
+          "const": "EDITOR_BUSY",
+          "description": "The trusted root editor is not in a state that permits this operation.",
+          "type": "string"
+        },
+        {
+          "const": "ID_CONFLICT",
+          "description": "The action identifier was reused with a different payload digest.",
+          "type": "string"
+        },
+        {
+          "const": "UPSTREAM_UNAVAILABLE",
+          "description": "The upstream agent or provider interface could not be reached.",
+          "type": "string"
+        },
+        {
+          "const": "OUTCOME_UNKNOWN",
+          "description": "Dispatch may have occurred without a confirmed outcome. Never retried automatically.",
+          "type": "string"
+        },
+        {
+          "const": "RESYNC_REQUIRED",
+          "description": "The client fell behind its stream. Request a new snapshot and resume from its cursor.",
+          "type": "string"
+        },
+        {
+          "const": "QUOTA_EXCEEDED",
+          "description": "An allowance is exhausted. A retry cannot succeed until the allowance changes.",
+          "type": "string"
+        },
+        {
+          "const": "RATE_LIMITED",
+          "description": "The caller exceeded a rate limit.",
+          "type": "string"
+        },
+        {
+          "const": "SERVICE_CAPACITY",
+          "description": "A managed service has no capacity. This is not a host failure.",
+          "type": "string"
+        },
+        {
+          "const": "CLOCK_UNTRUSTED",
+          "description": "Wall-clock trust is unresolved, so an expiry-dependent object cannot be proved valid.",
+          "type": "string"
+        },
+        {
+          "const": "STORAGE_UNAVAILABLE",
+          "description": "A required durable store is unavailable or full, so no durable mutation is accepted.",
+          "type": "string"
+        },
+        {
+          "const": "SHELL_INTEGRATION_UNSUPPORTED",
+          "description": "The running shell has no managed integration for this operation.",
+          "type": "string"
+        },
+        {
+          "const": "ATTACHMENT_INTEGRITY",
+          "description": "A chunk digest, total size or whole-file digest did not match.",
+          "type": "string"
+        },
+        {
+          "const": "REPOSITORY_UNTRUSTED",
+          "description": "The catalogue root, generation or signature is not trusted by this host.",
+          "type": "string"
+        },
+        {
+          "const": "PACKAGE_UNAVAILABLE_OFFLINE",
+          "description": "The package is not present locally and no repository is reachable.",
+          "type": "string"
+        },
+        {
+          "const": "PLUGIN_GRANT_REQUIRED",
+          "description": "The plugin needs a capability grant that has not been given.",
+          "type": "string"
+        },
+        {
+          "const": "PLUGIN_DISABLED",
+          "description": "The plugin is installed but disabled in this environment.",
+          "type": "string"
+        },
+        {
+          "const": "QUESTION_RESOLVED",
+          "description": "The question was already answered or cancelled.",
+          "type": "string"
+        },
+        {
+          "const": "QUESTION_EXPIRED",
+          "description": "The question passed its expiry before an answer arrived.",
+          "type": "string"
+        },
+        {
+          "const": "NOT_IN_KR_SESSION",
+          "description": "The caller is not running inside a KalaReach session, so this operation has no subject.",
+          "type": "string"
+        },
+        {
+          "const": "OWNER_CONFIRMATION_REQUIRED",
+          "description": "A fresh owner confirmation bound to this exact action digest is required.",
+          "type": "string"
+        },
+        {
+          "const": "CAUSAL_LIMIT",
+          "description": "The causal budget for this chain of automated runs is exhausted.",
+          "type": "string"
+        },
+        {
+          "const": "SOURCE_CHANGED",
+          "description": "The source revision changed under a staging snapshot or capture.",
+          "type": "string"
+        }
+      ]
+    },
+    "EventSequence": {
+      "$ref": "#/$defs/U64",
+      "description": "A position in one notification stream."
+    },
+    "EventType": {
+      "description": "The type of one notification event.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "FreshnessRequirement": {
+      "description": "Which freshness context a request must carry.",
+      "oneOf": [
+        {
+          "const": "current_authority",
+          "description": "Current authority, expiry and revocation revision are revalidated when the request is\nserved. A read carries no action window.",
+          "type": "string"
+        },
+        {
+          "const": "action_window",
+          "description": "A host-issued action window plus the requested time to live. The host derives the accepted\ndeadline as the earliest of window expiry, receipt time plus the requested time to live and\nany applicable authority or subject deadline. A local IPC caller receives the host-stamped\nequivalent context instead of a network window.",
+          "type": "string"
+        },
+        {
+          "const": "input_lease",
+          "description": "The current input lease epoch and connection stream identity. Raw input is an ordered\nstream, not an admitted action.",
+          "type": "string"
+        },
+        {
+          "const": "invitation_deadline",
+          "description": "The invitation's deadline and its attempt budget.",
+          "type": "string"
+        },
+        {
+          "const": "service_credential",
+          "description": "A service credential's validity plus the host's current authority revision.",
+          "type": "string"
+        }
+      ]
+    },
+    "Grant": {
+      "additionalProperties": false,
+      "description": "A host-issued authority object.",
+      "properties": {
+        "actions": {
+          "description": "The actions it permits.",
+          "items": {
+            "$ref": "#/$defs/ActionRight"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The host authority revision it was issued under. The host intersects the grant with current\npolicy on every request."
+        },
+        "environment_selector": {
+          "$ref": "#/$defs/EnvironmentSelector",
+          "description": "Which environments it covers."
+        },
+        "expiry": {
+          "$ref": "#/$defs/GrantExpiry",
+          "description": "When it stops being valid."
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "This grant's identity."
+        },
+        "history": {
+          "$ref": "#/$defs/HistoryScope",
+          "description": "How far back it may see."
+        },
+        "issuer_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device that issued it."
+        },
+        "organisation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OrganisationRequirement"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An optional organisation membership requirement."
+        },
+        "parent_grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant this one was delegated from. Revoking a parent revokes its descendants."
+        },
+        "recipient_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device it was issued to."
+        },
+        "session_selector": {
+          "$ref": "#/$defs/SessionSelector",
+          "description": "Which sessions it covers."
+        }
+      },
+      "required": [
+        "grant_id",
+        "parent_grant_id",
+        "issuer_device_id",
+        "recipient_device_id",
+        "authority_revision",
+        "environment_selector",
+        "session_selector",
+        "actions",
+        "history",
+        "expiry",
+        "organisation"
+      ],
+      "type": "object"
+    },
+    "GrantExpiry": {
+      "description": "When a grant stops being valid.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Valid until revoked. Personal owner grants use this so independent operation does not\ndepend on a cloud lease.",
+          "properties": {
+            "kind": {
+              "const": "never",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Valid until an absolute UTC deadline. A previously expired grant never revives.",
+          "properties": {
+            "expires_at_ms": {
+              "$ref": "#/$defs/TimestampMs",
+              "description": "The deadline in UTC milliseconds."
+            },
+            "kind": {
+              "const": "at",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "expires_at_ms"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "GrantId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One host-issued authority object."
+    },
+    "HistoryFilter": {
+      "description": "How the shared host-side history filter applies to a method's result.",
+      "oneOf": [
+        {
+          "const": "not_applicable",
+          "description": "The method returns no retained history or derived content.",
+          "type": "string"
+        },
+        {
+          "const": "grant_lower_bound",
+          "description": "The grant's history lower bound applies to every returned event, snapshot, transcript,\nattachment reference, export and summary. Derived data identifies its source interval and\nis omitted or recomputed when that provenance crosses the viewer's scope.",
+          "type": "string"
+        },
+        {
+          "const": "live_view_only",
+          "description": "Live view only: the currently visible screen. Inactive buffers, scrollback and the backing\ntranscript stay excluded until actually displayed or separately granted.",
+          "type": "string"
+        },
+        {
+          "const": "named_current_resources",
+          "description": "Current questions or approval resources the grant names explicitly, even when they were\ncreated before the history lower bound. Without that scope the lower bound applies.",
+          "type": "string"
+        }
+      ]
+    },
+    "HistoryScope": {
+      "additionalProperties": false,
+      "description": "How far back a grant may see, and which current resources it names explicitly.\n\nThe lower bound is enforced once, in shared host-side filtering used by event pages, snapshots,\nloaded conversations, attachment references, exports, summaries, changed-since-last-visit and\nvoice context. A later snapshot or a freshly generated summary never makes older underlying\ncontent newly authorised.",
+      "properties": {
+        "include_live_screen": {
+          "description": "Whether the currently visible screen is included. This exception never grants inactive\nscreen buffers, scrollback or the backing transcript.",
+          "type": "boolean"
+        },
+        "lower_bound_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The earliest content this grant may see. Null means no retained history at all."
+        },
+        "named_approvals": {
+          "description": "Current approval requests named explicitly, on the same terms.",
+          "items": {
+            "$ref": "#/$defs/ApprovalRequestId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "named_questions": {
+          "description": "Current questions named explicitly, even when they were created before the lower bound.",
+          "items": {
+            "$ref": "#/$defs/QuestionId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "lower_bound_ms",
+        "include_live_screen",
+        "named_questions",
+        "named_approvals"
+      ],
+      "type": "object"
+    },
+    "HostSelection": {
+      "additionalProperties": false,
+      "description": "The host's complete `hello` selection.\n\nIt echoes the client nonce as well as carrying its own, so the transcript binds one exact\noffer to one exact selection.",
+      "properties": {
+        "boot_epoch": {
+          "$ref": "#/$defs/BootEpoch",
+          "description": "The host boot epoch."
+        },
+        "capabilities": {
+          "description": "The capabilities the host selected.",
+          "items": {
+            "$ref": "#/$defs/CapabilityId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "client_nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The client nonce this selection answers."
+        },
+        "clock_epoch": {
+          "$ref": "#/$defs/ClockEpoch",
+          "description": "The host clock epoch."
+        },
+        "connection_id": {
+          "$ref": "#/$defs/ConnectionId",
+          "description": "The connection identity the host allocated."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The host's device identity."
+        },
+        "device_key_revision": {
+          "$ref": "#/$defs/DeviceKeyRevision",
+          "description": "The revision of the host's purpose-separated keys."
+        },
+        "endpoint_id": {
+          "$ref": "#/$defs/EndpointKey",
+          "description": "The host's iroh endpoint identity, validated against the paired record."
+        },
+        "host_nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "A fresh host nonce."
+        },
+        "limits": {
+          "$ref": "#/$defs/ReceiveLimits",
+          "description": "The negotiated limits."
+        },
+        "selected_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The version the host selected."
+        }
+      },
+      "required": [
+        "host_nonce",
+        "client_nonce",
+        "connection_id",
+        "selected_version",
+        "capabilities",
+        "limits",
+        "endpoint_id",
+        "device_id",
+        "device_key_revision",
+        "boot_epoch",
+        "clock_epoch"
+      ],
+      "type": "object"
+    },
+    "IdempotencyBehaviour": {
+      "description": "How a repeated request is resolved.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "An idempotent read. An automatic retry is permitted.",
+          "properties": {
+            "kind": {
+              "const": "idempotent_read",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Deduplicated by the verified actor and action identifier against the payload digest. A\nduplicate returns the retained receipt without dispatch; a reused identifier with a\ndifferent payload is an `ID_CONFLICT`.",
+          "properties": {
+            "kind": {
+              "const": "action_deduplicated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Idempotent under a protocol key. A matching duplicate is acknowledged; a conflicting\nduplicate invalidates the operation.",
+          "properties": {
+            "key": {
+              "description": "The key the operation is idempotent under.",
+              "type": "string"
+            },
+            "kind": {
+              "const": "keyed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "key"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An ordered stream. Positions are acknowledged per connection and never replayed;\nreconnecting creates a new stream identity.",
+          "properties": {
+            "kind": {
+              "const": "ordered_stream",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Method": {
+      "description": "Every method in the section 23 method-groups table.",
+      "oneOf": [
+        {
+          "const": "host.info",
+          "description": "Host build identity, protocol limits and configured services.",
+          "type": "string"
+        },
+        {
+          "const": "environment.list",
+          "description": "The environments this actor's grant admits.",
+          "type": "string"
+        },
+        {
+          "const": "environment.capabilities",
+          "description": "What one environment can currently do. Capability evidence, never authority.",
+          "type": "string"
+        },
+        {
+          "const": "host.doctor",
+          "description": "Host diagnostics with credentials redacted.",
+          "type": "string"
+        },
+        {
+          "const": "pair.invite",
+          "description": "Issue a five-minute single-use pairing invitation in code or direct mode.",
+          "type": "string"
+        },
+        {
+          "const": "pair.redeem",
+          "description": "Redeem an invitation from the bounded pre-authorisation surface.",
+          "type": "string"
+        },
+        {
+          "const": "pair.finish",
+          "description": "Bind the pairing transcript to the live iroh endpoint identities.",
+          "type": "string"
+        },
+        {
+          "const": "pair.confirm",
+          "description": "Commit the device record and its grant after owner approval.",
+          "type": "string"
+        },
+        {
+          "const": "pair.cancel",
+          "description": "Consume an invitation without issuing a grant.",
+          "type": "string"
+        },
+        {
+          "const": "pair.status",
+          "description": "Report a pending or committed pairing result, never secret material.",
+          "type": "string"
+        },
+        {
+          "const": "device.list",
+          "description": "Paired devices, their key purposes and each host's last authority acknowledgement.",
+          "type": "string"
+        },
+        {
+          "const": "device.revoke",
+          "description": "Revoke a device. Completion requires the per-worker dispatch barrier, not a lease timer.",
+          "type": "string"
+        },
+        {
+          "const": "device.preview_key.update",
+          "description": "Rotate this device's own notification-preview key through its paired proof.",
+          "type": "string"
+        },
+        {
+          "const": "catalogue.list",
+          "description": "Configured plugin catalogues, their roots, generations and budgets.",
+          "type": "string"
+        },
+        {
+          "const": "catalogue.add",
+          "description": "Trust a new catalogue root. A new root always requires fresh owner confirmation.",
+          "type": "string"
+        },
+        {
+          "const": "catalogue.sync",
+          "description": "Synchronise a catalogue generation within its verified trust ceiling.",
+          "type": "string"
+        },
+        {
+          "const": "catalogue.pin",
+          "description": "Pin a catalogue to an exact generation.",
+          "type": "string"
+        },
+        {
+          "const": "catalogue.remove",
+          "description": "Remove a catalogue and stop trusting its root.",
+          "type": "string"
+        },
+        {
+          "const": "plugin.list",
+          "description": "Installed plugins, their pinned packages and their enabled state.",
+          "type": "string"
+        },
+        {
+          "const": "plugin.install",
+          "description": "Install a verified package inside the repository's trust ceiling.",
+          "type": "string"
+        },
+        {
+          "const": "plugin.remove",
+          "description": "Remove an installed plugin from an environment.",
+          "type": "string"
+        },
+        {
+          "const": "plugin.pin",
+          "description": "Pin a plugin to an exact package hash.",
+          "type": "string"
+        },
+        {
+          "const": "plugin.enable",
+          "description": "Enable an installed plugin in an environment.",
+          "type": "string"
+        },
+        {
+          "const": "plugin.disable",
+          "description": "Disable an installed plugin without removing it.",
+          "type": "string"
+        },
+        {
+          "const": "plugin.grant",
+          "description": "Grant a plugin capability. Executable and native-bridge capabilities need confirmation.",
+          "type": "string"
+        },
+        {
+          "const": "plugin.capabilities",
+          "description": "What one installed plugin can currently do under its verified package.",
+          "type": "string"
+        },
+        {
+          "const": "plugin.action.invoke",
+          "description": "Invoke a registered plugin action. Its own entry adds the rights this call intersects.",
+          "type": "string"
+        },
+        {
+          "const": "question.create",
+          "description": "Create a question from a verified originating application. Source ownership never impersonates a human answer or chooses an ungranted destination.",
+          "type": "string"
+        },
+        {
+          "const": "question.read_own",
+          "description": "Read the questions this source created.",
+          "type": "string"
+        },
+        {
+          "const": "question.cancel_own",
+          "description": "Cancel a question this source created.",
+          "type": "string"
+        },
+        {
+          "const": "alert.create",
+          "description": "Raise an alert from a verified originating application.",
+          "type": "string"
+        },
+        {
+          "const": "question.read",
+          "description": "Read questions this actor may see, at their exact current revision.",
+          "type": "string"
+        },
+        {
+          "const": "question.answer",
+          "description": "Answer the exact question revision shown, resolved atomically.",
+          "type": "string"
+        },
+        {
+          "const": "question.cancel",
+          "description": "Cancel the exact question revision shown, resolved atomically.",
+          "type": "string"
+        },
+        {
+          "const": "agent_tools.install",
+          "description": "Install the contact skill for a target agent under an exact change manifest.",
+          "type": "string"
+        },
+        {
+          "const": "agent_tools.status",
+          "description": "Report what is installed for a target agent, at which scope and version.",
+          "type": "string"
+        },
+        {
+          "const": "agent_tools.remove",
+          "description": "Remove the contact skill from a target agent under an exact change manifest.",
+          "type": "string"
+        },
+        {
+          "const": "session.list",
+          "description": "List the sessions this actor may observe.",
+          "type": "string"
+        },
+        {
+          "const": "session.create",
+          "description": "Create a session. Deduplication happens in the controller before a worker exists.",
+          "type": "string"
+        },
+        {
+          "const": "session.read",
+          "description": "Read one session's filtered metadata and current state.",
+          "type": "string"
+        },
+        {
+          "const": "session.close",
+          "description": "Close a session and hand its final metadata to the archive service.",
+          "type": "string"
+        },
+        {
+          "const": "session.describe",
+          "description": "An authorised read of filtered session metadata, not arbitrary model control.",
+          "type": "string"
+        },
+        {
+          "const": "session.rename",
+          "description": "Set a session's pinned label.",
+          "type": "string"
+        },
+        {
+          "const": "session.attach",
+          "description": "Attach in semantic or terminal mode. A geometry claim needs terminal.geometry as well.",
+          "type": "string"
+        },
+        {
+          "const": "session.detach",
+          "description": "Detach this actor's own attachment and run geometry succession.",
+          "type": "string"
+        },
+        {
+          "const": "attachment.configure",
+          "description": "Withdraw or add an authorised geometry claim without displacing the current owner.",
+          "type": "string"
+        },
+        {
+          "const": "attachment.viewport",
+          "description": "Report this attachment's physical dimensions. It never changes the pseudoterminal.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.resize",
+          "description": "Resize the pseudoterminal. Only the current geometry owner at the current epoch may.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.geometry.transfer",
+          "description": "Hand geometry ownership to another eligible attachment.",
+          "type": "string"
+        },
+        {
+          "const": "terminal.palette.set",
+          "description": "Set the session palette.",
+          "type": "string"
+        },
+        {
+          "const": "input.acquire",
+          "description": "Acquire the input lease explicitly. There is no implicit remote acquisition.",
+          "type": "string"
+        },
+        {
+          "const": "input.release",
+          "description": "Release the input lease this actor holds.",
+          "type": "string"
+        },
+        {
+          "const": "input.interrupt",
+          "description": "Send an interrupt under the current lease.",
+          "type": "string"
+        },
+        {
+          "const": "input.write",
+          "description": "Write ordered raw input under the current lease epoch and input sequence. Unsent or ambiguously delivered keystrokes are discarded, never replayed.",
+          "type": "string"
+        },
+        {
+          "const": "root.editor.enter",
+          "description": "The validated root process reports that its line editor is active.",
+          "type": "string"
+        },
+        {
+          "const": "root.editor.leave",
+          "description": "The validated root process reports that its line editor is no longer active.",
+          "type": "string"
+        },
+        {
+          "const": "root.editor.fence",
+          "description": "Advance the root editor fence so an intervening local edit is detected.",
+          "type": "string"
+        },
+        {
+          "const": "root.eof.detach",
+          "description": "The root shell reached end of file and the session detaches instead of exiting blindly.",
+          "type": "string"
+        },
+        {
+          "const": "root.command.accepted",
+          "description": "The root integration confirms that the installed command was accepted by the editor.",
+          "type": "string"
+        },
+        {
+          "const": "shell.launch",
+          "description": "Install and submit an argument vector or correctly quoted command through the trusted root editor. An intervening local edit returns DRAFT_CONFLICT.",
+          "type": "string"
+        },
+        {
+          "const": "agent.capabilities",
+          "description": "What the bound agent can currently do, with its capability evidence.",
+          "type": "string"
+        },
+        {
+          "const": "agent.snapshot",
+          "description": "A filtered snapshot of the bound agent's shared state.",
+          "type": "string"
+        },
+        {
+          "const": "agent.commands",
+          "description": "The commands the bound agent advertises.",
+          "type": "string"
+        },
+        {
+          "const": "agent.prompt.submit",
+          "description": "Submit a prompt. Applied means upstream admission, not task completion.",
+          "type": "string"
+        },
+        {
+          "const": "agent.prompt.queue",
+          "description": "Queue a prompt behind the current turn.",
+          "type": "string"
+        },
+        {
+          "const": "agent.turn.steer",
+          "description": "Steer the current turn where the upstream agent supports it.",
+          "type": "string"
+        },
+        {
+          "const": "agent.turn.cancel",
+          "description": "Cancel the current turn using its typed request and current turn identifier.",
+          "type": "string"
+        },
+        {
+          "const": "agent.approval.respond",
+          "description": "Answer an upstream approval request at its exact revision and pending state.",
+          "type": "string"
+        },
+        {
+          "const": "draft.create",
+          "description": "Create a device-owned draft that survives attachment replacement.",
+          "type": "string"
+        },
+        {
+          "const": "draft.update",
+          "description": "Update a draft at its exact revision. A draft is never submitted automatically.",
+          "type": "string"
+        },
+        {
+          "const": "agent.draft.add_attachment",
+          "description": "Insert a completed attachment handle into a draft through the active adapter.",
+          "type": "string"
+        },
+        {
+          "const": "upload.begin",
+          "description": "Reserve the declared size and return an upload identifier, chunk size and expiry.",
+          "type": "string"
+        },
+        {
+          "const": "upload.status",
+          "description": "Report verified chunk status so an interrupted transfer resumes without republishing.",
+          "type": "string"
+        },
+        {
+          "const": "upload.chunk",
+          "description": "Send one chunk with its index, exact length and digest. A matching duplicate is acknowledged; a conflicting duplicate invalidates the upload.",
+          "type": "string"
+        },
+        {
+          "const": "upload.finish",
+          "description": "Verify the declared digest and size, then publish the attachment handle atomically.",
+          "type": "string"
+        },
+        {
+          "const": "upload.cancel",
+          "description": "Cancel an unfinished upload and release its reservation.",
+          "type": "string"
+        },
+        {
+          "const": "download.begin",
+          "description": "Open an immutable source revision or bounded staging snapshot and describe its chunks.",
+          "type": "string"
+        },
+        {
+          "const": "download.chunk",
+          "description": "Read one chunk of the same snapshot. Read authority is checked on every request.",
+          "type": "string"
+        },
+        {
+          "const": "project.list",
+          "description": "List environment-local repositories as scoped metadata.",
+          "type": "string"
+        },
+        {
+          "const": "project.read",
+          "description": "Read one repository's scoped metadata.",
+          "type": "string"
+        },
+        {
+          "const": "project.init",
+          "description": "Initialise a repository at an authorised destination handle.",
+          "type": "string"
+        },
+        {
+          "const": "project.clone",
+          "description": "Clone into an authorised destination through the approved credential broker.",
+          "type": "string"
+        },
+        {
+          "const": "project.adopt",
+          "description": "Adopt an existing checkout through the explicit adoption flow.",
+          "type": "string"
+        },
+        {
+          "const": "project.operation.cancel",
+          "description": "Cancel owned repository work and report retained or removed staging paths.",
+          "type": "string"
+        },
+        {
+          "const": "workspace.list",
+          "description": "List workspaces. A view never implies deletion.",
+          "type": "string"
+        },
+        {
+          "const": "workspace.create",
+          "description": "Create a shared or isolated workspace with explicit inclusion rules.",
+          "type": "string"
+        },
+        {
+          "const": "workspace.read",
+          "description": "Read one workspace's policy and bound sessions.",
+          "type": "string"
+        },
+        {
+          "const": "workspace.remove",
+          "description": "Remove a workspace once its retention rules and pins permit it.",
+          "type": "string"
+        },
+        {
+          "const": "diff.read",
+          "description": "Read a diff with repository identity, base, head and content revisions.",
+          "type": "string"
+        },
+        {
+          "const": "diff.apply",
+          "description": "Apply a diff under the destination's concurrency contract. A preflight conflict returns DRAFT_CONFLICT without any write.",
+          "type": "string"
+        },
+        {
+          "const": "diff.revert",
+          "description": "Revert a previously applied change under the same destination contract.",
+          "type": "string"
+        },
+        {
+          "const": "changeset.capture",
+          "description": "Capture an immutable change-set version with its policy and provenance.",
+          "type": "string"
+        },
+        {
+          "const": "changeset.read",
+          "description": "Read one exact change-set version.",
+          "type": "string"
+        },
+        {
+          "const": "changeset.materialize",
+          "description": "Materialise an exact change-set version into an independent workspace.",
+          "type": "string"
+        },
+        {
+          "const": "review.read",
+          "description": "Read review state bound to exact change-set versions.",
+          "type": "string"
+        },
+        {
+          "const": "review.acknowledge",
+          "description": "Acknowledge review of one version. It affects only this actor and mutates no code.",
+          "type": "string"
+        },
+        {
+          "const": "attention.read",
+          "description": "Read the attention inbox for this actor's scope.",
+          "type": "string"
+        },
+        {
+          "const": "attention.acknowledge",
+          "description": "Acknowledge an attention item for this actor only.",
+          "type": "string"
+        },
+        {
+          "const": "visit.acknowledge",
+          "description": "Record this actor's visit so changed-since-last-visit stays per actor.",
+          "type": "string"
+        },
+        {
+          "const": "action.cancel",
+          "description": "Cancel an undispatched intent atomically. After a dispatch marker, cancellation is a separate upstream action with its own receipt.",
+          "type": "string"
+        },
+        {
+          "const": "owner.confirmation.request",
+          "description": "Start a confirmation ceremony bound to one single-use action digest.",
+          "type": "string"
+        },
+        {
+          "const": "owner.confirmation.complete",
+          "description": "Complete the ceremony with a protected user-verification context. A click that desktop automation can synthesise is not that proof.",
+          "type": "string"
+        },
+        {
+          "const": "events.subscribe",
+          "description": "Subscribe to an event stream from a cursor.",
+          "type": "string"
+        },
+        {
+          "const": "events.snapshot",
+          "description": "Take a filtered snapshot and the cursor it was taken at, after RESYNC_REQUIRED.",
+          "type": "string"
+        },
+        {
+          "const": "history.page",
+          "description": "Page retained history. A history request never creates a worker.",
+          "type": "string"
+        },
+        {
+          "const": "action.read",
+          "description": "Read a retained receipt. Current authority is checked before it is returned.",
+          "type": "string"
+        },
+        {
+          "const": "grant.create",
+          "description": "Delegate a narrower grant. Persistent enlargement requires owner confirmation.",
+          "type": "string"
+        },
+        {
+          "const": "grant.revoke",
+          "description": "Revoke a grant and its descendants. Completion uses the per-worker dispatch barrier.",
+          "type": "string"
+        },
+        {
+          "const": "grant.list",
+          "description": "List grants this issuer may see, with their revisions and expiry.",
+          "type": "string"
+        },
+        {
+          "const": "push.installation.register",
+          "description": "Bind a push token to an installation identity after the token-receipt challenge.",
+          "type": "string"
+        },
+        {
+          "const": "push.sender.issue",
+          "description": "Issue a host-scoped delivery credential for one installation.",
+          "type": "string"
+        },
+        {
+          "const": "push.sender.renew",
+          "description": "Renew a delivery credential without changing destination, host key or rate policy.",
+          "type": "string"
+        },
+        {
+          "const": "push.sender.revoke",
+          "description": "Revoke a sender authorisation. A revoked record cannot renew.",
+          "type": "string"
+        },
+        {
+          "const": "mailbox.read",
+          "description": "Read encrypted mailbox envelopes. The service never sees their plaintext.",
+          "type": "string"
+        },
+        {
+          "const": "authority.sync",
+          "description": "Exchange signed revocation requests and host acknowledgements. Only the host issues its own ordered revisions, and it rejects an older revision.",
+          "type": "string"
+        },
+        {
+          "const": "sync.compare_exchange",
+          "description": "Publish encrypted settings or draft state under a compare-and-exchange generation.",
+          "type": "string"
+        },
+        {
+          "const": "backup.manifest",
+          "description": "Publish or fetch a backup generation manifest. Writer authority is verified.",
+          "type": "string"
+        },
+        {
+          "const": "voice.start",
+          "description": "Start a voice session. Budget and account checks happen at the managed broker.",
+          "type": "string"
+        },
+        {
+          "const": "voice.stop",
+          "description": "Stop a voice session. Ending it revokes its voice grant immediately.",
+          "type": "string"
+        },
+        {
+          "const": "voice.grant",
+          "description": "Create or change a voice grant, stating exactly which actions it permits.",
+          "type": "string"
+        },
+        {
+          "const": "voice.delegate",
+          "description": "Submit a delegation from the paired device. A provider delegation identifier is correlation data, never authority.",
+          "type": "string"
+        },
+        {
+          "const": "voice.context",
+          "description": "Read the selected voice context. Selection intersects this device's scope and never uses the host owner's broader history.",
+          "type": "string"
+        },
+        {
+          "const": "workflow.install",
+          "description": "Install a versioned automation definition under an explicit workflow grant.",
+          "type": "string"
+        },
+        {
+          "const": "workflow.enable",
+          "description": "Enable an installed definition at an exact revision.",
+          "type": "string"
+        },
+        {
+          "const": "workflow.pause",
+          "description": "Pause a definition. Exceeding a concurrency or budget limit pauses it automatically.",
+          "type": "string"
+        },
+        {
+          "const": "workflow.run",
+          "description": "Start a run, recording the trigger event, definition version and causal parent.",
+          "type": "string"
+        },
+        {
+          "const": "workflow.read",
+          "description": "Read definitions, runs, node receipts and remaining causal budget.",
+          "type": "string"
+        }
+      ]
+    },
+    "MethodEntry": {
+      "description": "One exhaustive authority entry.",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/CapabilityRequirement",
+          "description": "Which capability evidence is required, and at which revision."
+        },
+        "confirmation": {
+          "$ref": "#/$defs/ConfirmationRequirement",
+          "description": "Whether a fresh owner confirmation is required."
+        },
+        "effect": {
+          "$ref": "#/$defs/EffectClass",
+          "description": "Read or write."
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessRequirement",
+          "description": "Which freshness context the request must carry."
+        },
+        "group": {
+          "$ref": "#/$defs/MethodGroup",
+          "description": "The method group from section 23."
+        },
+        "history_filter": {
+          "$ref": "#/$defs/HistoryFilter",
+          "description": "How the history filter applies to the result."
+        },
+        "idempotency": {
+          "$ref": "#/$defs/IdempotencyBehaviour",
+          "description": "How a repeated request is resolved."
+        },
+        "ingress": {
+          "description": "The only ingress classes that may reach this method.",
+          "items": {
+            "$ref": "#/$defs/ActorIngress"
+          },
+          "type": "array"
+        },
+        "method": {
+          "$ref": "#/$defs/Method",
+          "description": "The method this entry governs."
+        },
+        "name": {
+          "description": "The stable wire name.",
+          "type": "string"
+        },
+        "required_rights": {
+          "description": "Everything the actor must present, intersected.",
+          "items": {
+            "$ref": "#/$defs/RequiredRight"
+          },
+          "type": "array"
+        },
+        "resource_selectors": {
+          "description": "The resources the request names and the host resolves.",
+          "items": {
+            "$ref": "#/$defs/ResourceSelectorKind"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "description": "What the method does.",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "#/$defs/MethodVersion",
+          "description": "The method version this entry describes."
+        }
+      },
+      "required": [
+        "method",
+        "name",
+        "group",
+        "version",
+        "effect",
+        "ingress",
+        "required_rights",
+        "resource_selectors",
+        "history_filter",
+        "capability",
+        "freshness",
+        "confirmation",
+        "idempotency",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "MethodGroup": {
+      "description": "The method groups of section 23.",
+      "oneOf": [
+        {
+          "const": "host_and_environment",
+          "description": "Host and environment.",
+          "type": "string"
+        },
+        {
+          "const": "pairing",
+          "description": "Pairing.",
+          "type": "string"
+        },
+        {
+          "const": "devices",
+          "description": "Devices.",
+          "type": "string"
+        },
+        {
+          "const": "plugin_catalogues",
+          "description": "Plugin catalogues.",
+          "type": "string"
+        },
+        {
+          "const": "plugins",
+          "description": "Plugins.",
+          "type": "string"
+        },
+        {
+          "const": "plugin_actions",
+          "description": "Plugin actions.",
+          "type": "string"
+        },
+        {
+          "const": "question_source",
+          "description": "Question source, reachable only over private IPC.",
+          "type": "string"
+        },
+        {
+          "const": "question_user_interface",
+          "description": "Question user interface.",
+          "type": "string"
+        },
+        {
+          "const": "skill_setup",
+          "description": "Skill setup.",
+          "type": "string"
+        },
+        {
+          "const": "sessions",
+          "description": "Sessions.",
+          "type": "string"
+        },
+        {
+          "const": "attachments",
+          "description": "Attachments.",
+          "type": "string"
+        },
+        {
+          "const": "input",
+          "description": "Input.",
+          "type": "string"
+        },
+        {
+          "const": "root_integration",
+          "description": "Root integration, reachable only over private IPC.",
+          "type": "string"
+        },
+        {
+          "const": "shell_launch",
+          "description": "Shell launch.",
+          "type": "string"
+        },
+        {
+          "const": "agent_state",
+          "description": "Agent state.",
+          "type": "string"
+        },
+        {
+          "const": "agent_mutations",
+          "description": "Agent mutations.",
+          "type": "string"
+        },
+        {
+          "const": "drafts_and_media",
+          "description": "Drafts and media.",
+          "type": "string"
+        },
+        {
+          "const": "project_repositories",
+          "description": "Project repositories.",
+          "type": "string"
+        },
+        {
+          "const": "workspaces",
+          "description": "Workspaces.",
+          "type": "string"
+        },
+        {
+          "const": "changes_and_diffs",
+          "description": "Changes and diffs.",
+          "type": "string"
+        },
+        {
+          "const": "review_and_attention",
+          "description": "Review and attention.",
+          "type": "string"
+        },
+        {
+          "const": "pending_action_control",
+          "description": "Pending action control.",
+          "type": "string"
+        },
+        {
+          "const": "owner_confirmation",
+          "description": "Owner confirmation.",
+          "type": "string"
+        },
+        {
+          "const": "state_recovery",
+          "description": "State recovery.",
+          "type": "string"
+        },
+        {
+          "const": "sharing",
+          "description": "Sharing.",
+          "type": "string"
+        },
+        {
+          "const": "services",
+          "description": "Services.",
+          "type": "string"
+        },
+        {
+          "const": "voice",
+          "description": "Voice.",
+          "type": "string"
+        },
+        {
+          "const": "automation",
+          "description": "Automation.",
+          "type": "string"
+        }
+      ]
+    },
+    "MethodName": {
+      "description": "A method name. A name that is not in the registry is denied.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)*$",
+      "type": "string"
+    },
+    "MethodVersion": {
+      "description": "The version of one method's schema.\n\nMutation schemas are closed for the negotiated version: an unknown field rejects rather than\nbeing stripped. Read-only metadata may add explicitly optional ignored fields.",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "MutationRequest": {
+      "additionalProperties": false,
+      "description": "A mutation request.\n\nThe payload digest covers the method and version, the actor and grant, the complete target, the\npreconditions, the action identifier, the freshness window and time to live, and the\nparameters. Replacing the window changes the digest, so it is never an automatic retry.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The durable operation identity, a cryptographically generated UUIDv4."
+        },
+        "action_window_id": {
+          "$ref": "#/$defs/ActionWindowId",
+          "description": "The host-issued action window this first admission is bound to."
+        },
+        "expected": {
+          "$ref": "#/$defs/ParamsValue",
+          "description": "The subject preconditions this mutation requires."
+        },
+        "grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant this mutation is claimed under. A local caller's host-stamped context leaves this\nnull and the host resolves its own owner authority."
+        },
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The method name."
+        },
+        "method_version": {
+          "$ref": "#/$defs/MethodVersion",
+          "description": "The method version."
+        },
+        "params": {
+          "$ref": "#/$defs/ParamsValue",
+          "description": "The method's parameters."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "Correlates the response. Durable operation identity is `action_id`, not this."
+        },
+        "requested_ttl_ms": {
+          "$ref": "#/$defs/DurationMs",
+          "description": "The requested lifetime. The host derives the accepted deadline and may shorten it. This is\na duration, not permission to refresh a replay."
+        },
+        "target": {
+          "$ref": "#/$defs/ActionTarget",
+          "description": "The exact subject."
+        }
+      },
+      "required": [
+        "request_id",
+        "method",
+        "method_version",
+        "action_id",
+        "grant_id",
+        "target",
+        "expected",
+        "action_window_id",
+        "requested_ttl_ms",
+        "params"
+      ],
+      "type": "object"
+    },
+    "Nonce256": {
+      "contentEncoding": "base64url",
+      "description": "A 32-byte nonce. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "type": "string"
+    },
+    "Notification": {
+      "additionalProperties": false,
+      "description": "One event on a subscribed stream.\n\nStream sequences are application sequence numbers. Transport streams do not replace them, and a\nclient that falls behind receives `RESYNC_REQUIRED` rather than holding the read loop.",
+      "properties": {
+        "event_type": {
+          "$ref": "#/$defs/EventType",
+          "description": "What happened."
+        },
+        "payload": {
+          "$ref": "#/$defs/ParamsValue",
+          "description": "The event payload."
+        },
+        "sequence": {
+          "$ref": "#/$defs/EventSequence",
+          "description": "The position of this event in that stream."
+        },
+        "stream_id": {
+          "$ref": "#/$defs/StreamId",
+          "description": "Which stream the event belongs to."
+        }
+      },
+      "required": [
+        "stream_id",
+        "sequence",
+        "event_type",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "OrganisationId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One organisation whose signed policy a host has opted into."
+    },
+    "OrganisationRequirement": {
+      "additionalProperties": false,
+      "description": "An organisation membership requirement attached to a grant.\n\nOrganisation leases keep their stricter policy: expired membership blocks further\norganisation-mediated reads and mutations even while the transport stays connected.",
+      "properties": {
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation whose membership the recipient must hold."
+        },
+        "policy_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The policy revision the host has pinned."
+        }
+      },
+      "required": [
+        "organisation_id",
+        "policy_revision"
+      ],
+      "type": "object"
+    },
+    "Outcome": {
+      "description": "The result of a request.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The request succeeded.",
+          "properties": {
+            "result": {
+              "$ref": "#/$defs/ParamsValue",
+              "description": "The method's result."
+            },
+            "status": {
+              "const": "ok",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The request failed.",
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/ProtocolError",
+              "description": "Why it failed."
+            },
+            "status": {
+              "const": "error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ParamsValue": {
+      "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings appear as unpadded base64url and cannot be told apart from text."
+    },
+    "ProtocolError": {
+      "additionalProperties": false,
+      "description": "The error object returned in a response or recorded on a receipt.\n\nThe message is plain text for a person or a log. The user interface translates the code into a\ndirect action and does not display protocol internals by default.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode",
+          "description": "The stable code."
+        },
+        "diagnostic_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiagnosticId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An opaque identifier for correlating this failure with host diagnostics."
+        },
+        "message": {
+          "description": "A plain message. It never carries credentials or command text.",
+          "type": "string"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryCategory",
+          "description": "How the client may react. It must equal [`ErrorCode::retry_category`] for the code."
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retry",
+        "diagnostic_id"
+      ],
+      "type": "object"
+    },
+    "ProtocolVersion": {
+      "additionalProperties": false,
+      "description": "One public protocol version.",
+      "properties": {
+        "major": {
+          "description": "The major version. A mismatch is not negotiable.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minor": {
+          "description": "The minor version. A peer selects the highest minor both sides support.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    },
+    "QuestionId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One agent-to-user question."
+    },
+    "Receipt": {
+      "additionalProperties": false,
+      "description": "One action receipt.\n\nThe de-duplication key is `(actor_id, action_id)`. An exact duplicate returns the stored\nreceipt; a reused identifier with a different payload digest is an `ID_CONFLICT`.",
+      "properties": {
+        "accepted_deadline_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The deadline the host derived at acceptance: the earliest of window expiry, receipt time\nplus the requested time to live, and any applicable authority or subject deadline. An exact\nretry never receives a new deadline."
+        },
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The durable operation identity."
+        },
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The verified actor that submitted it."
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProtocolError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The failure recorded with a refusal, rejection or unknown outcome."
+        },
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The method and version the digest covers."
+        },
+        "method_version": {
+          "$ref": "#/$defs/MethodVersion",
+          "description": "The method version the digest covers."
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the submitted payload, used to detect a reused identifier."
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RejectionReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the action was rejected, when the state is `rejected`."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "A monotonically increasing revision."
+        },
+        "state": {
+          "$ref": "#/$defs/ReceiptState",
+          "description": "The current state."
+        },
+        "updated_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When this revision was written."
+        }
+      },
+      "required": [
+        "action_id",
+        "actor_id",
+        "method",
+        "method_version",
+        "revision",
+        "state",
+        "reason",
+        "payload_digest",
+        "accepted_deadline_ms",
+        "error",
+        "updated_at_ms"
+      ],
+      "type": "object"
+    },
+    "ReceiptResponse": {
+      "additionalProperties": false,
+      "description": "The response to a mutation request.\n\nA duplicate request from a still-authorised actor returns the retained receipt without\ndispatch. The host checks current authority before returning it, so a revoked device cannot use\nan old action identifier to retrieve protected information.",
+      "properties": {
+        "receipt": {
+          "$ref": "#/$defs/Receipt",
+          "description": "The current receipt."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "The request this response correlates with."
+        }
+      },
+      "required": [
+        "request_id",
+        "receipt"
+      ],
+      "type": "object"
+    },
+    "ReceiptState": {
+      "description": "The state of one action receipt.",
+      "oneOf": [
+        {
+          "const": "received",
+          "description": "The connection acknowledged the request. Transient, never durable acceptance.",
+          "type": "string"
+        },
+        {
+          "const": "accepted",
+          "description": "The intent is durably committed. No dispatch marker exists yet.",
+          "type": "string"
+        },
+        {
+          "const": "dispatching",
+          "description": "A durable dispatch marker was committed before crossing the external-effect boundary.",
+          "type": "string"
+        },
+        {
+          "const": "applied",
+          "description": "The authoritative interface acknowledged the operation. Terminal for admission and\ndispatch; later work completion is separate evidence.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "The authoritative interface proved the operation was refused without the requested effect.\nTerminal. This is not a local pre-dispatch rejection.",
+          "type": "string"
+        },
+        {
+          "const": "rejected",
+          "description": "Never dispatched. Admission failure, or later expiry, cancellation, revocation or stale\npreconditions before dispatch. Terminal.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Dispatch may have occurred. This identifier is never dispatched again. Later authoritative\nreconciliation may move it to applied or refused; otherwise it stays unknown.",
+          "type": "string"
+        }
+      ]
+    },
+    "ReceiveLimits": {
+      "additionalProperties": false,
+      "description": "The receive limits a peer declares.\n\nBoth sides state their own bounds; the selection carries the negotiated values and the\ntranscript covers them, so a downgrade cannot be introduced after `hello`.",
+      "properties": {
+        "max_attachment_frame_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum attachment frame payload, in bytes."
+        },
+        "max_control_frame_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum control frame payload, in bytes."
+        },
+        "max_input_frame_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum input frame payload, in bytes."
+        },
+        "max_outstanding_mutations": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum outstanding mutations per session."
+        },
+        "max_send_queue_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum queued bytes before the peer is resynchronised."
+        }
+      },
+      "required": [
+        "max_control_frame_len",
+        "max_input_frame_len",
+        "max_attachment_frame_len",
+        "max_outstanding_mutations",
+        "max_send_queue_bytes"
+      ],
+      "type": "object"
+    },
+    "RejectionReason": {
+      "description": "Why an action was rejected before dispatch.",
+      "oneOf": [
+        {
+          "const": "admission_failed",
+          "description": "Admission failed: authority, preconditions, limits or schema.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "The accepted deadline passed before dispatch.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The actor or the host owner cancelled an undispatched intent.",
+          "type": "string"
+        },
+        {
+          "const": "revoked",
+          "description": "A revocation fenced the action before dispatch.",
+          "type": "string"
+        },
+        {
+          "const": "stale_preconditions",
+          "description": "A subject precondition no longer held in the serial dispatch path.",
+          "type": "string"
+        }
+      ]
+    },
+    "Request": {
+      "additionalProperties": false,
+      "description": "A read request.",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The method name. A name that is not in the registry is denied."
+        },
+        "method_version": {
+          "$ref": "#/$defs/MethodVersion",
+          "description": "The method version. Schemas are closed for the negotiated version."
+        },
+        "params": {
+          "$ref": "#/$defs/ParamsValue",
+          "description": "The method's parameters."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "Correlates the response. Unique for the lifetime of one connection."
+        }
+      },
+      "required": [
+        "request_id",
+        "method",
+        "method_version",
+        "params"
+      ],
+      "type": "object"
+    },
+    "RequestId": {
+      "$ref": "#/$defs/U64",
+      "description": "A request identifier, unique for the lifetime of one connection."
+    },
+    "RequiredAuthority": {
+      "description": "What a request must present besides a valid current grant.\n\nAn empty required-rights list is not \"no check\". It means the baseline only: a valid,\nunexpired, unrevoked grant for this actor covering the named environment.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One right from the section 10 action vocabulary.",
+          "properties": {
+            "kind": {
+              "const": "right",
+              "type": "string"
+            },
+            "right": {
+              "$ref": "#/$defs/ActionRight",
+              "description": "The required right."
+            }
+          },
+          "required": [
+            "kind",
+            "right"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Ownership of the named resource by the verified actor: its own draft, its own attachment,\nits own question or its own undispatched action.",
+          "properties": {
+            "kind": {
+              "const": "resource_owner",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A pairing transcript proof bound to the pinned endpoint identities.",
+          "properties": {
+            "kind": {
+              "const": "pairing_transcript",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The invitation's issuing-owner context.",
+          "properties": {
+            "kind": {
+              "const": "issuing_owner_context",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A separately created voice grant, intersected with the actor's ordinary grant.",
+          "properties": {
+            "kind": {
+              "const": "voice_grant",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An installation or host service credential presented at a service endpoint.",
+          "properties": {
+            "kind": {
+              "const": "service_credential",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The registered plugin effect's own declared rights, intersected at dispatch.",
+          "properties": {
+            "kind": {
+              "const": "plugin_effect_rights",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The verified originating application or helper and its caller token on private IPC.",
+          "properties": {
+            "kind": {
+              "const": "local_caller_token",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RequiredRight": {
+      "additionalProperties": false,
+      "description": "One entry in a method's required-authority list.\n\nA composite action intersects every entry whose condition holds. A configuration or role label\nnever short-circuits one of these checks.",
+      "properties": {
+        "authority": {
+          "$ref": "#/$defs/RequiredAuthority",
+          "description": "What must be presented."
+        },
+        "when": {
+          "$ref": "#/$defs/RightCondition",
+          "description": "When it must be presented."
+        }
+      },
+      "required": [
+        "authority",
+        "when"
+      ],
+      "type": "object"
+    },
+    "ResourceSelectorKind": {
+      "description": "Which resource identities a request names and the host resolves before the authority check.\n\nAn attachment's identifier alone is not permission: it selects a resource, and the rights check\nstill runs against the resolved resource.",
+      "oneOf": [
+        {
+          "const": "host",
+          "description": "The host itself.",
+          "type": "string"
+        },
+        {
+          "const": "environment",
+          "description": "One execution environment.",
+          "type": "string"
+        },
+        {
+          "const": "session",
+          "description": "One session.",
+          "type": "string"
+        },
+        {
+          "const": "attachment",
+          "description": "One attachment.",
+          "type": "string"
+        },
+        {
+          "const": "application_instance",
+          "description": "One foreground application instance.",
+          "type": "string"
+        },
+        {
+          "const": "device",
+          "description": "One paired device.",
+          "type": "string"
+        },
+        {
+          "const": "grant",
+          "description": "One grant.",
+          "type": "string"
+        },
+        {
+          "const": "invitation",
+          "description": "One pairing invitation and candidate attempt.",
+          "type": "string"
+        },
+        {
+          "const": "catalogue",
+          "description": "One plugin catalogue.",
+          "type": "string"
+        },
+        {
+          "const": "plugin",
+          "description": "One plugin package.",
+          "type": "string"
+        },
+        {
+          "const": "question",
+          "description": "One question.",
+          "type": "string"
+        },
+        {
+          "const": "draft",
+          "description": "One draft.",
+          "type": "string"
+        },
+        {
+          "const": "transfer",
+          "description": "One upload or download transfer.",
+          "type": "string"
+        },
+        {
+          "const": "project",
+          "description": "One project repository.",
+          "type": "string"
+        },
+        {
+          "const": "workspace",
+          "description": "One workspace.",
+          "type": "string"
+        },
+        {
+          "const": "change_set",
+          "description": "One change set version.",
+          "type": "string"
+        },
+        {
+          "const": "event_stream",
+          "description": "One event stream and cursor range.",
+          "type": "string"
+        },
+        {
+          "const": "action",
+          "description": "One action receipt.",
+          "type": "string"
+        },
+        {
+          "const": "workflow",
+          "description": "One automation definition or run.",
+          "type": "string"
+        },
+        {
+          "const": "installation",
+          "description": "One native application installation.",
+          "type": "string"
+        },
+        {
+          "const": "voice_session",
+          "description": "One managed voice session.",
+          "type": "string"
+        },
+        {
+          "const": "mailbox",
+          "description": "One encrypted mailbox.",
+          "type": "string"
+        },
+        {
+          "const": "agent_target",
+          "description": "The target agent of a skill installation.",
+          "type": "string"
+        }
+      ]
+    },
+    "Response": {
+      "additionalProperties": false,
+      "description": "A response correlated to one request.",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/Outcome",
+          "description": "The result."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "The request this response answers."
+        }
+      },
+      "required": [
+        "request_id",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "RetryCategory": {
+      "description": "How a client may react to an error.\n\nOnly idempotent reads, transfer chunks and requests whose receipt proves no dispatch may retry\nautomatically.",
+      "oneOf": [
+        {
+          "const": "no_retry",
+          "description": "Do not retry automatically. A new user action, a new subject version or a new action\nidentifier is required.",
+          "type": "string"
+        },
+        {
+          "const": "transient",
+          "description": "A transient condition. Only an idempotent read, a transfer chunk or a request whose receipt\nproves no dispatch may retry, under jittered exponential backoff.",
+          "type": "string"
+        },
+        {
+          "const": "resync",
+          "description": "The client's view is stale. Request a new snapshot and resume from the returned cursor.",
+          "type": "string"
+        },
+        {
+          "const": "configuration_change",
+          "description": "A configuration or software change is required. Retrying the same request cannot succeed.",
+          "type": "string"
+        },
+        {
+          "const": "outcome_unknown",
+          "description": "Dispatch may have occurred. Never retry this action identifier; show the unknown result and\nrequire a new identifier for an explicit later user request.",
+          "type": "string"
+        }
+      ]
+    },
+    "RevisionBinding": {
+      "description": "Which revision a capability check is bound to.",
+      "oneOf": [
+        {
+          "const": "agent_binding",
+          "description": "The active agent binding revision.",
+          "type": "string"
+        },
+        {
+          "const": "session_epoch",
+          "description": "The session epoch.",
+          "type": "string"
+        },
+        {
+          "const": "input_lease_epoch",
+          "description": "The current input lease epoch.",
+          "type": "string"
+        },
+        {
+          "const": "geometry_epoch",
+          "description": "The current geometry-owner epoch.",
+          "type": "string"
+        },
+        {
+          "const": "question_revision",
+          "description": "The exact question revision.",
+          "type": "string"
+        },
+        {
+          "const": "draft_revision",
+          "description": "The exact draft revision.",
+          "type": "string"
+        },
+        {
+          "const": "change_set_version",
+          "description": "The exact change-set version.",
+          "type": "string"
+        },
+        {
+          "const": "authority_revision",
+          "description": "The host authority revision.",
+          "type": "string"
+        },
+        {
+          "const": "device_key_revision",
+          "description": "The device's authorisation or preview key revision.",
+          "type": "string"
+        },
+        {
+          "const": "package_hash",
+          "description": "The verified plugin package hash.",
+          "type": "string"
+        },
+        {
+          "const": "repository_generation",
+          "description": "The catalogue repository generation.",
+          "type": "string"
+        },
+        {
+          "const": "workflow_definition_version",
+          "description": "The automation definition version.",
+          "type": "string"
+        },
+        {
+          "const": "root_editor_fence",
+          "description": "The trusted root editor's fence state.",
+          "type": "string"
+        },
+        {
+          "const": "installation_key_revision",
+          "description": "The installation key revision at a push gateway.",
+          "type": "string"
+        }
+      ]
+    },
+    "RightCondition": {
+      "description": "When a required authority applies.",
+      "oneOf": [
+        {
+          "const": "always",
+          "description": "Always required.",
+          "type": "string"
+        },
+        {
+          "const": "geometry_claim",
+          "description": "Required only when the request claims or adds a geometry claim.",
+          "type": "string"
+        },
+        {
+          "const": "other_actor",
+          "description": "Required only when the subject belongs to another actor.",
+          "type": "string"
+        },
+        {
+          "const": "candidate_endpoint",
+          "description": "Required only when the caller is the pairing candidate rather than the issuing owner.",
+          "type": "string"
+        },
+        {
+          "const": "issuing_owner",
+          "description": "Required only when the caller is the invitation's issuing owner rather than the candidate.",
+          "type": "string"
+        }
+      ]
+    },
+    "SessionEpoch": {
+      "$ref": "#/$defs/U64",
+      "description": "The session epoch, fixed at 1 in protocol version 1."
+    },
+    "SessionId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One KalaReach terminal session."
+    },
+    "SessionRef": {
+      "additionalProperties": false,
+      "description": "A session and the epoch it was addressed in.",
+      "properties": {
+        "session_epoch": {
+          "$ref": "#/$defs/SessionEpoch",
+          "description": "The session epoch. Version 1 always uses [`SessionEpoch::V1`]."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session identifier."
+        }
+      },
+      "required": [
+        "session_id",
+        "session_epoch"
+      ],
+      "type": "object"
+    },
+    "SessionSelector": {
+      "description": "Which sessions a grant covers.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Every session inside the selected environments.",
+          "properties": {
+            "kind": {
+              "const": "any",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Only the named sessions.",
+          "properties": {
+            "kind": {
+              "const": "these",
+              "type": "string"
+            },
+            "session_ids": {
+              "description": "The permitted sessions.",
+              "items": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "kind",
+            "session_ids"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "No session. The grant covers host-level effects only.",
+          "properties": {
+            "kind": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "StreamHeader": {
+      "additionalProperties": false,
+      "description": "The bounded header every stream sends first.",
+      "properties": {
+        "connection_id": {
+          "$ref": "#/$defs/ConnectionId",
+          "description": "The control connection this stream is validated against."
+        },
+        "kind": {
+          "$ref": "#/$defs/StreamKind",
+          "description": "What this stream carries."
+        },
+        "resource": {
+          "$ref": "#/$defs/StreamResource",
+          "description": "The authorised resource."
+        },
+        "stream_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StreamId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The event stream this data stream corresponds to, where one applies."
+        }
+      },
+      "required": [
+        "kind",
+        "connection_id",
+        "stream_id",
+        "resource"
+      ],
+      "type": "object"
+    },
+    "StreamId": {
+      "description": "The name of one event stream.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "StreamKind": {
+      "description": "What one stream carries.\n\nControl and receipts, terminal output, terminal input, semantic updates and attachment chunks\nuse distinct streams so the host's scheduler can prioritise control and receipts over bulk\ntransfers.",
+      "oneOf": [
+        {
+          "const": "control",
+          "description": "Requests, responses and receipts.",
+          "type": "string"
+        },
+        {
+          "const": "terminal_output",
+          "description": "Terminal output bytes.",
+          "type": "string"
+        },
+        {
+          "const": "terminal_input",
+          "description": "Terminal input bytes.",
+          "type": "string"
+        },
+        {
+          "const": "semantic_updates",
+          "description": "Semantic updates.",
+          "type": "string"
+        },
+        {
+          "const": "attachment_chunks",
+          "description": "Attachment chunks.",
+          "type": "string"
+        }
+      ]
+    },
+    "StreamResource": {
+      "additionalProperties": false,
+      "description": "The authorised resource a stream belongs to.",
+      "properties": {
+        "attachment_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachmentId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The attachment, for attachment-scoped terminal streams."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns the resource."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session, for session streams."
+        },
+        "transfer_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TransferId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The transfer, for attachment chunk streams."
+        }
+      },
+      "required": [
+        "environment_id",
+        "session_id",
+        "attachment_id",
+        "transfer_id"
+      ],
+      "type": "object"
+    },
+    "TimestampMs": {
+      "description": "A UTC timestamp in milliseconds, as a decimal string in JSON.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "TransferId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One upload or download transfer."
+    },
+    "U64": {
+      "description": "An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "Uuid": {
+      "description": "A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.",
+  "properties": {
+    "actor_envelope": {
+      "$ref": "#/$defs/ActorEnvelope"
+    },
+    "client_offer": {
+      "$ref": "#/$defs/ClientOffer"
+    },
+    "grant": {
+      "$ref": "#/$defs/Grant"
+    },
+    "host_selection": {
+      "$ref": "#/$defs/HostSelection"
+    },
+    "method_entry": {
+      "$ref": "#/$defs/MethodEntry"
+    },
+    "mutation_request": {
+      "$ref": "#/$defs/MutationRequest"
+    },
+    "notification": {
+      "$ref": "#/$defs/Notification"
+    },
+    "protocol_error": {
+      "$ref": "#/$defs/ProtocolError"
+    },
+    "receipt": {
+      "$ref": "#/$defs/Receipt"
+    },
+    "receipt_response": {
+      "$ref": "#/$defs/ReceiptResponse"
+    },
+    "request": {
+      "$ref": "#/$defs/Request"
+    },
+    "response": {
+      "$ref": "#/$defs/Response"
+    },
+    "session_ref": {
+      "$ref": "#/$defs/SessionRef"
+    },
+    "stream_header": {
+      "$ref": "#/$defs/StreamHeader"
+    }
+  },
+  "title": "KalaReach protocol",
+  "type": "object"
+}

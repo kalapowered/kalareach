@@ -1,0 +1,4388 @@
+{
+  "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
+  "method_count": 127,
+  "methods": [
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "host.info",
+      "name": "host.info",
+      "required_rights": [],
+      "resource_selectors": [
+        "host"
+      ],
+      "summary": "Host build identity, protocol limits and configured services.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "environment.list",
+      "name": "environment.list",
+      "required_rights": [],
+      "resource_selectors": [
+        "host"
+      ],
+      "summary": "The environments this actor's grant admits.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "environment.capabilities",
+      "name": "environment.capabilities",
+      "required_rights": [],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "What one environment can currently do. Capability evidence, never authority.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "host.doctor",
+      "name": "host.doctor",
+      "required_rights": [],
+      "resource_selectors": [
+        "host",
+        "environment"
+      ],
+      "summary": "Host diagnostics with credentials redacted.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "always",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "pairing",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "pair.invite",
+      "name": "pair.invite",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host",
+        "invitation"
+      ],
+      "summary": "Issue a five-minute single-use pairing invitation in code or direct mode.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "invitation_deadline",
+      "group": "pairing",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "invitation_id + attempt_id",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "unpaired_peer"
+      ],
+      "method": "pair.redeem",
+      "name": "pair.redeem",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "pairing_transcript"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "invitation"
+      ],
+      "summary": "Redeem an invitation from the bounded pre-authorisation surface.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "invitation_deadline",
+      "group": "pairing",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "invitation_id + attempt_id",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "unpaired_peer"
+      ],
+      "method": "pair.finish",
+      "name": "pair.finish",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "pairing_transcript"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "invitation"
+      ],
+      "summary": "Bind the pairing transcript to the live iroh endpoint identities.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "always",
+      "effect": "write",
+      "freshness": "invitation_deadline",
+      "group": "pairing",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "invitation_id + client bundle hash",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "pair.confirm",
+      "name": "pair.confirm",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "issuing_owner_context"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "invitation",
+        "device",
+        "grant"
+      ],
+      "summary": "Commit the device record and its grant after owner approval.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "invitation_deadline",
+      "group": "pairing",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "invitation_id",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "pair.cancel",
+      "name": "pair.cancel",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "issuing_owner_context"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "invitation"
+      ],
+      "summary": "Consume an invitation without issuing a grant.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "invitation_deadline",
+      "group": "pairing",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "unpaired_peer",
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "pair.status",
+      "name": "pair.status",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "pairing_transcript"
+          },
+          "when": "candidate_endpoint"
+        },
+        {
+          "authority": {
+            "kind": "issuing_owner_context"
+          },
+          "when": "issuing_owner"
+        }
+      ],
+      "resource_selectors": [
+        "invitation"
+      ],
+      "summary": "Report a pending or committed pairing result, never secret material.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "devices",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "device.list",
+      "name": "device.list",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "device"
+      ],
+      "summary": "Paired devices, their key purposes and each host's last authority acknowledgement.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "devices",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "device.revoke",
+      "name": "device.revoke",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "device",
+        "grant"
+      ],
+      "summary": "Revoke a device. Completion requires the per-worker dispatch barrier, not a lease timer.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "device.preview_key",
+        "kind": "required",
+        "revision": "device_key_revision"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "devices",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "device.preview_key.update",
+      "name": "device.preview_key.update",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "device"
+      ],
+      "summary": "Rotate this device's own notification-preview key through its paired proof.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "plugin_catalogues",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "catalogue.list",
+      "name": "catalogue.list",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "catalogue"
+      ],
+      "summary": "Configured plugin catalogues, their roots, generations and budgets.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "catalogue.root",
+        "kind": "required",
+        "revision": "repository_generation"
+      },
+      "confirmation": "always",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugin_catalogues",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "catalogue.add",
+      "name": "catalogue.add",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "catalogue"
+      ],
+      "summary": "Trust a new catalogue root. A new root always requires fresh owner confirmation.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "catalogue.root",
+        "kind": "required",
+        "revision": "repository_generation"
+      },
+      "confirmation": "when_enlarging_authority",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugin_catalogues",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "catalogue.sync",
+      "name": "catalogue.sync",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "catalogue"
+      ],
+      "summary": "Synchronise a catalogue generation within its verified trust ceiling.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "catalogue.root",
+        "kind": "required",
+        "revision": "repository_generation"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugin_catalogues",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "catalogue.pin",
+      "name": "catalogue.pin",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "catalogue"
+      ],
+      "summary": "Pin a catalogue to an exact generation.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugin_catalogues",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "catalogue.remove",
+      "name": "catalogue.remove",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "catalogue"
+      ],
+      "summary": "Remove a catalogue and stop trusting its root.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "plugins",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "plugin.list",
+      "name": "plugin.list",
+      "required_rights": [],
+      "resource_selectors": [
+        "plugin",
+        "environment"
+      ],
+      "summary": "Installed plugins, their pinned packages and their enabled state.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "plugin.package",
+        "kind": "required",
+        "revision": "package_hash"
+      },
+      "confirmation": "when_enlarging_authority",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugins",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "plugin.install",
+      "name": "plugin.install",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "plugin",
+        "catalogue",
+        "environment"
+      ],
+      "summary": "Install a verified package inside the repository's trust ceiling.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugins",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "plugin.remove",
+      "name": "plugin.remove",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "plugin",
+        "environment"
+      ],
+      "summary": "Remove an installed plugin from an environment.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "plugin.package",
+        "kind": "required",
+        "revision": "package_hash"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugins",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "plugin.pin",
+      "name": "plugin.pin",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "plugin",
+        "environment"
+      ],
+      "summary": "Pin a plugin to an exact package hash.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "plugin.package",
+        "kind": "required",
+        "revision": "package_hash"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugins",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "plugin.enable",
+      "name": "plugin.enable",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "plugin",
+        "environment"
+      ],
+      "summary": "Enable an installed plugin in an environment.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugins",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "plugin.disable",
+      "name": "plugin.disable",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "plugin",
+        "environment"
+      ],
+      "summary": "Disable an installed plugin without removing it.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "plugin.package",
+        "kind": "required",
+        "revision": "package_hash"
+      },
+      "confirmation": "always",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugins",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "plugin.grant",
+      "name": "plugin.grant",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "plugin",
+        "environment"
+      ],
+      "summary": "Grant a plugin capability. Executable and native-bridge capabilities need confirmation.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "plugin.package",
+        "kind": "required",
+        "revision": "package_hash"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "plugins",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "plugin.capabilities",
+      "name": "plugin.capabilities",
+      "required_rights": [],
+      "resource_selectors": [
+        "plugin",
+        "environment"
+      ],
+      "summary": "What one installed plugin can currently do under its verified package.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "plugin.action",
+        "kind": "required",
+        "revision": "package_hash"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "plugin_actions",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "plugin.action.invoke",
+      "name": "plugin.action.invoke",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "plugin_effect_rights"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "plugin",
+        "session",
+        "application_instance",
+        "draft"
+      ],
+      "summary": "Invoke a registered plugin action. Its own entry adds the rights this call intersects.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "question_source",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "question.create",
+      "name": "question.create",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "local_caller_token"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "question"
+      ],
+      "summary": "Create a question from a verified originating application. Source ownership never impersonates a human answer or chooses an ungranted destination.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "question_source",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "question.read_own",
+      "name": "question.read_own",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "local_caller_token"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "question"
+      ],
+      "summary": "Read the questions this source created.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "question",
+        "kind": "required",
+        "revision": "question_revision"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "question_source",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "question.cancel_own",
+      "name": "question.cancel_own",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "local_caller_token"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "question"
+      ],
+      "summary": "Cancel a question this source created.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "question_source",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "alert.create",
+      "name": "alert.create",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "local_caller_token"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Raise an alert from a verified originating application.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "question_user_interface",
+      "history_filter": "named_current_resources",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "question.read",
+      "name": "question.read",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "question"
+      ],
+      "summary": "Read questions this actor may see, at their exact current revision.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "question",
+        "kind": "required",
+        "revision": "question_revision"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "question_user_interface",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "question.answer",
+      "name": "question.answer",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "question.respond"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "question"
+      ],
+      "summary": "Answer the exact question revision shown, resolved atomically.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "question",
+        "kind": "required",
+        "revision": "question_revision"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "question_user_interface",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "question.cancel",
+      "name": "question.cancel",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "question.respond"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "question"
+      ],
+      "summary": "Cancel the exact question revision shown, resolved atomically.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "skill_setup",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "agent_tools.install",
+      "name": "agent_tools.install",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host",
+        "agent_target"
+      ],
+      "summary": "Install the contact skill for a target agent under an exact change manifest.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "skill_setup",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "agent_tools.status",
+      "name": "agent_tools.status",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host",
+        "agent_target"
+      ],
+      "summary": "Report what is installed for a target agent, at which scope and version.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "skill_setup",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "agent_tools.remove",
+      "name": "agent_tools.remove",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host",
+        "agent_target"
+      ],
+      "summary": "Remove the contact skill from a target agent under an exact change manifest.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "sessions",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "session.list",
+      "name": "session.list",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "List the sessions this actor may observe.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "sessions",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "session.create",
+      "name": "session.create",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.create"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "session"
+      ],
+      "summary": "Create a session. Deduplication happens in the controller before a worker exists.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "sessions",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "session.read",
+      "name": "session.read",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Read one session's filtered metadata and current state.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "sessions",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "session.close",
+      "name": "session.close",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.close"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Close a session and hand its final metadata to the archive service.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "sessions",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "session.describe",
+      "name": "session.describe",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "An authorised read of filtered session metadata, not arbitrary model control.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "sessions",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "session.rename",
+      "name": "session.rename",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.rename"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Set a session's pinned label.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "attachments",
+      "history_filter": "live_view_only",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "session.attach",
+      "name": "session.attach",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "right",
+            "right": "terminal.geometry"
+          },
+          "when": "geometry_claim"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Attach in semantic or terminal mode. A geometry claim needs terminal.geometry as well.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "attachments",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "session.detach",
+      "name": "session.detach",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Detach this actor's own attachment and run geometry succession.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "attachments",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "attachment.configure",
+      "name": "attachment.configure",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "right",
+            "right": "terminal.geometry"
+          },
+          "when": "geometry_claim"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Withdraw or add an authorised geometry claim without displacing the current owner.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "attachments",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "attachment.viewport",
+      "name": "attachment.viewport",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Report this attachment's physical dimensions. It never changes the pseudoterminal.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "terminal.geometry",
+        "kind": "required",
+        "revision": "geometry_epoch"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "attachments",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "terminal.resize",
+      "name": "terminal.resize",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "terminal.geometry"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Resize the pseudoterminal. Only the current geometry owner at the current epoch may.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "terminal.geometry",
+        "kind": "required",
+        "revision": "geometry_epoch"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "attachments",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "terminal.geometry.transfer",
+      "name": "terminal.geometry.transfer",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "terminal.geometry.transfer"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Hand geometry ownership to another eligible attachment.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "attachments",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "terminal.palette.set",
+      "name": "terminal.palette.set",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "terminal.palette"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Set the session palette.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "terminal.input",
+        "kind": "required",
+        "revision": "input_lease_epoch"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "input",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "input.acquire",
+      "name": "input.acquire",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "terminal.input"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Acquire the input lease explicitly. There is no implicit remote acquisition.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "terminal.input",
+        "kind": "required",
+        "revision": "input_lease_epoch"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "input",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "input.release",
+      "name": "input.release",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "terminal.input"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Release the input lease this actor holds.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "terminal.input",
+        "kind": "required",
+        "revision": "input_lease_epoch"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "input",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "input.interrupt",
+      "name": "input.interrupt",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "terminal.input"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Send an interrupt under the current lease.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "terminal.input",
+        "kind": "required",
+        "revision": "input_lease_epoch"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "input_lease",
+      "group": "input",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "ordered_stream"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "input.write",
+      "name": "input.write",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "terminal.input"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "Write ordered raw input under the current lease epoch and input sequence. Unsent or ambiguously delivered keystrokes are discarded, never replayed.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "shell.root_integration",
+        "kind": "required",
+        "revision": "root_editor_fence"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "root_integration",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "root.editor.enter",
+      "name": "root.editor.enter",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "local_caller_token"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "The validated root process reports that its line editor is active.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "shell.root_integration",
+        "kind": "required",
+        "revision": "root_editor_fence"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "root_integration",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "root.editor.leave",
+      "name": "root.editor.leave",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "local_caller_token"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "The validated root process reports that its line editor is no longer active.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "shell.root_integration",
+        "kind": "required",
+        "revision": "root_editor_fence"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "root_integration",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "root.editor.fence",
+      "name": "root.editor.fence",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "local_caller_token"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Advance the root editor fence so an intervening local edit is detected.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "shell.root_integration",
+        "kind": "required",
+        "revision": "root_editor_fence"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "root_integration",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "root.eof.detach",
+      "name": "root.eof.detach",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "local_caller_token"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "attachment"
+      ],
+      "summary": "The root shell reached end of file and the session detaches instead of exiting blindly.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "shell.root_integration",
+        "kind": "required",
+        "revision": "root_editor_fence"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "root_integration",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "root.command.accepted",
+      "name": "root.command.accepted",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "local_caller_token"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "The root integration confirms that the installed command was accepted by the editor.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "shell.root_integration",
+        "kind": "required",
+        "revision": "root_editor_fence"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "shell_launch",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "shell.launch",
+      "name": "shell.launch",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "terminal.input"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Install and submit an argument vector or correctly quoted command through the trusted root editor. An intervening local edit returns DRAFT_CONFLICT.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "agent.binding",
+        "kind": "required",
+        "revision": "agent_binding"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "agent_state",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "agent.capabilities",
+      "name": "agent.capabilities",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "application_instance"
+      ],
+      "summary": "What the bound agent can currently do, with its capability evidence.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "agent.binding",
+        "kind": "required",
+        "revision": "agent_binding"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "agent_state",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "agent.snapshot",
+      "name": "agent.snapshot",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "application_instance"
+      ],
+      "summary": "A filtered snapshot of the bound agent's shared state.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "agent.binding",
+        "kind": "required",
+        "revision": "agent_binding"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "agent_state",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "agent.commands",
+      "name": "agent.commands",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "application_instance"
+      ],
+      "summary": "The commands the bound agent advertises.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "agent.prompt",
+        "kind": "required",
+        "revision": "agent_binding"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "agent_mutations",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "agent.prompt.submit",
+      "name": "agent.prompt.submit",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "agent.prompt"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "application_instance",
+        "draft"
+      ],
+      "summary": "Submit a prompt. Applied means upstream admission, not task completion.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "agent.prompt",
+        "kind": "required",
+        "revision": "agent_binding"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "agent_mutations",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "agent.prompt.queue",
+      "name": "agent.prompt.queue",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "agent.prompt"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "application_instance",
+        "draft"
+      ],
+      "summary": "Queue a prompt behind the current turn.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "agent.steer",
+        "kind": "required",
+        "revision": "agent_binding"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "agent_mutations",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "agent.turn.steer",
+      "name": "agent.turn.steer",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "agent.prompt"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "application_instance"
+      ],
+      "summary": "Steer the current turn where the upstream agent supports it.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "agent.cancel",
+        "kind": "required",
+        "revision": "agent_binding"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "agent_mutations",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "agent.turn.cancel",
+      "name": "agent.turn.cancel",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "agent.cancel"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "application_instance"
+      ],
+      "summary": "Cancel the current turn using its typed request and current turn identifier.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "agent.approval",
+        "kind": "required",
+        "revision": "agent_binding"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "agent_mutations",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "agent.approval.respond",
+      "name": "agent.approval.respond",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "agent.approval.respond"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "application_instance"
+      ],
+      "summary": "Answer an upstream approval request at its exact revision and pending state.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "drafts_and_media",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "draft.create",
+      "name": "draft.create",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "draft"
+      ],
+      "summary": "Create a device-owned draft that survives attachment replacement.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "draft",
+        "kind": "required",
+        "revision": "draft_revision"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "drafts_and_media",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "draft.update",
+      "name": "draft.update",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "draft"
+      ],
+      "summary": "Update a draft at its exact revision. A draft is never submitted automatically.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "agent.attachment",
+        "kind": "required",
+        "revision": "agent_binding"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "drafts_and_media",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "agent.draft.add_attachment",
+      "name": "agent.draft.add_attachment",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.upload"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "right",
+            "right": "agent.prompt"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "draft",
+        "transfer",
+        "session",
+        "application_instance"
+      ],
+      "summary": "Insert a completed attachment handle into a draft through the active adapter.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "drafts_and_media",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "upload.begin",
+      "name": "upload.begin",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.upload"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "transfer"
+      ],
+      "summary": "Reserve the declared size and return an upload identifier, chunk size and expiry.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "drafts_and_media",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "upload.status",
+      "name": "upload.status",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.upload"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer"
+      ],
+      "summary": "Report verified chunk status so an interrupted transfer resumes without republishing.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "drafts_and_media",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "upload_id + chunk index + chunk digest",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "upload.chunk",
+      "name": "upload.chunk",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.upload"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer"
+      ],
+      "summary": "Send one chunk with its index, exact length and digest. A matching duplicate is acknowledged; a conflicting duplicate invalidates the upload.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "drafts_and_media",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "upload_id",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "upload.finish",
+      "name": "upload.finish",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.upload"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer"
+      ],
+      "summary": "Verify the declared digest and size, then publish the attachment handle atomically.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "drafts_and_media",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "upload_id",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "upload.cancel",
+      "name": "upload.cancel",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.upload"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer"
+      ],
+      "summary": "Cancel an unfinished upload and release its reservation.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "drafts_and_media",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "key": "transfer_id",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "download.begin",
+      "name": "download.begin",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.read"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "transfer"
+      ],
+      "summary": "Open an immutable source revision or bounded staging snapshot and describe its chunks.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "drafts_and_media",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "download.chunk",
+      "name": "download.chunk",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.read"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer"
+      ],
+      "summary": "Read one chunk of the same snapshot. Read authority is checked on every request.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "project_repositories",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "project.list",
+      "name": "project.list",
+      "required_rights": [],
+      "resource_selectors": [
+        "environment",
+        "project"
+      ],
+      "summary": "List environment-local repositories as scoped metadata.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "project_repositories",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "project.read",
+      "name": "project.read",
+      "required_rights": [],
+      "resource_selectors": [
+        "project"
+      ],
+      "summary": "Read one repository's scoped metadata.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "project_repositories",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "project.init",
+      "name": "project.init",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "project.create"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "project"
+      ],
+      "summary": "Initialise a repository at an authorised destination handle.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "project_repositories",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "project.clone",
+      "name": "project.clone",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "project.create"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "project"
+      ],
+      "summary": "Clone into an authorised destination through the approved credential broker.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "project_repositories",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "project.adopt",
+      "name": "project.adopt",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "project.create"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "project"
+      ],
+      "summary": "Adopt an existing checkout through the explicit adoption flow.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "project_repositories",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "project.operation.cancel",
+      "name": "project.operation.cancel",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "project",
+        "action"
+      ],
+      "summary": "Cancel owned repository work and report retained or removed staging paths.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "workspaces",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "workspace.list",
+      "name": "workspace.list",
+      "required_rights": [],
+      "resource_selectors": [
+        "environment",
+        "workspace"
+      ],
+      "summary": "List workspaces. A view never implies deletion.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "workspaces",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "workspace.create",
+      "name": "workspace.create",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "workspace.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "project",
+        "workspace"
+      ],
+      "summary": "Create a shared or isolated workspace with explicit inclusion rules.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "workspaces",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "workspace.read",
+      "name": "workspace.read",
+      "required_rights": [],
+      "resource_selectors": [
+        "workspace"
+      ],
+      "summary": "Read one workspace's policy and bound sessions.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "workspaces",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "workspace.remove",
+      "name": "workspace.remove",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "workspace.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "workspace"
+      ],
+      "summary": "Remove a workspace once its retention rules and pins permit it.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "changes_and_diffs",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "diff.read",
+      "name": "diff.read",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.read"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "workspace",
+        "change_set"
+      ],
+      "summary": "Read a diff with repository identity, base, head and content revisions.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "workspace.destination",
+        "kind": "required",
+        "revision": "change_set_version"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "changes_and_diffs",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "diff.apply",
+      "name": "diff.apply",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.apply_diff"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "workspace",
+        "change_set"
+      ],
+      "summary": "Apply a diff under the destination's concurrency contract. A preflight conflict returns DRAFT_CONFLICT without any write.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "workspace.destination",
+        "kind": "required",
+        "revision": "change_set_version"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "changes_and_diffs",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "diff.revert",
+      "name": "diff.revert",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.apply_diff"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "workspace",
+        "change_set"
+      ],
+      "summary": "Revert a previously applied change under the same destination contract.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "changes_and_diffs",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "changeset.capture",
+      "name": "changeset.capture",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "changeset.create"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "workspace",
+        "change_set"
+      ],
+      "summary": "Capture an immutable change-set version with its policy and provenance.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "changeset",
+        "kind": "required",
+        "revision": "change_set_version"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "changes_and_diffs",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "changeset.read",
+      "name": "changeset.read",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "files.read"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "change_set"
+      ],
+      "summary": "Read one exact change-set version.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "changeset",
+        "kind": "required",
+        "revision": "change_set_version"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "changes_and_diffs",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "changeset.materialize",
+      "name": "changeset.materialize",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "workspace.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "change_set",
+        "workspace"
+      ],
+      "summary": "Materialise an exact change-set version into an independent workspace.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "review_and_attention",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "review.read",
+      "name": "review.read",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "change_set"
+      ],
+      "summary": "Read review state bound to exact change-set versions.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "changeset",
+        "kind": "required",
+        "revision": "change_set_version"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "review_and_attention",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "review.acknowledge",
+      "name": "review.acknowledge",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "change_set"
+      ],
+      "summary": "Acknowledge review of one version. It affects only this actor and mutates no code.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "review_and_attention",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "attention.read",
+      "name": "attention.read",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "session"
+      ],
+      "summary": "Read the attention inbox for this actor's scope.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "review_and_attention",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "attention.acknowledge",
+      "name": "attention.acknowledge",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "session"
+      ],
+      "summary": "Acknowledge an attention item for this actor only.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "review_and_attention",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "visit.acknowledge",
+      "name": "visit.acknowledge",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Record this actor's visit so changed-since-last-visit stays per actor.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "pending_action_control",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "action.cancel",
+      "name": "action.cancel",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "other_actor"
+        }
+      ],
+      "resource_selectors": [
+        "action"
+      ],
+      "summary": "Cancel an undispatched intent atomically. After a dispatch marker, cancellation is a separate upstream action with its own receipt.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "owner_confirmation",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "owner.confirmation.request",
+      "name": "owner.confirmation.request",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "issuing_owner_context"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host",
+        "action"
+      ],
+      "summary": "Start a confirmation ceremony bound to one single-use action digest.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "always",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "owner_confirmation",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "single-use action digest",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "owner.confirmation.complete",
+      "name": "owner.confirmation.complete",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "issuing_owner_context"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host",
+        "action"
+      ],
+      "summary": "Complete the ceremony with a protected user-verification context. A click that desktop automation can synthesise is not that proof.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "state_recovery",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "events.subscribe",
+      "name": "events.subscribe",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "event_stream"
+      ],
+      "summary": "Subscribe to an event stream from a cursor.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "state_recovery",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "events.snapshot",
+      "name": "events.snapshot",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "event_stream"
+      ],
+      "summary": "Take a filtered snapshot and the cursor it was taken at, after RESYNC_REQUIRED.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "state_recovery",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "history.page",
+      "name": "history.page",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "event_stream"
+      ],
+      "summary": "Page retained history. A history request never creates a worker.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "state_recovery",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "action.read",
+      "name": "action.read",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "resource_owner"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "action"
+      ],
+      "summary": "Read a retained receipt. Current authority is checked before it is returned.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "grant.parent",
+        "kind": "required",
+        "revision": "authority_revision"
+      },
+      "confirmation": "when_enlarging_authority",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "sharing",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "grant.create",
+      "name": "grant.create",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.share"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "grant",
+        "device"
+      ],
+      "summary": "Delegate a narrower grant. Persistent enlargement requires owner confirmation.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "grant.parent",
+        "kind": "required",
+        "revision": "authority_revision"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "sharing",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "grant.revoke",
+      "name": "grant.revoke",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.share"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "grant"
+      ],
+      "summary": "Revoke a grant and its descendants. Completion uses the per-worker dispatch barrier.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "sharing",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "grant.list",
+      "name": "grant.list",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.share"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "grant"
+      ],
+      "summary": "List grants this issuer may see, with their revisions and expiry.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "push.installation",
+        "kind": "required",
+        "revision": "installation_key_revision"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "token hash + installation key",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "push.installation.register",
+      "name": "push.installation.register",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "service_credential"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "installation"
+      ],
+      "summary": "Bind a push token to an installation identity after the token-receipt challenge.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "push.installation",
+        "kind": "required",
+        "revision": "installation_key_revision"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "sender record id",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "push.sender.issue",
+      "name": "push.sender.issue",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "service_credential"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "installation",
+        "host"
+      ],
+      "summary": "Issue a host-scoped delivery credential for one installation.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "sender record id",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "push.sender.renew",
+      "name": "push.sender.renew",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "service_credential"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "installation",
+        "host"
+      ],
+      "summary": "Renew a delivery credential without changing destination, host key or rate policy.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "sender record id",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "push.sender.revoke",
+      "name": "push.sender.revoke",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "service_credential"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "installation",
+        "host"
+      ],
+      "summary": "Revoke a sender authorisation. A revoked record cannot renew.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "mailbox.read",
+      "name": "mailbox.read",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "service_credential"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "mailbox"
+      ],
+      "summary": "Read encrypted mailbox envelopes. The service never sees their plaintext.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "authority.feed",
+        "kind": "required",
+        "revision": "authority_revision"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "authority revision + host acknowledgement",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "authority.sync",
+      "name": "authority.sync",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "service_credential"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host",
+        "grant"
+      ],
+      "summary": "Exchange signed revocation requests and host acknowledgements. Only the host issues its own ordered revisions, and it rejects an older revision.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "collection generation",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "sync.compare_exchange",
+      "name": "sync.compare_exchange",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "service_credential"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "mailbox"
+      ],
+      "summary": "Publish encrypted settings or draft state under a compare-and-exchange generation.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "key": "backup generation",
+        "kind": "keyed"
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "backup.manifest",
+      "name": "backup.manifest",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "service_credential"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "mailbox"
+      ],
+      "summary": "Publish or fetch a backup generation manifest. Writer authority is verified.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "voice",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "voice.start",
+      "name": "voice.start",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "voice_grant"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "voice_session"
+      ],
+      "summary": "Start a voice session. Budget and account checks happen at the managed broker.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "voice",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "voice.stop",
+      "name": "voice.stop",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "voice_grant"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "voice_session"
+      ],
+      "summary": "Stop a voice session. Ending it revokes its voice grant immediately.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "when_enlarging_authority",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "voice",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "voice.grant",
+      "name": "voice.grant",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "host.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host",
+        "session"
+      ],
+      "summary": "Create or change a voice grant, stating exactly which actions it permits.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "voice",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "voice.delegate",
+      "name": "voice.delegate",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "voice_grant"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "voice_session"
+      ],
+      "summary": "Submit a delegation from the paired device. A provider delegation identifier is correlation data, never authority.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "voice",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "voice.context",
+      "name": "voice.context",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "voice_grant"
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "kind": "right",
+            "right": "session.view"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "voice_session"
+      ],
+      "summary": "Read the selected voice context. Selection intersects this device's scope and never uses the host owner's broader history.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "workflow",
+        "kind": "required",
+        "revision": "workflow_definition_version"
+      },
+      "confirmation": "when_enlarging_authority",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "automation",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "workflow.install",
+      "name": "workflow.install",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "automation.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "workflow"
+      ],
+      "summary": "Install a versioned automation definition under an explicit workflow grant.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "workflow",
+        "kind": "required",
+        "revision": "workflow_definition_version"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "automation",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "workflow.enable",
+      "name": "workflow.enable",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "automation.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "workflow"
+      ],
+      "summary": "Enable an installed definition at an exact revision.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "workflow",
+        "kind": "required",
+        "revision": "workflow_definition_version"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "automation",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "workflow.pause",
+      "name": "workflow.pause",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "automation.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "workflow"
+      ],
+      "summary": "Pause a definition. Exceeding a concurrency or budget limit pauses it automatically.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "capability_id": "workflow",
+        "kind": "required",
+        "revision": "workflow_definition_version"
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "automation",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "kind": "action_deduplicated"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "workflow.run",
+      "name": "workflow.run",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "automation.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "workflow"
+      ],
+      "summary": "Start a run, recording the trigger event, definition version and causal parent.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "kind": "none"
+      },
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "automation",
+      "history_filter": "grant_lower_bound",
+      "idempotency": {
+        "kind": "idempotent_read"
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "workflow.read",
+      "name": "workflow.read",
+      "required_rights": [
+        {
+          "authority": {
+            "kind": "right",
+            "right": "automation.manage"
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "workflow"
+      ],
+      "summary": "Read definitions, runs, node receipts and remaining causal budget.",
+      "version": 1
+    }
+  ],
+  "unlisted_methods_are_denied": true
+}
