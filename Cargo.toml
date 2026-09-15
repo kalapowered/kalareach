@@ -55,10 +55,10 @@ thiserror = "=2.0.20"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
 url = "=2.5.8"
-vtparse = { git = "https://github.com/wezterm/wezterm", rev = "699fd77b44641c43476c945054cfae6518dbd632" }
-wezterm-escape-parser = { git = "https://github.com/wezterm/wezterm", rev = "699fd77b44641c43476c945054cfae6518dbd632", features = ["std"] }
-wezterm-surface = { git = "https://github.com/wezterm/wezterm", rev = "699fd77b44641c43476c945054cfae6518dbd632" }
-wezterm-term = { git = "https://github.com/wezterm/wezterm", rev = "699fd77b44641c43476c945054cfae6518dbd632" }
+vtparse = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
+wezterm-escape-parser = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb", features = ["std"] }
+wezterm-surface = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
+wezterm-term = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 wit-parser = "=0.259.0"
 zeroize = { version = "=1.9.0", features = ["derive"] }
 
