@@ -326,11 +326,21 @@ impl NoProbeProfile {
 fn interpret(event: &Event) -> Option<(ProbeItem, ProbeAnswer)> {
     match &event.kind {
         EventKind::Csi {
-            params, final_byte, ..
+            params,
+            final_byte,
+            truncated,
         } => {
+            // A reply the parser could not keep whole is not a shorter reply: the part it dropped
+            // could have carried the rest of the number this would be recorded as.
+            if *truncated {
+                return None;
+            }
             let csi = crate::classify::CsiView::new(params, *final_byte);
+            if !csi.intermediates.is_empty() && csi.intermediates != *b"$" {
+                return None;
+            }
             match (csi.private, csi.final_byte) {
-                (Some(b'?'), b'c') => {
+                (Some(b'?'), b'c') if csi.intermediates.is_empty() => {
                     // A device-attributes reply names at least one attribute. An empty one is not
                     // a terminal saying it has none: it is a reply this profile does not recognise,
                     // and accepting it as the terminator would end the exchange on nothing.
@@ -344,7 +354,7 @@ fn interpret(event: &Event) -> Option<(ProbeItem, ProbeAnswer)> {
                         ProbeAnswer::DeviceAttributes(attributes),
                     ))
                 }
-                (Some(b'?'), b'u') => {
+                (Some(b'?'), b'u') if csi.intermediates.is_empty() => {
                     // The qualified flags are the five the profile advertises.
                     let flags = csi.number(0).unwrap_or(0);
                     if !(0..=0x1f).contains(&flags) || csi.numbers.len() > 1 {

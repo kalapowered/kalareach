@@ -914,3 +914,119 @@ fn a_full_cell_reports_the_marks_it_dropped() {
             .any(|entry| entry.kind == kr_term::diag::DiagnosticKind::ResidentStateTruncated)
     );
 }
+
+/// A mark written into a cell after the fact is a change like any other.
+#[test]
+fn a_mark_added_to_a_settled_cell_reaches_a_delta() {
+    let mut engine = engine();
+    engine.feed(b"e", 0);
+    let view = viewport(&engine);
+    let (snapshot, _) = engine.snapshot(view, 0);
+    engine.feed("\u{301}".as_bytes(), 0);
+    engine.quiesce(0);
+    let delta = engine
+        .delta(snapshot.output_cursor, snapshot.projection_generation)
+        .expect("inside the window");
+    assert_eq!(
+        delta
+            .rows
+            .iter()
+            .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+            .collect::<Vec<String>>(),
+        vec!["e\u{301}".to_owned()],
+        "the row the mark changed is carried"
+    );
+}
+
+/// A geometry change reflows the rows, so a mark cannot land on whatever moved into that cell.
+#[test]
+fn a_mark_after_a_resize_does_not_overwrite_another_cell() {
+    let mut engine = Engine::new(EngineConfig {
+        size: kr_term::budget::GridSize::new(4, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    engine.feed(b"abcde\r\nZ\x1b[2;1H", 0);
+    engine.feed(b"e", 0);
+    engine.quiesce(0);
+    engine
+        .resize(kr_term::budget::GridSize::new(8, 3))
+        .expect("valid geometry");
+    let before: Vec<String> = engine
+        .grid()
+        .visible_rows()
+        .iter()
+        .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+        .collect();
+    engine.feed("\u{301}".as_bytes(), 0);
+    engine.quiesce(0);
+    let after: Vec<String> = engine
+        .grid()
+        .visible_rows()
+        .iter()
+        .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+        .collect();
+    assert_eq!(before, after, "the mark reached a cell that had moved");
+}
+
+/// A reply that does not fit its form is not an answer.
+#[test]
+fn a_malformed_reply_does_not_answer_a_probe() {
+    // A mode report whose prelude the parser could not keep whole.
+    let (mut session, _) = ProbeSession::start(
+        0,
+        InputContext::Clean,
+        &[ProbeItem::SynchronisedOutput, ProbeItem::DeviceAttributes],
+    )
+    .expect("clean stream");
+    let mut input = b"\x1b[?2026;1".to_vec();
+    input.extend(std::iter::repeat_n(0u8, 300));
+    input.extend_from_slice(b"$y\x1b[?1c");
+    session.observe(&input, 10).expect("answers");
+    let error = session.finish(20).expect_err("neither reply is an answer");
+    assert!(matches!(
+        error,
+        TermError::ProbeFailed {
+            reason: ProbeFailure::MissingAnswer | ProbeFailure::NoTerminator
+        }
+    ));
+
+    // A device-attributes reply with an intermediate is a different sequence.
+    let (mut session, _) =
+        ProbeSession::start(0, InputContext::Clean, &[ProbeItem::DeviceAttributes])
+            .expect("clean stream");
+    session
+        .observe(b"\x1b[?1$c", 10)
+        .expect("no terminator yet");
+    let error = session
+        .finish(20)
+        .expect_err("the terminator never arrived");
+    assert!(matches!(
+        error,
+        TermError::ProbeFailed {
+            reason: ProbeFailure::NoTerminator
+        }
+    ));
+}
+
+/// A history page walks forward through what is retained, whatever was evicted.
+#[test]
+fn a_history_page_does_not_repeat_rows() {
+    let mut engine = Engine::new(EngineConfig {
+        size: kr_term::budget::GridSize::new(20, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    engine.feed(&b"x\r\n".repeat(3_600), 0);
+    engine.quiesce(0);
+    let page = engine.history_page(0);
+    let ids: Vec<i64> = page.rows.iter().map(|row| row.stable_id).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(ids.len(), sorted.len(), "a row appeared twice on one page");
+    assert!(
+        ids.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "the page is one contiguous run of rows"
+    );
+}

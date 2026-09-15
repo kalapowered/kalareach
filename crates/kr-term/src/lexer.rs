@@ -863,7 +863,7 @@ impl Lexer {
 
     fn hook_dcs(&mut self, final_byte: u8) {
         self.finish_param();
-        if self.pending_truncated || !self.pending_controls.is_empty() || self.extra_intermediates {
+        if self.pending_truncated || self.extra_intermediates {
             // The prelude is not one this profile can act on, but its string body still has to be
             // consumed rather than executed.
             self.dcs_final = 0;
@@ -1171,14 +1171,12 @@ impl Lexer {
             // NUL and DEL are padding that every terminal discards, so the sequence carries on.
             0x00 | 0x7f => self.retain(byte),
             // Any other embedded control is performed where it appears, and the sequence carries
-            // on being collected around it. Past the bound the sequence becomes an extension, so a
-            // stream of controls inside one prelude cannot grow this list.
+            // on being collected around it. The list is bounded by the prelude's own retention
+            // bound, because every control in it is a byte of that prelude.
             0x01..=0x17 | 0x19 | 0x1c..=0x1f => {
                 self.retain(byte);
-                if self.pending_controls.len() < MAX_EMBEDDED_CONTROLS {
+                if self.pending_controls.len() < self.limits.max_sequence_bytes {
                     self.pending_controls.push(byte);
-                } else {
-                    self.pending_truncated = true;
                 }
             }
             _ => {
@@ -1333,9 +1331,6 @@ impl Default for Lexer {
         Self::new()
     }
 }
-
-/// The most control bytes one sequence may carry before it stops being a sequence.
-const MAX_EMBEDDED_CONTROLS: usize = 8;
 
 /// Counts the scalars in a run of valid UTF-8.
 fn count_scalars(bytes: &[u8]) -> usize {

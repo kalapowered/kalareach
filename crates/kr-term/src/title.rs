@@ -141,23 +141,42 @@ impl TitleState {
     /// reaches past the session into a client's saved title.
     ///
     /// The entry is discarded whether or not it held the title that was asked for, which is what a
-    /// physical terminal does: the stack is one stack of entries, not one stack per title.
+    /// physical terminal does: the stack is one stack of entries, not one stack per title. Where
+    /// the top entry did not save the title being asked for, the entries below it are searched, so
+    /// a selective push followed by a selective pop of the other title still restores what it saved.
     pub fn pop(&mut self, target: TitleTarget) -> bool {
         let Some(entry) = self.stack.pop() else {
             self.underflows = self.underflows.saturating_add(1);
             return false;
         };
-        if matches!(target, TitleTarget::Icon | TitleTarget::Both)
-            && let Some(icon) = entry.icon
-        {
-            self.current.icon = icon;
+        if matches!(target, TitleTarget::Icon | TitleTarget::Both) {
+            if let Some(icon) = entry.icon {
+                self.current.icon = icon;
+            } else if let Some(icon) = self.take_saved(|entry| entry.icon.take()) {
+                self.current.icon = icon;
+            }
         }
-        if matches!(target, TitleTarget::Window | TitleTarget::Both)
-            && let Some(window) = entry.window
-        {
-            self.current.window = window;
+        if matches!(target, TitleTarget::Window | TitleTarget::Both) {
+            if let Some(window) = entry.window {
+                self.current.window = window;
+            } else if let Some(window) = self.take_saved(|entry| entry.window.take()) {
+                self.current.window = window;
+            }
         }
         true
+    }
+
+    /// Takes the most recently saved value of one title from the entries still on the stack.
+    fn take_saved(
+        &mut self,
+        mut pick: impl FnMut(&mut SavedTitle) -> Option<String>,
+    ) -> Option<String> {
+        for entry in self.stack.iter_mut().rev() {
+            if let Some(value) = pick(entry) {
+                return Some(value);
+            }
+        }
+        None
     }
 
     /// The saved entries, oldest first, for a snapshot.

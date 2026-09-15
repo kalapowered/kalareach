@@ -457,10 +457,18 @@ fn answer_dcs(
     at: u64,
 ) -> Vec<Response> {
     match (intermediates, final_byte) {
-        ([b'$'], b'q') => vec![Response::new(
+        // A setting name longer than a subject can hold would share a subject with every other
+        // name that starts the same way, and one answer would stand in for another's while the lane
+        // sheds load. No setting this profile reports has a name of that length.
+        ([b'$'], b'q') if payload.len() <= crate::lane::SubjectName::MAX => vec![Response::new(
             ResponseKind::SettingReport(crate::lane::SubjectName::new(payload)),
             at,
             decrqss(payload, state),
+        )],
+        ([b'$'], b'q') => vec![Response::new(
+            ResponseKind::SettingReport(crate::lane::SubjectName::new(b"")),
+            at,
+            b"\x1bP0$r\x1b\\".to_vec(),
         )],
         ([b'+'], b'q') => terminfo::xtgettcap_replies(payload)
             .into_iter()

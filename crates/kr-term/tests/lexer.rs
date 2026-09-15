@@ -720,6 +720,30 @@ fn clustering_does_not_depend_on_read_boundaries() {
             text: "e\u{0301}X",
             cells: 2,
         },
+        // A mark on a cell the row wrapped to, where the row above ends in the same character.
+        Case {
+            cols: 4,
+            rows: 3,
+            setup: b"",
+            text: "abcdd\u{0301}",
+            cells: 1,
+        },
+        // A designated character set, which changes what a cell holds but not which cell it is.
+        Case {
+            cols: 20,
+            rows: 3,
+            setup: b"\x1b(0",
+            text: "q\u{0301}X",
+            cells: 2,
+        },
+        // A zero-width space, which the library drops if it reaches it on its own.
+        Case {
+            cols: 20,
+            rows: 3,
+            setup: b"",
+            text: "a\u{200b}X",
+            cells: 2,
+        },
     ];
 
     for case in &cases {

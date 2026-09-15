@@ -702,11 +702,15 @@ fn stops_here(kind: &EventKind) -> StopsHere {
     } = kind
         && matches!(selector, 4 | 10..=19)
     {
-        let asks = parts.iter().skip(1).any(|part| part.as_slice() == b"?");
-        let changes = parts
+        // For the palette the fields alternate index and value, and only a value can be a change.
+        let step = usize::from(*selector == 4) + 1;
+        let values = parts
             .iter()
+            .enumerate()
             .skip(1)
-            .any(|part| part.as_slice() != b"?" && !part.is_empty());
+            .filter_map(|(index, part)| (step == 1 || index % 2 == 0).then_some(part.as_slice()));
+        let asks = parts.iter().skip(1).any(|part| part.as_slice() == b"?");
+        let changes = values.clone().any(|part| part != b"?" && !part.is_empty());
         return if asks && changes {
             StopsHere::Projection
         } else {

@@ -2390,7 +2390,7 @@
         {
           "bytes": "1b5d343b313b3f1b5c",
           "class": "Q",
-          "disposition": "RequireProjection",
+          "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
           "kind": "osc",
@@ -2407,7 +2407,7 @@
       "ground_after": true,
       "id": "palette_query",
       "input": "1b5d343b313b3f1b5c",
-      "projection_required_at": 0,
+      "projection_required_at": null,
       "refusals": [],
       "responses": [
         "1b5d343b313b7267623a636463642f303030302f303030301b5c"

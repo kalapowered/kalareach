@@ -433,9 +433,14 @@ impl Engine {
         let generation_before = self.projection_generation;
         for event in events {
             // A control inside a sequence is performed where it appeared, before the sequence it
-            // was found in, which is the order a terminal performs them in.
+            // was found in, which is the order a terminal performs them in. The bytes stop here
+            // whatever the sequence around them turns out to be, so the attachment has to project:
+            // a direct terminal never saw the controls, and its cursor is now somewhere else.
             if !event.embedded.is_empty() {
                 self.apply_embedded(event, &mut outcome, now_ms);
+                outcome
+                    .projection_required_at
+                    .get_or_insert(event.span.start());
             }
             let decision = self.policy.decide(event);
             let mut disposition = decision.disposition;
@@ -461,7 +466,6 @@ impl Engine {
                             "a parameter was reduced to what the grid can act on",
                         );
                     }
-                    self.sync_grid_modes();
                     // Anything but printed text can move a margin, change the pen, a tab stop or a
                     // character set, and a delta has to carry those for a client to repaint from.
                     if !matches!(
@@ -487,6 +491,12 @@ impl Engine {
                 }
             } else if decision.track {
                 self.track(event, &mut outcome);
+            }
+            if decision.apply_to_grid {
+                if restores_cursor(&event.kind) {
+                    self.follow_cursor_restore(&mut outcome, event.span.start());
+                }
+                self.sync_grid_modes();
             }
             if decision.answer {
                 outcome.responses += self.answer_query(event, now_ms);
@@ -600,15 +610,39 @@ impl Engine {
 
     /// Copies back the modes the canonical grid changes on its own.
     ///
-    /// Origin mode is the one that matters. A cursor restore, a soft reset and a buffer switch all
-    /// change it inside the reducer without a set or reset sequence of their own, so a tracker that
-    /// only watched sequences would report a frame the grid is not using, and the cursor report
-    /// would name the wrong row.
+    /// A cursor restore, a soft reset and a buffer switch all change these inside the reducer
+    /// without a set or reset sequence of their own, so a tracker that only watched sequences would
+    /// report state the grid is not using, and the cursor report would name the wrong row. The grid
+    /// is the one that draws, so the grid is the answer.
+    ///
+    /// This runs after the event has been tracked, because the tracker would otherwise write the
+    /// sequence's own parameter over what the reducer just did.
     fn sync_grid_modes(&mut self) {
-        let origin = self.grid.origin_mode();
-        if self.modes.is_set(ModeKind::Dec, 6) != origin {
-            self.modes.set(ModeKind::Dec, 6, origin);
-            self.mark_mode(ModeKind::Dec, 6);
+        for (kind, mode, value) in [
+            (ModeKind::Dec, 6, self.grid.origin_mode()),
+            (ModeKind::Dec, 7, self.grid.auto_wrap()),
+            (ModeKind::Dec, 69, self.grid.margin_mode()),
+            (ModeKind::Ansi, 4, self.grid.insert_mode()),
+        ] {
+            if self.modes.is_set(kind, mode) != value {
+                self.modes.set(kind, mode, value);
+                self.mark_mode(kind, mode);
+            }
+        }
+    }
+
+    /// Follows the reducer's cursor restore for the state it changes without exposing.
+    ///
+    /// The pinned revision clears newline mode and the shift-out selection when it restores a
+    /// cursor, which xterm does not, and it does not expose newline mode for reading back. The
+    /// profile applies the same rule so that there is one answer, and asks for projection when that
+    /// changes something, because a physical terminal following the same bytes would not have done
+    /// it. The narrow patch is recorded in `crate::unicode::LIBRARY`.
+    fn follow_cursor_restore(&mut self, outcome: &mut FeedOutcome, at: u64) {
+        if self.modes.is_set(ModeKind::Ansi, 20) {
+            self.modes.set(ModeKind::Ansi, 20, false);
+            self.mark_mode(ModeKind::Ansi, 20);
+            outcome.projection_required_at.get_or_insert(at);
         }
     }
 
@@ -1310,7 +1344,12 @@ impl Engine {
             if batch.is_empty() {
                 break;
             }
-            next = next.saturating_add(i64::try_from(batch.len()).unwrap_or(0));
+            // The grid clamps a request below its oldest retained row, so the next batch starts
+            // after the last row it actually returned rather than after where it was asked to look.
+            let Some(last) = batch.last().map(|row| row.stable_id) else {
+                break;
+            };
+            next = last.saturating_add(1);
             for mut row in batch {
                 let mut row_bytes = encoded_row_bytes(&row);
                 if row_bytes > limits.history_page_bytes {
@@ -1356,6 +1395,31 @@ impl Engine {
     #[must_use]
     pub fn diagnostic_totals(&self) -> Vec<(DiagnosticKind, u64)> {
         self.diagnostics.totals()
+    }
+}
+
+/// Whether a sequence restores a saved cursor, directly or as part of leaving a buffer.
+fn restores_cursor(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Esc {
+            intermediate: None,
+            final_byte: b'8',
+            ..
+        } => true,
+        EventKind::Csi {
+            params, final_byte, ..
+        } => {
+            let csi = crate::classify::CsiView::new(params, *final_byte);
+            match csi.final_byte {
+                b'u' if csi.private.is_none() => true,
+                b'l' if csi.private == Some(b'?') => csi
+                    .numbers
+                    .iter()
+                    .any(|slot| matches!(slot, Some(1048 | 1049))),
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 

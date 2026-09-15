@@ -342,8 +342,10 @@ pub struct CanonicalGrid {
 /// would have produced had they arrived together.
 #[derive(Debug, Clone)]
 struct TailCell {
-    /// The scalars in the cell.
+    /// The scalars that were printed into the cell.
     text: String,
+    /// What the cell holds, which a designated character set can make different from the scalars.
+    stored: String,
     /// Cells it occupies.
     width: usize,
     /// Column of its first cell.
@@ -460,13 +462,21 @@ impl CanonicalGrid {
         if rest.is_empty() {
             return;
         }
+        if crate::unicode::may_join(rest) {
+            self.print_cells(rest);
+            return;
+        }
+        // Plain ASCII: one call for the run, and one more for its final cell so that the cell's
+        // position is known and a mark in a later read can still reach it.
         let split = crate::unicode::last_cell_start(rest);
         let (head, last) = rest.split_at(split);
         if !head.is_empty() {
-            self.print_cells(head);
+            self.terminal
+                .perform_actions(vec![Action::PrintString(head.to_owned())]);
         }
-        let before = self.cursor_cell();
-        self.print_cells(last);
+        let before = self.print_origin();
+        self.terminal
+            .perform_actions(vec![Action::PrintString(last.to_owned())]);
         self.tail = self.locate(last, before);
     }
 
@@ -477,33 +487,46 @@ impl CanonicalGrid {
     /// joins the library performs: a list can be incomplete, and the library's list is longer than
     /// emoji.
     fn print_cells(&mut self, text: &str) {
-        if !crate::unicode::may_join(text) {
-            self.terminal
-                .perform_actions(vec![Action::PrintString(text.to_owned())]);
+        let starts: Vec<usize> = text
+            .char_indices()
+            .filter(|(_, scalar)| !crate::unicode::is_zero_width(*scalar))
+            .map(|(index, _)| index)
+            .collect();
+        let Some(first) = starts.first().copied() else {
+            // Nothing here has a width of its own, so all of it belongs to the cell before.
+            self.rejoin(text);
             return;
+        };
+        if first > 0 {
+            self.rejoin(&text[..first]);
         }
-        let mut start = 0;
-        for (index, scalar) in text.char_indices() {
-            if index > start && !crate::unicode::is_zero_width(scalar) {
-                self.print_cell(&text[start..index]);
-                start = index;
-            }
+        for (position, start) in starts.iter().copied().enumerate() {
+            let end = starts.get(position + 1).copied().unwrap_or(text.len());
+            let base = start + text[start..end].chars().next().map_or(0, char::len_utf8);
+            self.print_cell(&text[start..base], &text[base..end]);
         }
-        self.print_cell(&text[start..]);
     }
 
-    /// Draws one cell, keeping the row in the representation that remembers where its cells are.
+    /// Draws one cell: the scalar that has a width, then the marks that belong to it.
     ///
-    /// The library has two row representations. One stores each cell with its own content; the
-    /// other stores the row as one string and works out where the cells are when the row is read,
-    /// by clustering that string again. The second undoes the cut, because the scalars end up
-    /// adjacent in the string whichever call they arrived in. Reading a cell of the row converts it
-    /// to the first representation, so that is done before each cell is written.
-    fn print_cell(&mut self, cell: &str) {
+    /// The marks are written into the cell rather than printed, for two reasons. The library
+    /// clusters what it is given by its own rules, which would split some of them off and drop
+    /// them; and printing them separately is exactly what happens when they arrive in a later read,
+    /// so doing it the same way here is what makes the two answers identical.
+    ///
+    /// The row is read first because the library has two row representations, and the compact one
+    /// stores a row as one string and works out where its cells are by clustering that string
+    /// again. Reading a cell converts the row to the representation that remembers.
+    fn print_cell(&mut self, base: &str, marks: &str) {
         let (_, row) = self.cursor_cell();
         let _ = self.terminal.screen_mut().get_cell(0, row);
+        let before = self.print_origin();
         self.terminal
-            .perform_actions(vec![Action::PrintString(cell.to_owned())]);
+            .perform_actions(vec![Action::PrintString(base.to_owned())]);
+        self.tail = self.locate(base, before);
+        if !marks.is_empty() {
+            self.rejoin(marks);
+        }
     }
 
     /// The cursor as a cell coordinate, before or after a print.
@@ -512,33 +535,48 @@ impl CanonicalGrid {
         (pos.x, pos.y)
     }
 
+    /// The cursor and the screen's position, which together say where a print put its cell.
+    fn print_origin(&self) -> (usize, i64, i64) {
+        let (col, row) = self.cursor_cell();
+        (col, row, self.stable_top())
+    }
+
+    /// The stable identifier of the top visible row, which moves exactly when the screen scrolls.
+    fn stable_top(&self) -> i64 {
+        let screen = self.terminal.screen();
+        i64::try_from(screen.visible_row_to_stable_row(0)).unwrap_or(0)
+    }
+
     /// Finds where a just-printed cell landed, so a later combining mark can reach it.
     ///
-    /// The cursor after a print does not say this on its own: a cell in the last column leaves the
-    /// cursor on top of itself, and a print that wrapped first leaves it on another row. Rather than
-    /// infer the answer from state the library does not expose, each candidate position is checked
-    /// against what is actually in that cell.
-    fn locate(&mut self, cell: &str, before: (usize, i64)) -> Option<TailCell> {
+    /// The column the cursor started at is the cell's column, whether or not the cursor then
+    /// advanced: a cell that fills the row to its margin leaves the cursor on top of itself. What
+    /// the cursor cannot say is whether the print wrapped before placing anything, and whether that
+    /// wrap scrolled the screen. The stable identifier of the top visible row answers the second,
+    /// and the row the cursor is on answers the first.
+    ///
+    /// Comparing what is in the cell would be the obvious alternative and is wrong twice over: two
+    /// cells can hold the same text, and a designated character set means a cell may not hold the
+    /// scalars that were printed into it.
+    fn locate(&mut self, cell: &str, before: (usize, i64, i64)) -> Option<TailCell> {
         let width = crate::unicode::cells_for(cell);
-        let (col, row) = self.cursor_cell();
+        let (_, row) = self.cursor_cell();
         let left = self.terminal.get_left_and_right_margins().start;
-        let candidates = [
-            (before.0, before.1),
-            (col.saturating_sub(width), row),
-            (col, row),
-            (left, row),
-        ];
-        for (col, row) in candidates {
-            if self.cell_text(col, row).as_deref() == Some(cell) {
-                return Some(TailCell {
-                    text: cell.to_owned(),
-                    width,
-                    col,
-                    row,
-                });
-            }
-        }
-        None
+        let (col, row) = if self.stable_top() == before.2 && row == before.1 {
+            (before.0, before.1)
+        } else {
+            // The print wrapped before it placed anything, so the cell went to the left margin of
+            // whichever row the cursor is on now.
+            (left, row)
+        };
+        let stored = self.cell_text(col, row)?;
+        Some(TailCell {
+            text: cell.to_owned(),
+            stored,
+            width,
+            col,
+            row,
+        })
     }
 
     /// The text of one cell of the active buffer.
@@ -566,22 +604,40 @@ impl CanonicalGrid {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
             return;
         }
-        let Some(attributes) = self
+        let Some((attributes, found)) = self
             .terminal
             .screen_mut()
             .get_cell(tail.col, tail.row)
-            .map(|cell| cell.attrs().clone())
+            .map(|cell| (cell.attrs().clone(), cell.str().to_owned()))
         else {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
             return;
         };
+        // The cell has to still be the one that was drawn. A resize reflows the rows and eviction
+        // moves them, so the remembered position can now hold someone else's text, and writing into
+        // it would overwrite that instead of adding a mark to this.
+        if found != tail.stored {
+            self.dropped_marks = self.dropped_marks.saturating_add(1);
+            return;
+        }
         let mut text = tail.text;
         text.push_str(marks);
+        // The write is a change like any other, so it takes a sequence number of its own. Without
+        // one the row does not count as changed, and the mark never reaches a client reading
+        // deltas.
+        self.terminal.increment_seqno();
         let seqno = self.terminal.current_seqno();
         self.terminal
             .screen_mut()
             .set_cell_grapheme(tail.col, tail.row, &text, tail.width, attributes, seqno);
-        self.tail = Some(TailCell { text, ..tail });
+        let stored = self
+            .cell_text(tail.col, tail.row)
+            .unwrap_or_else(|| text.clone());
+        self.tail = Some(TailCell {
+            text,
+            stored,
+            ..tail
+        });
     }
 
     /// How many combining marks arrived with no cell to join.
@@ -707,10 +763,30 @@ impl CanonicalGrid {
     pub fn resize(&mut self, size: GridSize, budget: &mut SessionBudget) -> Result<()> {
         let size = size.validate()?;
         let cost = budget.check_geometry(size)?;
+        // The rows reflow, so the cell a mark would have joined is no longer where it was.
+        self.tail = None;
         self.terminal.resize(to_library_size(size));
         budget.commit_geometry(cost);
         self.size = size;
         Ok(())
+    }
+
+    /// Whether autowrap is on.
+    #[must_use]
+    pub fn auto_wrap(&self) -> bool {
+        self.terminal.dec_auto_wrap_enabled()
+    }
+
+    /// Whether insert mode is on.
+    #[must_use]
+    pub fn insert_mode(&self) -> bool {
+        self.terminal.insert_mode_enabled()
+    }
+
+    /// Whether left and right margin mode is on.
+    #[must_use]
+    pub fn margin_mode(&self) -> bool {
+        self.terminal.left_and_right_margin_mode_enabled()
     }
 
     /// Whether the alternate buffer is active.
@@ -1007,8 +1083,10 @@ pub fn sgr_parameters(attrs: &CellAttributes) -> String {
         Underline::Dotted => parts.push("4:4".to_owned()),
         Underline::Dashed => parts.push("4:5".to_owned()),
     }
-    if attrs.blink() != wezterm_term::Blink::None {
-        parts.push("5".to_owned());
+    match attrs.blink() {
+        wezterm_term::Blink::None => {}
+        wezterm_term::Blink::Slow => parts.push("5".to_owned()),
+        wezterm_term::Blink::Rapid => parts.push("6".to_owned()),
     }
     if attrs.reverse() {
         parts.push("7".to_owned());

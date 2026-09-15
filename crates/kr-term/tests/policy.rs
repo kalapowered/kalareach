@@ -667,8 +667,8 @@ fn a_selective_title_save_leaves_the_other_title_alone() {
     let (snapshot, _) = engine.snapshot(view, 0);
     assert_eq!(
         (snapshot.title.icon.as_str(), snapshot.title.window.as_str()),
-        ("third", "third"),
-        "a pop of a title nothing saved leaves it alone rather than clearing it"
+        ("initial", "third"),
+        "the icon pop finds the entry that saved an icon, and the window title is untouched"
     );
 }
 
@@ -704,9 +704,10 @@ fn an_embedded_control_is_performed_where_it_appears() {
     engine.feed(b"\x1b[5\nC", 0);
     assert_eq!(engine.grid().cursor(), (5, 1));
 
-    // A sequence stuffed with controls is an extension rather than an unbounded list of them.
+    // Every control is performed, however many there are, and the sequence still happens.
     let mut engine = engine_at(20, 3);
     let outcome = engine.feed(b"\x1b[5\x07\x07\x07\x07\x07\x07\x07\x07\x07C", 0);
     assert!(outcome.forward.is_empty());
-    assert_eq!(engine.grid().cursor(), (0, 0), "nothing was performed");
+    assert_eq!(outcome.side_effects.len(), 9, "every bell rang");
+    assert_eq!(engine.grid().cursor(), (5, 0), "and the movement happened");
 }
