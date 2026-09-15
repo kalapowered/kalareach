@@ -13,6 +13,7 @@ use std::sync::Arc;
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::framed::split;
+use kr_ipc::freshness::FreshnessWindow;
 use kr_ipc::paths::{Endpoint, EnvironmentPaths};
 use kr_ipc::peer::PeerIdentity;
 use kr_ipc::verify::{ControllerIdentity, check_rendezvous};
@@ -28,8 +29,8 @@ use kr_protocol::hostinfo::{
 };
 use kr_protocol::identity::{BootIdentity, WorkerProfile};
 use kr_protocol::ids::{
-    ActionWindowId, ActorId, BuildId, ConnectionId, ControllerGeneration, EnvironmentId, RequestId,
-    SessionEpoch, SessionId,
+    ActorId, BuildId, ConnectionId, ControllerGeneration, EnvironmentId, RequestId, SessionEpoch,
+    SessionId,
 };
 use kr_protocol::local::{ControlMessage, LocalClientKind, LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
@@ -256,7 +257,7 @@ impl Controller {
         writer
             .write_message(&ControlMessage::HelloAck(self.acknowledgement(
                 LocalRole::Rendezvous,
-                connection_id,
+                &self.window(connection_id),
                 &peer,
             )))
             .await?;
@@ -458,14 +459,13 @@ impl Controller {
     fn acknowledgement(
         &self,
         role: LocalRole,
-        connection_id: ConnectionId,
+        window: &FreshnessWindow,
         peer: &PeerIdentity,
     ) -> LocalHelloAck {
-        let now = kr_ipc::now_ms();
         LocalHelloAck {
             selected_version: PROTOCOL_VERSION,
             role,
-            connection_id,
+            connection_id: window.connection_id(),
             environment_id: self.paths.environment_id(),
             boot_identity: self.boot_identity.clone(),
             peer: LocalPeer {
@@ -473,14 +473,57 @@ impl Controller {
                 gid: U64::new(u64::from(peer.gid)),
                 pid: Nullable(peer.pid.map(|pid| U64::new(u64::from(pid)))),
             },
-            action_window_id: ActionWindowId::new(format!("local:{connection_id}"))
-                .unwrap_or_else(|_| ActionWindowId::new("local").expect("a valid window")),
-            action_window_expires_at_ms: TimestampMs::new(
-                now.get().saturating_add(ACTION_WINDOW_MS),
-            ),
+            action_window_id: window.id().clone(),
+            action_window_expires_at_ms: window.expires_at_ms(),
             capabilities: CanonicalSet::new(),
             max_receive: ReceiveLimits::default(),
         }
+    }
+
+    /// Stamps a freshness window for one authenticated connection.
+    fn window(&self, connection_id: ConnectionId) -> FreshnessWindow {
+        FreshnessWindow::issue(
+            connection_id,
+            self.boot_identity.clone(),
+            kr_ipc::now_ms().get(),
+            ACTION_WINDOW_MS,
+        )
+    }
+
+    /// Checks the envelope of a mutation this daemon is asked to perform.
+    ///
+    /// The target says which environment the effect belongs to, and the window says whether this
+    /// is a first admission the host will accept at all. Both are checked before the create token
+    /// reaches the registry, so an expired window never reserves a session.
+    fn check_envelope(&self, window: &FreshnessWindow, mutation: &MutationRequest) -> Result<()> {
+        mutation
+            .target
+            .validate()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        if mutation.target.environment_id != self.paths.environment_id() {
+            return Err(ControllerError::InvalidArgument(format!(
+                "this daemon owns environment {}",
+                self.paths.environment_id()
+            )));
+        }
+        // A local caller's authority is the operating-system caller the listener authenticated.
+        if mutation.grant_id.as_ref().is_some() {
+            return Err(ControllerError::InvalidArgument(
+                "a local caller acts under its authenticated operating-system identity, not a \
+                 grant"
+                    .to_owned(),
+            ));
+        }
+        window
+            .admit(
+                &mutation.action_window_id,
+                &self.boot_identity,
+                kr_ipc::now_ms().get(),
+            )
+            .map(|_| ())
+            .map_err(|refusal| ControllerError::WindowExpired {
+                detail: refusal.detail().to_owned(),
+            })
     }
 
     async fn client(self: &Arc<Self>, connection: Connection, peer: PeerIdentity) -> Result<()> {
@@ -489,6 +532,7 @@ impl Controller {
             .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal"));
         let (mut reader, mut writer) = split(connection, StreamKind::Control);
         let mut negotiated = false;
+        let mut window = self.window(connection_id);
         loop {
             let message: ControlMessage = match reader.read_message().await {
                 Ok(message) => message,
@@ -502,9 +546,12 @@ impl Controller {
                         .any(|offered| offered.major == PROTOCOL_VERSION.major)
                     {
                         negotiated = true;
+                        // The window is stamped when the connection is authenticated, so its
+                        // deadline starts from the handshake the client will quote it against.
+                        window = self.window(connection_id);
                         ControlMessage::HelloAck(self.acknowledgement(
                             LocalRole::Controller,
-                            connection_id,
+                            &window,
                             &peer,
                         ))
                     } else {
@@ -515,9 +562,23 @@ impl Controller {
                         )
                     }
                 }
+                ControlMessage::ActionWindowRenew(_) if negotiated => {
+                    window = window.renew(kr_ipc::now_ms().get());
+                    ControlMessage::ActionWindow(kr_protocol::local::ActionWindowGrant {
+                        connection_id,
+                        action_window_id: window.id().clone(),
+                        action_window_expires_at_ms: window.expires_at_ms(),
+                    })
+                }
                 ControlMessage::Request(request) if negotiated => self.read_method(&request).await,
                 ControlMessage::Mutation(mutation) if negotiated => {
-                    self.write_method(&actor_id, &mutation).await
+                    match self.check_envelope(&window, &mutation) {
+                        Ok(()) => self.write_method(&actor_id, &mutation).await,
+                        Err(error) => ControlMessage::Response(Response {
+                            request_id: mutation.request_id,
+                            outcome: Outcome::Error(error.to_protocol_error()),
+                        }),
+                    }
                 }
                 _ => error_reply(
                     RequestId::new(0),

@@ -52,6 +52,12 @@ pub enum ControllerError {
         /// The identifier that was named.
         session: String,
     },
+    /// The freshness window this first admission is bound to is expired or unknown.
+    #[error("{detail}")]
+    WindowExpired {
+        /// What went wrong.
+        detail: String,
+    },
     /// A create token was reused with a different request.
     #[error("create token {token} was already used with a different request")]
     IdConflict {
@@ -102,7 +108,9 @@ impl ControllerError {
             Self::AlreadyRunning { .. } => ErrorCode::ResourceUnavailable,
             Self::SessionLimit { .. } => ErrorCode::SessionLimit,
             Self::Supervision { .. } => ErrorCode::ResourceUnavailable,
-            Self::RendezvousRefused { .. } | Self::Verification(_) => ErrorCode::PermissionDenied,
+            Self::RendezvousRefused { .. } | Self::Verification(_) | Self::WindowExpired { .. } => {
+                ErrorCode::PermissionDenied
+            }
             Self::UnknownSession { .. } => ErrorCode::UnknownSession,
             Self::SessionClosed { .. } => ErrorCode::SessionClosed,
             Self::IdConflict { .. } => ErrorCode::IdConflict,

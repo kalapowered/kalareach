@@ -204,6 +204,51 @@ impl LocalClient {
         }
     }
 
+    /// Asks the host for a fresh freshness window on this connection.
+    ///
+    /// A window lasts five minutes. A connection that stays open longer than that — an attached
+    /// terminal, for instance — renews it before submitting a mutation, because section 9 refuses a
+    /// first admission through an expired window and replacing the window is a new request rather
+    /// than an automatic retry of the old one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host refuses or the transport fails.
+    pub async fn renew_window(&mut self) -> Result<()> {
+        self.writer
+            .write_message(&ControlMessage::ActionWindowRenew(
+                kr_protocol::local::ActionWindowRenew {
+                    connection_id: self.acknowledgement.connection_id,
+                },
+            ))
+            .await?;
+        loop {
+            match self.reader.read_message().await? {
+                ControlMessage::ActionWindow(granted) => {
+                    self.acknowledgement.action_window_id = granted.action_window_id;
+                    self.acknowledgement.action_window_expires_at_ms =
+                        granted.action_window_expires_at_ms;
+                    return Ok(());
+                }
+                ControlMessage::Notification(_) => {}
+                ControlMessage::Response(Response {
+                    outcome: Outcome::Error(error),
+                    ..
+                }) => {
+                    return Err(IpcError::IdentityUnavailable {
+                        what: "the host refused to renew this connection's action window",
+                        detail: error.to_string(),
+                    });
+                }
+                _ => {
+                    return Err(IpcError::UnexpectedMessage(
+                        "the host answered something other than a window",
+                    ));
+                }
+            }
+        }
+    }
+
     /// Calls a read method.
     ///
     /// # Errors
