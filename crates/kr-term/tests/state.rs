@@ -2012,3 +2012,35 @@ fn a_screen_of_known_cells_measures_what_those_cells_cost() {
         "a full screen of the most expensive cell there is fits what its geometry reserved"
     );
 }
+
+/// A resize while the alternate buffer is showing still moves rows into the primary buffer's
+/// history, and the cache is charged for them where they move.
+#[test]
+fn a_resize_behind_the_alternate_buffer_still_charges_the_history() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(40, 8),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    for index in 0..64u32 {
+        engine.feed(
+            format!("\x1b[41mrow {index} with some content\r\n").as_bytes(),
+            0,
+        );
+    }
+    engine.feed(b"\x1b[?1049h", 0);
+    engine.quiesce(0);
+    let before = engine.budget().usage().rows;
+    assert!(before > 0, "the primary buffer's history is still there");
+
+    engine.resize(GridSize::new(40, 4), 0).expect("admitted");
+    assert_eq!(
+        engine.budget().usage().rows,
+        engine.grid().history_bytes(),
+        "the cache holds what the primary buffer's rows cost, whichever buffer is showing"
+    );
+    assert!(
+        engine.budget().usage().rows > before,
+        "the rows the primary screen gave up are charged to the cache"
+    );
+}

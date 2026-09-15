@@ -847,7 +847,9 @@ impl CanonicalGrid {
     /// Lowers the scrollback row count so the retained rows fit the byte bound.
     ///
     /// Returns whether the rows were over it. `bytes` is what they cost now, which the caller has
-    /// already measured.
+    /// already measured. The caller applies it while the primary buffer is showing: the library
+    /// drops the rows it is told to drop as it appends, and nothing appends to a buffer that is
+    /// not showing.
     ///
     /// One pass is enough, and it lands under the bound rather than converging towards it. The row
     /// count kept is read off the rows themselves: the oldest rows are dropped one at a time until
@@ -882,7 +884,7 @@ impl CanonicalGrid {
     /// once the rows still ahead cost no more than the bound, the rest of the walk changes
     /// nothing. Every row is visited at most once.
     fn newest_history_rows_within(&self, total: u64, limit: u64) -> usize {
-        let screen = self.terminal.screen();
+        let screen = self.primary_screen();
         let history = screen
             .scrollback_rows()
             .saturating_sub(self.size.rows as usize);
@@ -1225,8 +1227,7 @@ impl CanonicalGrid {
     /// Cheap, unlike measuring them, so it is what decides when a measurement is worth taking.
     #[must_use]
     pub fn scrollback_rows(&self) -> usize {
-        self.terminal
-            .screen()
+        self.primary_screen()
             .scrollback_rows()
             .saturating_sub(self.size.rows as usize)
     }
@@ -1266,6 +1267,20 @@ impl CanonicalGrid {
         BufferBytes { content, links }
     }
 
+    /// The screen the history belongs to, wherever it is.
+    ///
+    /// The alternate buffer keeps no history, so the retained rows are always the primary one's.
+    /// While the alternate buffer is showing they are still there and a resize can still move rows
+    /// into them, so what they cost is read from the primary screen rather than from whichever
+    /// screen happens to be active.
+    fn primary_screen(&self) -> &wezterm_term::screen::Screen {
+        if self.alternate_active() {
+            self.terminal.inactive_screen()
+        } else {
+            self.terminal.screen()
+        }
+    }
+
     /// What one screen's rows that are showing hold, adding their links to a running total.
     ///
     /// The rows above the screen are the historical cache's, which has a bound of its own.
@@ -1297,7 +1312,7 @@ impl CanonicalGrid {
     /// an older row to make room, so it counts arrivals where a row count cannot.
     #[must_use]
     pub fn history_end(&self) -> i64 {
-        let screen = self.terminal.screen();
+        let screen = self.primary_screen();
         i64::try_from(screen.visible_row_to_stable_row(0)).unwrap_or(0)
     }
 
@@ -1307,7 +1322,7 @@ impl CanonicalGrid {
     /// rather than at the next measurement: two rows can carry more than the whole cache.
     #[must_use]
     pub fn newest_history_bytes(&self, rows: usize) -> u64 {
-        let screen = self.terminal.screen();
+        let screen = self.primary_screen();
         let history = screen
             .scrollback_rows()
             .saturating_sub(self.size.rows as usize);
@@ -1330,7 +1345,7 @@ impl CanonicalGrid {
     /// the bound in section 8 is on resident state rather than on characters.
     #[must_use]
     pub fn history_bytes(&self) -> u64 {
-        let screen = self.terminal.screen();
+        let screen = self.primary_screen();
         // Only the rows above the screen. The screens have a cost of their own in the session
         // budget, and charging them twice would make a wide grid look like it had passed a bound it
         // has nothing to do with.

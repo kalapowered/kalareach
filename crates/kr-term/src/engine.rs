@@ -902,9 +902,12 @@ impl Engine {
             .set_links(buffers.links.saturating_add(self.link_table_bytes()));
         self.budget.set_titles(self.titles.resident_bytes());
         if self.grid.alternate_active() {
-            // The primary buffer's history is not reachable while the alternate buffer is showing,
-            // and it is not changing either, so the last measurement of it stands rather than being
-            // replaced by the alternate buffer's nothing.
+            // Nothing appends to the primary buffer while the alternate one is showing, so its
+            // history cannot grow here; a resize can still move rows into it, so what it costs is
+            // measured rather than assumed. Bringing it back under the bound waits until the
+            // primary buffer is showing again, because the library drops the rows it is told to
+            // drop as it appends to them.
+            self.budget.set_row_cache(self.grid.history_bytes());
             return;
         }
         self.evict_history(now_ms);
