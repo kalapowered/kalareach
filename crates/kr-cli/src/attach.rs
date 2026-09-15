@@ -326,7 +326,9 @@ pub fn spawn_input_reader(
     receiver
 }
 
-fn target(descriptor: &WorkerDescriptor) -> ActionTarget {
+/// Returns the action target that names this worker's session.
+#[must_use]
+pub fn target(descriptor: &WorkerDescriptor) -> ActionTarget {
     ActionTarget {
         environment_id: descriptor.environment_id,
         session_id: Nullable::some(descriptor.session_id),

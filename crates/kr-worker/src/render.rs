@@ -39,7 +39,9 @@
 use kr_term::grid::{Blink, Colour, GridRow, Rendition, Run, UnderlineStyle, VerticalPosition};
 use kr_term::modes::ALTERNATE_BUFFER_MODES;
 use kr_term::palette::Rgb;
-use kr_term::sideeffect::{ClipboardSelection, Progress, SideEffectKind};
+use kr_term::sideeffect::{
+    ClipboardSelection, NotificationDisplay, NotificationUrgency, Progress, SideEffectKind,
+};
 use kr_term::snapshot::{
     ActiveBuffer, Charsets, CursorState, KeyboardSnapshot, Margins, PaletteSnapshot, RestoreOp,
     SavedCursor, Viewport,
@@ -123,6 +125,8 @@ struct Writer {
     link: Option<String>,
     /// True once the snapshot's own open hyperlink has been installed, so it is not closed again.
     link_is_the_snapshots: bool,
+    /// The character sets the application had selected, held back until the rows are painted.
+    charsets: Option<Charsets>,
     /// The scroll region, held back until the rows have been painted.
     ///
     /// Every row is addressed absolutely, and an absolute address means something different once
@@ -144,6 +148,7 @@ impl Writer {
             pen: None,
             link: None,
             link_is_the_snapshots: false,
+            charsets: None,
             margins: None,
             origin_mode: false,
             carried: Carried::default(),
@@ -226,7 +231,10 @@ impl Writer {
             }
             RestoreOp::SetKeyboard { keyboard } => self.keyboard(keyboard),
             RestoreOp::SetTabStops { columns } => self.tab_stops(columns),
-            RestoreOp::SetCharsets { charsets } => self.charsets(charsets),
+            // Held back with the margins. The rows carry canonical text, and a character set the
+            // application selected afterwards would redraw that text as something else: an `q`
+            // printed before DEC line drawing was selected is the letter, not a horizontal line.
+            RestoreOp::SetCharsets { charsets } => self.charsets = Some(charsets.clone()),
             // Held back until the rows are painted; see the field's own note.
             RestoreOp::SetMargins { margins } => self.margins = Some(*margins),
             RestoreOp::PaintInactiveRow { .. } => self.carried.inactive_rows += 1,
@@ -365,6 +373,10 @@ impl Writer {
         }
     }
 
+    /// Writes the character-set designations and the shift state.
+    ///
+    /// Rows are painted before this runs, under whatever the terminal already had; the profile's
+    /// reset leaves that as ASCII with the shift-out set inactive, which is what canonical text is.
     fn charsets(&mut self, charsets: &Charsets) {
         if let Some(designation) = designation(&charsets.g0) {
             self.out.push(ESC);
@@ -565,8 +577,12 @@ impl Writer {
     }
 
     fn cursor(&mut self, cursor: CursorState) {
-        // The scroll region and origin mode go in here, after every row has been painted at an
-        // absolute address and before the one position they apply to.
+        // Everything the rows had to be painted without goes in here: the character sets the text
+        // would have been drawn through, and the scroll region and origin mode that would have
+        // moved every absolute address.
+        if let Some(charsets) = self.charsets.take() {
+            self.charsets(&charsets);
+        }
         let margins = self.margins.take();
         if let Some(margins) = margins {
             self.install_margins(margins);
@@ -739,20 +755,52 @@ pub fn side_effect(kind: &SideEffectKind) -> Option<Vec<u8>> {
             Some(out)
         }
         SideEffectKind::Notification {
-            title, body, id, ..
+            title,
+            body,
+            id,
+            urgency,
+            display,
         } => {
-            // OSC 777 is the spelling with the widest support, and it is the one kr-vt/1 names for
-            // a notification a terminal is asked to raise. The identifier travels in the title
-            // field's own separator position, where the sequence puts it.
-            let mut payload = b"notify;".to_vec();
-            let heading = title
-                .as_deref()
-                .unwrap_or_else(|| id.as_deref().unwrap_or(""));
-            payload.extend_from_slice(heading.as_bytes());
-            payload.push(b';');
-            payload.extend_from_slice(body.as_bytes());
+            // OSC 99 rather than OSC 777, because it is the spelling that carries everything the
+            // application said: the identifier that groups and replaces a notification, the
+            // urgency, and the condition under which it asked to be shown. OSC 777 has fields for
+            // none of those, so converting to it would quietly turn a notification meant only for
+            // an unfocused session into an unconditional one, and would leave an identifier to be
+            // used as a title.
+            let mut metadata: Vec<String> = Vec::new();
+            if let Some(id) = id {
+                metadata.push(format!("i={id}"));
+            }
+            metadata.push(format!(
+                "u={}",
+                match urgency {
+                    NotificationUrgency::Low => 0,
+                    NotificationUrgency::Normal => 1,
+                    NotificationUrgency::Critical => 2,
+                }
+            ));
+            metadata.push(
+                match display {
+                    NotificationDisplay::Always => "o=always",
+                    NotificationDisplay::Unfocused => "o=unfocused",
+                    NotificationDisplay::Invisible => "o=invisible",
+                }
+                .to_owned(),
+            );
+            let common = metadata.join(":");
             let mut out = Vec::new();
-            osc_into(&mut out, b"777", &payload);
+            // A title and a body are two payloads of one notification: the title comes first, the
+            // body second, and only the last one is marked complete.
+            if let Some(title) = title {
+                let mut heading = common.clone().into_bytes();
+                heading.extend_from_slice(b":p=title:d=0;");
+                heading.extend_from_slice(title.as_bytes());
+                osc_into(&mut out, b"99", &heading);
+            }
+            let mut rest = common.into_bytes();
+            rest.extend_from_slice(b":p=body:d=1;");
+            rest.extend_from_slice(body.as_bytes());
+            osc_into(&mut out, b"99", &rest);
             Some(out)
         }
         SideEffectKind::Progress { progress } => {

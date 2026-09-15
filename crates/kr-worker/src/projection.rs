@@ -28,11 +28,10 @@
 //! | `viewport` | a rendering of the canonical grid, clipped to the terminal's own size | every other case |
 //!
 //! Direct mode is *qualified*, not assumed: the engine reports the point at which the stream stops
-//! being something a physical terminal can be handed, and an attachment moves to a projection
-//! there rather than being sent bytes that would leave its screen wrong. Coming back the other way
-//! waits for a parser-ground boundary, because starting a byte stream anywhere else would hand a
-//! terminal the middle of an escape sequence; [`kr_term::snapshot::LiveForwardingHandoff`] holds
-//! that rule and this module applies it.
+//! being something a physical terminal can be handed, and an attachment moves to a projection there
+//! rather than being sent bytes that would leave its screen wrong. A direct attachment is only ever
+//! handed complete spans the engine has cleared, each one beginning where a sequence begins, so
+//! there is no moment at which it could be handed the middle of an escape sequence.
 
 use kr_protocol::ids::{AttachmentId, InputLeaseEpoch};
 use kr_protocol::session::Dimensions;
@@ -40,10 +39,19 @@ use kr_term::budget::GridSize;
 use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
 use kr_term::lane::LaneGate;
 use kr_term::sideeffect::{LeaseHolder, SideEffect, SideEffectKind};
-use kr_term::snapshot::{HandoffOutcome, LiveForwardingHandoff, Viewport, restoration_operations};
+use kr_term::snapshot::{Viewport, restoration_operations};
 
 use crate::error::{Result, WorkerError};
 use crate::render::{Restoration, render};
+
+/// The most raw output the host keeps so a span the engine clears later can still be produced.
+///
+/// Trimming to the engine's committed offset is exactly what a valid forward span needs, and it is
+/// not a memory bound on its own: a control string that never terminates leaves the committed
+/// offset where it is while the lexer keeps discarding its payload in constant space. This bounds
+/// what the host keeps, and a span that then cannot be produced is reported as lost rather than
+/// skipped, which resynchronises every subscriber.
+pub const MAX_RETAINED_TAIL: usize = 1024 * 1024;
 
 /// The largest batch of query answers written into the application in one go.
 ///
@@ -115,8 +123,6 @@ pub struct TerminalEngine {
     /// It is cleared by a projection reset, because a reset is the engine starting the projection
     /// again from a screen it fully describes.
     projection_required: bool,
-    /// The handoff waiting for a parser-ground boundary before byte forwarding may resume.
-    handoff: Option<LiveForwardingHandoff>,
     /// The raw bytes the engine has not committed yet, so a span it clears later can be resolved.
     ///
     /// It begins at the engine's own committed offset and is trimmed to it after every call, which
@@ -155,7 +161,6 @@ impl TerminalEngine {
             engine,
             canonical,
             projection_required: false,
-            handoff: None,
             tail: Vec::new(),
             tail_cursor: 0,
         })
@@ -196,7 +201,6 @@ impl TerminalEngine {
         // are kept: the lexer's position does not move, so a sequence that was arriving across the
         // resize still has to be resolvable when it completes.
         self.projection_required = false;
-        self.handoff = None;
         Ok(())
     }
 
@@ -314,26 +318,6 @@ impl TerminalEngine {
         )
     }
 
-    /// Decides whether byte forwarding may resume for a direct attachment.
-    ///
-    /// Forwarding may only start where the parser stands on ground. Output does not stop for the
-    /// handoff, so this waits, and a window without a boundary leaves the attachment projected and
-    /// tries again later.
-    pub fn poll_handoff(&mut self, now_ms: u64) -> HandoffOutcome {
-        if self.projection_required {
-            return HandoffOutcome::StayProjected;
-        }
-        let handoff = *self
-            .handoff
-            .get_or_insert_with(|| LiveForwardingHandoff::start(now_ms));
-        let outcome = handoff.poll(now_ms, self.engine.ground_boundary());
-        match outcome {
-            HandoffOutcome::Waiting => {}
-            HandoffOutcome::Ready { .. } | HandoffOutcome::StayProjected => self.handoff = None,
-        }
-        outcome
-    }
-
     fn collect(&mut self, outcome: &FeedOutcome, gate: LaneGate, now_ms: u64) -> Filtered {
         let mut filtered = Filtered {
             projection_required_at: outcome.projection_required_at,
@@ -377,6 +361,14 @@ impl TerminalEngine {
             let spent = spent.min(self.tail.len());
             self.tail.drain(..spent);
             self.tail_cursor = self.tail_cursor.saturating_add(spent as u64);
+        }
+        // And a bound of its own, because the committed offset can stand still while an
+        // unterminated control string arrives without limit.
+        if self.tail.len() > MAX_RETAINED_TAIL {
+            let surplus = self.tail.len() - MAX_RETAINED_TAIL;
+            self.tail.drain(..surplus);
+            self.tail_cursor = self.tail_cursor.saturating_add(surplus as u64);
+            filtered.lost = true;
         }
         for effect in &outcome.side_effects {
             match effect.destination {

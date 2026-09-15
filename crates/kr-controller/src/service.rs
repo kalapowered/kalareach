@@ -213,21 +213,23 @@ impl Controller {
                 // hands it a launch specification, and that never happened, so an ended process
                 // means nothing came of this launch. A process still running, or one the kernel
                 // will not describe, keeps its slot.
-                LaunchPhase::Spawned => {
-                    if reservation
-                        .launcher_identity
-                        .as_ref()
-                        .is_some_and(|identity| {
-                            matches!(
-                                kr_ipc::identity::process_state(identity),
-                                kr_ipc::identity::ProcessState::Ended
-                            )
-                        })
-                    {
-                        let mut registry = self.registry.lock().await;
-                        registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                LaunchPhase::Spawned => match reservation.launcher_identity.as_ref() {
+                    Some(identity) => {
+                        if matches!(
+                            kr_ipc::identity::process_state(identity),
+                            kr_ipc::identity::ProcessState::Ended
+                        ) {
+                            let mut registry = self.registry.lock().await;
+                            registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                        }
                     }
-                }
+                    // Spawned with no launcher recorded: the daemon died between handing the
+                    // launch to the service manager and writing down what it returned. Something
+                    // may be running, so it is recovered the way a consumed claim is — by
+                    // challenge where it answers, and by a recorded abnormal closure where its
+                    // endpoint is confirmed gone. Leaving it here would hold a slot for ever.
+                    None => self.recover_claim(&reservation).await?,
+                },
                 // Claimed. This worker received its launch specification, so it may have started a
                 // shell. It is recovered by challenge where it still answers, and recorded as an
                 // abnormal closure where its process is confirmed gone; a claim is never resolved
@@ -489,11 +491,11 @@ impl Controller {
                     let mut registry = self.registry.lock().await;
                     registry.record_acknowledged_revision(session_id, ack.revision)?;
                     drop(registry);
-                    self.leases.acknowledge(
-                        session_id,
-                        self.leases.binding(session_id),
-                        ack.revision,
-                    );
+                    // Under the binding this announcement was made over, not whatever the binding
+                    // is now: another exchange can lose the path and advance it while this one
+                    // waits for the registry, and an acknowledgement from the path that was lost
+                    // must not lift the fence that loss set on the one in force.
+                    self.leases.acknowledge(session_id, binding, ack.revision);
                 }
                 // A worker that is confirmed gone answers the question a different way: it can no
                 // longer act under anything.
@@ -548,6 +550,43 @@ impl Controller {
             .filter(|worker| worker.acknowledged_revision.get() < revision.get())
             .map(|worker| worker.session_id)
             .collect())
+    }
+
+    /// Answers an action this daemon has already admitted for this caller, if it has.
+    ///
+    /// The de-duplication key is the actor and the action together, and the payload digest decides
+    /// whether it is the same action or a reused identifier. Only `session.create` has a retained
+    /// record here; a close is retained by the worker that owns the session, which answers its own
+    /// duplicates.
+    async fn retained(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Option<ControlFrame> {
+        if method != Method::SessionCreate {
+            return None;
+        }
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        let existing = {
+            let registry = self.registry.lock().await;
+            registry
+                .reservation_for_token(actor_id, mutation.action_id.get())
+                .ok()
+                .flatten()?
+        };
+        if existing.payload_digest != digest {
+            return Some(respond(
+                mutation.request_id,
+                Err(ControllerError::IdConflict {
+                    token: mutation.action_id.to_string(),
+                }),
+            ));
+        }
+        Some(respond(
+            mutation.request_id,
+            self.replay_create(&existing).await,
+        ))
     }
 
     /// Validates a local caller's record and registers its connection in one step.
@@ -1265,6 +1304,13 @@ impl Controller {
                 "the method is not in the registry",
             );
         };
+        // A retained action is answered before anything about a first admission is considered.
+        // Section 9 makes the freshness window the thing that admits a *new* action; applying it to
+        // a retry would refuse a caller its own completed result because its window has since been
+        // replaced, and replacing the window of an action already submitted is not allowed either.
+        if let Some(retained) = self.retained(actor_id, &mutation, method).await {
+            return retained;
+        }
         let accepted = match self.check_envelope(connection_id, &mutation, method) {
             Ok(accepted) => accepted,
             Err(error) => {
@@ -1322,7 +1368,7 @@ impl Controller {
         accepted: AcceptedDeadline,
     ) -> ControlFrame {
         let outcome = match method {
-            Method::SessionCreate => self.session_create(actor_id, mutation).await,
+            Method::SessionCreate => self.session_create(actor_id, mutation, accepted).await,
             Method::SessionClose => {
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
                 self.session_close(mutation, &actor, accepted).await
@@ -1511,6 +1557,7 @@ impl Controller {
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
+        accepted: AcceptedDeadline,
     ) -> Result<ParamsValue> {
         let create: SessionCreateParams = parse(&mutation.params)?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
@@ -1543,6 +1590,22 @@ impl Controller {
             .await
             .insert(reservation.reservation_id, PendingCreate { ready: sender });
 
+        // The deadline the host accepted, checked at the moment the launch runs rather than when
+        // the request arrived. Reserving takes a lock and a durable write, and an action whose life
+        // ran out while it waited for those does not then start a shell.
+        if self.clock.now() >= accepted.deadline {
+            let mut registry = self.registry.lock().await;
+            registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+            drop(registry);
+            self.pending
+                .lock()
+                .await
+                .remove(&reservation.reservation_id);
+            return Err(ControllerError::WindowExpired {
+                detail: "the deadline this create was admitted under passed before it could start"
+                    .to_owned(),
+            });
+        }
         // The reservation moves to `spawned` before anything is started. A worker can reach the
         // rendezvous socket the instant the service manager starts it, which is sooner than the
         // launcher returns, and a reservation still recorded as merely reserved would fence its

@@ -117,10 +117,15 @@ impl Attachment {
 /// the stream; one that does not is shown a rendering of the canonical grid instead, which needs
 /// nothing of it beyond cursor addressing and colour.
 ///
-/// The list is a qualification record, not a guess. A name is added to it when the profile's own
-/// conformance corpus has been run against that terminal, and `TERM=dumb`, `TERM=vt100` and an
-/// unknown name are all outside it for the same reason: this build has not established what its
-/// output does there.
+/// What the list rests on is stated rather than implied: each of these terminals implements the
+/// `xterm-256color` entry the kr-vt/1 profile is written against, and the profile's own conformance
+/// corpus has been run against the engine's output rather than against each of these terminals.
+/// That is weaker than a per-terminal measurement, and it is why the list is short and why anything
+/// outside it is projected. `TERM=dumb` and `TERM=vt100` are outside it because they do not
+/// implement that entry at all.
+///
+/// A name reaching here is the client's own report of what it probed, which is a claim rather than
+/// a measurement: `TERM` names a terminfo entry, not a build or a configuration of it.
 pub const QUALIFIED_TERMINALS: &[&str] = &[
     "xterm-256color",
     "xterm-kitty",

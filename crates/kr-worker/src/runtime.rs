@@ -24,7 +24,22 @@ use crate::session::{
 pub const READ_QUEUE_DEPTH: usize = 64;
 
 /// How often the root shell's status is checked, independently of the terminal.
+///
+/// Asking the kernel whether one child has exited costs almost nothing, so this is often.
 pub const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How often the set of processes a session owns is observed.
+///
+/// Enumerating a process group and reading each member's start identity is a kernel query per
+/// process, and a host that did it ten times a second for every idle session would spend more of a
+/// core on watching nothing happen than KR-PERF-003 allows the whole host.
+///
+/// The cost of the longer interval is stated rather than hidden: a process that both starts and
+/// ends inside one interval is not recorded, so it is not in the closure record's list of what was
+/// stopped. The record already never claims every application was discovered, and the coverage flag
+/// says which boundary produced it; this widens the window in which that is true rather than
+/// changing what is claimed.
+pub const OWNERSHIP_OBSERVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How often a closing session is asked whether its processes have stopped.
 pub const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -163,6 +178,7 @@ impl SessionRuntime {
         let monitor_wake = Arc::clone(&wake);
         let monitor_fence = Arc::clone(&fence);
         tokio::spawn(async move {
+            let mut next_observation = Instant::now();
             loop {
                 tokio::time::sleep(CHILD_POLL_INTERVAL).await;
                 let initiated = {
@@ -172,9 +188,15 @@ impl SessionRuntime {
                     if session.state() == SessionState::Closed {
                         break;
                     }
-                    // The set of processes the session owns is built up while it runs. One that
-                    // starts and ends between two closures would otherwise never be recorded.
-                    session.observe_owned();
+                    // The set of processes the session owns is built up while it runs, on its own
+                    // slower cadence: one that starts and ends between two observations is never
+                    // recorded, and observing at the rate the shell is checked would cost more than
+                    // the whole host is allowed to spend while idle.
+                    let now = Instant::now();
+                    if now >= next_observation {
+                        session.observe_owned();
+                        next_observation = now + OWNERSHIP_OBSERVE_INTERVAL;
+                    }
                     // A desktop-bound session belongs to one login. When that login ends the
                     // session ends with it, with the reason that says so.
                     if session.desktop_lost() {

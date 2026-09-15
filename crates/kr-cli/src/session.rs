@@ -158,8 +158,13 @@ pub async fn run(
     let outcome = drive(
         &mut client,
         descriptor,
-        attachment.attachment_id,
-        epoch,
+        Attached {
+            attachment_id: attachment.attachment_id,
+            lease_epoch: epoch,
+            geometry_epoch: attachment.result.geometry.epoch,
+            owns_geometry: attachment.result.geometry.owner.as_ref()
+                == Some(&attachment.attachment_id),
+        },
         &mut input,
         &handle,
         &terminal,
@@ -174,17 +179,32 @@ pub async fn run(
     Ok((outcome, descriptor.session_id))
 }
 
+/// What the attach established, which the loop then keeps up to date.
+#[derive(Clone, Copy, Debug)]
+struct Attached {
+    attachment_id: kr_protocol::ids::AttachmentId,
+    lease_epoch: InputLeaseEpoch,
+    /// The geometry epoch this terminal last saw. A resize quotes it, so a claim that moved while
+    /// the window was being dragged is refused rather than silently applied to a stale view.
+    geometry_epoch: kr_protocol::ids::GeometryEpoch,
+    /// Whether this attachment owns the session's size.
+    owns_geometry: bool,
+}
+
+/// What one outstanding request was for, so its answer is read as an answer to that.
+#[derive(Clone, Copy, Debug)]
+enum Outstanding {
+    /// Input at this sequence number.
+    Input(u64),
+    /// A size change this terminal reported.
+    Geometry,
+}
+
 /// Runs the attachment's input, output and connection in one loop.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "an attachment is input, output, connection, terminal and size; the loop needs all of \
-              them and splitting it would split the thing that has to end together"
-)]
 async fn drive(
     client: &mut LocalClient,
     descriptor: &WorkerDescriptor,
-    attachment_id: kr_protocol::ids::AttachmentId,
-    epoch: InputLeaseEpoch,
+    attached: Attached,
     input: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     output: &Arc<std::fs::File>,
     terminal: &ControllingTerminal,
@@ -193,10 +213,14 @@ async fn drive(
     use std::io::Write as _;
 
     let session_id = descriptor.session_id;
+    let attachment_id = attached.attachment_id;
+    let epoch = attached.lease_epoch;
+    let mut geometry_epoch = attached.geometry_epoch;
+    let mut owns_geometry = attached.owns_geometry;
     let mut resized = resized;
 
     let mut sequence = 0_u64;
-    let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, u64> =
+    let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding> =
         std::collections::BTreeMap::new();
     let mut next_request = 1_u64;
     loop {
@@ -230,18 +254,37 @@ async fn drive(
                         }
                     }
                     Ok(ControlFrame::Response(response)) => {
-                        let Some(sent) = outstanding.remove(&response.request_id) else {
+                        let Some(what) = outstanding.remove(&response.request_id) else {
                             continue;
                         };
-                        if let kr_protocol::envelope::Outcome::Error(error) = response.outcome {
-                            return match error.code {
-                                ErrorCode::LeaseLost => AttachOutcome::LeaseLost,
-                                ErrorCode::SessionClosed => AttachOutcome::SessionClosed,
-                                code => AttachOutcome::DeliveryUncertain(format!(
-                                    "{code} at input {sent}: {}",
-                                    error.message
-                                )),
-                            };
+                        match (what, response.outcome) {
+                            // A size report is a report, not an insistence. Another attachment may
+                            // own the size, and the answer then says so; the terminal is shown that
+                            // size rather than taking it, and the attachment carries on.
+                            (Outstanding::Geometry, outcome) => {
+                                if let kr_protocol::envelope::Outcome::Ok(value) = outcome
+                                    && let Ok(result) = value
+                                        .to_typed::<kr_protocol::attachment::GeometryResult>()
+                                {
+                                    geometry_epoch = result.geometry.epoch;
+                                    owns_geometry = result.geometry.owner.as_ref()
+                                        == Some(&attachment_id);
+                                }
+                            }
+                            (
+                                Outstanding::Input(sent),
+                                kr_protocol::envelope::Outcome::Error(error),
+                            ) => {
+                                return match error.code {
+                                    ErrorCode::LeaseLost => AttachOutcome::LeaseLost,
+                                    ErrorCode::SessionClosed => AttachOutcome::SessionClosed,
+                                    code => AttachOutcome::DeliveryUncertain(format!(
+                                        "{code} at input {sent}: {}",
+                                        error.message
+                                    )),
+                                };
+                            }
+                            (Outstanding::Input(_), kr_protocol::envelope::Outcome::Ok(_)) => {}
                         }
                     }
                     Ok(_) => {}
@@ -250,20 +293,41 @@ async fn drive(
             }
             () = wait_for_resize(&mut resized) => {
                 // The outer terminal changed size. The session is told, so the application is
-                // redrawn at the size the person is actually looking at.
-                if let Ok(size) = terminal.size() {
+                // redrawn at the size the person is actually looking at. The request goes out on
+                // this loop's own connection and its answer comes back through the arm above:
+                // calling out to a separate request-and-wait here would read this attachment's
+                // output, resynchronisation and detach events as though they were the answer.
+                let Ok(size) = terminal.size() else {
+                    continue;
+                };
+                let dimensions = Dimensions::new(
+                    u64::from(size.columns),
+                    u64::from(size.rows),
+                );
+                let request_id = kr_protocol::ids::RequestId::new(next_request);
+                next_request += 1;
+                // The owner moves the session's size; anybody else reports the size it is
+                // looking at, which changes which presentation it is served and nothing else.
+                let sent = if owns_geometry {
                     let params = kr_protocol::attachment::TerminalResizeParams {
                         attachment_id,
-                        dimensions: Dimensions::new(
-                            u64::from(size.columns),
-                            u64::from(size.rows),
-                        ),
-                        expected_geometry_epoch: kr_protocol::ids::GeometryEpoch::new(0),
+                        dimensions,
+                        expected_geometry_epoch: geometry_epoch,
                     };
-                    // A size change is reported, not insisted on: another attachment may own the
-                    // geometry, and this one is then shown that size rather than taking it.
-                    let _ = crate::attach::resize(client, descriptor, &params).await;
+                    send_geometry(client, descriptor, request_id, Method::TerminalResize, &params)
+                        .await
+                } else {
+                    let params = kr_protocol::attachment::AttachmentViewportParams {
+                        attachment_id,
+                        dimensions,
+                    };
+                    send_geometry(client, descriptor, request_id, Method::AttachmentViewport, &params)
+                        .await
+                };
+                if !sent {
+                    return AttachOutcome::Disconnected;
                 }
+                outstanding.insert(request_id, Outstanding::Geometry);
             }
             bytes = input.recv() => {
                 let Some(bytes) = bytes else {
@@ -297,11 +361,46 @@ async fn drive(
                         "the connection ended while input was being sent".to_owned(),
                     );
                 }
-                outstanding.insert(request_id, sequence);
+                outstanding.insert(request_id, Outstanding::Input(sequence));
                 sequence += 1;
             }
         }
     }
+}
+
+/// Writes one size report on this loop's own connection.
+///
+/// Returns whether it reached the socket. The answer comes back through the loop, like every other
+/// answer on this connection.
+async fn send_geometry<T: serde::Serialize + ?Sized>(
+    client: &mut LocalClient,
+    descriptor: &WorkerDescriptor,
+    request_id: kr_protocol::ids::RequestId,
+    method: Method,
+    params: &T,
+) -> bool {
+    let Ok(params) = kr_protocol::envelope::ParamsValue::from_typed(params) else {
+        return false;
+    };
+    let mutation = kr_protocol::envelope::MutationRequest {
+        request_id,
+        method: method.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+        grant_id: kr_protocol::scalars::Nullable::null(),
+        target: crate::attach::target(descriptor),
+        expected: kr_protocol::envelope::ParamsValue::empty(),
+        action_window_id: client.action_window().action_window_id.clone(),
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(
+            kr_protocol::limits::DEFAULT_MUTATION_TTL.get(),
+        ),
+        params,
+    };
+    client
+        .writer()
+        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .is_ok()
 }
 
 /// How this platform reports that the terminal changed size.

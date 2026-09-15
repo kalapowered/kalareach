@@ -57,7 +57,7 @@ use kr_protocol::session::{
     ClosureReason, SessionCloseResult, SessionReadParams, SessionReadResult,
 };
 use kr_protocol::worker::GenerationChallenge;
-use kr_transport::clock::{ContinuousClock, SystemContinuousClock};
+use kr_transport::clock::{ContinuousClock, ContinuousInstant, SystemContinuousClock};
 use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
 use crate::error::{Result, WorkerError};
@@ -465,13 +465,31 @@ impl WorkerService {
                     }
                     let _ = attachment_id;
                 });
-                // The registry holds the handle too, so a withdrawal can stop the delivery
-                // without waiting for this loop to come back round.
-                *registration
-                    .delivery
-                    .lock()
-                    .expect("the delivery slot is not poisoned") = Some(task.abort_handle());
-                state.delivery = Some(task);
+                // The registry holds the handle too, so a withdrawal can stop the delivery without
+                // waiting for this loop to come back round. A withdrawal that happened while the
+                // task was being spawned has already removed the registration, and the task is
+                // stopped here instead: otherwise it would deliver this session's output on a
+                // connection whose authority is gone.
+                let still_admitted = {
+                    let mut held = registration
+                        .delivery
+                        .lock()
+                        .expect("the delivery slot is not poisoned");
+                    let admitted = self
+                        .admitted
+                        .lock()
+                        .expect("the connection registry is not poisoned")
+                        .contains_key(&connection_id);
+                    if admitted {
+                        *held = Some(task.abort_handle());
+                    }
+                    admitted
+                };
+                if still_admitted {
+                    state.delivery = Some(task);
+                } else {
+                    task.abort();
+                }
             }
         }
         // A close whose acceptance was never confirmed delivered still happens. The connection is
@@ -1017,11 +1035,29 @@ impl WorkerService {
                 ),
             );
         }
+        // Anchored here, before the dispatch barrier and before anything else this worker waits
+        // for. The daemon's remaining lifetime is bounded by the protocol maximum on the way in, so
+        // a daemon cannot hand a worker a longer life than the protocol allows.
+        let remaining = std::time::Duration::from_millis(
+            forwarded
+                .accepted_ttl_ms
+                .get()
+                .min(kr_protocol::limits::MAX_MUTATION_TTL.get()),
+        );
+        let Some(deadline) = self.clock.now().checked_add(remaining) else {
+            return failure(
+                forwarded.mutation.request_id,
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "the accepted deadline for this action is out of range",
+                ),
+            );
+        };
         self.mutation(
             state,
             &forwarded.mutation,
             forwarded.actor.actor_id.clone(),
-            Freshness::Vouched(forwarded.accepted_ttl_ms),
+            Freshness::Vouched(deadline),
         )
     }
 
@@ -1063,20 +1099,11 @@ impl WorkerService {
         let now = self.clock.now();
         let deadline = match freshness {
             Freshness::Window => self.check_window(state, mutation)?.deadline,
-            // The daemon derived this deadline at first admission and this is what was left of it
-            // when the mutation was forwarded. The worker anchors it on its own clock and bounds it
-            // by the protocol maximum; it never lengthens a deadline somebody else shortened.
-            Freshness::Vouched(remaining) => {
-                let remaining = std::time::Duration::from_millis(
-                    remaining
-                        .get()
-                        .min(kr_protocol::limits::MAX_MUTATION_TTL.get()),
-                );
-                now.checked_add(remaining)
-                    .ok_or_else(|| WorkerError::WindowExpired {
-                        detail: "the accepted deadline for this action is out of range".to_owned(),
-                    })?
-            }
+            // The daemon derived this deadline at first admission and the worker anchored what was
+            // left of it on its own clock the moment the frame arrived, before it waited for
+            // anything. Anchoring it here instead would hand back every millisecond the dispatch
+            // barrier had already spent.
+            Freshness::Vouched(deadline) => deadline,
         };
         // The receipt carries a wall-clock deadline, because that is what a person and a wire
         // format read. Nothing expires against it.
@@ -1107,13 +1134,21 @@ impl WorkerService {
 
         // Storage failure stops an ordinary typed mutation before dispatch. An authorised stop is
         // the named exception: section 7 requires `session.close` to proceed on the worker's
-        // current in-memory authority and report `durability=volatile`.
+        // current in-memory authority and report `durability=volatile`. A journal that is *open
+        // and failing* is the same condition as one that is absent — a full disk refusing a write
+        // is exactly when a person most needs to be able to stop a session — so the exception
+        // covers the write failing as well as the journal being missing.
+        let stopping = method == Method::SessionClose;
         let admitted = match session.journal_mut() {
-            Some(journal) => {
-                journal.accept(&submission)?;
-                true
-            }
-            None if method == Method::SessionClose => false,
+            Some(journal) => match journal.accept(&submission) {
+                Ok(_) => true,
+                Err(error) if stopping => {
+                    session.note_journal_failure(error.to_string());
+                    false
+                }
+                Err(error) => return Err(error),
+            },
+            None if stopping => false,
             None => {
                 return Err(WorkerError::JournalUnavailable {
                     detail:
@@ -1158,7 +1193,17 @@ impl WorkerService {
             return Err(error);
         }
         if admitted && let Some(journal) = session.journal_mut() {
-            journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())?;
+            // The dispatch marker is committed before the effect. A stop whose marker cannot be
+            // written proceeds on the worker's current authority and reports volatile durability,
+            // for the same reason its acceptance did; anything else is refused before it happens.
+            if let Err(error) =
+                journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())
+            {
+                if !stopping {
+                    return Err(error);
+                }
+                session.note_journal_failure(error.to_string());
+            }
         }
 
         let outcome = self.apply(&mut session, state, mutation, method);
@@ -1859,13 +1904,14 @@ pub struct JoinedScreen {
 pub enum Freshness {
     /// The action window this connection holds.
     Window,
-    /// What remained of the deadline the control daemon derived when it admitted the action.
+    /// The deadline the control daemon derived, anchored on this worker's clock as the frame
+    /// arrived.
     ///
-    /// A duration rather than an instant: the two processes measure on their own continuous
-    /// clocks, whose origins mean nothing to each other. The worker anchors it on its own clock as
-    /// it reads the frame, and bounds it by the protocol maximum, so a daemon cannot hand a worker
-    /// a longer life than the protocol allows.
-    Vouched(kr_protocol::scalars::DurationMs),
+    /// The wire carries a duration rather than an instant, because the two processes measure on
+    /// their own continuous clocks and neither origin means anything to the other. It is anchored
+    /// the moment the frame is read, before this worker waits for anything, so nothing the worker
+    /// then waits for gives the action its time back.
+    Vouched(ContinuousInstant),
 }
 
 /// The subject facts a mutation requires to still be true.

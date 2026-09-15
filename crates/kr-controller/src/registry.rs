@@ -761,7 +761,12 @@ impl Registry {
         )
     }
 
-    fn reservation_for_token(
+    /// Returns the reservation one actor's create token already named, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub fn reservation_for_token(
         &self,
         actor_id: &ActorId,
         create_token: Uuid,

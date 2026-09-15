@@ -36,12 +36,18 @@ pub use crate::platform::{ControllingTerminal, SavedModes};
 #[cfg(unix)]
 pub use unix::{ControllingTerminal, SavedModes};
 
-/// The escape sequences that undo the modes a full-screen application may have enabled.
+/// The escape sequences that undo the modes a session may have left the terminal in.
 ///
-/// A detach restores the saved terminal modes and then sends these, because an application that
-/// was killed never got the chance to turn its own modes off.
-pub const RESET_SEQUENCES: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b[?2004l\x1b[?25h\x1b[?1l\x1b>";
+/// A detach restores the saved terminal modes and then sends these, because an application that was
+/// killed never got the chance to turn its own modes off. Termios alone is not enough: it does not
+/// describe mouse reporting, the alternate screen, bracketed paste, focus reporting or which key
+/// encoding the terminal is using, and a person left in one of those has a terminal that behaves
+/// like somebody else's.
+///
+/// The order matters. The keyboard protocols come last, because leaving a terminal in an enhanced
+/// key encoding is the failure a person cannot work around: their shell receives escape sequences
+/// where it expects characters.
+pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1049l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f\x1b[<65535u\x1b[>4;0m";
 
 /// The size of a terminal, in character cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -139,6 +139,9 @@ async fn create(host: &Host) -> SessionCreateResult {
 }
 
 /// Returns the resident size of a process, in kibibytes.
+///
+/// A reading this host could not take is not zero. Treating it as zero would make the total smaller
+/// than the truth, and a measurement that can only be wrong downwards is not evidence.
 fn resident_kib(pid: u32) -> u64 {
     let output = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
@@ -147,7 +150,7 @@ fn resident_kib(pid: u32) -> u64 {
     String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()
-        .unwrap_or(0)
+        .unwrap_or_else(|_| panic!("the kernel reports process {pid}'s resident size"))
 }
 
 /// Returns the processor time a process has used, in seconds.
@@ -200,14 +203,17 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
     // that counted only the shell would leave out the thing it is meant to be measuring.
     let mut measured: Vec<u32> = Vec::new();
     for created in &sessions {
-        let Some(root) = created.session.root_process.as_ref() else {
-            continue;
-        };
-        let shell = u32::try_from(root.pid.get()).unwrap_or_default();
+        // A session with no root process, or a worker the kernel will not name, is a measurement
+        // this host cannot take. Quietly leaving it out would make the answer smaller than the
+        // truth, which is the one direction a resource measurement must never be wrong in.
+        let root = created
+            .session
+            .root_process
+            .as_ref()
+            .expect("every live session names its root process");
+        let shell = u32::try_from(root.pid.get()).expect("a process identifier");
         measured.push(shell);
-        if let Some(worker) = parent_of(shell) {
-            measured.push(worker);
-        }
+        measured.push(parent_of(shell).expect("the kernel names each root shell's worker"));
     }
     measured.sort_unstable();
     measured.dedup();

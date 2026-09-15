@@ -712,6 +712,10 @@ impl Session {
                 bytes: outcome.forward.clone(),
             });
         }
+        // A paste that has just closed, or a frame that has just completed, opens the gate the
+        // response lane was waiting on. An application that asked a question during one of those
+        // and then sat still would otherwise wait for its answer until the next byte of output.
+        self.pump_replies();
         Ok(InputAccepted {
             forwarded_bytes: outcome.forward.len() as u64,
             held_prefix_bytes: outcome.held as u64,
@@ -725,7 +729,7 @@ impl Session {
     /// another keystroke.
     pub fn expire_paste_prefix(&mut self, now: Instant) -> usize {
         let epoch = self.lease.epoch();
-        match self.framer.expire(now) {
+        let expired = match self.framer.expire(now) {
             Some(bytes) if !bytes.is_empty() => {
                 let len = bytes.len();
                 self.pending_input.push(InputBatch {
@@ -735,7 +739,11 @@ impl Session {
                 len
             }
             _ => 0,
-        }
+        };
+        // The held prefix has gone, so a frame that was open is closed and the response lane's
+        // gate is open again.
+        self.pump_replies();
+        expired
     }
 
     /// Returns the deadline of a held delimiter prefix, if there is one.
@@ -1047,11 +1055,14 @@ impl Session {
             {
                 resynchronised.push(attachment_id);
             }
-            // The screen was settled before this loop began, so this snapshot released nothing.
+            // The screen was settled before this loop began, so this snapshot changes no display
+            // state. It can still return replies the response lane released in the moment between,
+            // and those are the application's, not this subscriber's repaint.
             debug_assert!(
-                settled.is_empty(),
+                settled.direct.is_empty() && settled.effects.is_empty(),
                 "the screen is settled once, before any snapshot is taken"
             );
+            self.queue_replies(settled.replies);
         }
         resynchronised.sort_unstable();
         resynchronised.dedup();
@@ -1150,6 +1161,21 @@ impl Session {
                 // process group about to be stopped, and section 7 gives it its acceptance first.
                 self.state = SessionState::Closing;
                 self.closing_reason = Some(reason);
+                // Input is rejected from here, and that has to reach bytes already handed to the
+                // writer as well as the ones not yet accepted. Releasing the lease moves the fence,
+                // so a keystroke queued a moment before the close is dropped rather than typed into
+                // a shell that is being stopped.
+                if let Some(holder) = self.lease.holder() {
+                    self.lease.release_attachment(holder);
+                }
+                let framing = self.framer.close_for_takeover();
+                if let Some(terminator) = framing.terminator {
+                    self.pending_input.push(InputBatch {
+                        origin: InputOrigin::Host,
+                        bytes: terminator.to_vec(),
+                    });
+                }
+                self.note_lease_holder();
                 CloseAcceptance {
                     state: SessionState::Closing,
                     durability: self.durability(),
