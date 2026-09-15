@@ -1125,10 +1125,18 @@ impl Engine {
     }
 
     fn keyboard_snapshot(&self) -> KeyboardSnapshot {
+        let (primary_flags, primary_stack) = self.modes.kitty_buffer(false);
+        let (alternate_flags, alternate_stack) = self.modes.kitty_buffer(true);
         KeyboardSnapshot {
             modify_other_keys: self.modes.modify_other_keys(),
-            kitty_flags: self.modes.kitty_flags(),
-            kitty_stack: self.modes.kitty_stack().to_vec(),
+            primary: crate::snapshot::KittyKeyboard {
+                flags: primary_flags,
+                stack: primary_stack,
+            },
+            alternate: crate::snapshot::KittyKeyboard {
+                flags: alternate_flags,
+                stack: alternate_stack,
+            },
         }
     }
 

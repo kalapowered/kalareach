@@ -538,9 +538,9 @@ fn a_snapshot_carries_the_keyboard_protocol() {
     let view = viewport(&engine);
     let (snapshot, _) = engine.snapshot(view, 0);
     assert_eq!(snapshot.keyboard.modify_other_keys, 2);
-    assert_eq!(snapshot.keyboard.kitty_flags, Some(3));
+    assert_eq!(snapshot.keyboard.primary.flags, Some(3));
     assert_eq!(
-        snapshot.keyboard.kitty_stack.len(),
+        snapshot.keyboard.primary.stack.len(),
         2,
         "the flag stack survives with it"
     );
@@ -763,25 +763,30 @@ fn keyboard_negotiation_has_one_owner() {
     assert_eq!(keyboard(b"\x1b[>4;2m\x1b[>4m").modify_other_keys, 0);
 
     // `CSI =u` with no parameters resets the Kitty flags.
-    assert_eq!(keyboard(b"\x1b[=3u").kitty_flags, Some(3));
-    assert_eq!(keyboard(b"\x1b[=3u\x1b[=u").kitty_flags, Some(0));
+    assert_eq!(keyboard(b"\x1b[=3u").primary.flags, Some(3));
+    assert_eq!(keyboard(b"\x1b[=3u\x1b[=u").primary.flags, Some(0));
 
     // `CSI <u` pops one entry; `CSI <0u` pops one as well, because zero means one.
     let one = keyboard(b"\x1b[>1u\x1b[>3u\x1b[<u");
-    assert_eq!(one.kitty_flags, Some(1));
+    assert_eq!(one.primary.flags, Some(1));
     let zero = keyboard(b"\x1b[>1u\x1b[>3u\x1b[<0u");
-    assert_eq!(zero.kitty_flags, one.kitty_flags);
-    assert_eq!(zero.kitty_stack, one.kitty_stack);
+    assert_eq!(zero.primary.flags, one.primary.flags);
+    assert_eq!(zero.primary.stack, one.primary.stack);
 
     // Popping an empty stack leaves the flags alone rather than going negative.
-    assert_eq!(keyboard(b"\x1b[<u\x1b[<u\x1b[<u").kitty_flags, None);
+    assert_eq!(keyboard(b"\x1b[<u\x1b[<u\x1b[<u").primary.flags, None);
 
-    // Each screen buffer keeps its own stack, as the reducer does.
+    // Each screen buffer keeps its own stack, as the protocol says, and a snapshot carries both.
     let split = keyboard(b"\x1b[>1u\x1b[?1049h\x1b[>7u\x1b[?1049l");
     assert_eq!(
-        split.kitty_flags,
+        split.primary.flags,
         Some(1),
         "leaving the alternate buffer restores the primary buffer's negotiation"
+    );
+    assert_eq!(
+        split.alternate.flags,
+        Some(7),
+        "and the alternate buffer's own negotiation is carried too"
     );
 }
 

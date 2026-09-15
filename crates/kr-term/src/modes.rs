@@ -370,19 +370,25 @@ impl ModeState {
         &self.kitty[self.kitty_slot()].stack
     }
 
+    /// One buffer's Kitty keyboard negotiation, for a snapshot.
+    ///
+    /// Both buffers are carried, because a restored session may leave the alternate buffer later
+    /// and has to speak what the primary buffer negotiated when it does.
+    #[must_use]
+    pub fn kitty_buffer(&self, alternate: bool) -> (Option<u8>, Vec<u8>) {
+        let state = &self.kitty[usize::from(alternate)];
+        (state.flags, state.stack.clone())
+    }
+
     /// Restores the keyboard negotiation state from a snapshot.
-    pub fn restore_keyboard(
-        &mut self,
-        modify_other_keys: u8,
-        kitty_flags: Option<u8>,
-        kitty_stack: Vec<u8>,
-    ) {
+    pub fn restore_keyboard(&mut self, modify_other_keys: u8, buffers: [(Option<u8>, Vec<u8>); 2]) {
         self.modify_other_keys = modify_other_keys.min(2);
-        let slot = self.kitty_slot();
-        let state = &mut self.kitty[slot];
-        state.flags = kitty_flags.map(|flags| flags & KITTY_QUALIFIED_FLAGS);
-        state.stack = kitty_stack;
-        state.stack.truncate(KITTY_STACK_DEPTH);
+        for (slot, (flags, stack)) in buffers.into_iter().enumerate() {
+            let state = &mut self.kitty[slot];
+            state.flags = flags.map(|flags| flags & KITTY_QUALIFIED_FLAGS);
+            state.stack = stack;
+            state.stack.truncate(KITTY_STACK_DEPTH);
+        }
     }
 
     /// Every tracked mode and its value, for a snapshot.

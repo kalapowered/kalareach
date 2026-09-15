@@ -67,10 +67,23 @@ pub struct SavedCursor {
 pub struct KeyboardSnapshot {
     /// The `modifyOtherKeys` level.
     pub modify_other_keys: u8,
-    /// The active Kitty keyboard flags, when the protocol is in use.
-    pub kitty_flags: Option<u8>,
-    /// The Kitty keyboard flag stack, oldest first.
-    pub kitty_stack: Vec<u8>,
+    /// The primary buffer's Kitty keyboard negotiation.
+    pub primary: KittyKeyboard,
+    /// The alternate buffer's Kitty keyboard negotiation.
+    ///
+    /// The protocol gives each screen its own stack, so a full-screen application's negotiation
+    /// cannot leak into the shell's when it exits. A restored session needs both, or leaving the
+    /// alternate buffer would leave it speaking the wrong protocol.
+    pub alternate: KittyKeyboard,
+}
+
+/// One buffer's Kitty keyboard negotiation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KittyKeyboard {
+    /// The active flags, when the protocol is in use.
+    pub flags: Option<u8>,
+    /// The flag stack, oldest first.
+    pub stack: Vec<u8>,
 }
 
 /// The scroll region.
