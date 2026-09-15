@@ -281,12 +281,17 @@ Two secret buffers in this path are not cleared, and neither is reachable from t
    uncleared, and closing it means either a value tree whose temporaries clear themselves or a
    secret-bearing payload type. Both belong with the crate that owns the encoder.
 
-   Reading a QR payload is the same case in miniature. Writing one is not: its encoding is
-   assembled around the secret, so no encoder ever sees it. Reading one still goes through the
-   strict decoder, which is the right place for the canonical-form rules; a payload that decodes
-   has its value tree cleared, and one that fails to decode leaves a partial tree inside `kr-cbor`
-   that this crate cannot reach. Closing that means the same thing as the envelope case: a value
-   tree whose temporaries clear themselves, in the crate that owns the decoder.
+   Reading a QR payload is the same case. Writing one is not: its encoding is assembled around the
+   secret, into a buffer reserved at its exact final size, so no encoder ever sees the secret and
+   no reallocation ever moves it. Reading one goes through the strict decoder, which is where the
+   canonical-form rules belong; writing a second decoder to avoid its buffers would mean a second
+   implementation of those rules, which section 23 tells this project not to do.
+
+   The decoder's copies are therefore uncleared in both outcomes: a payload that fails to decode
+   leaves a partial tree, and one that succeeds leaves the tree the decoder re-encoded to check the
+   canonical form, plus those output bytes. This crate clears the tree it is handed back; it cannot
+   reach the rest. Closing it means the same thing as the envelope case: a value tree whose
+   temporaries clear themselves, in `crates/kr-cbor`, which owns the decoder.
 2. **`hkdf` 0.13.0 keeps its pseudorandom key and expansion buffers uncleared.** The crate has no
    `zeroize` feature; `hmac` and `sha2` are built with theirs. Closing this means a maintained
    release that clears them, or a reviewed patch. Section 20 requires a maintained implementation,

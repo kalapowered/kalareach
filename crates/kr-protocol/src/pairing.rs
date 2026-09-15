@@ -1422,46 +1422,72 @@ impl QrPayload {
         // not secret is still encoded by `kr-cbor`; the only bytes written here are a map head, a
         // byte-string head and a text head.
         //
+        // The pieces are built first and the output is reserved to its exact size, so the buffer
+        // never grows after a secret is written into it: a reallocation would move the secret and
+        // leave the old allocation behind, and `Zeroizing` clears only the current one.
+        //
         // `the_hand_assembled_encoding_matches_the_value_tree` checks the result against the
         // encoder for a sample of each payload kind.
-        let mut out = zeroize::Zeroizing::new(Vec::with_capacity(512));
-        match self {
-            Self::Code(payload) => {
-                out.push(0xa4);
-                out.extend_from_slice(&encode_text("code"));
-                let code = payload.code.as_str().as_bytes();
-                out.extend_from_slice(&text_head(code.len()));
-                out.extend_from_slice(code);
-                out.extend_from_slice(&encode_text("mode"));
-                out.extend_from_slice(&encode_text(QR_MODE_CODE));
-                out.extend_from_slice(&encode_text("version"));
-                out.extend_from_slice(&encode_unsigned(QR_PAYLOAD_VERSION));
-                out.extend_from_slice(&encode_text("rendezvous_origin"));
-                out.extend_from_slice(&encode_text(payload.rendezvous_origin.as_str()));
-            }
-            Self::Direct(payload) => {
-                out.push(0xa8);
-                out.extend_from_slice(&encode_text("mode"));
-                out.extend_from_slice(&encode_text(QR_MODE_DIRECT));
-                out.extend_from_slice(&encode_text("secret"));
-                out.extend_from_slice(&bytes_head(SecretBytes32::LEN));
-                out.extend_from_slice(payload.secret.expose().as_slice());
-                out.extend_from_slice(&encode_text("version"));
-                out.extend_from_slice(&encode_unsigned(QR_PAYLOAD_VERSION));
-                out.extend_from_slice(&encode_text("expires_at"));
-                out.extend_from_slice(&encode_unsigned(payload.expires_at_ms.get()));
-                out.extend_from_slice(&encode_text("endpoint_id"));
-                out.extend_from_slice(&encode_bytes(payload.endpoint_id.as_bytes().as_slice()));
-                out.extend_from_slice(&encode_text("invitation_id"));
-                out.extend_from_slice(&encode_bytes(
-                    payload.invitation_id.get().as_bytes().as_slice(),
-                ));
-                out.extend_from_slice(&encode_text("network_config"));
-                out.extend_from_slice(&kr_cbor::to_canonical_vec(&payload.network_config)?);
-                out.extend_from_slice(&encode_text("proposed_grant"));
-                out.extend_from_slice(&kr_cbor::to_canonical_vec(&payload.proposed_grant)?);
+        let (map_head, pieces, secret): (u8, Vec<Piece>, &[u8]) = match self {
+            Self::Code(payload) => (
+                0xa4,
+                vec![
+                    Piece::Encoded(encode_text("code")),
+                    Piece::Encoded(text_head(payload.code.as_str().len())),
+                    Piece::Secret,
+                    Piece::Encoded(encode_text("mode")),
+                    Piece::Encoded(encode_text(QR_MODE_CODE)),
+                    Piece::Encoded(encode_text("version")),
+                    Piece::Encoded(encode_unsigned(QR_PAYLOAD_VERSION)),
+                    Piece::Encoded(encode_text("rendezvous_origin")),
+                    Piece::Encoded(encode_text(payload.rendezvous_origin.as_str())),
+                ],
+                payload.code.as_str().as_bytes(),
+            ),
+            Self::Direct(payload) => (
+                0xa8,
+                vec![
+                    Piece::Encoded(encode_text("mode")),
+                    Piece::Encoded(encode_text(QR_MODE_DIRECT)),
+                    Piece::Encoded(encode_text("secret")),
+                    Piece::Encoded(bytes_head(SecretBytes32::LEN)),
+                    Piece::Secret,
+                    Piece::Encoded(encode_text("version")),
+                    Piece::Encoded(encode_unsigned(QR_PAYLOAD_VERSION)),
+                    Piece::Encoded(encode_text("expires_at")),
+                    Piece::Encoded(encode_unsigned(payload.expires_at_ms.get())),
+                    Piece::Encoded(encode_text("endpoint_id")),
+                    Piece::Encoded(encode_bytes(payload.endpoint_id.as_bytes().as_slice())),
+                    Piece::Encoded(encode_text("invitation_id")),
+                    Piece::Encoded(encode_bytes(
+                        payload.invitation_id.get().as_bytes().as_slice(),
+                    )),
+                    Piece::Encoded(encode_text("network_config")),
+                    Piece::Encoded(kr_cbor::to_canonical_vec(&payload.network_config)?),
+                    Piece::Encoded(encode_text("proposed_grant")),
+                    Piece::Encoded(kr_cbor::to_canonical_vec(&payload.proposed_grant)?),
+                ],
+                payload.secret.expose().as_slice(),
+            ),
+        };
+
+        let total = 1 + pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Encoded(bytes) => bytes.len(),
+                Piece::Secret => secret.len(),
+            })
+            .sum::<usize>();
+        let mut out = zeroize::Zeroizing::new(Vec::with_capacity(total));
+        out.push(map_head);
+        for piece in &pieces {
+            match piece {
+                Piece::Encoded(bytes) => out.extend_from_slice(bytes),
+                Piece::Secret => out.extend_from_slice(secret),
             }
         }
+        debug_assert_eq!(out.len(), total, "the reserved size is the written size");
+        debug_assert_eq!(out.capacity(), total, "the buffer never grew");
         Ok(out)
     }
 
@@ -1610,6 +1636,14 @@ impl QrPayload {
         })?;
         Self::from_canonical_bytes(&bytes)
     }
+}
+
+/// One part of a hand-assembled encoding: either bytes an encoder produced, or the secret itself.
+enum Piece {
+    /// Bytes the canonical encoder produced for a member that is not secret.
+    Encoded(Vec<u8>),
+    /// The secret's own bytes, written straight from the value that owns them.
+    Secret,
 }
 
 /// Encodes one text string through the canonical encoder. Never used for a secret.
@@ -2182,8 +2216,22 @@ mod tests {
                 code: ShortCode::new("aB3x-Yz7-9Qw").expect("a code"),
             }),
             QrPayload::Direct(Box::new(sample_direct_payload())),
+            // A payload whose network configuration fills most of a QR code, so the exact
+            // reservation is exercised well past any fixed guess.
+            QrPayload::Direct(Box::new(DirectQrPayload {
+                network_config: NetworkConfig {
+                    relay_urls: vec![NetworkHint::new("r".repeat(253)).expect("a hint"); 2],
+                    discovery_origins: vec![NetworkHint::new("d".repeat(253)).expect("a hint"); 2],
+                    direct_addresses: vec![NetworkHint::new("a".repeat(253)).expect("a hint"); 2],
+                },
+                ..sample_direct_payload()
+            })),
         ] {
             let assembled = payload.to_canonical_bytes().expect("canonical bytes");
+            assert!(
+                assembled.len() <= MAX_QR_PAYLOAD_LEN,
+                "the sample fits in a QR code"
+            );
             let through_the_tree =
                 kr_cbor::encode(&payload.to_canonical_value().expect("a value tree"));
             assert_eq!(
