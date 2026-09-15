@@ -381,11 +381,36 @@ pub struct ClientAttemptRecord {
 }
 
 impl ClientAttemptRecord {
+    /// Returns this record anchored to the current boot, which is what a reboot does to it.
+    ///
+    /// A monotonic deadline from an earlier boot means nothing, so the remaining retention is read
+    /// off the wall clock **once**, at the first sight of the record under the new boot, and from
+    /// then on the monotonic clock of this boot is what protects it. Without that step a record
+    /// would stay on wall-clock retention indefinitely, and moving the wall clock forward would
+    /// delete a live tombstone and hand back five attempts.
+    ///
+    /// Anchoring also ends the window, because section 10 says a reboot expires an unfinished
+    /// entry: what survives the reboot is a tombstone, not a fresh five minutes.
+    #[must_use]
+    pub fn anchored(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> Self {
+        if self.boot_identity == boot {
+            return self.clone();
+        }
+        let remaining = self.retain_until_wall_ms.saturating_sub(now_wall_ms);
+        Self {
+            boot_identity: boot,
+            first_entry_monotonic_ms: now_monotonic_ms,
+            exhausted: true,
+            retain_until_monotonic_ms: now_monotonic_ms.saturating_add(remaining),
+            ..self.clone()
+        }
+    }
+
     /// Returns true when this record may be forgotten.
     ///
     /// Within the boot that wrote it, the monotonic deadline decides: a wall-clock jump forwards
-    /// must not delete a record whose five minutes are still running. Once the boot has changed
-    /// that deadline means nothing, and the wall clock is what is left.
+    /// must not delete a record whose retention is still running. A record from another boot has
+    /// not been anchored yet, and the wall clock is all there is until it is.
     #[must_use]
     pub fn is_expired(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> bool {
         if self.boot_identity == boot {
@@ -431,7 +456,12 @@ pub trait ClientBudgetStore {
     /// Returns [`PairingError::Store`].
     fn load(&self, code_key: &Mac256) -> Result<Option<ClientAttemptRecord>>;
 
-    /// Drops records whose retention has ended, by [`ClientAttemptRecord::is_expired`].
+    /// Anchors records from earlier boots and drops those whose retention has ended.
+    ///
+    /// An implementation applies [`ClientAttemptRecord::anchored`] to each record it keeps and
+    /// [`ClientAttemptRecord::is_expired`] to decide. Anchoring is a write: a sweep is the first
+    /// thing that sees a record after a reboot, and it is where that record stops depending on the
+    /// wall clock.
     ///
     /// # Errors
     ///
@@ -576,6 +606,7 @@ pub struct TestInvitationStore {
     state: Mutex<TestInvitationState>,
     failing: Mutex<bool>,
     failing_writes: Mutex<bool>,
+    interleaved: Mutex<Option<InvitationRecord>>,
 }
 
 #[derive(Debug, Default)]
@@ -594,6 +625,15 @@ impl TestInvitationStore {
     /// Makes every operation fail, so a test can check that a failed read stops a step.
     pub fn set_failing(&self, failing: bool) {
         *self.failing.lock().expect("a test store") = failing;
+    }
+
+    /// Applies `record` inside the next conditional write, before it compares.
+    ///
+    /// This is the race a conditional write exists for: another writer lands between the moment a
+    /// caller read the record and the moment it writes its decision back. A test cannot produce
+    /// that by calling the store in order, so the store produces it.
+    pub fn interleave(&self, record: InvitationRecord) {
+        *self.interleaved.lock().expect("a test store") = Some(record);
     }
 
     /// Makes writes fail while reads keep working, which is the interesting half.
@@ -623,6 +663,13 @@ impl TestInvitationStore {
             });
         }
         Ok(())
+    }
+
+    /// Applies a pending interleaved write, as another writer racing this one would.
+    fn interleave_now(&self, state: &mut TestInvitationState) {
+        if let Some(record) = self.interleaved.lock().expect("a test store").take() {
+            state.records.insert(record.invitation_id, record);
+        }
     }
 
     fn check_write(&self) -> Result<()> {
@@ -669,6 +716,7 @@ impl InvitationStore for TestInvitationStore {
         // The comparison and the write are under one lock, which is the whole point of this
         // method: another writer cannot slip between them.
         let mut state = self.state.lock().expect("a test store");
+        self.interleave_now(&mut state);
         match state.records.get(&expected.invitation_id) {
             Some(current) if current == expected => {
                 state.records.insert(next.invitation_id, next.clone());
@@ -690,6 +738,7 @@ impl InvitationStore for TestInvitationStore {
         self.check_write()?;
         // One lock over both maps: the record and the commitment appear together or not at all.
         let mut state = self.state.lock().expect("a test store");
+        self.interleave_now(&mut state);
         match state.records.get(&expected.invitation_id) {
             Some(current) if current == expected => {
                 state.records.insert(next.invitation_id, next.clone());
@@ -798,7 +847,10 @@ impl ClientBudgetStore for TestClientBudgetStore {
         self.records
             .lock()
             .expect("a test store")
-            .retain(|_, record| !record.is_expired(now_monotonic_ms, boot, now_wall_ms));
+            .retain(|_, record| {
+                *record = record.anchored(now_monotonic_ms, boot, now_wall_ms);
+                !record.is_expired(now_monotonic_ms, boot, now_wall_ms)
+            });
         Ok(())
     }
 }
@@ -1016,14 +1068,47 @@ mod tests {
         let store = TestClientBudgetStore::new().expect("a store");
         let key = Mac256::from_bytes([1; 32]);
         tombstone(&store, key);
-        // Another boot: the monotonic deadline means nothing, and the wall clock is what is left.
+        // Another boot: the monotonic deadline means nothing, so the remaining retention is read
+        // off the wall clock once and anchored to this boot.
         let rebooted = BootIdentity([9; 32]);
-        store.expire(0, rebooted, 999_999).expect("an expiry sweep");
+        store.expire(0, rebooted, 900_000).expect("an expiry sweep");
+        assert_eq!(store.len(), 1);
+        let anchored = store.load(&key).expect("a read").expect("a record");
+        assert_eq!(anchored.boot_identity, rebooted);
+        assert_eq!(anchored.retain_until_monotonic_ms, 100_000);
+
+        // From here the wall clock cannot touch it: a jump forward deletes nothing.
+        store
+            .expire(99_999, rebooted, 9_000_000)
+            .expect("an expiry sweep");
         assert_eq!(store.len(), 1);
         store
-            .expire(0, rebooted, 1_000_000)
+            .expire(100_000, rebooted, 9_000_000)
             .expect("an expiry sweep");
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_reboot_leaves_a_tombstone_even_for_an_unfinished_entry() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let key = Mac256::from_bytes([2; 32]);
+        store
+            .update(&key, &|_| {
+                Ok(ClientAttemptRecord {
+                    attempts: 2,
+                    first_entry_monotonic_ms: 0,
+                    boot_identity: BootIdentity([0; 32]),
+                    retain_until_monotonic_ms: 500,
+                    retain_until_wall_ms: 1_000_000,
+                    exhausted: false,
+                })
+            })
+            .expect("a write");
+        let rebooted = BootIdentity([9; 32]);
+        store.expire(0, rebooted, 0).expect("an expiry sweep");
+        let anchored = store.load(&key).expect("a read").expect("a record");
+        assert!(anchored.exhausted, "a reboot expires an unfinished entry");
+        assert_eq!(anchored.attempts, 2, "and it does not hand attempts back");
     }
 
     #[test]

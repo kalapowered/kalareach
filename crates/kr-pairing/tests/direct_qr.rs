@@ -778,8 +778,9 @@ fn a_write_that_lost_a_race_does_not_undo_the_writer_that_won() {
     let harness = Harness::new();
     let mut invitation = harness.issue();
     let payload = harness.scan(&invitation);
-    let host_peer = harness.client_peer();
-    let challenge = invitation.issue_challenge(&host_peer).expect("a challenge");
+    let challenge = invitation
+        .issue_challenge(&harness.client_peer())
+        .expect("a challenge");
     let (proof, _) = redeem_proof(
         &payload,
         &challenge,
@@ -789,24 +790,108 @@ fn a_write_that_lost_a_race_does_not_undo_the_writer_that_won() {
     )
     .expect("a proof");
 
-    // The other entry mode consumes the invitation after this flow read the record and before it
-    // writes. The conditional write refuses rather than reopening a consumed invitation.
-    let expected = invitation.record().clone();
-    let mut consumed = expected.clone();
-    consumed.state = InvitationState::Consumed {
+    // The short-code route locks a candidate between this flow's read and its write. The
+    // conditional write refuses rather than replacing that candidate.
+    let mut locked = invitation.record().clone();
+    locked.state = InvitationState::Locked {
+        attempt_id: kr_pairing::host::new_attempt_id().expect("an attempt"),
+    };
+    harness.store.interleave(locked.clone());
+    let peer = harness.client_peer();
+    assert!(matches!(
+        invitation.redeem(&proof, harness.client_keys.transport.public(), &peer),
+        Err(PairingError::CandidateLocked)
+    ));
+    assert_eq!(invitation.record().state, locked.state);
+    assert_eq!(
+        harness
+            .store
+            .snapshot()
+            .into_iter()
+            .find(|record| record.invitation_id == invitation.invitation_id())
+            .expect("a record")
+            .state,
+        locked.state,
+        "the winner's lock stands"
+    );
+}
+
+#[test]
+fn a_commit_that_lost_a_race_writes_nothing() {
+    let harness = Harness::new();
+    let mut invitation = harness.issue();
+    let payload = harness.scan(&invitation);
+    let (candidate, _) = run_redemption(&harness, &mut invitation, &payload).expect("a redemption");
+    let keys_digest = client_keys_digest(&harness.client_keys.public_keys()).expect("a digest");
+
+    let mut cancelled = invitation.record().clone();
+    cancelled.state = InvitationState::Consumed {
         reason: PairingConsumedReason::Cancelled,
     };
-    kr_pairing::platform::InvitationStore::transition(&&harness.store, &expected, &consumed)
-        .expect("a write");
+    harness.store.interleave(cancelled.clone());
+    assert!(matches!(
+        harness.confirm(&mut invitation, candidate.transcript_digest, keys_digest),
+        Err(PairingError::Consumed {
+            reason: PairingConsumedReason::Cancelled
+        })
+    ));
+    assert_eq!(
+        kr_pairing::platform::InvitationStore::commitment(
+            &&harness.store,
+            invitation.invitation_id()
+        )
+        .expect("a read"),
+        None,
+        "a commit that lost the race wrote no commitment either"
+    );
+}
 
+#[test]
+fn a_lost_response_does_not_strand_the_candidate() {
+    let harness = Harness::new();
+    let mut invitation = harness.issue();
+    let payload = harness.scan(&invitation);
+    let challenge = invitation
+        .issue_challenge(&harness.client_peer())
+        .expect("a challenge");
+    let (proof, _) = redeem_proof(
+        &payload,
+        &challenge,
+        &harness.client_keys.authorisation,
+        &candidate_identity(&harness),
+        &harness.host_peer(),
+    )
+    .expect("a proof");
     let peer = harness.client_peer();
+    let first = invitation
+        .redeem(&proof, harness.client_keys.transport.public(), &peer)
+        .expect("a redemption");
+
+    // The response never reached the candidate, so it sends the same proof again. The attempt
+    // identity is the host's, and this is the only way the candidate can learn it.
+    let second = invitation
+        .redeem(&proof, harness.client_keys.transport.public(), &peer)
+        .expect("the same candidate");
+    assert_eq!(first, second);
+
+    // Another device presenting the same proof from its own connection gets nothing: the retry is
+    // for the endpoint that redeemed, and a new redemption is refused while a candidate holds it.
+    let elsewhere = TestLivePeer::new(EndpointKey::from_bytes([0x66; 32]));
+    assert!(matches!(
+        invitation.redeem(&proof, harness.client_keys.transport.public(), &elsewhere),
+        Err(PairingError::CandidateLocked)
+    ));
+
+    // And a cancelled invitation hands nothing back, retry or not.
+    invitation
+        .cancel(&harness.issuing_owner)
+        .expect("cancelled");
     assert!(matches!(
         invitation.redeem(&proof, harness.client_keys.transport.public(), &peer),
         Err(PairingError::Consumed {
             reason: PairingConsumedReason::Cancelled
         })
     ));
-    assert_eq!(invitation.record().state, consumed.state);
 }
 
 #[test]

@@ -627,7 +627,9 @@ fn a_locked_candidate_that_stops_consumes_the_invitation() {
     harness.clock.advance(HANDSHAKE_DEADLINE_MS);
     assert!(matches!(
         host.seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation),
-        Err(PairingError::Expired)
+        Err(PairingError::Consumed {
+            reason: PairingConsumedReason::Expired
+        })
     ));
     assert_eq!(
         host.record().state,
@@ -635,6 +637,61 @@ fn a_locked_candidate_that_stops_consumes_the_invitation() {
             reason: PairingConsumedReason::Expired
         }
     );
+    // Asking for the status runs the same sweep, so it does not report a candidate that stopped
+    // as though it were still arriving.
+    assert!(matches!(
+        host.status(StatusViewer::IssuingOwner(&harness.issuing_owner)),
+        Ok(PairStatus::Consumed {
+            reason: PairingConsumedReason::Expired
+        })
+    ));
+}
+
+#[test]
+fn a_status_request_sweeps_a_candidate_that_stopped() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+
+    let budget = TestClientBudgetStore::new().expect("a store");
+    let service = TestClient::new(LocatorRecord {
+        invitation_id: host.invitation_id(),
+        advertised_expires_at_ms: TimestampMs::new(0),
+    });
+    let (mut client, admission, _) =
+        ClientAttempt::start(&budget, &harness.clock, &service, &origin(), &entered)
+            .expect("an attempt");
+    let host_pake = host
+        .admit(admission.attempt_id, admission.client_nonce)
+        .expect("a slot");
+    let client_pake = client
+        .with_host_nonce(
+            host.context(admission.attempt_id)
+                .expect("a context")
+                .host_nonce,
+            &harness.clock,
+        )
+        .expect("a message");
+    host.receive_client_pake(admission.attempt_id, &client_pake)
+        .expect("a message");
+    let client_tag = client
+        .receive_host_pake(&host_pake, &harness.clock)
+        .expect("a tag");
+    host.verify_client_confirmation(admission.attempt_id, &client_tag)
+        .expect("a tag");
+
+    assert!(matches!(
+        host.status(StatusViewer::IssuingOwner(&harness.issuing_owner)),
+        Ok(PairStatus::Locked { .. })
+    ));
+    harness.clock.advance(HANDSHAKE_DEADLINE_MS);
+    // Without the sweep this would keep reporting a locked invitation for the whole five minutes.
+    assert!(matches!(
+        host.status(StatusViewer::IssuingOwner(&harness.issuing_owner)),
+        Ok(PairStatus::Consumed {
+            reason: PairingConsumedReason::Expired
+        })
+    ));
 }
 
 #[test]
@@ -905,6 +962,203 @@ fn a_substituted_endpoint_at_finish_is_rejected() {
         Err(PairingError::EndpointMismatch { side: "host" })
     ));
     assert!(client.is_finished(), "a mismatch ends the attempt");
+}
+
+#[test]
+fn a_candidate_attempt_ends_at_its_first_failure_of_any_kind() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+
+    // An early-data connection at pair.finish ends the attempt, the same as a wrong tag does.
+    let budget = TestClientBudgetStore::new().expect("a store");
+    let service = TestClient::new(LocatorRecord {
+        invitation_id: host.invitation_id(),
+        advertised_expires_at_ms: TimestampMs::new(0),
+    });
+    let (mut client, admission, _) =
+        ClientAttempt::start(&budget, &harness.clock, &service, &origin(), &entered)
+            .expect("an attempt");
+    let host_pake = host
+        .admit(admission.attempt_id, admission.client_nonce)
+        .expect("a slot");
+    let client_pake = client
+        .with_host_nonce(
+            host.context(admission.attempt_id)
+                .expect("a context")
+                .host_nonce,
+            &harness.clock,
+        )
+        .expect("a message");
+    host.receive_client_pake(admission.attempt_id, &client_pake)
+        .expect("a message");
+    let client_tag = client
+        .receive_host_pake(&host_pake, &harness.clock)
+        .expect("a tag");
+    let confirmation = host
+        .verify_client_confirmation(admission.attempt_id, &client_tag)
+        .expect("a tag");
+    client
+        .verify_host_confirmation(&confirmation.host_tag, &harness.clock)
+        .expect("confirmed");
+    let host_frame = host
+        .seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation)
+        .expect("a frame");
+    client
+        .open_host_bundle(&host_frame, &harness.clock)
+        .expect("a bundle");
+    client
+        .seal_client_bundle(
+            &harness.client_keys.authorisation,
+            client_bundle(&harness.client_keys),
+            &harness.clock,
+        )
+        .expect("a frame");
+
+    let early = harness.host_peer();
+    early.set_early_data(true);
+    assert!(matches!(
+        client.finish_request(
+            &early,
+            harness.client_keys.transport.public(),
+            &harness.clock
+        ),
+        Err(PairingError::EarlyData)
+    ));
+    assert!(client.is_finished());
+    // And it stays finished: a completed connection does not resume it.
+    let host_peer = harness.host_peer();
+    assert!(matches!(
+        client.finish_request(
+            &host_peer,
+            harness.client_keys.transport.public(),
+            &harness.clock
+        ),
+        Err(PairingError::WrongPhase { .. })
+    ));
+}
+
+#[test]
+fn a_client_bundle_that_lies_about_its_endpoint_ends_the_attempt() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+
+    let budget = TestClientBudgetStore::new().expect("a store");
+    let service = TestClient::new(LocatorRecord {
+        invitation_id: host.invitation_id(),
+        advertised_expires_at_ms: TimestampMs::new(0),
+    });
+    let (mut client, admission, _) =
+        ClientAttempt::start(&budget, &harness.clock, &service, &origin(), &entered)
+            .expect("an attempt");
+    let host_pake = host
+        .admit(admission.attempt_id, admission.client_nonce)
+        .expect("a slot");
+    let client_pake = client
+        .with_host_nonce(
+            host.context(admission.attempt_id)
+                .expect("a context")
+                .host_nonce,
+            &harness.clock,
+        )
+        .expect("a message");
+    host.receive_client_pake(admission.attempt_id, &client_pake)
+        .expect("a message");
+    let client_tag = client
+        .receive_host_pake(&host_pake, &harness.clock)
+        .expect("a tag");
+    let confirmation = host
+        .verify_client_confirmation(admission.attempt_id, &client_tag)
+        .expect("a tag");
+    client
+        .verify_host_confirmation(&confirmation.host_tag, &harness.clock)
+        .expect("confirmed");
+    let host_frame = host
+        .seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation)
+        .expect("a frame");
+    client
+        .open_host_bundle(&host_frame, &harness.clock)
+        .expect("a bundle");
+
+    let mut inconsistent = client_bundle(&harness.client_keys);
+    inconsistent.endpoint_id = EndpointKey::from_bytes([0x44; 32]);
+    assert!(matches!(
+        client.seal_client_bundle(
+            &harness.client_keys.authorisation,
+            inconsistent,
+            &harness.clock
+        ),
+        Err(PairingError::ContextMismatch { .. })
+    ));
+    assert!(client.is_finished(), "the attempt does not get another go");
+    assert!(matches!(
+        client.seal_client_bundle(
+            &harness.client_keys.authorisation,
+            client_bundle(&harness.client_keys),
+            &harness.clock
+        ),
+        Err(PairingError::WrongPhase { .. })
+    ));
+}
+
+#[test]
+fn a_write_that_lost_a_race_does_not_undo_the_writer_that_won() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+
+    // The other entry mode cancels the invitation between this flow's read and its write. The
+    // conditional write refuses rather than reopening a cancelled invitation.
+    let mut cancelled = host.record().clone();
+    cancelled.state = InvitationState::Consumed {
+        reason: PairingConsumedReason::Cancelled,
+    };
+    harness.store.interleave(cancelled.clone());
+    assert!(matches!(
+        run_exchange(&harness, &mut host, &entered),
+        Err(PairingError::Consumed {
+            reason: PairingConsumedReason::Cancelled
+        })
+    ));
+    assert_eq!(host.record().state, cancelled.state);
+    assert_eq!(
+        harness
+            .store
+            .snapshot()
+            .into_iter()
+            .find(|record| record.invitation_id == host.invitation_id())
+            .expect("a record")
+            .state,
+        cancelled.state,
+        "the winner's write stands"
+    );
+}
+
+#[test]
+fn a_commit_that_lost_a_race_writes_nothing() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+    run_exchange(&harness, &mut host, &entered).expect("a pairing");
+
+    // The owner cancels through another path after this flow read the record.
+    let mut cancelled = host.record().clone();
+    cancelled.state = InvitationState::Consumed {
+        reason: PairingConsumedReason::Cancelled,
+    };
+    harness.store.interleave(cancelled.clone());
+    assert!(matches!(
+        approve(&harness, &mut host),
+        Err(PairingError::Consumed {
+            reason: PairingConsumedReason::Cancelled
+        })
+    ));
+    assert_eq!(
+        recover_commitment(&&harness.store, host.invitation_id()).expect("a read"),
+        None,
+        "a commit that lost the race wrote no commitment either"
+    );
 }
 
 #[test]

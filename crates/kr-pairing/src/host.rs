@@ -1062,6 +1062,9 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         if self.is_expired() {
             self.consume(PairingConsumedReason::Expired)?;
         }
+        // The same sweep every other transition runs, so asking for the status does not report a
+        // candidate that stopped as though it were still arriving.
+        self.sweep_attempts()?;
         let committed = self.store.commitment(self.record.invitation_id)?;
         let permitted = match viewer {
             StatusViewer::IssuingOwner(owner) => owner == &self.issuing_owner,
@@ -1211,27 +1214,39 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
             self.consume(PairingConsumedReason::Expired)?;
             return Err(PairingError::Expired);
         }
+        self.sweep_attempts()?;
+        if let InvitationState::Consumed { reason } = self.record.state {
+            // The sweep consumed it: the candidate holding the invitation ran out of time.
+            return Err(PairingError::Consumed { reason });
+        }
+        if self.record.state.locked_attempt().is_some_and(|locked| {
+            // A candidate already holds the invitation, by the other entry mode or from before a
+            // restart. Whichever state machine reloaded this record refuses to start another.
+            !self.attempts.contains_key(&locked)
+        }) {
+            return Err(PairingError::CandidateLocked);
+        }
+        Ok(())
+    }
+
+    /// Drops attempts that ran out of handshake time, consuming the invitation if one held it.
+    ///
+    /// A candidate that walks away charges no guess: it produced no confirmation result. Holding
+    /// the invitation does not suspend the deadline either, because a candidate that proved the
+    /// code and then stopped would otherwise hold it for its whole five minutes; the invitation is
+    /// consumed instead, so the owner can issue another.
+    fn sweep_attempts(&mut self) -> Result<()> {
         let now = self.clock.monotonic_ms();
         let locked = self.record.state.locked_attempt();
-        // A candidate that ran out of handshake time frees its slot and charges no guess.
         self.attempts
             .retain(|id, attempt| Some(*id) == locked || now < attempt.deadline_monotonic_ms);
-        if let Some(locked) = locked {
-            let Some(attempt) = self.attempts.get(&locked) else {
-                // A candidate already holds the invitation, by the other entry mode or from
-                // before a restart. Whichever state machine reloaded this record refuses to start
-                // another candidate.
-                return Err(PairingError::CandidateLocked);
-            };
-            // Holding the invitation does not suspend the handshake deadline. A candidate that
-            // proved the code and then stopped would otherwise hold the invitation for its whole
-            // five minutes; the invitation is consumed instead, so the owner can issue another.
-            if attempt.phase != AttemptPhase::AwaitingApproval
-                && now >= attempt.deadline_monotonic_ms
-            {
-                self.consume(PairingConsumedReason::Expired)?;
-                return Err(PairingError::Expired);
-            }
+        if let Some(locked) = locked
+            && self.attempts.get(&locked).is_some_and(|attempt| {
+                attempt.phase != AttemptPhase::AwaitingApproval
+                    && now >= attempt.deadline_monotonic_ms
+            })
+        {
+            self.consume(PairingConsumedReason::Expired)?;
         }
         Ok(())
     }
@@ -1408,15 +1423,12 @@ pub fn recover_candidate_status(
             grant_id: committed.grant.grant_id,
         });
     }
-    let Some(record) = store.load(invitation_id)? else {
-        return Err(PairingError::NotIssuingOwner);
-    };
-    match record.state {
-        // Nothing here can prove which candidate is asking, because the endpoint a candidate
-        // authenticated with lives in the invitation object that the restart lost.
-        InvitationState::Consumed { reason } => Ok(PairStatus::Consumed { reason }),
-        _ => Err(PairingError::NotIssuingOwner),
-    }
+    // Anything short of a commitment is refused. The endpoint a candidate authenticated with lives
+    // in the invitation object the restart lost, so nothing persisted can tell this asker apart
+    // from any other authenticated endpoint, and "your pairing was denied" is not something to
+    // tell a stranger. A host that still holds the invitation answers through
+    // [`HostInvitation::status`], which does have that identity.
+    Err(PairingError::NotIssuingOwner)
 }
 
 /// Returns 128 random bits.

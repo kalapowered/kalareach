@@ -135,15 +135,17 @@ fn next_record(
     let Some(record) = current else {
         return (charge(fresh(now, boot, wall), now, wall), true);
     };
+    // A record from an earlier boot is anchored to this one the first time it is seen: the reboot
+    // ended its window, and from here its retention runs on a clock a wall-clock jump cannot move.
+    let record = record.anchored(now, boot, wall);
     if record.exhausted {
         // Spent. Another advertised expiry does not reset the counter, and neither does anything
         // else: an exhausted entry needs a newly issued code.
         return (record, false);
     }
-    // A reboot ends the window, and so does running out of time. Either way the entry becomes a
-    // tombstone rather than a fresh start, so a device cannot buy five more guesses by restarting.
-    if record.boot_identity != boot
-        || now.saturating_sub(record.first_entry_monotonic_ms) >= INVITATION_LIFETIME_MS
+    // The window ran out, or the five attempts did. Either way the entry becomes a tombstone
+    // rather than a fresh start.
+    if now.saturating_sub(record.first_entry_monotonic_ms) >= INVITATION_LIFETIME_MS
         || record.attempts >= MAX_CLIENT_ATTEMPTS
     {
         return (tombstone(record, now, wall), false);
@@ -468,7 +470,8 @@ impl ClientAttempt {
                 what: "the invitation a host bundle answers",
             });
         }
-        self.host_bundle_hash = Some(bundles::bundle_hash(&signed.bundle)?);
+        let hash = bundles::bundle_hash(&signed.bundle);
+        self.host_bundle_hash = Some(self.terminal(hash)?);
         self.host_bundle = Some(signed.clone());
         self.phase = ClientPhase::HostBundleReceived;
         Ok(signed)
@@ -495,16 +498,22 @@ impl ClientAttempt {
                 actual: "an attempt with no derived keys",
             });
         };
-        bundles::require_consistent_client_bundle(&bundle)?;
-        let signed = bundles::sign_client_bundle(authorisation, bundle, transcript)?;
-        self.client_bundle_hash = Some(bundles::bundle_hash(&signed.bundle)?);
-        bundles::seal_bundle(
-            &keys.client_to_host,
-            transcript,
-            BundleMessageType::ClientBundle,
-            &mut self.budget,
-            &signed,
-        )
+        let sealed = (|| {
+            bundles::require_consistent_client_bundle(&bundle)?;
+            let signed = bundles::sign_client_bundle(authorisation, bundle, transcript)?;
+            let hash = bundles::bundle_hash(&signed.bundle)?;
+            let frame = bundles::seal_bundle(
+                &keys.client_to_host,
+                transcript,
+                BundleMessageType::ClientBundle,
+                &mut self.budget,
+                &signed,
+            )?;
+            Ok((hash, frame))
+        })();
+        let (hash, frame) = self.terminal(sealed)?;
+        self.client_bundle_hash = Some(hash);
+        Ok(frame)
     }
 
     /// Builds `pair.finish` and checks the live host endpoint against the authenticated bundle.
@@ -523,7 +532,10 @@ impl ClientAttempt {
         clock: &dyn PairingClock,
     ) -> Result<PairFinishRequest> {
         self.require_phase(ClientPhase::HostBundleReceived, clock)?;
-        require_completed_handshake(live_peer)?;
+        // Early data is replayable, and a missing peer means there is no authenticated connection
+        // at all. Neither is something to retry on this attempt.
+        let handshake = require_completed_handshake(live_peer);
+        self.terminal(handshake)?;
         let (
             Some(keys),
             Some(transcript),
@@ -544,7 +556,15 @@ impl ClientAttempt {
                 actual: "an attempt with no exchanged bundles",
             });
         };
-        if live_peer.live_endpoint()? != host_bundle.bundle.endpoint_id {
+        let live = live_peer.live_endpoint();
+        let live = match live {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.phase = ClientPhase::Finished;
+                return Err(error);
+            }
+        };
+        if live != host_bundle.bundle.endpoint_id {
             self.phase = ClientPhase::Finished;
             return Err(PairingError::EndpointMismatch { side: "host" });
         }

@@ -60,7 +60,8 @@ attempt state lives only in memory and nothing can resume it — consumed record
 survive.
 
 Each candidate also has ten seconds to finish its handshake, and holding the invitation does not
-suspend that. A slot that runs out frees itself and charges no guess, `abort` frees one on request,
+suspend that. Every transition applies the deadline, asking for the status included, so an
+invitation does not report a candidate that stopped as though it were still arriving. A slot that runs out frees itself and charges no guess, `abort` frees one on request,
 and a candidate that proved the code and then stopped consumes the invitation instead of holding it
 for the remaining five minutes: the owner issues another rather than waiting.
 
@@ -75,9 +76,12 @@ has moved since, so an invitation that offers a short code and a direct QR has o
 one consumption whichever route reaches it first, and the slower of two writers is refused rather
 than allowed to undo the faster one's lock, spent guess or consumption.
 
-A restart loses the invitation object but not the pairing. The device record, the grant and the
-owner's proof are in the store under the invitation identity, so a host that comes back answers a
-retry and tells the candidate what happened without holding anything in memory.
+A restart loses the invitation object but not a completed pairing. The device record, the grant
+and the owner's proof are in the store under the invitation identity, so a host that comes back
+answers the retry and tells that candidate, on its own endpoint, that it is paired. It answers
+nothing else: the endpoint a candidate authenticated with lives in the object the restart lost, so
+a host with no way to tell one authenticated asker from another says nothing rather than telling a
+stranger that somebody's pairing was denied.
 
 **The candidate** permits five attempts per entered code, and never retries a failed key
 confirmation automatically. The counter is keyed by an HMAC of the configured origin and the
@@ -91,8 +95,11 @@ counter. The tombstone's retention is on the wall clock, because a monotonic dea
 previous boot means nothing after one.
 
 Retention is kept on both clocks. Within the boot that wrote the record the monotonic deadline
-governs, so moving the wall clock forward cannot delete a tombstone or an open window; after a
-reboot the monotonic value means nothing and the wall clock is what is left.
+governs, so moving the wall clock forward cannot delete a tombstone or an open window. A record
+from an earlier boot is *anchored* the first time it is seen: the remaining retention is read off
+the wall clock once, the record becomes a tombstone, and from then on this boot's monotonic clock
+is what protects it. Without that step a record would stay on wall-clock retention indefinitely,
+and a jump forward would delete a live tombstone and hand back five attempts.
 
 The whole rule is one pure function applied inside the store's own lock, so the read, the decision
 and the write are one transition: two entries of the same code cannot both see four attempts and
@@ -125,7 +132,12 @@ is another device using a challenge it was not given. It is spent only once a re
 could answer, so a stale nonce or a stranger's message cannot cancel the candidate's redemption.
 
 A direct invitation is single use, so once a candidate has redeemed it the host issues no further
-challenge and accepts no further redemption, by this route or the other. The transcript `D` is
+challenge and accepts no further redemption, by this route or the other. The one exception is the
+candidate's own retry: the attempt identity is the host's, so a device whose response was lost has
+no other way to learn it. An identical proof, over the same authenticated connection, with every
+member of the transcript matching and both proofs verifying again, retrieves the candidate the
+first redemption produced. Nothing is written and no challenge is spent, and a cancelled or
+committed invitation hands nothing back. The transcript `D` is
 `CBOR(["kr-pair/direct/1", invitation_id, host_endpoint, client_endpoint, host_keys, client_keys,
 proposed_grant_digest, host_nonce, client_nonce, expires_at])`. The candidate supplies
 `HMAC-SHA256(invitation_secret, D)` **and** an Ed25519 signature over `D`: the tag proves possession

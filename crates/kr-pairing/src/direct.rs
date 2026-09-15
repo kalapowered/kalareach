@@ -266,12 +266,18 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         live_peer: &dyn LivePeer,
     ) -> Result<DirectCandidate> {
         require_completed_handshake(live_peer)?;
-        self.require_no_candidate()?;
         if proof.invitation_id != self.record.invitation_id {
             return Err(PairingError::ContextMismatch {
                 what: "the invitation a redemption names",
             });
         }
+        // A retry of the redemption that already succeeded retrieves its result. The attempt
+        // identity is the host's, so a candidate whose response was lost has no other way to learn
+        // it, and refusing would strand a device that did everything right.
+        if let Some(existing) = self.retry(proof, client_endpoint, live_peer)? {
+            return Ok(existing);
+        }
+        self.require_no_candidate()?;
         let Some(outstanding) = self.challenge else {
             return Err(PairingError::ContextMismatch {
                 what: "a redemption with no outstanding challenge",
@@ -594,6 +600,50 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             return Err(PairingError::CandidateLocked);
         }
         Ok(())
+    }
+
+    /// Returns the locked candidate when this redemption is the one that produced it.
+    ///
+    /// Everything the transcript covers has to match, the connection has to be the same
+    /// authenticated endpoint, and both proofs are verified again over the recorded transcript.
+    /// Nothing is written and no challenge is spent: this returns a result that already exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::Consumed`], [`PairingError::AlreadyCommitted`],
+    /// [`PairingError::Expired`] or [`PairingError::Store`].
+    fn retry(
+        &mut self,
+        proof: &DirectRedeemProof,
+        client_endpoint: &EndpointKey,
+        live_peer: &dyn LivePeer,
+    ) -> Result<Option<DirectCandidate>> {
+        let Some(existing) = self.candidate.clone() else {
+            return Ok(None);
+        };
+        let transcript = &existing.transcript;
+        if transcript.client_endpoint_id != *client_endpoint
+            || transcript.host_nonce != proof.host_nonce
+            || transcript.client_nonce != proof.client_nonce
+            || transcript.client_keys != proof.client_keys
+            || live_peer.live_endpoint()? != *client_endpoint
+        {
+            return Ok(None);
+        }
+        // The invitation still has to be servable: a cancelled or committed one answers through
+        // `status`, not by handing a candidate back.
+        self.require_open()?;
+        let bytes = transcript.to_canonical_bytes();
+        let secret_key = kr_crypto::secret::SymmetricKey::from_bytes(*self.secret.expose());
+        kdf::verify_hmac_sha256(&secret_key, &bytes, &proof.secret_proof)
+            .map_err(|_| PairingError::AuthenticationFailed)?;
+        sign::verify(
+            &proof.client_keys.authorisation,
+            &SigningTranscript::from_canonical_bytes(DIRECT_DOMAIN, bytes)?,
+            &proof.signature,
+        )
+        .map_err(|_| PairingError::AuthenticationFailed)?;
+        Ok(Some(existing))
     }
 
     /// Checks the invitation and refuses once any candidate holds it, this flow's own included.
