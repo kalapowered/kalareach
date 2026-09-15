@@ -70,6 +70,13 @@ jobs:
       - name: Pairing vectors are current
         run: cargo run --locked -p kr-pairing --bin kr-pairing-vectors -- --check
 
+      - name: Terminal fixtures are current
+        run: cargo run --locked -p kr-term --bin kr-term-fixtures -- --check
+
+      # KR-PERF-007 is a throughput target, so the figure comes from an optimised build.
+      - name: Terminal output handling
+        run: cargo test --locked --release -p kr-term --test perf -- --nocapture
+
   typescript:
     name: typescript
     runs-on: ubuntu-24.04
