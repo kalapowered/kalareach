@@ -547,14 +547,29 @@ impl Session {
     ///
     /// Returns an error when the attachment is unknown.
     pub fn subscribe(&mut self, attachment_id: AttachmentId) -> Result<OutputStream> {
+        self.subscribe_within(attachment_id, self.config.send_queue_bytes)
+    }
+
+    /// Subscribes an attachment to output with its own queue bound.
+    ///
+    /// The bound is per peer, as section 9 describes it. A client that asks for less gets less,
+    /// and nothing lets one client raise the bound for another.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attachment is unknown.
+    pub fn subscribe_within(
+        &mut self,
+        attachment_id: AttachmentId,
+        send_queue_bytes: usize,
+    ) -> Result<OutputStream> {
         if self.attachments.get(attachment_id).is_none() {
             return Err(WorkerError::UnknownAttachment {
                 attachment: attachment_id.to_string(),
             });
         }
-        Ok(self
-            .hub
-            .subscribe(attachment_id, self.config.send_queue_bytes))
+        let limit = send_queue_bytes.clamp(1, self.config.send_queue_bytes);
+        Ok(self.hub.subscribe(attachment_id, limit))
     }
 
     /// Records output from the terminal and delivers it.
