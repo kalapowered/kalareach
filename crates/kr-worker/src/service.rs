@@ -135,6 +135,14 @@ pub struct WorkerService {
     dispatch: Mutex<()>,
     /// How many connections this session is serving.
     connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// Every connection this worker has admitted, and how to withdraw it.
+    ///
+    /// The transport's contract names this as the host's to keep: the final validation of the
+    /// caller's record and the registration of the connection are one step, and the registration
+    /// stays revocable for the life of the session. Section 9's dispatch barrier covers a
+    /// mutation; it does not cover a read or a subscription already running on a connection that
+    /// was authorised a moment before its authority was withdrawn. This is what covers those.
+    admitted: Mutex<std::collections::BTreeMap<ConnectionId, Arc<tokio::sync::Notify>>>,
     build_id: kr_protocol::ids::BuildId,
 }
 
@@ -198,6 +206,7 @@ impl WorkerService {
             }),
             dispatch: Mutex::new(()),
             connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            admitted: Mutex::new(std::collections::BTreeMap::new()),
             build_id: binding.build_id,
         })
     }
@@ -258,6 +267,13 @@ impl WorkerService {
         let (mut reader, writer) = split(connection, StreamKind::Control);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
         let mut state = ConnectionState::new(connection_id, &peer);
+        // The caller's record is validated and the connection registered in one step. The
+        // listener checked the peer when it accepted the connection; this is the final check, and
+        // it happens where the registration is written, so nothing can be admitted in between.
+        if peer.authorise(kr_ipc::paths::current_uid()).is_err() {
+            return Ok(());
+        }
+        let withdrawn = self.admit(connection_id);
         // Both timers fire once immediately; that first tick is consumed here so a connection is
         // not handed a replacement window before it has read the one in its acknowledgement.
         let mut renewal = tokio::time::interval(WINDOW_RENEWAL);
@@ -270,6 +286,21 @@ impl WorkerService {
                     Ok(message) => message,
                     Err(_) => break,
                 },
+                // The authority this connection was admitted under has been withdrawn. Whatever
+                // it had already subscribed to stops here: refusing its *next* request would leave
+                // a delivery task streaming this session's output down a connection that no longer
+                // holds authority. The connection itself stays open, so the caller is told why its
+                // next request is refused rather than finding a socket that closed.
+                () = withdrawn.notified() => {
+                    if let Some(task) = state.delivery.take() {
+                        task.abort();
+                    }
+                    for attachment_id in state.attachments.drain(..) {
+                        let mut session = self.runtime.session();
+                        let _ = session.detach(attachment_id);
+                    }
+                    continue;
+                }
                 // The window is replaced without being asked for, at half its validity. An
                 // attachment that stays open for hours never has to renew before a mutation.
                 _ = renewal.tick(), if state.negotiated => {
@@ -453,8 +484,10 @@ impl WorkerService {
             let _ = session.detach(attachment_id);
         }
         // A window that outlived its connection could first-admit a request through a connection
-        // that no longer exists, so the connection's windows go when it does.
+        // that no longer exists, so the connection's windows go when it does, and so does its
+        // registration.
         self.windows.retire_connection(connection_id);
+        self.deregister(connection_id);
         Ok(())
     }
 
@@ -654,10 +687,16 @@ impl WorkerService {
             Ok(()) => {
                 authority.accepted_generation = Some(token.generation);
                 // Installing this connection fences whatever was bound before it, including an
-                // earlier connection of the same generation. A fenced connection can still read
-                // its own replies; what it cannot do is dispatch anything else.
+                // earlier connection of the same generation.
                 let fenced_previous = authority.bound_connection.replace(state.connection_id);
                 drop(authority);
+                // Refusing the fenced connection's next request is not enough on its own: a
+                // subscription it already started would keep delivering this session's output down
+                // a connection whose authority has been withdrawn. Withdrawing the registration
+                // ends that connection, which takes its delivery task and its attachments with it.
+                if let Some(previous) = fenced_previous {
+                    self.withdraw(previous);
+                }
                 state.controller = true;
                 state.generation = Some(token.generation);
                 ControlFrame::GenerationAccepted(kr_protocol::worker::GenerationAccepted {
@@ -765,6 +804,46 @@ impl WorkerService {
             session_id: self.runtime.session().id(),
             revision: notice.revision,
         })
+    }
+
+    /// Registers one admitted connection, and returns how it learns that it has been withdrawn.
+    ///
+    /// The registration is written under the authority lock, in the same critical section as the
+    /// check that admitted the connection, so nothing can be admitted against authority that has
+    /// already been replaced.
+    fn admit(&self, connection_id: ConnectionId) -> Arc<tokio::sync::Notify> {
+        let withdrawn = Arc::new(tokio::sync::Notify::new());
+        let _authority = self
+            .authority
+            .lock()
+            .expect("the authority lock is not poisoned");
+        self.admitted
+            .lock()
+            .expect("the connection registry is not poisoned")
+            .insert(connection_id, Arc::clone(&withdrawn));
+        withdrawn
+    }
+
+    /// Withdraws one connection's registration, which ends it.
+    fn withdraw(&self, connection_id: ConnectionId) {
+        let held = self
+            .admitted
+            .lock()
+            .expect("the connection registry is not poisoned")
+            .remove(&connection_id);
+        if let Some(withdrawn) = held {
+            // A stored permit, so a connection that is not waiting at this instant still learns of
+            // it the moment it next looks.
+            withdrawn.notify_one();
+        }
+    }
+
+    /// Removes a connection that has ended of its own accord.
+    fn deregister(&self, connection_id: ConnectionId) {
+        self.admitted
+            .lock()
+            .expect("the connection registry is not poisoned")
+            .remove(&connection_id);
     }
 
     /// Refuses a request from a controller connection that does not hold current authority.

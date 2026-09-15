@@ -39,6 +39,10 @@ fn build() -> BuildId {
 }
 
 async fn host(generation: u64) -> Host {
+    host_producing(generation, "sleep 30").await
+}
+
+async fn host_producing(generation: u64, script: &str) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -69,7 +73,7 @@ async fn host(generation: u64) -> Host {
         display_number: DisplayNumber::new(1),
         shell: ShellCommand {
             program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "sleep 30".to_owned()],
+            arguments: vec!["-c".to_owned(), script.to_owned()],
             cwd: "/".to_owned(),
             environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
         },
@@ -524,4 +528,92 @@ async fn only_the_controller_that_holds_authority_announces_a_revision() {
         host.service.acknowledged_revision().map(|held| held.get()),
         Some(4)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscription_on_a_fenced_connection_stops_delivering() {
+    // The transport names this one as the host's own: section 9's dispatch barrier covers a
+    // mutation, and it does not cover a read or a subscription that was already running when the
+    // authority behind it was withdrawn. Refusing the fenced connection's *next* request would
+    // leave its delivery task streaming this session's output for as long as it kept quiet.
+    let host = host_producing(1, "while true; do printf 'line\\n'; sleep 1; done").await;
+    let mut first = controller_client(&host, 1).await;
+
+    let attached: kr_protocol::attachment::SessionAttachResult = first
+        .mutate(
+            Method::SessionAttach,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            target(host.environment_id, host.session_id),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attach succeeds")
+        .to_typed()
+        .expect("decodes");
+    let mut streams = kr_protocol::scalars::CanonicalSet::new();
+    streams.insert(kr_protocol::recovery::EventStream::Output);
+    first
+        .request(
+            Method::EventsSubscribe,
+            &kr_protocol::recovery::EventsSubscribeParams {
+                session_id: host.session_id,
+                attachment_id: attached.attachment.attachment_id,
+                streams,
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the subscription succeeds");
+    assert!(
+        output_within(&mut first, std::time::Duration::from_secs(4)).await,
+        "the subscription is delivering before anything is fenced"
+    );
+
+    // A replacement daemon binds the authority. The first connection is fenced.
+    let mut second = controller_client(&host, 2).await;
+    read_session(&mut second, host.session_id)
+        .await
+        .expect("the replacement connection is served");
+
+    assert!(
+        !output_within(&mut first, std::time::Duration::from_secs(3)).await,
+        "the fenced connection's subscription stopped delivering"
+    );
+    assert_eq!(
+        read_session(&mut first, host.session_id).await,
+        Err(ErrorCode::PermissionDenied),
+        "and its next request says why"
+    );
+}
+
+/// Returns whether any session output reaches this client inside `window`.
+async fn output_within(client: &mut LocalClient, window: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + window;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let Ok(Ok(frame)) = tokio::time::timeout(remaining, client.recv()).await else {
+            return false;
+        };
+        if let kr_protocol::envelope::ControlFrame::Notification(notification) = frame
+            && notification.event_type.as_str() == "session.output"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn attach_params(session_id: SessionId) -> kr_protocol::attachment::SessionAttachParams {
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    kr_protocol::attachment::SessionAttachParams {
+        session_id,
+        mode: kr_protocol::attachment::AttachMode::Terminal,
+        claim_geometry: false,
+        dimensions: Nullable::some(Dimensions::new(80, 24)),
+        terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+        requested,
+    }
 }
