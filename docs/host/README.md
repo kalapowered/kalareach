@@ -100,6 +100,19 @@ The service manager reports a process identifier as soon as it has spawned the p
 be before the kernel will describe it. The daemon retries briefly rather than refusing a worker
 that started perfectly well.
 
+### Privacy permissions
+
+A worker started by the service manager is not a child of the terminal that asked for it. On macOS
+that makes it its own process as far as the operating system's privacy controls are concerned, so
+the first time a worker reads a protected location — an external volume, the desktop, the documents
+folder — the person is asked to allow it, once per installed binary. That is the operating system
+working as intended; nothing here asks for blanket access on the user's behalf.
+
+Two consequences are worth knowing. A session whose working directory is on a protected volume will
+prompt when its shell starts, not when the person later opens a file. And a host whose binaries are
+replaced — a new build, an upgrade — is a new binary to those controls, so the question is asked
+again.
+
 A launchd job's standard error goes to `<state>/environments/<prefix>/jobs/<label>.diagnostics`. A
 worker that fails before its rendezvous has no terminal, no connection and no journal yet, so that
 file is the only place its diagnosis can go.
