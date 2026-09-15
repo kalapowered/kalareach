@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 macro_rules! action_rights {
     ($($variant:ident => $wire:literal, $doc:literal;)+) => {
         /// One permitted action in a grant.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
         pub enum ActionRight {
             $(
                 #[doc = $doc]
@@ -92,6 +92,20 @@ action_rights! {
         "Install, enable, pause and run automation definitions.";
     HostManage => "host.manage",
         "Change host configuration: devices, catalogues, plugins and installation state.";
+}
+
+/// Ordered by the wire string, so a set of rights encodes in an order a reader can verify from the
+/// encoded values alone rather than from this file's declaration order.
+impl Ord for ActionRight {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for ActionRight {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl fmt::Display for ActionRight {

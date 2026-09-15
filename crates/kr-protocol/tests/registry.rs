@@ -426,7 +426,7 @@ fn every_entry_that_names_a_capability_names_a_revision() {
 }
 
 #[test]
-fn geometry_claims_are_the_only_conditional_terminal_rights() {
+fn every_conditional_right_is_one_the_specification_states() {
     let conditional: Vec<(&str, RightCondition)> = REGISTRY
         .iter()
         .flat_map(|entry| {
@@ -440,13 +440,78 @@ fn geometry_claims_are_the_only_conditional_terminal_rights() {
     assert_eq!(
         conditional,
         [
+            // Either the candidate's transcript proof or the issuing owner's context.
             ("pair.status", RightCondition::CandidateEndpoint),
             ("pair.status", RightCondition::IssuingOwner),
+            // A geometry claim needs terminal.geometry; observing does not.
             ("session.attach", RightCondition::GeometryClaim),
             ("attachment.configure", RightCondition::GeometryClaim),
+            // Own undispatched intent, or explicit host-owner authority.
+            ("action.cancel", RightCondition::OwnSubject),
             ("action.cancel", RightCondition::OtherActor),
+            // A device may broaden its own voice grant; another device's needs host.manage.
+            ("voice.grant", RightCondition::OwnSubject),
+            ("voice.grant", RightCondition::OtherActor),
         ]
     );
+}
+
+#[test]
+fn a_conditional_pair_is_a_choice_and_not_an_intersection() {
+    // OwnSubject and OtherActor are mutually exclusive, so exactly one branch applies to any
+    // request. An entry that lists one must list the other, otherwise one case is unauthorised.
+    for entry in REGISTRY {
+        let has_own = entry
+            .required_rights
+            .iter()
+            .any(|required| required.when == RightCondition::OwnSubject);
+        let has_other = entry
+            .required_rights
+            .iter()
+            .any(|required| required.when == RightCondition::OtherActor);
+        assert_eq!(has_own, has_other, "{}: one branch is missing", entry.name);
+
+        let has_candidate = entry
+            .required_rights
+            .iter()
+            .any(|required| required.when == RightCondition::CandidateEndpoint);
+        let has_issuer = entry
+            .required_rights
+            .iter()
+            .any(|required| required.when == RightCondition::IssuingOwner);
+        assert_eq!(
+            has_candidate, has_issuer,
+            "{}: one pairing branch is missing",
+            entry.name
+        );
+    }
+}
+
+#[test]
+fn reading_a_retained_receipt_needs_present_view_authority() {
+    // Owning an action identifier is not permission to read what the receipt exposes.
+    let entry = lookup("action.read").expect("listed");
+    assert!(
+        entry
+            .unconditional_rights()
+            .any(|right| right == ActionRight::SessionView),
+        "action.read must require present view authority"
+    );
+    assert_eq!(entry.history_filter, HistoryFilter::GrantLowerBound);
+}
+
+#[test]
+fn sharing_needs_issuer_or_delegation_authority() {
+    for name in ["grant.create", "grant.revoke", "grant.list"] {
+        let entry = lookup(name).expect("listed");
+        assert!(
+            entry
+                .required_rights
+                .iter()
+                .any(|required| matches!(required.authority, RequiredAuthority::IssuerDelegation)),
+            "{name} must require issuer or delegation authority over the grant itself"
+        );
+    }
 }
 
 #[test]

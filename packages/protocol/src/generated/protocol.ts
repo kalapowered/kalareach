@@ -48,6 +48,178 @@ export type TimestampMs = string
  */
 export type ApprovalRequestId = string
 /**
+ * One submitted intent and its receipt, generated as a UUIDv4.
+ */
+export type ActionId = string
+/**
+ * A host-issued action window identifier, bound to one authenticated connection and host boot.
+ */
+export type ActionWindowId = string
+/**
+ * A stable host-issued principal for one verified actor. The caller cannot assert it.
+ */
+export type ActorId = string
+/**
+ * The upstream agent's conversation identifier, where available. Correlation data, not authority.
+ */
+export type AgentThreadId = string
+/**
+ * The upstream agent's current turn identifier, where available.
+ */
+export type AgentTurnId = string
+/**
+ * One CLI or application attachment, independently of its device.
+ */
+export type AttachmentId = string
+/**
+ * Monotonic attachment join order, used for deterministic geometry-owner succession.
+ */
+export type AttachmentOrdinal = string
+/**
+ * One pairing attempt by one candidate: 128 random bits.
+ */
+export type AttemptId = string
+/**
+ * The host boot epoch, which binds continuous-time deadlines to one boot.
+ */
+export type BootEpoch = string
+/**
+ * A build identifier reported in hello.
+ */
+export type BuildId = string
+/**
+ * Current evidence for a versioned capability. Never permission.
+ */
+export type CapabilityRevision = string
+/**
+ * The root of a bounded cross-run causal chain.
+ */
+export type CausalRootId = string
+/**
+ * One immutable captured change set.
+ */
+export type ChangeSetId = string
+/**
+ * The exact version of a change set that was tested or reviewed.
+ */
+export type ChangeSetVersion = string
+/**
+ * The host clock epoch, advanced when wall-clock trust changes.
+ */
+export type ClockEpoch = string
+/**
+ * One transport connection, allocated by the host during hello.
+ */
+export type ConnectionId = string
+/**
+ * The controller's persistent generation, advanced on every controller start.
+ */
+export type ControllerGeneration = string
+/**
+ * A host-derived desktop session identity binding OS user, boot identity and login-session generation.
+ */
+export type DesktopSessionId = string
+/**
+ * The revision of a device's purpose-separated public keys.
+ */
+export type DeviceKeyRevision = string
+/**
+ * An opaque diagnostic identifier. It carries no protocol meaning.
+ */
+export type DiagnosticId = string
+/**
+ * One durable device-owned draft, independent of an attachment.
+ */
+export type DraftId = string
+/**
+ * The exact version of a draft.
+ */
+export type DraftRevision = string
+/**
+ * A position in one notification stream.
+ */
+export type EventSequence = string
+/**
+ * The type of one notification event.
+ */
+export type EventType = string
+/**
+ * The current geometry-owner epoch, separate from the input lease.
+ */
+export type GeometryEpoch = string
+/**
+ * The current input lease epoch.
+ */
+export type InputLeaseEpoch = string
+/**
+ * An increasing sequence number inside one raw input stream.
+ */
+export type InputSequence = string
+/**
+ * One native application installation registered with a push gateway.
+ */
+export type InstallationId = string
+/**
+ * One pairing invitation: 128 random bits, not necessarily a UUIDv4.
+ */
+export type InvitationId = string
+/**
+ * A logical machine group. Not a hardware identity.
+ */
+export type MachineId = string
+/**
+ * One organisation whose signed policy a host has opted into.
+ */
+export type OrganisationId = string
+/**
+ * A plugin identifier from its manifest.
+ */
+export type PluginId = string
+/**
+ * One environment-bound source repository.
+ */
+export type ProjectRepositoryId = string
+/**
+ * The exact version of a question that a person answers.
+ */
+export type QuestionRevision = string
+/**
+ * One remote dispatch lease from the current controller generation.
+ */
+export type RemoteDispatchLeaseId = string
+/**
+ * The catalogue generation a plugin package was resolved against.
+ */
+export type RepositoryGeneration = string
+/**
+ * A request identifier, unique for the lifetime of one connection.
+ */
+export type RequestId = string
+/**
+ * A private broker handle for immutable upstream bytes and their execution provenance.
+ */
+export type SourceEventHandle = string
+/**
+ * A position in one event stream.
+ */
+export type StreamCursor = string
+/**
+ * The name of one event stream.
+ */
+export type StreamId = string
+/**
+ * One automation definition.
+ */
+export type WorkflowId = string
+/**
+ * One automation run.
+ */
+export type WorkflowRunId = string
+/**
+ * One selected working copy and its policy.
+ */
+export type WorkspaceId = string
+/**
  * Where a request entered the host.
  *
  * Ingress is part of every authority entry. A method restricted to private IPC is never reachable
@@ -86,22 +258,10 @@ export type ResourceSelectorKind =
   | 'mailbox'
   | 'agent_target'
 /**
- * An opaque diagnostic identifier. It carries no protocol meaning.
- */
-export type DiagnosticId = string
-/**
  * Why an action was rejected before dispatch.
  */
 export type RejectionReason =
   'admission_failed' | 'expired' | 'cancelled' | 'revoked' | 'stale_preconditions'
-/**
- * One CLI or application attachment, independently of its device.
- */
-export type AttachmentId = string
-/**
- * The name of one event stream.
- */
-export type StreamId = string
 
 /**
  * Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.
@@ -111,6 +271,93 @@ export interface KalaReachProtocol {
   client_offer?: ClientOffer
   grant?: Grant
   host_selection?: HostSelection
+  /**
+   * Every identifier in the identity and object model. This is a vocabulary rather than a message: it exists so each identifier has one named type.
+   */
+  identifiers?: {
+    action_id?: ActionId
+    action_window_id?: ActionWindowId
+    actor_id?: ActorId
+    /**
+     * Changes when the active upstream execution owner or selected thread changes.
+     */
+    agent_binding_revision?: string
+    agent_thread_id?: AgentThreadId
+    agent_turn_id?: AgentTurnId
+    /**
+     * One foreground application within a terminal session.
+     */
+    application_instance_id?: string
+    approval_request_id?: ApprovalRequestId
+    attachment_id?: AttachmentId
+    attachment_ordinal?: AttachmentOrdinal
+    attempt_id?: AttemptId
+    /**
+     * The host's ordered authority revision. Only the host issues its own revisions.
+     */
+    authority_revision?: string
+    boot_epoch?: BootEpoch
+    build_id?: BuildId
+    capability_id?: CapabilityId
+    capability_revision?: CapabilityRevision
+    causal_root_id?: CausalRootId
+    change_set_id?: ChangeSetId
+    change_set_version?: ChangeSetVersion
+    clock_epoch?: ClockEpoch
+    connection_id?: ConnectionId
+    controller_generation?: ControllerGeneration
+    desktop_session_id?: DesktopSessionId
+    /**
+     * One paired device.
+     */
+    device_id?: string
+    device_key_revision?: DeviceKeyRevision
+    diagnostic_id?: DiagnosticId
+    draft_id?: DraftId
+    draft_revision?: DraftRevision
+    environment_id?: EnvironmentId
+    event_sequence?: EventSequence
+    event_type?: EventType
+    geometry_epoch?: GeometryEpoch
+    /**
+     * One host-issued authority object.
+     */
+    grant_id?: string
+    input_lease_epoch?: InputLeaseEpoch
+    input_sequence?: InputSequence
+    installation_id?: InstallationId
+    invitation_id?: InvitationId
+    machine_id?: MachineId
+    organisation_id?: OrganisationId
+    plugin_id?: PluginId
+    project_repository_id?: ProjectRepositoryId
+    /**
+     * One agent-to-user question.
+     */
+    question_id?: string
+    question_revision?: QuestionRevision
+    remote_dispatch_lease_id?: RemoteDispatchLeaseId
+    repository_generation?: RepositoryGeneration
+    request_id?: RequestId
+    /**
+     * The session epoch, fixed at 1 in protocol version 1.
+     */
+    session_epoch?: string
+    /**
+     * One KalaReach terminal session.
+     */
+    session_id?: string
+    source_event_handle?: SourceEventHandle
+    stream_cursor?: StreamCursor
+    stream_id?: StreamId
+    /**
+     * One upload or download transfer.
+     */
+    transfer_id?: string
+    workflow_id?: WorkflowId
+    workflow_run_id?: WorkflowRunId
+    workspace_id?: WorkspaceId
+  }
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
   notification?: Notification
@@ -244,29 +491,27 @@ export interface Grant {
    * Which environments it covers.
    */
   environment_selector:
+    | 'any'
     | {
-        kind: 'any'
-      }
-    | {
-        /**
-         * The permitted environments.
-         */
-        environment_ids: EnvironmentId[]
-        kind: 'these'
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
       }
   /**
    * When it stops being valid.
    */
   expiry:
+    | 'never'
     | {
-        kind: 'never'
-      }
-    | {
-        /**
-         * The deadline in UTC milliseconds.
-         */
-        expires_at_ms: string
-        kind: 'at'
+        at: {
+          /**
+           * The deadline in UTC milliseconds.
+           */
+          expires_at_ms: string
+        }
       }
   /**
    * One host-issued authority object.
@@ -293,21 +538,18 @@ export interface Grant {
    * Which sessions it covers.
    */
   session_selector:
+    | 'any'
     | {
-        kind: 'any'
+        these: {
+          /**
+           * The permitted sessions.
+           *
+           * Items: One KalaReach terminal session.
+           */
+          session_ids: string[]
+        }
       }
-    | {
-        kind: 'these'
-        /**
-         * The permitted sessions.
-         *
-         * Items: One KalaReach terminal session.
-         */
-        session_ids: string[]
-      }
-    | {
-        kind: 'none'
-      }
+    | 'none'
 }
 /**
  * How far back it may see.
@@ -441,33 +683,32 @@ export interface MethodEntry {
    * Which capability evidence is required, and at which revision.
    */
   capability:
+    | 'none'
     | {
-        kind: 'none'
-      }
-    | {
-        /**
-         * The capability name.
-         */
-        capability_id: string
-        kind: 'required'
-        /**
-         * The revision the evidence is bound to.
-         */
-        revision:
-          | 'agent_binding'
-          | 'session_epoch'
-          | 'input_lease_epoch'
-          | 'geometry_epoch'
-          | 'question_revision'
-          | 'draft_revision'
-          | 'change_set_version'
-          | 'authority_revision'
-          | 'device_key_revision'
-          | 'package_hash'
-          | 'repository_generation'
-          | 'workflow_definition_version'
-          | 'root_editor_fence'
-          | 'installation_key_revision'
+        required: {
+          /**
+           * The capability name.
+           */
+          capability_id: string
+          /**
+           * The revision the evidence is bound to.
+           */
+          revision:
+            | 'agent_binding'
+            | 'session_epoch'
+            | 'input_lease_epoch'
+            | 'geometry_epoch'
+            | 'question_revision'
+            | 'draft_revision'
+            | 'change_set_version'
+            | 'authority_revision'
+            | 'device_key_revision'
+            | 'package_hash'
+            | 'repository_generation'
+            | 'workflow_definition_version'
+            | 'root_editor_fence'
+            | 'installation_key_revision'
+        }
       }
   /**
    * Whether a fresh owner confirmation is required.
@@ -527,22 +768,17 @@ export interface MethodEntry {
    * How a repeated request is resolved.
    */
   idempotency:
+    | 'idempotent_read'
+    | 'action_deduplicated'
     | {
-        kind: 'idempotent_read'
+        keyed: {
+          /**
+           * The key the operation is idempotent under.
+           */
+          key: string
+        }
       }
-    | {
-        kind: 'action_deduplicated'
-      }
-    | {
-        /**
-         * The key the operation is idempotent under.
-         */
-        key: string
-        kind: 'keyed'
-      }
-    | {
-        kind: 'ordered_stream'
-      }
+    | 'ordered_stream'
   /**
    * The only ingress classes that may reach this method.
    */
@@ -711,58 +947,52 @@ export interface RequiredRight {
    */
   authority:
     | {
-        kind: 'right'
-        /**
-         * One permitted action in a grant.
-         */
-        right:
-          | 'session.view'
-          | 'terminal.input'
-          | 'terminal.geometry'
-          | 'terminal.geometry.transfer'
-          | 'terminal.palette'
-          | 'agent.prompt'
-          | 'agent.cancel'
-          | 'agent.approval.respond'
-          | 'question.respond'
-          | 'files.read'
-          | 'files.upload'
-          | 'files.apply_diff'
-          | 'project.create'
-          | 'workspace.manage'
-          | 'changeset.create'
-          | 'session.create'
-          | 'session.rename'
-          | 'session.close'
-          | 'session.share'
-          | 'automation.manage'
-          | 'host.manage'
+        right: {
+          /**
+           * One permitted action in a grant.
+           */
+          right:
+            | 'session.view'
+            | 'terminal.input'
+            | 'terminal.geometry'
+            | 'terminal.geometry.transfer'
+            | 'terminal.palette'
+            | 'agent.prompt'
+            | 'agent.cancel'
+            | 'agent.approval.respond'
+            | 'question.respond'
+            | 'files.read'
+            | 'files.upload'
+            | 'files.apply_diff'
+            | 'project.create'
+            | 'workspace.manage'
+            | 'changeset.create'
+            | 'session.create'
+            | 'session.rename'
+            | 'session.close'
+            | 'session.share'
+            | 'automation.manage'
+            | 'host.manage'
+        }
       }
-    | {
-        kind: 'resource_owner'
-      }
-    | {
-        kind: 'pairing_transcript'
-      }
-    | {
-        kind: 'issuing_owner_context'
-      }
-    | {
-        kind: 'voice_grant'
-      }
-    | {
-        kind: 'service_credential'
-      }
-    | {
-        kind: 'plugin_effect_rights'
-      }
-    | {
-        kind: 'local_caller_token'
-      }
+    | 'resource_owner'
+    | 'pairing_transcript'
+    | 'issuing_owner_context'
+    | 'voice_grant'
+    | 'service_credential'
+    | 'plugin_effect_rights'
+    | 'local_caller_token'
+    | 'issuer_delegation'
   /**
    * When it must be presented.
    */
-  when: 'always' | 'geometry_claim' | 'other_actor' | 'candidate_endpoint' | 'issuing_owner'
+  when:
+    | 'always'
+    | 'geometry_claim'
+    | 'own_subject'
+    | 'other_actor'
+    | 'candidate_endpoint'
+    | 'issuing_owner'
 }
 /**
  * A mutation request.
@@ -1071,7 +1301,7 @@ export interface Request {
    */
   method_version: number
   /**
-   * The method's parameters.
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings appear as unpadded base64url and cannot be told apart from text.
    */
   params: {
     [k: string]: unknown
@@ -1090,17 +1320,10 @@ export interface Response {
    */
   outcome:
     | {
-        /**
-         * The method's result.
-         */
-        result: {
-          [k: string]: unknown
-        }
-        status: 'ok'
+        ok: ParamsValue
       }
     | {
-        error: ProtocolError1
-        status: 'error'
+        error: ProtocolError
       }
   /**
    * The request this response answers.
@@ -1108,73 +1331,10 @@ export interface Response {
   request_id: string
 }
 /**
- * Why it failed.
+ * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings appear as unpadded base64url and cannot be told apart from text.
  */
-export interface ProtocolError1 {
-  /**
-   * The stable code.
-   */
-  code:
-    | 'INVALID_ARGUMENT'
-    | 'UNSUPPORTED_SCHEMA'
-    | 'UNSUPPORTED_CAPABILITY'
-    | 'PERMISSION_DENIED'
-    | 'PAIRING_EXPIRED'
-    | 'PAIRING_REJECTED'
-    | 'PAIRING_AUTH_FAILED'
-    | 'PAIRING_ATTEMPTS_EXHAUSTED'
-    | 'RENDEZVOUS_UNAVAILABLE'
-    | 'RENDEZVOUS_CONFIG_ERROR'
-    | 'UNKNOWN_SESSION'
-    | 'AMBIGUOUS_SESSION'
-    | 'AMBIGUOUS_ATTACHMENT'
-    | 'TERMINAL_UNAVAILABLE'
-    | 'TERMINAL_PROBE_FAILED'
-    | 'INPUT_INCOMPATIBLE'
-    | 'SESSION_CLOSED'
-    | 'SESSION_LIMIT'
-    | 'RESOURCE_UNAVAILABLE'
-    | 'HOST_NOT_CONFIGURED'
-    | 'ENVIRONMENT_UNAVAILABLE'
-    | 'DESKTOP_UNAVAILABLE'
-    | 'STALE_SESSION'
-    | 'LEASE_LOST'
-    | 'GEOMETRY_NOT_OWNER'
-    | 'DRAFT_CONFLICT'
-    | 'EDITOR_BUSY'
-    | 'ID_CONFLICT'
-    | 'UPSTREAM_UNAVAILABLE'
-    | 'OUTCOME_UNKNOWN'
-    | 'RESYNC_REQUIRED'
-    | 'QUOTA_EXCEEDED'
-    | 'RATE_LIMITED'
-    | 'SERVICE_CAPACITY'
-    | 'CLOCK_UNTRUSTED'
-    | 'STORAGE_UNAVAILABLE'
-    | 'SHELL_INTEGRATION_UNSUPPORTED'
-    | 'ATTACHMENT_INTEGRITY'
-    | 'REPOSITORY_UNTRUSTED'
-    | 'PACKAGE_UNAVAILABLE_OFFLINE'
-    | 'PLUGIN_GRANT_REQUIRED'
-    | 'PLUGIN_DISABLED'
-    | 'QUESTION_RESOLVED'
-    | 'QUESTION_EXPIRED'
-    | 'NOT_IN_KR_SESSION'
-    | 'OWNER_CONFIRMATION_REQUIRED'
-    | 'CAUSAL_LIMIT'
-    | 'SOURCE_CHANGED'
-  /**
-   * An opaque identifier for correlating this failure with host diagnostics.
-   */
-  diagnostic_id: DiagnosticId | null
-  /**
-   * A plain message. It never carries credentials or command text.
-   */
-  message: string
-  /**
-   * How the client may react. It must equal [`ErrorCode::retry_category`] for the code.
-   */
-  retry: 'no_retry' | 'transient' | 'resync' | 'configuration_change' | 'outcome_unknown'
+export interface ParamsValue {
+  [k: string]: unknown
 }
 /**
  * A session and the epoch it was addressed in.

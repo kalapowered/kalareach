@@ -19,6 +19,7 @@
 use core::fmt;
 use core::marker::PhantomData;
 use core::str::FromStr;
+use std::collections::BTreeSet;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -745,6 +746,145 @@ impl<T: JsonSchema> JsonSchema for Nullable<T> {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         json_schema!({
             "anyOf": [generator.subschema_for::<T>(), { "type": "null" }]
+        })
+    }
+}
+
+/// A set that keeps one exact encoding.
+///
+/// A signed object is verified against the bytes it arrived in, so a collection inside one cannot
+/// normalise on the way through. `BTreeSet` would: decoding `["z", "a"]` gives `{"a", "z"}`, and
+/// re-serialising it for a transcript would cover bytes the peer never sent.
+///
+/// `CanonicalSet` closes that by making the schema order part of the contract. It serialises in
+/// ascending element order and rejects an incoming sequence that is not already strictly
+/// ascending, so a received value always re-encodes to the bytes it came from. Section 23 permits
+/// exactly this: a schema may validate a canonical form, as long as it does so *before* encoding.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CanonicalSet<T: Ord>(BTreeSet<T>);
+
+impl<T: Ord> CanonicalSet<T> {
+    /// An empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(BTreeSet::new())
+    }
+
+    /// Returns true when `value` is a member.
+    pub fn contains<Q>(&self, value: &Q) -> bool
+    where
+        T: core::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.0.contains(value)
+    }
+
+    /// Adds a member, returning true when it was not already present.
+    pub fn insert(&mut self, value: T) -> bool {
+        self.0.insert(value)
+    }
+
+    /// Iterates the members in ascending order.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.0.iter()
+    }
+
+    /// Returns the number of members.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns true when the set is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns true when every member of `self` is also a member of `other`.
+    #[must_use]
+    pub fn is_subset(&self, other: &Self) -> bool {
+        self.0.is_subset(&other.0)
+    }
+}
+
+impl<T: Ord> FromIterator<T> for CanonicalSet<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl<'a, T: Ord> IntoIterator for &'a CanonicalSet<T> {
+    type Item = &'a T;
+    type IntoIter = std::collections::btree_set::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<T: Ord + Serialize> Serialize for CanonicalSet<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter())
+    }
+}
+
+impl<'de, T: Ord + Deserialize<'de>> Deserialize<'de> for CanonicalSet<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_seq(CanonicalSetVisitor(PhantomData))
+    }
+}
+
+struct CanonicalSetVisitor<T>(PhantomData<T>);
+
+impl<'de, T: Ord + Deserialize<'de>> Visitor<'de> for CanonicalSetVisitor<T> {
+    type Value = CanonicalSet<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a sequence in strictly ascending order")
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        let mut members: Vec<T> = Vec::new();
+        while let Some(member) = sequence.next_element::<T>()? {
+            if let Some(previous) = members.last() {
+                match previous.cmp(&member) {
+                    core::cmp::Ordering::Less => {}
+                    core::cmp::Ordering::Equal => {
+                        return Err(de::Error::custom("duplicate member in a canonical set"));
+                    }
+                    core::cmp::Ordering::Greater => {
+                        return Err(de::Error::custom(
+                            "members of a canonical set must be in ascending order",
+                        ));
+                    }
+                }
+            }
+            members.push(member);
+        }
+        Ok(CanonicalSet(members.into_iter().collect()))
+    }
+}
+
+impl<T: Ord + JsonSchema> JsonSchema for CanonicalSet<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        format!("CanonicalSet_{}", T::schema_name()).into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        format!("kalareach::CanonicalSet<{}>", T::schema_id()).into()
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "array",
+            "items": generator.subschema_for::<T>(),
+            "uniqueItems": true,
+            "description": "A set encoded as a sequence in strictly ascending order. A sequence that is unsorted or repeats a member is rejected."
         })
     }
 }

@@ -8,7 +8,7 @@
 //! The output is byte stable: every object is a sorted map, the indentation is fixed and each file
 //! ends with one newline.
 
-use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
+use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings, json_schema};
 use serde_json::{Map, Value, json};
 
 use crate::actor::ActorEnvelope;
@@ -18,6 +18,7 @@ use crate::error::ProtocolError;
 use crate::frame::StreamHeader;
 use crate::grant::Grant;
 use crate::hello::{ClientOffer, HostSelection};
+use crate::ids;
 use crate::ids::SessionRef;
 use crate::method::{Method, REGISTRY};
 use crate::receipt::{Receipt, ReceiptResponse};
@@ -64,6 +65,10 @@ pub fn protocol_schema() -> Value {
         "session_ref" => SessionRef,
         "stream_header" => StreamHeader,
     }
+    properties.insert(
+        "identifiers".to_owned(),
+        identifier_vocabulary(&mut generator).to_value(),
+    );
     let definitions = generator.take_definitions(true);
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -72,6 +77,83 @@ pub fn protocol_schema() -> Value {
         "type": "object",
         "properties": Value::Object(properties),
         "$defs": Value::Object(definitions.into_iter().collect()),
+    })
+}
+
+/// Registers every public identifier so consumers get a named type for each one.
+///
+/// Most identifiers are reachable from a root message, but not all of them are, and a consumer
+/// that has to hand-write `WorkspaceId` has already lost the guarantee this package exists to
+/// give. The synthetic root below names them all; the fields are optional because it is a
+/// vocabulary, not a message.
+fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
+    let mut properties = Map::new();
+    macro_rules! vocabulary {
+        ($($name:literal => $type:ty),+ $(,)?) => {
+            $(properties.insert($name.to_owned(), generator.subschema_for::<$type>().to_value());)+
+        };
+    }
+    vocabulary! {
+        "action_id" => ids::ActionId,
+        "action_window_id" => ids::ActionWindowId,
+        "actor_id" => ids::ActorId,
+        "agent_binding_revision" => ids::AgentBindingRevision,
+        "agent_thread_id" => ids::AgentThreadId,
+        "agent_turn_id" => ids::AgentTurnId,
+        "application_instance_id" => ids::ApplicationInstanceId,
+        "approval_request_id" => ids::ApprovalRequestId,
+        "attachment_id" => ids::AttachmentId,
+        "attachment_ordinal" => ids::AttachmentOrdinal,
+        "attempt_id" => ids::AttemptId,
+        "authority_revision" => ids::AuthorityRevision,
+        "boot_epoch" => ids::BootEpoch,
+        "build_id" => ids::BuildId,
+        "capability_id" => ids::CapabilityId,
+        "capability_revision" => ids::CapabilityRevision,
+        "causal_root_id" => ids::CausalRootId,
+        "change_set_id" => ids::ChangeSetId,
+        "change_set_version" => ids::ChangeSetVersion,
+        "clock_epoch" => ids::ClockEpoch,
+        "connection_id" => ids::ConnectionId,
+        "controller_generation" => ids::ControllerGeneration,
+        "desktop_session_id" => ids::DesktopSessionId,
+        "device_id" => ids::DeviceId,
+        "device_key_revision" => ids::DeviceKeyRevision,
+        "diagnostic_id" => ids::DiagnosticId,
+        "draft_id" => ids::DraftId,
+        "draft_revision" => ids::DraftRevision,
+        "environment_id" => ids::EnvironmentId,
+        "event_sequence" => ids::EventSequence,
+        "event_type" => ids::EventType,
+        "geometry_epoch" => ids::GeometryEpoch,
+        "grant_id" => ids::GrantId,
+        "input_lease_epoch" => ids::InputLeaseEpoch,
+        "input_sequence" => ids::InputSequence,
+        "installation_id" => ids::InstallationId,
+        "invitation_id" => ids::InvitationId,
+        "machine_id" => ids::MachineId,
+        "organisation_id" => ids::OrganisationId,
+        "plugin_id" => ids::PluginId,
+        "project_repository_id" => ids::ProjectRepositoryId,
+        "question_id" => ids::QuestionId,
+        "question_revision" => ids::QuestionRevision,
+        "remote_dispatch_lease_id" => ids::RemoteDispatchLeaseId,
+        "repository_generation" => ids::RepositoryGeneration,
+        "request_id" => ids::RequestId,
+        "session_epoch" => ids::SessionEpoch,
+        "session_id" => ids::SessionId,
+        "source_event_handle" => ids::SourceEventHandle,
+        "stream_cursor" => ids::StreamCursor,
+        "stream_id" => ids::StreamId,
+        "transfer_id" => ids::TransferId,
+        "workflow_id" => ids::WorkflowId,
+        "workflow_run_id" => ids::WorkflowRunId,
+        "workspace_id" => ids::WorkspaceId,
+    }
+    json_schema!({
+        "type": "object",
+        "description": "Every identifier in the identity and object model. This is a vocabulary rather than a message: it exists so each identifier has one named type.",
+        "properties": Value::Object(properties)
     })
 }
 

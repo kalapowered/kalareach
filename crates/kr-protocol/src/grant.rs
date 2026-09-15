@@ -8,8 +8,6 @@
 //! [`Grant::narrows`] states that rule as code so the controller and the tests share one
 //! definition.
 
-use std::collections::BTreeSet;
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -18,18 +16,18 @@ use crate::ids::{
     QuestionId, SessionId,
 };
 use crate::rights::ActionRight;
-use crate::scalars::{Nullable, TimestampMs};
+use crate::scalars::{CanonicalSet, Nullable, TimestampMs};
 
 /// Which environments a grant covers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EnvironmentSelector {
     /// Every environment on the host.
     Any,
     /// Only the named environments.
     These {
         /// The permitted environments.
-        environment_ids: BTreeSet<EnvironmentId>,
+        environment_ids: CanonicalSet<EnvironmentId>,
     },
 }
 
@@ -63,14 +61,14 @@ impl EnvironmentSelector {
 
 /// Which sessions a grant covers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionSelector {
     /// Every session inside the selected environments.
     Any,
     /// Only the named sessions.
     These {
         /// The permitted sessions.
-        session_ids: BTreeSet<SessionId>,
+        session_ids: CanonicalSet<SessionId>,
     },
     /// No session. The grant covers host-level effects only.
     None,
@@ -119,9 +117,9 @@ pub struct HistoryScope {
     /// screen buffers, scrollback or the backing transcript.
     pub include_live_screen: bool,
     /// Current questions named explicitly, even when they were created before the lower bound.
-    pub named_questions: BTreeSet<QuestionId>,
+    pub named_questions: CanonicalSet<QuestionId>,
     /// Current approval requests named explicitly, on the same terms.
-    pub named_approvals: BTreeSet<ApprovalRequestId>,
+    pub named_approvals: CanonicalSet<ApprovalRequestId>,
 }
 
 impl HistoryScope {
@@ -142,7 +140,7 @@ impl HistoryScope {
 
 /// When a grant stops being valid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GrantExpiry {
     /// Valid until revoked. Personal owner grants use this so independent operation does not
     /// depend on a cloud lease.
@@ -215,7 +213,7 @@ pub struct Grant {
     /// Which sessions it covers.
     pub session_selector: SessionSelector,
     /// The actions it permits.
-    pub actions: BTreeSet<ActionRight>,
+    pub actions: CanonicalSet<ActionRight>,
     /// How far back it may see.
     pub history: HistoryScope,
     /// When it stops being valid.

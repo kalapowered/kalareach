@@ -10,8 +10,10 @@
 //! * `effect` — read or write.
 //! * `ingress` — the only ingress classes that may reach the method. An ingress class that is not
 //!   listed is denied whatever rights the caller holds.
-//! * `rights` — everything the actor must present, intersected. An empty list is the baseline
-//!   only: a valid, unexpired, unrevoked grant covering the named environment.
+//! * `rights` — everything the actor must present, intersected. An empty list means scoped read
+//!   authority and nothing more: a valid, unexpired, unrevoked grant covering the named
+//!   environment and resource. Entries whose condition is not `always` apply only when that
+//!   condition holds, which is how a pair of mutually exclusive conditions expresses a choice.
 //! * `selectors` — the resources the request names and the host resolves before the check.
 //! * `history` — how the shared host-side history filter applies to the result.
 //! * `capability` — which capability evidence is required, and which revision it is bound to.
@@ -1058,7 +1060,11 @@ methods! {
     // ----- Pending action control -----------------------------------------------------------
     ActionCancel = "action.cancel", PendingActionControl,
     effect: Write, ingress: [LocalIpc, PairedDevice, Workflow],
-    rights: [basis(ResourceOwner), req_when(HostManage, OtherActor)], selectors: [Action],
+    rights: [
+        basis_when(ResourceOwner, OwnSubject),
+        req_when(HostManage, OtherActor),
+    ],
+    selectors: [Action],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Cancel an undispatched intent atomically. After a dispatch marker, cancellation is a \
@@ -1103,29 +1109,34 @@ methods! {
     doc: "Page retained history. A history request never creates a worker.";
 
     ActionRead = "action.read", StateRecovery,
-    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [basis(ResourceOwner)],
-    selectors: [Action],
-    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow],
+    rights: [basis(ResourceOwner), req(SessionView)], selectors: [Action, Session],
+    history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
-    doc: "Read a retained receipt. Current authority is checked before it is returned.";
+    doc: "Read a retained receipt. Owning the identifier is not enough: present view authority \
+          over the receipt's subject is checked before it is returned, so a device that lost its \
+          scope cannot retrieve protected information through an old action identifier.";
 
     // ----- Sharing --------------------------------------------------------------------------
     GrantCreate = "grant.create", Sharing,
-    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(SessionShare)],
+    effect: Write, ingress: [LocalIpc, PairedDevice],
+    rights: [req(SessionShare), basis(IssuerDelegation)],
     selectors: [Session, Grant, Device],
     history: NotApplicable, capability: cap("grant.parent", AuthorityRevision),
     freshness: ActionWindow, confirmation: WhenEnlargingAuthority, idempotency: ACTION,
     doc: "Delegate a narrower grant. Persistent enlargement requires owner confirmation.";
 
     GrantRevoke = "grant.revoke", Sharing,
-    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(SessionShare)],
+    effect: Write, ingress: [LocalIpc, PairedDevice],
+    rights: [req(SessionShare), basis(IssuerDelegation)],
     selectors: [Grant],
     history: NotApplicable, capability: cap("grant.parent", AuthorityRevision),
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
     doc: "Revoke a grant and its descendants. Completion uses the per-worker dispatch barrier.";
 
     GrantList = "grant.list", Sharing,
-    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(SessionShare)],
+    effect: Read, ingress: [LocalIpc, PairedDevice],
+    rights: [req(SessionShare), basis(IssuerDelegation)],
     selectors: [Grant],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
@@ -1206,11 +1217,16 @@ methods! {
     doc: "Stop a voice session. Ending it revokes its voice grant immediately.";
 
     VoiceGrant = "voice.grant", Voice,
-    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
-    selectors: [Host, Session],
+    effect: Write, ingress: [LocalIpc, PairedDevice],
+    rights: [
+        basis_when(ResourceOwner, OwnSubject),
+        req_when(HostManage, OtherActor),
+    ],
+    selectors: [Host, Device, Session],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: WhenEnlargingAuthority, idempotency: ACTION,
-    doc: "Create or change a voice grant, stating exactly which actions it permits.";
+    doc: "Create or change a voice grant, stating exactly which actions it permits. A device may \
+          broaden its own; changing another device's needs host-management authority.";
 
     VoiceDelegate = "voice.delegate", Voice,
     effect: Write, ingress: [PairedDevice], rights: [basis(VoiceGrant)],

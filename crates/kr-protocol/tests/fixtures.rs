@@ -2,7 +2,6 @@
 //!
 //! The TypeScript package loads the same files and asserts the same bytes and digests.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -20,7 +19,7 @@ use kr_protocol::ids::{
     GrantId, RequestId, SessionEpoch, SessionId,
 };
 use kr_protocol::method::{Method, MethodVersion};
-use kr_protocol::scalars::{DurationMs, EndpointKey, Nonce256, Nullable, Uuid};
+use kr_protocol::scalars::{CanonicalSet, DurationMs, EndpointKey, Nonce256, Nullable, Uuid};
 use serde_json::Value as Json;
 
 fn fixture_dir() -> PathBuf {
@@ -91,7 +90,7 @@ fn uuid(text: &str) -> Uuid {
     Uuid::from_str(text).expect("valid uuid")
 }
 
-fn capabilities() -> BTreeSet<CapabilityId> {
+fn capabilities() -> CanonicalSet<CapabilityId> {
     ["semantic.updates", "terminal.direct"]
         .into_iter()
         .map(|name| CapabilityId::new(name).expect("capability name"))

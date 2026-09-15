@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
-use kr_cbor::Limits;
+use kr_cbor::{CanonicalValue, Limits};
 use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
 use kr_protocol::frame::{FrameCodec, FrameError, StreamHeader, StreamKind, StreamResource};
 use kr_protocol::grant::{
@@ -20,7 +20,7 @@ use kr_protocol::limits::{
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::receipt::{Receipt, ReceiptState, RejectionReason, TransitionError};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
 
 fn uuid(text: &str) -> Uuid {
     Uuid::from_str(text).expect("valid uuid")
@@ -352,8 +352,8 @@ fn base_grant() -> Grant {
         history: HistoryScope {
             lower_bound_ms: Nullable::some(TimestampMs::new(1_000)),
             include_live_screen: true,
-            named_questions: BTreeSet::new(),
-            named_approvals: BTreeSet::new(),
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
         },
         expiry: GrantExpiry::At {
             expires_at_ms: TimestampMs::new(10_000),
@@ -384,8 +384,8 @@ fn delegation_narrows_and_never_extends() {
         history: HistoryScope {
             lower_bound_ms: Nullable::some(TimestampMs::new(5_000)),
             include_live_screen: false,
-            named_questions: BTreeSet::new(),
-            named_approvals: BTreeSet::new(),
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
         },
         expiry: GrantExpiry::At {
             expires_at_ms: TimestampMs::new(9_000),
@@ -776,23 +776,40 @@ fn a_target_states_fields_that_agree_with_each_other() {
 // ----- version negotiation ---------------------------------------------------------------------
 
 #[test]
-fn version_selection_takes_the_highest_mutually_supported_minor() {
-    let supported = [ProtocolVersion::new(1, 3)];
-    assert_eq!(
-        select_version(&[ProtocolVersion::new(1, 7)], &supported).expect("selected"),
-        ProtocolVersion::new(1, 3)
-    );
-    assert_eq!(
-        select_version(&[ProtocolVersion::new(1, 1)], &supported).expect("selected"),
-        ProtocolVersion::new(1, 1)
-    );
+fn version_selection_takes_the_highest_version_both_sides_listed() {
+    let supported = [
+        ProtocolVersion::new(1, 1),
+        ProtocolVersion::new(1, 2),
+        ProtocolVersion::new(1, 3),
+    ];
     assert_eq!(
         select_version(
-            &[ProtocolVersion::new(2, 0), ProtocolVersion::new(1, 2)],
+            &[ProtocolVersion::new(1, 1), ProtocolVersion::new(1, 2)],
             &supported
         )
         .expect("selected"),
         ProtocolVersion::new(1, 2)
+    );
+    assert_eq!(
+        select_version(
+            &[ProtocolVersion::new(2, 0), ProtocolVersion::new(1, 1)],
+            &supported
+        )
+        .expect("selected"),
+        ProtocolVersion::new(1, 1)
+    );
+}
+
+#[test]
+fn version_selection_never_assumes_an_unlisted_version_is_supported() {
+    // Supporting 1.3 says nothing about 1.1. A peer enumerates what it supports.
+    assert_eq!(
+        select_version(&[ProtocolVersion::new(1, 1)], &[ProtocolVersion::new(1, 3)]),
+        Err(ErrorCode::UnsupportedSchema)
+    );
+    assert_eq!(
+        select_version(&[ProtocolVersion::new(1, 7)], &[ProtocolVersion::new(1, 3)]),
+        Err(ErrorCode::UnsupportedSchema)
     );
 }
 
@@ -812,4 +829,151 @@ fn a_major_mismatch_is_an_unsupported_schema() {
 fn the_session_epoch_is_fixed_at_one_in_version_one() {
     assert_eq!(SessionEpoch::V1.get(), 1);
     assert_eq!(PROTOCOL_VERSION, ProtocolVersion::new(1, 0));
+}
+
+// ----- closed schemas and exact encodings ------------------------------------------------------
+
+#[test]
+fn a_scoped_selector_round_trips_through_its_own_wire_encoding() {
+    // An enum variant must not change the representation of the scalars inside it. A tagged
+    // representation that buffers the content would hand the inner identifier a human-readable
+    // deserializer and reject the 16-byte wire form.
+    let selector = EnvironmentSelector::These {
+        environment_ids: [EnvironmentId::new(uuid(
+            "3de5e6cb-bf21-49c1-8d34-b9a8729539da",
+        ))]
+        .into_iter()
+        .collect(),
+    };
+    let wire = kr_cbor::to_canonical_vec(&selector).expect("encode");
+    assert_eq!(
+        kr_cbor::from_canonical_slice::<EnvironmentSelector>(&wire, &Limits::DEFAULT)
+            .expect("decode"),
+        selector
+    );
+
+    let json = serde_json::to_string(&selector).expect("json");
+    assert!(
+        json.contains("3de5e6cb-bf21-49c1-8d34-b9a8729539da"),
+        "{json}"
+    );
+    assert_eq!(
+        serde_json::from_str::<EnvironmentSelector>(&json).expect("parse"),
+        selector
+    );
+
+    let empty = SessionSelector::None;
+    let wire = kr_cbor::to_canonical_vec(&empty).expect("encode");
+    assert_eq!(
+        kr_cbor::from_canonical_slice::<SessionSelector>(&wire, &Limits::DEFAULT).expect("decode"),
+        empty
+    );
+}
+
+#[test]
+fn an_unknown_field_is_rejected_even_on_a_variant_that_carries_none() {
+    // A tagged representation accepts and discards extra fields on a unit variant, which is the
+    // strip-and-verify behaviour section 23 forbids.
+    assert!(
+        serde_json::from_str::<GrantExpiry>(r#"{"never": {"expires_at_ms": "1"}}"#).is_err(),
+        "a payload on a variant that carries none must reject"
+    );
+    assert_eq!(
+        serde_json::from_str::<GrantExpiry>(r#""never""#).expect("plain variant"),
+        GrantExpiry::Never
+    );
+    assert!(
+        serde_json::from_str::<GrantExpiry>(r#"{"at": {"expires_at_ms": "1", "extra": 2}}"#)
+            .is_err(),
+        "an unknown field inside a variant must reject"
+    );
+    assert_eq!(
+        serde_json::from_str::<GrantExpiry>(r#"{"at": {"expires_at_ms": "1"}}"#).expect("variant"),
+        GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(1)
+        }
+    );
+}
+
+#[test]
+fn a_canonical_set_re_encodes_to_the_bytes_it_arrived_in() {
+    // A signed object is verified against the bytes it arrived in, so a set inside one cannot
+    // reorder or deduplicate on the way through.
+    let capabilities: CanonicalSet<kr_protocol::ids::CapabilityId> =
+        ["semantic.updates", "terminal.direct"]
+            .into_iter()
+            .map(|name| kr_protocol::ids::CapabilityId::new(name).expect("name"))
+            .collect();
+    let wire = kr_cbor::to_canonical_vec(&capabilities).expect("encode");
+    let decoded: CanonicalSet<kr_protocol::ids::CapabilityId> =
+        kr_cbor::from_canonical_slice(&wire, &Limits::DEFAULT).expect("decode");
+    assert_eq!(
+        kr_cbor::to_canonical_vec(&decoded).expect("re-encode"),
+        wire,
+        "a received set must re-encode to the same bytes"
+    );
+
+    // The same members in the wrong order, and a repeated member, are both rejected rather than
+    // silently normalised.
+    let unsorted = kr_cbor::encode(&CanonicalValue::Array(vec![
+        CanonicalValue::text("terminal.direct"),
+        CanonicalValue::text("semantic.updates"),
+    ]));
+    assert!(
+        kr_cbor::from_canonical_slice::<CanonicalSet<kr_protocol::ids::CapabilityId>>(
+            &unsorted,
+            &Limits::DEFAULT
+        )
+        .is_err()
+    );
+    let repeated = kr_cbor::encode(&CanonicalValue::Array(vec![
+        CanonicalValue::text("semantic.updates"),
+        CanonicalValue::text("semantic.updates"),
+    ]));
+    assert!(
+        kr_cbor::from_canonical_slice::<CanonicalSet<kr_protocol::ids::CapabilityId>>(
+            &repeated,
+            &Limits::DEFAULT
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_grant_re_encodes_to_the_bytes_it_arrived_in() {
+    let grant = base_grant();
+    let wire = kr_cbor::to_canonical_vec(&grant).expect("encode");
+    let decoded: Grant = kr_cbor::from_canonical_slice(&wire, &Limits::DEFAULT).expect("decode");
+    assert_eq!(decoded, grant);
+    assert_eq!(
+        kr_cbor::to_canonical_vec(&decoded).expect("re-encode"),
+        wire
+    );
+}
+
+#[test]
+fn opaque_parameters_keep_every_integer_exact_in_json() {
+    use kr_protocol::envelope::ParamsValue;
+
+    let mut map = kr_cbor::CanonicalMap::new();
+    map.insert(
+        "big".to_owned(),
+        CanonicalValue::integer(i128::from(u64::MAX)).expect("int"),
+    )
+    .expect("insert");
+    map.insert("small".to_owned(), CanonicalValue::integer(3).expect("int"))
+        .expect("insert");
+    let params = ParamsValue::new(CanonicalValue::Map(map));
+
+    // A JSON number cannot carry 2^64-1, and a reader cannot tell which integers were counters, so
+    // every integer renders as a decimal string.
+    let json = serde_json::to_string(&params).expect("json");
+    assert_eq!(json, r#"{"big":"18446744073709551615","small":"3"}"#);
+
+    // The wire form is unaffected: integers stay integers.
+    let wire = kr_cbor::to_canonical_vec(&params).expect("cbor");
+    assert_eq!(
+        hex::encode(&wire),
+        "a2636269671bffffffffffffffff65736d616c6c03"
+    );
 }

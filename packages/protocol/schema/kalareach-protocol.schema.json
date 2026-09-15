@@ -292,6 +292,18 @@
       "$ref": "#/$defs/U64",
       "description": "Changes when the active upstream execution owner or selected thread changes."
     },
+    "AgentThreadId": {
+      "description": "The upstream agent's conversation identifier, where available. Correlation data, not authority.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "AgentTurnId": {
+      "description": "The upstream agent's current turn identifier, where available.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
     "ApplicationInstanceId": {
       "$ref": "#/$defs/Uuid",
       "description": "One foreground application within a terminal session."
@@ -305,6 +317,14 @@
     "AttachmentId": {
       "$ref": "#/$defs/Uuid",
       "description": "One CLI or application attachment, independently of its device."
+    },
+    "AttachmentOrdinal": {
+      "$ref": "#/$defs/U64",
+      "description": "Monotonic attachment join order, used for deterministic geometry-owner succession."
+    },
+    "AttemptId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One pairing attempt by one candidate: 128 random bits."
     },
     "AuthorityRevision": {
       "$ref": "#/$defs/U64",
@@ -330,44 +350,55 @@
       "description": "Which capability evidence a method requires, and at which revision.\n\nCapabilities describe feasibility. They never create authority.",
       "oneOf": [
         {
-          "additionalProperties": false,
+          "const": "none",
           "description": "No capability evidence beyond the method being listed.",
-          "properties": {
-            "kind": {
-              "const": "none",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
           "additionalProperties": false,
           "description": "The named capability must be currently evidenced at the bound revision.",
           "properties": {
-            "capability_id": {
-              "description": "The capability name.",
-              "type": "string"
-            },
-            "kind": {
-              "const": "required",
-              "type": "string"
-            },
-            "revision": {
-              "$ref": "#/$defs/RevisionBinding",
-              "description": "The revision the evidence is bound to."
+            "required": {
+              "additionalProperties": false,
+              "properties": {
+                "capability_id": {
+                  "description": "The capability name.",
+                  "type": "string"
+                },
+                "revision": {
+                  "$ref": "#/$defs/RevisionBinding",
+                  "description": "The revision the evidence is bound to."
+                }
+              },
+              "required": [
+                "capability_id",
+                "revision"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "kind",
-            "capability_id",
-            "revision"
+            "required"
           ],
           "type": "object"
         }
       ]
+    },
+    "CapabilityRevision": {
+      "$ref": "#/$defs/U64",
+      "description": "Current evidence for a versioned capability. Never permission."
+    },
+    "CausalRootId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "The root of a bounded cross-run causal chain."
+    },
+    "ChangeSetId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One immutable captured change set."
+    },
+    "ChangeSetVersion": {
+      "$ref": "#/$defs/U64",
+      "description": "The exact version of a change set that was tested or reviewed."
     },
     "ClientOffer": {
       "additionalProperties": false,
@@ -452,6 +483,12 @@
       "$ref": "#/$defs/U64",
       "description": "The controller's persistent generation, advanced on every controller start."
     },
+    "DesktopSessionId": {
+      "description": "A host-derived desktop session identity binding OS user, boot identity and login-session generation.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
     "DeviceId": {
       "$ref": "#/$defs/Uuid",
       "description": "One paired device."
@@ -471,6 +508,14 @@
       "description": "A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
+    },
+    "DraftId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One durable device-owned draft, independent of an attachment."
+    },
+    "DraftRevision": {
+      "$ref": "#/$defs/U64",
+      "description": "The exact version of a draft."
     },
     "DurationMs": {
       "description": "A duration in milliseconds, as a decimal string in JSON.",
@@ -506,39 +551,34 @@
       "description": "Which environments a grant covers.",
       "oneOf": [
         {
-          "additionalProperties": false,
+          "const": "any",
           "description": "Every environment on the host.",
-          "properties": {
-            "kind": {
-              "const": "any",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
           "additionalProperties": false,
           "description": "Only the named environments.",
           "properties": {
-            "environment_ids": {
-              "description": "The permitted environments.",
-              "items": {
-                "$ref": "#/$defs/EnvironmentId"
+            "these": {
+              "additionalProperties": false,
+              "properties": {
+                "environment_ids": {
+                  "description": "The permitted environments.",
+                  "items": {
+                    "$ref": "#/$defs/EnvironmentId"
+                  },
+                  "type": "array",
+                  "uniqueItems": true
+                }
               },
-              "type": "array",
-              "uniqueItems": true
-            },
-            "kind": {
-              "const": "these",
-              "type": "string"
+              "required": [
+                "environment_ids"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "kind",
-            "environment_ids"
+            "these"
           ],
           "type": "object"
         }
@@ -829,6 +869,10 @@
         }
       ]
     },
+    "GeometryEpoch": {
+      "$ref": "#/$defs/U64",
+      "description": "The current geometry-owner epoch, separate from the input lease."
+    },
     "Grant": {
       "additionalProperties": false,
       "description": "A host-issued authority object.",
@@ -915,35 +959,30 @@
       "description": "When a grant stops being valid.",
       "oneOf": [
         {
-          "additionalProperties": false,
+          "const": "never",
           "description": "Valid until revoked. Personal owner grants use this so independent operation does not\ndepend on a cloud lease.",
-          "properties": {
-            "kind": {
-              "const": "never",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
           "additionalProperties": false,
           "description": "Valid until an absolute UTC deadline. A previously expired grant never revives.",
           "properties": {
-            "expires_at_ms": {
-              "$ref": "#/$defs/TimestampMs",
-              "description": "The deadline in UTC milliseconds."
-            },
-            "kind": {
-              "const": "at",
-              "type": "string"
+            "at": {
+              "additionalProperties": false,
+              "properties": {
+                "expires_at_ms": {
+                  "$ref": "#/$defs/TimestampMs",
+                  "description": "The deadline in UTC milliseconds."
+                }
+              },
+              "required": [
+                "expires_at_ms"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "kind",
-            "expires_at_ms"
+            "at"
           ],
           "type": "object"
         }
@@ -1094,67 +1133,64 @@
       "description": "How a repeated request is resolved.",
       "oneOf": [
         {
-          "additionalProperties": false,
+          "const": "idempotent_read",
           "description": "An idempotent read. An automatic retry is permitted.",
-          "properties": {
-            "kind": {
-              "const": "idempotent_read",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
-          "additionalProperties": false,
+          "const": "action_deduplicated",
           "description": "Deduplicated by the verified actor and action identifier against the payload digest. A\nduplicate returns the retained receipt without dispatch; a reused identifier with a\ndifferent payload is an `ID_CONFLICT`.",
-          "properties": {
-            "kind": {
-              "const": "action_deduplicated",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
           "additionalProperties": false,
           "description": "Idempotent under a protocol key. A matching duplicate is acknowledged; a conflicting\nduplicate invalidates the operation.",
           "properties": {
-            "key": {
-              "description": "The key the operation is idempotent under.",
-              "type": "string"
-            },
-            "kind": {
-              "const": "keyed",
-              "type": "string"
+            "keyed": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "description": "The key the operation is idempotent under.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "kind",
-            "key"
+            "keyed"
           ],
           "type": "object"
         },
         {
-          "additionalProperties": false,
+          "const": "ordered_stream",
           "description": "An ordered stream. Positions are acknowledged per connection and never replayed;\nreconnecting creates a new stream identity.",
-          "properties": {
-            "kind": {
-              "const": "ordered_stream",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         }
       ]
+    },
+    "InputLeaseEpoch": {
+      "$ref": "#/$defs/U64",
+      "description": "The current input lease epoch."
+    },
+    "InputSequence": {
+      "$ref": "#/$defs/U64",
+      "description": "An increasing sequence number inside one raw input stream."
+    },
+    "InstallationId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One native application installation registered with a push gateway."
+    },
+    "InvitationId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One pairing invitation: 128 random bits, not necessarily a UUIDv4."
+    },
+    "MachineId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "A logical machine group. Not a hardware identity."
     },
     "Method": {
       "description": "Every method in the section 23 method-groups table.",
@@ -1686,7 +1722,7 @@
         },
         {
           "const": "action.read",
-          "description": "Read a retained receipt. Current authority is checked before it is returned.",
+          "description": "Read a retained receipt. Owning the identifier is not enough: present view authority over the receipt's subject is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier.",
           "type": "string"
         },
         {
@@ -1756,7 +1792,7 @@
         },
         {
           "const": "voice.grant",
-          "description": "Create or change a voice grant, stating exactly which actions it permits.",
+          "description": "Create or change a voice grant, stating exactly which actions it permits. A device may broaden its own; changing another device's needs host-management authority.",
           "type": "string"
         },
         {
@@ -2171,20 +2207,14 @@
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "The request succeeded.",
+          "description": "The request succeeded, with the method's result.",
           "properties": {
-            "result": {
-              "$ref": "#/$defs/ParamsValue",
-              "description": "The method's result."
-            },
-            "status": {
-              "const": "ok",
-              "type": "string"
+            "ok": {
+              "$ref": "#/$defs/ParamsValue"
             }
           },
           "required": [
-            "status",
-            "result"
+            "ok"
           ],
           "type": "object"
         },
@@ -2193,16 +2223,10 @@
           "description": "The request failed.",
           "properties": {
             "error": {
-              "$ref": "#/$defs/ProtocolError",
-              "description": "Why it failed."
-            },
-            "status": {
-              "const": "error",
-              "type": "string"
+              "$ref": "#/$defs/ProtocolError"
             }
           },
           "required": [
-            "status",
             "error"
           ],
           "type": "object"
@@ -2211,6 +2235,16 @@
     },
     "ParamsValue": {
       "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings appear as unpadded base64url and cannot be told apart from text."
+    },
+    "PluginId": {
+      "description": "A plugin identifier from its manifest.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "ProjectRepositoryId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One environment-bound source repository."
     },
     "ProtocolError": {
       "additionalProperties": false,
@@ -2276,6 +2310,10 @@
     "QuestionId": {
       "$ref": "#/$defs/Uuid",
       "description": "One agent-to-user question."
+    },
+    "QuestionRevision": {
+      "$ref": "#/$defs/U64",
+      "description": "The exact version of a question that a person answers."
     },
     "Receipt": {
       "additionalProperties": false,
@@ -2485,6 +2523,14 @@
         }
       ]
     },
+    "RemoteDispatchLeaseId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One remote dispatch lease from the current controller generation."
+    },
+    "RepositoryGeneration": {
+      "$ref": "#/$defs/U64",
+      "description": "The catalogue generation a plugin package was resolved against."
+    },
     "Request": {
       "additionalProperties": false,
       "description": "A read request.",
@@ -2519,124 +2565,70 @@
       "description": "A request identifier, unique for the lifetime of one connection."
     },
     "RequiredAuthority": {
-      "description": "What a request must present besides a valid current grant.\n\nAn empty required-rights list is not \"no check\". It means the baseline only: a valid,\nunexpired, unrevoked grant for this actor covering the named environment.",
+      "description": "What a request must present besides a valid current grant.\n\nAn empty required-rights list is not \"no check\". It means scoped read authority and nothing\nmore: a valid, unexpired, unrevoked grant for this actor that covers the named environment and\nthe named resource. Only reads of host and environment configuration use it.",
       "oneOf": [
         {
           "additionalProperties": false,
           "description": "One right from the section 10 action vocabulary.",
           "properties": {
-            "kind": {
-              "const": "right",
-              "type": "string"
-            },
             "right": {
-              "$ref": "#/$defs/ActionRight",
-              "description": "The required right."
+              "additionalProperties": false,
+              "properties": {
+                "right": {
+                  "$ref": "#/$defs/ActionRight",
+                  "description": "The required right."
+                }
+              },
+              "required": [
+                "right"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "kind",
             "right"
           ],
           "type": "object"
         },
         {
-          "additionalProperties": false,
+          "const": "resource_owner",
           "description": "Ownership of the named resource by the verified actor: its own draft, its own attachment,\nits own question or its own undispatched action.",
-          "properties": {
-            "kind": {
-              "const": "resource_owner",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
-          "additionalProperties": false,
+          "const": "pairing_transcript",
           "description": "A pairing transcript proof bound to the pinned endpoint identities.",
-          "properties": {
-            "kind": {
-              "const": "pairing_transcript",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
-          "additionalProperties": false,
+          "const": "issuing_owner_context",
           "description": "The invitation's issuing-owner context.",
-          "properties": {
-            "kind": {
-              "const": "issuing_owner_context",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
-          "additionalProperties": false,
+          "const": "voice_grant",
           "description": "A separately created voice grant, intersected with the actor's ordinary grant.",
-          "properties": {
-            "kind": {
-              "const": "voice_grant",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
-          "additionalProperties": false,
+          "const": "service_credential",
           "description": "An installation or host service credential presented at a service endpoint.",
-          "properties": {
-            "kind": {
-              "const": "service_credential",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
-          "additionalProperties": false,
+          "const": "plugin_effect_rights",
           "description": "The registered plugin effect's own declared rights, intersected at dispatch.",
-          "properties": {
-            "kind": {
-              "const": "plugin_effect_rights",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
-          "additionalProperties": false,
+          "const": "local_caller_token",
           "description": "The verified originating application or helper and its caller token on private IPC.",
-          "properties": {
-            "kind": {
-              "const": "local_caller_token",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
+        },
+        {
+          "const": "issuer_delegation",
+          "description": "Current issuer or delegation authority over the named grant: the actor holds the parent\ngrant it is delegating from, or issued the grant it is revoking. Holding a right that a\ngrant happens to contain never implies authority over the grant itself.",
+          "type": "string"
         }
       ]
     },
@@ -2917,6 +2909,11 @@
           "type": "string"
         },
         {
+          "const": "own_subject",
+          "description": "Required only when the subject belongs to the verified actor itself.",
+          "type": "string"
+        },
+        {
           "const": "other_actor",
           "description": "Required only when the subject belongs to another actor.",
           "type": "string"
@@ -2964,57 +2961,53 @@
       "description": "Which sessions a grant covers.",
       "oneOf": [
         {
-          "additionalProperties": false,
+          "const": "any",
           "description": "Every session inside the selected environments.",
-          "properties": {
-            "kind": {
-              "const": "any",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         },
         {
           "additionalProperties": false,
           "description": "Only the named sessions.",
           "properties": {
-            "kind": {
-              "const": "these",
-              "type": "string"
-            },
-            "session_ids": {
-              "description": "The permitted sessions.",
-              "items": {
-                "$ref": "#/$defs/SessionId"
+            "these": {
+              "additionalProperties": false,
+              "properties": {
+                "session_ids": {
+                  "description": "The permitted sessions.",
+                  "items": {
+                    "$ref": "#/$defs/SessionId"
+                  },
+                  "type": "array",
+                  "uniqueItems": true
+                }
               },
-              "type": "array",
-              "uniqueItems": true
+              "required": [
+                "session_ids"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "kind",
-            "session_ids"
+            "these"
           ],
           "type": "object"
         },
         {
-          "additionalProperties": false,
+          "const": "none",
           "description": "No session. The grant covers host-level effects only.",
-          "properties": {
-            "kind": {
-              "const": "none",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
+          "type": "string"
         }
       ]
+    },
+    "SourceEventHandle": {
+      "description": "A private broker handle for immutable upstream bytes and their execution provenance.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "StreamCursor": {
+      "$ref": "#/$defs/U64",
+      "description": "A position in one event stream."
     },
     "StreamHeader": {
       "additionalProperties": false,
@@ -3157,6 +3150,18 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "WorkflowId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One automation definition."
+    },
+    "WorkflowRunId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One automation run."
+    },
+    "WorkspaceId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "One selected working copy and its policy."
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3173,6 +3178,177 @@
     },
     "host_selection": {
       "$ref": "#/$defs/HostSelection"
+    },
+    "identifiers": {
+      "description": "Every identifier in the identity and object model. This is a vocabulary rather than a message: it exists so each identifier has one named type.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId"
+        },
+        "action_window_id": {
+          "$ref": "#/$defs/ActionWindowId"
+        },
+        "actor_id": {
+          "$ref": "#/$defs/ActorId"
+        },
+        "agent_binding_revision": {
+          "$ref": "#/$defs/AgentBindingRevision"
+        },
+        "agent_thread_id": {
+          "$ref": "#/$defs/AgentThreadId"
+        },
+        "agent_turn_id": {
+          "$ref": "#/$defs/AgentTurnId"
+        },
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId"
+        },
+        "approval_request_id": {
+          "$ref": "#/$defs/ApprovalRequestId"
+        },
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId"
+        },
+        "attachment_ordinal": {
+          "$ref": "#/$defs/AttachmentOrdinal"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/AttemptId"
+        },
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision"
+        },
+        "boot_epoch": {
+          "$ref": "#/$defs/BootEpoch"
+        },
+        "build_id": {
+          "$ref": "#/$defs/BuildId"
+        },
+        "capability_id": {
+          "$ref": "#/$defs/CapabilityId"
+        },
+        "capability_revision": {
+          "$ref": "#/$defs/CapabilityRevision"
+        },
+        "causal_root_id": {
+          "$ref": "#/$defs/CausalRootId"
+        },
+        "change_set_id": {
+          "$ref": "#/$defs/ChangeSetId"
+        },
+        "change_set_version": {
+          "$ref": "#/$defs/ChangeSetVersion"
+        },
+        "clock_epoch": {
+          "$ref": "#/$defs/ClockEpoch"
+        },
+        "connection_id": {
+          "$ref": "#/$defs/ConnectionId"
+        },
+        "controller_generation": {
+          "$ref": "#/$defs/ControllerGeneration"
+        },
+        "desktop_session_id": {
+          "$ref": "#/$defs/DesktopSessionId"
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "device_key_revision": {
+          "$ref": "#/$defs/DeviceKeyRevision"
+        },
+        "diagnostic_id": {
+          "$ref": "#/$defs/DiagnosticId"
+        },
+        "draft_id": {
+          "$ref": "#/$defs/DraftId"
+        },
+        "draft_revision": {
+          "$ref": "#/$defs/DraftRevision"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId"
+        },
+        "event_sequence": {
+          "$ref": "#/$defs/EventSequence"
+        },
+        "event_type": {
+          "$ref": "#/$defs/EventType"
+        },
+        "geometry_epoch": {
+          "$ref": "#/$defs/GeometryEpoch"
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId"
+        },
+        "input_lease_epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch"
+        },
+        "input_sequence": {
+          "$ref": "#/$defs/InputSequence"
+        },
+        "installation_id": {
+          "$ref": "#/$defs/InstallationId"
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId"
+        },
+        "machine_id": {
+          "$ref": "#/$defs/MachineId"
+        },
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId"
+        },
+        "project_repository_id": {
+          "$ref": "#/$defs/ProjectRepositoryId"
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId"
+        },
+        "question_revision": {
+          "$ref": "#/$defs/QuestionRevision"
+        },
+        "remote_dispatch_lease_id": {
+          "$ref": "#/$defs/RemoteDispatchLeaseId"
+        },
+        "repository_generation": {
+          "$ref": "#/$defs/RepositoryGeneration"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "session_epoch": {
+          "$ref": "#/$defs/SessionEpoch"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "source_event_handle": {
+          "$ref": "#/$defs/SourceEventHandle"
+        },
+        "stream_cursor": {
+          "$ref": "#/$defs/StreamCursor"
+        },
+        "stream_id": {
+          "$ref": "#/$defs/StreamId"
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId"
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/WorkflowId"
+        },
+        "workflow_run_id": {
+          "$ref": "#/$defs/WorkflowRunId"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "type": "object"
     },
     "method_entry": {
       "$ref": "#/$defs/MethodEntry"

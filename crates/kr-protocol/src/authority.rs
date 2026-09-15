@@ -27,10 +27,11 @@ pub enum EffectClass {
 
 /// What a request must present besides a valid current grant.
 ///
-/// An empty required-rights list is not "no check". It means the baseline only: a valid,
-/// unexpired, unrevoked grant for this actor covering the named environment.
+/// An empty required-rights list is not "no check". It means scoped read authority and nothing
+/// more: a valid, unexpired, unrevoked grant for this actor that covers the named environment and
+/// the named resource. Only reads of host and environment configuration use it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequiredAuthority {
     /// One right from the section 10 action vocabulary.
     Right {
@@ -52,6 +53,10 @@ pub enum RequiredAuthority {
     PluginEffectRights,
     /// The verified originating application or helper and its caller token on private IPC.
     LocalCallerToken,
+    /// Current issuer or delegation authority over the named grant: the actor holds the parent
+    /// grant it is delegating from, or issued the grant it is revoking. Holding a right that a
+    /// grant happens to contain never implies authority over the grant itself.
+    IssuerDelegation,
 }
 
 /// When a required authority applies.
@@ -62,6 +67,8 @@ pub enum RightCondition {
     Always,
     /// Required only when the request claims or adds a geometry claim.
     GeometryClaim,
+    /// Required only when the subject belongs to the verified actor itself.
+    OwnSubject,
     /// Required only when the subject belongs to another actor.
     OtherActor,
     /// Required only when the caller is the pairing candidate rather than the issuing owner.
@@ -229,7 +236,7 @@ pub enum RevisionBinding {
 ///
 /// Capabilities describe feasibility. They never create authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CapabilityRequirement {
     /// No capability evidence beyond the method being listed.
     None,
@@ -280,7 +287,7 @@ pub enum ConfirmationRequirement {
 
 /// How a repeated request is resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum IdempotencyBehaviour {
     /// An idempotent read. An automatic retry is permitted.
     IdempotentRead,

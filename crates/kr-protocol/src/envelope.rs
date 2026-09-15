@@ -30,9 +30,10 @@ use crate::scalars::{DurationMs, Nullable, to_base64url};
 /// covers the parameters byte for byte.
 ///
 /// The JSON representation is diagnostic. Byte strings render as unpadded base64url and integers
-/// outside the signed 64-bit range render as decimal strings, so reading JSON back cannot
-/// reconstruct which strings were byte strings. Nothing is ever signed from JSON: signing input is
-/// built from the canonical bytes, never from a re-serialised diagnostic document.
+/// render as decimal strings, matching the rule for named counters, so no value loses precision on
+/// the way out. Reading JSON back cannot tell which strings were byte strings or integers, which
+/// is why nothing is ever signed from JSON: signing input is built from the canonical bytes, never
+/// from a re-serialised diagnostic document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParamsValue(CanonicalValue);
 
@@ -133,14 +134,16 @@ fn serialize_integer<S: Serializer>(
     human_readable: bool,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
+    if human_readable {
+        // A JSON number cannot carry every value in the profile's range exactly, and a reader
+        // cannot tell which integers in an opaque value were meant to be counters. Rendering them
+        // all as decimal strings keeps every value exact, the same rule named counters follow.
+        return serializer.serialize_str(&value.get().to_string());
+    }
     if let Some(unsigned) = value.as_u64() {
         serializer.serialize_u64(unsigned)
     } else if let Some(signed) = value.as_i64() {
         serializer.serialize_i64(signed)
-    } else if human_readable {
-        // Below i64::MIN a JSON number cannot carry the value. The diagnostic form uses a decimal
-        // string; the wire form is unaffected.
-        serializer.serialize_str(&value.get().to_string())
     } else {
         serializer.serialize_i128(value.get())
     }
@@ -369,18 +372,12 @@ pub struct MutationRequest {
 
 /// The result of a request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum Outcome {
-    /// The request succeeded.
-    Ok {
-        /// The method's result.
-        result: ParamsValue,
-    },
+    /// The request succeeded, with the method's result.
+    Ok(ParamsValue),
     /// The request failed.
-    Error {
-        /// Why it failed.
-        error: ProtocolError,
-    },
+    Error(ProtocolError),
 }
 
 /// A response correlated to one request.

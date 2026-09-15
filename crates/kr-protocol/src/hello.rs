@@ -10,8 +10,6 @@
 //! host_endpoint_id])`, encoded as KR-CBOR-1. Both mutual proofs are required: a holder of one
 //! transport key alone cannot substitute the authorised application identity.
 
-use std::collections::BTreeSet;
-
 use kr_cbor::{CanonicalValue, CborError, sha256, signing_input};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -24,7 +22,7 @@ use crate::limits::{
     MAX_ATTACHMENT_FRAME_LEN, MAX_CONTROL_FRAME_LEN, MAX_INPUT_FRAME_LEN,
     MAX_OUTSTANDING_MUTATIONS, MAX_SEND_QUEUE_BYTES,
 };
-use crate::scalars::{Digest256, EndpointKey, Nonce256, U64};
+use crate::scalars::{CanonicalSet, Digest256, EndpointKey, Nonce256, U64};
 
 /// The stable transport ALPN.
 ///
@@ -107,7 +105,7 @@ pub struct ClientOffer {
     /// The revision of that device's purpose-separated keys.
     pub device_key_revision: DeviceKeyRevision,
     /// The capabilities the client offers.
-    pub capabilities: BTreeSet<CapabilityId>,
+    pub capabilities: CanonicalSet<CapabilityId>,
     /// The client's own receive limits.
     pub max_receive: ReceiveLimits,
     /// A fresh client nonce.
@@ -130,7 +128,7 @@ pub struct HostSelection {
     /// The version the host selected.
     pub selected_version: ProtocolVersion,
     /// The capabilities the host selected.
-    pub capabilities: BTreeSet<CapabilityId>,
+    pub capabilities: CanonicalSet<CapabilityId>,
     /// The negotiated limits.
     pub limits: ReceiveLimits,
     /// The host's iroh endpoint identity, validated against the paired record.
@@ -145,32 +143,26 @@ pub struct HostSelection {
     pub clock_epoch: ClockEpoch,
 }
 
-/// Selects the highest mutually supported version.
+/// Selects the highest version both sides listed.
+///
+/// A peer enumerates every version it supports rather than a range, so the selection is the
+/// highest version present in both lists. Nothing here assumes that supporting one minor implies
+/// supporting the ones below it; the specification states no such compatibility rule.
 ///
 /// # Errors
 ///
-/// Returns [`ErrorCode::UnsupportedSchema`] when no offered major matches a supported major, or
-/// when the offered minor for a matching major is below every supported minor.
+/// Returns [`ErrorCode::UnsupportedSchema`] when the two lists share no version. A major mismatch
+/// is the usual case, and it returns before any session data.
 pub fn select_version(
     offered: &[ProtocolVersion],
     supported: &[ProtocolVersion],
 ) -> Result<ProtocolVersion, ErrorCode> {
-    let mut best: Option<ProtocolVersion> = None;
-    for candidate in offered {
-        for local in supported {
-            if local.major != candidate.major {
-                continue;
-            }
-            // Both sides understand every minor at or below their own, so the selection is the
-            // lower of the two minors for that major.
-            let minor = local.minor.min(candidate.minor);
-            let selected = ProtocolVersion::new(local.major, minor);
-            if best.is_none_or(|current| selected > current) {
-                best = Some(selected);
-            }
-        }
-    }
-    best.ok_or(ErrorCode::UnsupportedSchema)
+    offered
+        .iter()
+        .filter(|candidate| supported.contains(candidate))
+        .max()
+        .copied()
+        .ok_or(ErrorCode::UnsupportedSchema)
 }
 
 /// Builds the `kr-connect/1` proof transcript.

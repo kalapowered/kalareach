@@ -3,17 +3,13 @@
   "method_count": 127,
   "methods": [
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "host_and_environment",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -28,17 +24,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "host_and_environment",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -53,17 +45,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "host_and_environment",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -78,17 +66,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "host_and_environment",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -104,17 +88,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "always",
       "effect": "write",
       "freshness": "action_window",
       "group": "pairing",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -123,8 +103,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -137,17 +118,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "invitation_deadline",
       "group": "pairing",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "invitation_id + attempt_id",
-        "kind": "keyed"
+        "keyed": {
+          "key": "invitation_id + attempt_id"
+        }
       },
       "ingress": [
         "unpaired_peer"
@@ -156,9 +136,7 @@
       "name": "pair.redeem",
       "required_rights": [
         {
-          "authority": {
-            "kind": "pairing_transcript"
-          },
+          "authority": "pairing_transcript",
           "when": "always"
         }
       ],
@@ -169,17 +147,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "invitation_deadline",
       "group": "pairing",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "invitation_id + attempt_id",
-        "kind": "keyed"
+        "keyed": {
+          "key": "invitation_id + attempt_id"
+        }
       },
       "ingress": [
         "unpaired_peer"
@@ -188,9 +165,7 @@
       "name": "pair.finish",
       "required_rights": [
         {
-          "authority": {
-            "kind": "pairing_transcript"
-          },
+          "authority": "pairing_transcript",
           "when": "always"
         }
       ],
@@ -201,17 +176,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "always",
       "effect": "write",
       "freshness": "invitation_deadline",
       "group": "pairing",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "invitation_id + client bundle hash",
-        "kind": "keyed"
+        "keyed": {
+          "key": "invitation_id + client bundle hash"
+        }
       },
       "ingress": [
         "local_ipc",
@@ -221,9 +195,7 @@
       "name": "pair.confirm",
       "required_rights": [
         {
-          "authority": {
-            "kind": "issuing_owner_context"
-          },
+          "authority": "issuing_owner_context",
           "when": "always"
         }
       ],
@@ -236,17 +208,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "invitation_deadline",
       "group": "pairing",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "invitation_id",
-        "kind": "keyed"
+        "keyed": {
+          "key": "invitation_id"
+        }
       },
       "ingress": [
         "local_ipc",
@@ -256,9 +227,7 @@
       "name": "pair.cancel",
       "required_rights": [
         {
-          "authority": {
-            "kind": "issuing_owner_context"
-          },
+          "authority": "issuing_owner_context",
           "when": "always"
         }
       ],
@@ -269,17 +238,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "invitation_deadline",
       "group": "pairing",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "unpaired_peer",
         "local_ipc",
@@ -289,15 +254,11 @@
       "name": "pair.status",
       "required_rights": [
         {
-          "authority": {
-            "kind": "pairing_transcript"
-          },
+          "authority": "pairing_transcript",
           "when": "candidate_endpoint"
         },
         {
-          "authority": {
-            "kind": "issuing_owner_context"
-          },
+          "authority": "issuing_owner_context",
           "when": "issuing_owner"
         }
       ],
@@ -308,17 +269,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "devices",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -328,8 +285,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -341,17 +299,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "devices",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -361,8 +315,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -376,18 +331,17 @@
     },
     {
       "capability": {
-        "capability_id": "device.preview_key",
-        "kind": "required",
-        "revision": "device_key_revision"
+        "required": {
+          "capability_id": "device.preview_key",
+          "revision": "device_key_revision"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "devices",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "paired_device"
       ],
@@ -395,9 +349,7 @@
       "name": "device.preview_key.update",
       "required_rights": [
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
+          "authority": "resource_owner",
           "when": "always"
         }
       ],
@@ -408,17 +360,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "plugin_catalogues",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -428,8 +376,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -442,18 +391,17 @@
     },
     {
       "capability": {
-        "capability_id": "catalogue.root",
-        "kind": "required",
-        "revision": "repository_generation"
+        "required": {
+          "capability_id": "catalogue.root",
+          "revision": "repository_generation"
+        }
       },
       "confirmation": "always",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugin_catalogues",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -463,8 +411,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -477,18 +426,17 @@
     },
     {
       "capability": {
-        "capability_id": "catalogue.root",
-        "kind": "required",
-        "revision": "repository_generation"
+        "required": {
+          "capability_id": "catalogue.root",
+          "revision": "repository_generation"
+        }
       },
       "confirmation": "when_enlarging_authority",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugin_catalogues",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -498,8 +446,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -512,18 +461,17 @@
     },
     {
       "capability": {
-        "capability_id": "catalogue.root",
-        "kind": "required",
-        "revision": "repository_generation"
+        "required": {
+          "capability_id": "catalogue.root",
+          "revision": "repository_generation"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugin_catalogues",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -533,8 +481,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -546,17 +495,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugin_catalogues",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -566,8 +511,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -579,17 +525,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "plugins",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -606,18 +548,17 @@
     },
     {
       "capability": {
-        "capability_id": "plugin.package",
-        "kind": "required",
-        "revision": "package_hash"
+        "required": {
+          "capability_id": "plugin.package",
+          "revision": "package_hash"
+        }
       },
       "confirmation": "when_enlarging_authority",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugins",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -627,8 +568,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -642,17 +584,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugins",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -662,8 +600,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -677,18 +616,17 @@
     },
     {
       "capability": {
-        "capability_id": "plugin.package",
-        "kind": "required",
-        "revision": "package_hash"
+        "required": {
+          "capability_id": "plugin.package",
+          "revision": "package_hash"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugins",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -698,8 +636,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -713,18 +652,17 @@
     },
     {
       "capability": {
-        "capability_id": "plugin.package",
-        "kind": "required",
-        "revision": "package_hash"
+        "required": {
+          "capability_id": "plugin.package",
+          "revision": "package_hash"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugins",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -734,8 +672,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -748,17 +687,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugins",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -768,8 +703,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -783,18 +719,17 @@
     },
     {
       "capability": {
-        "capability_id": "plugin.package",
-        "kind": "required",
-        "revision": "package_hash"
+        "required": {
+          "capability_id": "plugin.package",
+          "revision": "package_hash"
+        }
       },
       "confirmation": "always",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugins",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -804,8 +739,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -819,18 +755,17 @@
     },
     {
       "capability": {
-        "capability_id": "plugin.package",
-        "kind": "required",
-        "revision": "package_hash"
+        "required": {
+          "capability_id": "plugin.package",
+          "revision": "package_hash"
+        }
       },
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "plugins",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -847,18 +782,17 @@
     },
     {
       "capability": {
-        "capability_id": "plugin.action",
-        "kind": "required",
-        "revision": "package_hash"
+        "required": {
+          "capability_id": "plugin.action",
+          "revision": "package_hash"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "plugin_actions",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -867,9 +801,7 @@
       "name": "plugin.action.invoke",
       "required_rights": [
         {
-          "authority": {
-            "kind": "plugin_effect_rights"
-          },
+          "authority": "plugin_effect_rights",
           "when": "always"
         }
       ],
@@ -883,17 +815,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "question_source",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -901,9 +829,7 @@
       "name": "question.create",
       "required_rights": [
         {
-          "authority": {
-            "kind": "local_caller_token"
-          },
+          "authority": "local_caller_token",
           "when": "always"
         }
       ],
@@ -915,17 +841,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "question_source",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc"
       ],
@@ -933,15 +855,11 @@
       "name": "question.read_own",
       "required_rights": [
         {
-          "authority": {
-            "kind": "local_caller_token"
-          },
+          "authority": "local_caller_token",
           "when": "always"
         },
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
+          "authority": "resource_owner",
           "when": "always"
         }
       ],
@@ -954,18 +872,17 @@
     },
     {
       "capability": {
-        "capability_id": "question",
-        "kind": "required",
-        "revision": "question_revision"
+        "required": {
+          "capability_id": "question",
+          "revision": "question_revision"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "question_source",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -973,15 +890,11 @@
       "name": "question.cancel_own",
       "required_rights": [
         {
-          "authority": {
-            "kind": "local_caller_token"
-          },
+          "authority": "local_caller_token",
           "when": "always"
         },
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
+          "authority": "resource_owner",
           "when": "always"
         }
       ],
@@ -993,17 +906,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "question_source",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -1011,9 +920,7 @@
       "name": "alert.create",
       "required_rights": [
         {
-          "authority": {
-            "kind": "local_caller_token"
-          },
+          "authority": "local_caller_token",
           "when": "always"
         }
       ],
@@ -1024,17 +931,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "question_user_interface",
       "history_filter": "named_current_resources",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1044,8 +947,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -1059,18 +963,17 @@
     },
     {
       "capability": {
-        "capability_id": "question",
-        "kind": "required",
-        "revision": "question_revision"
+        "required": {
+          "capability_id": "question",
+          "revision": "question_revision"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "question_user_interface",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1080,8 +983,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "question.respond"
+            "right": {
+              "right": "question.respond"
+            }
           },
           "when": "always"
         }
@@ -1095,18 +999,17 @@
     },
     {
       "capability": {
-        "capability_id": "question",
-        "kind": "required",
-        "revision": "question_revision"
+        "required": {
+          "capability_id": "question",
+          "revision": "question_revision"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "question_user_interface",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1116,8 +1019,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "question.respond"
+            "right": {
+              "right": "question.respond"
+            }
           },
           "when": "always"
         }
@@ -1130,17 +1034,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "skill_setup",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -1149,8 +1049,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -1163,17 +1064,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "skill_setup",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc"
       ],
@@ -1182,8 +1079,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -1196,17 +1094,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "skill_setup",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -1215,8 +1109,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "always"
         }
@@ -1229,17 +1124,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "sessions",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -1250,8 +1141,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -1263,17 +1155,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "sessions",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -1284,8 +1172,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.create"
+            "right": {
+              "right": "session.create"
+            }
           },
           "when": "always"
         }
@@ -1298,17 +1187,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "sessions",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -1319,8 +1204,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -1332,17 +1218,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "sessions",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -1353,8 +1235,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.close"
+            "right": {
+              "right": "session.close"
+            }
           },
           "when": "always"
         }
@@ -1366,17 +1249,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "sessions",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -1387,8 +1266,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -1400,17 +1280,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "sessions",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -1421,8 +1297,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.rename"
+            "right": {
+              "right": "session.rename"
+            }
           },
           "when": "always"
         }
@@ -1434,17 +1311,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "attachments",
       "history_filter": "live_view_only",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1454,15 +1327,17 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         },
         {
           "authority": {
-            "kind": "right",
-            "right": "terminal.geometry"
+            "right": {
+              "right": "terminal.geometry"
+            }
           },
           "when": "geometry_claim"
         }
@@ -1475,17 +1350,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "attachments",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1495,15 +1366,14 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         },
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
+          "authority": "resource_owner",
           "when": "always"
         }
       ],
@@ -1515,17 +1385,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "attachments",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1535,21 +1401,21 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         },
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
+          "authority": "resource_owner",
           "when": "always"
         },
         {
           "authority": {
-            "kind": "right",
-            "right": "terminal.geometry"
+            "right": {
+              "right": "terminal.geometry"
+            }
           },
           "when": "geometry_claim"
         }
@@ -1562,17 +1428,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "attachments",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1582,15 +1444,14 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         },
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
+          "authority": "resource_owner",
           "when": "always"
         }
       ],
@@ -1603,18 +1464,17 @@
     },
     {
       "capability": {
-        "capability_id": "terminal.geometry",
-        "kind": "required",
-        "revision": "geometry_epoch"
+        "required": {
+          "capability_id": "terminal.geometry",
+          "revision": "geometry_epoch"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "attachments",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1624,8 +1484,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "terminal.geometry"
+            "right": {
+              "right": "terminal.geometry"
+            }
           },
           "when": "always"
         }
@@ -1639,18 +1500,17 @@
     },
     {
       "capability": {
-        "capability_id": "terminal.geometry",
-        "kind": "required",
-        "revision": "geometry_epoch"
+        "required": {
+          "capability_id": "terminal.geometry",
+          "revision": "geometry_epoch"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "attachments",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1660,8 +1520,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "terminal.geometry.transfer"
+            "right": {
+              "right": "terminal.geometry.transfer"
+            }
           },
           "when": "always"
         }
@@ -1674,17 +1535,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "attachments",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1694,8 +1551,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "terminal.palette"
+            "right": {
+              "right": "terminal.palette"
+            }
           },
           "when": "always"
         }
@@ -1709,18 +1567,17 @@
     },
     {
       "capability": {
-        "capability_id": "terminal.input",
-        "kind": "required",
-        "revision": "input_lease_epoch"
+        "required": {
+          "capability_id": "terminal.input",
+          "revision": "input_lease_epoch"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "input",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1730,8 +1587,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "terminal.input"
+            "right": {
+              "right": "terminal.input"
+            }
           },
           "when": "always"
         }
@@ -1745,18 +1603,17 @@
     },
     {
       "capability": {
-        "capability_id": "terminal.input",
-        "kind": "required",
-        "revision": "input_lease_epoch"
+        "required": {
+          "capability_id": "terminal.input",
+          "revision": "input_lease_epoch"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "input",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1766,8 +1623,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "terminal.input"
+            "right": {
+              "right": "terminal.input"
+            }
           },
           "when": "always"
         }
@@ -1781,18 +1639,17 @@
     },
     {
       "capability": {
-        "capability_id": "terminal.input",
-        "kind": "required",
-        "revision": "input_lease_epoch"
+        "required": {
+          "capability_id": "terminal.input",
+          "revision": "input_lease_epoch"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "input",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1802,8 +1659,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "terminal.input"
+            "right": {
+              "right": "terminal.input"
+            }
           },
           "when": "always"
         }
@@ -1817,18 +1675,17 @@
     },
     {
       "capability": {
-        "capability_id": "terminal.input",
-        "kind": "required",
-        "revision": "input_lease_epoch"
+        "required": {
+          "capability_id": "terminal.input",
+          "revision": "input_lease_epoch"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "input_lease",
       "group": "input",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "ordered_stream"
-      },
+      "idempotency": "ordered_stream",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -1838,8 +1695,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "terminal.input"
+            "right": {
+              "right": "terminal.input"
+            }
           },
           "when": "always"
         }
@@ -1853,18 +1711,17 @@
     },
     {
       "capability": {
-        "capability_id": "shell.root_integration",
-        "kind": "required",
-        "revision": "root_editor_fence"
+        "required": {
+          "capability_id": "shell.root_integration",
+          "revision": "root_editor_fence"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "root_integration",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -1872,9 +1729,7 @@
       "name": "root.editor.enter",
       "required_rights": [
         {
-          "authority": {
-            "kind": "local_caller_token"
-          },
+          "authority": "local_caller_token",
           "when": "always"
         }
       ],
@@ -1886,18 +1741,17 @@
     },
     {
       "capability": {
-        "capability_id": "shell.root_integration",
-        "kind": "required",
-        "revision": "root_editor_fence"
+        "required": {
+          "capability_id": "shell.root_integration",
+          "revision": "root_editor_fence"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "root_integration",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -1905,9 +1759,7 @@
       "name": "root.editor.leave",
       "required_rights": [
         {
-          "authority": {
-            "kind": "local_caller_token"
-          },
+          "authority": "local_caller_token",
           "when": "always"
         }
       ],
@@ -1919,18 +1771,17 @@
     },
     {
       "capability": {
-        "capability_id": "shell.root_integration",
-        "kind": "required",
-        "revision": "root_editor_fence"
+        "required": {
+          "capability_id": "shell.root_integration",
+          "revision": "root_editor_fence"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "root_integration",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -1938,9 +1789,7 @@
       "name": "root.editor.fence",
       "required_rights": [
         {
-          "authority": {
-            "kind": "local_caller_token"
-          },
+          "authority": "local_caller_token",
           "when": "always"
         }
       ],
@@ -1952,18 +1801,17 @@
     },
     {
       "capability": {
-        "capability_id": "shell.root_integration",
-        "kind": "required",
-        "revision": "root_editor_fence"
+        "required": {
+          "capability_id": "shell.root_integration",
+          "revision": "root_editor_fence"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "root_integration",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -1971,9 +1819,7 @@
       "name": "root.eof.detach",
       "required_rights": [
         {
-          "authority": {
-            "kind": "local_caller_token"
-          },
+          "authority": "local_caller_token",
           "when": "always"
         }
       ],
@@ -1986,18 +1832,17 @@
     },
     {
       "capability": {
-        "capability_id": "shell.root_integration",
-        "kind": "required",
-        "revision": "root_editor_fence"
+        "required": {
+          "capability_id": "shell.root_integration",
+          "revision": "root_editor_fence"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "root_integration",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc"
       ],
@@ -2005,9 +1850,7 @@
       "name": "root.command.accepted",
       "required_rights": [
         {
-          "authority": {
-            "kind": "local_caller_token"
-          },
+          "authority": "local_caller_token",
           "when": "always"
         }
       ],
@@ -2019,18 +1862,17 @@
     },
     {
       "capability": {
-        "capability_id": "shell.root_integration",
-        "kind": "required",
-        "revision": "root_editor_fence"
+        "required": {
+          "capability_id": "shell.root_integration",
+          "revision": "root_editor_fence"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "shell_launch",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -2040,8 +1882,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "terminal.input"
+            "right": {
+              "right": "terminal.input"
+            }
           },
           "when": "always"
         }
@@ -2054,18 +1897,17 @@
     },
     {
       "capability": {
-        "capability_id": "agent.binding",
-        "kind": "required",
-        "revision": "agent_binding"
+        "required": {
+          "capability_id": "agent.binding",
+          "revision": "agent_binding"
+        }
       },
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "agent_state",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2076,8 +1918,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -2091,18 +1934,17 @@
     },
     {
       "capability": {
-        "capability_id": "agent.binding",
-        "kind": "required",
-        "revision": "agent_binding"
+        "required": {
+          "capability_id": "agent.binding",
+          "revision": "agent_binding"
+        }
       },
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "agent_state",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2113,8 +1955,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -2128,18 +1971,17 @@
     },
     {
       "capability": {
-        "capability_id": "agent.binding",
-        "kind": "required",
-        "revision": "agent_binding"
+        "required": {
+          "capability_id": "agent.binding",
+          "revision": "agent_binding"
+        }
       },
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "agent_state",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2150,8 +1992,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -2165,18 +2008,17 @@
     },
     {
       "capability": {
-        "capability_id": "agent.prompt",
-        "kind": "required",
-        "revision": "agent_binding"
+        "required": {
+          "capability_id": "agent.prompt",
+          "revision": "agent_binding"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "agent_mutations",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2187,8 +2029,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "agent.prompt"
+            "right": {
+              "right": "agent.prompt"
+            }
           },
           "when": "always"
         }
@@ -2203,18 +2046,17 @@
     },
     {
       "capability": {
-        "capability_id": "agent.prompt",
-        "kind": "required",
-        "revision": "agent_binding"
+        "required": {
+          "capability_id": "agent.prompt",
+          "revision": "agent_binding"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "agent_mutations",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2225,8 +2067,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "agent.prompt"
+            "right": {
+              "right": "agent.prompt"
+            }
           },
           "when": "always"
         }
@@ -2241,18 +2084,17 @@
     },
     {
       "capability": {
-        "capability_id": "agent.steer",
-        "kind": "required",
-        "revision": "agent_binding"
+        "required": {
+          "capability_id": "agent.steer",
+          "revision": "agent_binding"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "agent_mutations",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2263,8 +2105,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "agent.prompt"
+            "right": {
+              "right": "agent.prompt"
+            }
           },
           "when": "always"
         }
@@ -2278,18 +2121,17 @@
     },
     {
       "capability": {
-        "capability_id": "agent.cancel",
-        "kind": "required",
-        "revision": "agent_binding"
+        "required": {
+          "capability_id": "agent.cancel",
+          "revision": "agent_binding"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "agent_mutations",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2300,8 +2142,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "agent.cancel"
+            "right": {
+              "right": "agent.cancel"
+            }
           },
           "when": "always"
         }
@@ -2315,18 +2158,17 @@
     },
     {
       "capability": {
-        "capability_id": "agent.approval",
-        "kind": "required",
-        "revision": "agent_binding"
+        "required": {
+          "capability_id": "agent.approval",
+          "revision": "agent_binding"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "agent_mutations",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -2336,8 +2178,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "agent.approval.respond"
+            "right": {
+              "right": "agent.approval.respond"
+            }
           },
           "when": "always"
         }
@@ -2350,17 +2193,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "drafts_and_media",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -2369,9 +2208,7 @@
       "name": "draft.create",
       "required_rights": [
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
+          "authority": "resource_owner",
           "when": "always"
         }
       ],
@@ -2384,18 +2221,17 @@
     },
     {
       "capability": {
-        "capability_id": "draft",
-        "kind": "required",
-        "revision": "draft_revision"
+        "required": {
+          "capability_id": "draft",
+          "revision": "draft_revision"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "drafts_and_media",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -2404,9 +2240,7 @@
       "name": "draft.update",
       "required_rights": [
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
+          "authority": "resource_owner",
           "when": "always"
         }
       ],
@@ -2418,18 +2252,17 @@
     },
     {
       "capability": {
-        "capability_id": "agent.attachment",
-        "kind": "required",
-        "revision": "agent_binding"
+        "required": {
+          "capability_id": "agent.attachment",
+          "revision": "agent_binding"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "drafts_and_media",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -2438,22 +2271,22 @@
       "name": "agent.draft.add_attachment",
       "required_rights": [
         {
+          "authority": "resource_owner",
+          "when": "always"
+        },
+        {
           "authority": {
-            "kind": "resource_owner"
+            "right": {
+              "right": "files.upload"
+            }
           },
           "when": "always"
         },
         {
           "authority": {
-            "kind": "right",
-            "right": "files.upload"
-          },
-          "when": "always"
-        },
-        {
-          "authority": {
-            "kind": "right",
-            "right": "agent.prompt"
+            "right": {
+              "right": "agent.prompt"
+            }
           },
           "when": "always"
         }
@@ -2468,17 +2301,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "drafts_and_media",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2489,8 +2318,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.upload"
+            "right": {
+              "right": "files.upload"
+            }
           },
           "when": "always"
         }
@@ -2503,17 +2333,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "drafts_and_media",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2524,8 +2350,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.upload"
+            "right": {
+              "right": "files.upload"
+            }
           },
           "when": "always"
         }
@@ -2537,17 +2364,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "drafts_and_media",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "upload_id + chunk index + chunk digest",
-        "kind": "keyed"
+        "keyed": {
+          "key": "upload_id + chunk index + chunk digest"
+        }
       },
       "ingress": [
         "local_ipc",
@@ -2559,8 +2385,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.upload"
+            "right": {
+              "right": "files.upload"
+            }
           },
           "when": "always"
         }
@@ -2572,17 +2399,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "drafts_and_media",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "upload_id",
-        "kind": "keyed"
+        "keyed": {
+          "key": "upload_id"
+        }
       },
       "ingress": [
         "local_ipc",
@@ -2594,8 +2420,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.upload"
+            "right": {
+              "right": "files.upload"
+            }
           },
           "when": "always"
         }
@@ -2607,17 +2434,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "drafts_and_media",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "upload_id",
-        "kind": "keyed"
+        "keyed": {
+          "key": "upload_id"
+        }
       },
       "ingress": [
         "local_ipc",
@@ -2629,15 +2455,14 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.upload"
+            "right": {
+              "right": "files.upload"
+            }
           },
           "when": "always"
         },
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
+          "authority": "resource_owner",
           "when": "always"
         }
       ],
@@ -2648,17 +2473,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "drafts_and_media",
       "history_filter": "grant_lower_bound",
       "idempotency": {
-        "key": "transfer_id",
-        "kind": "keyed"
+        "keyed": {
+          "key": "transfer_id"
+        }
       },
       "ingress": [
         "local_ipc",
@@ -2670,8 +2494,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.read"
+            "right": {
+              "right": "files.read"
+            }
           },
           "when": "always"
         }
@@ -2684,17 +2509,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "drafts_and_media",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2705,8 +2526,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.read"
+            "right": {
+              "right": "files.read"
+            }
           },
           "when": "always"
         }
@@ -2718,17 +2540,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "project_repositories",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2745,17 +2563,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "project_repositories",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2771,17 +2585,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "project_repositories",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2792,8 +2602,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "project.create"
+            "right": {
+              "right": "project.create"
+            }
           },
           "when": "always"
         }
@@ -2806,17 +2617,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "project_repositories",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2827,8 +2634,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "project.create"
+            "right": {
+              "right": "project.create"
+            }
           },
           "when": "always"
         }
@@ -2841,17 +2649,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "project_repositories",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2862,8 +2666,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "project.create"
+            "right": {
+              "right": "project.create"
+            }
           },
           "when": "always"
         }
@@ -2876,17 +2681,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "project_repositories",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2896,9 +2697,7 @@
       "name": "project.operation.cancel",
       "required_rights": [
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
+          "authority": "resource_owner",
           "when": "always"
         }
       ],
@@ -2910,17 +2709,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "workspaces",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2937,17 +2732,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "workspaces",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2958,8 +2749,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "workspace.manage"
+            "right": {
+              "right": "workspace.manage"
+            }
           },
           "when": "always"
         }
@@ -2972,17 +2764,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "workspaces",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -2998,17 +2786,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "workspaces",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3019,8 +2803,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "workspace.manage"
+            "right": {
+              "right": "workspace.manage"
+            }
           },
           "when": "always"
         }
@@ -3032,17 +2817,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "changes_and_diffs",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3053,8 +2834,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.read"
+            "right": {
+              "right": "files.read"
+            }
           },
           "when": "always"
         }
@@ -3068,18 +2850,17 @@
     },
     {
       "capability": {
-        "capability_id": "workspace.destination",
-        "kind": "required",
-        "revision": "change_set_version"
+        "required": {
+          "capability_id": "workspace.destination",
+          "revision": "change_set_version"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "changes_and_diffs",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3090,8 +2871,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.apply_diff"
+            "right": {
+              "right": "files.apply_diff"
+            }
           },
           "when": "always"
         }
@@ -3105,18 +2887,17 @@
     },
     {
       "capability": {
-        "capability_id": "workspace.destination",
-        "kind": "required",
-        "revision": "change_set_version"
+        "required": {
+          "capability_id": "workspace.destination",
+          "revision": "change_set_version"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "changes_and_diffs",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3127,8 +2908,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.apply_diff"
+            "right": {
+              "right": "files.apply_diff"
+            }
           },
           "when": "always"
         }
@@ -3141,17 +2923,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "changes_and_diffs",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3162,8 +2940,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "changeset.create"
+            "right": {
+              "right": "changeset.create"
+            }
           },
           "when": "always"
         }
@@ -3177,18 +2956,17 @@
     },
     {
       "capability": {
-        "capability_id": "changeset",
-        "kind": "required",
-        "revision": "change_set_version"
+        "required": {
+          "capability_id": "changeset",
+          "revision": "change_set_version"
+        }
       },
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "changes_and_diffs",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3199,8 +2977,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "files.read"
+            "right": {
+              "right": "files.read"
+            }
           },
           "when": "always"
         }
@@ -3213,18 +2992,17 @@
     },
     {
       "capability": {
-        "capability_id": "changeset",
-        "kind": "required",
-        "revision": "change_set_version"
+        "required": {
+          "capability_id": "changeset",
+          "revision": "change_set_version"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "changes_and_diffs",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3235,8 +3013,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "workspace.manage"
+            "right": {
+              "right": "workspace.manage"
+            }
           },
           "when": "always"
         }
@@ -3249,17 +3028,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "review_and_attention",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3270,8 +3045,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -3285,18 +3061,17 @@
     },
     {
       "capability": {
-        "capability_id": "changeset",
-        "kind": "required",
-        "revision": "change_set_version"
+        "required": {
+          "capability_id": "changeset",
+          "revision": "change_set_version"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "review_and_attention",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3307,8 +3082,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -3321,17 +3097,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "review_and_attention",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3342,8 +3114,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -3356,17 +3129,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "review_and_attention",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3377,8 +3146,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -3391,17 +3161,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "review_and_attention",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3412,8 +3178,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -3425,17 +3192,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "pending_action_control",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3445,15 +3208,14 @@
       "name": "action.cancel",
       "required_rights": [
         {
-          "authority": {
-            "kind": "resource_owner"
-          },
-          "when": "always"
+          "authority": "resource_owner",
+          "when": "own_subject"
         },
         {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
           "when": "other_actor"
         }
@@ -3465,17 +3227,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "owner_confirmation",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -3484,9 +3242,7 @@
       "name": "owner.confirmation.request",
       "required_rights": [
         {
-          "authority": {
-            "kind": "issuing_owner_context"
-          },
+          "authority": "issuing_owner_context",
           "when": "always"
         }
       ],
@@ -3498,17 +3254,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "always",
       "effect": "write",
       "freshness": "action_window",
       "group": "owner_confirmation",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "single-use action digest",
-        "kind": "keyed"
+        "keyed": {
+          "key": "single-use action digest"
+        }
       },
       "ingress": [
         "local_ipc",
@@ -3518,9 +3273,7 @@
       "name": "owner.confirmation.complete",
       "required_rights": [
         {
-          "authority": {
-            "kind": "issuing_owner_context"
-          },
+          "authority": "issuing_owner_context",
           "when": "always"
         }
       ],
@@ -3532,17 +3285,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "state_recovery",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3553,8 +3302,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -3567,17 +3317,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "state_recovery",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3588,8 +3334,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -3602,17 +3349,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "state_recovery",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3623,8 +3366,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -3637,17 +3381,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "state_recovery",
-      "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "history_filter": "grant_lower_bound",
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -3657,32 +3397,38 @@
       "name": "action.read",
       "required_rights": [
         {
+          "authority": "resource_owner",
+          "when": "always"
+        },
+        {
           "authority": {
-            "kind": "resource_owner"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
       ],
       "resource_selectors": [
-        "action"
+        "action",
+        "session"
       ],
-      "summary": "Read a retained receipt. Current authority is checked before it is returned.",
+      "summary": "Read a retained receipt. Owning the identifier is not enough: present view authority over the receipt's subject is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier.",
       "version": 1
     },
     {
       "capability": {
-        "capability_id": "grant.parent",
-        "kind": "required",
-        "revision": "authority_revision"
+        "required": {
+          "capability_id": "grant.parent",
+          "revision": "authority_revision"
+        }
       },
       "confirmation": "when_enlarging_authority",
       "effect": "write",
       "freshness": "action_window",
       "group": "sharing",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -3692,9 +3438,14 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.share"
+            "right": {
+              "right": "session.share"
+            }
           },
+          "when": "always"
+        },
+        {
+          "authority": "issuer_delegation",
           "when": "always"
         }
       ],
@@ -3708,18 +3459,17 @@
     },
     {
       "capability": {
-        "capability_id": "grant.parent",
-        "kind": "required",
-        "revision": "authority_revision"
+        "required": {
+          "capability_id": "grant.parent",
+          "revision": "authority_revision"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "sharing",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -3729,9 +3479,14 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.share"
+            "right": {
+              "right": "session.share"
+            }
           },
+          "when": "always"
+        },
+        {
+          "authority": "issuer_delegation",
           "when": "always"
         }
       ],
@@ -3742,17 +3497,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "sharing",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -3762,9 +3513,14 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "session.share"
+            "right": {
+              "right": "session.share"
+            }
           },
+          "when": "always"
+        },
+        {
+          "authority": "issuer_delegation",
           "when": "always"
         }
       ],
@@ -3776,9 +3532,10 @@
     },
     {
       "capability": {
-        "capability_id": "push.installation",
-        "kind": "required",
-        "revision": "installation_key_revision"
+        "required": {
+          "capability_id": "push.installation",
+          "revision": "installation_key_revision"
+        }
       },
       "confirmation": "none",
       "effect": "write",
@@ -3786,8 +3543,9 @@
       "group": "services",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "token hash + installation key",
-        "kind": "keyed"
+        "keyed": {
+          "key": "token hash + installation key"
+        }
       },
       "ingress": [
         "service_client"
@@ -3796,9 +3554,7 @@
       "name": "push.installation.register",
       "required_rights": [
         {
-          "authority": {
-            "kind": "service_credential"
-          },
+          "authority": "service_credential",
           "when": "always"
         }
       ],
@@ -3810,9 +3566,10 @@
     },
     {
       "capability": {
-        "capability_id": "push.installation",
-        "kind": "required",
-        "revision": "installation_key_revision"
+        "required": {
+          "capability_id": "push.installation",
+          "revision": "installation_key_revision"
+        }
       },
       "confirmation": "none",
       "effect": "write",
@@ -3820,8 +3577,9 @@
       "group": "services",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "sender record id",
-        "kind": "keyed"
+        "keyed": {
+          "key": "sender record id"
+        }
       },
       "ingress": [
         "service_client"
@@ -3830,9 +3588,7 @@
       "name": "push.sender.issue",
       "required_rights": [
         {
-          "authority": {
-            "kind": "service_credential"
-          },
+          "authority": "service_credential",
           "when": "always"
         }
       ],
@@ -3844,17 +3600,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "service_credential",
       "group": "services",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "sender record id",
-        "kind": "keyed"
+        "keyed": {
+          "key": "sender record id"
+        }
       },
       "ingress": [
         "service_client"
@@ -3863,9 +3618,7 @@
       "name": "push.sender.renew",
       "required_rights": [
         {
-          "authority": {
-            "kind": "service_credential"
-          },
+          "authority": "service_credential",
           "when": "always"
         }
       ],
@@ -3877,17 +3630,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "service_credential",
       "group": "services",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "sender record id",
-        "kind": "keyed"
+        "keyed": {
+          "key": "sender record id"
+        }
       },
       "ingress": [
         "service_client"
@@ -3896,9 +3648,7 @@
       "name": "push.sender.revoke",
       "required_rights": [
         {
-          "authority": {
-            "kind": "service_credential"
-          },
+          "authority": "service_credential",
           "when": "always"
         }
       ],
@@ -3910,17 +3660,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "service_credential",
       "group": "services",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "service_client"
       ],
@@ -3928,9 +3674,7 @@
       "name": "mailbox.read",
       "required_rights": [
         {
-          "authority": {
-            "kind": "service_credential"
-          },
+          "authority": "service_credential",
           "when": "always"
         }
       ],
@@ -3942,9 +3686,10 @@
     },
     {
       "capability": {
-        "capability_id": "authority.feed",
-        "kind": "required",
-        "revision": "authority_revision"
+        "required": {
+          "capability_id": "authority.feed",
+          "revision": "authority_revision"
+        }
       },
       "confirmation": "none",
       "effect": "write",
@@ -3952,8 +3697,9 @@
       "group": "services",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "authority revision + host acknowledgement",
-        "kind": "keyed"
+        "keyed": {
+          "key": "authority revision + host acknowledgement"
+        }
       },
       "ingress": [
         "service_client"
@@ -3962,9 +3708,7 @@
       "name": "authority.sync",
       "required_rights": [
         {
-          "authority": {
-            "kind": "service_credential"
-          },
+          "authority": "service_credential",
           "when": "always"
         }
       ],
@@ -3976,17 +3720,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "service_credential",
       "group": "services",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "collection generation",
-        "kind": "keyed"
+        "keyed": {
+          "key": "collection generation"
+        }
       },
       "ingress": [
         "service_client"
@@ -3995,9 +3738,7 @@
       "name": "sync.compare_exchange",
       "required_rights": [
         {
-          "authority": {
-            "kind": "service_credential"
-          },
+          "authority": "service_credential",
           "when": "always"
         }
       ],
@@ -4008,17 +3749,16 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "service_credential",
       "group": "services",
       "history_filter": "not_applicable",
       "idempotency": {
-        "key": "backup generation",
-        "kind": "keyed"
+        "keyed": {
+          "key": "backup generation"
+        }
       },
       "ingress": [
         "service_client"
@@ -4027,9 +3767,7 @@
       "name": "backup.manifest",
       "required_rights": [
         {
-          "authority": {
-            "kind": "service_credential"
-          },
+          "authority": "service_credential",
           "when": "always"
         }
       ],
@@ -4040,17 +3778,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "voice",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "paired_device"
       ],
@@ -4058,9 +3792,7 @@
       "name": "voice.start",
       "required_rights": [
         {
-          "authority": {
-            "kind": "voice_grant"
-          },
+          "authority": "voice_grant",
           "when": "always"
         }
       ],
@@ -4072,17 +3804,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "voice",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "paired_device"
       ],
@@ -4090,9 +3818,7 @@
       "name": "voice.stop",
       "required_rights": [
         {
-          "authority": {
-            "kind": "voice_grant"
-          },
+          "authority": "voice_grant",
           "when": "always"
         }
       ],
@@ -4103,17 +3829,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "when_enlarging_authority",
       "effect": "write",
       "freshness": "action_window",
       "group": "voice",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -4122,32 +3844,34 @@
       "name": "voice.grant",
       "required_rights": [
         {
+          "authority": "resource_owner",
+          "when": "own_subject"
+        },
+        {
           "authority": {
-            "kind": "right",
-            "right": "host.manage"
+            "right": {
+              "right": "host.manage"
+            }
           },
-          "when": "always"
+          "when": "other_actor"
         }
       ],
       "resource_selectors": [
         "host",
+        "device",
         "session"
       ],
-      "summary": "Create or change a voice grant, stating exactly which actions it permits.",
+      "summary": "Create or change a voice grant, stating exactly which actions it permits. A device may broaden its own; changing another device's needs host-management authority.",
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "voice",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "paired_device"
       ],
@@ -4155,9 +3879,7 @@
       "name": "voice.delegate",
       "required_rights": [
         {
-          "authority": {
-            "kind": "voice_grant"
-          },
+          "authority": "voice_grant",
           "when": "always"
         }
       ],
@@ -4169,17 +3891,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "voice",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "paired_device"
       ],
@@ -4187,15 +3905,14 @@
       "name": "voice.context",
       "required_rights": [
         {
-          "authority": {
-            "kind": "voice_grant"
-          },
+          "authority": "voice_grant",
           "when": "always"
         },
         {
           "authority": {
-            "kind": "right",
-            "right": "session.view"
+            "right": {
+              "right": "session.view"
+            }
           },
           "when": "always"
         }
@@ -4209,18 +3926,17 @@
     },
     {
       "capability": {
-        "capability_id": "workflow",
-        "kind": "required",
-        "revision": "workflow_definition_version"
+        "required": {
+          "capability_id": "workflow",
+          "revision": "workflow_definition_version"
+        }
       },
       "confirmation": "when_enlarging_authority",
       "effect": "write",
       "freshness": "action_window",
       "group": "automation",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -4230,8 +3946,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "automation.manage"
+            "right": {
+              "right": "automation.manage"
+            }
           },
           "when": "always"
         }
@@ -4245,18 +3962,17 @@
     },
     {
       "capability": {
-        "capability_id": "workflow",
-        "kind": "required",
-        "revision": "workflow_definition_version"
+        "required": {
+          "capability_id": "workflow",
+          "revision": "workflow_definition_version"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "automation",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -4266,8 +3982,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "automation.manage"
+            "right": {
+              "right": "automation.manage"
+            }
           },
           "when": "always"
         }
@@ -4280,18 +3997,17 @@
     },
     {
       "capability": {
-        "capability_id": "workflow",
-        "kind": "required",
-        "revision": "workflow_definition_version"
+        "required": {
+          "capability_id": "workflow",
+          "revision": "workflow_definition_version"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "automation",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device"
@@ -4301,8 +4017,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "automation.manage"
+            "right": {
+              "right": "automation.manage"
+            }
           },
           "when": "always"
         }
@@ -4315,18 +4032,17 @@
     },
     {
       "capability": {
-        "capability_id": "workflow",
-        "kind": "required",
-        "revision": "workflow_definition_version"
+        "required": {
+          "capability_id": "workflow",
+          "revision": "workflow_definition_version"
+        }
       },
       "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "automation",
       "history_filter": "not_applicable",
-      "idempotency": {
-        "kind": "action_deduplicated"
-      },
+      "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -4337,8 +4053,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "automation.manage"
+            "right": {
+              "right": "automation.manage"
+            }
           },
           "when": "always"
         }
@@ -4350,17 +4067,13 @@
       "version": 1
     },
     {
-      "capability": {
-        "kind": "none"
-      },
+      "capability": "none",
       "confirmation": "none",
       "effect": "read",
       "freshness": "current_authority",
       "group": "automation",
       "history_filter": "grant_lower_bound",
-      "idempotency": {
-        "kind": "idempotent_read"
-      },
+      "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
         "paired_device",
@@ -4371,8 +4084,9 @@
       "required_rights": [
         {
           "authority": {
-            "kind": "right",
-            "right": "automation.manage"
+            "right": {
+              "right": "automation.manage"
+            }
           },
           "when": "always"
         }
