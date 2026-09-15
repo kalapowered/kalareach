@@ -1148,7 +1148,7 @@ impl Engine {
                 pending_wrap: None,
             },
             // Not observable from the pinned grid library; see `crate::unicode::LIBRARY`.
-            saved_cursor: None,
+            saved_cursors: [None, None],
             margins: Margins {
                 top,
                 bottom,

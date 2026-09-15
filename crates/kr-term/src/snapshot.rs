@@ -47,7 +47,11 @@ pub struct CursorState {
 }
 
 /// A saved cursor, from DECSC or the alternate-buffer switch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// A saved cursor is more than a position. DECSC saves the graphic rendition, the character sets
+/// and origin mode with it, and a restore that put back only the position would leave an
+/// application drawing in the wrong colours from the wrong origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedCursor {
     /// Which buffer saved it.
     pub buffer: ActiveBuffer,
@@ -57,6 +61,14 @@ pub struct SavedCursor {
     pub row: u32,
     /// Whether the saved cursor had a pending wrap.
     pub pending_wrap: bool,
+    /// The graphic rendition that was saved with it.
+    pub rendition: Rendition,
+    /// The character sets that were saved with it.
+    pub charsets: Charsets,
+    /// Whether origin mode was set when it was saved.
+    pub origin_mode: bool,
+    /// The DECSCUSR style that was saved with it.
+    pub style: u32,
 }
 
 /// The keyboard negotiation a reconnecting client has to be put back into.
@@ -189,11 +201,12 @@ pub struct Snapshot {
     pub viewport: Viewport,
     /// The cursor.
     pub cursor: CursorState,
-    /// The saved cursor of the active buffer.
+    /// The saved cursor of each buffer, primary first.
     ///
     /// `None` means the pinned grid library does not expose it; see the narrow patch recorded in
-    /// [`crate::unicode::LIBRARY`].
-    pub saved_cursor: Option<SavedCursor>,
+    /// [`crate::unicode::LIBRARY`]. Each buffer has its own, because the switch into the alternate
+    /// buffer saves one of its own.
+    pub saved_cursors: [Option<SavedCursor>; 2],
     /// The scroll region.
     pub margins: Margins,
     /// The current graphic rendition.
@@ -482,8 +495,10 @@ pub fn restoration_operations(snapshot: &Snapshot) -> Vec<RestoreOp> {
     ops.push(RestoreOp::SetHyperlink {
         uri: snapshot.hyperlink.clone(),
     });
-    if let Some(cursor) = snapshot.saved_cursor {
-        ops.push(RestoreOp::SetSavedCursor { cursor });
+    for cursor in snapshot.saved_cursors.iter().flatten() {
+        ops.push(RestoreOp::SetSavedCursor {
+            cursor: cursor.clone(),
+        });
     }
     ops.push(RestoreOp::SetCursor {
         cursor: snapshot.cursor,
