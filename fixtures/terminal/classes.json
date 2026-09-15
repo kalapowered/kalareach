@@ -1624,7 +1624,7 @@
         {
           "bytes": "1b5b3e343b326d",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -1635,12 +1635,7 @@
           ]
         }
       ],
-      "forward": [
-        [
-          0,
-          7
-        ]
-      ],
+      "forward": [],
       "grid_unrecognised": 0,
       "grid_writes": 0,
       "ground_after": true,
@@ -1694,7 +1689,7 @@
         {
           "bytes": "1b5b3e3175",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -1705,12 +1700,7 @@
           ]
         }
       ],
-      "forward": [
-        [
-          0,
-          5
-        ]
-      ],
+      "forward": [],
       "grid_unrecognised": 0,
       "grid_writes": 0,
       "ground_after": true,
@@ -1728,7 +1718,7 @@
         {
           "bytes": "1b5b3d353b3175",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -1739,12 +1729,7 @@
           ]
         }
       ],
-      "forward": [
-        [
-          0,
-          7
-        ]
-      ],
+      "forward": [],
       "grid_unrecognised": 0,
       "grid_writes": 0,
       "ground_after": true,
@@ -1762,7 +1747,7 @@
         {
           "bytes": "1b5b3c3175",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -1773,12 +1758,7 @@
           ]
         }
       ],
-      "forward": [
-        [
-          0,
-          5
-        ]
-      ],
+      "forward": [],
       "grid_unrecognised": 0,
       "grid_writes": 0,
       "ground_after": true,
@@ -3849,7 +3829,7 @@
         {
           "bytes": "1b5b3f393030313b3130343968",
           "class": "M",
-          "disposition": "Withhold",
+          "disposition": "RequireProjection",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -3866,7 +3846,7 @@
       "ground_after": true,
       "id": "dec_mode_mixed_with_9001",
       "input": "1b5b3f393030313b3130343968",
-      "projection_required_at": null,
+      "projection_required_at": 0,
       "refusals": [],
       "responses": [],
       "side_effects": []

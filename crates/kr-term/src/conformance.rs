@@ -517,6 +517,34 @@ pub const WIDTH_CASES: &[GridCase] = &[
         rows: 3,
         input: b"\x1b[?7labcdefgh",
     },
+    GridCase {
+        id: "emoji_modifier",
+        covers: "KR-REQ-08.39 an emoji modifier is its own cell",
+        cols: 10,
+        rows: 3,
+        input: "\u{1f44d}\u{1f3fb}X".as_bytes(),
+    },
+    GridCase {
+        id: "regional_indicators",
+        covers: "KR-REQ-08.39 a regional-indicator pair is two cells",
+        cols: 10,
+        rows: 3,
+        input: "\u{1f1ff}\u{1f1e6}X".as_bytes(),
+    },
+    GridCase {
+        id: "keycap_sequence",
+        covers: "KR-REQ-08.39 a keycap sequence is one cell",
+        cols: 10,
+        rows: 3,
+        input: "1\u{fe0f}\u{20e3}X".as_bytes(),
+    },
+    GridCase {
+        id: "combining_mark_at_the_right_margin",
+        covers: "KR-REQ-08.39 a mark joins the cell in the last column",
+        cols: 5,
+        rows: 3,
+        input: "abcde\u{0301}f".as_bytes(),
+    },
 ];
 
 /// The snapshot cases section 27 names: mid-output and at an alternate-screen transition.
@@ -655,7 +683,7 @@ pub fn summarise_grid(case: &GridCase) -> Value {
         left_col: 0,
         cols: case.cols,
     };
-    let snapshot = engine.snapshot(viewport, 0);
+    let (snapshot, _) = engine.snapshot(viewport, 0);
     let rows: Vec<Value> = snapshot
         .rows
         .iter()

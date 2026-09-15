@@ -85,6 +85,53 @@ impl QueryBroker {
         Self
     }
 
+    /// The empty clipboard answer kr-vt/1 gives a read by default.
+    ///
+    /// It is built here rather than by the caller so that every reply on the trusted lane comes
+    /// from one place.
+    #[must_use]
+    pub fn clipboard_answer(
+        &self,
+        selection: crate::sideeffect::ClipboardSelection,
+        at: u64,
+    ) -> Response {
+        Response::new(
+            ResponseKind::Clipboard,
+            at,
+            format!("\x1b]52;{};\x1b\\", char::from(selection.code())).into_bytes(),
+        )
+    }
+
+    /// One colour answer, built from the palette as it stands at this point in the request.
+    ///
+    /// A colour string may interleave mutations with questions, so the answers are built one at a
+    /// time as the engine works through the operations rather than all at once at the end.
+    #[must_use]
+    pub fn colour_answer(
+        &self,
+        selector: u32,
+        colour: Rgb,
+        terminator: &[u8],
+        at: u64,
+    ) -> Option<Response> {
+        let prefix = if selector >= INDEXED_BASE {
+            let index = u8::try_from(selector - INDEXED_BASE).ok()?;
+            format!("\x1b]4;{index};")
+        } else {
+            DynamicColour::from_selector(selector)?;
+            format!("\x1b]{selector};")
+        };
+        let mut bytes = format!("{prefix}{}", colour.to_report()).into_bytes();
+        bytes.extend_from_slice(terminator);
+        Some(Response::new(ResponseKind::Colour(selector), at, bytes))
+    }
+
+    /// The string terminator a reply to `event` should use.
+    #[must_use]
+    pub fn reply_terminator(event: &Event) -> &'static [u8] {
+        osc_terminator(event)
+    }
+
     /// Answers one `Q`-class event.
     ///
     /// Returns the replies in the order they must be written. An empty result means the profile's
@@ -241,7 +288,7 @@ fn answer_decrqm(csi: &CsiView, state: &BrokerState<'_>, kind: ModeKind, at: u64
         ModeKind::Dec => "?",
     };
     vec![Response::new(
-        ResponseKind::ModeReport(mode),
+        ResponseKind::ModeReport(kind, mode),
         at,
         format!("\x1b[{prefix}{mode};{status}$y").into_bytes(),
     )]
@@ -347,38 +394,15 @@ pub fn colour_operations(selector: u32, parts: &[Vec<u8>]) -> Vec<ColourOperatio
     out
 }
 
+/// Colour answers are built by the engine, which applies the mutations in the same pass.
 fn answer_osc(
-    selector: Option<u32>,
-    parts: &[Vec<u8>],
-    event: &Event,
-    state: &BrokerState<'_>,
-    at: u64,
+    _selector: Option<u32>,
+    _parts: &[Vec<u8>],
+    _event: &Event,
+    _state: &BrokerState<'_>,
+    _at: u64,
 ) -> Vec<Response> {
-    let Some(selector) = selector else {
-        return Vec::new();
-    };
-    if !matches!(selector, 4 | 10..=19) {
-        return Vec::new();
-    }
-    let terminator = osc_terminator(event);
-    colour_operations(selector, parts)
-        .into_iter()
-        .filter_map(|operation| {
-            let ColourOperation::Query { selector: key } = operation else {
-                return None;
-            };
-            let (prefix, colour) = if key >= INDEXED_BASE {
-                let index = u8::try_from(key - INDEXED_BASE).ok()?;
-                (format!("\x1b]4;{index};"), state.palette.indexed(index))
-            } else {
-                let which = DynamicColour::from_selector(key)?;
-                (format!("\x1b]{key};"), state.palette.dynamic(which))
-            };
-            let mut bytes = format!("{prefix}{}", colour.to_report()).into_bytes();
-            bytes.extend_from_slice(terminator);
-            Some(Response::new(ResponseKind::Colour(key), at, bytes))
-        })
-        .collect()
+    Vec::new()
 }
 
 fn parse_index(part: &[u8]) -> Option<u8> {

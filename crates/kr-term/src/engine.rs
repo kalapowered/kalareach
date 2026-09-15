@@ -13,7 +13,7 @@
 //! not forwarded. Half-understanding a sequence is worse than refusing it, because the canonical
 //! screen and the physical terminal would then disagree about what happened.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::broker::{BrokerState, CanonicalReport, ColourOperation, INDEXED_BASE, QueryBroker};
 use crate::budget::{GridSize, SessionBudget};
@@ -23,7 +23,7 @@ use crate::diag::{Diagnostic, DiagnosticKind, DiagnosticSink};
 use crate::error::{Result, TermError};
 use crate::event::{DirectDisposition, Event, EventKind};
 use crate::grid::{CanonicalGrid, GridConfig, GridRow};
-use crate::lane::{LaneDegradation, LaneLimits, Response, ResponseKind, ResponseLane};
+use crate::lane::{LaneDegradation, LaneLimits, ResponseLane};
 use crate::lexer::{LexLimits, Lexer};
 use crate::modes::{ModeKind, ModeState};
 use crate::palette::{DynamicColour, Palette, PaletteSource};
@@ -135,6 +135,43 @@ pub struct FeedOutcome {
     pub degradation: LaneDegradation,
     /// Whether the projection generation advanced, which resets a client's projection.
     pub projection_reset: bool,
+    /// Whether resident state is over one of its bounds.
+    pub resident_pressure: ResidentPressure,
+}
+
+/// Which resident-state bounds are currently exceeded.
+///
+/// Both are degradations rather than failures. The session keeps running while the grid evicts
+/// historical rows back under the cache bound; a caller that watches these reports pressure and,
+/// for a session that stays over, can detach rather than grow without limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResidentPressure {
+    /// The historical row cache is over its own bound.
+    pub row_cache: bool,
+    /// Committed usage is over the whole session budget.
+    pub session: bool,
+}
+
+impl ResidentPressure {
+    /// Whether any bound is exceeded.
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.row_cache || self.session
+    }
+}
+
+/// The revisions a delta compares against.
+///
+/// A revision is a counter rather than a flag, so two clients reading deltas from two different
+/// bases never clear each other's changes. Nothing has to be acknowledged, and nothing is lost if
+/// one client is slower than the other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Revisions {
+    any: u64,
+    title: u64,
+    palette: u64,
+    dimensions: u64,
+    keyboard: u64,
 }
 
 /// One point a delta may be built against.
@@ -143,6 +180,7 @@ struct Checkpoint {
     cursor: u64,
     seqno: usize,
     generation: u64,
+    revisions: Revisions,
 }
 
 /// How many checkpoints the replay window keeps.
@@ -176,10 +214,12 @@ pub struct Engine {
     cursor_style: u32,
     links: BTreeSet<String>,
     checkpoints: VecDeque<Checkpoint>,
-    dirty_modes: BTreeSet<(ModeKind, u16)>,
-    dirty_title: bool,
-    dirty_palette: bool,
-    dirty_dimensions: bool,
+    revision: u64,
+    mode_revisions: BTreeMap<(ModeKind, u16), u64>,
+    title_revision: u64,
+    palette_revision: u64,
+    dimensions_revision: u64,
+    keyboard_revision: u64,
     feeds: u32,
     scratch: Vec<Event>,
 }
@@ -211,10 +251,12 @@ impl Engine {
             cursor_style: 1,
             links: BTreeSet::new(),
             checkpoints: VecDeque::new(),
-            dirty_modes: BTreeSet::new(),
-            dirty_title: false,
-            dirty_palette: false,
-            dirty_dimensions: false,
+            revision: 0,
+            mode_revisions: BTreeMap::new(),
+            title_revision: 0,
+            palette_revision: 0,
+            dimensions_revision: 0,
+            keyboard_revision: 0,
             feeds: 0,
             scratch: Vec::new(),
         };
@@ -225,7 +267,19 @@ impl Engine {
     /// Adopts a palette the client shared during the bounded probe.
     pub fn adopt_palette(&mut self, palette: Palette) {
         self.palette = palette;
-        self.dirty_palette = true;
+        self.palette_revision = self.next_revision();
+    }
+
+    /// Advances the change counter and returns its new value.
+    fn next_revision(&mut self) -> u64 {
+        self.revision = self.revision.saturating_add(1);
+        self.revision
+    }
+
+    /// Records that one mode changed.
+    fn mark_mode(&mut self, kind: ModeKind, mode: u16) {
+        let revision = self.next_revision();
+        self.mode_revisions.insert((kind, mode), revision);
     }
 
     /// Records who holds the input lease, which is the default destination for a side effect.
@@ -280,9 +334,19 @@ impl Engine {
         &self.budget
     }
 
-    /// The monotonic output cursor: how many bytes of the session's output have been lexed.
+    /// The monotonic output cursor: the point every delivered event has reached.
+    ///
+    /// This is the cursor a snapshot, a delta base and a live-forwarding handoff all refer to. It
+    /// lags [`Engine::read_offset`] by whatever the parser is still collecting, so a client never
+    /// holds a cursor for output it has not been given.
     #[must_use]
-    pub const fn output_cursor(&self) -> u64 {
+    pub fn output_cursor(&self) -> u64 {
+        self.lexer.committed_offset()
+    }
+
+    /// How many bytes of the session's output have been read.
+    #[must_use]
+    pub const fn read_offset(&self) -> u64 {
         self.lexer.offset()
     }
 
@@ -299,10 +363,13 @@ impl Engine {
     }
 
     /// The output cursor of a parser-ground boundary, when the parser is on one.
+    ///
+    /// The boundary is the committed cursor, not the read offset: forwarding may only resume where
+    /// every byte before it has already been delivered.
     #[must_use]
     pub fn ground_boundary(&self) -> Option<u64> {
         if self.lexer.at_ground() {
-            Some(self.lexer.offset())
+            Some(self.lexer.committed_offset())
         } else {
             None
         }
@@ -363,6 +430,17 @@ impl Engine {
                     disposition = DirectDisposition::Withhold;
                 } else {
                     let adapted = self.grid.apply(event);
+                    if adapted.clamped {
+                        // The grid did what it could rather than what the sequence said, so the
+                        // original bytes would take a physical terminal somewhere else.
+                        disposition = DirectDisposition::RequireProjection;
+                        self.diagnostics.record(
+                            DiagnosticKind::UnclassifiedSequence,
+                            event.span.start(),
+                            now_ms,
+                            "a parameter was reduced to what the grid can act on",
+                        );
+                    }
                     if adapted.unrecognised {
                         // The class table approved it and the canonical grid does not know it.
                         // Consuming it keeps the two screens in step.
@@ -382,9 +460,10 @@ impl Engine {
             }
             if decision.answer {
                 outcome.responses += self.answer_query(event, now_ms);
+                outcome.responses += self.apply_colours(event, now_ms);
             }
-            if let Some(bytes) = decision.immediate_reply {
-                let response = Response::new(ResponseKind::Clipboard, event.span.start(), bytes);
+            if let Some(selection) = decision.clipboard_answer {
+                let response = self.broker.clipboard_answer(selection, event.span.start());
                 if self.lane.offer(response, now_ms) {
                     outcome.responses += 1;
                 }
@@ -440,6 +519,7 @@ impl Engine {
         self.enforce_resident_state(now_ms);
         self.record_checkpoint();
         outcome.degradation = degradation;
+        outcome.resident_pressure = self.resident_pressure();
         outcome.diagnostics = self.diagnostics.drain();
         outcome.ground_boundary = self.ground_boundary();
         outcome.projection_reset = self.projection_generation != generation_before;
@@ -465,11 +545,13 @@ impl Engine {
         if self.links.contains(&uri) {
             return false;
         }
-        if self.links.len() >= self.budget.limits().unique_links {
+        let cost = uri.len() as u64;
+        if self.links.len() >= self.budget.limits().unique_links || !self.budget.metadata_fits(cost)
+        {
             self.budget.record_truncation();
             return true;
         }
-        let metadata = self.budget.usage().metadata + uri.len() as u64;
+        let metadata = self.budget.usage().metadata + cost;
         self.budget.set_metadata(metadata);
         self.links.insert(uri);
         false
@@ -497,19 +579,48 @@ impl Engine {
         self.budget.set_row_cache(bytes);
     }
 
+    /// Whether resident state is over one of its bounds right now.
+    ///
+    /// This is a degradation, not an error: the session keeps working while the grid evicts rows
+    /// back under the bound. It is reported on every feed, where a rate-limited diagnostic would
+    /// be suppressed and the caller would see nothing.
+    fn resident_pressure(&self) -> ResidentPressure {
+        ResidentPressure {
+            row_cache: self.budget.row_cache_over_budget(),
+            session: self.budget.session_over_budget(),
+        }
+    }
+
     fn record_checkpoint(&mut self) {
         let checkpoint = Checkpoint {
-            cursor: self.lexer.offset(),
+            cursor: self.lexer.committed_offset(),
             seqno: self.grid.sequence_number(),
             generation: self.projection_generation,
+            revisions: self.revisions(),
         };
         if self.checkpoints.back() == Some(&checkpoint) {
             return;
+        }
+        // A cursor can repeat while the screen moves on, because a held cluster keeps the committed
+        // cursor still. The newest checkpoint for a cursor is the one a delta is built against, so
+        // an older one with the same cursor is replaced rather than kept.
+        if self.checkpoints.back().map(|last| last.cursor) == Some(checkpoint.cursor) {
+            self.checkpoints.pop_back();
         }
         if self.checkpoints.len() == REPLAY_WINDOW {
             self.checkpoints.pop_front();
         }
         self.checkpoints.push_back(checkpoint);
+    }
+
+    const fn revisions(&self) -> Revisions {
+        Revisions {
+            any: self.revision,
+            title: self.title_revision,
+            palette: self.palette_revision,
+            dimensions: self.dimensions_revision,
+            keyboard: self.keyboard_revision,
+        }
     }
 
     fn canonical_report(&self) -> CanonicalReport {
@@ -569,12 +680,18 @@ impl Engine {
                     self.titles = TitleState::new();
                     self.palette = Palette::new(self.palette.source());
                     self.cursor_style = 1;
-                    self.dirty_title = true;
-                    self.dirty_palette = true;
+                    self.title_revision = self.next_revision();
+                    self.palette_revision = self.next_revision();
                     self.advance_projection();
                 }
-                b'=' => self.modes.set_keypad_application(true),
-                b'>' => self.modes.set_keypad_application(false),
+                b'=' => {
+                    self.modes.set_keypad_application(true);
+                    self.mark_mode(ModeKind::Dec, 66);
+                }
+                b'>' => {
+                    self.modes.set_keypad_application(false);
+                    self.mark_mode(ModeKind::Dec, 66);
+                }
                 _ => {}
             },
             EventKind::Csi {
@@ -600,7 +717,7 @@ impl Engine {
                 for slot in &csi.numbers {
                     if let Some(mode) = slot.and_then(|value| u16::try_from(value).ok()) {
                         self.modes.set(ModeKind::Ansi, mode, enabled);
-                        self.dirty_modes.insert((ModeKind::Ansi, mode));
+                        self.mark_mode(ModeKind::Ansi, mode);
                     }
                 }
             }
@@ -616,7 +733,7 @@ impl Engine {
                         continue;
                     }
                     self.modes.set(ModeKind::Dec, mode, enabled);
-                    self.dirty_modes.insert((ModeKind::Dec, mode));
+                    self.mark_mode(ModeKind::Dec, mode);
                     if matches!(mode, 47 | 1047 | 1049) {
                         self.advance_projection();
                     }
@@ -636,34 +753,44 @@ impl Engine {
                 match csi.first_or(0) {
                     22 => {
                         self.titles.push(target);
-                        self.dirty_title = true;
+                        self.title_revision = self.next_revision();
                     }
                     // The stack is the session's own. An underflow stops here rather than reaching
                     // into whatever the attach client saved, so the result is not acted on.
                     23 => {
                         let _ = self.titles.pop(target);
-                        self.dirty_title = true;
+                        self.title_revision = self.next_revision();
                     }
                     _ => {}
                 }
             }
+            // Keyboard negotiation, with the defaults each form carries. `CSI > m` resets every
+            // resource, `CSI = u` clears the flags, and a pop count of zero pops nothing.
             (Some(b'>'), [], b'm') => {
-                let resource = u8::try_from(csi.first_or(4).clamp(0, 255)).unwrap_or(4);
-                let value = u8::try_from(csi.number(1).unwrap_or(0).clamp(0, 255)).unwrap_or(0);
+                let resource = csi
+                    .number(0)
+                    .map(|value| u8::try_from(value.clamp(0, 255)).unwrap_or(0));
+                let value = csi
+                    .number(1)
+                    .map(|value| u8::try_from(value.clamp(0, 255)).unwrap_or(0));
                 self.modes.set_modify_other_keys(resource, value);
+                self.keyboard_revision = self.next_revision();
             }
             (Some(b'>'), [], b'u') => {
                 let flags = u8::try_from(csi.first_or(0).clamp(0, 255)).unwrap_or(0);
                 self.modes.push_kitty(flags);
+                self.keyboard_revision = self.next_revision();
             }
             (Some(b'<'), [], b'u') => {
-                let count = usize::try_from(csi.first_or(1).max(1)).unwrap_or(1);
+                let count = usize::try_from(csi.first_or(1).max(0)).unwrap_or(0);
                 self.modes.pop_kitty(count);
+                self.keyboard_revision = self.next_revision();
             }
             (Some(b'='), [], b'u') => {
                 let flags = u8::try_from(csi.first_or(0).clamp(0, 255)).unwrap_or(0);
                 let mode = u8::try_from(csi.number(1).unwrap_or(1).clamp(0, 255)).unwrap_or(1);
                 self.modes.set_kitty(flags, mode);
+                self.keyboard_revision = self.next_revision();
             }
             _ => {}
         }
@@ -679,13 +806,15 @@ impl Engine {
                     return;
                 };
                 // A title may contain semicolons, so everything after the selector is the title.
+                // Everything after the selector is the title, and it is sanitised once so that the
+                // session title and the grid's title are the same string.
                 let title = parts[1..]
                     .iter()
-                    .map(|part| String::from_utf8_lossy(part).into_owned())
+                    .map(|part| sanitise_text(part))
                     .collect::<Vec<_>>()
                     .join(";");
                 self.titles.set(target, &title);
-                self.dirty_title = true;
+                self.title_revision = self.next_revision();
             }
             4 | 10..=19 => {
                 for operation in crate::broker::colour_operations(selector, parts) {
@@ -699,11 +828,11 @@ impl Engine {
                     if key >= INDEXED_BASE {
                         if let Ok(index) = u8::try_from(key - INDEXED_BASE) {
                             self.palette.set_indexed(index, colour);
-                            self.dirty_palette = true;
+                            self.palette_revision = self.next_revision();
                         }
                     } else if let Some(which) = DynamicColour::from_selector(key) {
                         self.palette.set_dynamic(which, colour);
-                        self.dirty_palette = true;
+                        self.palette_revision = self.next_revision();
                     }
                 }
             }
@@ -720,16 +849,73 @@ impl Engine {
                         }
                     }
                 }
-                self.dirty_palette = true;
+                self.palette_revision = self.next_revision();
             }
             110..=119 => {
                 if let Some(which) = DynamicColour::from_selector(selector - 100) {
                     self.palette.reset_dynamic(which);
-                    self.dirty_palette = true;
+                    self.palette_revision = self.next_revision();
                 }
             }
             _ => {}
         }
+    }
+
+    /// Applies an OSC colour string in order, queueing an answer at each question.
+    ///
+    /// A request may interleave mutations and questions, and each question is about the palette as
+    /// it stands at that point. Applying every mutation first and answering afterwards would give
+    /// the wrong answer to a question that came before a change.
+    fn apply_colours(&mut self, event: &Event, now_ms: u64) -> usize {
+        let EventKind::Osc { selector, parts } = &event.kind else {
+            return 0;
+        };
+        let Some(selector) = *selector else {
+            return 0;
+        };
+        if !matches!(selector, 4 | 10..=19) {
+            return 0;
+        }
+        let terminator = QueryBroker::reply_terminator(event);
+        let at = event.span.start();
+        let operations = crate::broker::colour_operations(selector, parts);
+        let mut accepted = 0;
+        for operation in operations {
+            match operation {
+                ColourOperation::Set {
+                    selector: key,
+                    colour,
+                } => {
+                    if key >= INDEXED_BASE {
+                        if let Ok(index) = u8::try_from(key - INDEXED_BASE) {
+                            self.palette.set_indexed(index, colour);
+                            self.palette_revision = self.next_revision();
+                        }
+                    } else if let Some(which) = DynamicColour::from_selector(key) {
+                        self.palette.set_dynamic(which, colour);
+                        self.palette_revision = self.next_revision();
+                    }
+                }
+                ColourOperation::Query { selector: key } => {
+                    let colour = if key >= INDEXED_BASE {
+                        u8::try_from(key - INDEXED_BASE)
+                            .ok()
+                            .map(|index| self.palette.indexed(index))
+                    } else {
+                        DynamicColour::from_selector(key).map(|which| self.palette.dynamic(which))
+                    };
+                    let Some(colour) = colour else {
+                        continue;
+                    };
+                    if let Some(response) = self.broker.colour_answer(key, colour, terminator, at)
+                        && self.lane.offer(response, now_ms)
+                    {
+                        accepted += 1;
+                    }
+                }
+            }
+        }
+        accepted
     }
 
     const fn advance_projection(&mut self) {
@@ -744,15 +930,15 @@ impl Engine {
     /// either case.
     pub fn resize(&mut self, size: GridSize) -> Result<()> {
         self.grid.resize(size, &mut self.budget)?;
-        self.dirty_dimensions = true;
+        self.dimensions_revision = self.next_revision();
         Ok(())
     }
 
     /// Takes a snapshot for `viewport`.
     ///
     /// Any held text tail is released first, so the snapshot describes a settled screen.
-    pub fn snapshot(&mut self, viewport: Viewport, now_ms: u64) -> Snapshot {
-        self.quiesce(now_ms);
+    pub fn snapshot(&mut self, viewport: Viewport, now_ms: u64) -> (Snapshot, FeedOutcome) {
+        let settled = self.quiesce(now_ms);
         let rows = self.grid.visible_rows();
         let (oldest, _) = self.grid.stable_range();
         let (col, row) = self.grid.cursor();
@@ -761,7 +947,7 @@ impl Engine {
         let (g0, g1) = self.grid.charsets();
         let snapshot = Snapshot {
             projection_generation: self.projection_generation,
-            output_cursor: self.lexer.offset(),
+            output_cursor: self.lexer.committed_offset(),
             active_buffer: self.active_buffer(),
             dimensions: self.grid.size(),
             viewport,
@@ -799,14 +985,12 @@ impl Engine {
             hyperlinks: hyperlinks_of(&rows),
             palette: self.palette_snapshot(),
             rows,
+            // Not reachable on the pinned grid library; see `crate::unicode::LIBRARY`.
+            inactive_rows: None,
             oldest_retained_row: oldest,
             evicted: oldest > 0,
         };
-        self.dirty_modes.clear();
-        self.dirty_title = false;
-        self.dirty_palette = false;
-        self.dirty_dimensions = false;
-        snapshot
+        (snapshot, settled)
     }
 
     fn active_buffer(&self) -> ActiveBuffer {
@@ -888,6 +1072,7 @@ impl Engine {
                 available: self.lexer.offset(),
             });
         }
+        let base = *base;
         let changed: BTreeSet<i64> = self
             .grid
             .changed_rows_since(base.seqno)
@@ -902,7 +1087,7 @@ impl Engine {
         let (col, row) = self.grid.cursor();
         Ok(Delta {
             base_cursor,
-            next_cursor: self.lexer.offset(),
+            next_cursor: self.lexer.committed_offset(),
             projection_generation: self.projection_generation,
             rows,
             cursor: CursorState {
@@ -912,38 +1097,30 @@ impl Engine {
                 style: self.cursor_style,
                 pending_wrap: None,
             },
-            modes: self.changed_modes(),
-            title: self.dirty_title.then(|| crate::title::TitleEntry {
+            modes: self.changed_modes(base.revisions.any),
+            title: (self.title_revision > base.revisions.title).then(|| crate::title::TitleEntry {
                 icon: self.titles.icon().to_owned(),
                 window: self.titles.window().to_owned(),
             }),
-            palette: self.dirty_palette.then(|| self.palette_snapshot()),
-            dimensions: self.dirty_dimensions.then(|| self.grid.size()),
+            keyboard: (self.keyboard_revision > base.revisions.keyboard)
+                .then(|| self.keyboard_snapshot()),
+            palette: (self.palette_revision > base.revisions.palette)
+                .then(|| self.palette_snapshot()),
+            dimensions: (self.dimensions_revision > base.revisions.dimensions)
+                .then(|| self.grid.size()),
         })
     }
 
-    fn changed_modes(&self) -> Vec<ModeEntry> {
-        self.dirty_modes
+    fn changed_modes(&self, since: u64) -> Vec<ModeEntry> {
+        self.mode_revisions
             .iter()
-            .map(|(kind, mode)| ModeEntry {
+            .filter(|(_, revision)| **revision > since)
+            .map(|((kind, mode), _)| ModeEntry {
                 kind: *kind,
                 mode: *mode,
                 enabled: self.modes.is_set(*kind, *mode),
             })
             .collect()
-    }
-
-    /// Acknowledges that a client now holds everything up to `cursor`.
-    ///
-    /// The next delta starts from there, so a change is carried once rather than in every delta
-    /// until the next snapshot.
-    pub fn acknowledge(&mut self, cursor: u64) {
-        if cursor >= self.lexer.offset() {
-            self.dirty_modes.clear();
-            self.dirty_title = false;
-            self.dirty_palette = false;
-            self.dirty_dimensions = false;
-        }
     }
 
     /// Reads a page of history rows.
@@ -957,8 +1134,18 @@ impl Engine {
         let mut rows = Vec::new();
         let mut bytes = 0usize;
         let mut truncated = false;
-        for row in self.grid.history_rows(from, limits.history_page_rows) {
-            let row_bytes = encoded_row_bytes(&row);
+        for mut row in self.grid.history_rows(from, limits.history_page_rows) {
+            let mut row_bytes = encoded_row_bytes(&row);
+            if row_bytes > limits.history_page_bytes {
+                // One row larger than a whole page still has to be representable, or a reader
+                // could never get past it. It is degraded explicitly rather than dropped.
+                if !rows.is_empty() {
+                    truncated = true;
+                    break;
+                }
+                truncate_row(&mut row, limits.history_page_bytes);
+                row_bytes = encoded_row_bytes(&row);
+            }
             if bytes + row_bytes > limits.history_page_bytes {
                 truncated = true;
                 break;
@@ -1047,6 +1234,22 @@ fn encoded_row_bytes(row: &GridRow) -> usize {
                     + run.hyperlink.as_ref().map_or(0, std::string::String::len)
             })
             .sum::<usize>()
+}
+
+/// Drops runs from the end of a row until its record fits `limit`, and says that it happened.
+fn truncate_row(row: &mut GridRow, limit: usize) {
+    while encoded_row_bytes(row) > limit && !row.runs.is_empty() {
+        row.runs.pop();
+    }
+    row.truncated = true;
+}
+
+/// Makes a control-string payload safe to show, the same way the grid sees it.
+fn sanitise_text(part: &[u8]) -> String {
+    String::from_utf8_lossy(part)
+        .chars()
+        .filter(|scalar| !scalar.is_control() && !('\u{80}'..='\u{9f}').contains(scalar))
+        .collect()
 }
 
 fn text_of(part: Option<&Vec<u8>>) -> String {

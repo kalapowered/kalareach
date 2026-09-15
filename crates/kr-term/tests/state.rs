@@ -98,11 +98,19 @@ fn the_budget_refuses_before_it_allocates() {
 }
 
 #[test]
-fn the_row_cache_is_capped_independently_of_the_session_budget() {
+fn the_row_cache_is_measured_against_its_own_bound() {
     let mut budget = SessionBudget::new();
-    let evicted = budget.set_row_cache(BudgetLimits::DEFAULT.row_cache_bytes * 2);
-    assert!(evicted, "rows beyond the cache come from the spool");
-    assert_eq!(budget.usage().rows, BudgetLimits::DEFAULT.row_cache_bytes);
+    let over = budget.set_row_cache(BudgetLimits::DEFAULT.row_cache_bytes * 2);
+    assert!(over, "rows beyond the cache come from the spool");
+    assert_eq!(
+        budget.usage().rows,
+        BudgetLimits::DEFAULT.row_cache_bytes * 2,
+        "the measurement is what the rows cost, not what they are allowed to cost"
+    );
+    assert!(budget.row_cache_over_budget());
+    // Eviction is not instant, so the reading stays over until the grid has caught up.
+    budget.set_row_cache(BudgetLimits::DEFAULT.row_cache_bytes / 2);
+    assert!(!budget.row_cache_over_budget());
 }
 
 // --------------------------------------------------------------------- snapshots
@@ -115,7 +123,7 @@ fn a_snapshot_carries_the_state_a_reconnection_needs() {
         0,
     );
     let view = viewport(&engine);
-    let snapshot = engine.snapshot(view, 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
     assert_eq!(snapshot.active_buffer, ActiveBuffer::Alternate);
     assert_eq!(snapshot.title.window, "session");
     assert!(snapshot.keypad_application);
@@ -145,7 +153,7 @@ fn restoration_never_replays_a_side_effect() {
         0,
     );
     let view = viewport(&engine);
-    let snapshot = engine.snapshot(view, 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
     let operations = restoration_operations(&snapshot);
     assert!(!operations.is_empty());
     for operation in &operations {
@@ -301,11 +309,21 @@ fn the_probe_set_ends_with_device_attributes() {
             .count()
             == 1
     );
+    // Asking a subset still ends with the terminator, and asks for it only once.
+    let (_, request) = ProbeSession::start(
+        0,
+        InputContext::Clean,
+        &[ProbeItem::Version, ProbeItem::DeviceAttributes],
+    )
+    .expect("clean stream");
+    assert!(request.ends_with(b"\x1b[c"));
+    assert_eq!(request.windows(4).filter(|w| *w == b"\x1b[0c").count(), 0);
 }
 
 #[test]
 fn a_probe_completes_on_its_terminator() {
-    let (mut session, request) = ProbeSession::start(0, InputContext::Clean).expect("clean stream");
+    let (mut session, request) =
+        ProbeSession::start(0, InputContext::Clean, PROBE_SET).expect("clean stream");
     assert!(request.ends_with(b"\x1b[c"), "the terminator is asked last");
     assert_eq!(
         session
@@ -326,6 +344,14 @@ fn a_probe_completes_on_its_terminator() {
         ProbeProgress::Collecting
     );
     assert_eq!(
+        session.observe(b"\x1b[?0u", 33).expect("answer"),
+        ProbeProgress::Collecting
+    );
+    assert_eq!(
+        session.observe(b"\x1b[?2026;2$y", 35).expect("answer"),
+        ProbeProgress::Collecting
+    );
+    assert_eq!(
         session
             .observe(b"\x1b[?62;1;6;22c", 40)
             .expect("terminator"),
@@ -342,7 +368,8 @@ fn a_probe_completes_on_its_terminator() {
 
 #[test]
 fn a_probe_without_its_terminator_fails_the_attach() {
-    let (mut session, _) = ProbeSession::start(0, InputContext::Clean).expect("clean stream");
+    let (mut session, _) =
+        ProbeSession::start(0, InputContext::Clean, PROBE_SET).expect("clean stream");
     session
         .observe(b"\x1b]11;rgb:0000/0000/0000\x1b\\", 10)
         .expect("answer");
@@ -357,7 +384,8 @@ fn a_probe_without_its_terminator_fails_the_attach() {
 
 #[test]
 fn a_probe_that_runs_out_of_time_fails_rather_than_forwarding() {
-    let (mut session, _) = ProbeSession::start(0, InputContext::Clean).expect("clean stream");
+    let (mut session, _) =
+        ProbeSession::start(0, InputContext::Clean, PROBE_SET).expect("clean stream");
     let error = session
         .observe(b"\x1b[?62;1;22c", 1_001)
         .expect_err("deadline");
@@ -372,7 +400,7 @@ fn a_probe_that_runs_out_of_time_fails_rather_than_forwarding() {
 
 #[test]
 fn a_contaminated_stream_cannot_be_probed_again() {
-    let error = ProbeSession::start(0, InputContext::Contaminated).expect_err("refused");
+    let error = ProbeSession::start(0, InputContext::Contaminated, PROBE_SET).expect_err("refused");
     assert!(matches!(
         error,
         TermError::ProbeFailed {
@@ -409,14 +437,14 @@ fn the_palette_source_is_recorded_and_survives_a_snapshot() {
     })
     .expect("engine");
     let view = viewport(&engine);
-    let snapshot = engine.snapshot(view, 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
     assert_eq!(snapshot.palette.source, PaletteSource::LightPreset);
     engine.adopt_palette(kr_term::palette::Palette::from_client_preference(
         Rgb::new(1, 2, 3),
         Rgb::new(4, 5, 6),
     ));
     let view = viewport(&engine);
-    let snapshot = engine.snapshot(view, 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
     assert_eq!(snapshot.palette.source, PaletteSource::ClientPreference);
     assert_eq!(snapshot.palette.foreground, Rgb::new(1, 2, 3));
 }
@@ -501,7 +529,7 @@ fn a_snapshot_carries_the_keyboard_protocol() {
     let mut engine = engine();
     engine.feed(b"\x1b[>4;2m\x1b[>1u\x1b[>3u", 0);
     let view = viewport(&engine);
-    let snapshot = engine.snapshot(view, 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
     assert_eq!(snapshot.keyboard.modify_other_keys, 2);
     assert_eq!(snapshot.keyboard.kitty_flags, Some(3));
     assert_eq!(
@@ -522,7 +550,7 @@ fn a_snapshot_carries_the_current_rendition() {
     let mut engine = engine();
     engine.feed(b"\x1b[1;4;31mtext", 0);
     let view = viewport(&engine);
-    let snapshot = engine.snapshot(view, 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
     assert!(snapshot.rendition.bold);
     assert_eq!(
         snapshot.rendition.underline,
@@ -540,39 +568,50 @@ fn a_snapshot_carries_the_whole_palette() {
     let mut engine = engine();
     engine.feed(b"\x1b]12;#010203\x1b\\\x1b]17;#040506\x1b\\", 0);
     let view = viewport(&engine);
-    let snapshot = engine.snapshot(view, 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
     assert_eq!(snapshot.palette.cursor, Rgb::new(1, 2, 3));
     assert_eq!(snapshot.palette.selection_background, Rgb::new(4, 5, 6));
 }
 
-/// A probe that never answers a required question fails the attach.
+/// A question the probe asked and the terminal did not answer fails the attach.
 #[test]
-fn a_probe_without_its_required_answer_fails() {
-    // Device attributes is the only required answer, and it is also the terminator, so a probe
-    // that finishes without it has already failed on the terminator.
-    let required: Vec<ProbeItem> = PROBE_SET
-        .iter()
-        .copied()
-        .filter(|item| item.requirement() == kr_term::probe::ProbeRequirement::Required)
-        .collect();
-    assert_eq!(required, vec![ProbeItem::DeviceAttributes]);
+fn a_probe_without_every_answer_fails() {
+    // The terminator arrives, so nothing is still in flight, and one question is unanswered. The
+    // attach fails rather than recording the silence as a capability the terminal lacks.
+    let (mut session, _) =
+        ProbeSession::start(0, InputContext::Clean, PROBE_SET).expect("clean stream");
+    session.observe(b"\x1b[?62;22c", 10).expect("terminator");
+    let error = session.finish(20).expect_err("an unanswered question");
+    assert!(matches!(
+        error,
+        TermError::ProbeFailed {
+            reason: ProbeFailure::MissingAnswer
+        }
+    ));
+}
 
-    // A terminal that answers nothing else still completes, because the terminator proves the
-    // silence was an answer.
-    let (mut session, _) = ProbeSession::start(0, InputContext::Clean).expect("clean stream");
+/// A caller that needs less asks less, and every question it did ask is answered.
+#[test]
+fn a_probe_asks_only_what_its_profile_needs() {
+    let (mut session, request) =
+        ProbeSession::start(0, InputContext::Clean, &[ProbeItem::DeviceAttributes])
+            .expect("clean stream");
+    assert_eq!(request, b"\x1b[c".to_vec());
     session.observe(b"\x1b[?62;22c", 10).expect("terminator");
     let outcome = session.finish(20).expect("complete");
-    assert!(
-        outcome.unanswered().contains(&ProbeItem::Version),
-        "the unanswered questions are named, so the profile does not claim them"
-    );
+    assert_eq!(outcome.asked(), vec![ProbeItem::DeviceAttributes]);
     assert!(outcome.adopt_palette().is_none());
 }
 
 /// The synchronised-output probe reads a real DECRPM reply.
 #[test]
 fn the_probe_reads_a_mode_report_in_its_real_form() {
-    let (mut session, _) = ProbeSession::start(0, InputContext::Clean).expect("clean stream");
+    let (mut session, _) = ProbeSession::start(
+        0,
+        InputContext::Clean,
+        &[ProbeItem::SynchronisedOutput, ProbeItem::DeviceAttributes],
+    )
+    .expect("clean stream");
     session
         .observe(b"\x1b[?2026;2$y\x1b[?62;22c", 10)
         .expect("answers");
@@ -595,5 +634,143 @@ fn the_alert_list_is_bounded() {
     assert!(
         engine.grid().alerts_dropped() > 0,
         "a program that renames itself in a loop cannot grow the list"
+    );
+}
+
+// ------------------------------------------------------ what the review round found
+
+/// Two clients reading deltas from two different bases never clear each other's changes.
+#[test]
+fn a_delta_belongs_to_the_base_it_names() {
+    let mut engine = engine();
+    engine.feed(b"first\r\n", 0);
+    let older = engine.output_cursor();
+    engine.feed(b"\x1b]2;renamed\x07", 0);
+    let newer = engine.output_cursor();
+    engine.feed(b"\x1b[?25l", 0);
+
+    // The client on the newer base sees only the mode change.
+    let recent = engine.delta(newer).expect("inside the window");
+    assert!(recent.title.is_none(), "the title changed before this base");
+    assert!(recent.modes.iter().any(|entry| entry.mode == 25));
+
+    // The client on the older base still sees the title, after the other client read.
+    let behind = engine.delta(older).expect("inside the window");
+    assert_eq!(
+        behind.title.as_ref().map(|entry| entry.window.as_str()),
+        Some("renamed"),
+        "one client's read does not clear another client's changes"
+    );
+    assert!(behind.modes.iter().any(|entry| entry.mode == 25));
+
+    // Reading again returns the same answer: nothing was consumed.
+    let again = engine.delta(older).expect("inside the window");
+    assert_eq!(behind.title, again.title);
+}
+
+/// A snapshot settles the held cell and hands back what settling produced.
+#[test]
+fn a_snapshot_returns_the_output_its_own_settling_made() {
+    let mut engine = engine();
+    let outcome = engine.feed(b"abc", 0);
+    assert!(
+        outcome.forward.iter().all(|span| span.end() < 3),
+        "the last cell is held until the next read"
+    );
+    let before = engine.output_cursor();
+    let view = viewport(&engine);
+    let (snapshot, settled) = engine.snapshot(view, 0);
+
+    // The snapshot's cursor is the committed one, and it includes the settled cell.
+    assert_eq!(snapshot.output_cursor, engine.output_cursor());
+    assert!(
+        snapshot.output_cursor > before,
+        "settling committed the cell"
+    );
+    assert_eq!(
+        settled.forward.len(),
+        1,
+        "a direct attachment is given the bytes the snapshot settled"
+    );
+
+    // A delta from the snapshot's own cursor reports nothing outstanding.
+    let delta = engine.delta(snapshot.output_cursor).expect("its own base");
+    assert!(delta.rows.is_empty(), "the snapshot already carried it");
+}
+
+/// A qualified sequence with omitted parameters acts on its documented defaults.
+#[test]
+fn omitted_parameters_take_their_documented_defaults() {
+    fn after(input: &[u8]) -> kr_term::snapshot::Snapshot {
+        let mut session = engine();
+        session.feed(input, 0);
+        let view = viewport(&session);
+        session.snapshot(view, 0).0
+    }
+
+    // Both slots omitted: the scroll region becomes the whole screen.
+    let snapshot = after(b"\x1b[3;10r\x1b[r");
+    assert_eq!(snapshot.margins.top, 0);
+    assert_eq!(snapshot.margins.bottom, snapshot.dimensions.rows - 1);
+
+    // The trailing slot omitted: the bottom margin is the last row.
+    let snapshot = after(b"\x1b[2;r");
+    assert_eq!(snapshot.margins.top, 1);
+    assert_eq!(snapshot.margins.bottom, snapshot.dimensions.rows - 1);
+
+    // The leading slot omitted: the top margin is the first row.
+    let snapshot = after(b"\x1b[;5r");
+    assert_eq!(snapshot.margins.top, 0);
+    assert_eq!(snapshot.margins.bottom, 4);
+
+    // Cursor placement with both slots omitted goes home.
+    let snapshot = after(b"\x1b[5;5H\x1b[;H");
+    assert_eq!((snapshot.cursor.col, snapshot.cursor.row), (0, 0));
+}
+
+/// Resident state over a bound is reported as pressure on every feed, not only as a diagnostic.
+#[test]
+fn resident_pressure_is_reported_while_it_lasts() {
+    let mut engine = engine();
+    let outcome = engine.feed(b"hello", 0);
+    assert!(!outcome.resident_pressure.any());
+    assert!(!engine.budget().row_cache_over_budget());
+}
+
+/// Keyboard negotiation has one owner: the tracker, the reducer and the broker never disagree.
+#[test]
+fn keyboard_negotiation_has_one_owner() {
+    fn keyboard(input: &[u8]) -> kr_term::snapshot::KeyboardSnapshot {
+        let mut session = engine();
+        session.feed(input, 0);
+        let view = viewport(&session);
+        session.snapshot(view, 0).0.keyboard
+    }
+
+    // `CSI >m` with no parameters resets modifyOtherKeys to its default.
+    assert_eq!(keyboard(b"\x1b[>4;2m").modify_other_keys, 2);
+    assert_eq!(keyboard(b"\x1b[>4;2m\x1b[>m").modify_other_keys, 0);
+    assert_eq!(keyboard(b"\x1b[>4;2m\x1b[>4m").modify_other_keys, 0);
+
+    // `CSI =u` with no parameters resets the Kitty flags.
+    assert_eq!(keyboard(b"\x1b[=3u").kitty_flags, Some(3));
+    assert_eq!(keyboard(b"\x1b[=3u\x1b[=u").kitty_flags, Some(0));
+
+    // `CSI <u` pops one entry; `CSI <0u` pops one as well, because zero means one.
+    let one = keyboard(b"\x1b[>1u\x1b[>3u\x1b[<u");
+    assert_eq!(one.kitty_flags, Some(1));
+    let zero = keyboard(b"\x1b[>1u\x1b[>3u\x1b[<0u");
+    assert_eq!(zero.kitty_flags, one.kitty_flags);
+    assert_eq!(zero.kitty_stack, one.kitty_stack);
+
+    // Popping an empty stack leaves the flags alone rather than going negative.
+    assert_eq!(keyboard(b"\x1b[<u\x1b[<u\x1b[<u").kitty_flags, None);
+
+    // Each screen buffer keeps its own stack, as the reducer does.
+    let split = keyboard(b"\x1b[>1u\x1b[?1049h\x1b[>7u\x1b[?1049l");
+    assert_eq!(
+        split.kitty_flags,
+        Some(1),
+        "leaving the alternate buffer restores the primary buffer's negotiation"
     );
 }

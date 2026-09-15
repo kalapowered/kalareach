@@ -75,6 +75,9 @@ pub const KITTY_QUALIFIED_FLAGS: u8 = 0b0000_1111;
 /// Depth of the Kitty keyboard flag stack.
 const KITTY_STACK_DEPTH: usize = 16;
 
+/// The DEC modes that all name the same thing: whether the alternate buffer is active.
+pub const ALTERNATE_BUFFER_MODES: &[u16] = &[47, 1047, 1049];
+
 /// Every mode the engine tracks, and the keyboard state that goes with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModeState {
@@ -82,9 +85,20 @@ pub struct ModeState {
     dec: BTreeMap<u16, bool>,
     keypad_application: bool,
     modify_other_keys: u8,
-    kitty_flags: Option<u8>,
-    kitty_stack: Vec<u8>,
+    /// The Kitty keyboard state of each buffer: primary first, alternate second.
+    ///
+    /// The protocol gives each screen its own stack, so a full-screen application's negotiation
+    /// cannot leak into the shell's when it exits. One shared stack would leave the shell speaking
+    /// a protocol it never asked for.
+    kitty: [KittyState; 2],
     win32_input: bool,
+}
+
+/// One buffer's Kitty keyboard negotiation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct KittyState {
+    flags: Option<u8>,
+    stack: Vec<u8>,
 }
 
 impl ModeState {
@@ -98,6 +112,9 @@ impl ModeState {
         for mode in TRACKED_DEC_MODES {
             dec.insert(*mode, matches!(mode, 7 | 12 | 25));
         }
+        for mode in ALTERNATE_BUFFER_MODES {
+            dec.insert(*mode, false);
+        }
         let mut ansi = BTreeMap::new();
         for mode in TRACKED_ANSI_MODES {
             ansi.insert(*mode, false);
@@ -107,8 +124,7 @@ impl ModeState {
             dec,
             keypad_application: false,
             modify_other_keys: 0,
-            kitty_flags: None,
-            kitty_stack: Vec::new(),
+            kitty: [KittyState::default(), KittyState::default()],
             win32_input: false,
         }
     }
@@ -128,8 +144,15 @@ impl ModeState {
                     self.win32_input = enabled;
                     return true;
                 }
-                // Modes 1047, 1048 and 1049 combine buffer switching with the saved cursor; the
-                // canonical grid owns that, so only the observable flag is recorded here.
+                // Modes 47, 1047 and 1049 all name one thing: whether the alternate buffer is
+                // active. Recording them separately would let the tracker disagree with the grid
+                // about which screen is showing.
+                if ALTERNATE_BUFFER_MODES.contains(&mode) {
+                    for alias in ALTERNATE_BUFFER_MODES {
+                        self.dec.insert(*alias, enabled);
+                    }
+                    return true;
+                }
                 match self.dec.get_mut(&mode) {
                     Some(slot) => {
                         *slot = enabled;
@@ -219,36 +242,61 @@ impl ModeState {
     }
 
     /// Records a `modifyOtherKeys` resource change. Only resource 4 is qualified.
-    pub const fn set_modify_other_keys(&mut self, resource: u8, value: u8) -> bool {
-        if resource != 4 {
-            return false;
+    ///
+    /// `CSI > m` with no resource resets every resource to its initial value, and `CSI > 4 m` with
+    /// no value resets that one. Both mean level zero here.
+    pub const fn set_modify_other_keys(&mut self, resource: Option<u8>, value: Option<u8>) -> bool {
+        match resource {
+            None => {
+                self.modify_other_keys = 0;
+                true
+            }
+            Some(4) => {
+                self.modify_other_keys = match value {
+                    None => 0,
+                    Some(level) if level > 2 => 2,
+                    Some(level) => level,
+                };
+                true
+            }
+            Some(_) => false,
         }
-        self.modify_other_keys = if value > 2 { 2 } else { value };
-        true
+    }
+
+    /// Which buffer's keyboard negotiation is in force.
+    fn kitty_slot(&self) -> usize {
+        usize::from(self.is_set(ModeKind::Dec, 1049))
     }
 
     /// The active Kitty keyboard flags, when the protocol is in use.
     #[must_use]
     pub fn kitty_flags(&self) -> Option<u8> {
-        self.kitty_flags
+        self.kitty[self.kitty_slot()].flags
     }
 
     /// Pushes Kitty keyboard flags, keeping only the qualified bits.
     pub fn push_kitty(&mut self, flags: u8) {
-        if self.kitty_stack.len() >= KITTY_STACK_DEPTH {
-            self.kitty_stack.remove(0);
+        let slot = self.kitty_slot();
+        let state = &mut self.kitty[slot];
+        if state.stack.len() >= KITTY_STACK_DEPTH {
+            state.stack.remove(0);
         }
-        self.kitty_stack.push(self.kitty_flags.unwrap_or(0));
-        self.kitty_flags = Some(flags & KITTY_QUALIFIED_FLAGS);
+        state.stack.push(state.flags.unwrap_or(0));
+        state.flags = Some(flags & KITTY_QUALIFIED_FLAGS);
     }
 
     /// Pops `count` entries from the Kitty keyboard flag stack.
+    ///
+    /// The protocol's default is one entry, and so is an explicit zero, because a parameter of zero
+    /// takes the sequence's default.
     pub fn pop_kitty(&mut self, count: usize) {
+        let slot = self.kitty_slot();
+        let state = &mut self.kitty[slot];
         for _ in 0..count.max(1) {
-            match self.kitty_stack.pop() {
-                Some(previous) => self.kitty_flags = Some(previous),
+            match state.stack.pop() {
+                Some(previous) => state.flags = Some(previous),
                 None => {
-                    self.kitty_flags = None;
+                    state.flags = None;
                     break;
                 }
             }
@@ -258,13 +306,15 @@ impl ModeState {
     /// Sets the Kitty keyboard flags in place, honouring the set, or, and and modes.
     pub fn set_kitty(&mut self, flags: u8, mode: u8) {
         let qualified = flags & KITTY_QUALIFIED_FLAGS;
-        let current = self.kitty_flags.unwrap_or(0);
+        let slot = self.kitty_slot();
+        let state = &mut self.kitty[slot];
+        let current = state.flags.unwrap_or(0);
         let next = match mode {
             2 => current | qualified,
             3 => current & !qualified,
             _ => qualified,
         };
-        self.kitty_flags = Some(next);
+        state.flags = Some(next);
     }
 
     /// The encoding an input path must produce to control this application.
@@ -273,7 +323,7 @@ impl ModeState {
     /// application does not accept.
     #[must_use]
     pub fn keyboard_encoding(&self) -> KeyboardEncoding {
-        match self.kitty_flags {
+        match self.kitty_flags() {
             Some(flags) if flags != 0 => KeyboardEncoding::Kitty(flags),
             _ => {
                 if self.modify_other_keys > 0 {
@@ -292,19 +342,32 @@ impl ModeState {
 
     /// Applies a soft reset.
     ///
-    /// DECSTR returns the primary screen, which is what the canonical grid does, so the tracked
-    /// buffer modes go with it. The backend's own input mode survives, because DECSTR comes from
-    /// the application and the backend is not the application.
+    /// DECSTR touches a named set of state and leaves the rest alone, and the tracker resets
+    /// exactly what the canonical grid resets. Resetting more would put the two out of step in the
+    /// other direction, which is just as wrong as resetting less.
+    ///
+    /// The set is: application cursor keys (1), reverse video (5), origin mode (6), autowrap (7,
+    /// which DECSTR sets rather than clears, following xterm), reverse wraparound (45), the keypad
+    /// (66), left and right margin mode (69), insert mode (4), the alternate buffer, the character
+    /// sets and `modifyOtherKeys`. Line feed mode, the cursor modes, the mouse modes, bracketed
+    /// paste, synchronised output and the backend's own input mode all survive.
     pub fn soft_reset(&mut self) {
-        let win32 = self.win32_input;
-        *self = Self::new();
-        self.win32_input = win32;
+        for mode in [1u16, 5, 45, 69] {
+            self.dec.insert(mode, false);
+        }
+        self.dec.insert(7, true);
+        self.set_keypad_application(false);
+        self.ansi.insert(4, false);
+        for alias in ALTERNATE_BUFFER_MODES {
+            self.dec.insert(*alias, false);
+        }
+        self.modify_other_keys = 0;
     }
 
-    /// The Kitty keyboard flag stack, oldest first, for a snapshot.
+    /// The active buffer's Kitty keyboard flag stack, oldest first, for a snapshot.
     #[must_use]
     pub fn kitty_stack(&self) -> &[u8] {
-        &self.kitty_stack
+        &self.kitty[self.kitty_slot()].stack
     }
 
     /// Restores the keyboard negotiation state from a snapshot.
@@ -315,9 +378,11 @@ impl ModeState {
         kitty_stack: Vec<u8>,
     ) {
         self.modify_other_keys = modify_other_keys.min(2);
-        self.kitty_flags = kitty_flags.map(|flags| flags & KITTY_QUALIFIED_FLAGS);
-        self.kitty_stack = kitty_stack;
-        self.kitty_stack.truncate(KITTY_STACK_DEPTH);
+        let slot = self.kitty_slot();
+        let state = &mut self.kitty[slot];
+        state.flags = kitty_flags.map(|flags| flags & KITTY_QUALIFIED_FLAGS);
+        state.stack = kitty_stack;
+        state.stack.truncate(KITTY_STACK_DEPTH);
     }
 
     /// Every tracked mode and its value, for a snapshot.

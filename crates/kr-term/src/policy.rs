@@ -70,8 +70,8 @@ pub struct Outcome {
     pub side_effect: Option<SideEffectKind>,
     /// Why a side effect was refused, when one was.
     pub refusal: Option<SideEffectRefusal>,
-    /// A reply the engine owes without consulting any client, such as an empty clipboard read.
-    pub immediate_reply: Option<Vec<u8>>,
+    /// A clipboard read the profile answers itself, without consulting any client.
+    pub clipboard_answer: Option<ClipboardSelection>,
     /// The diagnostic to record, when one is owed.
     pub diagnostic: Option<(DiagnosticKind, String)>,
     /// What direct mode may do with the original bytes.
@@ -86,7 +86,7 @@ impl Outcome {
             answer: false,
             side_effect: None,
             refusal: None,
-            immediate_reply: None,
+            clipboard_answer: None,
             diagnostic: None,
             disposition,
         }
@@ -137,7 +137,7 @@ impl Policy {
             answer: false,
             side_effect: None,
             refusal: None,
-            immediate_reply: None,
+            clipboard_answer: None,
             diagnostic,
             disposition: event.disposition,
         }
@@ -189,11 +189,9 @@ impl Policy {
         if payload == b"?" {
             return match self.side_effects.clipboard_read {
                 ClipboardReadPolicy::EmptyResponse => Outcome {
-                    // The answer is empty and comes from here, so no client is consulted and no
-                    // clipboard content leaves any device.
-                    immediate_reply: Some(
-                        format!("\x1b]52;{};\x1b\\", char::from(selection.code())).into_bytes(),
-                    ),
+                    // The answer is empty and comes from the broker, so no client is consulted and
+                    // no clipboard content leaves any device.
+                    clipboard_answer: Some(selection),
                     ..Outcome::withheld(DirectDisposition::Withhold)
                 },
                 ClipboardReadPolicy::LeaseHolder => Outcome {

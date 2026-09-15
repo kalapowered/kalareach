@@ -65,24 +65,81 @@ pub fn is_zero_width(scalar: char) -> bool {
     grapheme_column_width(text, Some(&UnicodeModel::KR_VT_1.to_library())) == 0
 }
 
-/// Whether `scalar` continues the cluster that `previous` was part of.
+/// Whether the pinned grid library would join `scalar` to the cell `previous` started.
 ///
-/// Three things continue a cluster: a scalar with no width of its own, a scalar after a zero-width
-/// joiner, and the second half of a regional-indicator pair. The lexer uses this to decide how much
-/// of a text run to hold back, because the next read may carry more of the same cluster.
+/// The profile's width model gives every scalar with a width of its own a cell of its own. The
+/// library's cluster reducer is more modern than that: it joins an emoji sequence into one cell.
+/// Three joins matter, because in each the scalar has a width of its own under this model:
+///
+/// * a scalar after a zero-width joiner,
+/// * an emoji modifier, which the library folds into the emoji before it,
+/// * the second half of a regional-indicator pair.
+///
+/// Text is cut before each of these before it reaches the library, so the library never sees the
+/// two scalars in one call and the cell count follows this model rather than the library's.
 #[must_use]
-pub fn continues_cluster(previous: Option<char>, scalar: char) -> bool {
-    if is_zero_width(scalar) {
+pub fn joins_previous(previous: char, scalar: char) -> bool {
+    if previous == ZERO_WIDTH_JOINER {
         return true;
     }
-    let Some(previous) = previous else {
-        return false;
-    };
-    if previous == ZERO_WIDTH_JOINER {
+    if ('\u{1f3fb}'..='\u{1f3ff}').contains(&scalar) {
         return true;
     }
     let regional = |value: char| ('\u{1f1e6}'..='\u{1f1ff}').contains(&value);
     regional(previous) && regional(scalar)
+}
+
+/// Whether any scalar in `text` could make the library join two cells.
+///
+/// Every joining scalar is outside ASCII, so ordinary output answers this without decoding.
+#[must_use]
+pub fn may_join(text: &str) -> bool {
+    !text.is_ascii()
+}
+
+/// Byte offsets at which `text` must be cut before it reaches the grid library.
+///
+/// Each offset is the start of a scalar the library would otherwise fold into the cell before it.
+pub fn split_points(text: &str) -> impl Iterator<Item = usize> + '_ {
+    let mut previous: Option<char> = None;
+    text.char_indices().filter_map(move |(index, scalar)| {
+        let cut = match previous {
+            Some(previous) if !is_zero_width(scalar) && joins_previous(previous, scalar) => {
+                Some(index)
+            }
+            _ => None,
+        };
+        previous = Some(scalar);
+        cut
+    })
+}
+
+/// Byte length of the run of zero-width scalars at the start of `text`.
+///
+/// These belong to whatever the previous text run ended with, which may already be on the screen.
+#[must_use]
+pub fn leading_zero_width(text: &str) -> usize {
+    text.char_indices()
+        .find(|&(_, scalar)| !is_zero_width(scalar))
+        .map_or(text.len(), |(index, _)| index)
+}
+
+/// Byte offset where the last cell of `text` starts.
+///
+/// A cell is one scalar with a width of its own, plus the zero-width scalars after it. `text` must
+/// not be empty.
+#[must_use]
+pub fn last_cell_start(text: &str) -> usize {
+    if text.is_ascii() {
+        return text.len() - 1;
+    }
+    let mut start = 0;
+    for (index, scalar) in text.char_indices() {
+        if !is_zero_width(scalar) {
+            start = index;
+        }
+    }
+    start
 }
 
 /// One accessor the profile needs and the pinned revision does not expose.
@@ -125,9 +182,16 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          discouraged.",
         "The width model is configuration, not a fork: generation 9 with narrow ambiguous \
          characters is exactly the pinned kr-vt/1 model.",
-        "Grapheme clustering, in-band resize and DECCOLM never reach the library, because the \
-         policy layer classifies them before the reducer sees anything. The library's own support \
-         for them is therefore not part of the profile.",
+        "In-band resize and DECCOLM never reach the library, because the policy layer classifies \
+         them before the reducer sees anything. The library's own support for them is therefore \
+         not part of the profile.",
+        "The library's cluster reducer runs on ordinary text and is more modern than the pinned \
+         width model: it folds an emoji sequence into one cell where this model gives each scalar \
+         with a width of its own a cell of its own. The qualified change is in what the library is \
+         given, not in the library: a text run is cut before every scalar the reducer would fold, \
+         so the two never arrive in the same call and the cell count follows the pinned model. \
+         Zero-width scalars are left where they are, because folding those is exactly what the \
+         model asks for.",
         "Raster graphics are disabled in configuration and no image sequence is ever forwarded, so \
          the library's sixel, iTerm2 and Kitty image paths stay unreachable.",
         "The library is built with a writer that accepts no bytes. Every reply comes from the \
@@ -136,13 +200,16 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          forwarded. The mapping is therefore checked by what the library does with it rather than \
          by whether it parsed.",
         "The library clusters the text of one call to its action interface, so the engine holds \
-         the final scalar of a text run until it knows what follows. Without that, the same bytes \
-         would produce different screens depending on where a read happened to split them.",
+         the final cell of a text run until it knows what follows, and draws that cell again with \
+         the marks on it when a combining mark arrives after the screen has settled. Without \
+         both, the same bytes would produce different screens depending on where a read happened \
+         to split them, or on whether the stream went quiet in the middle of a cell.",
     ],
     direct_mode_constraints: &[
-        "A grapheme cluster takes one cell. A ZWJ emoji sequence occupies two cells even though \
-         the profile does not advertise mode 2027, and a terminal without it would draw four. A \
-         physical profile qualified for direct mode has to cluster the same way.",
+        "Cells follow the pinned legacy codepoint-width model, so a multi-scalar emoji sequence \
+         takes one cell per scalar that has a width of its own. A physical terminal that applies \
+         its own grapheme clustering to the same bytes draws fewer cells and every later column \
+         on the row disagrees, so it is not qualified for direct mode whatever it reports.",
         "A wide cell may overhang the right margin. Writing a two-cell character in the last \
          column leaves a row one cell wider than the grid and sets the pending wrap, where xterm \
          blanks the last column and wraps the character. A projected renderer clips or safely \
@@ -156,10 +223,20 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
                       next character it places",
         },
         RequiredPatch {
-            state: "TerminalState::saved_cursor() as a shared reference with public fields",
-            reason: "section 8 lists saved cursors among the state a snapshot restores",
+            state: "TerminalState::saved_cursor() as a shared reference, with the saved rendition \
+                    and character sets among its public fields",
+            reason: "section 8 lists saved cursors among the state a snapshot restores, and a \
+                     saved cursor that carries only a position restores the wrong colours",
             interim: "the snapshot carries None; a restored session behaves as though nothing was \
                       saved until the application saves again",
+        },
+        RequiredPatch {
+            state: "TerminalState::inactive_screen(), the buffer that is not active",
+            reason: "section 8 requires a restoration sequence to reproduce both buffer states, \
+                     and the accessor the revision exposes returns whichever buffer is active",
+            interim: "the snapshot carries the active buffer and None for the other; a client that \
+                      reconnects during a full-screen application has no primary-buffer content \
+                      until that application exits and the shell redraws",
         },
     ],
 };

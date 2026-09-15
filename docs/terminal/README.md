@@ -159,17 +159,38 @@ Nothing changes inside an envelope. A query at depth three is still answered by 
 never forwarded. What does change is the disposition: an envelope is consumed, so its decoded
 display and mode events require projection rather than forwarding.
 
-### Reads and clusters
+### Cells, reads and combining marks
 
-A text run holds back its final grapheme cluster until the next read. Without that, `e` and its
-combining acute would land in different calls when the kernel split the read between them, and the
-mark would be lost; identical bytes would produce different screens depending on how the output
-arrived. `Engine::quiesce` releases the held cluster, and the session loop calls it when a read
-returns nothing. A snapshot calls it itself, so a settled screen is always what a snapshot
-describes.
+kr-vt/1 uses a pinned legacy codepoint-width model: every scalar that has a width of its own takes
+that many cells, ambiguous characters are one cell, and a zero-width scalar takes none and belongs
+to the cell before it. A multi-scalar emoji sequence therefore takes one cell per scalar that has a
+width: U+1F469 U+200D U+1F4BB is four cells, not two, and a thumbs-up with a skin-tone modifier is
+four, not two. The profile does not advertise mode 2027 and does not pretend to implement it.
 
-A cluster is bounded at 64 bytes, which is the per-cell content bound: past it the cluster ends and
-the next scalar starts a new one, so a run of combining marks cannot become one unbounded cell.
+The grid library's own cluster reducer is more modern than that. Three joins matter, because in each
+the second scalar has a width of its own: a scalar after a zero-width joiner, an emoji modifier, and
+the second half of a regional-indicator pair. The qualified change is in what the library is given
+rather than in the library: a text run is cut before each of those, so the two scalars never arrive
+in the same call and the cell count follows the pinned model. Cutting costs nothing on ordinary
+output, because every joining scalar is outside ASCII.
+
+Three rules keep the answer the same however the reads fall.
+
+1. A text run holds back its final cell until the next read, so `e` and a combining acute that
+   arrive in different reads still land in one cell.
+2. `Engine::quiesce` releases that cell, and the session loop calls it when a read returns nothing.
+   A snapshot calls it itself and hands back the output the settling produced, so a settled screen
+   is what the snapshot describes and a direct attachment still receives those bytes.
+3. A combining mark that arrives *after* the cell has been drawn joins it anyway: the grid draws the
+   cell again with the mark on it, in place, which the width model guarantees cannot move anything
+   beside it. Without this, quiescing between two scalars would lose the mark.
+
+The result is checked by feeding every case one byte at a time, settling the screen after each byte,
+and requiring the same screen as the single-read answer.
+
+A cell is bounded at 64 bytes, which is the per-cell content bound: past it the cell ends and the
+next scalar starts a new one, so a run of combining marks cannot become one unbounded cell. The
+bound also stops the redraw above from growing a cell without limit across quiet periods.
 
 ## The canonical grid
 
@@ -212,35 +233,47 @@ The revision serves kr-vt/1 for these reasons.
    false }` is exactly the pinned kr-vt/1 model: the last table generation before the Unicode 14
    emoji presentation selectors changed the width of existing sequences, with ambiguous characters
    one cell and combining characters none.
-3. Grapheme clustering, in-band resize and DECCOLM never reach it, because the policy layer
-   classifies them before the reducer sees anything. Whatever the library supports there is not part
-   of the profile.
+3. In-band resize and DECCOLM never reach it, because the policy layer classifies them before the
+   reducer sees anything. Whatever the library supports there is not part of the profile.
+   Clustering is different: ordinary text does reach its cluster reducer, so the text is cut before
+   the joins that would disagree with the pinned width model. See "Cells, reads and combining
+   marks".
 4. It is constructed with a writer that accepts bytes and delivers none, and counts them. Every
    reply comes from the broker, and every fixture fails if that count is not zero.
 5. It clusters the text of one call to its action interface, which is why the engine holds a text
-   run's final cluster until it knows what follows.
+   run's final cell until it knows what follows, and why a mark arriving later is applied by
+   drawing that cell again.
 
 The Unicode data behind the width model is pinned by the same revision: `emoji-data.txt` dated
 2020-01-28 and `emoji-variation-sequences-14.0.0.txt` dated 2021-06-08.
 
 #### What the revision needs before the profile is complete
 
-Two pieces of state section 8 lists among what a snapshot restores are not reachable from the pinned
-revision. Both need the same narrow published patch: a public accessor.
+Three pieces of state section 8 lists among what a snapshot restores are not reachable from the
+pinned revision. All three need the same narrow published patch: a public accessor.
 
 | State | Why the profile needs it | What happens until then |
 | --- | --- | --- |
-| `TerminalState::pending_wrap()` | Section 8 lists pending wrap among the restored state | The snapshot carries `None`; a reconnecting client re-derives it from the next character it places, which costs that character's position and nothing else |
-| `TerminalState::saved_cursor()` as a shared reference with public fields | Section 8 lists saved cursors among the restored state | The snapshot carries `None`; a restored session behaves as though nothing was saved until the application saves again |
+| `TerminalState::pending_wrap()` | Section 8 lists pending wrap among the restored state | The snapshot carries `None`; a reconnecting client re-derives it from the next character it places. At the bottom-right corner that character can change what scrolls, so this is a real gap and not a cosmetic one |
+| `TerminalState::saved_cursor()` as a shared reference, with the saved rendition and character sets among its public fields | Section 8 lists saved cursors among the restored state, and a saved cursor carrying only a position restores the wrong colours | The snapshot carries `None`; a restored session behaves as though nothing was saved until the application saves again |
+| `TerminalState::inactive_screen()` | Section 8 requires a restoration sequence to reproduce **both** buffer states, and the accessor the revision exposes returns whichever buffer is active | The snapshot carries the active buffer's rows and `None` for the other. A client that reconnects while a full-screen application is running gets that application's screen and no primary-buffer content until the application exits and the shell redraws |
+
+The last one is worth being plain about. The worker does maintain both buffers, because the library
+holds both; what is missing is a way to read the one that is not showing. Copying the primary
+buffer's rows aside on every switch would be a second copy of state that can drift from the first,
+which is the failure the single-reducer rule exists to prevent. So the gap is declared rather than
+papered over.
 
 #### What constrains the direct compatibility profile
 
 Two behaviours differ from xterm. Neither is a defect in the canonical state, and both mean a
 physical terminal has to be qualified against them before direct mode is offered.
 
-- **A grapheme cluster takes one cell.** A ZWJ emoji sequence such as U+1F469 U+200D U+1F4BB
-  occupies two cells even though the profile does not advertise mode 2027, and a terminal without it
-  would draw four. `fixtures/terminal/width.json` pins both margins of this case.
+- **Cells follow the pinned width model, not the terminal's own clustering.** U+1F469 U+200D
+  U+1F4BB takes four cells here. A physical terminal that applies its own grapheme clustering draws
+  two, and every later column on that row disagrees, so it is not qualified for direct mode whatever
+  it reports. `fixtures/terminal/width.json` pins both margins of this case, along with emoji
+  modifiers, regional-indicator pairs and keycap sequences.
 - **A wide cell may overhang the right margin.** Writing a two-cell character in the last column of
   a five-column grid leaves a six-cell row and sets the pending wrap, where xterm blanks the last
   column and wraps the character. The fixture records the canonical result, and a projected renderer
@@ -347,14 +380,17 @@ event that a person can see later. There is no broadcast.
 | BEL | One bell to the lease holder. Never replayed, never broadcast |
 | OSC 9 (message) | Notification |
 | OSC 9 ; 4 | Progress report |
-| OSC 99 | Notification |
+| OSC 99 | Notification, when its metadata is inside the qualified subset |
 | OSC 777 ; notify | Notification |
 | OSC 52 write | Clipboard write to the lease holder, under its own local policy |
 | OSC 52 read | Empty response by default, sent without consulting any client |
 
-Subcommands are recognised explicitly. An OSC 9 with an unrecognised numeric subcommand, an OSC 777
-that is not `notify`, an OSC 99 without a payload, an OSC 9 progress report with a state outside
-0 to 4: all `X`.
+Subcommands are recognised explicitly, and a value that is present and invalid is never confused
+with one that was left out. An OSC 9 with an unrecognised numeric subcommand, an OSC 777 that is not
+`notify`, an OSC 99 without a payload, an OSC 9 progress report whose state is outside 0 to 4 or is
+not a number at all, a progress percentage above 100: all `X`. OSC 99 metadata is checked key by
+key, and the qualified keys are the identifier, the payload part, the done and encoding flags, the
+urgency and the display condition; anything else, including a notification action, is `X`.
 
 OSC 52 has two bounds. The encoded string is bounded at 1 MiB in the lexer, so a larger one is
 discarded as an oversized control string and never becomes a clipboard operation at all. Inside that
@@ -380,8 +416,14 @@ tracked mode, the keypad mode, the keyboard protocol an input encoder has to rep
 and the virtual title stack, the hyperlink ranges, the whole palette with its source, and paged rows
 with stable identifiers and wrap markers.
 
-Pending wrap and the saved cursor are the two fields the pinned library does not expose; see the
-narrow patch above.
+Pending wrap, the saved cursor and the inactive buffer's rows are the three fields the pinned
+library does not expose; see the narrow patch above. Each is `None` rather than a plausible-looking
+default, because a client that is told a saved cursor is at the origin will restore it there.
+
+The cursor a snapshot names is the committed output cursor, not the read offset: it is the point
+every delivered event has reached. Taking a snapshot settles the held cell, and `Engine::snapshot`
+returns what that settling produced alongside the snapshot, so a direct attachment that is already
+forwarding still receives those bytes instead of silently missing them.
 
 ### Restoration cannot do anything twice
 
@@ -427,7 +469,7 @@ linked rows would otherwise pass the bound several times over.
 | Rows | 1 to 1,024 |
 | Cells | 1 to 262,144 |
 | One control sequence's retained bytes | 256 |
-| One grapheme cluster, which is one cell's content | 64 bytes |
+| One cell's content | 64 bytes |
 | In-memory historical rows | 8 MiB per session |
 | Distinct hyperlink targets | 4,096 per session |
 | Canonical screens, metadata and per-cell storage | 64 MiB per session |
@@ -441,9 +483,17 @@ not fit is refused before the grid is touched, and the current grid is unchanged
 
 The historical-row bound is enforced rather than reported. The engine measures the retained rows
 periodically, and when they pass the bound it lowers the library's scrollback row count so older
-rows are evicted as new ones arrive. Measuring means walking the scrollback, so doing it on every
-read would cost more than the bound saves; every 64 reads keeps the overshoot to a fraction of the
-cache.
+rows are evicted as new ones arrive. The new row count is proportional to the overshoot, so the
+retained rows converge back under the bound over the following rows rather than oscillating.
+Measuring means walking the scrollback, so doing it on every read would cost more than the bound
+saves; every 64 reads keeps the overshoot to a fraction of the cache.
+
+What the budget records is what the rows actually cost, not what they are allowed to cost. Recording
+the bound instead would make a session that is over its cache look exactly like one that is at it,
+and the reading that matters most is the one taken while the cache is too big. While eviction
+catches up, `FeedOutcome::resident_pressure` says so on every feed. It is a degradation rather than
+a failure, and it is reported there rather than only as a diagnostic, because diagnostics are rate
+limited and this is the one a caller must not miss.
 
 A control-sequence parameter is clamped to 65,535 before it reaches the grid. A parameter is a
 repeat count, a column or a tab stop, and the grid is at most 2,048 by 1,024, so a larger value
@@ -468,11 +518,20 @@ The database is the ncurses `xterm-256color` entry with these deliberate differe
 | Added | `Tc`, `RGB`, `setrgbf`, `setrgbb` | The profile declares truecolour |
 | Added | `BE`, `BD`, `PS`, `PE` | The profile supports bracketed paste |
 
-Every advertised output capability is lexed, and it has to land in a class the profile supports *and*
-produce actions the canonical grid recognises. The second half is what makes this a check rather
-than a formality: a capability can lex into a perfectly ordinary control sequence that the grid then
-does not understand, and advertising that is the same inconsistency as advertising an `X`. That is
-the `coverage` section of `fixtures/terminal/terminfo-xterm-256color.json` and the test
+Every advertised output capability is expanded, lexed, and has to land in a class the profile
+supports, produce actions the canonical grid recognises, *and* survive the policy layer. Each half
+catches a different inconsistency. A capability can lex into a perfectly ordinary control sequence
+the grid does not understand; it can also lex and adapt cleanly and still ask for something the
+policy layer refuses, which is the same inconsistency as advertising an `X`.
+
+A parameterised capability is a small program, not a template, so the check runs that program. Each
+entry carries representative `arguments` and the expansion is computed from the capability's own
+value, with a terminfo parameter machine that implements the stack, the arithmetic, the conditionals
+and the printf conversions. A sample written out by hand can drift from the value it claims to
+illustrate, and a drifting sample proves the wrong thing: an advertised clipboard capability whose
+sample used an invalid selection once passed a check its real expansion would have failed. The
+expansion each entry produced is in the fixture. That is the `coverage` section of
+`fixtures/terminal/terminfo-xterm-256color.json` and the test
 `every_advertised_capability_has_a_class`.
 
 Input and report capabilities are not checked there, and the `checked` field says so. A key encoding
@@ -492,15 +551,19 @@ A probe is a short, bounded, synchronous conversation with the terminal a person
 of. It happens once, before the application gets any input, and everything about it is designed so
 that no answer can arrive later and be mistaken for something the person typed.
 
-The set is fixed: terminal identity, foreground, background, Kitty keyboard flags, synchronised
-output, and then primary device attributes. DA1 is last because every qualified terminal answers it
-and answers it last, which makes it the terminator: once it arrives, every earlier answer has either
-arrived or is never coming.
+`PROBE_SET` lists every question a probe may ask: terminal identity, foreground, background, Kitty
+keyboard flags, synchronised output, and then primary device attributes. DA1 is last because every
+qualified terminal answers it and answers it last, which makes it the terminator: once it arrives,
+every earlier answer has either arrived or is never coming.
 
-That is why DA1 is the only required answer. Silence to any of the others is itself an answer,
-namely that the terminal does not have the feature, and `ProbeOutcome::unanswered` names them so the
-saved profile does not claim them. Requiring an answer to a question a qualified terminal may
-legitimately ignore would fail the attach for having asked.
+A caller passes the questions its qualified profile actually needs, and DA1 is appended whether or
+not it asked. **Every question the probe asks must be answered.** Silence is not evidence: a
+terminal that ignores a question may be an old build, a multiplexer in the middle, or a terminal
+that would have answered a moment later. Treating silence as "this feature is absent" writes a
+capability record from an absence of information, and the record then outlives the attach. So the
+attach fails with `TERMINAL_PROBE_FAILED`, and that terminal belongs on the `--no-probe` path with a
+saved or conservative profile. A profile that does not need a question omits it before anything is
+transmitted, which is the honest way to not ask.
 
 The whole exchange has one second. A missing terminator fails the attach with
 `TERMINAL_PROBE_FAILED`, restores the outer terminal's modes and reports the failure. It never gives
@@ -544,7 +607,7 @@ interesting part.
 | `classes.json` | One case per class-table row, and the unqualified forms of those rows | KR-REQ-08.15 to 08.39 |
 | `byte-policy.json` | Raw C1, malformed UTF-8, nested passthrough, oversized strings and preludes, escape doubling | KR-ACC-024, KR-REQ-08.45 to 08.47 |
 | `broker.json` | Every query and the exact reply bytes | KR-ACC-001, KR-REQ-08.05 |
-| `width.json` | CJK, combining marks, emoji at both margins, delayed wrap, bottom-row scrolling | KR-REQ-08.39 |
+| `width.json` | CJK, combining marks, emoji at both margins, emoji modifiers, regional indicators, keycap sequences, delayed wrap, bottom-row scrolling | KR-REQ-08.39 |
 | `snapshot.json` | Snapshots mid-output and at alternate-screen transitions | KR-REQ-08.40 |
 | `profile.json` | What kr-vt/1 advertises, what it refuses, the identity bytes, and the library record | KR-REQ-08.10, KR-REQ-04.02, KR-REQ-04.24 |
 | `terminfo-xterm-256color.json` | The pinned database and the class of every advertised capability | KR-REQ-08.11, KR-REQ-08.35 |

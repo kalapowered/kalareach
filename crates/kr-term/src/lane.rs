@@ -38,8 +38,11 @@ pub enum ResponseKind {
     DeviceStatus(u16),
     /// A cursor position report.
     CursorPosition,
-    /// A mode report, identified by the mode.
-    ModeReport(u16),
+    /// A mode report, identified by the spelling and the mode.
+    ///
+    /// The spelling is part of the subject: ANSI mode 4 and DEC private mode 4 are different modes,
+    /// and an answer about one must never stand in for an answer about the other.
+    ModeReport(crate::modes::ModeKind, u16),
     /// A window or geometry report, identified by the window operation.
     GeometryReport(u16),
     /// A setting report, identified by a key derived from the setting name.

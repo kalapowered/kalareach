@@ -28,6 +28,41 @@ pub struct Adapted {
     pub actions: Vec<Action>,
     /// Whether the grid library failed to recognise a sequence the engine classified as `D` or `M`.
     pub unrecognised: bool,
+    /// Whether a parameter was reduced to the largest value the grid could act on.
+    ///
+    /// A clamped sequence does what it can rather than what it said, so its original bytes are not
+    /// forwarded: a physical terminal would take the unclamped value and end up somewhere else.
+    pub clamped: bool,
+}
+
+/// What the canonical grid can act on, which bounds the parameters it is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptContext {
+    /// Canonical rows.
+    pub rows: u32,
+    /// Canonical columns.
+    pub cols: u32,
+}
+
+impl AdaptContext {
+    /// The largest parameter `final_byte` can meaningfully carry.
+    ///
+    /// A cursor movement, an insertion or a scroll cannot do more than fill the screen, so a larger
+    /// value asks for work with no effect. A repeat can wrap and scroll, so it is bounded by the
+    /// whole grid instead of one dimension. Everything else keeps the general bound, because an SGR
+    /// parameter is a colour rather than a distance.
+    #[must_use]
+    pub fn limit_for(self, final_byte: u8) -> i64 {
+        let dimension = i64::from(self.rows.max(self.cols)).max(1);
+        match final_byte {
+            b'@' | b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G' | b'I' | b'J' | b'K' | b'L'
+            | b'M' | b'P' | b'S' | b'T' | b'X' | b'Z' | b'`' | b'a' | b'd' | b'e' | b'g' => {
+                dimension
+            }
+            b'b' => i64::from(self.rows).max(1) * i64::from(self.cols).max(1),
+            _ => MAX_CSI_PARAM,
+        }
+    }
 }
 
 /// The replacement character malformed input becomes.
@@ -39,7 +74,7 @@ const REPLACEMENT: &str = "\u{fffd}";
 /// changes no state. That is the second half of "the reducer cannot apply a sequence that policy
 /// rejected": the policy layer does not offer it, and the adapter would refuse it anyway.
 #[must_use]
-pub fn adapt(event: &Event) -> Adapted {
+pub fn adapt(event: &Event, context: AdaptContext) -> Adapted {
     if !event.class.reaches_grid() || profile_owned(&event.kind) {
         return Adapted::default();
     }
@@ -51,22 +86,23 @@ pub fn adapt(event: &Event) -> Adapted {
                 return Adapted {
                     actions: vec![Action::PrintString(REPLACEMENT.to_owned())],
                     unrecognised: true,
+                    clamped: false,
                 };
             };
             Adapted {
                 actions: vec![Action::PrintString(text.to_owned())],
-                unrecognised: false,
+                ..Adapted::default()
             }
         }
         EventKind::Replacement { count, .. } => Adapted {
             actions: vec![Action::PrintString(REPLACEMENT.repeat(*count))],
-            unrecognised: false,
+            ..Adapted::default()
         },
         EventKind::Control { byte } => Adapted {
             actions: control_code(*byte)
                 .map(|code| vec![Action::Control(code)])
                 .unwrap_or_default(),
-            unrecognised: false,
+            ..Adapted::default()
         },
         EventKind::Esc {
             intermediate,
@@ -78,6 +114,7 @@ pub fn adapt(event: &Event) -> Adapted {
             Adapted {
                 actions: vec![Action::Esc(esc)],
                 unrecognised,
+                clamped: false,
             }
         }
         EventKind::Csi {
@@ -85,7 +122,14 @@ pub fn adapt(event: &Event) -> Adapted {
             truncated,
             final_byte,
         } => {
-            let vt: Vec<VtCsiParam> = params.iter().copied().map(to_vt).collect();
+            let limit = context.limit_for(*final_byte);
+            let mut clamped = false;
+            let mut vt: Vec<VtCsiParam> = params
+                .iter()
+                .copied()
+                .map(|param| to_vt(param, limit, &mut clamped))
+                .collect();
+            normalise(&mut vt, *final_byte);
             let parsed: Vec<Action> = CSI::parse(&vt, *truncated, char::from(*final_byte))
                 .map(Action::CSI)
                 .collect();
@@ -100,6 +144,7 @@ pub fn adapt(event: &Event) -> Adapted {
             Adapted {
                 actions,
                 unrecognised,
+                clamped,
             }
         }
         EventKind::Osc { parts, .. } => {
@@ -113,6 +158,7 @@ pub fn adapt(event: &Event) -> Adapted {
             Adapted {
                 actions: vec![Action::OperatingSystemCommand(Box::new(osc))],
                 unrecognised,
+                clamped: false,
             }
         }
         // No device-control, application-program or discarded sequence is ever `D` or `M` in
@@ -145,11 +191,41 @@ fn profile_owned(kind: &EventKind) -> bool {
             final_byte: b't',
             ..
         } => matches!(CsiView::new(params, b't').first_or(0), 22 | 23),
+        // Keyboard negotiation is an input semantic with one owner: the engine tracks it and the
+        // input encoders read it. Handing it to the grid as well would give it a second owner that
+        // disagrees about resets, pops and defaults.
+        EventKind::Csi {
+            params,
+            final_byte: b'm',
+            ..
+        } => CsiView::new(params, b'm').private == Some(b'>'),
+        EventKind::Csi {
+            params,
+            final_byte: b'u',
+            ..
+        } => matches!(CsiView::new(params, b'u').private, Some(b'>' | b'<' | b'=')),
         EventKind::Osc {
             selector: Some(633),
             ..
         } => true,
         _ => false,
+    }
+}
+
+/// Fills in the defaults the grid library does not supply for itself.
+///
+/// A trailing empty parameter slot means "use the default", and the library reads `CSI 2 ; r` as a
+/// sequence it does not know rather than as a top margin with a default bottom. SGR is the
+/// exception: there a trailing empty slot is a reset, not an omission.
+fn normalise(params: &mut Vec<VtCsiParam>, final_byte: u8) {
+    if final_byte != b'm' {
+        while matches!(params.last(), Some(VtCsiParam::P(b';'))) {
+            params.pop();
+        }
+    }
+    // DECSCUSR with no parameter selects the default cursor style.
+    if final_byte == b'q' && params.as_slice() == [VtCsiParam::P(b' ')] {
+        params.insert(0, VtCsiParam::Integer(0));
     }
 }
 
@@ -215,9 +291,15 @@ fn action_is_unrecognised(action: &Action) -> bool {
 ///
 /// The reducer loops once per unit for repeats, tabs and insertions, so an unclamped parameter
 /// turns five bytes of input into hours of work.
-fn to_vt(param: CsiParam) -> VtCsiParam {
+fn to_vt(param: CsiParam, limit: i64, clamped: &mut bool) -> VtCsiParam {
     match param {
-        CsiParam::Integer(value) => VtCsiParam::Integer(value.clamp(0, MAX_CSI_PARAM)),
+        CsiParam::Integer(value) => {
+            let bounded = value.clamp(0, limit);
+            if bounded != value {
+                *clamped = true;
+            }
+            VtCsiParam::Integer(bounded)
+        }
         CsiParam::Punct(byte) => VtCsiParam::P(byte),
     }
 }

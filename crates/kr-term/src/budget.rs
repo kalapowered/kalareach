@@ -226,17 +226,30 @@ impl SessionBudget {
         self.usage.screens = cost;
     }
 
-    /// Records the current size of the historical row cache, capped at its own bound.
+    /// Records the measured size of the historical row cache.
     ///
-    /// Returns whether rows had to be evicted to stay inside the cache bound.
+    /// The figure recorded is what the rows actually cost, not the bound. Recording the bound
+    /// instead would make a session that is over its cache look exactly like one that is at it,
+    /// and the reading that matters most is the one taken while the cache is too big.
+    ///
+    /// Returns whether the measurement is over the cache bound. Eviction is not instant: the grid
+    /// lowers its scrollback row count and the rows leave as later rows arrive, so the measurement
+    /// falls back under the bound over the following rows rather than in one step.
     pub const fn set_row_cache(&mut self, bytes: u64) -> bool {
-        let capped = if bytes > self.limits.row_cache_bytes {
-            self.limits.row_cache_bytes
-        } else {
-            bytes
-        };
-        self.usage.rows = capped;
-        bytes > capped
+        self.usage.rows = bytes;
+        bytes > self.limits.row_cache_bytes
+    }
+
+    /// Whether the historical row cache is over its bound.
+    #[must_use]
+    pub const fn row_cache_over_budget(&self) -> bool {
+        self.usage.rows > self.limits.row_cache_bytes
+    }
+
+    /// Whether committed usage is over the session budget.
+    #[must_use]
+    pub const fn session_over_budget(&self) -> bool {
+        self.usage.total() > self.limits.session_bytes
     }
 
     /// Records the current size of the hyperlink and title tables.

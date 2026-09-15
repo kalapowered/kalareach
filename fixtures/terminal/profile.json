@@ -28,17 +28,18 @@
   },
   "grid_library": {
     "direct_mode_constraints": [
-      "A grapheme cluster takes one cell. A ZWJ emoji sequence occupies two cells even though the profile does not advertise mode 2027, and a terminal without it would draw four. A physical profile qualified for direct mode has to cluster the same way.",
+      "Cells follow the pinned legacy codepoint-width model, so a multi-scalar emoji sequence takes one cell per scalar that has a width of its own. A physical terminal that applies its own grapheme clustering to the same bytes draws fewer cells and every later column on the row disagrees, so it is not qualified for direct mode whatever it reports.",
       "A wide cell may overhang the right margin. Writing a two-cell character in the last column leaves a row one cell wider than the grid and sets the pending wrap, where xterm blanks the last column and wraps the character. A projected renderer clips or safely replaces the overhanging cell."
     ],
     "notes": [
       "The revision accepts already-parsed actions, so the engine parses once and the library never re-frames a byte. That is what makes a second parse unnecessary rather than merely discouraged.",
       "The width model is configuration, not a fork: generation 9 with narrow ambiguous characters is exactly the pinned kr-vt/1 model.",
-      "Grapheme clustering, in-band resize and DECCOLM never reach the library, because the policy layer classifies them before the reducer sees anything. The library's own support for them is therefore not part of the profile.",
+      "In-band resize and DECCOLM never reach the library, because the policy layer classifies them before the reducer sees anything. The library's own support for them is therefore not part of the profile.",
+      "The library's cluster reducer runs on ordinary text and is more modern than the pinned width model: it folds an emoji sequence into one cell where this model gives each scalar with a width of its own a cell of its own. The qualified change is in what the library is given, not in the library: a text run is cut before every scalar the reducer would fold, so the two never arrive in the same call and the cell count follows the pinned model. Zero-width scalars are left where they are, because folding those is exactly what the model asks for.",
       "Raster graphics are disabled in configuration and no image sequence is ever forwarded, so the library's sixel, iTerm2 and Kitty image paths stay unreachable.",
       "The library is built with a writer that accepts no bytes. Every reply comes from the query broker, and the fixtures fail if the library ever writes one.",
       "A sequence the library marks unspecified, at any nesting, is not applied and not forwarded. The mapping is therefore checked by what the library does with it rather than by whether it parsed.",
-      "The library clusters the text of one call to its action interface, so the engine holds the final scalar of a text run until it knows what follows. Without that, the same bytes would produce different screens depending on where a read happened to split them."
+      "The library clusters the text of one call to its action interface, so the engine holds the final cell of a text run until it knows what follows, and draws that cell again with the marks on it when a combining mark arrives after the screen has settled. Without both, the same bytes would produce different screens depending on where a read happened to split them, or on whether the stream went quiet in the middle of a cell."
     ],
     "repository": "https://github.com/wezterm/wezterm",
     "required_patch": [
@@ -49,8 +50,13 @@
       },
       {
         "interim": "the snapshot carries None; a restored session behaves as though nothing was saved until the application saves again",
-        "reason": "section 8 lists saved cursors among the state a snapshot restores",
-        "state": "TerminalState::saved_cursor() as a shared reference with public fields"
+        "reason": "section 8 lists saved cursors among the state a snapshot restores, and a saved cursor that carries only a position restores the wrong colours",
+        "state": "TerminalState::saved_cursor() as a shared reference, with the saved rendition and character sets among its public fields"
+      },
+      {
+        "interim": "the snapshot carries the active buffer and None for the other; a client that reconnects during a full-screen application has no primary-buffer content until that application exits and the shell redraws",
+        "reason": "section 8 requires a restoration sequence to reproduce both buffer states, and the accessor the revision exposes returns whichever buffer is active",
+        "state": "TerminalState::inactive_screen(), the buffer that is not active"
       }
     ],
     "revision": "699fd77b44641c43476c945054cfae6518dbd632"

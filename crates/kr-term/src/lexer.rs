@@ -35,10 +35,11 @@
 //! sequence stays pending until the next [`Lexer::feed`], and the event that eventually comes out
 //! carries the whole original span.
 //!
-//! A text run also holds back its final scalar, because the next read may carry a combining mark
+//! A text run also holds back its final cell, because the next read may carry a combining mark
 //! that belongs to it. Without that, identical bytes would produce different canonical screens
 //! depending on where the kernel happened to split the read. [`Lexer::flush_tail`] releases it, and
-//! the engine calls that whenever it needs a settled screen.
+//! the engine calls that whenever it needs a settled screen. A mark that arrives after the release
+//! rejoins the cell the grid has already drawn, so settling early costs nothing either.
 
 use crate::event::{
     CsiParam, DirectDisposition, DiscardCause, Event, EventKind, ReplacementCause, SequenceFamily,
@@ -150,14 +151,14 @@ pub struct Lexer {
     pending_len: u64,
     /// Whether retention stopped because the sequence passed its byte bound.
     pending_truncated: bool,
+    /// Whether a control byte other than NUL or DEL appeared inside the sequence prelude.
+    pending_control: bool,
     /// Bytes of the text run under construction.
     text: Vec<u8>,
     text_start: u64,
     text_scalars: usize,
     /// Byte index in `text` where the final grapheme cluster begins.
     text_cluster: usize,
-    /// The scalar before the one being appended, which decides whether a cluster continues.
-    text_previous: Option<char>,
     /// UTF-8 decoding state.
     utf8_needed: u8,
     utf8_seen: u8,
@@ -204,11 +205,11 @@ impl Lexer {
             pending_start: 0,
             pending_len: 0,
             pending_truncated: false,
+            pending_control: false,
             text: Vec::new(),
             text_start: 0,
             text_scalars: 0,
             text_cluster: 0,
-            text_previous: None,
             utf8_needed: 0,
             utf8_seen: 0,
             utf8_acc: 0,
@@ -254,6 +255,18 @@ impl Lexer {
     #[must_use]
     pub const fn pending_len(&self) -> u64 {
         self.pending_len
+    }
+
+    /// Offset of the first byte that has not yet been delivered as an event.
+    ///
+    /// This is the cursor a snapshot, a checkpoint and a live-forwarding handoff all refer to. It
+    /// lags [`Lexer::offset`] by whatever is still being collected: an incomplete sequence, an
+    /// incomplete scalar, or a held grapheme cluster.
+    #[must_use]
+    pub fn committed_offset(&self) -> u64 {
+        self.offset
+            .saturating_sub(self.pending_len)
+            .saturating_sub(self.text.len() as u64)
     }
 
     /// Whether a completed text scalar is being held back for a possible combining mark.
@@ -420,7 +433,6 @@ impl Lexer {
             self.text_start = self.offset;
         }
         self.text_cluster = self.text.len();
-        self.text_previous = Some(char::from(byte));
         self.text.push(byte);
         self.text_scalars += 1;
         self.offset += 1;
@@ -434,13 +446,11 @@ impl Lexer {
         if self.text.is_empty() {
             self.text_start = self.offset;
         }
-        let cluster_len = self.text.len() - self.text_cluster;
-        let continues = crate::unicode::continues_cluster(self.text_previous, scalar)
-            && cluster_len + bytes.len() <= self.limits.max_cluster_bytes;
-        if !continues {
+        // The profile's width model gives a cell to every scalar that has a width of its own, so
+        // only a zero-width scalar joins the cell before it.
+        if !crate::unicode::is_zero_width(scalar) {
             self.text_cluster = self.text.len();
         }
-        self.text_previous = Some(scalar);
         self.text.extend_from_slice(bytes);
         self.text_scalars += 1;
         self.offset += bytes.len() as u64;
@@ -481,9 +491,6 @@ impl Lexer {
         let span = ByteSpan::new(self.text_start, split as u64);
         self.text_start += split as u64;
         self.text_cluster = 0;
-        if self.text.is_empty() {
-            self.text_previous = None;
-        }
         // A finished text run leaves the parser on ground unless a scalar or a sequence is still
         // being collected, which is exactly the condition a live-forwarding handoff tests.
         let ground_after = self.state == State::Ground && self.pending.is_empty();
@@ -570,9 +577,18 @@ impl Lexer {
         if self.text_would_overflow(bytes.len()) {
             self.flush_text(out, false);
         }
+        let scalar = char::from_u32(scalar).unwrap_or(char::REPLACEMENT_CHARACTER);
+        // A cell holds a bounded amount of content. Once a cluster reaches its bound the run ends
+        // here, so the grid starts a new cluster instead of growing one cell without limit.
+        let cluster_len = self.text.len() - self.text_cluster;
+        if !self.text.is_empty()
+            && crate::unicode::is_zero_width(scalar)
+            && cluster_len + bytes.len() > self.limits.max_cluster_bytes
+        {
+            self.flush_text(out, false);
+        }
         // `offset` already counted these bytes while they were pending.
         self.offset -= bytes.len() as u64;
-        let scalar = char::from_u32(scalar).unwrap_or(char::REPLACEMENT_CHARACTER);
         self.push_text_bytes(&bytes, scalar);
     }
 
@@ -620,10 +636,11 @@ impl Lexer {
             }
             0x30..=0x7e => {
                 self.retain(byte);
+                let rejected = self.pending_truncated || self.pending_control;
                 self.finish_pending(
                     EventKind::Esc {
                         intermediate: None,
-                        extra_intermediates: false,
+                        extra_intermediates: rejected,
                         final_byte: byte,
                     },
                     out,
@@ -645,7 +662,8 @@ impl Lexer {
             0x30..=0x7e => {
                 self.retain(byte);
                 let intermediate = self.intermediates.first().copied();
-                let extra = self.extra_intermediates;
+                let extra =
+                    self.extra_intermediates || self.pending_truncated || self.pending_control;
                 self.finish_pending(
                     EventKind::Esc {
                         intermediate,
@@ -761,7 +779,10 @@ impl Lexer {
             self.push_param(CsiParam::Punct(byte));
         }
         let params = core::mem::take(&mut self.params);
-        let truncated = self.truncated || self.extra_intermediates || self.pending_truncated;
+        let truncated = self.truncated
+            || self.extra_intermediates
+            || self.pending_truncated
+            || self.pending_control;
         self.finish_pending(
             EventKind::Csi {
                 params,
@@ -846,6 +867,19 @@ impl Lexer {
 
     fn hook_dcs(&mut self, final_byte: u8) {
         self.finish_param();
+        if self.pending_truncated || self.pending_control || self.extra_intermediates {
+            // The prelude is not one this profile can act on, but its string body still has to be
+            // consumed rather than executed.
+            self.dcs_final = 0;
+            self.string_buf.clear();
+            self.string_parts.clear();
+            self.string_limit = self.limits.max_control_string;
+            self.string_seen = 0;
+            self.string_discarding = Some(DiscardCause::Cancelled);
+            self.string_saw_esc = false;
+            self.state = State::DcsPassthrough;
+            return;
+        }
         self.dcs_final = final_byte;
         self.string_buf.clear();
         self.string_parts.clear();
@@ -886,10 +920,28 @@ impl Lexer {
                 self.terminate_string(family, out);
                 return;
             }
-            if byte == 0x1b && self.escape_doubling_applies() {
+            if byte == 0x18 || byte == 0x1a {
+                // Cancellation outranks a pending terminator, whatever the string is doing.
                 self.retain(byte);
-                self.push_string_payload(0x1b, family);
-                self.push_string_payload(0x1b, family);
+                let seen = self.string_seen;
+                self.emit_discard(family, DiscardCause::Cancelled, seen, out);
+                return;
+            }
+            if byte == 0x1b {
+                if self.escape_doubling_applies() {
+                    self.retain(byte);
+                    self.push_string_payload(0x1b, family);
+                    self.push_string_payload(0x1b, family);
+                    return;
+                }
+                // A second escape is payload for the first and the start of a possible terminator
+                // for itself, so the string stays open on it.
+                self.retain(byte);
+                self.string_seen = self.string_seen.saturating_add(1);
+                if self.string_discarding.is_none() {
+                    self.push_string_payload_byte(0x1b);
+                }
+                self.string_saw_esc = true;
                 return;
             }
             if self.string_discarding.is_some() {
@@ -947,6 +999,15 @@ impl Lexer {
             self.string_parts.push(part);
             return;
         }
+        if self.string_seen > self.string_limit {
+            self.begin_discarding(DiscardCause::Oversized);
+            return;
+        }
+        self.string_buf.push(byte);
+    }
+
+    /// Adds one payload byte that is not a separator and not a bound trigger.
+    fn push_string_payload_byte(&mut self, byte: u8) {
         if self.string_seen > self.string_limit {
             self.begin_discarding(DiscardCause::Oversized);
             return;
@@ -1026,6 +1087,7 @@ impl Lexer {
             self.pending.clear();
             self.pending_len = 0;
             self.pending_truncated = false;
+            self.pending_control = false;
             self.state = State::Ground;
             let decoded = undouble_escapes(&payload[4..]);
             let mut inner = Lexer::nested(self.limits, self.depth + 1);
@@ -1066,6 +1128,7 @@ impl Lexer {
         self.pending.push(byte);
         self.pending_len = 1;
         self.pending_truncated = false;
+        self.pending_control = false;
         self.offset += 1;
         self.eight_bit = false;
     }
@@ -1106,7 +1169,14 @@ impl Lexer {
                 self.retain(byte);
                 self.abandon(out);
             }
-            0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f => self.retain(byte),
+            // NUL and DEL are padding that every terminal discards, so the sequence carries on.
+            0x00 | 0x7f => self.retain(byte),
+            // Any other embedded control would be executed by a physical terminal and not by this
+            // engine, so the sequence becomes an extension: consumed here, forwarded nowhere.
+            0x01..=0x17 | 0x19 | 0x1c..=0x1f => {
+                self.retain(byte);
+                self.pending_control = true;
+            }
             _ => {
                 self.abandon(out);
                 self.ground_byte(byte, out);
@@ -1121,9 +1191,10 @@ impl Lexer {
     fn finish_pending(&mut self, kind: EventKind, out: &mut Vec<Event>) {
         let span = self.pending_span();
         let bytes = core::mem::take(&mut self.pending);
-        let truncated = self.pending_truncated;
+        let truncated = self.pending_truncated || self.pending_control;
         self.pending_len = 0;
         self.pending_truncated = false;
+        self.pending_control = false;
         self.state = State::Ground;
         let direct_safe = !truncated && kind.payload_is_direct_safe();
         let event = self.build(span, SeqBytes::from_vec(bytes), kind, true, direct_safe);
@@ -1188,10 +1259,10 @@ impl Lexer {
         self.pending.clear();
         self.pending_len = 0;
         self.pending_truncated = false;
+        self.pending_control = false;
         self.text.clear();
         self.text_scalars = 0;
         self.text_cluster = 0;
-        self.text_previous = None;
         self.params.clear();
         self.current_param = None;
         self.intermediates.clear();

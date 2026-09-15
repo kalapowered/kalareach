@@ -487,8 +487,8 @@ fn escape_doubling_outside_tmux_abandons_the_string() {
     let events = lex(b"\x1b]2;x\x1b\x1b]52;c;c2VjcmV0\x07");
     assert_eq!(
         classes(&events),
-        "XXS",
-        "the title is abandoned, twice, then OSC 52 is routed"
+        "XS",
+        "the title is abandoned, and the clipboard write is routed on its own"
     );
     assert!(
         events
@@ -605,7 +605,7 @@ fn a_colon_sublist_outside_sgr_is_an_extension() {
 /// Text is clustered the same way however the reads fall.
 #[test]
 fn clustering_does_not_depend_on_read_boundaries() {
-    fn screen(chunks: &[&[u8]]) -> (u32, String) {
+    fn screen(chunks: &[&[u8]], settle_between: bool) -> (u32, String) {
         let mut engine = kr_term::engine::Engine::new(kr_term::engine::EngineConfig {
             size: kr_term::budget::GridSize::new(20, 3),
             ..kr_term::engine::EngineConfig::DEFAULT
@@ -613,6 +613,9 @@ fn clustering_does_not_depend_on_read_boundaries() {
         .expect("engine");
         for chunk in chunks {
             engine.feed(chunk, 0);
+            if settle_between {
+                engine.quiesce(0);
+            }
         }
         engine.quiesce(0);
         let view = kr_term::snapshot::Viewport {
@@ -621,7 +624,7 @@ fn clustering_does_not_depend_on_read_boundaries() {
             left_col: 0,
             cols: 20,
         };
-        let snapshot = engine.snapshot(view, 0);
+        let (snapshot, _) = engine.snapshot(view, 0);
         let text: String = snapshot.rows[0]
             .runs
             .iter()
@@ -630,18 +633,42 @@ fn clustering_does_not_depend_on_read_boundaries() {
         (snapshot.cursor.col, text)
     }
 
-    for whole in [
-        "e\u{0301}X".as_bytes(),
-        "\u{1f469}\u{200d}\u{1f4bb}X".as_bytes(),
-        "a\u{0308}\u{0323}b".as_bytes(),
-    ] {
-        let together = screen(&[whole]);
+    // The cell count each case takes under the pinned legacy codepoint-width model: every scalar
+    // with a width of its own gets a cell, and only a zero-width scalar joins the cell before it.
+    let cases: [(&[u8], u32); 6] = [
+        ("e\u{0301}X".as_bytes(), 2),
+        ("a\u{0308}\u{0323}b".as_bytes(), 2),
+        // A woman, a joiner and a laptop: three scalars, two of which are wide, then ASCII.
+        ("\u{1f469}\u{200d}\u{1f4bb}X".as_bytes(), 5),
+        // An emoji and a skin-tone modifier, which the library would fold into one cell.
+        ("\u{1f44d}\u{1f3fb}X".as_bytes(), 5),
+        // A regional-indicator pair, which the library would fold into one flag. The pinned table
+        // gives each indicator one cell, so the pair is two cells rather than the flag's two.
+        ("\u{1f1ff}\u{1f1e6}X".as_bytes(), 3),
+        // A keycap sequence: a digit, a variation selector and an enclosing mark.
+        ("1\u{fe0f}\u{20e3}X".as_bytes(), 2),
+    ];
+
+    for (whole, cells) in cases {
+        let together = screen(&[whole], false);
+        assert_eq!(
+            together.0, cells,
+            "{whole:?} does not take the cells the width model gives it"
+        );
         for split in 1..whole.len() {
-            let apart = screen(&[&whole[..split], &whole[split..]]);
-            assert_eq!(
-                together, apart,
-                "splitting {whole:?} at {split} changed the screen"
-            );
+            for settle in [false, true] {
+                let apart = screen(&[&whole[..split], &whole[split..]], settle);
+                assert_eq!(
+                    together, apart,
+                    "splitting {whole:?} at {split} (settling: {settle}) changed the screen"
+                );
+            }
         }
+        // One byte at a time, with the screen settled after every one, is the hardest case: every
+        // cell has already been drawn before the scalar that belongs to it arrives.
+        let bytes: Vec<&[u8]> = (0..whole.len())
+            .map(|index| &whole[index..=index])
+            .collect();
+        assert_eq!(together, screen(&bytes, true), "{whole:?} byte by byte");
     }
 }

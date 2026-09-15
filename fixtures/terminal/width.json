@@ -162,7 +162,7 @@
       "cols": 10,
       "covers": "KR-REQ-08.39 emoji followed by ASCII",
       "cursor": {
-        "col": 4,
+        "col": 6,
         "row": 0,
         "visible": true
       },
@@ -176,7 +176,7 @@
       "rows": 3,
       "screen": [
         {
-          "cells": 4,
+          "cells": 5,
           "soft_wrapped": false,
           "stable_id": 0,
           "text": "👩‍💻AB"
@@ -201,7 +201,7 @@
       "cols": 6,
       "covers": "KR-REQ-08.39 emoji at the right margin",
       "cursor": {
-        "col": 1,
+        "col": 3,
         "row": 1,
         "visible": true
       },
@@ -218,13 +218,13 @@
           "cells": 6,
           "soft_wrapped": true,
           "stable_id": 0,
-          "text": "abcd👩‍💻"
+          "text": "abcd👩‍"
         },
         {
-          "cells": 1,
+          "cells": 3,
           "soft_wrapped": false,
           "stable_id": 1,
-          "text": "E"
+          "text": "💻E"
         },
         {
           "cells": 0,
@@ -381,6 +381,162 @@
           "soft_wrapped": false,
           "stable_id": 1,
           "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "active_buffer": "Primary",
+      "at_ground": true,
+      "cols": 10,
+      "covers": "KR-REQ-08.39 an emoji modifier is its own cell",
+      "cursor": {
+        "col": 5,
+        "row": 0,
+        "visible": true
+      },
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "hyperlinks": [],
+      "id": "emoji_modifier",
+      "input": "f09f918df09f8fbb58",
+      "output_cursor": 9,
+      "projection_generation": 1,
+      "rows": 3,
+      "screen": [
+        {
+          "cells": 4,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": "👍🏻X"
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "active_buffer": "Primary",
+      "at_ground": true,
+      "cols": 10,
+      "covers": "KR-REQ-08.39 a regional-indicator pair is two cells",
+      "cursor": {
+        "col": 3,
+        "row": 0,
+        "visible": true
+      },
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "hyperlinks": [],
+      "id": "regional_indicators",
+      "input": "f09f87bff09f87a658",
+      "output_cursor": 9,
+      "projection_generation": 1,
+      "rows": 3,
+      "screen": [
+        {
+          "cells": 2,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": "🇿🇦X"
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "active_buffer": "Primary",
+      "at_ground": true,
+      "cols": 10,
+      "covers": "KR-REQ-08.39 a keycap sequence is one cell",
+      "cursor": {
+        "col": 2,
+        "row": 0,
+        "visible": true
+      },
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "hyperlinks": [],
+      "id": "keycap_sequence",
+      "input": "31efb88fe283a358",
+      "output_cursor": 8,
+      "projection_generation": 1,
+      "rows": 3,
+      "screen": [
+        {
+          "cells": 2,
+          "soft_wrapped": false,
+          "stable_id": 0,
+          "text": "1️⃣X"
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": ""
+        },
+        {
+          "cells": 0,
+          "soft_wrapped": false,
+          "stable_id": 2,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "active_buffer": "Primary",
+      "at_ground": true,
+      "cols": 5,
+      "covers": "KR-REQ-08.39 a mark joins the cell in the last column",
+      "cursor": {
+        "col": 1,
+        "row": 1,
+        "visible": true
+      },
+      "grid_unrecognised": 0,
+      "grid_writes": 0,
+      "hyperlinks": [],
+      "id": "combining_mark_at_the_right_margin",
+      "input": "6162636465cc8166",
+      "output_cursor": 8,
+      "projection_generation": 1,
+      "rows": 3,
+      "screen": [
+        {
+          "cells": 5,
+          "soft_wrapped": true,
+          "stable_id": 0,
+          "text": "abcdé"
+        },
+        {
+          "cells": 1,
+          "soft_wrapped": false,
+          "stable_id": 1,
+          "text": "f"
         },
         {
           "cells": 0,

@@ -204,6 +204,39 @@ fn notifications_and_progress_are_recognised_by_subcommand() {
             .iter()
             .any(|d| d.kind == DiagnosticKind::UnclassifiedSequence)
     );
+
+    // A value that is present and invalid is not the same as one that was left out. Both of these
+    // would otherwise take the omitted form's answer.
+    for input in [
+        b"\x1b]9;4;256\x07".as_slice(),
+        b"\x1b]9;4;x\x07".as_slice(),
+        b"\x1b]9;4;1;101\x07".as_slice(),
+        b"\x1b]99;p=not-a-subcommand;hello\x07".as_slice(),
+        b"\x1b]99;a=run-this;hello\x07".as_slice(),
+    ] {
+        let outcome = engine.feed(input, 0);
+        assert!(
+            outcome.side_effects.is_empty(),
+            "{input:?} became a side effect"
+        );
+        assert!(
+            outcome.forward.is_empty(),
+            "{input:?} reached a physical terminal"
+        );
+    }
+
+    // The qualified forms still work, including the one with no state at all.
+    for input in [
+        b"\x1b]9;4\x07".as_slice(),
+        b"\x1b]9;4;0\x07".as_slice(),
+        b"\x1b]99;i=note-1:p=title;Build\x07".as_slice(),
+    ] {
+        let outcome = engine.feed(input, 0);
+        assert!(
+            !outcome.side_effects.is_empty(),
+            "{input:?} is a qualified notification"
+        );
+    }
 }
 
 /// The reducer cannot apply a sequence policy rejected, even when handed one directly.
@@ -212,6 +245,7 @@ fn the_reducer_refuses_what_policy_refused() {
     let policy = Policy::DEFAULT;
     let mut lexer = Lexer::new();
     let mut events = Vec::new();
+    let context = kr_term::adapter::AdaptContext { rows: 24, cols: 80 };
     // A query, a side effect and an extension: none of them may reach the grid.
     lexer.feed(b"\x1b[c\x07\x1b[?2027h\x1b_Gf=24;AAAA\x1b\\", &mut events);
     lexer.close(&mut events);
@@ -221,7 +255,7 @@ fn the_reducer_refuses_what_policy_refused() {
         assert_ne!(event.class, SequenceClass::Mode);
         assert!(!policy.decide(event).apply_to_grid);
         assert!(
-            kr_term::adapter::adapt(event).actions.is_empty(),
+            kr_term::adapter::adapt(event, context).actions.is_empty(),
             "the adapter produces no action for {event:?}"
         );
     }

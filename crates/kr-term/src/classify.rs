@@ -466,20 +466,89 @@ fn osc1337_is_documented(body: &[u8]) -> bool {
 
 /// OSC 9 carries two conventions: a progress report under subcommand `4`, and a notification body
 /// otherwise. Any other numeric subcommand belongs to a convention kr-vt/1 has not qualified.
+/// A numeric parameter that may be omitted or empty, but not malformed.
+///
+/// `None` is the answer for a value that is present and is not a number, which is a different thing
+/// from a value that was left out.
+fn optional_number(part: Option<&Vec<u8>>) -> Option<u32> {
+    match part {
+        None => Some(0),
+        Some(part) if part.is_empty() => Some(0),
+        Some(part) => core::str::from_utf8(part)
+            .ok()
+            .and_then(|text| text.parse::<u32>().ok()),
+    }
+}
+
+/// Whether OSC 99 notification metadata is inside the qualified subset.
+///
+/// The metadata is a colon-separated list of `key=value` pairs. Only the keys below are qualified,
+/// and each one's value is checked: an unknown key, or a known key with a value outside its set, is
+/// an extension rather than a notification with an unread instruction in it.
+fn osc99_metadata_qualified(metadata: &[u8]) -> bool {
+    if metadata.is_empty() {
+        return true;
+    }
+    metadata.split(|byte| *byte == b':').all(|pair| {
+        let mut halves = pair.splitn(2, |byte| *byte == b'=');
+        let Some(key) = halves.next() else {
+            return false;
+        };
+        let value = halves.next().unwrap_or(b"");
+        match key {
+            // The notification identifier, which groups the parts of one notification.
+            b"i" | b"g" => {
+                !value.is_empty()
+                    && value.len() <= 64
+                    && value
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_')
+            }
+            // Which part of the notification the payload is.
+            b"p" => matches!(value, b"title" | b"body"),
+            // Whether this is the last part, whether the payload is encoded, and the urgency.
+            b"d" | b"e" => matches!(value, b"0" | b"1"),
+            b"u" => matches!(value, b"0" | b"1" | b"2"),
+            // When the notification is shown.
+            b"o" => matches!(value, b"always" | b"unfocused" | b"invisible"),
+            _ => false,
+        }
+    })
+}
+
+/// The OSC 99 notification row.
+fn osc99_class(parts: &[Vec<u8>]) -> SequenceClass {
+    let Some(metadata) = parts.get(1) else {
+        return SequenceClass::Extension;
+    };
+    if parts.len() < 3 || !osc99_metadata_qualified(metadata) {
+        return SequenceClass::Extension;
+    }
+    SequenceClass::SideEffect
+}
+
 fn osc9_class(parts: &[Vec<u8>]) -> SequenceClass {
     let Some(sub) = parts.get(1) else {
         return SequenceClass::Extension;
     };
     if sub.as_slice() == b"4" {
-        // States 0 to 4: none, determinate, error, indeterminate and paused.
-        let state = parts
-            .get(2)
-            .and_then(|part| core::str::from_utf8(part).ok())
-            .and_then(|text| text.parse::<u8>().ok());
-        return match state {
-            Some(0..=4) | None => SequenceClass::SideEffect,
-            Some(_) => SequenceClass::Extension,
+        // States 0 to 4: none, determinate, error, indeterminate and paused. An omitted state is
+        // the documented default; a state that is present and is not one of those is not the same
+        // thing, and must not take the omitted form's answer.
+        let Some(state) = optional_number(parts.get(2)) else {
+            return SequenceClass::Extension;
         };
+        if state > 4 {
+            return SequenceClass::Extension;
+        }
+        // The determinate form carries a percentage.
+        let Some(progress) = optional_number(parts.get(3)) else {
+            return SequenceClass::Extension;
+        };
+        if progress > 100 {
+            return SequenceClass::Extension;
+        }
+        return SequenceClass::SideEffect;
     }
     let numeric = !sub.is_empty() && sub.iter().all(u8::is_ascii_digit);
     if numeric {
@@ -522,13 +591,7 @@ pub fn classify_osc(selector: Option<u32>, parts: &[Vec<u8>]) -> SequenceClass {
         // Row: OSC 9, 99 and 777 notifications and progress. Each subcommand is recognised
         // explicitly; an unknown one is X rather than a side effect of unknown shape.
         9 => osc9_class(parts),
-        99 => {
-            if parts.len() >= 3 {
-                SequenceClass::SideEffect
-            } else {
-                SequenceClass::Extension
-            }
-        }
+        99 => osc99_class(parts),
         777 => {
             if parts.get(1).map(Vec::as_slice) == Some(b"notify") {
                 SequenceClass::SideEffect
@@ -581,28 +644,53 @@ pub fn classify_dcs(params: &[CsiParam], intermediates: &[u8], final_byte: u8) -
     }
 }
 
+/// What the profile does with a sequence it handles itself rather than passing on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopsHere {
+    /// Nothing special: the ordinary rules decide.
+    No,
+    /// The sequence goes no further, and nothing else needs to happen.
+    Withhold,
+    /// The sequence goes no further, but it changed the canonical screen, so the attachment has to
+    /// project to see the result.
+    Projection,
+}
+
 /// Whether a sequence is one the profile handles itself rather than passing on.
 ///
 /// The virtualised title stack is the clearest case. Section 8 requires push and pop to be
 /// virtualised so that they cannot consume the attach client's saved outer title, and forwarding
 /// the raw bytes would do exactly that. The ConPTY win32 input mode is the other: it stops at the
-/// backend that owns it and is never broadcast to a remote client.
-fn stops_here(kind: &EventKind) -> bool {
+/// backend that owns it and is never broadcast to a remote client. A request that names mode 9001
+/// alongside other modes still stops here, so the attachment projects rather than falling out of
+/// step over the modes that did apply.
+fn stops_here(kind: &EventKind) -> StopsHere {
     let EventKind::Csi {
         params,
         truncated,
         final_byte,
     } = kind
     else {
-        return false;
+        return StopsHere::No;
     };
     let csi = CsiView::with_truncation(params, *final_byte, *truncated);
     match csi.final_byte {
-        b't' => matches!(csi.first_or(0), 22 | 23),
-        b'h' | b'l' => {
-            csi.private == Some(b'?') && csi.numbers.contains(&Some(i64::from(MODE_WIN32_INPUT)))
+        b't' if matches!(csi.first_or(0), 22 | 23) => StopsHere::Withhold,
+        b'h' | b'l'
+            if csi.private == Some(b'?')
+                && csi.numbers.contains(&Some(i64::from(MODE_WIN32_INPUT))) =>
+        {
+            if csi.numbers.len() > 1 {
+                StopsHere::Projection
+            } else {
+                StopsHere::Withhold
+            }
         }
-        _ => false,
+        // Keyboard negotiation is an input semantic the profile owns outright. Forwarding it would
+        // leave the terminal encoding keys the engine did not agree to.
+        b'm' if csi.private == Some(b'>') => StopsHere::Withhold,
+        b'u' if matches!(csi.private, Some(b'>' | b'<' | b'=')) => StopsHere::Withhold,
+        _ => StopsHere::No,
     }
 }
 
@@ -617,8 +705,13 @@ pub fn disposition(
     class: SequenceClass,
     needs_projection: bool,
 ) -> DirectDisposition {
-    if !class.reaches_grid() || stops_here(kind) {
+    if !class.reaches_grid() {
         return DirectDisposition::Withhold;
+    }
+    match stops_here(kind) {
+        StopsHere::Withhold => return DirectDisposition::Withhold,
+        StopsHere::Projection => return DirectDisposition::RequireProjection,
+        StopsHere::No => {}
     }
     if needs_projection || matches!(kind, EventKind::Replacement { .. }) {
         return DirectDisposition::RequireProjection;

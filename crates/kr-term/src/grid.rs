@@ -19,16 +19,18 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use wezterm_escape_parser::Action;
+use wezterm_escape_parser::csi::{CSI, Cursor};
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
     Alert, AlertHandler, CellAttributes, Intensity, Terminal, TerminalConfiguration, TerminalSize,
-    Underline, UnicodeVersion,
+    Underline, UnicodeVersion, VerticalAlign,
 };
 
-use crate::adapter::{Adapted, adapt};
-use crate::budget::{GridSize, SessionBudget};
+use crate::adapter::{AdaptContext, Adapted, adapt};
+use crate::budget::{CELL_OVERHEAD_BYTES, GridSize, SessionBudget};
 use crate::error::Result;
-use crate::event::Event;
+use crate::event::{Event, EventKind};
 use crate::palette::Rgb;
 use crate::unicode::UnicodeModel;
 
@@ -126,6 +128,8 @@ pub struct GridConfig {
     pub scrollback_rows: usize,
     /// The pinned Unicode model.
     pub unicode: UnicodeModel,
+    /// Bytes of encoded content one cell may hold.
+    pub cell_bytes: usize,
 }
 
 impl GridConfig {
@@ -133,6 +137,7 @@ impl GridConfig {
     pub const DEFAULT: Self = Self {
         scrollback_rows: 3_500,
         unicode: UnicodeModel::KR_VT_1,
+        cell_bytes: 64,
     };
 }
 
@@ -178,7 +183,9 @@ impl TerminalConfiguration for KrVtConfiguration {
     }
 
     fn enable_kitty_keyboard(&self) -> bool {
-        true
+        // Keyboard negotiation has one owner in this profile, and it is not the grid. Nothing
+        // reaches this path, and leaving it off means nothing ever can.
+        false
     }
 
     fn enable_title_reporting(&self) -> bool {
@@ -246,6 +253,23 @@ pub struct Rendition {
     pub invisible: bool,
     /// Struck through.
     pub strikethrough: bool,
+    /// Overlined.
+    pub overline: bool,
+    /// The underline colour, when it differs from the text.
+    pub underline_colour: Colour,
+    /// Superscript or subscript.
+    pub vertical_align: VerticalPosition,
+}
+
+/// Where a run sits relative to the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerticalPosition {
+    /// On the baseline.
+    Baseline,
+    /// Raised.
+    Superscript,
+    /// Lowered.
+    Subscript,
 }
 
 impl Default for Rendition {
@@ -261,6 +285,9 @@ impl Default for Rendition {
             reverse: false,
             invisible: false,
             strikethrough: false,
+            overline: false,
+            underline_colour: Colour::Default,
+            vertical_align: VerticalPosition::Baseline,
         }
     }
 }
@@ -287,6 +314,8 @@ pub struct GridRow {
     pub stable_id: i64,
     /// Whether the row ends in a soft wrap rather than a hard line break.
     pub soft_wrapped: bool,
+    /// Whether runs were dropped to keep the row inside a page's byte bound.
+    pub truncated: bool,
     /// The runs, left to right.
     pub runs: Vec<Run>,
 }
@@ -301,6 +330,24 @@ pub struct CanonicalGrid {
     size: GridSize,
     config: GridConfig,
     unrecognised: u64,
+    tail: Option<TailCell>,
+    dropped_marks: u64,
+}
+
+/// The cell a text run ended on, so a later combining mark can still join it.
+///
+/// The grid library drops a zero-width grapheme that arrives with nothing before it in the same
+/// call, so a mark that arrives after the screen has settled would be lost. Keeping the cell means
+/// the mark is applied by drawing the cell again with the mark on it, which is what the same bytes
+/// would have produced had they arrived together.
+#[derive(Debug, Clone)]
+struct TailCell {
+    /// The scalars in the cell.
+    text: String,
+    /// How many cells back the cursor is from where it ended.
+    back: u32,
+    /// Where the cursor stood after the cell was drawn.
+    cursor: (u32, u32),
 }
 
 impl core::fmt::Debug for CanonicalGrid {
@@ -354,6 +401,8 @@ impl CanonicalGrid {
             size,
             config,
             unrecognised: 0,
+            tail: None,
+            dropped_marks: 0,
         })
     }
 
@@ -366,15 +415,119 @@ impl CanonicalGrid {
     /// worse than a consumed one: the canonical grid would do something the physical terminal on
     /// the other side would not, or the other way round.
     pub fn apply(&mut self, event: &Event) -> Adapted {
-        let adapted = adapt(event);
+        let adapted = adapt(
+            event,
+            AdaptContext {
+                rows: self.size.rows,
+                cols: self.size.cols,
+            },
+        );
         if adapted.unrecognised {
             self.unrecognised = self.unrecognised.saturating_add(1);
             return adapted;
         }
+        if let EventKind::Text { .. } = &event.kind
+            && let Ok(text) = core::str::from_utf8(event.raw())
+        {
+            self.print(text);
+            return adapted;
+        }
+        // Anything that is not printed text ends the cell, exactly as it would have done inside one
+        // read: the library flushes its own print buffer for the same reason.
+        self.tail = None;
         if !adapted.actions.is_empty() {
             self.terminal.perform_actions(adapted.actions.clone());
         }
         adapted
+    }
+
+    /// Draws a text run as the profile's width model says it should look.
+    ///
+    /// Two things separate this from handing the whole run to the library. The run is cut wherever
+    /// the library would fold two scalars into one cell that this model gives a cell each, and the
+    /// final cell is drawn on its own so that a combining mark in a later read can still reach it.
+    fn print(&mut self, text: &str) {
+        let mut rest = text;
+        let leading = crate::unicode::leading_zero_width(rest);
+        if leading > 0 {
+            let (marks, tail) = rest.split_at(leading);
+            self.rejoin(marks);
+            rest = tail;
+        }
+        if rest.is_empty() {
+            return;
+        }
+        let split = crate::unicode::last_cell_start(rest);
+        let (head, last) = rest.split_at(split);
+        if !head.is_empty() {
+            self.print_cells(head);
+        }
+        let before = self.cursor();
+        self.print_cells(last);
+        let after = self.cursor();
+        self.tail = (after.1 == before.1 && after.0 >= before.0).then(|| TailCell {
+            text: last.to_owned(),
+            back: after.0 - before.0,
+            cursor: after,
+        });
+    }
+
+    /// Draws text that starts a cell, cutting it wherever the library would join two cells.
+    fn print_cells(&mut self, text: &str) {
+        if !crate::unicode::may_join(text) {
+            self.terminal
+                .perform_actions(vec![Action::PrintString(text.to_owned())]);
+            return;
+        }
+        let mut start = 0;
+        let points: Vec<usize> = crate::unicode::split_points(text).collect();
+        for point in points {
+            self.terminal
+                .perform_actions(vec![Action::PrintString(text[start..point].to_owned())]);
+            start = point;
+        }
+        self.terminal
+            .perform_actions(vec![Action::PrintString(text[start..].to_owned())]);
+    }
+
+    /// Adds combining marks to the cell the previous text run ended on.
+    ///
+    /// The cell is drawn again with the marks on it. Its width cannot change, because a zero-width
+    /// scalar adds none, so nothing beside it moves. The marks are dropped when the cursor has
+    /// moved since, which is the same answer the library gives, and when the cell has reached its
+    /// content bound.
+    fn rejoin(&mut self, marks: &str) {
+        let Some(tail) = self.tail.take() else {
+            self.dropped_marks = self.dropped_marks.saturating_add(1);
+            return;
+        };
+        if tail.cursor != self.cursor() || tail.text.len() + marks.len() > self.config.cell_bytes {
+            self.dropped_marks = self.dropped_marks.saturating_add(1);
+            return;
+        }
+        let mut text = tail.text;
+        text.push_str(marks);
+        let mut actions = Vec::with_capacity(3);
+        // Moving right by nothing cancels a pending wrap without moving the cursor, so a cell drawn
+        // in the last column is drawn again where it already is rather than on the next row.
+        actions.push(Action::CSI(CSI::Cursor(Cursor::Right(0))));
+        if tail.back > 0 {
+            actions.push(Action::CSI(CSI::Cursor(Cursor::Left(tail.back))));
+        }
+        actions.push(Action::PrintString(text.clone()));
+        self.terminal.perform_actions(actions);
+        let after = self.cursor();
+        self.tail = (after == tail.cursor).then_some(TailCell {
+            text,
+            back: tail.back,
+            cursor: after,
+        });
+    }
+
+    /// How many combining marks arrived with no cell to join.
+    #[must_use]
+    pub const fn dropped_marks(&self) -> u64 {
+        self.dropped_marks
     }
 
     /// How many approved sequences the grid library did not recognise.
@@ -437,8 +590,10 @@ impl CanonicalGrid {
 
     /// Lowers the scrollback row count so the retained rows fit the byte bound.
     ///
-    /// Returns whether the bound bound. The library evicts as it appends, so this converges over
-    /// the next few rows rather than dropping everything at once.
+    /// Returns whether the cache was over its bound. The library evicts as it appends, so the
+    /// retained rows converge back under the bound over the following rows rather than being
+    /// dropped all at once. The lowered row count is proportional to the overshoot, so the
+    /// sequence converges rather than oscillating.
     pub fn enforce_row_cache(&mut self, bytes: u64, limit: u64) -> bool {
         if bytes <= limit {
             return false;
@@ -610,6 +765,7 @@ impl CanonicalGrid {
                 GridRow {
                     stable_id: i64::try_from(stable).unwrap_or(0),
                     soft_wrapped: line.last_cell_was_wrapped(),
+                    truncated: false,
                     runs: runs_of(line),
                 }
             })
@@ -635,18 +791,24 @@ impl CanonicalGrid {
             .map(|(index, line)| GridRow {
                 stable_id: start.saturating_add(i64::try_from(index).unwrap_or(0)),
                 soft_wrapped: line.last_cell_was_wrapped(),
+                truncated: false,
                 runs: runs_of(line),
             })
             .collect()
     }
 
-    /// Bytes the historical rows are currently using, for the budget.
+    /// Bytes the retained rows are currently using.
+    ///
+    /// This counts the encoded text plus the per-cell bookkeeping the grid keeps for it, because
+    /// the bound in section 8 is on resident state rather than on characters.
     #[must_use]
     pub fn history_bytes(&self) -> u64 {
         let screen = self.terminal.screen();
         let mut bytes = 0u64;
         screen.for_each_phys_line(|_, line| {
-            bytes = bytes.saturating_add(line.as_str().len() as u64);
+            let text = line.as_str().len() as u64;
+            let cells = line.len() as u64;
+            bytes = bytes.saturating_add(text + cells * CELL_OVERHEAD_BYTES);
         });
         bytes
     }
@@ -694,6 +856,13 @@ fn rendition_of(attrs: &CellAttributes) -> Rendition {
         reverse: attrs.reverse(),
         invisible: attrs.invisible(),
         strikethrough: attrs.strikethrough(),
+        overline: attrs.overline(),
+        underline_colour: colour_of(attrs.underline_color()),
+        vertical_align: match attrs.vertical_align() {
+            VerticalAlign::BaseLine => VerticalPosition::Baseline,
+            VerticalAlign::SuperScript => VerticalPosition::Superscript,
+            VerticalAlign::SubScript => VerticalPosition::Subscript,
+        },
     }
 }
 

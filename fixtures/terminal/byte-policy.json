@@ -1000,7 +1000,7 @@
       ],
       "events": [
         {
-          "bytes": "1b5d323b78",
+          "bytes": "1b5d323b781b",
           "class": "X",
           "disposition": "Withhold",
           "eight_bit": false,
@@ -1009,19 +1009,6 @@
           "passthrough_depth": 0,
           "span": [
             0,
-            5
-          ]
-        },
-        {
-          "bytes": "1b",
-          "class": "X",
-          "disposition": "Withhold",
-          "eight_bit": false,
-          "ground_after": true,
-          "kind": "discarded:ControlSequence:Cancelled",
-          "passthrough_depth": 0,
-          "span": [
-            5,
             6
           ]
         },

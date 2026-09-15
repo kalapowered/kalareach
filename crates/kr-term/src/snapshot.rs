@@ -203,8 +203,16 @@ pub struct Snapshot {
     pub hyperlinks: Vec<HyperlinkRange>,
     /// The palette.
     pub palette: PaletteSnapshot,
-    /// The rows, with stable identifiers and wrap markers.
+    /// The rows of the active buffer, with stable identifiers and wrap markers.
     pub rows: Vec<GridRow>,
+    /// The rows of the buffer that is not active.
+    ///
+    /// Section 8 requires restoration to reproduce both buffers. `None` means the pinned grid
+    /// library does not expose the inactive one; see the narrow patch recorded in
+    /// [`crate::unicode::LIBRARY`]. Until it lands, a client that reconnects while a full-screen
+    /// application is running gets that application's screen and no primary-buffer content until
+    /// the application exits and redraws.
+    pub inactive_rows: Option<Vec<GridRow>>,
     /// The oldest row still retained anywhere.
     pub oldest_retained_row: i64,
     /// Whether rows have been evicted since the session started.
@@ -231,6 +239,8 @@ pub struct Delta {
     pub modes: Vec<ModeEntry>,
     /// The titles, when they changed since the base.
     pub title: Option<TitleEntry>,
+    /// The keyboard negotiation, when it changed since the base.
+    pub keyboard: Option<KeyboardSnapshot>,
     /// The palette, when it changed since the base.
     pub palette: Option<PaletteSnapshot>,
     /// The canonical dimensions, when they changed since the base.
