@@ -1133,8 +1133,8 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
     /// Decides whether a candidate may read this invitation's status.
     ///
     /// The authenticated endpoint is what identifies a candidate. The attempt identity is checked
-    /// when the asker has one and is not required, because a candidate whose response was lost
-    /// never learnt it.
+    /// when the asker has one and is not required: a direct candidate whose redemption response
+    /// was lost never learnt it, because that identity is the host's.
     fn candidate_may_view(
         &self,
         attempt_id: Option<AttemptId>,
@@ -1342,8 +1342,9 @@ pub enum StatusViewer<'a> {
     IssuingOwner(&'a OwnerContext),
     /// One candidate, which must ask from the endpoint its own bundle declared.
     Candidate {
-        /// Its attempt, when it learnt one. A candidate whose response was lost has none, and the
-        /// endpoint it authenticated with is what identifies it either way.
+        /// Its attempt. A short-code candidate always has one, because it made it; a direct
+        /// candidate whose redemption response was lost has none, and the endpoint it
+        /// authenticated with is what identifies it either way.
         attempt_id: Option<AttemptId>,
         /// The live connection it is asking over.
         live_peer: &'a dyn LivePeer,
@@ -1405,8 +1406,9 @@ pub fn recover_commitment(
 ///
 /// The candidate proves the endpoint its own bundle declared, which is what identifies it: the
 /// commitment records that key, so the answer reaches the paired device and nobody else. The
-/// attempt identity is checked when the candidate has one and is not required, because a candidate
-/// whose `pair.finish` response was lost never learnt it and is still the device that paired.
+/// attempt identity is checked when the candidate has one and is not required: a direct candidate
+/// whose `pair.redeem` response was lost never learnt it, because that identity is the host's, and
+/// it is still the device that paired. A short-code candidate always has one, because it made it.
 ///
 /// Only a committed pairing is recoverable this way. The endpoint a candidate authenticated with
 /// lives in the invitation object the restart lost, so for anything else there is nothing to tell

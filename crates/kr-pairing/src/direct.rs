@@ -721,8 +721,8 @@ pub enum DirectStatusViewer<'a> {
     IssuingOwner(&'a OwnerContext),
     /// The candidate, which must ask from the endpoint its redemption declared.
     Candidate {
-        /// Its attempt, when it learnt one. A candidate whose response was lost has none, and the
-        /// endpoint it authenticated with is what identifies it either way.
+        /// Its attempt. The host generates it at redemption, so a candidate whose response was
+        /// lost has none, and the endpoint it authenticated with is what identifies it either way.
         attempt_id: Option<AttemptId>,
         /// The live connection it is asking over.
         live_peer: &'a dyn LivePeer,

@@ -80,7 +80,8 @@ A restart loses the invitation object but not a completed pairing. The device re
 and the owner's proof are in the store under the invitation identity, so a host that comes back
 answers the retry and tells that candidate, on its own endpoint, that it is paired. The endpoint is
 what identifies a candidate throughout; the attempt identity is checked when the asker has one and
-is never required, because a device whose response was lost never learnt it. A host answers nothing
+is never required, because a direct candidate whose redemption response was lost never learnt it:
+that identity is the host's, while a short-code candidate makes its own. A host answers nothing
 short of a commitment that way: the endpoint a candidate authenticated with lives in the object the
 restart lost, so a host with no way to tell one authenticated asker from another says nothing
 rather than telling a stranger that somebody's pairing was denied.

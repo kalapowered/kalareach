@@ -8,6 +8,7 @@
 //! exactly that reason.
 
 use kr_protocol::error::ErrorCode;
+use kr_protocol::pairing::PairingConsumedReason;
 
 /// The result of a pairing step.
 pub type Result<T> = core::result::Result<T, PairingError>;
@@ -36,7 +37,7 @@ pub enum PairingError {
     #[error("the invitation is no longer open ({reason:?})")]
     Consumed {
         /// How it was consumed.
-        reason: kr_protocol::pairing::PairingConsumedReason,
+        reason: PairingConsumedReason,
     },
 
     /// The invitation was already committed, and a retry retrieves that result.
@@ -171,17 +172,21 @@ impl PairingError {
             | Self::ReplayedSequence { .. }
             | Self::EarlyData
             | Self::WrongPhase { .. } => ErrorCode::PairingAuthFailed,
-            // An invitation consumed *because* it ran out reports as expired, not as rejected:
-            // the caller's retry deadline is what that distinction drives.
+            // How an invitation was consumed is what a caller acts on, so the reason decides the
+            // code rather than the fact. An invitation that ran out reports as expired and one
+            // that ran out of guesses reports as exhausted, at the step that spent the last one
+            // and at every step afterwards. Only an owner's decision reports as rejected.
             Self::Expired
             | Self::Consumed {
-                reason: kr_protocol::pairing::PairingConsumedReason::Expired,
+                reason: PairingConsumedReason::Expired,
             } => ErrorCode::PairingExpired,
+            Self::AttemptsExhausted
+            | Self::ClientAttemptsExhausted
+            | Self::Consumed {
+                reason: PairingConsumedReason::AttemptsExhausted,
+            } => ErrorCode::PairingAttemptsExhausted,
             Self::Consumed { .. } | Self::CandidateLocked | Self::AlreadyCommitted => {
                 ErrorCode::PairingRejected
-            }
-            Self::AttemptsExhausted | Self::ClientAttemptsExhausted => {
-                ErrorCode::PairingAttemptsExhausted
             }
             Self::TooLarge { .. } => ErrorCode::InvalidArgument,
             Self::NotIssuingOwner => ErrorCode::PermissionDenied,
@@ -218,9 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deadline_reports_as_expired_however_it_was_reached() {
-        use kr_protocol::pairing::PairingConsumedReason;
-
+    fn a_consumed_invitation_reports_how_it_was_consumed() {
         // A caller distinguishes "it ran out" from "it was refused", and an invitation consumed
         // because it ran out is the first of those whichever step noticed.
         assert_eq!(PairingError::Expired.code(), ErrorCode::PairingExpired);
@@ -231,10 +234,24 @@ mod tests {
             .code(),
             ErrorCode::PairingExpired
         );
+        // And an invitation that ran out of guesses keeps saying so, at the step that spent the
+        // last one and at every step afterwards.
+        assert_eq!(
+            PairingError::AttemptsExhausted.code(),
+            ErrorCode::PairingAttemptsExhausted
+        );
+        assert_eq!(
+            PairingError::Consumed {
+                reason: PairingConsumedReason::AttemptsExhausted
+            }
+            .code(),
+            ErrorCode::PairingAttemptsExhausted
+        );
+
+        // What is left is an owner's decision, or a host that restarted.
         for reason in [
             PairingConsumedReason::Denied,
             PairingConsumedReason::Cancelled,
-            PairingConsumedReason::AttemptsExhausted,
             PairingConsumedReason::HostRestarted,
         ] {
             assert_eq!(
