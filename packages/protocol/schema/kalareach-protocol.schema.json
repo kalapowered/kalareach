@@ -178,6 +178,40 @@
       ],
       "type": "object"
     },
+    "ActionWindow": {
+      "additionalProperties": false,
+      "description": "A host-issued action window.\n\nSection 9: an original online request carries a window bound to this authenticated connection\nand to the host's boot identity, and the host derives the accepted deadline from the earliest\nof window expiry, receipt time plus the requested time to live, and any authority or subject\ndeadline. The window carries a *duration*, not an absolute wall-clock deadline: the client\nschedules its renewal from that duration, while the host keeps the authoritative deadline on\nits own suspend-aware continuous clock. `issued_at_ms` is the host's stamp, for display and\ndiagnosis only.",
+      "properties": {
+        "action_window_id": {
+          "$ref": "#/$defs/ActionWindowId",
+          "description": "The window identity a mutation names."
+        },
+        "boot_epoch": {
+          "$ref": "#/$defs/BootEpoch",
+          "description": "The host boot the window is bound to. A restart invalidates new admission through it."
+        },
+        "connection_id": {
+          "$ref": "#/$defs/ConnectionId",
+          "description": "The connection the window is bound to."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The host's stamp of when it issued the window, in UTC milliseconds."
+        },
+        "valid_for_ms": {
+          "$ref": "#/$defs/DurationMs",
+          "description": "How long the window stays valid, at most [`crate::limits::MAX_ACTION_WINDOW`]."
+        }
+      },
+      "required": [
+        "action_window_id",
+        "connection_id",
+        "boot_epoch",
+        "issued_at_ms",
+        "valid_for_ms"
+      ],
+      "type": "object"
+    },
     "ActionWindowId": {
       "description": "A host-issued action window identifier, bound to one authenticated connection and host boot.",
       "maxLength": 256,
@@ -783,11 +817,98 @@
         }
       ]
     },
+    "ConnectAccepted": {
+      "additionalProperties": false,
+      "description": "What the host returns once both proofs verify.",
+      "properties": {
+        "action_window": {
+          "$ref": "#/$defs/ActionWindow",
+          "description": "The first action window of this connection."
+        },
+        "host_proof": {
+          "$ref": "#/$defs/ConnectProof",
+          "description": "The host's own proof over the same transcript."
+        }
+      },
+      "required": [
+        "host_proof",
+        "action_window"
+      ],
+      "type": "object"
+    },
+    "ConnectProof": {
+      "additionalProperties": false,
+      "description": "One endpoint's `kr-connect/1` proof.\n\nThe signature covers the transcript built by [`connect_transcript`]. Nothing else travels with\nit: every value the signature depends on is already in the offer, the selection or the two\nendpoint identities, so a receiver reconstructs the transcript rather than trusting a copy.",
+      "properties": {
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The signature over the connection transcript, made with the paired authorisation key."
+        }
+      },
+      "required": [
+        "signature"
+      ],
+      "type": "object"
+    },
+    "ConnectReply": {
+      "description": "The host's answer to a client proof.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Both proofs verified; authorised streams may be opened.",
+          "properties": {
+            "accepted": {
+              "$ref": "#/$defs/ConnectAccepted"
+            }
+          },
+          "required": [
+            "accepted"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Authorisation failed. No authorised stream is ever enabled on this connection.",
+          "properties": {
+            "refused": {
+              "$ref": "#/$defs/ProtocolError"
+            }
+          },
+          "required": [
+            "refused"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ConnectionId": {
       "description": "One transport connection, allocated by the host during hello.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "ControlEvent": {
+      "description": "What the host sends on the control stream outside a response.\n\nThe control stream carries ordinary [`crate::envelope::Notification`] events once the\nconnection is authorised. These two messages are the connection's own, not an application\nevent: they exist because the freshness resource and the transport's liveness belong to the\nconnection rather than to any session.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The host renewed this connection's action window.",
+          "properties": {
+            "action_window_renewed": {
+              "$ref": "#/$defs/ActionWindow"
+            }
+          },
+          "required": [
+            "action_window_renewed"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "keepalive",
+          "description": "A keepalive. It carries nothing; its arrival is the whole message.",
+          "type": "string"
+        }
+      ]
     },
     "ControllerGeneration": {
       "description": "The controller's persistent generation, advanced on every controller start.",
@@ -1671,6 +1792,37 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "HelloReply": {
+      "description": "The host's answer to a `hello` offer.\n\nA major mismatch answers [`ErrorCode::UnsupportedSchema`] here and the connection carries no\nsession data. Every other refusal before device authorisation answers here too, so a client\nnever has to distinguish a closed stream from a rejected offer.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The host selected a version and its limits.",
+          "properties": {
+            "selected": {
+              "$ref": "#/$defs/HostSelection"
+            }
+          },
+          "required": [
+            "selected"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host refused the offer.",
+          "properties": {
+            "refused": {
+              "$ref": "#/$defs/ProtocolError"
+            }
+          },
+          "required": [
+            "refused"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "HistoryFilter": {
       "description": "How the shared host-side history filter applies to a method's result.",
@@ -3008,7 +3160,7 @@
     },
     "NetworkConfig": {
       "additionalProperties": false,
-      "description": "The selected discovery and relay configuration a pairing invitation carries.\n\nDiscovery and relay selection are separate configuration choices, and a self-hosted deployment\nreplaces each service independently, so each list stands on its own.",
+      "description": "The selected discovery and relay configuration a pairing invitation carries.\n\nDiscovery and relay selection are separate configuration choices, and a self-hosted deployment\nreplaces each service independently. Section 17 therefore names the publisher URL, the resolver\nURL, the DNS origin and the relay map separately, and each one is selected on its own: a null\nfield means that service is not selected, never that a default is inherited. There are no\npublic defaults to fall back on, so a receiver that finds a field null simply does without it.",
       "properties": {
         "direct_addresses": {
           "description": "Current direct-address hints. Hints only: the endpoint identity is what authenticates.",
@@ -3017,15 +3169,41 @@
           },
           "type": "array"
         },
-        "discovery_origins": {
-          "description": "The selected discovery configuration, as Pkarr or DNS origins.",
-          "items": {
-            "$ref": "#/$defs/NetworkHint"
-          },
-          "type": "array"
+        "dns_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetworkHint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The selected DNS origin, or null when DNS lookup is not selected."
+        },
+        "pkarr_publisher_url": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetworkHint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The selected Pkarr publisher URL, or null when publication is not selected."
+        },
+        "pkarr_resolver_url": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetworkHint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The selected Pkarr resolver URL, or null when Pkarr resolution is not selected."
         },
         "relay_urls": {
-          "description": "The selected relay configuration, as relay URLs.",
+          "description": "The selected relay map, as relay URLs.",
           "items": {
             "$ref": "#/$defs/NetworkHint"
           },
@@ -3034,7 +3212,9 @@
       },
       "required": [
         "relay_urls",
-        "discovery_origins",
+        "pkarr_publisher_url",
+        "pkarr_resolver_url",
+        "dns_origin",
         "direct_addresses"
       ],
       "type": "object"
@@ -4945,6 +5125,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.",
   "properties": {
+    "action_window": {
+      "$ref": "#/$defs/ActionWindow"
+    },
     "actor_envelope": {
       "$ref": "#/$defs/ActorEnvelope"
     },
@@ -4956,6 +5139,12 @@
     },
     "client_offer": {
       "$ref": "#/$defs/ClientOffer"
+    },
+    "connect_reply": {
+      "$ref": "#/$defs/ConnectReply"
+    },
+    "control_event": {
+      "$ref": "#/$defs/ControlEvent"
     },
     "direct_challenge": {
       "$ref": "#/$defs/DirectChallenge"
@@ -4971,6 +5160,9 @@
     },
     "grant": {
       "$ref": "#/$defs/Grant"
+    },
+    "hello_reply": {
+      "$ref": "#/$defs/HelloReply"
     },
     "host_selection": {
       "$ref": "#/$defs/HostSelection"

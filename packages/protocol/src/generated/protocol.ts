@@ -27,6 +27,33 @@ export type RevocationRequestId = string
  */
 export type CapabilityId = string
 /**
+ * The host's answer to a client proof.
+ */
+export type ConnectReply =
+  | {
+      accepted: ConnectAccepted
+    }
+  | {
+      refused: ProtocolError
+    }
+/**
+ * An opaque diagnostic identifier. It carries no protocol meaning.
+ */
+export type DiagnosticId = string
+/**
+ * What the host sends on the control stream outside a response.
+ *
+ * The control stream carries ordinary [`crate::envelope::Notification`] events once the
+ * connection is authorised. These two messages are the connection's own, not an application
+ * event: they exist because the freshness resource and the transport's liveness belong to the
+ * connection rather than to any session.
+ */
+export type ControlEvent =
+  | {
+      action_window_renewed: ActionWindow
+    }
+  | 'keepalive'
+/**
  * One installed OS, distribution or container environment and OS user.
  */
 export type EnvironmentId = string
@@ -75,6 +102,20 @@ export type ApprovalRequestId = string
  * One agent-to-user question.
  */
 export type QuestionId = string
+/**
+ * The host's answer to a `hello` offer.
+ *
+ * A major mismatch answers [`ErrorCode::UnsupportedSchema`] here and the connection carries no
+ * session data. Every other refusal before device authorisation answers here too, so a client
+ * never has to distinguish a closed stream from a rejected offer.
+ */
+export type HelloReply =
+  | {
+      selected: HostSelection
+    }
+  | {
+      refused: ProtocolError
+    }
 /**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
@@ -175,10 +216,6 @@ export type DesktopSessionId = string
  * The revision of a device's purpose-separated public keys.
  */
 export type DeviceKeyRevision = string
-/**
- * An opaque diagnostic identifier. It carries no protocol meaning.
- */
-export type DiagnosticId = string
 /**
  * One durable device-owned draft, independent of an attachment.
  */
@@ -422,15 +459,19 @@ export type NetworkHint = string
  * Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.
  */
 export interface KalaReachProtocol {
+  action_window?: ActionWindow
   actor_envelope?: ActorEnvelope
   archive_descriptor?: ArchiveDescriptor
   authority_revision_record?: AuthorityRevisionRecord
   client_offer?: ClientOffer
+  connect_reply?: ConnectReply
+  control_event?: ControlEvent
   direct_challenge?: DirectChallenge
   direct_redeem_proof?: DirectRedeemProof
   envelope_plaintext?: EnvelopePlaintext
   generation_checkpoint?: GenerationCheckpoint
   grant?: Grant
+  hello_reply?: HelloReply
   host_selection?: HostSelection
   /**
    * Every identifier in the identity and object model. This is a vocabulary rather than a message: it exists so each identifier has one named type.
@@ -527,6 +568,39 @@ export interface KalaReachProtocol {
   signed_client_bundle?: SignedClientBundle
   signed_host_bundle?: SignedHostBundle
   stream_header?: StreamHeader
+}
+/**
+ * A host-issued action window.
+ *
+ * Section 9: an original online request carries a window bound to this authenticated connection
+ * and to the host's boot identity, and the host derives the accepted deadline from the earliest
+ * of window expiry, receipt time plus the requested time to live, and any authority or subject
+ * deadline. The window carries a *duration*, not an absolute wall-clock deadline: the client
+ * schedules its renewal from that duration, while the host keeps the authoritative deadline on
+ * its own suspend-aware continuous clock. `issued_at_ms` is the host's stamp, for display and
+ * diagnosis only.
+ */
+export interface ActionWindow {
+  /**
+   * The window identity a mutation names.
+   */
+  action_window_id: string
+  /**
+   * The host boot the window is bound to. A restart invalidates new admission through it.
+   */
+  boot_epoch: string
+  /**
+   * The connection the window is bound to.
+   */
+  connection_id: string
+  /**
+   * The host's stamp of when it issued the window, in UTC milliseconds.
+   */
+  issued_at_ms: string
+  /**
+   * How long the window stays valid, at most [`crate::limits::MAX_ACTION_WINDOW`].
+   */
+  valid_for_ms: string
 }
 /**
  * The host-constructed identity of one request.
@@ -763,6 +837,119 @@ export interface ProtocolVersion {
    * The minor version. A peer selects the highest minor both sides support.
    */
   minor: number
+}
+/**
+ * What the host returns once both proofs verify.
+ */
+export interface ConnectAccepted {
+  action_window: ActionWindow1
+  host_proof: ConnectProof
+}
+/**
+ * The first action window of this connection.
+ */
+export interface ActionWindow1 {
+  /**
+   * The window identity a mutation names.
+   */
+  action_window_id: string
+  /**
+   * The host boot the window is bound to. A restart invalidates new admission through it.
+   */
+  boot_epoch: string
+  /**
+   * The connection the window is bound to.
+   */
+  connection_id: string
+  /**
+   * The host's stamp of when it issued the window, in UTC milliseconds.
+   */
+  issued_at_ms: string
+  /**
+   * How long the window stays valid, at most [`crate::limits::MAX_ACTION_WINDOW`].
+   */
+  valid_for_ms: string
+}
+/**
+ * The host's own proof over the same transcript.
+ */
+export interface ConnectProof {
+  /**
+   * The signature over the connection transcript, made with the paired authorisation key.
+   */
+  signature: string
+}
+/**
+ * The error object returned in a response or recorded on a receipt.
+ *
+ * The message is plain text for a person or a log. The user interface translates the code into a
+ * direct action and does not display protocol internals by default.
+ */
+export interface ProtocolError {
+  /**
+   * The stable code.
+   */
+  code:
+    | 'INVALID_ARGUMENT'
+    | 'UNSUPPORTED_SCHEMA'
+    | 'UNSUPPORTED_CAPABILITY'
+    | 'PERMISSION_DENIED'
+    | 'PAIRING_EXPIRED'
+    | 'PAIRING_REJECTED'
+    | 'PAIRING_AUTH_FAILED'
+    | 'PAIRING_ATTEMPTS_EXHAUSTED'
+    | 'RENDEZVOUS_UNAVAILABLE'
+    | 'RENDEZVOUS_CONFIG_ERROR'
+    | 'UNKNOWN_SESSION'
+    | 'AMBIGUOUS_SESSION'
+    | 'AMBIGUOUS_ATTACHMENT'
+    | 'TERMINAL_UNAVAILABLE'
+    | 'TERMINAL_PROBE_FAILED'
+    | 'INPUT_INCOMPATIBLE'
+    | 'SESSION_CLOSED'
+    | 'SESSION_LIMIT'
+    | 'RESOURCE_UNAVAILABLE'
+    | 'HOST_NOT_CONFIGURED'
+    | 'ENVIRONMENT_UNAVAILABLE'
+    | 'DESKTOP_UNAVAILABLE'
+    | 'STALE_SESSION'
+    | 'LEASE_LOST'
+    | 'GEOMETRY_NOT_OWNER'
+    | 'DRAFT_CONFLICT'
+    | 'EDITOR_BUSY'
+    | 'ID_CONFLICT'
+    | 'UPSTREAM_UNAVAILABLE'
+    | 'OUTCOME_UNKNOWN'
+    | 'RESYNC_REQUIRED'
+    | 'QUOTA_EXCEEDED'
+    | 'RATE_LIMITED'
+    | 'SERVICE_CAPACITY'
+    | 'CLOCK_UNTRUSTED'
+    | 'STORAGE_UNAVAILABLE'
+    | 'SHELL_INTEGRATION_UNSUPPORTED'
+    | 'ATTACHMENT_INTEGRITY'
+    | 'REPOSITORY_UNTRUSTED'
+    | 'PACKAGE_UNAVAILABLE_OFFLINE'
+    | 'PLUGIN_GRANT_REQUIRED'
+    | 'PLUGIN_DISABLED'
+    | 'QUESTION_RESOLVED'
+    | 'QUESTION_EXPIRED'
+    | 'NOT_IN_KR_SESSION'
+    | 'OWNER_CONFIRMATION_REQUIRED'
+    | 'CAUSAL_LIMIT'
+    | 'SOURCE_CHANGED'
+  /**
+   * An opaque identifier for correlating this failure with host diagnostics.
+   */
+  diagnostic_id: DiagnosticId | null
+  /**
+   * A plain message. It never carries credentials or command text.
+   */
+  message: string
+  /**
+   * How the client may react. It must equal [`ErrorCode::retry_category`] for the code.
+   */
+  retry: 'no_retry' | 'transient' | 'resync' | 'configuration_change' | 'outcome_unknown'
 }
 /**
  * The host challenge a direct redemption starts from. Single use, and it expires with the
@@ -1826,78 +2013,6 @@ export interface HistoryScope1 {
   named_questions: QuestionId[]
 }
 /**
- * The error object returned in a response or recorded on a receipt.
- *
- * The message is plain text for a person or a log. The user interface translates the code into a
- * direct action and does not display protocol internals by default.
- */
-export interface ProtocolError {
-  /**
-   * The stable code.
-   */
-  code:
-    | 'INVALID_ARGUMENT'
-    | 'UNSUPPORTED_SCHEMA'
-    | 'UNSUPPORTED_CAPABILITY'
-    | 'PERMISSION_DENIED'
-    | 'PAIRING_EXPIRED'
-    | 'PAIRING_REJECTED'
-    | 'PAIRING_AUTH_FAILED'
-    | 'PAIRING_ATTEMPTS_EXHAUSTED'
-    | 'RENDEZVOUS_UNAVAILABLE'
-    | 'RENDEZVOUS_CONFIG_ERROR'
-    | 'UNKNOWN_SESSION'
-    | 'AMBIGUOUS_SESSION'
-    | 'AMBIGUOUS_ATTACHMENT'
-    | 'TERMINAL_UNAVAILABLE'
-    | 'TERMINAL_PROBE_FAILED'
-    | 'INPUT_INCOMPATIBLE'
-    | 'SESSION_CLOSED'
-    | 'SESSION_LIMIT'
-    | 'RESOURCE_UNAVAILABLE'
-    | 'HOST_NOT_CONFIGURED'
-    | 'ENVIRONMENT_UNAVAILABLE'
-    | 'DESKTOP_UNAVAILABLE'
-    | 'STALE_SESSION'
-    | 'LEASE_LOST'
-    | 'GEOMETRY_NOT_OWNER'
-    | 'DRAFT_CONFLICT'
-    | 'EDITOR_BUSY'
-    | 'ID_CONFLICT'
-    | 'UPSTREAM_UNAVAILABLE'
-    | 'OUTCOME_UNKNOWN'
-    | 'RESYNC_REQUIRED'
-    | 'QUOTA_EXCEEDED'
-    | 'RATE_LIMITED'
-    | 'SERVICE_CAPACITY'
-    | 'CLOCK_UNTRUSTED'
-    | 'STORAGE_UNAVAILABLE'
-    | 'SHELL_INTEGRATION_UNSUPPORTED'
-    | 'ATTACHMENT_INTEGRITY'
-    | 'REPOSITORY_UNTRUSTED'
-    | 'PACKAGE_UNAVAILABLE_OFFLINE'
-    | 'PLUGIN_GRANT_REQUIRED'
-    | 'PLUGIN_DISABLED'
-    | 'QUESTION_RESOLVED'
-    | 'QUESTION_EXPIRED'
-    | 'NOT_IN_KR_SESSION'
-    | 'OWNER_CONFIRMATION_REQUIRED'
-    | 'CAUSAL_LIMIT'
-    | 'SOURCE_CHANGED'
-  /**
-   * An opaque identifier for correlating this failure with host diagnostics.
-   */
-  diagnostic_id: DiagnosticId | null
-  /**
-   * A plain message. It never carries credentials or command text.
-   */
-  message: string
-  /**
-   * How the client may react. It must equal [`ErrorCode::retry_category`] for the code.
-   */
-  retry: 'no_retry' | 'transient' | 'resync' | 'configuration_change' | 'outcome_unknown'
-}
-/**
  * One action receipt.
  *
  * The de-duplication key is `(actor_id, action_id)`. An exact duplicate returns the stored
@@ -2517,11 +2632,19 @@ export interface NetworkConfig {
    */
   direct_addresses: NetworkHint[]
   /**
-   * The selected discovery configuration, as Pkarr or DNS origins.
+   * The selected DNS origin, or null when DNS lookup is not selected.
    */
-  discovery_origins: NetworkHint[]
+  dns_origin: NetworkHint | null
   /**
-   * The selected relay configuration, as relay URLs.
+   * The selected Pkarr publisher URL, or null when publication is not selected.
+   */
+  pkarr_publisher_url: NetworkHint | null
+  /**
+   * The selected Pkarr resolver URL, or null when Pkarr resolution is not selected.
+   */
+  pkarr_resolver_url: NetworkHint | null
+  /**
+   * The selected relay map, as relay URLs.
    */
   relay_urls: NetworkHint[]
 }

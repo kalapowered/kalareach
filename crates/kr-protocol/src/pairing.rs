@@ -672,24 +672,42 @@ impl DevicePublicKeys {
 /// The selected discovery and relay configuration a pairing invitation carries.
 ///
 /// Discovery and relay selection are separate configuration choices, and a self-hosted deployment
-/// replaces each service independently, so each list stands on its own.
+/// replaces each service independently. Section 17 therefore names the publisher URL, the resolver
+/// URL, the DNS origin and the relay map separately, and each one is selected on its own: a null
+/// field means that service is not selected, never that a default is inherited. There are no
+/// public defaults to fall back on, so a receiver that finds a field null simply does without it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// The selected relay configuration, as relay URLs.
+    /// The selected relay map, as relay URLs.
     pub relay_urls: Vec<NetworkHint>,
-    /// The selected discovery configuration, as Pkarr or DNS origins.
-    pub discovery_origins: Vec<NetworkHint>,
+    /// The selected Pkarr publisher URL, or null when publication is not selected.
+    pub pkarr_publisher_url: Nullable<NetworkHint>,
+    /// The selected Pkarr resolver URL, or null when Pkarr resolution is not selected.
+    pub pkarr_resolver_url: Nullable<NetworkHint>,
+    /// The selected DNS origin, or null when DNS lookup is not selected.
+    pub dns_origin: Nullable<NetworkHint>,
     /// Current direct-address hints. Hints only: the endpoint identity is what authenticates.
     pub direct_addresses: Vec<NetworkHint>,
 }
 
 impl NetworkConfig {
+    /// A configuration that selects nothing.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            relay_urls: Vec::new(),
+            pkarr_publisher_url: Nullable::null(),
+            pkarr_resolver_url: Nullable::null(),
+            dns_origin: Nullable::null(),
+            direct_addresses: Vec::new(),
+        }
+    }
+
     /// Returns true when every list is inside [`MAX_NETWORK_HINTS`].
     #[must_use]
     pub fn is_bounded(&self) -> bool {
         self.relay_urls.len() <= MAX_NETWORK_HINTS
-            && self.discovery_origins.len() <= MAX_NETWORK_HINTS
             && self.direct_addresses.len() <= MAX_NETWORK_HINTS
     }
 }
@@ -2223,7 +2241,15 @@ mod tests {
             endpoint_id: EndpointKey::from_bytes([2; 32]),
             network_config: NetworkConfig {
                 relay_urls: vec![NetworkHint::new("https://relay.kala.to").expect("a hint")],
-                discovery_origins: Vec::new(),
+                pkarr_publisher_url: Nullable::some(
+                    NetworkHint::new("https://discovery.kala.to/pkarr").expect("a hint"),
+                ),
+                pkarr_resolver_url: Nullable::some(
+                    NetworkHint::new("https://discovery.kala.to/pkarr").expect("a hint"),
+                ),
+                dns_origin: Nullable::some(
+                    NetworkHint::new("discovery.kala.to").expect("a hint"),
+                ),
                 direct_addresses: vec![NetworkHint::new("192.0.2.1:41234").expect("a hint")],
             },
             secret: SecretBytes32::from_bytes([3; 32]),
@@ -2279,7 +2305,13 @@ mod tests {
             QrPayload::Direct(Box::new(DirectQrPayload {
                 network_config: NetworkConfig {
                     relay_urls: vec![NetworkHint::new("r".repeat(253)).expect("a hint"); 2],
-                    discovery_origins: vec![NetworkHint::new("d".repeat(253)).expect("a hint"); 2],
+                    pkarr_publisher_url: Nullable::some(
+                        NetworkHint::new("p".repeat(253)).expect("a hint"),
+                    ),
+                    pkarr_resolver_url: Nullable::some(
+                        NetworkHint::new("q".repeat(253)).expect("a hint"),
+                    ),
+                    dns_origin: Nullable::some(NetworkHint::new("d".repeat(253)).expect("a hint")),
                     direct_addresses: vec![NetworkHint::new("a".repeat(253)).expect("a hint"); 2],
                 },
                 ..sample_direct_payload()
@@ -2405,11 +2437,7 @@ mod tests {
         let payload = DirectQrPayload {
             invitation_id: InvitationId::new(crate::scalars::Uuid::from_bytes([1; 16])),
             endpoint_id: EndpointKey::from_bytes([2; 32]),
-            network_config: NetworkConfig {
-                relay_urls: Vec::new(),
-                discovery_origins: Vec::new(),
-                direct_addresses: Vec::new(),
-            },
+            network_config: NetworkConfig::empty(),
             secret: SecretBytes32::from_bytes([3; 32]),
             proposed_grant: ProposedGrant {
                 parent_grant_id: Nullable::null(),

@@ -14,15 +14,16 @@ use kr_cbor::{CanonicalValue, CborError, sha256, signing_input};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ErrorCode;
+use crate::error::{ErrorCode, ProtocolError};
 use crate::ids::{
-    BootEpoch, BuildId, CapabilityId, ClockEpoch, ConnectionId, DeviceId, DeviceKeyRevision,
+    ActionWindowId, BootEpoch, BuildId, CapabilityId, ClockEpoch, ConnectionId, DeviceId,
+    DeviceKeyRevision,
 };
 use crate::limits::{
     MAX_ATTACHMENT_FRAME_LEN, MAX_CONTROL_FRAME_LEN, MAX_INPUT_FRAME_LEN,
     MAX_OUTSTANDING_MUTATIONS, MAX_SEND_QUEUE_BYTES,
 };
-use crate::scalars::{CanonicalSet, Digest256, EndpointKey, Nonce256, U64};
+use crate::scalars::{CanonicalSet, Digest256, DurationMs, EndpointKey, Nonce256, Signature64, TimestampMs, U64};
 
 /// The stable transport ALPN.
 ///
@@ -145,6 +146,91 @@ pub struct HostSelection {
     pub boot_epoch: BootEpoch,
     /// The host clock epoch.
     pub clock_epoch: ClockEpoch,
+}
+
+/// The host's answer to a `hello` offer.
+///
+/// A major mismatch answers [`ErrorCode::UnsupportedSchema`] here and the connection carries no
+/// session data. Every other refusal before device authorisation answers here too, so a client
+/// never has to distinguish a closed stream from a rejected offer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HelloReply {
+    /// The host selected a version and its limits.
+    Selected(Box<HostSelection>),
+    /// The host refused the offer.
+    Refused(ProtocolError),
+}
+
+/// One endpoint's `kr-connect/1` proof.
+///
+/// The signature covers the transcript built by [`connect_transcript`]. Nothing else travels with
+/// it: every value the signature depends on is already in the offer, the selection or the two
+/// endpoint identities, so a receiver reconstructs the transcript rather than trusting a copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectProof {
+    /// The signature over the connection transcript, made with the paired authorisation key.
+    pub signature: Signature64,
+}
+
+/// A host-issued action window.
+///
+/// Section 9: an original online request carries a window bound to this authenticated connection
+/// and to the host's boot identity, and the host derives the accepted deadline from the earliest
+/// of window expiry, receipt time plus the requested time to live, and any authority or subject
+/// deadline. The window carries a *duration*, not an absolute wall-clock deadline: the client
+/// schedules its renewal from that duration, while the host keeps the authoritative deadline on
+/// its own suspend-aware continuous clock. `issued_at_ms` is the host's stamp, for display and
+/// diagnosis only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionWindow {
+    /// The window identity a mutation names.
+    pub action_window_id: ActionWindowId,
+    /// The connection the window is bound to.
+    pub connection_id: ConnectionId,
+    /// The host boot the window is bound to. A restart invalidates new admission through it.
+    pub boot_epoch: BootEpoch,
+    /// The host's stamp of when it issued the window, in UTC milliseconds.
+    pub issued_at_ms: TimestampMs,
+    /// How long the window stays valid, at most [`crate::limits::MAX_ACTION_WINDOW`].
+    pub valid_for_ms: DurationMs,
+}
+
+/// What the host returns once both proofs verify.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectAccepted {
+    /// The host's own proof over the same transcript.
+    pub host_proof: ConnectProof,
+    /// The first action window of this connection.
+    pub action_window: ActionWindow,
+}
+
+/// The host's answer to a client proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectReply {
+    /// Both proofs verified; authorised streams may be opened.
+    Accepted(Box<ConnectAccepted>),
+    /// Authorisation failed. No authorised stream is ever enabled on this connection.
+    Refused(ProtocolError),
+}
+
+/// What the host sends on the control stream outside a response.
+///
+/// The control stream carries ordinary [`crate::envelope::Notification`] events once the
+/// connection is authorised. These two messages are the connection's own, not an application
+/// event: they exist because the freshness resource and the transport's liveness belong to the
+/// connection rather than to any session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlEvent {
+    /// The host renewed this connection's action window.
+    ActionWindowRenewed(ActionWindow),
+    /// A keepalive. It carries nothing; its arrival is the whole message.
+    Keepalive,
 }
 
 /// Selects the highest version both sides listed.

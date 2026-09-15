@@ -18,7 +18,7 @@ use crate::envelope::{MutationRequest, Notification, Request, Response};
 use crate::error::ProtocolError;
 use crate::frame::StreamHeader;
 use crate::grant::Grant;
-use crate::hello::{ClientOffer, HostSelection};
+use crate::hello::{ActionWindow, ClientOffer, ConnectReply, ControlEvent, HelloReply, HostSelection};
 use crate::ids;
 use crate::ids::SessionRef;
 use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
@@ -57,15 +57,19 @@ pub fn protocol_schema() -> Value {
     let mut properties = Map::new();
     roots! {
         generator, properties,
+        "action_window" => ActionWindow,
         "actor_envelope" => ActorEnvelope,
         "archive_descriptor" => ArchiveDescriptor,
         "authority_revision_record" => AuthorityRevisionRecord,
         "client_offer" => ClientOffer,
+        "connect_reply" => ConnectReply,
+        "control_event" => ControlEvent,
         "direct_challenge" => DirectChallenge,
         "direct_redeem_proof" => DirectRedeemProof,
         "envelope_plaintext" => EnvelopePlaintext,
         "generation_checkpoint" => GenerationCheckpoint,
         "grant" => Grant,
+        "hello_reply" => HelloReply,
         "host_selection" => HostSelection,
         "method_entry" => MethodEntry,
         "mutation_request" => MutationRequest,
