@@ -656,16 +656,22 @@ fn saved_cursor_value(saved: &crate::snapshot::SavedCursor) -> Value {
         "charsets": {
             "g0": saved.charsets.g0,
             "g1": saved.charsets.g1,
-            "shift_out": saved.charsets.shift_out,
         },
         "hyperlink": saved.hyperlink,
         "rendition": {
             "foreground": format!("{:?}", saved.rendition.foreground),
             "background": format!("{:?}", saved.rendition.background),
+            "underline_colour": format!("{:?}", saved.rendition.underline_colour),
             "bold": saved.rendition.bold,
+            "faint": saved.rendition.faint,
             "italic": saved.rendition.italic,
             "underline": format!("{:?}", saved.rendition.underline),
+            "blink": format!("{:?}", saved.rendition.blink),
             "reverse": saved.rendition.reverse,
+            "invisible": saved.rendition.invisible,
+            "strikethrough": saved.rendition.strikethrough,
+            "overline": saved.rendition.overline,
+            "vertical_align": format!("{:?}", saved.rendition.vertical_align),
         },
     })
 }

@@ -202,7 +202,6 @@ fn a_snapshot_carries_both_saved_cursors() {
     assert!(primary.rendition.bold);
     assert_eq!(primary.rendition.foreground, Colour::Indexed(1));
     assert_eq!(primary.charsets.g1, "DecLineDrawing");
-    assert!(!primary.charsets.shift_out);
 
     let alternate = snapshot.saved_cursors[1]
         .as_ref()
@@ -1128,6 +1127,95 @@ fn each_buffer_keeps_its_own_charge_across_a_switch() {
         engine.budget().usage().screen_content[1],
         0,
         "the alternate buffer has nothing on it yet"
+    );
+}
+
+/// A reservation and a measurement round a hyperlink's parameter table the same way, so a
+/// measurement never finds more than the session was already charged.
+#[test]
+fn a_link_costs_no_more_than_was_reserved_at_every_table_size() {
+    for parameters in [1usize, 3, 4, 7, 8, 14, 15] {
+        let field: Vec<String> = (0..parameters)
+            .map(|index| format!("k{index}=v{index}"))
+            .collect();
+        let field = field.join(":");
+        let text = format!("{field};https://example.invalid/p");
+        let mut engine = engine();
+        engine.feed(format!("\x1b]8;{text}\x1b\\X").as_bytes(), 0);
+        engine.quiesce(0);
+        let reserved = kr_term::grid::link_cost(&text, parameters);
+        let measured = engine.grid().screen_link_bytes();
+        assert!(
+            measured > 0,
+            "{parameters} parameters: the link is resident state"
+        );
+        assert!(
+            measured <= reserved,
+            "{parameters} parameters: measured {measured} against a reservation of {reserved}"
+        );
+    }
+}
+
+/// A hyperlink with parameters and no target is a close. The parameters are not kept, because a
+/// link nothing can follow is not a link.
+#[test]
+fn a_hyperlink_with_no_target_keeps_no_parameters() {
+    let mut engine = engine();
+    let before = engine.budget().usage().metadata;
+    let identifier = "a".repeat(1_000);
+    engine.feed(format!("\x1b]8;id={identifier};\x1b\\X").as_bytes(), 0);
+    engine.quiesce(0);
+    assert!(engine.budget().truncations() > 0);
+    assert_eq!(
+        engine.budget().usage().metadata,
+        before,
+        "the identifier of a link that points nowhere is not kept"
+    );
+    assert_eq!(
+        engine.grid().screen_link_bytes(),
+        0,
+        "nothing on the screen belongs to a link that points nowhere"
+    );
+
+    // The ordinary close still reaches the grid.
+    let mut closing = Engine::new(EngineConfig::DEFAULT).expect("engine");
+    closing.feed(b"\x1b]8;;https://example.invalid/\x1b\\A\x1b]8;;\x1b\\B", 0);
+    closing.quiesce(0);
+    assert!(closing.grid().screen_link_bytes() > 0);
+}
+
+/// Two rows can carry more than the whole historical cache, so the bound is enforced where they
+/// join it rather than at the next measurement.
+#[test]
+fn rows_that_scroll_off_are_charged_where_they_arrive() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(2048, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+
+    // Two rows of separately opened links, each with a two-kilobyte identifier.
+    let mut input = Vec::new();
+    for row in 0..2u32 {
+        for column in 0..2048u32 {
+            input.extend_from_slice(b"\x1b]8;id=");
+            input.extend(std::iter::repeat_n(b'z', 1_900));
+            input.extend_from_slice(column.to_string().as_bytes());
+            input.extend_from_slice(b";u\x1b\\X\x1b]8;;\x1b\\");
+        }
+        if row == 0 {
+            input.extend_from_slice(b"\r\n");
+        }
+    }
+    engine.feed(&input, 0);
+    engine.quiesce(0);
+
+    // Scroll both rows into the cache in one step, well short of the measurement gate.
+    engine.feed(b"\x1b[2S", 0);
+    assert!(
+        engine.budget().usage().rows <= kr_term::budget::BudgetLimits::DEFAULT.row_cache_bytes,
+        "the cache is back under its bound without waiting for another read: {} bytes",
+        engine.budget().usage().rows
     );
 }
 

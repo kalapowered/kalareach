@@ -208,11 +208,17 @@ const LINK_MEASURE_INTERVAL: u64 = 64;
 /// How many times eviction re-measures before leaving the rest to the next read.
 const EVICTION_PASSES: u32 = 4;
 
-/// What one entry of the link table costs beyond the target it holds.
+/// What one entry of the link table costs beyond the bytes of the target it holds.
 ///
-/// The set keeps its entries in a tree, and a node carries the child and parent links around the
-/// string it holds.
-const TREE_NODE_BYTES: u64 = (4 * size_of::<usize>()) as u64;
+/// The set keeps its entries in nodes that hold several of them and are allocated whole, so an
+/// entry is charged for the slot it takes, for the room beside it the node is holding empty, and
+/// for the pointer the node above keeps to it.
+const TABLE_ENTRY_BYTES: u64 = (2 * size_of::<String>() + 2 * size_of::<usize>()) as u64;
+
+/// What the link table costs for one target.
+fn link_table_entry_bytes(uri: &str) -> u64 {
+    crate::grid::STRING_HANDLE_BYTES + uri.len() as u64 + TABLE_ENTRY_BYTES
+}
 
 /// How many rows a history page builds at a time before checking its byte bound.
 const PAGE_BATCH_ROWS: usize = 32;
@@ -245,6 +251,7 @@ pub struct Engine {
     saved_revision: u64,
     measured_rows: usize,
     measure_now: bool,
+    history_rows_held: usize,
     links_seen: u64,
     title_truncated: bool,
     dropped_marks: u64,
@@ -289,6 +296,7 @@ impl Engine {
             saved_revision: 0,
             measured_rows: 0,
             measure_now: false,
+            history_rows_held: 0,
             links_seen: 0,
             title_truncated: false,
             dropped_marks: 0,
@@ -485,12 +493,12 @@ impl Engine {
                     self.measure_now = true;
                     self.enforce_resident_state(now_ms);
                 }
-                if self.link_budget_exceeded(event) {
+                if let Some(reason) = self.link_refusal(event) {
                     self.diagnostics.record(
                         DiagnosticKind::ResidentStateTruncated,
                         event.span.start(),
                         now_ms,
-                        "the session hyperlink table is full; the link is not recorded",
+                        format!("{reason}; the hyperlink is not recorded"),
                     );
                     // The link that was open has to end here. Leaving it open would put the text
                     // that belongs to the refused link inside the previous one, which is worse than
@@ -506,6 +514,7 @@ impl Engine {
                     // measurement is periodic and a read can fill a screen between two of them.
                     self.reserve_content(event);
                     let adapted = self.grid.apply(event);
+                    self.charge_rows_that_left_the_screen(now_ms);
                     if adapted.clamped {
                         // The grid did what it could rather than what the sequence said, so the
                         // original bytes would take a physical terminal somewhere else.
@@ -702,8 +711,9 @@ impl Engine {
     /// cursor. A terminal does not: DECRC restores the cursor, the rendition and the character-set
     /// designations, and leaves the rest of the terminal's modes where they were. So whatever was
     /// in force before the restore is put back afterwards, through the same sequences an
-    /// application would have used, and nothing else is disturbed. The narrow patch that would make
-    /// this unnecessary is recorded in `crate::unicode::LIBRARY`.
+    /// application would have used, and nothing else is disturbed. That is a qualified difference
+    /// in how the library is driven rather than a gap in what it exposes, so it is a note in
+    /// `crate::unicode::LIBRARY` and not an accessor the revision has to add.
     fn restore_after_cursor(&mut self, before: (bool, bool)) {
         let (newline, shift_out) = before;
         if newline {
@@ -720,16 +730,16 @@ impl Engine {
     /// alongside the target and is the part an application controls most freely, so counting only
     /// the target would let a program hold megabytes of identifiers inside a budget that says it is
     /// using nothing.
-    fn link_budget_exceeded(&mut self, event: &Event) -> bool {
+    fn link_refusal(&mut self, event: &Event) -> Option<&'static str> {
         let EventKind::Osc {
             selector: Some(8),
             parts,
         } = &event.kind
         else {
-            return false;
+            return None;
         };
         if parts.len() < 3 {
-            return false;
+            return None;
         }
         // Every link the application opens is a link object the grid holds, whether or not it is
         // one the session has seen before, so the count that decides when to measure again is of
@@ -741,7 +751,16 @@ impl Engine {
         // A URI may contain the separator, so everything after the parameter field is the target.
         let uri = parts[2..].join(&b';');
         if uri.is_empty() {
-            return false;
+            // A target of nothing closes the link that was open. The grid library would instead
+            // build a link that points nowhere and keep the parameter field with it, so a
+            // parameter field arriving with no target is refused rather than applied: an
+            // application could otherwise hold a session's worth of identifiers in links that
+            // nothing can follow.
+            if parts[1].is_empty() {
+                return None;
+            }
+            self.budget.record_truncation();
+            return Some("a hyperlink with no target carries no parameters");
         }
         let parameters = String::from_utf8_lossy(&parts[1]).into_owned();
         let uri = format!("{parameters};{}", String::from_utf8_lossy(&uri));
@@ -751,7 +770,7 @@ impl Engine {
         // table of distinct targets would count that as one link.
         if uri.len() > self.budget.limits().link_bytes {
             self.budget.record_truncation();
-            return true;
+            return Some("the hyperlink is longer than one hyperlink may be");
         }
         // Every occurrence is another link object the grid holds, whether or not the session has
         // seen the target before, so what it will cost is reserved before it is applied rather than
@@ -760,26 +779,28 @@ impl Engine {
         let resident = crate::grid::link_cost(&uri, parameters);
         if !self.budget.metadata_fits(resident) {
             self.budget.record_truncation();
-            return true;
+            return Some("the session has no room left for another hyperlink");
         }
         let alternate = self.grid.alternate_active();
         self.budget.add_screen_links(alternate, resident);
         if self.links.contains(&uri) {
-            return false;
+            return None;
         }
-        let cost = uri.len() as u64;
+        // What the table will cost for this entry, worked out the way the measurement works it
+        // out, so admission and measurement cannot disagree about the same entry.
+        let cost = link_table_entry_bytes(&uri);
         if self.links.len() >= self.budget.limits().unique_links || !self.budget.metadata_fits(cost)
         {
             // The link is refused after all, so what was reserved for it is given back rather than
             // left to be corrected at the next measurement.
             self.budget.release_screen_links(alternate, resident);
             self.budget.record_truncation();
-            return true;
+            return Some("the session hyperlink table is full");
         }
         let metadata = self.budget.usage().metadata + cost;
         self.budget.set_metadata(metadata);
         self.links.insert(uri);
-        false
+        None
     }
 
     /// Charges what an event about to be applied can add to the buffer it draws into.
@@ -790,7 +811,20 @@ impl Engine {
         let cells = match &event.kind {
             EventKind::Text { scalars } => *scalars,
             EventKind::Replacement { count, .. } => *count,
-            _ => return,
+            _ => {
+                // An erase or a fill writes cells as well, and with a pen that needs an allocation
+                // of its own every cell it writes needs one. How many it writes is not known from
+                // the event, so what a buffer's cells can cost in those allocations is charged: the
+                // charge is held at the ceiling anyway, so charging it once is charging it.
+                if self.grid.pen_is_allocated() {
+                    self.budget.add_screen_content(
+                        self.grid.alternate_active(),
+                        self.grid.screen_attribute_ceiling(),
+                        self.grid.screen_content_ceiling(),
+                    );
+                }
+                return;
+            }
         };
         let cost = (event.bytes.len() as u64)
             .saturating_add((cells as u64).saturating_mul(crate::grid::CELL_ATTRIBUTE_BYTES));
@@ -799,6 +833,56 @@ impl Engine {
             cost,
             self.grid.screen_content_ceiling(),
         );
+    }
+
+    /// Charges the rows that have just left the screen, and evicts when they pass the bound.
+    ///
+    /// The historical cache is a byte bound rather than a row count, and two rows can carry more
+    /// than the whole of it, so it is enforced where the rows arrive. Counting rows is cheap;
+    /// measuring the ones that arrived is proportional to them rather than to the scrollback.
+    fn charge_rows_that_left_the_screen(&mut self, now_ms: u64) {
+        let held = self.grid.scrollback_rows();
+        let Some(added) = held.checked_sub(self.history_rows_held) else {
+            self.history_rows_held = held;
+            return;
+        };
+        self.history_rows_held = held;
+        if added == 0 {
+            return;
+        }
+        self.budget
+            .add_row_cache(self.grid.newest_history_bytes(added));
+        if self.budget.row_cache_over_budget() {
+            self.evict_history(now_ms);
+        }
+    }
+
+    /// Brings the historical cache back under its bound.
+    fn evict_history(&mut self, now_ms: u64) {
+        let limit = self.budget.limits().row_cache_bytes;
+        let mut bytes = self.grid.history_bytes();
+        let mut evicted = false;
+        // The row count to keep is worked out from the average cost of a row, and the rows are not
+        // all the same size, so one pass can land just over the bound. A few passes converge; the
+        // count is bounded so a pathological row cannot make this loop.
+        for _ in 0..EVICTION_PASSES {
+            if !self.grid.enforce_row_cache(bytes, limit) {
+                break;
+            }
+            evicted = true;
+            bytes = self.grid.history_bytes();
+        }
+        if evicted {
+            self.measured_rows = self.grid.scrollback_rows();
+            self.history_rows_held = self.measured_rows;
+            self.diagnostics.record(
+                DiagnosticKind::ResidentStateTruncated,
+                self.lexer.offset(),
+                now_ms,
+                format!("historical rows passed the {limit}-byte cache bound; older rows evicted"),
+            );
+        }
+        self.budget.set_row_cache(bytes);
     }
 
     /// Reports content the grid could not keep whole.
@@ -856,29 +940,8 @@ impl Engine {
         if alternate {
             return;
         }
-        let mut bytes = self.grid.history_bytes();
-        let limit = self.budget.limits().row_cache_bytes;
-        let mut evicted = false;
-        // The row count to keep is worked out from the average cost of a row, and the rows are not
-        // all the same size, so one pass can land just over the bound. A few passes converge; the
-        // count is bounded so a pathological row cannot make this loop.
-        for _ in 0..EVICTION_PASSES {
-            if !self.grid.enforce_row_cache(bytes, limit) {
-                break;
-            }
-            evicted = true;
-            bytes = self.grid.history_bytes();
-        }
-        if evicted {
-            self.measured_rows = self.grid.scrollback_rows();
-            self.diagnostics.record(
-                DiagnosticKind::ResidentStateTruncated,
-                self.lexer.offset(),
-                now_ms,
-                format!("historical rows passed the {limit}-byte cache bound; older rows evicted"),
-            );
-        }
-        self.budget.set_row_cache(bytes);
+        self.evict_history(now_ms);
+        self.history_rows_held = self.grid.scrollback_rows();
     }
 
     /// What the session's own tables hold.
@@ -890,13 +953,11 @@ impl Engine {
         let links: u64 = self
             .links
             .iter()
-            .map(|link| {
-                (crate::grid::STRING_HANDLE_BYTES + link.capacity() as u64) + TREE_NODE_BYTES
-            })
+            .map(|link| link_table_entry_bytes(link))
             .sum();
         let titles = crate::grid::STRING_HANDLE_BYTES * 2
-            + self.titles.icon().len() as u64
-            + self.titles.window().len() as u64;
+            + 2 * self.titles.icon().len() as u64
+            + 2 * self.titles.window().len() as u64;
         let stack: u64 = self
             .titles
             .entries()
@@ -913,7 +974,13 @@ impl Engine {
                         .map_or(0, |title| title.capacity() as u64)
             })
             .sum();
-        links.saturating_add(titles).saturating_add(stack)
+        // The stack grows by appending, so it can be holding twice the entries it is using.
+        links
+            .saturating_add(titles)
+            .saturating_add(2 * stack)
+            // The alert channel is bounded per alert and in how many it holds, so what it can be
+            // holding is charged whether or not anything is on it.
+            .saturating_add(crate::grid::ALERT_LIST_BYTES)
     }
 
     /// Whether resident state is over one of its bounds right now.

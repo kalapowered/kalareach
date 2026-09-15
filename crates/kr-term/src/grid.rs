@@ -37,7 +37,7 @@ use crate::budget::{CELL_OVERHEAD_BYTES, GridSize, SessionBudget};
 use crate::error::Result;
 use crate::event::{Event, EventKind};
 use crate::palette::Rgb;
-use crate::snapshot::{ActiveBuffer, Charsets, SavedCursor};
+use crate::snapshot::{ActiveBuffer, Designations, SavedCursor};
 use crate::unicode::UnicodeModel;
 
 /// A writer that accepts bytes and delivers none, counting what it was given.
@@ -100,6 +100,26 @@ pub enum GridAlert {
 /// grow this list, so the newest ones win and the drops are counted.
 const MAX_ALERTS: usize = 256;
 
+/// How much of one alert's text is held.
+///
+/// An alert carries what an application said, and an application can say a great deal: without a
+/// bound here a program that sets a long title in a loop would hold megabytes in a list nothing
+/// measures. What is kept is enough to see what happened.
+const MAX_ALERT_BYTES: usize = 1_024;
+
+/// Keeps the first `MAX_ALERT_BYTES` of `text`, cut at a scalar boundary.
+fn bounded_alert_text(mut text: String) -> String {
+    if text.len() <= MAX_ALERT_BYTES {
+        return text;
+    }
+    let mut end = MAX_ALERT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
 #[derive(Debug, Default)]
 struct AlertCollector {
     alerts: Arc<Mutex<Vec<GridAlert>>>,
@@ -109,13 +129,16 @@ struct AlertCollector {
 impl AlertHandler for AlertCollector {
     fn alert(&mut self, alert: Alert) {
         let record = match alert {
-            Alert::WindowTitleChanged(title) => GridAlert::WindowTitle(title),
-            Alert::IconTitleChanged(title) => GridAlert::IconTitle(title),
+            Alert::WindowTitleChanged(title) => GridAlert::WindowTitle(bounded_alert_text(title)),
+            Alert::IconTitleChanged(title) => GridAlert::IconTitle(title.map(bounded_alert_text)),
             Alert::CurrentWorkingDirectoryChanged => GridAlert::WorkingDirectory,
             Alert::PaletteChanged => GridAlert::Palette,
-            Alert::SetUserVar { name, value } => GridAlert::UserVar { name, value },
+            Alert::SetUserVar { name, value } => GridAlert::UserVar {
+                name: bounded_alert_text(name),
+                value: bounded_alert_text(value),
+            },
             Alert::OutputSinceFocusLost => return,
-            other => GridAlert::Unexpected(format!("{other:?}")),
+            other => GridAlert::Unexpected(bounded_alert_text(format!("{other:?}"))),
         };
         if let Ok(mut alerts) = self.alerts.lock() {
             if alerts.len() >= MAX_ALERTS {
@@ -126,6 +149,14 @@ impl AlertHandler for AlertCollector {
         }
     }
 }
+
+/// The most the alert list can be holding.
+///
+/// Every alert is bounded and the list is bounded, so this is a constant rather than a
+/// measurement: it is what the session is charged for the channel, whether or not anything is on
+/// it at the moment.
+pub(crate) const ALERT_LIST_BYTES: u64 =
+    (MAX_ALERTS * (2 * MAX_ALERT_BYTES + 2 * size_of::<String>())) as u64;
 
 /// The configuration the grid library runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -947,12 +978,9 @@ impl CanonicalGrid {
             row,
             pending_wrap: saved.wrap_next,
             rendition: rendition_of(&saved.pen),
-            charsets: Charsets {
+            charsets: Designations {
                 g0: format!("{:?}", saved.g0_charset),
                 g1: format!("{:?}", saved.g1_charset),
-                // A save does not carry the locking shift: a restore leaves G0 selected, so a
-                // restored session that recorded one would shift a buffer that never was shifted.
-                shift_out: false,
             },
             origin_mode: saved.dec_origin_mode,
             style: style_of(saved.position.shape),
@@ -1199,6 +1227,46 @@ impl CanonicalGrid {
             .saturating_mul((self.config.cell_bytes as u64).saturating_add(CELL_ATTRIBUTE_BYTES))
     }
 
+    /// The most one buffer's cells can cost in attribute allocations at this geometry.
+    #[must_use]
+    pub fn screen_attribute_ceiling(&self) -> u64 {
+        u64::from(self.size.cols)
+            .saturating_mul(u64::from(self.size.rows))
+            .saturating_mul(CELL_ATTRIBUTE_BYTES)
+    }
+
+    /// Whether the current pen makes every cell it writes keep an allocation of its own.
+    #[must_use]
+    pub fn pen_is_allocated(&self) -> bool {
+        attributes_are_allocated(&self.terminal.pen())
+    }
+
+    /// What the newest `rows` of the retained history cost.
+    ///
+    /// The rows that have just left the screen, so the cache can be charged where they join it
+    /// rather than at the next measurement: two rows can carry more than the whole cache.
+    #[must_use]
+    pub fn newest_history_bytes(&self, rows: usize) -> u64 {
+        let screen = self.terminal.screen();
+        let history = screen
+            .scrollback_rows()
+            .saturating_sub(self.size.rows as usize);
+        let first = history.saturating_sub(rows);
+        let mut bytes = 0u64;
+        let mut index = 0usize;
+        screen.for_each_phys_line(|_, line| {
+            let counted = index >= first && index < history;
+            index += 1;
+            if counted {
+                let cells = line.len() as u64;
+                bytes = bytes
+                    .saturating_add(row_content_bytes(line) + cells * CELL_OVERHEAD_BYTES)
+                    .saturating_add(link_bytes(line));
+            }
+        });
+        bytes
+    }
+
     /// Bytes the hyperlinks of the rows that are showing cost.
     #[must_use]
     pub fn screen_link_bytes(&self) -> u64 {
@@ -1282,9 +1350,7 @@ fn link_bytes(line: &wezterm_term::Line) -> u64 {
 /// what the object actually holds.
 #[must_use]
 pub fn link_cost(text: &str, parameters: usize) -> u64 {
-    LINK_OBJECT_BYTES
-        + 2 * text.len() as u64
-        + table_slots(parameters).saturating_mul(TABLE_SLOT_BYTES)
+    LINK_OBJECT_BYTES + 2 * text.len() as u64 + table_bytes(parameters)
 }
 
 /// What one link object costs, as the pinned library holds it.
@@ -1298,7 +1364,7 @@ fn link_object_bytes(link: &Hyperlink) -> u64 {
     // is not using, and a session that filled one would be under-charged for every link in it.
     let mut bytes = LINK_OBJECT_BYTES
         .saturating_add(link.uri().len() as u64)
-        .saturating_add(table_slots(params.capacity()).saturating_mul(TABLE_SLOT_BYTES));
+        .saturating_add(table_bytes(params.len()));
     for (key, value) in params {
         bytes = bytes.saturating_add((key.capacity() + value.capacity()) as u64);
     }
@@ -1318,24 +1384,44 @@ const LINK_OBJECT_BYTES: u64 = (size_of::<Hyperlink>() + 2 * size_of::<usize>())
 /// byte the table keeps beside them.
 const TABLE_SLOT_BYTES: u64 = (size_of::<(String, String)>() + 1) as u64;
 
+/// What a parameter table keeps beyond its slots: the group of control bytes it reads past the
+/// end of them.
+const TABLE_GROUP_BYTES: u64 = 16;
+
 /// What a cell's independently allocated attributes cost when it has them.
 ///
 /// A cell keeps its true colours, its underline colour, its link handle and its image list in one
 /// allocation of its own, reached through a pointer, and the grid makes that allocation as soon as
 /// any of them is more than the packed form on the cell can hold. Its fields are the three colour
 /// attributes, the link handle and the image list.
-pub(crate) const CELL_ATTRIBUTE_BYTES: u64 =
-    (3 * size_of::<ColorAttribute>() + 4 * size_of::<usize>()) as u64;
+pub(crate) const CELL_ATTRIBUTE_BYTES: u64 = {
+    let fields = 3 * size_of::<ColorAttribute>() + 4 * size_of::<usize>();
+    // The allocation is aligned to a pointer, so what it occupies rounds up to a multiple of one.
+    (fields.next_multiple_of(size_of::<usize>())) as u64
+};
 
-/// How many slots a hash table holding `entries` keeps.
+// A row is held either as a vector of cells or as a string with a run of attributes beside it, and
+// both are built by appending, so a row can be holding twice the slots it is using. The per-cell
+// figure the budget charges has to cover the larger of the two, doubled.
+const _: () = assert!(CELL_OVERHEAD_BYTES >= 2 * size_of::<wezterm_term::Cell>() as u64);
+const _: () =
+    assert!(CELL_OVERHEAD_BYTES >= 2 * (size_of::<CellAttributes>() + size_of::<u16>()) as u64);
+
+/// What a hash table holding `entries` costs.
 ///
-/// The table doubles as it grows and leaves an eighth of itself free, so an entry count rounds up
-/// to the next power of two above the fraction it needs.
-fn table_slots(entries: usize) -> u64 {
-    if entries == 0 {
-        return 0;
-    }
-    (entries.saturating_mul(8) / 7 + 1).next_power_of_two() as u64
+/// The table keeps a power of two of slots, never fewer than four, and leaves an eighth of them
+/// free. Both the reservation made before a link is applied and the measurement taken afterwards
+/// go through here on an entry count, so the two cannot round differently: the reservation counts
+/// the separators the parameter field carries, which is never fewer than the entries the table
+/// ends up with.
+fn table_bytes(entries: usize) -> u64 {
+    let slots: u64 = match entries {
+        0 => return 0,
+        1..=3 => 4,
+        4..=7 => 8,
+        _ => (entries.saturating_mul(8) / 7).next_power_of_two() as u64,
+    };
+    slots.saturating_mul(TABLE_SLOT_BYTES) + TABLE_GROUP_BYTES
 }
 
 /// Whether a cell with these attributes has an allocation of its own.
@@ -1352,10 +1438,15 @@ fn attributes_are_allocated(attrs: &CellAttributes) -> bool {
 /// attributes. Counting the text alone would report a screen of coloured cells as costing what a
 /// screen of plain ones costs.
 fn row_content_bytes(line: &wezterm_term::Line) -> u64 {
-    let mut bytes = line.as_str().len() as u64;
+    // The text as the row is holding it rather than as it reads: a row grows its string by
+    // appending, so it can be holding twice what it shows.
+    let mut bytes = 2 * line.as_str().len() as u64;
     for cell in line.visible_cells() {
         if attributes_are_allocated(cell.attrs()) {
-            bytes = bytes.saturating_add(CELL_ATTRIBUTE_BYTES);
+            // The columns a wide cell covers carry its attributes, and while the row is held as a
+            // vector of cells each of those columns is a cell with an allocation of its own.
+            bytes = bytes
+                .saturating_add(CELL_ATTRIBUTE_BYTES.saturating_mul(cell.width().max(1) as u64));
         }
     }
     bytes

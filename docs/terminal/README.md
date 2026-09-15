@@ -429,10 +429,10 @@ the same loop is delivering; a reply that does not fit stays where it is, includ
 The serial write loop itself belongs to the worker, which owns the pseudo-terminal: ordering a reply
 after its query event, closing paste framing on source loss, invalidating an editor fence, and
 accounting for every delivered byte are its work. This crate supplies the bounds, the ordering
-information (`Response::query_at`) and the gate it needs to do that. Those obligations are proved
-where the pseudo-terminal is, against the worker's own write path: serial delivery, a write that
-only partly completes, paste framing closed when the source is lost, replies that stay behind their
-queries, and a fence that an intervening write invalidates. A test here could only exercise a
+information (`Response::query_at`) and the gate it needs to do that. Those obligations must be
+proved where the pseudo-terminal is, against the worker's own write path: serial delivery, a write
+that only partly completes, paste framing closed when the source is lost, replies that stay behind
+their queries, and a fence that an intervening write invalidates. A test here could only exercise a
 stand-in for the write, which would prove nothing about the write.
 
 Nothing on the lane is history. `reset` drops everything pending, and a reconnecting client is never
@@ -572,10 +572,10 @@ The historical-row bound is enforced rather than reported. The engine measures t
 periodically, and when they pass the bound it lowers the library's scrollback row count so older
 rows are evicted as new ones arrive. The new row count is proportional to the overshoot, so the
 retained rows converge back under the bound over the following rows rather than oscillating.
-Measuring means walking the scrollback and every cell of the screens, so doing it on every read
-would cost more than the bound saves. It happens when the rows have grown, when something asks, and
-every 64 reads otherwise; between two measurements the charge is what each applied event reserved,
-which is never less than what was allocated.
+Measuring every retained row means walking the scrollback, so doing it on every read would cost more
+than the bound saves. A full measurement happens when the rows have grown, when something asks, and
+every 64 reads otherwise; between two of them the charge is what each applied event reserved, plus
+what the rows that scrolled off cost, which is never less than what was allocated.
 
 What the rows cost includes the hyperlinks they hold. Every cell inside a link holds a reference to
 the whole link, and the object behind that reference costs far more than its target's characters, so
@@ -587,19 +587,40 @@ buffer that is not showing still holds its own.
 
 Growth is charged as it happens rather than noticed at the next measurement, because one read can
 carry a session's worth of links or fill a screen, and a bound that is only checked afterwards is
-not a bound. A link's cost is reserved before it is applied, and a link that will not fit is
-refused; refusing one ends the link that was open, because the text that belonged to the refused
-link must not end up inside the previous one. Printing is charged the same way, held to what the
-buffer's cells can hold: a screen is a fixed number of cells, so printing through the same cell a
-thousand times costs what one cell costs. A reservation is deliberately generous, charging a
-string at twice what it holds, which is the most a doubling allocator keeps for it, so a later
-measurement never finds more than the session was already charged.
+not a bound.
 
-What a measurement counts is what the grid is holding, not a figure standing in for it: the
-capacity of a link's parameter table rather than how many parameters it has, the capacity of each
-key and value, and the allocation a cell keeps for the colours, underline colour, link handle and
-image list that the packed form on the cell cannot hold. Counting only characters would report a
-screen of coloured, linked cells as costing what a screen of plain ones costs.
+What section 8 asks to be *refused* before it is allocated is a geometry that cannot fit, and the
+metadata an application can grow without limit: per-cell content, and unique links and titles. Those
+are refused. A link's cost is reserved before it is applied, and one that will not fit is refused;
+refusing one ends the link that was open, because the text that belonged to the refused link must
+not end up inside the previous one. A link with parameters and no target is refused the same way:
+that is a close, and keeping its parameters would let an application hold a session's worth of
+identifiers in links nothing can follow. A cell that reaches its content bound drops the marks past
+it. The alert channel holds a bounded number of alerts, each cut to a bounded length.
+
+What the screens hold is bounded rather than refused, because a screen is a fixed number of cells:
+printing through the same cell a thousand times costs what one cell costs. Printing is charged as
+it is applied, held at what the buffer's cells can hold, so the running figure is never below what
+was allocated. Rows that scroll off the screen are charged where they join the historical cache,
+and the cache is brought back under its bound there rather than at the next measurement, because
+two rows can carry more than the whole of it.
+
+A reservation covers what the measurement will find. Both sides work a link's parameter table out
+from an entry count through the same rounding, and a string is reserved at twice what it holds,
+which is the most a doubling allocator keeps for it.
+
+What a measurement counts is what the grid is holding, not a figure standing in for it: a link's
+parameter table as it is allocated rather than as many entries as it has, each key and value at its
+capacity, and the allocation a cell keeps for the colours, underline colour, link handle and image
+list that the packed form on the cell cannot hold, counted for every column the cell covers.
+Counting only characters would report a screen of coloured, linked cells as costing what a screen of
+plain ones costs.
+
+Two bounds in section 8 meet awkwardly at the extremes. The largest grid it allows is 262,144 cells,
+each of which may hold 64 bytes of encoded content and an allocation of its own for attributes the
+packed form cannot hold; two buffers of those, filled, come to more than the 64 MiB session budget.
+A session there is reported as under resident pressure rather than refused, because refusing to
+print into a grid the same section says is valid would be worse than saying the session is large.
 
 What the budget records is what the rows actually cost, not what they are allowed to cost. Recording
 the bound instead would make a session that is over its cache look exactly like one that is at it,

@@ -44,6 +44,18 @@ pub struct CursorState {
     pub pending_wrap: bool,
 }
 
+/// The character sets a saved cursor carries.
+///
+/// DECSC saves the designations and not the locking shift, so a restore leaves whichever set was
+/// selected selected. A saved cursor therefore has no shift of its own to restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Designations {
+    /// The set designated as G0.
+    pub g0: String,
+    /// The set designated as G1.
+    pub g1: String,
+}
+
 /// A saved cursor, from DECSC or the alternate-buffer switch.
 ///
 /// A saved cursor is more than a position. DECSC saves the graphic rendition, the character sets
@@ -61,8 +73,8 @@ pub struct SavedCursor {
     pub pending_wrap: bool,
     /// The graphic rendition that was saved with it.
     pub rendition: Rendition,
-    /// The character sets that were saved with it.
-    pub charsets: Charsets,
+    /// The character sets that were designated when it was saved.
+    pub charsets: Designations,
     /// Whether origin mode was set when it was saved.
     pub origin_mode: bool,
     /// The DECSCUSR style that was saved with it.

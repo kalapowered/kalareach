@@ -128,8 +128,7 @@
           "buffer": "Primary",
           "charsets": {
             "g0": "Ascii",
-            "g1": "Ascii",
-            "shift_out": false
+            "g1": "Ascii"
           },
           "col": 0,
           "hyperlink": null,
@@ -137,11 +136,18 @@
           "pending_wrap": false,
           "rendition": {
             "background": "Default",
+            "blink": "None",
             "bold": false,
+            "faint": false,
             "foreground": "Default",
+            "invisible": false,
             "italic": false,
+            "overline": false,
             "reverse": false,
-            "underline": "None"
+            "strikethrough": false,
+            "underline": "None",
+            "underline_colour": "Default",
+            "vertical_align": "Baseline"
           },
           "row": 1,
           "style": 0
@@ -226,8 +232,7 @@
           "buffer": "Primary",
           "charsets": {
             "g0": "Ascii",
-            "g1": "Ascii",
-            "shift_out": false
+            "g1": "Ascii"
           },
           "col": 0,
           "hyperlink": null,
@@ -235,11 +240,18 @@
           "pending_wrap": false,
           "rendition": {
             "background": "Default",
+            "blink": "None",
             "bold": false,
+            "faint": false,
             "foreground": "Default",
+            "invisible": false,
             "italic": false,
+            "overline": false,
             "reverse": false,
-            "underline": "None"
+            "strikethrough": false,
+            "underline": "None",
+            "underline_colour": "Default",
+            "vertical_align": "Baseline"
           },
           "row": 1,
           "style": 0
@@ -544,8 +556,7 @@
           "buffer": "Primary",
           "charsets": {
             "g0": "Ascii",
-            "g1": "Ascii",
-            "shift_out": false
+            "g1": "Ascii"
           },
           "col": 0,
           "hyperlink": null,
@@ -553,11 +564,18 @@
           "pending_wrap": false,
           "rendition": {
             "background": "Default",
+            "blink": "None",
             "bold": false,
+            "faint": false,
             "foreground": "Default",
+            "invisible": false,
             "italic": false,
+            "overline": false,
             "reverse": false,
-            "underline": "None"
+            "strikethrough": false,
+            "underline": "None",
+            "underline_colour": "Default",
+            "vertical_align": "Baseline"
           },
           "row": 2,
           "style": 0
@@ -630,8 +648,7 @@
           "buffer": "Primary",
           "charsets": {
             "g0": "Ascii",
-            "g1": "DecLineDrawing",
-            "shift_out": false
+            "g1": "DecLineDrawing"
           },
           "col": 3,
           "hyperlink": null,
@@ -639,11 +656,18 @@
           "pending_wrap": false,
           "rendition": {
             "background": "Default",
+            "blink": "None",
             "bold": true,
+            "faint": false,
             "foreground": "Indexed(1)",
+            "invisible": false,
             "italic": false,
+            "overline": false,
             "reverse": false,
-            "underline": "None"
+            "strikethrough": false,
+            "underline": "None",
+            "underline_colour": "Default",
+            "vertical_align": "Baseline"
           },
           "row": 1,
           "style": 0
@@ -652,8 +676,7 @@
           "buffer": "Alternate",
           "charsets": {
             "g0": "Ascii",
-            "g1": "Ascii",
-            "shift_out": false
+            "g1": "Ascii"
           },
           "col": 1,
           "hyperlink": null,
@@ -661,11 +684,18 @@
           "pending_wrap": false,
           "rendition": {
             "background": "Indexed(2)",
+            "blink": "None",
             "bold": false,
+            "faint": false,
             "foreground": "Default",
+            "invisible": false,
             "italic": false,
+            "overline": false,
             "reverse": false,
-            "underline": "None"
+            "strikethrough": false,
+            "underline": "None",
+            "underline_colour": "Default",
+            "vertical_align": "Baseline"
           },
           "row": 2,
           "style": 0
