@@ -843,3 +843,69 @@ fn a_delta_carries_the_presentation_state_that_changed() {
         .expect_err("the base no longer describes anything");
     assert!(matches!(error, TermError::CursorGap { .. }));
 }
+
+/// Resident state is measured when it grows, not only every so many reads.
+#[test]
+fn one_large_read_is_measured_before_the_next_one() {
+    let mut engine = Engine::new(EngineConfig {
+        size: kr_term::budget::GridSize::new(2048, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let mut input = Vec::new();
+    for _ in 0..320 {
+        input.extend(std::iter::repeat_n(b'x', 2048));
+        input.extend_from_slice(b"\r\n");
+    }
+    let outcome = engine.feed(&input, 0);
+    assert_eq!(
+        engine.budget().usage().rows,
+        engine.grid().history_bytes(),
+        "the budget knows what the rows cost after the read that made them"
+    );
+    assert!(
+        outcome.resident_pressure.row_cache,
+        "and says the cache is over its bound while it is"
+    );
+}
+
+/// A hyperlink costs what the whole link costs, identifier included.
+#[test]
+fn hyperlink_identifiers_are_counted() {
+    let mut engine = engine();
+    let mut input = Vec::new();
+    for index in 0..8u32 {
+        input.extend_from_slice(b"\x1b]8;id=");
+        input.extend(std::iter::repeat_n(b'a', 4096));
+        input.extend_from_slice(index.to_string().as_bytes());
+        input.extend_from_slice(b";https://example.invalid/\x1b\\X");
+    }
+    engine.feed(&input, 0);
+    assert!(
+        engine.budget().usage().metadata > 8 * 4096,
+        "the identifiers are counted, not just the targets"
+    );
+}
+
+/// A cell that reaches its content bound says so rather than losing marks quietly.
+#[test]
+fn a_full_cell_reports_the_marks_it_dropped() {
+    let mut engine = engine();
+    let mut input = String::from("e");
+    for _ in 0..200 {
+        input.push('\u{301}');
+    }
+    input.push('X');
+    let outcome = engine.feed(input.as_bytes(), 0);
+    assert!(engine.budget().truncations() > 0);
+    assert!(
+        outcome.projection_required_at.is_some(),
+        "a physical terminal would have kept them, so the screens differ"
+    );
+    assert!(
+        outcome
+            .diagnostics
+            .iter()
+            .any(|entry| entry.kind == kr_term::diag::DiagnosticKind::ResidentStateTruncated)
+    );
+}

@@ -518,8 +518,12 @@ fn osc99_metadata_qualified(metadata: &[u8]) -> bool {
             }
             // Which part of the notification the payload is.
             b"p" => matches!(value, b"title" | b"body"),
-            // Whether this is the last part, whether the payload is encoded, and the urgency.
-            b"d" | b"e" => matches!(value, b"0" | b"1"),
+            // The payload's encoding.
+            b"e" => matches!(value, b"0" | b"1"),
+            // Whether the notification is complete. This profile delivers a notification when it
+            // arrives, so a part that says more is coming is an extension rather than the first of
+            // a pair that nothing will assemble.
+            b"d" => value == b"1",
             b"u" => matches!(value, b"0" | b"1" | b"2"),
             // When the notification is shown.
             b"o" => matches!(value, b"always" | b"unfocused" | b"invisible"),

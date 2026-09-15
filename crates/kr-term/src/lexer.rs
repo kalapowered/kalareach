@@ -1135,7 +1135,10 @@ impl Lexer {
         self.offset += 1;
         if self.pending.len() < self.limits.max_sequence_bytes {
             self.pending.push(byte);
-        } else {
+        } else if !matches!(self.state, State::String(_) | State::DcsPassthrough) {
+            // Only a prelude byte that was dropped changes what the sequence means. A string
+            // payload is accumulated separately, under its own much larger bound, so passing this
+            // one says nothing about the sequence except that it is long.
             self.pending_truncated = true;
         }
     }
@@ -1198,7 +1201,7 @@ impl Lexer {
         self.pending_truncated = false;
         self.state = State::Ground;
         let direct_safe = !truncated && kind.payload_is_direct_safe();
-        let event = self.build_with(
+        let mut event = self.build_with(
             span,
             SeqBytes::from_vec(bytes),
             kind,
@@ -1206,6 +1209,13 @@ impl Lexer {
             direct_safe,
             embedded,
         );
+        // A prelude the parser could not keep whole is not a shorter sequence: the bytes it dropped
+        // could have carried anything. That holds however the sequence ended, including the ones
+        // that go on to collect a string body before they finish here.
+        if truncated {
+            event.class = crate::class::SequenceClass::Extension;
+            event.disposition = DirectDisposition::Withhold;
+        }
         out.push(event);
     }
 

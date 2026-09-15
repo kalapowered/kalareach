@@ -753,3 +753,26 @@ fn clustering_does_not_depend_on_read_boundaries() {
         );
     }
 }
+
+/// A prelude the parser could not keep whole never becomes a shorter sequence.
+#[test]
+fn a_truncated_prelude_is_an_extension_whatever_follows_it() {
+    for tail in [
+        b"]2;hello\x07".as_slice(),
+        b"c".as_slice(),
+        b"P0;1|x\x1b\\".as_slice(),
+        b"[1;31m".as_slice(),
+    ] {
+        let mut input = vec![0x1b];
+        input.extend(std::iter::repeat_n(0u8, 300));
+        input.extend_from_slice(tail);
+        let events = lex(&input);
+        assert_eq!(classes(&events), "X", "{tail:?} survived a lost prelude");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.disposition == DirectDisposition::Withhold),
+            "{tail:?} reached a terminal"
+        );
+    }
+}

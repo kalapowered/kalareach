@@ -2616,13 +2616,13 @@
       "diagnostics": [
         {
           "at": 0,
-          "kind": "side-effect-without-destination"
+          "kind": "unclassified-sequence"
         }
       ],
       "events": [
         {
           "bytes": "1b5d39393b693d313a643d303b626f64791b5c",
-          "class": "S",
+          "class": "X",
           "disposition": "Withhold",
           "eight_bit": false,
           "ground_after": true,
@@ -2643,13 +2643,7 @@
       "projection_required_at": null,
       "refusals": [],
       "responses": [],
-      "side_effects": [
-        {
-          "at": 0,
-          "destination": "host-event",
-          "kind": "notification"
-        }
-      ]
+      "side_effects": []
     },
     {
       "covers": "KR-REQ-08.31 row OSC 777",

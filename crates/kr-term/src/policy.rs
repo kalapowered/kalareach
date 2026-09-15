@@ -319,10 +319,40 @@ fn parse_u8(part: &[u8]) -> Option<u8> {
     core::str::from_utf8(part).ok()?.parse::<u8>().ok()
 }
 
-/// `OSC 99 ; <metadata> ; <payload>`: the body is the payload, the metadata is not a title.
+/// `OSC 99 ; <metadata> ; <payload>`.
+///
+/// The metadata says what the payload is and how it is encoded, and the class table has already
+/// refused the forms this profile does not implement. `p` selects the title or the body, and `e=1`
+/// means the payload is base64.
 fn kitty_notification(parts: &[Vec<u8>]) -> Option<(Option<String>, String)> {
-    let body = parts.get(2)?;
-    Some((None, String::from_utf8_lossy(body).into_owned()))
+    let metadata = parts.get(1).map_or(&[][..], Vec::as_slice);
+    let mut encoded = false;
+    let mut is_title = false;
+    for pair in metadata.split(|byte| *byte == b':') {
+        let mut halves = pair.splitn(2, |byte| *byte == b'=');
+        let key = halves.next().unwrap_or(b"");
+        let value = halves.next().unwrap_or(b"");
+        match key {
+            b"e" => encoded = value == b"1",
+            b"p" => is_title = value == b"title",
+            _ => {}
+        }
+    }
+    let payload = parts.get(2)?;
+    let decoded = if encoded {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .ok()?
+    } else {
+        payload.clone()
+    };
+    let text = String::from_utf8_lossy(&decoded).into_owned();
+    if is_title {
+        Some((Some(text), String::new()))
+    } else {
+        Some((None, text))
+    }
 }
 
 /// `OSC 777 ; notify ; <title> ; <body>`.

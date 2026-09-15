@@ -330,24 +330,42 @@ fn interpret(event: &Event) -> Option<(ProbeItem, ProbeAnswer)> {
         } => {
             let csi = crate::classify::CsiView::new(params, *final_byte);
             match (csi.private, csi.final_byte) {
-                (Some(b'?'), b'c') => Some((
-                    ProbeItem::DeviceAttributes,
-                    ProbeAnswer::DeviceAttributes(
-                        csi.numbers.iter().filter_map(|slot| *slot).collect(),
-                    ),
-                )),
-                (Some(b'?'), b'u') => Some((
-                    ProbeItem::KittyKeyboard,
-                    ProbeAnswer::KittyFlags(
-                        u8::try_from(csi.first_or(0).clamp(0, i64::from(u8::MAX))).unwrap_or(0),
-                    ),
-                )),
+                (Some(b'?'), b'c') => {
+                    // A device-attributes reply names at least one attribute. An empty one is not
+                    // a terminal saying it has none: it is a reply this profile does not recognise,
+                    // and accepting it as the terminator would end the exchange on nothing.
+                    let attributes: Vec<i64> =
+                        csi.numbers.iter().filter_map(|slot| *slot).collect();
+                    if attributes.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        ProbeItem::DeviceAttributes,
+                        ProbeAnswer::DeviceAttributes(attributes),
+                    ))
+                }
+                (Some(b'?'), b'u') => {
+                    // The qualified flags are the five the profile advertises.
+                    let flags = csi.number(0).unwrap_or(0);
+                    if !(0..=0x1f).contains(&flags) || csi.numbers.len() > 1 {
+                        return None;
+                    }
+                    Some((
+                        ProbeItem::KittyKeyboard,
+                        ProbeAnswer::KittyFlags(u8::try_from(flags).unwrap_or(0)),
+                    ))
+                }
                 // A DECRQM reply is DECRPM: `CSI ? mode ; status $ y`.
                 (Some(b'?'), b'y') if csi.intermediates == *b"$" => {
                     if csi.number(0) != Some(i64::from(crate::classify::MODE_SYNCHRONISED_OUTPUT)) {
                         return None;
                     }
-                    let status = csi.number(1).unwrap_or(0);
+                    // DECRPM has five defined statuses. Anything else is not a status this
+                    // profile can record as a capability.
+                    let status = csi.number(1)?;
+                    if !(0..=4).contains(&status) || csi.numbers.len() != 2 {
+                        return None;
+                    }
                     Some((
                         ProbeItem::SynchronisedOutput,
                         ProbeAnswer::ModeStatus(u16::try_from(status).unwrap_or(0)),
@@ -378,7 +396,7 @@ fn interpret(event: &Event) -> Option<(ProbeItem, ProbeAnswer)> {
                     .first()
                     .and_then(|param| param.punct())
                     .is_some_and(|byte| byte == b'>');
-            if !is_version {
+            if !is_version || payload.is_empty() {
                 return None;
             }
             Some((

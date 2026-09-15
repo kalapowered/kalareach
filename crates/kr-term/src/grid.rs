@@ -871,6 +871,14 @@ impl CanonicalGrid {
             .collect()
     }
 
+    /// How many rows the active buffer is retaining.
+    ///
+    /// Cheap, unlike measuring them, so it is what decides when a measurement is worth taking.
+    #[must_use]
+    pub fn scrollback_rows(&self) -> usize {
+        self.terminal.screen().scrollback_rows()
+    }
+
     /// Bytes the retained rows are currently using.
     ///
     /// This counts the encoded text plus the per-cell bookkeeping the grid keeps for it, because
@@ -1011,8 +1019,22 @@ pub fn sgr_parameters(attrs: &CellAttributes) -> String {
     if attrs.strikethrough() {
         parts.push("9".to_owned());
     }
+    if attrs.overline() {
+        parts.push("53".to_owned());
+    }
+    match attrs.vertical_align() {
+        VerticalAlign::BaseLine => {}
+        VerticalAlign::SuperScript => parts.push("73".to_owned()),
+        VerticalAlign::SubScript => parts.push("74".to_owned()),
+    }
     push_colour(&mut parts, colour_of(attrs.foreground()), 30, 38, 90);
     push_colour(&mut parts, colour_of(attrs.background()), 40, 48, 100);
+    // The underline colour has no short form, so it is always the sublist spelling.
+    match colour_of(attrs.underline_color()) {
+        Colour::Default => {}
+        Colour::Indexed(index) => parts.push(format!("58:5:{index}")),
+        Colour::Direct(rgb) => parts.push(format!("58:2::{}:{}:{}", rgb.r, rgb.g, rgb.b)),
+    }
     parts.join(";")
 }
 

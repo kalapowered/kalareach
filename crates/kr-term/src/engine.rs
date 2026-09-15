@@ -197,6 +197,10 @@ const REPLAY_WINDOW: usize = 64;
 /// it enforces. Every 64 reads is often enough that the cache overshoots by a fraction of itself.
 const ROW_CACHE_INTERVAL: u32 = 64;
 
+/// How many rows the scrollback may gain or lose before it is measured again, whatever the read
+/// count says.
+const ROW_CACHE_ROW_STEP: usize = 32;
+
 /// The terminal engine for one session.
 #[derive(Debug)]
 pub struct Engine {
@@ -222,6 +226,8 @@ pub struct Engine {
     palette_revision: u64,
     dimensions_revision: u64,
     presentation_revision: u64,
+    measured_rows: usize,
+    dropped_marks: u64,
     keyboard_revision: u64,
     feeds: u32,
     scratch: Vec<Event>,
@@ -260,6 +266,8 @@ impl Engine {
             palette_revision: 0,
             dimensions_revision: 0,
             presentation_revision: 0,
+            measured_rows: 0,
+            dropped_marks: 0,
             keyboard_revision: 0,
             feeds: 0,
             scratch: Vec::new(),
@@ -459,6 +467,7 @@ impl Engine {
                     ) {
                         self.presentation_revision = self.next_revision();
                     }
+                    self.report_truncation(event, &mut outcome, now_ms);
                     if adapted.unrecognised {
                         // The class table approved it and the canonical grid does not know it.
                         // Consuming it keeps the two screens in step.
@@ -601,6 +610,11 @@ impl Engine {
     }
 
     /// Whether recording this event's hyperlink would pass the session's bound.
+    ///
+    /// What is counted is the whole link, parameters included. The identifier parameter is retained
+    /// alongside the target and is the part an application controls most freely, so counting only
+    /// the target would let a program hold megabytes of identifiers inside a budget that says it is
+    /// using nothing.
     fn link_budget_exceeded(&mut self, event: &Event) -> bool {
         let EventKind::Osc {
             selector: Some(8),
@@ -617,7 +631,8 @@ impl Engine {
         if uri.is_empty() {
             return false;
         }
-        let uri = String::from_utf8_lossy(&uri).into_owned();
+        let parameters = String::from_utf8_lossy(&parts[1]).into_owned();
+        let uri = format!("{parameters};{}", String::from_utf8_lossy(&uri));
         if self.links.contains(&uri) {
             return false;
         }
@@ -633,13 +648,48 @@ impl Engine {
         false
     }
 
+    /// Reports content the grid could not keep whole.
+    ///
+    /// A cell has a content bound, and combining marks past it are dropped rather than allowed to
+    /// grow one cell without limit. That is a degradation and not a silent one: the caller is told,
+    /// and the attachment projects, because a physical terminal reading the same bytes would have
+    /// kept them and the two screens would otherwise disagree.
+    fn report_truncation(&mut self, event: &Event, outcome: &mut FeedOutcome, now_ms: u64) {
+        let dropped = self.grid.dropped_marks();
+        if dropped == self.dropped_marks {
+            return;
+        }
+        self.dropped_marks = dropped;
+        self.budget.record_truncation();
+        self.diagnostics.record(
+            DiagnosticKind::ResidentStateTruncated,
+            event.span.start(),
+            now_ms,
+            "a cell reached its content bound; the marks past it were dropped",
+        );
+        outcome
+            .projection_required_at
+            .get_or_insert(event.span.start());
+    }
+
     /// Measures and enforces the resident-state bounds.
     ///
-    /// Measuring the retained rows means walking the scrollback, so it happens periodically rather
-    /// than on every read. The bound it enforces is a cache size, so overshooting it briefly costs
-    /// memory in proportion to how often this runs and nothing else.
+    /// Measuring the retained rows means walking the scrollback, so it is not done on every read.
+    /// Counting them is cheap, though, so a read that added rows is measured however few reads have
+    /// happened: one read can carry a megabyte, and waiting for the next sixty-three would let the
+    /// cache grow far past its bound before anyone looked.
+    ///
+    /// While the alternate buffer is active the primary buffer's history is not reachable and is
+    /// not changing either, so the last measurement of it stands rather than being replaced by the
+    /// alternate buffer's nothing.
     fn enforce_resident_state(&mut self, now_ms: u64) {
-        if !self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) {
+        let rows = self.grid.scrollback_rows();
+        let grew = rows.abs_diff(self.measured_rows) >= ROW_CACHE_ROW_STEP;
+        if !grew && !self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) {
+            return;
+        }
+        self.measured_rows = rows;
+        if self.grid.alternate_active() {
             return;
         }
         let bytes = self.grid.history_bytes();
