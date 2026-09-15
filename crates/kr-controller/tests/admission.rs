@@ -342,3 +342,84 @@ fn a_fenced_reservation_keeps_its_slot_and_a_failed_one_does_not() {
         "a launch confirmed not to have started occupies nothing"
     );
 }
+
+#[test]
+fn a_registry_written_by_the_previous_schema_is_brought_forward() {
+    let host = kr_ipc::testing::TempHost::create();
+    let path = host.environment().registry_database();
+    // The version 1 shape, written directly: reservations without a recorded create request and
+    // without a claimed key.
+    let legacy = rusqlite::Connection::open(&path).expect("opens");
+    legacy
+        .execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (1);
+             CREATE TABLE environment (
+                 environment_id BLOB PRIMARY KEY,
+                 generation     INTEGER NOT NULL,
+                 next_display   INTEGER NOT NULL,
+                 session_limit  INTEGER NOT NULL
+             );
+             CREATE TABLE reservations (
+                 reservation_id    BLOB PRIMARY KEY,
+                 actor_id          TEXT NOT NULL,
+                 create_token      BLOB NOT NULL,
+                 payload_digest    BLOB NOT NULL,
+                 session_id        BLOB NOT NULL UNIQUE,
+                 display_number    INTEGER NOT NULL UNIQUE,
+                 phase             TEXT NOT NULL,
+                 launcher_pid      INTEGER,
+                 launcher_source   TEXT,
+                 launcher_start    INTEGER,
+                 created_at_ms     INTEGER NOT NULL,
+                 UNIQUE (actor_id, create_token)
+             );
+             CREATE TABLE workers (
+                 session_id       BLOB PRIMARY KEY,
+                 display_number   INTEGER NOT NULL,
+                 public_key       BLOB NOT NULL,
+                 process_pid      INTEGER NOT NULL,
+                 process_source   TEXT NOT NULL,
+                 process_start    INTEGER NOT NULL,
+                 endpoint         TEXT NOT NULL,
+                 profile          TEXT NOT NULL,
+                 state            TEXT NOT NULL
+             );
+             CREATE TABLE tombstones (
+                 session_id BLOB PRIMARY KEY,
+                 record     BLOB NOT NULL,
+                 closed_at_ms INTEGER NOT NULL
+             );",
+        )
+        .expect("creates the previous schema");
+    legacy
+        .execute(
+            "INSERT INTO reservations (reservation_id, actor_id, create_token, payload_digest,
+                 session_id, display_number, phase, created_at_ms)
+             VALUES (?1, 'local:501', ?2, ?3, ?4, 3, 'live', 100)",
+            rusqlite::params![
+                vec![1_u8; 16],
+                vec![2_u8; 16],
+                vec![3_u8; 32],
+                vec![4_u8; 16],
+            ],
+        )
+        .expect("records a reservation the previous build made");
+    drop(legacy);
+
+    let registry =
+        Registry::open(&path, host.environment_id()).expect("brings the registry forward");
+    let session =
+        kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([4_u8; 16]));
+    let carried = registry
+        .reservation_for_session(session)
+        .expect("reads")
+        .expect("the reservation survived");
+    assert_eq!(carried.display_number.get(), 3);
+    assert_eq!(carried.phase, LaunchPhase::Live);
+    assert_eq!(
+        carried.create_intent, None,
+        "a reservation the previous build wrote genuinely has no recorded request"
+    );
+    assert_eq!(carried.claimed_key, None);
+}

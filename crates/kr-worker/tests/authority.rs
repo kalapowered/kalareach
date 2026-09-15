@@ -285,3 +285,237 @@ fn target(
         agent_binding_revision: Nullable::null(),
     }
 }
+
+/// Sends one prepared mutation on a live connection and returns what the worker answered.
+async fn send_mutation(
+    client: &mut LocalClient,
+    mutation: kr_protocol::envelope::MutationRequest,
+) -> kr_protocol::envelope::Outcome {
+    client
+        .writer()
+        .write_message(&kr_protocol::local::ControlMessage::Mutation(mutation))
+        .await
+        .expect("writes the mutation");
+    loop {
+        match client.recv().await.expect("the worker answers") {
+            kr_protocol::local::ControlMessage::Response(response) => return response.outcome,
+            kr_protocol::local::ControlMessage::Notification(_) => {}
+            other => panic!("the worker answered {other:?}"),
+        }
+    }
+}
+
+fn close_mutation(
+    client: &LocalClient,
+    host: &Host,
+    ttl_ms: u64,
+    expected: kr_protocol::envelope::ParamsValue,
+) -> kr_protocol::envelope::MutationRequest {
+    kr_protocol::envelope::MutationRequest {
+        request_id: kr_protocol::ids::RequestId::new(91),
+        method: Method::SessionClose.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: target(host.environment_id, host.session_id),
+        expected,
+        action_window_id: client.acknowledgement().action_window_id.clone(),
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(ttl_ms),
+        params: kr_protocol::envelope::ParamsValue::from_typed(
+            &kr_protocol::session::SessionCloseParams {
+                session_id: host.session_id,
+            },
+        )
+        .expect("encodes"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_action_whose_accepted_lifetime_is_already_spent_is_not_dispatched() {
+    let host = host(1).await;
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mutation = close_mutation(
+        &client,
+        &host,
+        0,
+        kr_protocol::envelope::ParamsValue::empty(),
+    );
+    let outcome = send_mutation(&mut client, mutation).await;
+    let kr_protocol::envelope::Outcome::Error(error) = outcome else {
+        panic!("a request with no lifetime left must not close the session");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    assert_eq!(host.service.runtime().state().as_str(), "live");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_precondition_that_names_a_fact_and_says_nothing_about_it_is_refused() {
+    let host = host(1).await;
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut expected = kr_cbor::CanonicalMap::new();
+    expected
+        .insert("session_state".to_owned(), kr_cbor::CanonicalValue::Null)
+        .expect("one key");
+    let mutation = close_mutation(
+        &client,
+        &host,
+        30_000,
+        kr_protocol::envelope::ParamsValue::new(kr_cbor::CanonicalValue::Map(expected)),
+    );
+    let outcome = send_mutation(&mut client, mutation).await;
+    let kr_protocol::envelope::Outcome::Error(error) = outcome else {
+        panic!("an explicit null is not the same as no precondition");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(host.service.runtime().state().as_str(), "live");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_precondition_the_subject_no_longer_satisfies_refuses_the_mutation() {
+    let host = host(1).await;
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut expected = kr_cbor::CanonicalMap::new();
+    expected
+        .insert(
+            "session_state".to_owned(),
+            kr_cbor::CanonicalValue::text("closed"),
+        )
+        .expect("one key");
+    let mutation = close_mutation(
+        &client,
+        &host,
+        30_000,
+        kr_protocol::envelope::ParamsValue::new(kr_cbor::CanonicalValue::Map(expected)),
+    );
+    let outcome = send_mutation(&mut client, mutation).await;
+    let kr_protocol::envelope::Outcome::Error(error) = outcome else {
+        panic!("a precondition that does not hold must refuse the mutation");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert_eq!(host.service.runtime().state().as_str(), "live");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_is_answered_even_after_its_own_effect_moved_the_subject() {
+    let host = host(1).await;
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut expected = kr_cbor::CanonicalMap::new();
+    expected
+        .insert(
+            "session_state".to_owned(),
+            kr_cbor::CanonicalValue::text("live"),
+        )
+        .expect("one key");
+    let mutation = close_mutation(
+        &client,
+        &host,
+        30_000,
+        kr_protocol::envelope::ParamsValue::new(kr_cbor::CanonicalValue::Map(expected)),
+    );
+    let first = send_mutation(&mut client, mutation.clone()).await;
+    assert!(
+        matches!(first, kr_protocol::envelope::Outcome::Ok(_)),
+        "the close is accepted while the session is live"
+    );
+    // The close moved the session out of `live`, which is the precondition its own envelope
+    // named. The retry must still receive the retained result rather than a refusal.
+    let second = send_mutation(&mut client, mutation).await;
+    assert!(
+        matches!(second, kr_protocol::envelope::Outcome::Ok(_)),
+        "an exact retry receives the result the first request produced"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_hello_cannot_change_what_a_connection_is() {
+    let host = host(1).await;
+    let mut first = controller_client(&host, 1).await;
+    let mut second = controller_client(&host, 1).await;
+    read_session(&mut second, host.session_id)
+        .await
+        .expect("the replacement connection is served");
+    // The first connection is fenced. Announcing itself as an ordinary local client would be a way
+    // round the authority check, so a second hello is refused outright.
+    first
+        .writer()
+        .write_message(&kr_protocol::local::ControlMessage::Hello(
+            kr_protocol::local::LocalHello {
+                offered_versions: vec![PROTOCOL_VERSION],
+                build_id: build(),
+                client: LocalClientKind::Cli,
+                capabilities: kr_protocol::scalars::CanonicalSet::new(),
+                max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            },
+        ))
+        .await
+        .expect("writes the hello");
+    let reply = first.recv().await.expect("the worker answers");
+    let kr_protocol::local::ControlMessage::Response(response) = reply else {
+        panic!("a second hello must not be acknowledged");
+    };
+    assert!(matches!(
+        response.outcome,
+        kr_protocol::envelope::Outcome::Error(_)
+    ));
+    assert_eq!(
+        read_session(&mut first, host.session_id).await,
+        Err(ErrorCode::PermissionDenied)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_the_controller_that_holds_authority_announces_a_revision() {
+    let host = host(1).await;
+    let mut cli = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let notice = kr_protocol::worker::AuthorityRevisionNotice {
+        environment_id: host.environment_id,
+        revision: kr_protocol::ids::AuthorityRevision::new(4),
+    };
+    cli.writer()
+        .write_message(&kr_protocol::local::ControlMessage::AuthorityRevision(
+            notice,
+        ))
+        .await
+        .expect("writes the notice");
+    let reply = cli.recv().await.expect("the worker answers");
+    assert!(
+        matches!(
+            reply,
+            kr_protocol::local::ControlMessage::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Error(_),
+                ..
+            })
+        ),
+        "an ordinary local caller does not announce the host's authority"
+    );
+    assert_eq!(host.service.acknowledged_revision(), None);
+
+    let mut controller = controller_client(&host, 1).await;
+    controller
+        .writer()
+        .write_message(&kr_protocol::local::ControlMessage::AuthorityRevision(
+            notice,
+        ))
+        .await
+        .expect("writes the notice");
+    let reply = controller.recv().await.expect("the worker answers");
+    let kr_protocol::local::ControlMessage::AuthorityRevisionAck(ack) = reply else {
+        panic!("the controller's announcement is acknowledged");
+    };
+    assert_eq!(ack.revision.get(), 4);
+    assert_eq!(ack.session_id, host.session_id);
+    assert_eq!(
+        host.service.acknowledged_revision().map(|held| held.get()),
+        Some(4)
+    );
+}

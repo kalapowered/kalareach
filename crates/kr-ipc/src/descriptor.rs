@@ -572,6 +572,32 @@ mod tests {
         assert!(entries[0].descriptor.is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_in_the_descriptor_directory_does_not_hold_a_reader() {
+        let host = TempHost::create();
+        let paths = host.environment();
+        publish(&paths, &descriptor(&host, 13)).expect("publishes");
+        let pipe = paths.descriptors_dir().join("waiting.kr");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .expect("runs mkfifo");
+        assert!(made.success(), "creates a named pipe");
+        // Nothing will ever write to it. Reading the directory must still finish.
+        let entries = read_all(&paths).expect("lists");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.descriptor.is_err())
+                .count(),
+            1,
+            "the pipe is reported as a file this host will not trust"
+        );
+        std::fs::remove_file(&pipe).ok();
+    }
+
     #[test]
     fn an_unreadable_descriptor_is_reported_rather_than_skipped() {
         let host = TempHost::create();
