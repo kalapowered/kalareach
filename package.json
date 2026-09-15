@@ -1,0 +1,17 @@
+{
+  "name": "kalareach",
+  "version": "0.1.0",
+  "private": true,
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=11.0.0"
+  },
+  "packageManager": "pnpm@11.14.0",
+  "scripts": {
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "generate": "pnpm -r generate"
+  }
+}
