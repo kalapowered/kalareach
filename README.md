@@ -17,6 +17,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-transport` | Transport: iroh endpoints, the connection handshake, stream kinds, actor envelopes, action windows and dispatch leases |
 | `crates/kr-client` | The native client library: connections, typed calls, cursors, receipts and replaceable service clients |
 | `crates/kr-plugin-sdk` | The plugin package contract: manifests, the WIT package, effect classes, the catalogue index and the package validator |
+| `crates/kr-term` | The terminal engine: the kr-vt/1 profile, sequence classes, canonical grid, query broker and snapshots |
 | `packages/protocol` | The generated TypeScript package: types, a byte-compatible codec and the JSON adapter |
 | `packages/plugin-sdk` | The generated plugin SDK package: types, the package contract as data and the published WIT file |
 | `fixtures/` | Cross-language conformance vectors and fixture packages that both languages test against |
@@ -25,6 +26,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `docs/pairing/` | The pairing reference |
 | `docs/transport/` | The transport reference |
 | `docs/plugins/` | The plugin reference |
+| `docs/terminal/` | The terminal reference |
 
 Rust is canonical. The JSON Schema in `packages/protocol/schema/` and `packages/plugin-sdk/schema/`
 comes from the Rust types, and the TypeScript types come from those schemas. Every step has a check
@@ -49,6 +51,7 @@ cargo run -p kr-crypto --bin kr-crypto-vectors -- --check
 cargo run -p kr-pairing --bin kr-pairing-vectors -- --check
 cargo run -p kr-plugin-sdk --bin kr-plugin-sdk-gen -- --check
 cargo run -p kr-plugin-sdk --bin kr-plugin-sandbox -- fixtures/plugins/valid/example-declarative
+cargo run -p kr-term --bin kr-term-fixtures -- --check
 
 pnpm install --frozen-lockfile
 pnpm -r test
@@ -68,11 +71,13 @@ cargo run -p kr-crypto --bin kr-crypto-vectors
 cargo run -p kr-pairing --bin kr-pairing-vectors
 ```
 
-After changing a manifest type, do the same for the plugin SDK:
+After changing a manifest type, do the same for the plugin SDK, and after changing terminal
+behaviour, for the terminal fixtures:
 
 ```bash
 cargo run -p kr-plugin-sdk --bin kr-plugin-sdk-gen
 pnpm -C packages/plugin-sdk generate
+cargo run -p kr-term --bin kr-term-fixtures
 ```
 
 [docs/protocol/README.md](docs/protocol/README.md) explains the encoding, the framing, the
@@ -86,3 +91,5 @@ configuration, the connection handshake, stream kinds and limits, reconnect beha
 envelopes, action windows, the dispatch lease and the self-hosting fields.
 [docs/plugins/README.md](docs/plugins/README.md) explains the package contract, the manifests, the
 effect classes, the node union, the predicate grammar and the limits.
+[docs/terminal/README.md](docs/terminal/README.md) explains the kr-vt/1 profile, the sequence class
+table, the byte policy, the query broker, snapshots and the probe contract.
