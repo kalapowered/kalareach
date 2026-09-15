@@ -7,9 +7,10 @@
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use kr_protocol::archive::{
-    RECOVERY_BUNDLE_SUBKEY_ID, RECOVERY_KDF_CONTEXT, RECOVERY_RECIPIENT_SUBKEY_ID,
+    RECOVERY_BUNDLE_DOMAIN, RECOVERY_BUNDLE_SUBKEY_ID, RECOVERY_KDF_CONTEXT,
+    RECOVERY_RECIPIENT_SUBKEY_ID, RecoveryContext, RecoveryKit,
 };
-use kr_protocol::scalars::{Mac256, StoredEnvelopeKey};
+use kr_protocol::scalars::{Bytes, Mac256, StoredEnvelopeKey, U64};
 use sha2::Sha256;
 
 use crate::error::{CryptoError, Result};
@@ -138,6 +139,59 @@ impl RecoverySeed {
         Ok(key)
     }
 
+    /// Exports the kit the user keeps: the seed, its checksum, the configured service origins and
+    /// the stable bundle locator.
+    ///
+    /// A seed without a way to find the encrypted bundle is not a complete kit, so the locator and
+    /// the origins travel with it.
+    #[must_use]
+    pub fn to_kit(
+        &self,
+        profile_version: u64,
+        service_origins: Vec<String>,
+        bundle_locator: String,
+    ) -> RecoveryKit {
+        RecoveryKit {
+            profile_version: U64::new(profile_version),
+            seed: Bytes::new(self.0.expose().to_vec()),
+            seed_checksum: Bytes::new(self.checksum().to_vec()),
+            service_origins,
+            bundle_locator,
+        }
+    }
+
+    /// Reads the seed out of a kit, checking its checksum first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::Authentication`] when the checksum does not match the seed, which is
+    /// what a mistyped printed kit looks like, and a length error when the seed is not 32 bytes.
+    pub fn from_kit(kit: &RecoveryKit) -> Result<Self> {
+        let seed = Self::from_stored_bytes(kit.seed.as_slice())?;
+        if !seed.checksum_matches(kit.seed_checksum.as_slice()) {
+            return Err(CryptoError::Authentication {
+                what: "a recovery kit checksum",
+            });
+        }
+        Ok(seed)
+    }
+
+    /// Derives the encryption key of the recovery bundle at one retrieval context.
+    ///
+    /// The bundle key from subkey 1 is mixed with the origin and locator the bundle is being read
+    /// from, so a bundle served from another origin or under another locator does not authenticate.
+    /// Origin or locator substitution therefore fails authentication instead of causing trust in
+    /// archive-supplied writer keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when libsodium is unavailable or the context is outside KR-CBOR-1.
+    pub fn bundle_key_for(&self, context: &RecoveryContext) -> Result<SymmetricKey> {
+        let salt = context.to_canonical_bytes()?;
+        let master = self.bundle_key()?;
+        hkdf_sha256(master.expose(), &salt, RECOVERY_BUNDLE_DOMAIN.as_bytes())
+    }
+
     /// Derives the recovery recipient's `crypto_box` keypair, from subkey 2 of context `KRRECOV1`.
     ///
     /// # Errors
@@ -153,11 +207,17 @@ impl RecoverySeed {
         )?;
         let result = sodium::box_seed_keypair(&seed);
         sodium::memzero(&mut seed);
-        let (public, secret) = result?;
+        let (public, mut secret) = result?;
+        let held = Secret::from_bytes(secret);
+        sodium::memzero(&mut secret);
         Ok(RecoveryRecipient {
-            secret: Secret::from_bytes(secret),
+            secret: held,
             public: StoredEnvelopeKey::from_bytes(public),
         })
+    }
+
+    pub(crate) const fn expose(&self) -> &[u8; 32] {
+        self.0.expose()
     }
 }
 
@@ -266,6 +326,46 @@ mod tests {
             fixed.recipient().expect("a recipient").public(),
             again.recipient().expect("a recipient").public()
         );
+    }
+
+    #[test]
+    fn a_kit_round_trips_and_a_mistyped_checksum_fails() {
+        let seed = RecoverySeed::generate().expect("a seed");
+        let kit = seed.to_kit(
+            1,
+            vec!["https://reach.kala.to".to_owned()],
+            "opaque-locator".to_owned(),
+        );
+        let restored = RecoverySeed::from_kit(&kit).expect("the seed");
+        assert_eq!(restored.checksum(), seed.checksum());
+
+        let mut mistyped = kit;
+        mistyped.seed_checksum = Bytes::new(vec![0; 4]);
+        assert!(matches!(
+            RecoverySeed::from_kit(&mistyped),
+            Err(CryptoError::Authentication { .. })
+        ));
+    }
+
+    #[test]
+    fn the_bundle_key_is_bound_to_the_origin_and_locator() {
+        let seed = RecoverySeed::generate().expect("a seed");
+        let here = RecoveryContext {
+            service_origin: "https://reach.kala.to".to_owned(),
+            bundle_locator: "opaque-locator".to_owned(),
+        };
+        let other_origin = RecoveryContext {
+            service_origin: "https://elsewhere.example".to_owned(),
+            ..here.clone()
+        };
+        let other_locator = RecoveryContext {
+            bundle_locator: "another-locator".to_owned(),
+            ..here.clone()
+        };
+        let key = seed.bundle_key_for(&here).expect("a key");
+        assert!(!key.constant_time_eq(&seed.bundle_key_for(&other_origin).expect("a key")));
+        assert!(!key.constant_time_eq(&seed.bundle_key_for(&other_locator).expect("a key")));
+        assert!(key.constant_time_eq(&seed.bundle_key_for(&here).expect("a key")));
     }
 
     #[test]

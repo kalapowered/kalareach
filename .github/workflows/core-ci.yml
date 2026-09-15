@@ -25,6 +25,8 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # rust-toolchain.toml pins the exact toolchain; rustup installs it on first use.
+      # libsodium-sys-stable builds libsodium from the source archive it ships, so the native
+      # library is compiled and its length constants are checked against this wrapper on every run.
       - name: Install the pinned toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
@@ -52,6 +54,9 @@ jobs:
 
       - name: Generated schema is current
         run: cargo run --locked -p kr-protocol --bin kr-protocol-gen -- --check
+
+      - name: Cryptography vectors are current
+        run: cargo run --locked -p kr-crypto --bin kr-crypto-vectors -- --check
 
   typescript:
     name: typescript

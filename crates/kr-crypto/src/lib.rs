@@ -13,8 +13,10 @@
 //!
 //! # What the wrapper adds
 //!
-//! * **One unsafe boundary.** [`sodium`] is the only module that calls the C library, and it is
-//!   the only module that is allowed to use `unsafe`. It checks every length constant against the
+//! * **One unsafe boundary.** The `sodium` module is the only one that calls the C library and the
+//!   only one allowed to use `unsafe`. It is private, so the raw primitives are not part of this
+//!   crate's interface: a caller cannot reach a nonce-accepting encryption function or a
+//!   `secretstream` without the final-record rule. It checks every length constant against the
 //!   linked library at initialisation, so a build that links a different libsodium fails before it
 //!   allocates a buffer.
 //! * **Purpose separation.** [`keys`] gives the four device key purposes four types that cannot be
@@ -24,14 +26,14 @@
 //!   redact themselves in debug output.
 //! * **Nonces the caller cannot repeat.** Every sealing function generates its own nonce from
 //!   libsodium's random generator and returns it. There is no function that accepts one.
-//! * **Domain separation by construction.** [`sign`] has no way to sign a bare message: every
-//!   signature covers `CBOR([domain, element, ...])`.
+//! * **Domain separation by construction.** [`sign`] has no way to sign a bare message. Signing
+//!   takes a [`sign::SigningTranscript`], which is either built from a domain and its elements or
+//!   checked against the domain it claims.
 //!
 //! # Modules
 //!
 //! | Module | What it does |
 //! | --- | --- |
-//! | [`sodium`] | The libsodium boundary: initialisation, randomness, and every primitive call |
 //! | [`secret`] | Zeroising secret buffers |
 //! | [`keys`] | The four purpose-separated device keys and key identifiers |
 //! | [`sign`] | Ed25519 authorisation signatures over domain-separated transcripts |
@@ -99,7 +101,7 @@ pub mod keys;
 pub mod sealed;
 pub mod secret;
 pub mod sign;
-pub mod sodium;
+mod sodium;
 pub mod store;
 pub mod stream;
 pub mod vectors;

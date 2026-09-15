@@ -18,6 +18,24 @@
 //! | [`DirectTranscript`] (`D`) | `[domain, invitation_id, host_endpoint_id, client_endpoint_id, host_keys, client_keys, proposed_grant_digest, host_nonce, client_nonce, expires_at_ms]` |
 //!
 //! Everything else is a closed map type whose canonical encoding follows from its field names.
+//!
+//! # Profile decisions
+//!
+//! Section 10 fixes some of this exactly and leaves the rest to the implementation. What it fixes
+//! is above. What it does not fix is decided here, once, and frozen by the vectors under
+//! `fixtures/pairing/`:
+//!
+//! | Decision | Choice | Why |
+//! | --- | --- | --- |
+//! | The bundle signature domains | `kr-pair/host-bundle/1`, `kr-pair/client-bundle/1` | Section 10 says each device signs its bundle and `T`; it names no domain, and a shared one would let a host bundle verify as a client bundle |
+//! | The `pair.finish` tag domain | `kr-pair/finish/1` | Section 10 fixes the tag's key and its inputs, not its encoding |
+//! | The owner-confirmation domain | `kr-pair/owner-confirm/1` | Section 10 fixes the fields, not the encoding |
+//! | The key identifier domain | `kr-key-id/1` | Section 10 requires purposes to stay separate; putting the purpose inside the identifier is how that is enforced |
+//! | The revocation and authority domains | `kr-revocation/1`, `kr-authority/1` | Section 10 requires signed revocation requests and host-issued revision records, and names no domain |
+//! | The bundle AAD's "protocol domain" | `kr-pair/spake2-ed25519/1`, the same literal as `C` | Section 10 says the additional data carries "the protocol domain"; reusing the one already defined avoids inventing a second |
+//! | The element order inside the AAD, the finish tag and `D` | The order section 10 lists them in, host before client wherever it writes "both" | Section 10 lists the members but not an encoding |
+//! | Key bundles inside `D` | A positional array in [`KeyPurpose::ALL`] order | `D` is an array, so its members are positional; a map inside it would encode the field names for no gain |
+//! | The QR code member | [`ShortCode`], the canonical `XXXX-XXX-XXX` form | Section 10 gives the display form; a payload that carried another spelling of the same code would produce another transcript |
 
 use core::fmt;
 use core::str::FromStr;
@@ -161,7 +179,7 @@ impl std::error::Error for PairingTextError {}
 macro_rules! validated_text {
     ($(#[$meta:meta])* $name:ident, $validate:ident, $description:literal, $pattern:expr) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -225,6 +243,20 @@ macro_rules! validated_text {
     };
 }
 
+/// Emits the ordinary `Debug` of a validated text newtype.
+///
+/// It is separate from [`validated_text`] because one of those types, [`ShortCode`], carries the
+/// six secret characters and redacts itself instead.
+macro_rules! text_debug {
+    ($name:ident) => {
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, concat!(stringify!($name), "({:?})"), self.0)
+            }
+        }
+    };
+}
+
 fn validate_locator(value: &str) -> Result<(), PairingTextError> {
     if value.chars().count() != LOCATOR_LEN {
         return Err(PairingTextError("a locator is exactly four characters"));
@@ -247,47 +279,139 @@ validated_text!(
     "The four-character Base58 locator of a rendezvous record. It carries no secret entropy.",
     "^[1-9A-HJ-NP-Za-km-z]{4}$"
 );
+text_debug!(Locator);
 
 fn validate_rendezvous_origin(value: &str) -> Result<(), PairingTextError> {
     let Some(authority) = value.strip_prefix("https://") else {
         return Err(PairingTextError("a rendezvous origin starts with https://"));
     };
-    if authority.is_empty() || authority.len() > 253 {
+    if authority.is_empty() || authority.len() > 255 {
         return Err(PairingTextError("a rendezvous origin has a host"));
     }
-    if authority.contains('/') || authority.contains('?') || authority.contains('#') {
+    if authority.bytes().any(|byte| !(b'!'..=b'~').contains(&byte)) {
         return Err(PairingTextError(
-            "a rendezvous origin carries no path, query or fragment",
+            "a rendezvous origin is printable ASCII without spaces",
         ));
     }
-    if authority.contains('@') {
+    if authority.contains('/')
+        || authority.contains('?')
+        || authority.contains('#')
+        || authority.contains('@')
+    {
         return Err(PairingTextError(
-            "a rendezvous origin carries no user information",
+            "a rendezvous origin carries no path, query, fragment or user information",
         ));
     }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (authority, None),
-    };
+
+    let (host, port, bracketed) = split_authority(authority)?;
     if let Some(port) = port {
         if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(PairingTextError("a rendezvous origin port is decimal"));
         }
-        if port.parse::<u16>().is_err() {
+        if port.len() > 1 && port.starts_with('0') {
             return Err(PairingTextError(
-                "a rendezvous origin port is a 16-bit port",
+                "a rendezvous origin port has no leading zero",
             ));
         }
+        match port.parse::<u16>() {
+            Ok(443) => {
+                return Err(PairingTextError(
+                    "a canonical https origin omits the default port 443",
+                ));
+            }
+            Ok(0) => return Err(PairingTextError("a rendezvous origin port is not zero")),
+            Ok(_) => {}
+            Err(_) => {
+                return Err(PairingTextError(
+                    "a rendezvous origin port is a 16-bit port",
+                ));
+            }
+        }
     }
+    validate_origin_host(host, bracketed)
+}
+
+/// Splits `host[:port]`, keeping an IPv6 literal inside its brackets.
+///
+/// The third element says whether the host arrived bracketed, so an unbracketed IPv6 literal is
+/// rejected rather than read as a host and a port.
+fn split_authority(authority: &str) -> Result<(&str, Option<&str>, bool), PairingTextError> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return Err(PairingTextError("an IPv6 origin closes its bracket"));
+        };
+        let host = &rest[..end];
+        return match &rest[end + 1..] {
+            "" => Ok((host, None, true)),
+            tail => match tail.strip_prefix(':') {
+                Some(port) => Ok((host, Some(port), true)),
+                None => Err(PairingTextError(
+                    "an IPv6 origin has nothing but a port after its bracket",
+                )),
+            },
+        };
+    }
+    if authority.contains('[') || authority.contains(']') {
+        return Err(PairingTextError(
+            "only an IPv6 literal uses brackets, and it starts with one",
+        ));
+    }
+    Ok(match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port), false),
+        None => (authority, None, false),
+    })
+}
+
+/// Validates the host half of an origin: a bracketed IPv6 literal, or lower-case DNS labels.
+fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), PairingTextError> {
     if host.is_empty() {
         return Err(PairingTextError("a rendezvous origin has a host"));
     }
-    if !host.bytes().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'
-    }) {
+    if bracketed {
+        // The bracketed form is the canonical one for an IPv6 literal, and its characters are
+        // restricted here; a fuller address check belongs to the transport layer that dials it.
+        if !host
+            .bytes()
+            .all(|byte| (byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) || byte == b':')
+        {
+            return Err(PairingTextError(
+                "an IPv6 origin is lower-case hexadecimal and colons",
+            ));
+        }
+        if !host.contains(':') {
+            return Err(PairingTextError(
+                "a bracketed origin host is an IPv6 literal",
+            ));
+        }
+        return Ok(());
+    }
+    if host.contains(':') {
+        return Err(PairingTextError("an IPv6 origin host is bracketed"));
+    }
+    if host.ends_with('.') {
         return Err(PairingTextError(
-            "a rendezvous origin host is lower-case ASCII; encode an international name as A-label punycode",
+            "a rendezvous origin host has no trailing dot",
         ));
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(PairingTextError(
+                "a rendezvous origin host label is 1 to 63 characters",
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(PairingTextError(
+                "a rendezvous origin host label does not start or end with a hyphen",
+            ));
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(PairingTextError(
+                "a rendezvous origin host is lower-case ASCII; encode an international name as A-label punycode",
+            ));
+        }
     }
     Ok(())
 }
@@ -300,9 +424,57 @@ validated_text!(
     /// A typed code never selects a service URL.
     RendezvousOrigin,
     validate_rendezvous_origin,
-    "A canonical HTTPS origin: https:// followed by a lower-case host and an optional port, with no path, query, fragment or user information.",
-    "^https://[a-z0-9.-]+(:[0-9]{1,5})?$"
+    "A canonical HTTPS origin: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.",
+    "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?$"
 );
+text_debug!(RendezvousOrigin);
+
+fn validate_short_code(value: &str) -> Result<(), PairingTextError> {
+    // The canonical display form is `XXXX-XXX-XXX`. A parser accepts a code with spaces or other
+    // hyphenation, but what travels in a QR payload or a transcript is this one form.
+    let bytes = value.as_bytes();
+    if bytes.len() != CODE_LEN + 2 {
+        return Err(PairingTextError(
+            "a short code is ten characters written XXXX-XXX-XXX",
+        ));
+    }
+    if bytes[LOCATOR_LEN] != b'-' || bytes[LOCATOR_LEN + 4] != b'-' {
+        return Err(PairingTextError("a short code is grouped XXXX-XXX-XXX"));
+    }
+    let digits = value.chars().filter(|character| *character != '-');
+    if digits.clone().count() != CODE_LEN || !digits.clone().all(is_base58) {
+        return Err(PairingTextError(
+            "a short code is ten characters from the Bitcoin Base58 alphabet",
+        ));
+    }
+    Ok(())
+}
+
+validated_text!(
+    /// A ten-character short code in its canonical `XXXX-XXX-XXX` display form.
+    ///
+    /// The six secret characters are in here, so this type redacts itself in debug output and
+    /// never reaches a log or an analytics event.
+    ShortCode,
+    validate_short_code,
+    "A ten-character Base58 pairing code in its canonical XXXX-XXX-XXX form.",
+    "^[1-9A-HJ-NP-Za-km-z]{4}-[1-9A-HJ-NP-Za-km-z]{3}-[1-9A-HJ-NP-Za-km-z]{3}$"
+);
+
+impl ShortCode {
+    /// Returns the locator half, which is not secret.
+    #[must_use]
+    pub fn locator(&self) -> Locator {
+        Locator::new(&self.as_str()[..LOCATOR_LEN]).expect("a validated code starts with a locator")
+    }
+}
+
+impl fmt::Debug for ShortCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Section 10: the six secret characters never enter a log or an analytics event.
+        write!(formatter, "ShortCode({}-...-...)", self.locator())
+    }
+}
 
 fn validate_device_name(value: &str) -> Result<(), PairingTextError> {
     if value.is_empty() {
@@ -326,6 +498,7 @@ validated_text!(
     "A device display name of at most 128 bytes and no control characters. Display text, never authority.",
     "^[^\\u0000-\\u001f\\u007f]{1,128}$"
 );
+text_debug!(DeviceName);
 
 fn validate_network_hint(value: &str) -> Result<(), PairingTextError> {
     if value.is_empty() || value.len() > 253 {
@@ -351,6 +524,7 @@ validated_text!(
     "One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.",
     "^[!-~]{1,253}$"
 );
+text_debug!(NetworkHint);
 
 /// The purpose a device key is declared for.
 ///
@@ -977,7 +1151,7 @@ pub struct DirectChallenge {
 /// value through serde's content representation, which does not preserve the binary
 /// representation of a 16-byte identifier or a byte string. Writing the map directly also keeps
 /// the QR bytes the exact contract section 10 asks for.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum QrPayload {
     /// The short-code payload: `{version, mode: "code", rendezvous_origin, code}`.
     Code(CodeQrPayload),
@@ -990,17 +1164,42 @@ pub enum QrPayload {
 }
 
 /// The members of a short-code QR payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` redacts the code: six of its ten characters are the PAKE secret, and section 10 keeps
+/// them out of every service request, URL, log and analytics event.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CodeQrPayload {
     /// The rendezvous origin to contact. Naming another origin requires explicit native
     /// confirmation before contact.
     pub rendezvous_origin: RendezvousOrigin,
     /// The ten-character code, in its canonical `XXXX-XXX-XXX` display form.
-    pub code: String,
+    pub code: ShortCode,
+}
+
+impl fmt::Debug for CodeQrPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodeQrPayload")
+            .field("rendezvous_origin", &self.rendezvous_origin)
+            .field("code", &self.code)
+            .finish()
+    }
+}
+
+impl fmt::Debug for QrPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Code(payload) => formatter.debug_tuple("Code").field(payload).finish(),
+            Self::Direct(payload) => formatter.debug_tuple("Direct").field(payload).finish(),
+        }
+    }
 }
 
 /// The members of a self-contained QR payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` redacts the invitation secret, which is the whole of the invitation's authority until
+/// the owner approves.
+#[derive(Clone, PartialEq, Eq)]
 pub struct DirectQrPayload {
     /// The invitation.
     pub invitation_id: InvitationId,
@@ -1015,6 +1214,27 @@ pub struct DirectQrPayload {
     /// The invitation's expiry in UTC milliseconds.
     pub expires_at_ms: TimestampMs,
 }
+
+impl fmt::Debug for DirectQrPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DirectQrPayload")
+            .field("invitation_id", &self.invitation_id)
+            .field("endpoint_id", &self.endpoint_id)
+            .field("network_config", &self.network_config)
+            .field("secret", &"redacted")
+            .field("proposed_grant", &self.proposed_grant)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+/// The largest QR payload this build encodes or accepts, in bytes.
+///
+/// A QR code in byte mode holds at most 2,953 bytes at version 40 with the lowest error
+/// correction, so anything larger was never a scannable code. The bound is applied to the text
+/// form before it is decoded, so an oversized payload costs no allocation.
+pub const MAX_QR_PAYLOAD_LEN: usize = 2953;
 
 /// The QR payload version this build produces and accepts.
 pub const QR_PAYLOAD_VERSION: u64 = 1;
@@ -1045,6 +1265,14 @@ pub enum QrPayloadError {
     UnsupportedVersion {
         /// The version the payload declared.
         version: i128,
+    },
+    /// The payload was larger than a scannable QR code can hold.
+    #[error("the QR payload is {len} bytes, over the {limit}-byte limit")]
+    TooLarge {
+        /// The size of the payload.
+        len: usize,
+        /// The limit.
+        limit: usize,
     },
     /// A member failed its own schema rule.
     #[error("the QR payload carries an invalid {member}: {reason}")]
@@ -1147,6 +1375,12 @@ impl QrPayload {
     /// supported mode, when it declares an unsupported version or when a member breaks its own
     /// schema rule.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, QrPayloadError> {
+        if bytes.len() > MAX_QR_PAYLOAD_LEN {
+            return Err(QrPayloadError::TooLarge {
+                len: bytes.len(),
+                limit: MAX_QR_PAYLOAD_LEN,
+            });
+        }
         let value = kr_cbor::decode(bytes, &kr_cbor::Limits::DEFAULT)?;
         Self::from_canonical_value(&value)
     }
@@ -1195,7 +1429,10 @@ impl QrPayload {
                             reason: error.to_string(),
                         }
                     })?,
-                    code: code.to_owned(),
+                    code: ShortCode::new(code).map_err(|error| QrPayloadError::InvalidMember {
+                        member: "code",
+                        reason: error.to_string(),
+                    })?,
                 }))
             }
             QR_MODE_DIRECT => {
@@ -1204,12 +1441,19 @@ impl QrPayload {
                         "a direct payload has exactly version, mode, invitation_id, endpoint_id, network_config, secret, proposed_grant and expires_at",
                     ));
                 }
+                let network_config: NetworkConfig = typed_member(map, "network_config")?;
+                if !network_config.is_bounded() {
+                    return Err(QrPayloadError::InvalidMember {
+                        member: "network_config",
+                        reason: format!("each list holds at most {MAX_NETWORK_HINTS} hints"),
+                    });
+                }
                 Ok(Self::Direct(Box::new(DirectQrPayload {
                     invitation_id: InvitationId::new(crate::scalars::Uuid::from_bytes(
                         fixed_member(map, "invitation_id")?,
                     )),
                     endpoint_id: EndpointKey::from_bytes(fixed_member(map, "endpoint_id")?),
-                    network_config: typed_member(map, "network_config")?,
+                    network_config,
                     secret: Nonce256::from_bytes(fixed_member(map, "secret")?),
                     proposed_grant: typed_member(map, "proposed_grant")?,
                     expires_at_ms: TimestampMs::new(
@@ -1316,16 +1560,35 @@ pub enum ConfirmationChannel {
 }
 
 impl ConfirmationChannel {
-    /// Returns true when a confirmation arriving through this channel may be accepted.
+    /// Returns the schema name of the channel.
     #[must_use]
-    pub const fn is_acceptable(self) -> bool {
-        matches!(
-            self,
-            Self::OwnerDevicePresence
-                | Self::PairedOwnerDevice
-                | Self::EnrolledPresenceSigner
-                | Self::LocalBootstrapTerminal
-        )
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerDevicePresence => "owner_device_presence",
+            Self::PairedOwnerDevice => "paired_owner_device",
+            Self::EnrolledPresenceSigner => "enrolled_presence_signer",
+            Self::LocalBootstrapTerminal => "local_bootstrap_terminal",
+            Self::Session => "session",
+            Self::Plugin => "plugin",
+            Self::ContactTool => "contact_tool",
+        }
+    }
+
+    /// Returns true when a confirmation arriving through this channel may be accepted.
+    ///
+    /// `initial_bootstrap` is true only while the host has no owner yet. The controlling-terminal
+    /// channel exists to protect that one moment against accidental agent initiation; afterwards a
+    /// host with no user-presence-capable signer and no separately paired owner refuses the
+    /// confirmation rather than downgrading it.
+    #[must_use]
+    pub const fn is_acceptable(self, initial_bootstrap: bool) -> bool {
+        match self {
+            Self::OwnerDevicePresence | Self::PairedOwnerDevice | Self::EnrolledPresenceSigner => {
+                true
+            }
+            Self::LocalBootstrapTerminal => initial_bootstrap,
+            Self::Session | Self::Plugin | Self::ContactTool => false,
+        }
     }
 }
 
@@ -1376,13 +1639,20 @@ pub struct OwnerConfirmationRequest {
 impl OwnerConfirmationRequest {
     /// Builds the canonical bytes an owner-confirmation proof signs.
     ///
+    /// The channel is inside the signed material. A channel field beside an unsigned signature
+    /// would be the signer's unauthenticated claim about how the confirmation was obtained, and a
+    /// host that recorded it would be recording an attacker's word.
+    ///
     /// # Errors
     ///
     /// Returns a CBOR error when the request cannot be represented in KR-CBOR-1.
-    pub fn signing_input(&self) -> Result<Vec<u8>, CborError> {
+    pub fn signing_input(&self, channel: ConfirmationChannel) -> Result<Vec<u8>, CborError> {
         Ok(kr_cbor::encode(&signing_value(
             OWNER_CONFIRM_DOMAIN,
-            vec![kr_cbor::to_canonical_value(self)?],
+            vec![
+                kr_cbor::to_canonical_value(self)?,
+                CanonicalValue::text(channel.as_str()),
+            ],
         )))
     }
 }
@@ -1401,7 +1671,7 @@ pub struct OwnerConfirmationProof {
     pub channel: ConfirmationChannel,
     /// The key identifier of the signer that produced the proof.
     pub signer_key_id: KeyId,
-    /// The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request])`.
+    /// The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request, channel])`.
     pub signature: Signature64,
 }
 
@@ -1669,7 +1939,7 @@ mod tests {
     fn a_qr_payload_round_trips_and_requires_a_supported_mode_and_version() {
         let payload = QrPayload::Code(CodeQrPayload {
             rendezvous_origin: origin(),
-            code: "aB3x-Yz7-9Qw".to_owned(),
+            code: ShortCode::new("aB3x-Yz7-9Qw").expect("a code"),
         });
         let bytes = payload.to_canonical_bytes().expect("canonical bytes");
         assert_eq!(
@@ -1711,13 +1981,99 @@ mod tests {
 
     #[test]
     fn only_interactive_channels_may_confirm() {
-        assert!(ConfirmationChannel::OwnerDevicePresence.is_acceptable());
-        assert!(ConfirmationChannel::PairedOwnerDevice.is_acceptable());
-        assert!(ConfirmationChannel::EnrolledPresenceSigner.is_acceptable());
-        assert!(ConfirmationChannel::LocalBootstrapTerminal.is_acceptable());
-        assert!(!ConfirmationChannel::Session.is_acceptable());
-        assert!(!ConfirmationChannel::Plugin.is_acceptable());
-        assert!(!ConfirmationChannel::ContactTool.is_acceptable());
+        for bootstrap in [false, true] {
+            assert!(ConfirmationChannel::OwnerDevicePresence.is_acceptable(bootstrap));
+            assert!(ConfirmationChannel::PairedOwnerDevice.is_acceptable(bootstrap));
+            assert!(ConfirmationChannel::EnrolledPresenceSigner.is_acceptable(bootstrap));
+            assert!(!ConfirmationChannel::Session.is_acceptable(bootstrap));
+            assert!(!ConfirmationChannel::Plugin.is_acceptable(bootstrap));
+            assert!(!ConfirmationChannel::ContactTool.is_acceptable(bootstrap));
+        }
+        // The controlling terminal is the initial bootstrap exception and nothing more.
+        assert!(ConfirmationChannel::LocalBootstrapTerminal.is_acceptable(true));
+        assert!(!ConfirmationChannel::LocalBootstrapTerminal.is_acceptable(false));
+    }
+
+    #[test]
+    fn the_confirmation_signature_covers_the_channel() {
+        let request = OwnerConfirmationRequest {
+            confirmation_id: ConfirmationId::new(crate::scalars::Uuid::from_bytes([1; 16])),
+            action: SensitiveAction::ConfirmDevice,
+            action_digest: Digest256::from_bytes([2; 32]),
+            destination_keys: Nullable::null(),
+            destination_rights: CanonicalSet::new(),
+            host_device_id: DeviceId::new(crate::scalars::Uuid::from_bytes([3; 16])),
+            host_endpoint_id: EndpointKey::from_bytes([4; 32]),
+            nonce: Nonce256::from_bytes([5; 32]),
+            expires_at_ms: TimestampMs::new(1_000),
+        };
+        assert_ne!(
+            request
+                .signing_input(ConfirmationChannel::OwnerDevicePresence)
+                .expect("bytes"),
+            request
+                .signing_input(ConfirmationChannel::LocalBootstrapTerminal)
+                .expect("bytes")
+        );
+    }
+
+    #[test]
+    fn a_short_code_redacts_its_secret_half() {
+        let code = ShortCode::new("aB3x-Yz7-9Qw").expect("a code");
+        let rendered = format!("{code:?}");
+        assert_eq!(rendered, "ShortCode(aB3x-...-...)");
+        assert!(!rendered.contains("Yz7"));
+        assert!(!rendered.contains("9Qw"));
+        assert_eq!(code.locator().as_str(), "aB3x");
+        assert!(ShortCode::new("aB3xYz79Qw").is_err());
+        assert!(ShortCode::new("aB3x-Yz7-9Q0").is_err());
+    }
+
+    #[test]
+    fn a_direct_payload_redacts_its_secret() {
+        let payload = DirectQrPayload {
+            invitation_id: InvitationId::new(crate::scalars::Uuid::from_bytes([1; 16])),
+            endpoint_id: EndpointKey::from_bytes([2; 32]),
+            network_config: NetworkConfig {
+                relay_urls: Vec::new(),
+                discovery_origins: Vec::new(),
+                direct_addresses: Vec::new(),
+            },
+            secret: Nonce256::from_bytes([3; 32]),
+            proposed_grant: ProposedGrant {
+                parent_grant_id: Nullable::null(),
+                environment_selector: EnvironmentSelector::Any,
+                session_selector: SessionSelector::None,
+                actions: CanonicalSet::new(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+                expiry: GrantExpiry::Never,
+                organisation: Nullable::null(),
+            },
+            expires_at_ms: TimestampMs::new(1),
+        };
+        let rendered = format!("{payload:?}");
+        assert!(rendered.contains("secret: \"redacted\""));
+        assert!(!rendered.contains(&crate::scalars::to_base64url(&[3u8; 32])));
+    }
+
+    #[test]
+    fn an_origin_has_one_canonical_form() {
+        assert!(RendezvousOrigin::new("https://reach.kala.to:443").is_err());
+        assert!(RendezvousOrigin::new("https://reach.kala.to:00443").is_err());
+        assert!(RendezvousOrigin::new("https://reach.kala.to:0").is_err());
+        assert!(RendezvousOrigin::new("https://reach.kala.to.").is_err());
+        assert!(RendezvousOrigin::new("https://-reach.kala.to").is_err());
+        assert!(RendezvousOrigin::new("https://reach..kala.to").is_err());
+        assert!(RendezvousOrigin::new("https://[2001:db8::1]").is_ok());
+        assert!(RendezvousOrigin::new("https://[2001:db8::1]:8443").is_ok());
+        assert!(RendezvousOrigin::new("https://[2001:DB8::1]").is_err());
+        assert!(RendezvousOrigin::new("https://2001:db8::1").is_err());
+        assert!(RendezvousOrigin::new("https://reach.kala.to:8443").is_ok());
     }
 
     #[test]

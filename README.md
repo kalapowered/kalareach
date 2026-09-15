@@ -12,9 +12,11 @@ A Cargo workspace and a pnpm workspace share one tree.
 | --- | --- |
 | `crates/kr-cbor` | The KR-CBOR-1 codec: canonical encoding, strict decoding, digests and signing input |
 | `crates/kr-protocol` | Wire types, the method authority table, error codes and the JSON Schema generator |
+| `crates/kr-crypto` | Cryptography: a narrow libsodium wrapper, purpose-separated device keys, encrypted objects and secret storage |
 | `packages/protocol` | The generated TypeScript package: types, a byte-compatible codec and the JSON adapter |
 | `fixtures/` | Cross-language conformance vectors that both languages test against |
 | `docs/protocol/` | The protocol reference |
+| `docs/crypto/` | The cryptography reference |
 
 Rust is canonical. The JSON Schema in `packages/protocol/schema/` comes from the Rust types, and the
 TypeScript types come from that schema. Both steps are checked in CI, so the two languages cannot
@@ -30,6 +32,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p kr-protocol --bin kr-protocol-gen -- --check
+cargo run -p kr-crypto --bin kr-crypto-vectors -- --check
 
 pnpm install --frozen-lockfile
 pnpm -r test
@@ -42,5 +45,13 @@ cargo run -p kr-protocol --bin kr-protocol-gen
 pnpm -C packages/protocol generate
 ```
 
+After changing anything the cryptography vectors cover, regenerate them and commit them too:
+
+```bash
+cargo run -p kr-crypto --bin kr-crypto-vectors
+```
+
 [docs/protocol/README.md](docs/protocol/README.md) explains the encoding, the framing, the
 envelopes, the receipt contract, the error codes and the authority table.
+[docs/crypto/README.md](docs/crypto/README.md) explains the cryptographic boundary: the key
+purposes, the domains, the encrypted object formats and the secret store.

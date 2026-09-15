@@ -641,7 +641,7 @@ export interface KeyWrapContext {
   /**
    * What the wrapped key opens.
    */
-  purpose: 'manifest_key' | 'object_key' | 'recovery_bundle_key'
+  purpose: 'manifest_key' | 'object_key'
   /**
    * The recipient's stored-envelope key.
    */
@@ -895,7 +895,7 @@ export interface EnvelopePlaintext {
    * What the payload is.
    */
   payload_type:
-    'authority_feed_change' | 'revocation_request' | 'notification_preview' | 'sync_change'
+    'authority_feed_change' | 'signed_authority_object' | 'notification_preview' | 'sync_change'
   /**
    * The recipient's stored-envelope key.
    */
@@ -1575,7 +1575,7 @@ export interface OwnerConfirmationProof {
     | 'contact_tool'
   request: OwnerConfirmationRequest
   /**
-   * The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request])`.
+   * The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request, channel])`.
    */
   signature: string
   /**
@@ -2283,7 +2283,9 @@ export interface EnvelopeRouting {
    */
   sender_key_id: string
   /**
-   * The declared size bucket, in bytes. Quota accounting measures stored bytes, not this.
+   * The declared size bucket, in bytes: the length of the padded plaintext that was encrypted.
+   *
+   * Quota accounting measures the complete stored ciphertext rather than this figure.
    */
   size_bucket_bytes: string
 }

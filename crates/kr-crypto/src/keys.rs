@@ -66,10 +66,15 @@ macro_rules! purpose_seed {
 
             /// Reads a seed back from this purpose's own stored item.
             ///
+            /// It is crate-private. If a caller outside this crate could build a seed from raw
+            /// bytes, it could take one purpose's seed and construct another purpose's key from
+            /// it, which section 10 forbids. Restoring a device's keys goes through
+            /// [`crate::store::load_device_keys`], which reads one item per purpose.
+            ///
             /// # Errors
             ///
             /// Returns an error when the stored value is not 32 bytes.
-            pub fn from_stored_bytes(bytes: &[u8]) -> Result<Self> {
+            pub(crate) fn from_stored_bytes(bytes: &[u8]) -> Result<Self> {
                 Ok(Self(Secret::from_slice(
                     concat!("the stored ", stringify!($name)),
                     bytes,
@@ -155,8 +160,9 @@ impl TransportIdentityKeyPair {
     /// Exports the seed so the transport layer can build iroh's endpoint from it.
     ///
     /// This is the only private key material this crate hands out, and it exists because iroh owns
-    /// the transport handshake. Nothing else may call it, and nothing may feed the result to
-    /// another purpose's constructor.
+    /// the transport handshake. It cannot be fed back into another purpose: the seed types take
+    /// raw bytes only inside this crate, so there is no constructor outside it that would accept
+    /// the result. The transport crate passes it straight to iroh and drops it.
     #[must_use]
     pub fn export_endpoint_seed(&self) -> Secret<32> {
         Secret::from_bytes(*self.seed.expose())
@@ -194,10 +200,13 @@ impl AuthorisationKeyPair {
     ///
     /// Returns an error when libsodium is unavailable or reports a failure.
     pub fn from_seed(seed: AuthorisationSeed) -> Result<Self> {
-        let (public, expanded) = sodium::sign_seed_keypair(seed.expose())?;
+        let (public, mut expanded) = sodium::sign_seed_keypair(seed.expose())?;
+        let held = Secret::from_bytes(expanded);
+        // `expanded` is an array, so wrapping it copied it. Wipe the library's own copy.
+        sodium::memzero(&mut expanded);
         Ok(Self {
             seed,
-            expanded: Secret::from_bytes(expanded),
+            expanded: held,
             public: AuthorisationKey::from_bytes(public),
         })
     }
@@ -250,10 +259,13 @@ macro_rules! box_keypair {
             ///
             /// Returns an error when libsodium is unavailable or reports a failure.
             pub fn from_seed(seed: $seed) -> Result<Self> {
-                let (public, secret) = sodium::box_seed_keypair(seed.expose())?;
+                let (public, mut secret) = sodium::box_seed_keypair(seed.expose())?;
+                let held = Secret::from_bytes(secret);
+                // `secret` is an array, so wrapping it copied it. Wipe the library's own copy.
+                sodium::memzero(&mut secret);
                 Ok(Self {
                     seed,
-                    secret: Secret::from_bytes(secret),
+                    secret: held,
                     public: <$public>::from_bytes(public),
                 })
             }
@@ -387,6 +399,20 @@ mod tests {
         .expect("a keypair");
         assert_ne!(signing.public().as_bytes(), boxed.public().as_bytes());
         assert_ne!(signing.key_id(), boxed.key_id());
+    }
+
+    #[test]
+    fn an_exported_transport_seed_cannot_become_another_purpose() {
+        // `export_endpoint_seed` is the one export, and the only constructors that take raw bytes
+        // are crate-private, so this is a compile-time property rather than a runtime check. The
+        // test records what the export is for.
+        let keys = TransportIdentityKeyPair::generate().expect("a keypair");
+        let exported = keys.export_endpoint_seed();
+        let rebuilt = TransportIdentityKeyPair::from_seed(
+            TransportSeed::from_stored_bytes(exported.expose()).expect("32 bytes"),
+        )
+        .expect("a keypair");
+        assert_eq!(rebuilt.public(), keys.public());
     }
 
     #[test]

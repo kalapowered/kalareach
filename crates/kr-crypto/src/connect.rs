@@ -19,7 +19,7 @@ use kr_protocol::scalars::{AuthorisationKey, Digest256, EndpointKey, Nonce256, S
 
 use crate::error::{CryptoError, Result};
 use crate::keys::AuthorisationKeyPair;
-use crate::sign;
+use crate::sign::{self, SigningTranscript};
 
 /// The paired record of one endpoint.
 ///
@@ -60,8 +60,11 @@ pub fn sign_connect(
     client_endpoint_id: &EndpointKey,
     host_endpoint_id: &EndpointKey,
 ) -> Result<Signature64> {
-    let transcript = connect_transcript(offer, selection, client_endpoint_id, host_endpoint_id)?;
-    sign::sign_bytes(key, &transcript)
+    let transcript = SigningTranscript::from_canonical_bytes(
+        CONNECT_DOMAIN,
+        connect_transcript(offer, selection, client_endpoint_id, host_endpoint_id)?,
+    )?;
+    sign::sign(key, &transcript)
 }
 
 /// Verifies both proofs and every binding the transcript depends on.
@@ -90,6 +93,26 @@ pub fn verify_connect(
     live_host_endpoint: &EndpointKey,
     proofs: &ConnectProofs,
 ) -> Result<Digest256> {
+    if !offer.offered_versions.contains(&selection.selected_version) {
+        return Err(CryptoError::BindingMismatch {
+            what: "the selected protocol version, which the client did not offer",
+        });
+    }
+    if !selection.capabilities.is_subset(&offer.capabilities) {
+        return Err(CryptoError::BindingMismatch {
+            what: "a selected capability the client did not offer",
+        });
+    }
+    if selection.limits.max_control_frame_len > offer.max_receive.max_control_frame_len
+        || selection.limits.max_input_frame_len > offer.max_receive.max_input_frame_len
+        || selection.limits.max_attachment_frame_len > offer.max_receive.max_attachment_frame_len
+        || selection.limits.max_outstanding_mutations > offer.max_receive.max_outstanding_mutations
+        || selection.limits.max_send_queue_bytes > offer.max_receive.max_send_queue_bytes
+    {
+        return Err(CryptoError::BindingMismatch {
+            what: "a negotiated limit above what the client offered to receive",
+        });
+    }
     if selection.client_nonce != offer.client_nonce {
         return Err(CryptoError::BindingMismatch {
             what: "the host selection's echoed client nonce",
@@ -131,73 +154,132 @@ pub fn verify_connect(
         });
     }
 
-    let transcript =
-        connect_transcript(offer, selection, live_client_endpoint, live_host_endpoint)?;
-    sign::verify_bytes(&client.authorisation, &transcript, &proofs.client)?;
-    sign::verify_bytes(&host.authorisation, &transcript, &proofs.host)?;
-    Ok(Digest256::from_bytes(kr_cbor::sha256(&transcript)))
+    let transcript = SigningTranscript::from_canonical_bytes(
+        CONNECT_DOMAIN,
+        connect_transcript(offer, selection, live_client_endpoint, live_host_endpoint)?,
+    )?;
+    sign::verify(&client.authorisation, &transcript, &proofs.client)?;
+    sign::verify(&host.authorisation, &transcript, &proofs.host)?;
+    Ok(transcript.digest())
 }
 
-/// Remembers the challenges a host has already admitted, so a transcript cannot be replayed.
+/// Verifies a connection and consumes the challenge the host issued for it.
 ///
-/// The host allocates its own nonce for every connection, so a replayed transcript needs the
-/// host's nonce as well as the client's. Recording the host nonce is therefore sufficient and
-/// bounded: one entry per connection the host itself opened.
+/// This is the entry point a host uses. [`verify_connect`] alone proves that the two devices
+/// signed this transcript; it does not prove that the transcript is new. The challenge the host
+/// issued at the start of the connection is consumed here, exactly once, so the same proofs
+/// presented again are rejected before they are checked.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::BindingMismatch`] when the challenge was not outstanding, and then
+/// whatever [`verify_connect`] returns.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_connect_once(
+    ledger: &mut ChallengeLedger,
+    offer: &ClientOffer,
+    selection: &HostSelection,
+    client: &PairedPeer,
+    host: &PairedPeer,
+    live_client_endpoint: &EndpointKey,
+    live_host_endpoint: &EndpointKey,
+    proofs: &ConnectProofs,
+) -> Result<Digest256> {
+    ledger.consume(&selection.host_nonce)?;
+    verify_connect(
+        offer,
+        selection,
+        client,
+        host,
+        live_client_endpoint,
+        live_host_endpoint,
+        proofs,
+    )
+}
+
+/// The challenges a host has issued and not yet consumed.
+///
+/// A host allocates its own 256-bit nonce for every connection, so a replayed transcript carries a
+/// nonce the host issued once. The ledger holds each one from the moment it is issued until the
+/// connection's proofs consume it; a nonce that is not outstanding is rejected, whether it was
+/// never issued or has already been used.
+///
+/// The ledger is bounded, so a peer cannot make a host remember an unbounded number of challenges.
+/// A full ledger is answered by ending idle connections, not by forgetting a challenge.
 #[derive(Debug, Default)]
 pub struct ChallengeLedger {
-    seen: BTreeSet<[u8; 32]>,
+    outstanding: BTreeSet<[u8; 32]>,
     limit: usize,
 }
 
 impl ChallengeLedger {
-    /// Creates a ledger that remembers at most `limit` challenges.
+    /// Creates a ledger that holds at most `limit` outstanding challenges.
     #[must_use]
     pub fn with_limit(limit: usize) -> Self {
         Self {
-            seen: BTreeSet::new(),
+            outstanding: BTreeSet::new(),
             limit,
         }
     }
 
-    /// Records a fresh challenge, rejecting one that has already been used.
+    /// Records a challenge the host has just issued.
     ///
     /// # Errors
     ///
-    /// Returns [`CryptoError::BindingMismatch`] when the challenge has been seen, and
-    /// [`CryptoError::TooLarge`] when the ledger is full, which a caller answers by retiring old
-    /// connections rather than by forgetting a challenge.
-    pub fn admit(&mut self, host_nonce: &Nonce256) -> Result<()> {
-        if self.seen.contains(host_nonce.as_bytes()) {
+    /// Returns [`CryptoError::BindingMismatch`] when the challenge is already outstanding, which
+    /// for a 256-bit random nonce means a generator failure, and [`CryptoError::TooLarge`] when the
+    /// ledger is full.
+    pub fn issue(&mut self, host_nonce: &Nonce256) -> Result<()> {
+        if self.outstanding.contains(host_nonce.as_bytes()) {
             return Err(CryptoError::BindingMismatch {
-                what: "a reused connection challenge",
+                what: "a reissued connection challenge",
             });
         }
-        if self.seen.len() >= self.limit {
+        if self.outstanding.len() >= self.limit {
             return Err(CryptoError::TooLarge {
                 what: "the connection challenge ledger",
                 limit: self.limit,
-                actual: self.seen.len() + 1,
+                actual: self.outstanding.len() + 1,
             });
         }
-        self.seen.insert(*host_nonce.as_bytes());
+        self.outstanding.insert(*host_nonce.as_bytes());
         Ok(())
     }
 
-    /// Forgets a challenge when its connection has ended.
-    pub fn retire(&mut self, host_nonce: &Nonce256) {
-        self.seen.remove(host_nonce.as_bytes());
+    /// Consumes an outstanding challenge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::BindingMismatch`] when the challenge was never issued or has already
+    /// been consumed.
+    pub fn consume(&mut self, host_nonce: &Nonce256) -> Result<()> {
+        if self.outstanding.remove(host_nonce.as_bytes()) {
+            Ok(())
+        } else {
+            Err(CryptoError::BindingMismatch {
+                what: "a connection challenge that is not outstanding",
+            })
+        }
     }
 
-    /// Returns how many challenges are live.
+    /// Drops a challenge whose connection ended before it was used.
+    ///
+    /// Abandoning a challenge is not the same as consuming one: it frees the slot, and the nonce
+    /// can never be presented afterwards because it is no longer outstanding either way.
+    pub fn abandon(&mut self, host_nonce: &Nonce256) {
+        self.outstanding.remove(host_nonce.as_bytes());
+    }
+
+    /// Returns how many challenges are outstanding.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.seen.len()
+        self.outstanding.len()
     }
 
-    /// Returns true when no challenge is live.
+    /// Returns true when none is outstanding.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.seen.is_empty()
+        self.outstanding.is_empty()
     }
 }
 
@@ -381,24 +463,101 @@ mod tests {
     }
 
     #[test]
-    fn a_reused_challenge_is_rejected_and_a_retired_one_is_forgotten() {
+    fn a_challenge_is_consumed_once_and_never_returns() {
         let mut ledger = ChallengeLedger::with_limit(2);
         let first = Nonce256::from_bytes([1; 32]);
         let second = Nonce256::from_bytes([2; 32]);
         let third = Nonce256::from_bytes([3; 32]);
-        assert!(ledger.admit(&first).is_ok());
+
+        assert!(ledger.issue(&first).is_ok());
         assert!(matches!(
-            ledger.admit(&first),
+            ledger.issue(&first),
             Err(CryptoError::BindingMismatch { .. })
         ));
-        assert!(ledger.admit(&second).is_ok());
+        assert!(ledger.issue(&second).is_ok());
         assert!(matches!(
-            ledger.admit(&third),
+            ledger.issue(&third),
             Err(CryptoError::TooLarge { .. })
         ));
-        ledger.retire(&first);
+
+        assert!(ledger.consume(&first).is_ok());
+        // Consuming frees the slot but never makes the nonce usable again.
+        assert!(matches!(
+            ledger.consume(&first),
+            Err(CryptoError::BindingMismatch { .. })
+        ));
+        assert!(ledger.issue(&third).is_ok());
+        ledger.abandon(&second);
+        assert!(matches!(
+            ledger.consume(&second),
+            Err(CryptoError::BindingMismatch { .. })
+        ));
         assert_eq!(ledger.len(), 1);
-        assert!(ledger.admit(&third).is_ok());
         assert!(!ledger.is_empty());
+    }
+
+    #[test]
+    fn one_set_of_proofs_is_accepted_once() {
+        let fixture = fixture();
+        let proofs = proofs(&fixture);
+        let mut ledger = ChallengeLedger::with_limit(4);
+        ledger.issue(&fixture.selection.host_nonce).expect("issued");
+
+        assert!(
+            verify_connect_once(
+                &mut ledger,
+                &fixture.offer,
+                &fixture.selection,
+                &fixture.client,
+                &fixture.host,
+                &fixture.client.endpoint_id,
+                &fixture.host.endpoint_id,
+                &proofs,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_connect_once(
+                &mut ledger,
+                &fixture.offer,
+                &fixture.selection,
+                &fixture.client,
+                &fixture.host,
+                &fixture.client.endpoint_id,
+                &fixture.host.endpoint_id,
+                &proofs,
+            ),
+            Err(CryptoError::BindingMismatch {
+                what: "a connection challenge that is not outstanding"
+            })
+        ));
+    }
+
+    #[test]
+    fn a_selection_outside_the_offer_is_rejected() {
+        let mut fixture = fixture();
+        fixture.selection.selected_version = kr_protocol::hello::ProtocolVersion::new(9, 0);
+        let proofs = proofs(&fixture);
+        assert!(matches!(
+            verify(&fixture, &proofs),
+            Err(CryptoError::BindingMismatch {
+                what: "the selected protocol version, which the client did not offer"
+            })
+        ));
+    }
+
+    #[test]
+    fn a_limit_above_what_the_client_offered_is_rejected() {
+        let mut fixture = fixture();
+        fixture.selection.limits.max_control_frame_len = kr_protocol::scalars::U64::new(
+            fixture.offer.max_receive.max_control_frame_len.get() + 1,
+        );
+        let proofs = proofs(&fixture);
+        assert!(matches!(
+            verify(&fixture, &proofs),
+            Err(CryptoError::BindingMismatch {
+                what: "a negotiated limit above what the client offered to receive"
+            })
+        ));
     }
 }

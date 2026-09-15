@@ -40,8 +40,40 @@ pub const RECOVERY_RECIPIENT_SUBKEY_ID: u64 = 2;
 /// The domain an archive manifest signature covers.
 pub const MANIFEST_DOMAIN: &str = "kr-archive-manifest/1";
 
-/// The domain a recovery bundle signature covers.
+/// The domain the recovery bundle's object key is derived under.
 pub const RECOVERY_BUNDLE_DOMAIN: &str = "kr-recovery-bundle/1";
+
+/// Where a recovery bundle is retrieved from.
+///
+/// The bundle's encryption key is derived from the recovery seed *and* this context, so a service
+/// that serves a bundle from another origin or another locator serves one that does not
+/// authenticate. Origin or locator substitution fails authentication rather than causing trust in
+/// archive-supplied writer keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryContext {
+    /// The configured service origin the bundle is retrieved from.
+    pub service_origin: String,
+    /// The stable opaque locator of the bundle.
+    pub bundle_locator: String,
+}
+
+impl RecoveryContext {
+    /// Builds the canonical bytes the bundle key is bound to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the context is outside KR-CBOR-1.
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, CborError> {
+        Ok(kr_cbor::encode(&kr_cbor::signing_value(
+            RECOVERY_BUNDLE_DOMAIN,
+            vec![
+                CanonicalValue::text(self.service_origin.as_str()),
+                CanonicalValue::text(self.bundle_locator.as_str()),
+            ],
+        )))
+    }
+}
 
 /// The key-wrap format this build writes and reads.
 #[derive(
@@ -64,8 +96,6 @@ pub enum KeyWrapPurpose {
     ManifestKey,
     /// The key of one member object.
     ObjectKey,
-    /// The key of an encrypted recovery bundle.
-    RecoveryBundleKey,
 }
 
 /// The fields a key wrap authenticates, apart from the key itself.
@@ -108,13 +138,37 @@ pub struct KeyWrapContext {
 /// Returns a CBOR error when the context is outside KR-CBOR-1.
 pub fn key_wrap_plaintext(
     context: &KeyWrapContext,
-    object_key: &[u8; 32],
+    object_key: &[u8; OBJECT_KEY_LEN],
 ) -> Result<Vec<u8>, CborError> {
-    let value = CanonicalValue::Array(vec![
-        kr_cbor::to_canonical_value(context)?,
-        CanonicalValue::bytes(object_key.as_slice()),
-    ]);
-    Ok(kr_cbor::encode(&value))
+    let mut plaintext = key_wrap_prefix(context)?;
+    plaintext.extend_from_slice(object_key.as_slice());
+    Ok(plaintext)
+}
+
+/// Bytes in an object key.
+pub const OBJECT_KEY_LEN: usize = 32;
+
+/// Builds everything in a key wrap plaintext up to, but not including, the key itself.
+///
+/// The encoding is assembled by hand rather than through a value tree: a tree would hold a second
+/// copy of the object key that no caller can reach and therefore cannot zeroise. The bytes are
+/// `0x82` (a two-element array), the canonical context, then `0x58 0x20` (a 32-byte string head).
+/// `key_wrap_prefix_is_the_canonical_encoding` checks that against the value-tree encoder.
+///
+/// An opener rebuilds this prefix from the context it expects and compares it with the opened
+/// plaintext, which is both the shape check and the context check.
+///
+/// # Errors
+///
+/// Returns a CBOR error when the context is outside KR-CBOR-1.
+pub fn key_wrap_prefix(context: &KeyWrapContext) -> Result<Vec<u8>, CborError> {
+    let encoded_context = kr_cbor::to_canonical_vec(context)?;
+    let mut prefix = Vec::with_capacity(encoded_context.len() + 4 + OBJECT_KEY_LEN);
+    prefix.push(0x82);
+    prefix.extend_from_slice(&encoded_context);
+    prefix.push(0x58);
+    prefix.push(0x20);
+    Ok(prefix)
 }
 
 /// One wrapped object key.
@@ -208,9 +262,21 @@ pub struct ArchiveDescriptor {
     pub manifest_key_wraps: Vec<SealedKeyWrap>,
 }
 
+/// The archive descriptor version this build writes and reads.
+pub const ARCHIVE_DESCRIPTOR_VERSION: u64 = 1;
+
 /// Why an archive descriptor was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DescriptorError {
+    /// The descriptor declared a version this build does not read.
+    #[error("the archive descriptor declares version {version}; this build reads version 1")]
+    UnsupportedVersion {
+        /// The version the descriptor declared.
+        version: u64,
+    },
+    /// A wrap named a different archive or generation from the descriptor.
+    #[error("a manifest key wrap names another archive or backup generation")]
+    WrapArchiveMismatch,
     /// The descriptor was larger than the limit.
     #[error("the archive descriptor is {len} bytes, over the {limit}-byte limit")]
     TooLarge {
@@ -245,6 +311,9 @@ pub enum DescriptorError {
     /// Two wraps named the same recipient.
     #[error("two manifest key wraps name the same recipient")]
     DuplicateRecipient,
+    /// The recovery kit does not name the service origin a restore is trying.
+    #[error("the recovery kit does not name that service origin")]
+    UnknownServiceOrigin,
 }
 
 impl ArchiveDescriptor {
@@ -257,10 +326,17 @@ impl ArchiveDescriptor {
     ///
     /// Returns the first rule the descriptor breaks.
     pub fn validate(&self, encoded_len: usize) -> Result<(), DescriptorError> {
+        // The byte limit is checked first, so an oversized descriptor costs nothing beyond the
+        // bytes that were already received.
         if encoded_len > MAX_ARCHIVE_DESCRIPTOR_LEN {
             return Err(DescriptorError::TooLarge {
                 len: encoded_len,
                 limit: MAX_ARCHIVE_DESCRIPTOR_LEN,
+            });
+        }
+        if self.version.get() != ARCHIVE_DESCRIPTOR_VERSION {
+            return Err(DescriptorError::UnsupportedVersion {
+                version: self.version.get(),
             });
         }
         if self.manifest_key_wraps.len() > MAX_ARCHIVE_RECIPIENTS {
@@ -275,6 +351,11 @@ impl ArchiveDescriptor {
                 return Err(DescriptorError::WrapPurposeMismatch {
                     purpose: wrap.context.purpose,
                 });
+            }
+            if wrap.context.archive_id != self.archive_id
+                || wrap.context.backup_generation != self.backup_generation
+            {
+                return Err(DescriptorError::WrapArchiveMismatch);
             }
             if wrap.context.object_id != self.encrypted_manifest.object_id {
                 return Err(DescriptorError::WrapObjectMismatch {
@@ -355,6 +436,31 @@ pub struct RecoveryBundle {
     pub written_at_ms: TimestampMs,
 }
 
+impl RecoveryKit {
+    /// Returns the retrieval context of the bundle this kit points at.
+    ///
+    /// A kit names every configured service origin; `service_origin` selects the one being tried,
+    /// and a restore tries each in turn. Substituting an origin changes the derived key, so the
+    /// wrong one fails authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the kit does not name `service_origin`.
+    pub fn context(&self, service_origin: &str) -> Result<RecoveryContext, DescriptorError> {
+        if !self
+            .service_origins
+            .iter()
+            .any(|origin| origin == service_origin)
+        {
+            return Err(DescriptorError::UnknownServiceOrigin);
+        }
+        Ok(RecoveryContext {
+            service_origin: service_origin.to_owned(),
+            bundle_locator: self.bundle_locator.clone(),
+        })
+    }
+}
+
 /// The printable and QR recovery kit.
 ///
 /// A seed with no way to find the encrypted bundle is not a complete kit, so the kit names the
@@ -412,6 +518,71 @@ mod tests {
             encrypted_manifest: object_ref(7),
             manifest_key_wraps: wraps,
         }
+    }
+
+    #[test]
+    fn the_key_wrap_prefix_is_the_canonical_encoding() {
+        let manifest = object_ref(7);
+        let wrap = wrap(&manifest, 1);
+        let key = [0xabu8; OBJECT_KEY_LEN];
+        let assembled = key_wrap_plaintext(&wrap.context, &key).expect("a plaintext");
+        let through_the_tree = kr_cbor::encode(&CanonicalValue::Array(vec![
+            kr_cbor::to_canonical_value(&wrap.context).expect("a context"),
+            CanonicalValue::bytes(key.as_slice()),
+        ]));
+        assert_eq!(assembled, through_the_tree);
+        assert_eq!(
+            key_wrap_prefix(&wrap.context).expect("a prefix").len() + OBJECT_KEY_LEN,
+            assembled.len()
+        );
+    }
+
+    #[test]
+    fn a_descriptor_of_another_version_is_rejected() {
+        let manifest = object_ref(7);
+        let mut descriptor = descriptor(vec![wrap(&manifest, 1)]);
+        descriptor.version = U64::new(2);
+        assert!(matches!(
+            descriptor.validate(1024),
+            Err(DescriptorError::UnsupportedVersion { version: 2 })
+        ));
+    }
+
+    #[test]
+    fn a_wrap_from_another_generation_is_rejected() {
+        let manifest = object_ref(7);
+        let mut moved = wrap(&manifest, 1);
+        moved.context.backup_generation = BackupGeneration::new(4);
+        assert!(matches!(
+            descriptor(vec![moved]).validate(1024),
+            Err(DescriptorError::WrapArchiveMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_kit_only_yields_a_context_for_an_origin_it_names() {
+        let kit = RecoveryKit {
+            profile_version: U64::new(1),
+            seed: Bytes::new(vec![1; 32]),
+            seed_checksum: Bytes::new(vec![2; 4]),
+            service_origins: vec!["https://reach.kala.to".to_owned()],
+            bundle_locator: "opaque-locator".to_owned(),
+        };
+        let context = kit.context("https://reach.kala.to").expect("a context");
+        assert_eq!(context.bundle_locator, "opaque-locator");
+        assert!(matches!(
+            kit.context("https://elsewhere.example"),
+            Err(DescriptorError::UnknownServiceOrigin)
+        ));
+        // A different origin changes the bytes the bundle key is bound to.
+        let other = RecoveryContext {
+            service_origin: "https://elsewhere.example".to_owned(),
+            bundle_locator: context.bundle_locator.clone(),
+        };
+        assert_ne!(
+            context.to_canonical_bytes().expect("bytes"),
+            other.to_canonical_bytes().expect("bytes")
+        );
     }
 
     #[test]

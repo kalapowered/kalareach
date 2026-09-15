@@ -6,8 +6,17 @@
 //! that this depends on operating-system account isolation and disk encryption.
 //!
 //! [`SecretStore`] is that choice as one interface. [`PlatformStore`] is the `keyring` crate,
-//! which selects the platform store; [`FileStore`] is the documented fallback; [`MemoryStore`] is
-//! for tests and never touches a disk.
+//! which selects Keychain Services on macOS, the Credential Manager on Windows and the Secret
+//! Service on other Unix systems; [`FileStore`] is the documented Linux fallback; [`MemoryStore`]
+//! is for tests and never touches a disk.
+//!
+//! # Where the fallback is not allowed
+//!
+//! Section 10 names a protected store for every platform and offers the 0700 directory only on
+//! Linux without a secret service. The fallback is therefore compiled out on macOS, iOS, Android
+//! and Windows: on those platforms a missing platform store is an error, not a downgrade. iOS and
+//! Android keys are held by the platform layer of the companion application, which owns Keychain
+//! and Keystore access; this crate refuses rather than writing them to a file.
 //!
 //! # Why every purpose has its own item
 //!
@@ -222,11 +231,24 @@ impl FileStore {
     /// Returns [`CryptoError::SecretStore`] when the directory cannot be created or its
     /// permissions cannot be set.
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self> {
+        if !FILE_FALLBACK_SUPPORTED {
+            return Err(CryptoError::SecretStore {
+                message: "this platform has a protected credential store; the 0700 directory \
+                          fallback is offered only on Unix systems without a secret service"
+                    .to_owned(),
+            });
+        }
         let directory = directory.into();
+        if directory.is_symlink() {
+            return Err(CryptoError::SecretStore {
+                message: format!("{} is a symbolic link", directory.display()),
+            });
+        }
         std::fs::create_dir_all(&directory).map_err(|error| CryptoError::SecretStore {
             message: format!("create {}: {error}", directory.display()),
         })?;
         set_mode(&directory, 0o700)?;
+        check_owner_only(&directory)?;
         Ok(Self { directory })
     }
 
@@ -250,22 +272,36 @@ impl FileStore {
 impl SecretStore for FileStore {
     fn set(&self, name: &SecretName, secret: &[u8]) -> Result<()> {
         let path = self.path(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| CryptoError::SecretStore {
-                message: format!("create {}: {error}", parent.display()),
-            })?;
-            set_mode(parent, 0o700)?;
-        }
-        // Write to a temporary file, restrict it, then rename, so a reader never observes a
-        // partially written secret and never observes one with the wrong mode.
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, secret).map_err(|error| CryptoError::SecretStore {
-            message: format!("write {}: {error}", temporary.display()),
+        let Some(parent) = path.parent() else {
+            return Err(CryptoError::SecretStore {
+                message: "a secret path has a parent directory".to_owned(),
+            });
+        };
+        std::fs::create_dir_all(parent).map_err(|error| CryptoError::SecretStore {
+            message: format!("create {}: {error}", parent.display()),
         })?;
-        set_mode(&temporary, 0o600)?;
-        std::fs::rename(&temporary, &path).map_err(|error| CryptoError::SecretStore {
+        set_mode(parent, 0o700)?;
+
+        // The staging name starts with a dot, which no valid secret name can produce, and carries
+        // the process and a counter, so two concurrent writes never share a file and a write never
+        // destroys a secret that happens to be named like the staging file.
+        let staging = parent.join(format!(
+            ".{}.{}.{}.staging",
+            std::process::id(),
+            STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name.as_str().rsplit('/').next().unwrap_or("secret")
+        ));
+        write_owner_only(&staging, secret)?;
+        // Rename replaces atomically, so a reader sees the old secret or the new one.
+        let renamed = std::fs::rename(&staging, &path);
+        if renamed.is_err() {
+            let _ = std::fs::remove_file(&staging);
+        }
+        renamed.map_err(|error| CryptoError::SecretStore {
             message: format!("rename into {}: {error}", path.display()),
-        })
+        })?;
+        // Persist the directory entry, so a crash cannot leave the secret unreachable.
+        sync_directory(parent)
     }
 
     fn get(&self, name: &SecretName) -> Result<Option<SecretVec>> {
@@ -305,6 +341,117 @@ impl SecretStore for FileStore {
     }
 }
 
+/// True on the platforms where section 10 offers the 0700 directory fallback.
+///
+/// Those are Unix systems that are not macOS, iOS or Android: the ones whose protected store is
+/// the Secret Service and may not have one. Everywhere else a missing platform store is an error.
+pub const FILE_FALLBACK_SUPPORTED: bool = cfg!(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ))
+));
+
+/// Distinguishes the staging files of concurrent writers in one process.
+static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Creates `path` exclusively with mode 0600, writes `secret` and flushes it to the device.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, secret: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| CryptoError::SecretStore {
+            message: format!("create {}: {error}", path.display()),
+        })?;
+    file.write_all(secret)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| CryptoError::SecretStore {
+            message: format!("write {}: {error}", path.display()),
+        })
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, _secret: &[u8]) -> Result<()> {
+    Err(CryptoError::SecretStore {
+        message: format!(
+            "{}: the file fallback store is only available on Unix",
+            path.display()
+        ),
+    })
+}
+
+/// Flushes a directory entry to the device.
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> Result<()> {
+    std::fs::File::open(directory)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|error| CryptoError::SecretStore {
+            message: format!("sync {}: {error}", directory.display()),
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Rejects a fallback directory that another account owns or can read.
+///
+/// The ownership check compares the directory with a file this process creates inside it: a freshly
+/// created file belongs to the effective user, so if the directory belongs to someone else the two
+/// owners differ. That answers the question without calling `getuid`, which would mean an `unsafe`
+/// call outside the one module allowed to make them.
+#[cfg(unix)]
+fn check_owner_only(directory: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = std::fs::metadata(directory).map_err(|error| CryptoError::SecretStore {
+        message: format!("stat {}: {error}", directory.display()),
+    })?;
+    if !metadata.is_dir() {
+        return Err(CryptoError::SecretStore {
+            message: format!("{} is not a directory", directory.display()),
+        });
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(CryptoError::SecretStore {
+            message: format!("{} is readable by another account", directory.display()),
+        });
+    }
+
+    let probe = directory.join(format!(
+        ".{}.{}.owner-probe",
+        std::process::id(),
+        STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    write_owner_only(&probe, b"")?;
+    let probe_uid = std::fs::metadata(&probe).map(|probe| probe.uid());
+    let _ = std::fs::remove_file(&probe);
+    let probe_uid = probe_uid.map_err(|error| CryptoError::SecretStore {
+        message: format!("stat {}: {error}", probe.display()),
+    })?;
+    if metadata.uid() != probe_uid {
+        return Err(CryptoError::SecretStore {
+            message: format!("{} is owned by another account", directory.display()),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_owner_only(_directory: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -318,17 +465,22 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
-    // The fallback exists for Unix systems without a secret service. Windows and the mobile
-    // platforms always have a platform store, so this build never relies on file modes.
     Err(CryptoError::SecretStore {
         message: "the file fallback store is only available on Unix".to_owned(),
     })
 }
 
 /// An in-memory store for tests. It never writes to a disk.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryStore {
     items: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+}
+
+impl fmt::Debug for MemoryStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let count = self.items.lock().map(|items| items.len()).unwrap_or(0);
+        write!(formatter, "MemoryStore({count} items, redacted)")
+    }
 }
 
 impl MemoryStore {
@@ -344,7 +496,9 @@ impl SecretStore for MemoryStore {
         let mut items = self.items.lock().map_err(|_| CryptoError::SecretStore {
             message: "the in-memory store is poisoned".to_owned(),
         })?;
-        items.insert(name.as_str().to_owned(), secret.to_vec());
+        if let Some(mut replaced) = items.insert(name.as_str().to_owned(), secret.to_vec()) {
+            sodium::memzero(&mut replaced);
+        }
         Ok(())
     }
 
@@ -382,26 +536,73 @@ impl Drop for MemoryStore {
 
 /// Opens the platform store, falling back to a 0700 directory when there is none.
 ///
-/// The result says which store was opened, so setup can report whether the host is relying on the
-/// documented fallback rather than on a platform store.
+/// Once a host has secrets in the fallback directory it keeps using them, even if a secret service
+/// appears later. Switching on the strength of whichever backend happens to work today would leave
+/// the application looking at an empty platform store while its keys sat in files. The result says
+/// a migration is available; moving the secrets is an explicit, verified step the host takes, not
+/// something that happens at startup.
 ///
 /// # Errors
 ///
 /// Returns [`CryptoError::SecretStore`] when neither store can be opened.
-pub fn open_store(
-    service: &str,
-    fallback_directory: &Path,
-) -> Result<(Box<dyn SecretStore>, StoreKind)> {
-    match PlatformStore::open(service) {
-        Ok(store) => Ok((Box::new(store), StoreKind::Platform)),
+pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStore> {
+    let platform = PlatformStore::open(service);
+    let has_fallback_secrets = directory_has_entries(fallback_directory);
+
+    if has_fallback_secrets {
+        let store = FileStore::open(fallback_directory)?;
+        return Ok(OpenedStore {
+            store: Box::new(store),
+            kind: StoreKind::FileFallback,
+            migration_available: platform.is_ok(),
+        });
+    }
+    match platform {
+        Ok(store) => Ok(OpenedStore {
+            store: Box::new(store),
+            kind: StoreKind::Platform,
+            migration_available: false,
+        }),
         Err(platform_error) => match FileStore::open(fallback_directory) {
-            Ok(store) => Ok((Box::new(store), StoreKind::FileFallback)),
+            Ok(store) => Ok(OpenedStore {
+                store: Box::new(store),
+                kind: StoreKind::FileFallback,
+                migration_available: false,
+            }),
             Err(fallback_error) => Err(CryptoError::SecretStore {
                 message: format!(
                     "no platform store ({platform_error}) and no fallback ({fallback_error})"
                 ),
             }),
         },
+    }
+}
+
+/// Returns true when `directory` exists and holds at least one entry.
+fn directory_has_entries(directory: &Path) -> bool {
+    std::fs::read_dir(directory).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// The store a host opened and what it means.
+pub struct OpenedStore {
+    /// The store.
+    pub store: Box<dyn SecretStore>,
+    /// Which store it is.
+    pub kind: StoreKind,
+    /// True when the host is using the fallback although a platform store is now available.
+    ///
+    /// Setup reports this. Moving the secrets is a separate, verified step.
+    pub migration_available: bool,
+}
+
+impl fmt::Debug for OpenedStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenedStore")
+            .field("kind", &self.kind)
+            .field("migration_available", &self.migration_available)
+            .field("store", &self.store.describe())
+            .finish()
     }
 }
 
@@ -470,20 +671,67 @@ pub fn load_device_keys(store: &dyn SecretStore, scope: &str) -> Result<Option<D
         });
     }
     let unwrap = |item: Option<SecretVec>| item.expect("all four items are present");
+    let transport = unwrap(transport);
+    let authorisation = unwrap(authorisation);
+    let stored_envelope = unwrap(stored_envelope);
+    let preview = unwrap(preview);
+
+    // Two purposes sharing a seed is a reused private key, which section 10 forbids. The public
+    // keys would differ, because the two algorithms differ, so nothing downstream would notice.
+    let seeds = [&transport, &authorisation, &stored_envelope, &preview];
+    for (index, left) in seeds.iter().enumerate() {
+        if seeds[index + 1..]
+            .iter()
+            .any(|right| sodium::constant_time_eq(left.expose(), right.expose()))
+        {
+            return Err(CryptoError::SecretStore {
+                message: format!("{scope} stores one seed under two key purposes"),
+            });
+        }
+    }
+
     Ok(Some(DeviceKeys {
         transport: TransportIdentityKeyPair::from_seed(TransportSeed::from_stored_bytes(
-            unwrap(transport).expose(),
+            transport.expose(),
         )?)?,
         authorisation: AuthorisationKeyPair::from_seed(AuthorisationSeed::from_stored_bytes(
-            unwrap(authorisation).expose(),
+            authorisation.expose(),
         )?)?,
         stored_envelope: StoredEnvelopeKeyPair::from_seed(StoredEnvelopeSeed::from_stored_bytes(
-            unwrap(stored_envelope).expose(),
+            stored_envelope.expose(),
         )?)?,
         notification_preview: NotificationPreviewKeyPair::from_seed(
-            NotificationPreviewSeed::from_stored_bytes(unwrap(preview).expose())?,
+            NotificationPreviewSeed::from_stored_bytes(preview.expose())?,
         )?,
     }))
+}
+
+/// Writes the recovery seed to its own item.
+///
+/// # Errors
+///
+/// Returns an error when the store rejects the write.
+pub fn store_recovery_seed(
+    store: &dyn SecretStore,
+    scope: &str,
+    seed: &crate::kdf::RecoverySeed,
+) -> Result<()> {
+    store.set(&SecretName::recovery_seed(scope)?, seed.expose())
+}
+
+/// Reads the recovery seed back, or `None` when the host has none.
+///
+/// # Errors
+///
+/// Returns an error when the store fails or the stored value is not 32 bytes.
+pub fn load_recovery_seed(
+    store: &dyn SecretStore,
+    scope: &str,
+) -> Result<Option<crate::kdf::RecoverySeed>> {
+    let Some(stored) = store.get(&SecretName::recovery_seed(scope)?)? else {
+        return Ok(None);
+    };
+    crate::kdf::RecoverySeed::from_stored_bytes(stored.expose()).map(Some)
 }
 
 #[cfg(test)]
@@ -543,17 +791,122 @@ mod tests {
         assert!(load_device_keys(&store, "host").is_err());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn the_fallback_directory_and_files_are_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_seed_shared_across_two_purposes_is_rejected() {
+        let store = MemoryStore::new();
+        let keys = DeviceKeys::generate().expect("keys");
+        store_device_keys(&store, "host", &keys).expect("a write");
+        let shared = store
+            .get(&SecretName::device_key("host", KeyPurpose::Transport).expect("a name"))
+            .expect("a read")
+            .expect("a value");
+        store
+            .set(
+                &SecretName::device_key("host", KeyPurpose::Authorisation).expect("a name"),
+                shared.expose(),
+            )
+            .expect("a write");
+        assert!(load_device_keys(&store, "host").is_err());
+    }
 
+    #[test]
+    fn a_recovery_seed_round_trips_through_a_store() {
+        let store = MemoryStore::new();
+        assert!(
+            load_recovery_seed(&store, "host")
+                .expect("a read")
+                .is_none()
+        );
+        let seed = crate::kdf::RecoverySeed::generate().expect("a seed");
+        store_recovery_seed(&store, "host", &seed).expect("a write");
+        let loaded = load_recovery_seed(&store, "host")
+            .expect("a read")
+            .expect("the seed");
+        assert_eq!(loaded.checksum(), seed.checksum());
+    }
+
+    #[test]
+    fn the_memory_store_redacts_its_contents() {
+        let store = MemoryStore::new();
+        store
+            .set(&SecretName::new("host/x").expect("a name"), b"secret")
+            .expect("a write");
+        let rendered = format!("{store:?}");
+        assert_eq!(rendered, "MemoryStore(1 items, redacted)");
+        assert!(!rendered.contains("secret"));
+    }
+
+    /// A directory only this test uses, under the system temporary directory.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    fn scratch_directory(name: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
-            "kr-crypto-store-{}-{:?}",
+            "kr-crypto-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&base);
+        base
+    }
+
+    #[test]
+    fn the_fallback_is_offered_only_where_section_10_offers_it() {
+        // macOS, iOS, Android and Windows always have a protected store, so a missing one is an
+        // error rather than a downgrade to files.
+        assert_eq!(
+            FILE_FALLBACK_SUPPORTED,
+            cfg!(all(
+                unix,
+                not(any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "android"
+                ))
+            ))
+        );
+        if !FILE_FALLBACK_SUPPORTED {
+            let base =
+                std::env::temp_dir().join(format!("kr-crypto-refused-{}", std::process::id()));
+            assert!(FileStore::open(&base).is_err());
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    #[test]
+    fn a_fallback_directory_already_holding_secrets_is_not_abandoned() {
+        let base = scratch_directory("migration");
+        let store = FileStore::open(&base).expect("a store");
+        store
+            .set(&SecretName::new("host/x").expect("a name"), b"seed")
+            .expect("a write");
+        let opened = open_store("kalareach-test", &base).expect("a store");
+        assert_eq!(opened.kind, StoreKind::FileFallback);
+        assert_eq!(
+            opened
+                .store
+                .get(&SecretName::new("host/x").expect("a name"))
+                .expect("a read")
+                .expect("a value")
+                .expose(),
+            b"seed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    #[test]
+    fn the_fallback_directory_and_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = scratch_directory("store");
         let store = FileStore::open(&base).expect("a store");
         let name = SecretName::new("host/device-key/transport").expect("a name");
         store.set(&name, b"seed").expect("a write");

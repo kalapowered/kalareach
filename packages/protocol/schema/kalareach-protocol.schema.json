@@ -1166,7 +1166,7 @@
         },
         "size_bucket_bytes": {
           "$ref": "#/$defs/U64",
-          "description": "The declared size bucket, in bytes. Quota accounting measures stored bytes, not this."
+          "description": "The declared size bucket, in bytes: the length of the padded plaintext that was encrypted.\n\nQuota accounting measures the complete stored ciphertext rather than this figure."
         }
       },
       "required": [
@@ -1995,11 +1995,6 @@
           "const": "object_key",
           "description": "The key of one member object.",
           "type": "string"
-        },
-        {
-          "const": "recovery_bundle_key",
-          "description": "The key of an encrypted recovery bundle.",
-          "type": "string"
         }
       ]
     },
@@ -2020,12 +2015,12 @@
       "oneOf": [
         {
           "const": "authority_feed_change",
-          "description": "An announcement that a device's authority feed changed. It announces; it does not carry\nauthority.",
+          "description": "An announcement that a device's authority feed changed.\n\nIt announces and nothing more. Revocation records live in the durable authority feed, which\nhas its own retention and is not coalesced with notifications; a device that sees this\nannouncement synchronises the feed.",
           "type": "string"
         },
         {
-          "const": "revocation_request",
-          "description": "A signed revocation request published by a remote owner.",
+          "const": "signed_authority_object",
+          "description": "A signed authority object forwarded to a device: a grant, a revocation request or a host\nauthority revision record.\n\nThe payload is the signed object's canonical bytes. The issuer's signature is what\nauthorises it; the envelope only delivers it.",
           "type": "string"
         },
         {
@@ -3166,7 +3161,7 @@
         },
         "signature": {
           "$ref": "#/$defs/Signature64",
-          "description": "The Ed25519 signature over `CBOR([\"kr-pair/owner-confirm/1\", request])`."
+          "description": "The Ed25519 signature over `CBOR([\"kr-pair/owner-confirm/1\", request, channel])`."
         },
         "signer_key_id": {
           "$ref": "#/$defs/KeyId",

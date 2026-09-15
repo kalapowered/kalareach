@@ -1,12 +1,11 @@
 {
-  "description": "Mailbox envelope and backup key wrap encodings, with crypto_box_easy output under fixed test keys and nonces.",
+  "description": "Mailbox envelope and backup key wrap encodings, sealed with crypto_box_easy under fixed test keys and nonces.",
   "envelope": {
     "canonical_hex": "ac677061796c6f616458186b722d617574686f726974792d666565642d6368616e67656776657273696f6e6c6b722d6d61696c626f782f31686772616e745f696450222222222222222222222222222222226a73657373696f6e5f696450242424242424242424242424242424246b656e76656c6f70655f696450212121212121212121212121212121216c7061796c6f61645f7479706575617574686f726974795f666565645f6368616e67656d637265617465645f61745f6d731b0000019ab697e8006d657870697265735f61745f6d731b0000019ab6a10fc06d73656e6465725f6b65795f69645820665ef826a540435a8b9699bdb18c60c6c5dc6c6152f798f7a66ef83113d162526d73657373696f6e5f65706f6368016e656e7669726f6e6d656e745f6964502323232323232323232323232323232370726563697069656e745f6b65795f69645820bd1ad3bf4a209d9522cc59ed914cb8038da0eb622dbd6207d13d9c1f355b493b",
     "canonical_sha256": "3d0f9101d3ca516ddc656b7be16379ade9bc346226e9a185260ca91635dd49e4",
-    "ciphertext_hex": "4ad99a7d8ab5582774c709f7dc394c8206b86681d4afa0f816ec94762cba7343598d565a7df938c3c81ef543bc3a72924bcefe53dccfe6b433de2281929a1c0196b714e1ff2d49e9b0e520150c5ad88796bd92202d580aecdbe1237010a8d63696ede0e2ba8f9ab8b87b802acfe047a3253ecdfc638644f1eb65c256327400d0b41a8aa54e363fef61532f42118b63e32a4163a1a87fd331e33985178be5e09a0bb6715a9c1beedecf86a29d1f29c78935358eb4d1663c430d72cbd0b41052fac5219849301d1ee89e9dc16c1c73efbdf2e70b5c798a56aa8cb3627e7edbbada36618ac7d8fbe13384d964131c515c08202a39042b469225c86757b53de258995c65399a3506e5c34ff936668d7ea37edb2b68e0dd0358ac04ff2a91a7a3c3bc66ade56814ed6d4056311524a826ab7cff0aa2f19d65622bc6b46cf671224261980b6ecdf7b9fa72183a7689df4716ea6c7e494b2d3976e0ceeaeeaa1fba642eb16d367ee97986e798d7d6cf5ea3b833715a81b440eda62ecdea38bbaaee",
-    "declared_size_bucket_bytes": 1024,
-    "description": "The authenticated plaintext of one mailbox envelope, its canonical encoding and its crypto_box_easy ciphertext.",
-    "nonce_hex": "c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5",
+    "description": "One mailbox envelope: its authenticated plaintext, that plaintext's canonical encoding, and the sealed object a recipient opens.",
+    "opened_at_ms": 1764000000000,
+    "padded_len": 1024,
     "plaintext_json": {
       "created_at_ms": "1764000000000",
       "envelope_id": "21212121-2121-2121-2121-212121212121",
@@ -20,11 +19,21 @@
       "session_epoch": "1",
       "session_id": "24242424-2424-2424-2424-242424242424",
       "version": "kr-mailbox/1"
+    },
+    "sealed_json": {
+      "ciphertext": "0lchHvU_Fc0k0Pfl44TJ3Qa4ZoHUr6D4FuyUdiy6c0NZjVZaffk4w8ge9UO8OnKSS87-U9zP5rQz3iKBkpocAZa3FOH_LUnpsOUgFQxa2IeWvZIgLVgK7NvhI3AQqNY2lu3g4rqPmri4e4Aqz-BHoyU-zfxjhkTx62XCVjJ0ANC0GoqlTjY_72FTL0IRi2PjKkFjoah_0zHjOYUXi-Xgmgu2cVqcG-7ez4ainR8px4k1NY600WY8Qw1yy9C0EFL6xSGYSTAdHuiencFsHHPvvfLnC1x5ilaqjLNifn7buto2YYrH2PvhM4TZZBMcUVwIICo5BCtGkiXIZ1e1PeJYmVxlOZo1BuXDT_k2Zo1-o37bK2jg3QNYrAT_KpGno8O8Zq3laBTtbUBWMRUkqCarfP8KovGdZWIrxrRs9nEiQmGYC27N97n6chg6donfRxbqbH5JSy05duDO6u6qH7pkLrFtNn7peYbnmNfWz16juDNxWoG0QO2mLs3qOLuq7ixaTc4MvXxWKGve3Q5jqyQqIBJw2uxN0nFCBHiQ5sGKGGgZm13HMxWWdHw2On4vUHMU7EE3olRU8m-QLIsEOMEmUVA9dQ8LhRVKWS_qciC90GebWQavIz_dBRcmGE0fdwa1bVt_gRO70115L01qhUdL2qZc8A5wPXjhXgMlBNu-Z2ygDD3V4fN_0CZuAZaTN1qVDGki5ALekcglXRcUD8QXgUIZ6YeWvewLB7ba1rJqwY-L_2FJSK4kNlFbZh360qV-vbu7eVNXmWX2qPmyjWHb2arFetGFfxUz-2scbCpevoQ7Fn2ftQmyGFCI1hD7XmORDVciz1-cU4JVyrhWKKSXpyLm3wFOJKsUmd7olG-1AlbSEKSUfMHsafF1OEtEjKjzfANmhfmTP92M6thRHnXcZEnYgDedt7UK2TFYaXxUQRhPvwaHd0HikzVZMTeyEVhz4H5chz0GGgVzkzCxpPGJj3vfA3Waq6UTKy6VfPXGW0eqFIYbruwvTm9H4x4icu01RT6kJg23L6v1v82n1ZDCpc3TFN2ch27a3qwFWvLSHCMrszBDt-F7hZ09DVrOdW1oh6-brv0y8fecz2c-haRvaaJhHha3whmvXvoaX4nt_ziupPTDBPjsgC716DaezV9nzsCZVGWbGQ1rfG72epJtcb7VSFqe2vHMjYynL4XMgd2NglY-0ygaBaN4G12j9UXH0pR_x53tiiaW8FInit8GU9Aoxm1X-Ni0E8n24d_7sU8ZU2QdzV-7Geem-6UzQpBL_1NxxpfwZBOztHAOydnueH6EHItWOfa6O-IH6GKJiVSupRoOnyu1kYM0Q_ktXmP-hldZ6sMW-VoMa25MM8AMtk0C0tLTsSXIG3bLASqDFLw",
+      "nonce": "xcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXF",
+      "routing": {
+        "envelope_id": "21212121-2121-2121-2121-212121212121",
+        "expires_at_ms": "1764000600000",
+        "recipient_key_id": "vRrTv0ognZUizFntkUy4A42g62ItvWIH0T2cHzVbSTs",
+        "sender_key_id": "Zl74JqVAQ1qLlpm9sYxgxsXcbGFS95j3pm74MRPRYlI",
+        "size_bucket_bytes": "1024"
+      }
     }
   },
   "key_wrap": {
     "canonical_hex": "82a866666f726d61746c6b722d6b6579777261702f3167707572706f73656c6d616e69666573745f6b6579696f626a6563745f696450323232323232323232323232323232326a617263686976655f696450313131313131313131313131313131316d73656e6465725f6b65795f69645820665ef826a540435a8b9699bdb18c60c6c5dc6c6152f798f7a66ef83113d1625270726563697069656e745f6b65795f69645820bd1ad3bf4a209d9522cc59ed914cb8038da0eb622dbd6207d13d9c1f355b493b716261636b75705f67656e65726174696f6e0475656e637279707465645f6f626a6563745f68617368582033333333333333333333333333333333333333333333333333333333333333335820e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8",
-    "ciphertext_hex": "540987130c3ca2e5f5d0bb1000897265121af08340a5ce74636df6e56be10bdad828f81e0bd54aae69c9eb8cdef029550c40f8061912bcbdb869409581393455a095707b9d37e47032401dd4e0239a8ee0865dea0cf9abefe88f389c95b5f30e692ba104653a8558e2505b62dc2beedc98f8bf95726bda49a78dc4bbcc2a1842bf80af8f83edcfac0230c4694ccfe35e720c0b2406662891c07b0c1b8c763f0849c82ded1b2ca4e35254a27f21dfc1839e7df2ef394c91c86171c72d1358980d14ecdef5ce5caa19b0d7a2ec0a4afaa62fa3ca1a45830fc3a8f9709a98afe8b88fed331fb31b51e64de7ed5a88bf6751197f19fbc927c94521b51cf5f2566fa5b9b644bba368c72008fd4d993acda65868ec26a23dc4ceec3de7e9a5e9debe389e22c6125e6e6d2caa12d58e0ddee5eea19e3c6b5c72c7c82847661fb0a731abefdc",
     "context_json": {
       "archive_id": "31313131-3131-3131-3131-313131313131",
       "backup_generation": "4",
@@ -35,9 +44,22 @@
       "recipient_key_id": "vRrTv0ognZUizFntkUy4A42g62ItvWIH0T2cHzVbSTs",
       "sender_key_id": "Zl74JqVAQ1qLlpm9sYxgxsXcbGFS95j3pm74MRPRYlI"
     },
-    "description": "The authenticated plaintext of one manifest key wrap, CBOR([context, object_key]), and its crypto_box_easy ciphertext.",
-    "nonce_hex": "c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6",
-    "object_key_hex": "e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8"
+    "description": "One manifest key wrap: CBOR([context, object_key]) sealed for the recipient.",
+    "object_key_hex": "e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8",
+    "sealed_json": {
+      "ciphertext": "VAmHEww8ouX10LsQAIlyZRIa8INApc50Y2325WvhC9rYKPgeC9VKrmnJ64ze8ClVDED4BhkSvL24aUCVgTk0VaCVcHudN-RwMkAd1OAjmo7ghl3qDPmr7-iPOJyVtfMOaSuhBGU6hVjiUFti3Cvu3Jj4v5Vya9pJp43Eu8wqGEK_gK-Pg-3PrAIwxGlMz-NecgwLJAZmKJHAewwbjHY_CEnILe0bLKTjUlSifyHfwYOeffLvOUyRyGFxxy0TWJgNFOze9c5cqhmw16LsCkr6pi-jyhpFgw_DqPlwmpiv6LiP7TMfsxtR5k3n7VqIv2dRGX8Z-8knyUUhtRz18lZvpbm2RLujaMcgCP1NmTrNplho7CaiPcTO7D3n6aXp3r44niLGEl5ubSyqEtWODd7l7qGePGtccsfIKEdmH7CnMavv3A",
+      "context": {
+        "archive_id": "31313131-3131-3131-3131-313131313131",
+        "backup_generation": "4",
+        "encrypted_object_hash": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM",
+        "format": "kr-keywrap/1",
+        "object_id": "32323232-3232-3232-3232-323232323232",
+        "purpose": "manifest_key",
+        "recipient_key_id": "vRrTv0ognZUizFntkUy4A42g62ItvWIH0T2cHzVbSTs",
+        "sender_key_id": "Zl74JqVAQ1qLlpm9sYxgxsXcbGFS95j3pm74MRPRYlI"
+      },
+      "nonce": "xsbGxsbGxsbGxsbGxsbGxsbGxsbGxsbG"
+    }
   },
   "keys": {
     "recipient": {
@@ -52,16 +74,16 @@
     }
   },
   "name": "envelopes",
-  "note": "A real envelope and a real key wrap always use a fresh random 24-byte nonce. These nonces are fixed so the vector is reproducible.",
+  "note": "A real envelope and a real key wrap always use a fresh random 24-byte nonce. These nonces are fixed so the vector is reproducible; the padding, the encodings and the checks are the ordinary ones.",
   "size_buckets": {
-    "description": "The declared size buckets of section 20. Quota accounting measures the complete stored ciphertext, not these.",
+    "description": "The declared size buckets of section 20. A plaintext is padded to its bucket before encryption, so the bucket is always strictly larger than the plaintext. Quota accounting measures the complete stored ciphertext.",
     "mailbox": [
       {
         "bucket_bytes": 1024,
         "plaintext_bytes": 1
       },
       {
-        "bucket_bytes": 16384,
+        "bucket_bytes": 17408,
         "plaintext_bytes": 16384
       },
       {
@@ -69,7 +91,7 @@
         "plaintext_bytes": 16385
       },
       {
-        "bucket_bytes": 65536,
+        "bucket_bytes": 69632,
         "plaintext_bytes": 65536
       },
       {
@@ -91,7 +113,7 @@
         "plaintext_bytes": 1
       },
       {
-        "bucket_bytes": 1024,
+        "bucket_bytes": 2048,
         "plaintext_bytes": 1024
       },
       {

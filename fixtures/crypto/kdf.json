@@ -19,6 +19,15 @@
     "bundle_key_hex": "7429476b502f78bf5bb283265f37b9fa2c077639db6678c35c796d4088483644",
     "bundle_subkey_id": 1,
     "context": "KRRECOV1",
+    "context_binding": {
+      "bundle_key_hex": "103afb451874c3aab581408b09dd2ef248bde8f6ef2ea330fe918ab6a27d6c76",
+      "context_json": {
+        "bundle_locator": "kr-recovery-vector-locator",
+        "service_origin": "https://reach.kala.to"
+      },
+      "context_salt_hex": "83746b722d7265636f766572792d62756e646c652f317568747470733a2f2f72656163682e6b616c612e746f781a6b722d7265636f766572792d766563746f722d6c6f6361746f72",
+      "description": "The key a bundle is actually encrypted under: HKDF-SHA256 over the subkey-1 key, salted with the canonical retrieval context. A bundle served from another origin or under another locator does not authenticate."
+    },
     "description": "libsodium crypto_kdf with context KRRECOV1: subkey 1 is the recovery-bundle key and subkey 2 seeds the recovery recipient's crypto_box keypair.",
     "recipient_key_id_hex": "6f8a8c29bc6afcc8a76935f3327e96c93039a744217f67183c3edc8ee73eb997",
     "recipient_public_key_hex": "e2e6aa4550b1027ed87bbba56cf8966933c0bcf267287a54be0d40178e5a2574",

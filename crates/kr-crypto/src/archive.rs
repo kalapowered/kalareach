@@ -13,11 +13,11 @@
 
 use kr_protocol::archive::{
     ArchiveDescriptor, ArchiveManifest, EncryptedObjectRef, KeyWrapContext, MANIFEST_DOMAIN,
-    RECOVERY_BUNDLE_DOMAIN, RecoveryBundle, SealedKeyWrap, SignedArchiveManifest, TrustedWriter,
-    key_wrap_plaintext,
+    OBJECT_KEY_LEN, RecoveryBundle, SealedKeyWrap, SignedArchiveManifest, TrustedWriter,
+    key_wrap_plaintext, key_wrap_prefix,
 };
 use kr_protocol::ids::BackupObjectId;
-use kr_protocol::scalars::{AuthorisationKey, Bytes, Digest256, KeyId, Signature64, U64};
+use kr_protocol::scalars::{Bytes, Digest256, KeyId, U64};
 
 use crate::error::{CryptoError, Result};
 use crate::kdf::RecoveryRecipient;
@@ -142,14 +142,10 @@ pub fn unwrap_object_key(
     wrap: &SealedKeyWrap,
     expected: &KeyWrapContext,
 ) -> Result<SymmetricKey> {
-    if &wrap.context != expected {
-        return Err(CryptoError::BindingMismatch {
-            what: "the context of a key wrap",
-        });
-    }
+    check_wrap_parties(expected, sender, &recipient.key_id())?;
     let opened =
         sealed::open_stored_envelope(recipient, sender, &wrap.nonce, wrap.ciphertext.as_slice())?;
-    read_wrapped_key(&opened, expected)
+    read_wrapped_key(&opened, &wrap.context, expected)
 }
 
 /// Opens one key wrap with the recovery recipient derived from the owner's seed.
@@ -160,50 +156,83 @@ pub fn unwrap_object_key(
 ///
 /// # Errors
 ///
-/// Returns [`CryptoError::BindingMismatch`] when the wrap's context is not the expected one, and
-/// an authentication error when the wrap does not open.
+/// Returns [`CryptoError::BindingMismatch`] when the wrap's context is not the expected one or
+/// does not name the two keys used, and an authentication error when the wrap does not open.
 pub fn unwrap_object_key_with_recovery(
     recovery: &RecoveryRecipient,
     sender: &kr_protocol::scalars::StoredEnvelopeKey,
     wrap: &SealedKeyWrap,
     expected: &KeyWrapContext,
 ) -> Result<SymmetricKey> {
-    if &wrap.context != expected {
-        return Err(CryptoError::BindingMismatch {
-            what: "the context of a key wrap",
-        });
-    }
+    let recipient_key_id = crate::keys::key_id(
+        kr_protocol::pairing::KeyPurpose::StoredEnvelope,
+        recovery.public().as_bytes(),
+    );
+    check_wrap_parties(expected, sender, &recipient_key_id)?;
     let opened = SecretVec::new(sodium::box_open_easy(
         wrap.ciphertext.as_slice(),
         wrap.nonce.as_bytes(),
         sender.as_bytes(),
         recovery.secret().expose(),
     )?);
-    read_wrapped_key(&opened, expected)
+    read_wrapped_key(&opened, &wrap.context, expected)
 }
 
-/// Reads `[context, key]` out of an opened wrap, checking the authenticated context.
-fn read_wrapped_key(opened: &SecretVec, expected: &KeyWrapContext) -> Result<SymmetricKey> {
-    // The plaintext is `[context, key]`, and the context inside it has to be the one the wrap
-    // declared: a wrap whose outer context was rewritten fails here rather than yielding a key.
-    let value = kr_cbor::decode(opened.expose(), &kr_cbor::Limits::DEFAULT)?;
-    let kr_cbor::CanonicalValue::Array(items) = &value else {
+/// Checks that the expected context names the two keys the caller is actually using.
+///
+/// `crypto_box` derives one shared secret from either direction, so a wrap sealed from A to B also
+/// opens from B to A. Without this check a recipient could open a wrap addressed to the sender and
+/// accept it as its own.
+fn check_wrap_parties(
+    expected: &KeyWrapContext,
+    sender: &kr_protocol::scalars::StoredEnvelopeKey,
+    recipient_key_id: &KeyId,
+) -> Result<()> {
+    if &expected.recipient_key_id != recipient_key_id {
         return Err(CryptoError::BindingMismatch {
-            what: "the shape of a key wrap plaintext",
+            what: "the recipient of a key wrap, which is not the key opening it",
         });
-    };
-    let [context_value, kr_cbor::CanonicalValue::Bytes(key_bytes)] = items.as_slice() else {
+    }
+    let sender_key_id = crate::keys::key_id(
+        kr_protocol::pairing::KeyPurpose::StoredEnvelope,
+        sender.as_bytes(),
+    );
+    if expected.sender_key_id != sender_key_id {
         return Err(CryptoError::BindingMismatch {
-            what: "the shape of a key wrap plaintext",
+            what: "the sender of a key wrap, which is not the key it is opened against",
         });
-    };
-    let inner: KeyWrapContext = kr_cbor::from_canonical_value(context_value)?;
-    if &inner != expected {
+    }
+    Ok(())
+}
+
+/// Reads the object key out of an opened wrap.
+///
+/// The plaintext is `CBOR([context, key])`. Rather than decoding it, which would put the key in a
+/// value tree no caller can zeroise, the expected prefix is rebuilt and compared: a wrap whose
+/// authenticated context is not the expected one fails here, and the key is the remaining 32 bytes.
+fn read_wrapped_key(
+    opened: &SecretVec,
+    declared: &KeyWrapContext,
+    expected: &KeyWrapContext,
+) -> Result<SymmetricKey> {
+    if declared != expected {
+        return Err(CryptoError::BindingMismatch {
+            what: "the context of a key wrap",
+        });
+    }
+    let prefix = key_wrap_prefix(expected)?;
+    let bytes = opened.expose();
+    if bytes.len() != prefix.len() + OBJECT_KEY_LEN {
+        return Err(CryptoError::BindingMismatch {
+            what: "the length of a key wrap plaintext",
+        });
+    }
+    if !sodium::constant_time_eq(&bytes[..prefix.len()], &prefix) {
         return Err(CryptoError::BindingMismatch {
             what: "the context inside a key wrap",
         });
     }
-    Secret::from_slice("a wrapped object key", key_bytes)
+    Secret::from_slice("a wrapped object key", &bytes[prefix.len()..])
 }
 
 /// Signs a manifest with a backup writer's authorisation key.
@@ -275,47 +304,40 @@ pub fn manifest_wrap_for<'a>(
         .find(|wrap| &wrap.context.recipient_key_id == recipient)
 }
 
-/// Encrypts a recovery bundle under the key derived from the recovery seed.
+/// Encrypts a recovery bundle under the key the seed derives for one retrieval context.
 ///
-/// The bundle is signed by the owner before encryption, so a service that serves an older bundle
-/// serves one whose signature and revision are visible.
+/// The `secretstream` object authenticates the bundle, and its key is bound to the origin and
+/// locator it is stored at, so nothing else has to sign it. A restore that has only the kit can
+/// therefore authenticate the bundle; requiring a separate owner signing key would ask the kit for
+/// something it does not carry.
 ///
 /// # Errors
 ///
 /// Returns an encoding error when the bundle is outside KR-CBOR-1, and a library error when
 /// libsodium fails.
-pub fn encrypt_recovery_bundle(
-    key: &SymmetricKey,
-    owner: &AuthorisationKeyPair,
-    bundle: &RecoveryBundle,
-) -> Result<(Vec<u8>, Signature64)> {
-    let signature = sign::sign_object(owner, RECOVERY_BUNDLE_DOMAIN, bundle)?;
+pub fn encrypt_recovery_bundle(key: &SymmetricKey, bundle: &RecoveryBundle) -> Result<Vec<u8>> {
     let mut encoded = kr_cbor::to_canonical_vec(bundle)?;
     let object = stream::encrypt_object(key, &encoded);
     sodium::memzero(&mut encoded);
-    Ok((object?, signature))
+    object
 }
 
-/// Decrypts a recovery bundle and verifies the owner's signature over it.
+/// Decrypts a recovery bundle.
 ///
-/// Origin or locator substitution fails here, because the bundle that comes back does not
-/// authenticate under the key the kit's seed derives.
+/// The key comes from [`crate::kdf::RecoverySeed::bundle_key_for`], which mixes the seed with the
+/// origin and locator being read. Origin or locator substitution therefore fails authentication
+/// here rather than causing trust in archive-supplied writer keys.
 ///
 /// # Errors
 ///
-/// Returns an authentication error when the object or the signature fails, and an encoding error
-/// when the plaintext is not a valid bundle.
-pub fn decrypt_recovery_bundle(
-    key: &SymmetricKey,
-    owner: &AuthorisationKey,
-    object: &[u8],
-    signature: &Signature64,
-) -> Result<RecoveryBundle> {
+/// Returns an authentication error when the object does not open, and an encoding error when the
+/// plaintext is not a valid bundle.
+pub fn decrypt_recovery_bundle(key: &SymmetricKey, object: &[u8]) -> Result<RecoveryBundle> {
     let plaintext = stream::decrypt_object(key, object)?;
-    let bundle: RecoveryBundle =
-        kr_cbor::from_canonical_slice(plaintext.expose(), &kr_cbor::Limits::DEFAULT)?;
-    sign::verify_object(owner, RECOVERY_BUNDLE_DOMAIN, &bundle, signature)?;
-    Ok(bundle)
+    Ok(kr_cbor::from_canonical_slice(
+        plaintext.expose(),
+        &kr_cbor::Limits::DEFAULT,
+    )?)
 }
 
 #[cfg(test)]
@@ -482,7 +504,11 @@ mod tests {
     fn a_recovery_bundle_round_trips_under_the_seed_derived_key() {
         let owner = AuthorisationKeyPair::generate().expect("a keypair");
         let seed = crate::kdf::RecoverySeed::generate().expect("a seed");
-        let key = seed.bundle_key().expect("a bundle key");
+        let context = kr_protocol::archive::RecoveryContext {
+            service_origin: "https://reach.kala.to".to_owned(),
+            bundle_locator: "opaque-locator".to_owned(),
+        };
+        let key = seed.bundle_key_for(&context).expect("a bundle key");
         let bundle = RecoveryBundle {
             schema_version: U64::new(1),
             collections: Vec::new(),
@@ -498,18 +524,27 @@ mod tests {
             revision: U64::new(3),
             written_at_ms: TimestampMs::new(2),
         };
-        let (object, signature) =
-            encrypt_recovery_bundle(&key, &owner, &bundle).expect("an encrypted bundle");
-        let restored =
-            decrypt_recovery_bundle(&key, owner.public(), &object, &signature).expect("the bundle");
-        assert_eq!(restored, bundle);
+        let object = encrypt_recovery_bundle(&key, &bundle).expect("an encrypted bundle");
+        assert_eq!(
+            decrypt_recovery_bundle(&key, &object).expect("the bundle"),
+            bundle
+        );
 
-        // A substituted locator gives a different seed, so the bundle does not decrypt.
-        let other = crate::kdf::RecoverySeed::generate()
-            .expect("a seed")
-            .bundle_key()
-            .expect("a bundle key");
-        assert!(decrypt_recovery_bundle(&other, owner.public(), &object, &signature).is_err());
+        // The same seed and the same ciphertext, retrieved from another origin or under another
+        // locator, does not authenticate.
+        for substituted in [
+            kr_protocol::archive::RecoveryContext {
+                service_origin: "https://elsewhere.example".to_owned(),
+                ..context.clone()
+            },
+            kr_protocol::archive::RecoveryContext {
+                bundle_locator: "another-locator".to_owned(),
+                ..context.clone()
+            },
+        ] {
+            let wrong = seed.bundle_key_for(&substituted).expect("a bundle key");
+            assert!(decrypt_recovery_bundle(&wrong, &object).is_err());
+        }
     }
 
     #[test]
@@ -550,28 +585,14 @@ mod tests {
 
         // The recovery recipient opens the wrap with the key the seed derives, so a future archive
         // stays recoverable without copying a device private key.
-        let opened = sealed::open_stored_envelope(
-            &StoredEnvelopeKeyPair::from_seed(
-                crate::keys::StoredEnvelopeSeed::from_stored_bytes(&[0; 32]).expect("32 bytes"),
-            )
-            .expect("a keypair"),
-            sender.public(),
-            &wrap.nonce,
-            wrap.ciphertext.as_slice(),
+        let other = StoredEnvelopeKeyPair::generate().expect("a keypair");
+        assert!(
+            unwrap_object_key(&other, sender.public(), &wrap, &context).is_err(),
+            "another device cannot open it"
         );
-        assert!(opened.is_err(), "another device cannot open it");
 
-        let plaintext = crate::sodium::box_open_easy(
-            wrap.ciphertext.as_slice(),
-            wrap.nonce.as_bytes(),
-            sender.public().as_bytes(),
-            recovery.secret().expose(),
-        )
-        .expect("the recovery recipient opens it");
-        let value = kr_cbor::decode(&plaintext, &kr_cbor::Limits::DEFAULT).expect("a value");
-        let kr_cbor::CanonicalValue::Array(items) = value else {
-            panic!("a key wrap plaintext is an array");
-        };
-        assert_eq!(items.len(), 2);
+        let key = unwrap_object_key_with_recovery(&recovery, sender.public(), &wrap, &context)
+            .expect("the recovery recipient opens it");
+        assert!(key.constant_time_eq(&object.key));
     }
 }

@@ -36,7 +36,10 @@ impl<const N: usize> Secret<N> {
     pub fn random() -> Result<Self> {
         let mut bytes = [0u8; N];
         sodium::random_bytes(&mut bytes)?;
-        Ok(Self(bytes))
+        // An array is `Copy`, so wrapping it leaves the local behind. Wipe it.
+        let secret = Self(bytes);
+        sodium::memzero(&mut bytes);
+        Ok(secret)
     }
 
     /// Wraps a slice of exactly `N` bytes.
@@ -47,7 +50,11 @@ impl<const N: usize> Secret<N> {
     /// different length.
     pub fn from_slice(what: &'static str, slice: &[u8]) -> Result<Self> {
         match <[u8; N]>::try_from(slice) {
-            Ok(bytes) => Ok(Self(bytes)),
+            Ok(mut bytes) => {
+                let secret = Self(bytes);
+                sodium::memzero(&mut bytes);
+                Ok(secret)
+            }
             Err(_) if slice.len() < N => Err(CryptoError::Truncated {
                 what,
                 minimum: N,
@@ -162,6 +169,12 @@ mod tests {
         assert!(!rendered.contains('7'));
         let variable = SecretVec::new(vec![7; 8]);
         assert_eq!(format!("{variable:?}"), "SecretVec(8 bytes, redacted)");
+    }
+
+    #[test]
+    fn a_secret_built_from_a_slice_keeps_the_bytes() {
+        let secret = Secret::<4>::from_slice("a test key", &[1, 2, 3, 4]).expect("four bytes");
+        assert_eq!(secret.expose(), &[1, 2, 3, 4]);
     }
 
     #[test]

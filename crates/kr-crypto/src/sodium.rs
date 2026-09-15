@@ -255,21 +255,6 @@ pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     unsafe { sodium::sodium_memcmp(left.as_ptr().cast(), right.as_ptr().cast(), left.len()) == 0 }
 }
 
-/// Generates an X25519 `crypto_box` keypair.
-///
-/// # Errors
-///
-/// Returns an error when libsodium is unavailable or reports a failure.
-pub fn box_keypair() -> Result<([u8; BOX_PUBLIC_KEY_LEN], [u8; BOX_SECRET_KEY_LEN])> {
-    initialise()?;
-    let mut public = [0u8; BOX_PUBLIC_KEY_LEN];
-    let mut secret = [0u8; BOX_SECRET_KEY_LEN];
-    // SAFETY: both buffers are exactly the lengths `initialise` verified against the library.
-    let code = unsafe { sodium::crypto_box_keypair(public.as_mut_ptr(), secret.as_mut_ptr()) };
-    check(code, "crypto_box_keypair")?;
-    Ok((public, secret))
-}
-
 /// Derives an X25519 `crypto_box` keypair from a seed.
 ///
 /// # Errors
@@ -700,6 +685,67 @@ pub fn stream_pull(state: &mut StreamPullState, record: &[u8]) -> Result<(Vec<u8
     }
     plaintext.truncate(usize::try_from(written).unwrap_or(plaintext.len()));
     Ok((plaintext, tag))
+}
+
+/// Pads `buffer` up to the next multiple of `granularity` with ISO/IEC 7816-4 padding.
+///
+/// `buffer` must already hold `unpadded_len` bytes of content and be long enough for the padded
+/// result. libsodium always adds at least one byte, so a content length that is already a multiple
+/// of the granularity grows to the next multiple.
+///
+/// # Errors
+///
+/// Returns an error when libsodium is unavailable or reports a failure.
+pub fn pad(buffer: &mut [u8], unpadded_len: usize, granularity: usize) -> Result<usize> {
+    initialise()?;
+    if unpadded_len > buffer.len() {
+        return Err(CryptoError::Truncated {
+            what: "a padding buffer",
+            minimum: unpadded_len,
+            actual: buffer.len(),
+        });
+    }
+    let mut padded_len = 0usize;
+    // SAFETY: the buffer and its length come from the same exclusively borrowed slice, and
+    // `max_buflen` is that length, which is the bound `sodium_pad` will not write past.
+    let code = unsafe {
+        sodium::sodium_pad(
+            &raw mut padded_len,
+            buffer.as_mut_ptr(),
+            unpadded_len,
+            granularity,
+            buffer.len(),
+        )
+    };
+    check(code, "sodium_pad")?;
+    Ok(padded_len)
+}
+
+/// Returns the content length of an ISO/IEC 7816-4 padded buffer.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::Authentication`] when the padding is malformed. The buffer is
+/// authenticated before it reaches this function, so malformed padding means a format error rather
+/// than an oracle.
+pub fn unpad(buffer: &[u8], granularity: usize) -> Result<usize> {
+    initialise()?;
+    let mut unpadded_len = 0usize;
+    // SAFETY: the buffer and its length come from the same live slice; `sodium_unpad` only reads.
+    let code = unsafe {
+        sodium::sodium_unpad(
+            &raw mut unpadded_len,
+            buffer.as_ptr(),
+            buffer.len(),
+            granularity,
+        )
+    };
+    if code != 0 {
+        return Err(CryptoError::Authentication {
+            what: "the padding of an authenticated plaintext",
+        });
+    }
+    Ok(unpadded_len)
 }
 
 /// libsodium's message-length type.

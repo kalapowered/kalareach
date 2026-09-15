@@ -14,8 +14,13 @@ the rules that make those implementations hard to misuse.
 ## The unsafe boundary
 
 `src/sodium.rs` is the only module that calls the C library and the only module that may use
-`unsafe`. The crate denies unsafe code everywhere else, and every other module in the workspace
+`unsafe`. The crate denies unsafe code everywhere else, and every other crate in the workspace
 forbids it outright.
+
+It is also **private**. The raw primitives are not part of the crate's interface, so a caller
+cannot reach an encryption function that accepts a nonce, a `secretstream` without the
+final-record rule, or a private key as a bare array. Every public entry point is typed and carries
+its own rule.
 
 `initialise()` runs `sodium_init` once and then compares every length the wrapper relies on with
 the linked library's own accessors: the key, nonce, MAC, header and record sizes, and the
@@ -73,9 +78,11 @@ with a fixed nonce. The fixture documents say so, and nothing else does it.
 
 ## Domain separation
 
-`sign` has no function that signs a bare message. Every signature covers
-`CBOR([domain, element, ...])` built through `kr-cbor`, which is the shape section 23 requires. The
-domains this crate and `kr-protocol` define:
+`sign` has no function that signs a bare message. Signing takes a `SigningTranscript`, which is
+either built from a domain and its elements or built from bytes another module produced and then
+checked: the bytes must decode as a canonical array whose first element is the claimed domain. The
+three transcripts the specification writes as arrays reach a signature that way, and nothing else
+can. The domains this crate and `kr-protocol` define:
 
 | Domain | Covers |
 | --- | --- |
@@ -89,7 +96,8 @@ domains this crate and `kr-protocol` define:
 | `kr-pair/direct/1`, `kr-pair/direct-verify/1` | The direct transcript `D` and its verification value |
 | `kr-pair/owner-confirm/1` | An owner-confirmation challenge |
 | `kr-revocation/1`, `kr-authority/1` | A revocation request and a host authority revision record |
-| `kr-archive-manifest/1`, `kr-recovery-bundle/1` | A signed archive manifest and a recovery bundle |
+| `kr-archive-manifest/1` | A signed archive manifest |
+| `kr-recovery-bundle/1` | The retrieval context a recovery bundle's key is derived from |
 | `KRRECOV1` | The `crypto_kdf` context of the recovery seed |
 
 ## Encrypted objects
@@ -104,10 +112,44 @@ authenticated plaintext is `CBOR([context, object_key])`, where the context carr
 purpose, archive, generation, object, encrypted-object hash and both key identifiers. A wrap moved
 to another object, generation or recipient fails to authenticate rather than yielding a key.
 
+Opening a wrap does not decode it. `crypto_box` derives one shared secret from either direction, so
+the same ciphertext opens both ways; the expected context's sender and recipient identifiers are
+therefore checked against the two keys actually being used before anything is opened. The expected
+prefix, `0x82 || CBOR(context) || 0x58 0x20`, is then rebuilt and compared with the opened bytes, and
+the key is the remaining 32 bytes. Rebuilding rather than decoding is both the context check and the
+reason no value tree ever holds a copy of the key.
+
+An archive descriptor is validated before any object is allocated: its byte limit first, then its
+version, its recipient count, and every wrap's archive, generation, object, hash and recipient.
+
 A manifest is verified against a writer key from the owner's recovery bundle. `verify_manifest`
 takes the trusted writers as an argument and has no way to read one out of the archive, so a
 descriptor cannot introduce a writer. A writer whose identifier is not the identifier of its own
 signing key is rejected even if it reaches the trusted list.
+
+## Envelopes and padding
+
+Section 20 puts envelope sizes in declared buckets. A bucket that only described the plaintext would
+describe nothing, because the ciphertext would still be the plaintext's length plus a constant. The
+canonical plaintext is therefore padded to its bucket with libsodium's ISO/IEC 7816-4 padding before
+it is encrypted, and the padding is inside the box.
+
+The bucket is the next multiple of the granularity that is strictly larger than the plaintext, so
+there is always at least one padding byte to remove. Granularity follows section 20: 1 KiB up to
+16 KiB, 4 KiB up to 64 KiB, 64 KiB above that. The three bands do not overlap, so a reader recovers
+the granularity from the padded length before it unpads, and then recomputes the bucket from the
+unpadded length and compares it with both the padded length and the routing record. A service that
+declares one size and stores another fails that comparison.
+
+A notification preview over 16 KiB is refused rather than padded: below that, the notification rule
+and the mailbox rule are the same 1 KiB granularity, and above it a reader with only the padded
+length could not tell which rule produced it.
+
+This reduces precision. It does not hide traffic patterns, and section 20 says so.
+
+Opening an envelope also checks the expiry, and `ReplayLedger` refuses an envelope that has expired
+as well as one it has already seen, so the retention window cannot be outlasted. The ledger's
+durable store belongs to the controller: `entries` and `restore` are how it survives a restart.
 
 ## Recovery
 
@@ -115,6 +157,17 @@ The recovery seed is 256 random bits. `crypto_kdf` with context `KRRECOV1` deriv
 recovery-bundle key from subkey 1 and the recovery recipient's `crypto_box` seed from subkey 2. A
 backup producer holds only the recipient's public key, so every new archive stays recoverable
 without copying a device private key.
+
+The bundle is encrypted under a key that mixes subkey 1 with its retrieval context: the canonical
+encoding of the service origin and the stable bundle locator. A bundle served from another origin
+or under another locator does not authenticate, which is how origin and locator substitution fail
+rather than causing trust in archive-supplied writer keys. Nothing else signs the bundle: the
+`secretstream` object authenticates it under a key only the seed derives, so a restore that has
+only the kit can authenticate what it retrieved.
+
+`RecoverySeed::to_kit` exports the user's copy and `from_kit` reads it back after checking the
+checksum. `store::store_recovery_seed` and `store::load_recovery_seed` keep the owner's copy in the
+secure store.
 
 The recovery recipient is an ordinary stored-envelope `crypto_box` recipient. It is not a fifth key
 purpose: what makes it different is that it is derived from the seed rather than generated on a
@@ -129,20 +182,29 @@ anything is decrypted.
 
 - `PlatformStore` uses the `keyring` crate, which selects Keychain Services on macOS and iOS, the
   Credential Manager on Windows and the Secret Service on other Unix systems.
-- `FileStore` is the documented fallback for a Unix system with no secret service. The directory is
-  mode 0700 and every file is mode 0600, written to a temporary file and renamed so a reader never
-  sees a partial secret or one with the wrong mode. **That is the whole protection.** It depends on
+- `FileStore` is the documented fallback, and **only** on a Unix system that is not macOS, iOS or
+  Android: those platforms always have a protected store, so a missing one is an error rather than a
+  downgrade to files. iOS and Android keys belong to the companion application's platform layer,
+  which owns Keychain and Keystore access.
+
+  The directory is mode 0700, owned by this account and not a symbolic link. Every secret is created
+  exclusively at mode 0600 under a staging name no valid secret name can collide with, flushed,
+  renamed into place and the directory entry flushed, so a reader never sees a partial secret, one
+  with the wrong mode, or a lost write after a crash. **That is the whole protection.** It depends on
   operating-system account isolation and on disk encryption, and it protects nothing from code
   already running as the same user. Deletion overwrites before unlinking, which a journalling or
   copy-on-write filesystem may not honour.
-- `MemoryStore` is for tests and never touches a disk.
+- `MemoryStore` is for tests, never touches a disk and redacts itself in debug output.
 
-`open_store` tries the platform store and falls back, reporting which one it opened, so setup can
-tell the user when a host is relying on the fallback.
+`open_store` reports which store it opened. A host whose fallback directory already holds secrets
+keeps using it even when a secret service appears later, and reports that a migration is available:
+switching on whichever backend happens to work today would leave the application reading an empty
+platform store while its keys sat in files. Moving them is an explicit, verified step.
 
 Loading a device's keys reads four items. A partially written set is an error, never a silent
 regeneration: regenerating one purpose would change that public key and break every record that
-names it.
+names it. Two purposes sharing a seed is also an error, because the two algorithms would give two
+different public keys and nothing downstream would notice the reuse.
 
 ## Connection proofs
 
@@ -156,8 +218,16 @@ host's paired endpoint; both live iroh endpoints equal the paired ones; and both
 over the exact transcript. A downgraded limit changes the transcript, so it fails as an
 authentication error rather than passing unnoticed.
 
-`ChallengeLedger` rejects a reused host challenge and is bounded, so a replayed transcript cannot be
-accepted and the ledger cannot grow without limit.
+It also checks the negotiation itself before trusting the signatures over it: the selected version
+must be one the client offered, every selected capability must be one the client offered, and no
+negotiated limit may exceed what the client said it could receive. Signatures authenticate those
+values; they do not establish that the negotiation was valid.
+
+`ChallengeLedger` holds each challenge from the moment the host issues it until the connection's
+proofs consume it, exactly once. `verify_connect_once` is the entry point a host uses: it consumes
+the challenge before it checks anything, so one set of proofs is accepted once. The ledger is
+bounded, and a full ledger is answered by ending idle connections rather than by forgetting a
+challenge.
 
 ## Vectors
 
@@ -167,13 +237,20 @@ accepted and the ledger cannot grow without limit.
 
 | File | Contents |
 | --- | --- |
-| `signatures.json` | Ed25519 signatures over the canonical bytes `fixtures/cbor/digests.json` and `fixtures/protocol/transcripts.json` publish, the RFC 8032 section 7.1 test vector, and three negative cases a verifier must reject |
-| `envelopes.json` | A mailbox envelope's authenticated plaintext, canonical bytes and `crypto_box_easy` output; a manifest key wrap's plaintext and ciphertext; the section 20 size buckets |
-| `kdf.json` | The RFC 5869 HKDF-SHA256 vector, an HMAC-SHA256 vector, and the `KRRECOV1` subkeys with the recovery recipient's public key |
+| `signatures.json` | Ed25519 signatures over the domain-separated transcripts `fixtures/cbor/digests.json` and `fixtures/protocol/transcripts.json` publish, the RFC 8032 section 7.1 test vector, and three negative cases a verifier must reject |
+| `envelopes.json` | A sealed mailbox envelope with its authenticated plaintext and canonical bytes; a sealed manifest key wrap with its plaintext; the section 20 size buckets |
+| `kdf.json` | The RFC 5869 HKDF-SHA256 vector, an HMAC-SHA256 vector, the `KRRECOV1` subkeys with the recovery recipient's public key, and the context-bound bundle key |
+
+Only domain-separated transcripts are signed. `fixtures/cbor/digests.json` also publishes a complete
+mutation object, which is hashed rather than signed: section 23 authenticates a live mutation
+through its connection and its receipt digest, so a signature vector for it would describe an
+operation the protocol does not perform.
 
 The RFC 8032 and RFC 5869 vectors are there so a reader can confirm that this is standard Ed25519
-and standard HKDF, not a variant. The TypeScript package checks the same documents with the Node
-runtime's own SHA-256, HMAC and HKDF, so a value that drifts in one language fails in both.
+and standard HKDF, not a variant. `packages/protocol/test/crypto.test.ts` checks the same documents
+with the Node runtime's own SHA-256, HMAC-SHA256, HKDF-SHA256 and Ed25519 verification, and with
+this repository's own TypeScript codec for the encodings, so a value that drifts in one language
+fails in both.
 
 ## Release manifest
 
@@ -188,7 +265,14 @@ Pin these in the release manifest, with their exact versions and the resolved de
 | `subtle` | 2.6.1 |
 | `zeroize` | 1.9.0 |
 | `keyring` | 4.2.0 |
+| `spake2` | 0.4.0 |
 
 `libsodium-sys-stable` builds libsodium from the source archive it ships, so the manifest records
-the crate version rather than a system library version. Compile and verify it on every Tauri
-target.
+the crate version rather than a system library version. Compile and verify it on every Tauri target.
+
+`hmac` and `sha2` are built with their `zeroize` features, so their internal buffers are cleared.
+`hkdf` 0.13.0 has no such feature; its pseudorandom key and expansion buffers are not cleared, which
+is a limitation of the pinned implementation rather than of this wrapper. The same applies to the
+`serde` and `ciborium` value trees an envelope's payload passes through on its way to and from
+canonical bytes. The paths that carry key material avoid both: a key wrap is assembled and read
+without a value tree, and every key lives in a `Secret`.
