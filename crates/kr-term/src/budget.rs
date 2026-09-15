@@ -129,13 +129,15 @@ pub struct BudgetUsage {
     pub rows: u64,
     /// Bytes held by the hyperlink and title tables.
     pub metadata: u64,
+    /// Bytes held by the hyperlinks of the rows that are showing.
+    pub screen_links: u64,
 }
 
 impl BudgetUsage {
     /// Total committed bytes.
     #[must_use]
     pub const fn total(self) -> u64 {
-        self.screens + self.rows + self.metadata
+        self.screens + self.rows + self.metadata + self.screen_links
     }
 }
 
@@ -169,6 +171,7 @@ impl SessionBudget {
                 screens: 0,
                 rows: 0,
                 metadata: 0,
+                screen_links: 0,
             },
             truncations: 0,
         }
@@ -212,7 +215,7 @@ impl SessionBudget {
     /// committed.
     pub const fn check_geometry(&self, size: GridSize) -> Result<u64> {
         let cost = Self::screens_cost(size);
-        let other = self.usage.rows + self.usage.metadata;
+        let other = self.usage.rows + self.usage.metadata + self.usage.screen_links;
         if cost + other > self.limits.session_bytes {
             return Err(TermError::Budget {
                 what: "canonical screens",
@@ -258,6 +261,11 @@ impl SessionBudget {
     /// Records the current size of the hyperlink and title tables.
     pub const fn set_metadata(&mut self, bytes: u64) {
         self.usage.metadata = bytes;
+    }
+
+    /// Records what the hyperlinks of the rows that are showing cost.
+    pub const fn set_screen_links(&mut self, bytes: u64) {
+        self.usage.screen_links = bytes;
     }
 
     /// Whether another `bytes` of metadata would fit.

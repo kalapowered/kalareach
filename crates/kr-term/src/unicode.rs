@@ -197,11 +197,9 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
          for.",
         "The library keeps a row in one of two representations and converts a row to the compact \
          one when it scrolls. The compact one stores the row as a single string and works out \
-         where its cells are by clustering that string again, which would undo the cut. Two things \
-         answer that: a cell of the row is read back before every write, which keeps a live row in \
-         the representation that remembers; and a bounded copy is kept of any row that was written \
-         with a cell the clustering could join, so that if the row is compacted anyway it is put \
-         back as it was.",
+         where its cells are by clustering that string again, which would undo the cut, so a cell \
+         of the row is read back before every write to keep a live row in the representation that \
+         remembers. A row that has scrolled is the patch below.",
         "Raster graphics are disabled in configuration and no image sequence is ever forwarded, so \
          the library's sixel, iTerm2 and Kitty image paths stay unreachable.",
         "The library is built with a writer that accepts no bytes. Every reply comes from the \
@@ -241,12 +239,16 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
                       saved until the application saves again",
         },
         RequiredPatch {
-            state: "TerminalState::restore_cursor() leaving newline mode and the shift-out \
-                    selection alone, and exposing newline mode for reading back",
-            reason: "restoring a cursor clears both in this revision, which xterm does not do, so \
-                     a direct terminal following the same bytes ends up in a different mode",
-            interim: "the profile applies the same rule so that there is one answer, and asks the \
-                      attachment to project when it changes anything",
+            state: "Line::compress_for_scrollback() keeping the cells it was given, rather than \
+                    working out where they are by clustering the row's text again",
+            reason: "the pinned width model gives a cell to every scalar that has a width of its \
+                     own, and the compact row representation joins adjacent scalars that the \
+                     library's own clustering would join, which also drops the columns they held",
+            interim: "a row keeps its cells while it is on screen, because a cell of the row is \
+                      read back before every write, which keeps the row out of that representation. \
+                      A row that has scrolled loses the columns reserved for joined scalars: its \
+                      text is all still there and the row is narrower than it was. Rows without \
+                      emoji sequences or Hangul jamo are unaffected, which is nearly all of them",
         },
         RequiredPatch {
             state: "TerminalState::inactive_screen(), the buffer that is not active",

@@ -335,8 +335,13 @@ fn interpret(event: &Event) -> Option<(ProbeItem, ProbeAnswer)> {
             if *truncated {
                 return None;
             }
-            let csi = crate::classify::CsiView::new(params, *final_byte);
+            let csi = crate::classify::CsiView::with_truncation(params, *final_byte, *truncated);
             if !csi.intermediates.is_empty() && csi.intermediates != *b"$" {
+                return None;
+            }
+            // A sublist belongs to ordinary SGR and to nothing this asks about, so a reply carrying
+            // one is not a reply to this question.
+            if csi.sub_parameters {
                 return None;
             }
             match (csi.private, csi.final_byte) {

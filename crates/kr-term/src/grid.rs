@@ -16,12 +16,13 @@
 //! * The Unicode model is pinned rather than defaulted, so the width of a cell is a property of
 //!   the profile and not of whatever the library's default happened to be that month.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use wezterm_escape_parser::Action;
+use wezterm_escape_parser::csi::{CSI, Mode, TerminalMode, TerminalModeCode};
+use wezterm_escape_parser::{Action, ControlCode};
 
+use wezterm_escape_parser::hyperlink::Hyperlink;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
     Alert, AlertHandler, CellAttributes, Intensity, Terminal, TerminalConfiguration, TerminalSize,
@@ -250,7 +251,7 @@ pub struct Rendition {
     /// Underline style.
     pub underline: UnderlineStyle,
     /// Blinking.
-    pub blink: bool,
+    pub blink: Blink,
     /// Reverse video.
     pub reverse: bool,
     /// Invisible.
@@ -285,7 +286,7 @@ impl Default for Rendition {
             faint: false,
             italic: false,
             underline: UnderlineStyle::None,
-            blink: false,
+            blink: Blink::None,
             reverse: false,
             invisible: false,
             strikethrough: false,
@@ -294,6 +295,21 @@ impl Default for Rendition {
             vertical_align: VerticalPosition::Baseline,
         }
     }
+}
+
+/// How a cell blinks.
+///
+/// The two rates are different sequences and different renderings, so they are different here as
+/// well: a projection that reduced them to one would draw a rapid blink as a slow one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Blink {
+    /// Not blinking.
+    #[default]
+    None,
+    /// SGR 5.
+    Slow,
+    /// SGR 6.
+    Rapid,
 }
 
 /// A run of cells sharing one rendition and one hyperlink.
@@ -336,27 +352,7 @@ pub struct CanonicalGrid {
     unrecognised: u64,
     tail: Option<TailCell>,
     dropped_marks: u64,
-    fragile: VecDeque<FragileRow>,
 }
-
-/// A row whose cells the library would re-cluster if it compacted the row.
-///
-/// The library keeps a row in one of two representations and converts to the compact one when the
-/// screen scrolls. The compact one stores the row as a single string and works out where its cells
-/// are by clustering that string again, which joins scalars this width model gives a cell each and
-/// shifts everything after them to the left. A copy of the row is kept while it is at risk, and put
-/// back if that happens. Only rows that were written with such a cell are copied, which is nearly
-/// none of them.
-#[derive(Debug, Clone)]
-struct FragileRow {
-    stable: i64,
-    text: String,
-    cells: usize,
-    line: wezterm_term::Line,
-}
-
-/// How many rows are kept against re-clustering. Older ones are let go first.
-const MAX_FRAGILE_ROWS: usize = 64;
 
 /// The cell a text run ended on, so a later combining mark can still join it.
 ///
@@ -431,7 +427,6 @@ impl CanonicalGrid {
             unrecognised: 0,
             tail: None,
             dropped_marks: 0,
-            fragile: VecDeque::new(),
         })
     }
 
@@ -459,7 +454,6 @@ impl CanonicalGrid {
             && let Ok(text) = core::str::from_utf8(event.raw())
         {
             self.print(text);
-            self.repair_fragile();
             return adapted;
         }
         // Anything that is not printed text ends the cell, exactly as it would have done inside one
@@ -468,81 +462,7 @@ impl CanonicalGrid {
         if !adapted.actions.is_empty() {
             self.terminal.perform_actions(adapted.actions.clone());
         }
-        self.repair_fragile();
         adapted
-    }
-
-    /// Remembers a row whose cells the library would re-cluster if it compacted the row.
-    fn remember_fragile(&mut self, row: i64) {
-        let stable = self.stable_row(row);
-        let Some(line) = self.line_at(stable) else {
-            return;
-        };
-        let text = line.as_str().into_owned();
-        let cells = line.visible_cells().count();
-        let entry = FragileRow {
-            stable,
-            text,
-            cells,
-            line,
-        };
-        self.fragile.retain(|held| held.stable != stable);
-        if self.fragile.len() == MAX_FRAGILE_ROWS {
-            self.fragile.pop_front();
-        }
-        self.fragile.push_back(entry);
-    }
-
-    /// Puts back any remembered row the library has re-clustered, and keeps the rest current.
-    ///
-    /// A row is only put back when it still holds the same text and has fewer cells than it had,
-    /// which is exactly what compacting does to it. A row the application has rewritten holds
-    /// different text, so it is remembered again as it now is rather than undone.
-    fn repair_fragile(&mut self) {
-        if self.fragile.is_empty() {
-            return;
-        }
-        let mut fragile = core::mem::take(&mut self.fragile);
-        for held in &mut fragile {
-            let stable = isize::try_from(held.stable).unwrap_or(isize::MIN);
-            let screen = self.terminal.screen_mut();
-            let Some(phys) = screen.stable_row_to_phys(stable) else {
-                // The row has been evicted, so there is nothing to keep it for.
-                held.stable = i64::MIN;
-                continue;
-            };
-            let line = screen.line_mut(phys);
-            if *line.as_str() == held.text {
-                if line.visible_cells().count() < held.cells {
-                    *line = held.line.clone();
-                }
-            } else {
-                held.text = line.as_str().into_owned();
-                held.cells = line.visible_cells().count();
-                held.line = line.clone();
-            }
-        }
-        fragile.retain(|held| held.stable != i64::MIN);
-        self.fragile = fragile;
-    }
-
-    /// The stable identifier of a visible row.
-    fn stable_row(&self, row: i64) -> i64 {
-        i64::try_from(self.terminal.screen().visible_row_to_stable_row(row)).unwrap_or(0)
-    }
-
-    /// A copy of the row with this stable identifier, when it is still retained.
-    fn line_at(&self, stable: i64) -> Option<wezterm_term::Line> {
-        Self::line_of(&self.terminal, stable)
-    }
-
-    fn line_of(terminal: &Terminal, stable: i64) -> Option<wezterm_term::Line> {
-        let screen = terminal.screen();
-        let phys = screen.stable_row_to_phys(isize::try_from(stable).ok()?)?;
-        screen
-            .lines_in_phys_range(phys..phys + 1)
-            .into_iter()
-            .next()
     }
 
     /// Draws a text run as the profile's width model says it should look.
@@ -620,22 +540,12 @@ impl CanonicalGrid {
     fn print_cell(&mut self, base: &str, marks: &str) {
         let (_, row) = self.cursor_cell();
         let _ = self.terminal.screen_mut().get_cell(0, row);
-        let previous = self
-            .tail
-            .as_ref()
-            .and_then(|tail| tail.text.chars().next_back());
         let before = self.print_origin();
         self.terminal
             .perform_actions(vec![Action::PrintString(base.to_owned())]);
         self.tail = self.locate(base, before);
         if !marks.is_empty() {
             self.rejoin(marks);
-        }
-        let joins = previous
-            .zip(base.chars().next())
-            .is_some_and(|(previous, scalar)| crate::unicode::may_recluster(previous, scalar));
-        if joins && let Some(row) = self.tail.as_ref().map(|tail| tail.row) {
-            self.remember_fragile(row);
         }
     }
 
@@ -670,14 +580,17 @@ impl CanonicalGrid {
     /// scalars that were printed into it.
     fn locate(&mut self, cell: &str, before: (usize, i64, i64)) -> Option<TailCell> {
         let width = crate::unicode::cells_for(cell);
-        let (_, row) = self.cursor_cell();
+        let (after_col, row) = self.cursor_cell();
         let left = self.terminal.get_left_and_right_margins().start;
-        let (col, row) = if self.stable_top() == before.2 && row == before.1 {
-            (before.0, before.1)
-        } else {
-            // The print wrapped before it placed anything, so the cell went to the left margin of
-            // whichever row the cursor is on now.
+        // Three things say the print wrapped before it placed anything: the cursor is on another
+        // row, the screen scrolled, or the cursor column moved left. The last one matters on its
+        // own, because a scroll inside a region or on the alternate buffer moves neither the row
+        // nor the screen's own position.
+        let wrapped = self.stable_top() != before.2 || row != before.1 || after_col < before.0;
+        let (col, row) = if wrapped {
             (left, row)
+        } else {
+            (before.0, before.1)
         };
         let stored = self.cell_text(col, row)?;
         Some(TailCell {
@@ -710,7 +623,7 @@ impl CanonicalGrid {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
             return;
         };
-        if tail.text.len() + marks.len() > self.config.cell_bytes {
+        if tail.stored.len() + marks.len() > self.config.cell_bytes {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
             return;
         }
@@ -730,7 +643,10 @@ impl CanonicalGrid {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
             return;
         }
-        let mut text = tail.text;
+        // The marks go on what the cell holds, not on the scalars that were printed into it. A
+        // designated character set makes those different, and rebuilding the cell from the printed
+        // scalars would undo the mapping the reducer applied.
+        let mut text = tail.stored;
         text.push_str(marks);
         // The write is a change like any other, so it takes a sequence number of its own. Without
         // one the row does not count as changed, and the mark never reaches a client reading
@@ -744,9 +660,11 @@ impl CanonicalGrid {
             .cell_text(tail.col, tail.row)
             .unwrap_or_else(|| text.clone());
         self.tail = Some(TailCell {
-            text,
+            text: tail.text,
             stored,
-            ..tail
+            width: tail.width,
+            col: tail.col,
+            row: tail.row,
         });
     }
 
@@ -847,7 +765,7 @@ impl CanonicalGrid {
         if bytes <= limit {
             return false;
         }
-        let rows = self.terminal.screen().scrollback_rows().max(1);
+        let rows = self.scrollback_rows().max(1);
         #[expect(
             clippy::cast_possible_truncation,
             reason = "the quotient of two byte counts times a row count stays inside usize here"
@@ -859,7 +777,10 @@ impl CanonicalGrid {
         let target =
             ((rows as u64).saturating_mul(limit) * 9 / (bytes.max(1).saturating_mul(10))) as usize;
         let current = self.configuration.scrollback_rows.load(Ordering::Relaxed);
-        let next = target.max(self.size.rows as usize).min(current);
+        // There is no floor: the retained rows are a cache, and at a wide geometry even a screen's
+        // worth of them can pass the bound on its own. Keeping none of them is the right answer
+        // then, and the spool still has everything.
+        let next = target.min(current);
         if next < current {
             self.configuration
                 .scrollback_rows
@@ -908,6 +829,20 @@ impl CanonicalGrid {
         budget.commit_geometry(cost);
         self.size = size;
         Ok(())
+    }
+
+    /// Turns newline mode back on, after something in the reducer cleared it.
+    pub fn set_newline_mode(&mut self) {
+        self.terminal
+            .perform_actions(vec![Action::CSI(CSI::Mode(Mode::SetMode(
+                TerminalMode::Code(TerminalModeCode::AutomaticNewline),
+            )))]);
+    }
+
+    /// Selects the shift-out character set again, after something in the reducer cleared it.
+    pub fn set_shift_out(&mut self) {
+        self.terminal
+            .perform_actions(vec![Action::Control(ControlCode::ShiftOut)]);
     }
 
     /// Whether autowrap is on.
@@ -1090,12 +1025,37 @@ impl CanonicalGrid {
             .collect()
     }
 
-    /// How many rows the active buffer is retaining.
+    /// How many rows the active buffer is retaining above the screen.
     ///
     /// Cheap, unlike measuring them, so it is what decides when a measurement is worth taking.
     #[must_use]
     pub fn scrollback_rows(&self) -> usize {
-        self.terminal.screen().scrollback_rows()
+        self.terminal
+            .screen()
+            .scrollback_rows()
+            .saturating_sub(self.size.rows as usize)
+    }
+
+    /// Bytes the retained rows are currently using.
+    ///
+    /// This counts the encoded text plus the per-cell bookkeeping the grid keeps for it, because
+    /// the bound in section 8 is on resident state rather than on characters.
+    #[must_use]
+    pub fn screen_link_bytes(&self) -> u64 {
+        let screen = self.terminal.screen();
+        let history = screen
+            .scrollback_rows()
+            .saturating_sub(self.size.rows as usize);
+        let mut bytes = 0u64;
+        let mut index = 0usize;
+        screen.for_each_phys_line(|_, line| {
+            let counted = index >= history;
+            index += 1;
+            if counted {
+                bytes = bytes.saturating_add(link_bytes(line));
+            }
+        });
+        bytes
     }
 
     /// Bytes the retained rows are currently using.
@@ -1105,14 +1065,56 @@ impl CanonicalGrid {
     #[must_use]
     pub fn history_bytes(&self) -> u64 {
         let screen = self.terminal.screen();
+        // Only the rows above the screen. The screens have a cost of their own in the session
+        // budget, and charging them twice would make a wide grid look like it had passed a bound it
+        // has nothing to do with.
+        let history = screen
+            .scrollback_rows()
+            .saturating_sub(self.size.rows as usize);
         let mut bytes = 0u64;
+        let mut index = 0usize;
         screen.for_each_phys_line(|_, line| {
+            let counted = index < history;
+            index += 1;
+            if !counted {
+                return;
+            }
             let text = line.as_str().len() as u64;
             let cells = line.len() as u64;
             bytes = bytes.saturating_add(text + cells * CELL_OVERHEAD_BYTES);
+            bytes = bytes.saturating_add(link_bytes(line));
         });
         bytes
     }
+}
+
+/// What the hyperlinks of one row cost.
+///
+/// A cell inside a hyperlink holds a reference to the whole link, and a row of them costs far more
+/// than its text. Each distinct link object is counted once: the cells of one link share it, and two
+/// links that happen to have the same target do not share anything.
+fn link_bytes(line: &wezterm_term::Line) -> u64 {
+    if !line.has_hyperlink() {
+        return 0;
+    }
+    let mut bytes = 0u64;
+    let mut seen: Option<*const Hyperlink> = None;
+    for cell in line.visible_cells() {
+        match cell.attrs().hyperlink() {
+            Some(link) if seen != Some(Arc::as_ptr(link)) => {
+                let params: u64 = link
+                    .params()
+                    .iter()
+                    .map(|(key, value)| (key.len() + value.len() + 2) as u64)
+                    .sum();
+                bytes = bytes.saturating_add(link.uri().len() as u64 + params);
+                seen = Some(Arc::as_ptr(link));
+            }
+            Some(_) => {}
+            None => seen = None,
+        }
+    }
+    bytes
 }
 
 fn to_library_size(size: GridSize) -> TerminalSize {
@@ -1153,7 +1155,11 @@ fn rendition_of(attrs: &CellAttributes) -> Rendition {
             Underline::Dotted => UnderlineStyle::Dotted,
             Underline::Dashed => UnderlineStyle::Dashed,
         },
-        blink: attrs.blink() != wezterm_term::Blink::None,
+        blink: match attrs.blink() {
+            wezterm_term::Blink::None => Blink::None,
+            wezterm_term::Blink::Slow => Blink::Slow,
+            wezterm_term::Blink::Rapid => Blink::Rapid,
+        },
         reverse: attrs.reverse(),
         invisible: attrs.invisible(),
         strikethrough: attrs.strikethrough(),
@@ -1184,9 +1190,20 @@ fn runs_of(line: &wezterm_term::Line, budget: usize) -> (Vec<Run>, bool) {
             continue;
         }
         next_column = column + width.max(1);
-        // A row is bounded while it is built, not after. Every cell inside a hyperlink carries the
-        // target, so a row of linked cells can cost many times the bound before anyone counts it.
-        bytes += cell.str().len() + hyperlink.as_ref().map_or(0, String::len) + RUN_OVERHEAD_BYTES;
+        // A row is bounded while it is built, not after. What a row costs is what its runs cost, so
+        // a cell that joins the run before it costs its own text and nothing more: charging the
+        // target and the run overhead for every cell would cut a row that fits comfortably.
+        let joins_previous = runs.last().is_some_and(|last: &Run| {
+            last.rendition == rendition
+                && last.hyperlink == hyperlink
+                && last.column + last.cells == column
+        });
+        bytes += cell.str().len()
+            + if joins_previous {
+                0
+            } else {
+                hyperlink.as_ref().map_or(0, String::len) + RUN_OVERHEAD_BYTES
+            };
         if bytes > budget {
             truncated = true;
             break;

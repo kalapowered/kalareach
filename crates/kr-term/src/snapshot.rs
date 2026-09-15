@@ -69,6 +69,11 @@ pub struct SavedCursor {
     pub origin_mode: bool,
     /// The DECSCUSR style that was saved with it.
     pub style: u32,
+    /// The hyperlink that was open when it was saved.
+    ///
+    /// A saved pen carries the open link with it, so text printed after a restore belongs to the
+    /// link the application had open when it saved.
+    pub hyperlink: Option<String>,
 }
 
 /// The keyboard negotiation a reconnecting client has to be put back into.

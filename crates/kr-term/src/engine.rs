@@ -201,6 +201,9 @@ const ROW_CACHE_INTERVAL: u32 = 64;
 /// count says.
 const ROW_CACHE_ROW_STEP: usize = 32;
 
+/// How many hyperlinks may arrive before the resident state is measured again.
+const LINK_MEASURE_INTERVAL: u64 = 64;
+
 /// How many times eviction re-measures before leaving the rest to the next read.
 const EVICTION_PASSES: u32 = 4;
 
@@ -234,6 +237,7 @@ pub struct Engine {
     presentation_revision: u64,
     measured_rows: usize,
     measure_now: bool,
+    links_seen: u64,
     dropped_marks: u64,
     keyboard_revision: u64,
     feeds: u32,
@@ -275,6 +279,7 @@ impl Engine {
             presentation_revision: 0,
             measured_rows: 0,
             measure_now: false,
+            links_seen: 0,
             dropped_marks: 0,
             keyboard_revision: 0,
             feeds: 0,
@@ -449,6 +454,16 @@ impl Engine {
             }
             let decision = self.policy.decide(event);
             let mut disposition = decision.disposition;
+            // A cursor restore clears state in the reducer that a terminal would have kept, so what
+            // it clears is noted before the restore and put back after it.
+            let restore_state = (decision.apply_to_grid && restores_cursor(&event.kind))
+                .then(|| (self.modes.is_set(ModeKind::Ansi, 20), self.grid.shift_out()));
+            // A measurement asked for part way through a read is taken there, not at the end of
+            // it: one read can carry a session's worth of links, and the bound is only a bound if
+            // something looks before the rest of them arrive.
+            if self.measure_now {
+                self.enforce_resident_state(now_ms);
+            }
             if decision.apply_to_grid {
                 // The primary buffer's rows are not reachable while the alternate buffer is
                 // showing, so they are measured before the switch rather than after it.
@@ -504,8 +519,8 @@ impl Engine {
                 self.track(event, &mut outcome);
             }
             if decision.apply_to_grid {
-                if restores_cursor(&event.kind) {
-                    self.follow_cursor_restore(&mut outcome, event.span.start());
+                if let Some(before) = restore_state {
+                    self.restore_after_cursor(before);
                 }
                 self.sync_grid_modes();
             }
@@ -642,18 +657,21 @@ impl Engine {
         }
     }
 
-    /// Follows the reducer's cursor restore for the state it changes without exposing.
+    /// Puts back the state the reducer clears when it restores a cursor.
     ///
     /// The pinned revision clears newline mode and the shift-out selection when it restores a
-    /// cursor, which xterm does not, and it does not expose newline mode for reading back. The
-    /// profile applies the same rule so that there is one answer, and asks for projection when that
-    /// changes something, because a physical terminal following the same bytes would not have done
-    /// it. The narrow patch is recorded in `crate::unicode::LIBRARY`.
-    fn follow_cursor_restore(&mut self, outcome: &mut FeedOutcome, at: u64) {
-        if self.modes.is_set(ModeKind::Ansi, 20) {
-            self.modes.set(ModeKind::Ansi, 20, false);
-            self.mark_mode(ModeKind::Ansi, 20);
-            outcome.projection_required_at.get_or_insert(at);
+    /// cursor. A terminal does not: DECRC restores the cursor, the rendition and the character-set
+    /// designations, and leaves the rest of the terminal's modes where they were. So whatever was
+    /// in force before the restore is put back afterwards, through the same sequences an
+    /// application would have used, and nothing else is disturbed. The narrow patch that would make
+    /// this unnecessary is recorded in `crate::unicode::LIBRARY`.
+    fn restore_after_cursor(&mut self, before: (bool, bool)) {
+        let (newline, shift_out) = before;
+        if newline {
+            self.grid.set_newline_mode();
+        }
+        if shift_out && !self.grid.shift_out() {
+            self.grid.set_shift_out();
         }
     }
 
@@ -674,6 +692,13 @@ impl Engine {
         if parts.len() < 3 {
             return false;
         }
+        // Every link the application opens is a link object the grid holds, whether or not it is
+        // one the session has seen before, so the count that decides when to measure again is of
+        // occurrences rather than of distinct targets.
+        self.links_seen = self.links_seen.wrapping_add(1);
+        if self.links_seen.is_multiple_of(LINK_MEASURE_INTERVAL) {
+            self.measure_now = true;
+        }
         // A URI may contain the separator, so everything after the parameter field is the target.
         let uri = parts[2..].join(&b';');
         if uri.is_empty() {
@@ -686,6 +711,13 @@ impl Engine {
         // link with a megabyte of identifier in it once a row would hold a megabyte a row, and the
         // table of distinct targets would count that as one link.
         if uri.len() > self.budget.limits().link_bytes {
+            self.budget.record_truncation();
+            return true;
+        }
+        // Every occurrence is another link object the grid holds, whether or not the session has
+        // seen the target before, so the session bound applies to all of them and not only to the
+        // ones that are new to the table.
+        if self.budget.session_over_budget() {
             self.budget.record_truncation();
             return true;
         }
@@ -745,6 +777,7 @@ impl Engine {
             return;
         }
         self.measure_now = false;
+        self.budget.set_screen_links(self.grid.screen_link_bytes());
         self.measured_rows = rows;
         if self.grid.alternate_active() {
             return;
@@ -1407,7 +1440,11 @@ impl Engine {
             }
         }
         let (oldest, newest) = self.grid.stable_range();
-        let last = from.saturating_add(i64::try_from(rows.len()).unwrap_or(0));
+        // Where the page ends is the row it ended on, not where it was asked to start plus a count:
+        // a request below the oldest retained row is answered from the oldest one there is.
+        let last = rows
+            .last()
+            .map_or(from, |row| row.stable_id.saturating_add(1));
         HistoryPage {
             rows,
             oldest_retained_row: oldest,

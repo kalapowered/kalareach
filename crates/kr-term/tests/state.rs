@@ -1042,3 +1042,52 @@ fn a_history_page_does_not_repeat_rows() {
         "the page is one contiguous run of rows"
     );
 }
+
+/// A cursor restore leaves the modes a terminal would have kept.
+#[test]
+fn a_cursor_restore_keeps_the_modes_around_it() {
+    let mut newline = Engine::new(EngineConfig {
+        size: kr_term::budget::GridSize::new(10, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let outcome = newline.feed(b"\x1b[20h\x1b7\x1b8abc\nd", 0);
+    newline.quiesce(0);
+    assert!(newline.modes().is_set(kr_term::modes::ModeKind::Ansi, 20));
+    assert_eq!(
+        newline.grid().cursor(),
+        (1, 1),
+        "newline mode still turns the line feed into a new line"
+    );
+    assert!(outcome.projection_required_at.is_none());
+
+    let mut shifted = Engine::new(EngineConfig {
+        size: kr_term::budget::GridSize::new(10, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    shifted.feed(b"\x1b)0\x0e\x1b7\x1b8q", 0);
+    shifted.quiesce(0);
+    assert!(shifted.grid().shift_out(), "the character set survived");
+}
+
+/// A session that fills its screen with hyperlinks is bounded by the session budget.
+#[test]
+fn hyperlinks_on_the_screen_are_counted() {
+    let mut engine = Engine::new(EngineConfig {
+        size: kr_term::budget::GridSize::new(80, 24),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let one = format!("\x1b]8;id={};u\x1b\\x", "z".repeat(1_000));
+    let mut input = String::new();
+    for _ in 0..512 {
+        input.push_str(&one);
+    }
+    engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+    assert!(
+        engine.budget().usage().screen_links > 0,
+        "the links the rows on screen hold are resident state"
+    );
+}

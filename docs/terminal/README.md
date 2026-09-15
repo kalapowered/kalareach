@@ -207,12 +207,9 @@ faster and wrong, because the list is longer than emoji and grows with the libra
 cell costs nothing on ordinary output, because plain ASCII is not cut at all.
 
 The library also keeps a row in one of two representations and reads a compact row by clustering its
-text again, which would undo the cut. Two things answer that. A cell of the row is read back before
-every write, which converts a live row to the representation that remembers where its cells are. And
-a bounded copy is kept of any row that was written with a cell the clustering could join, so that a
-row compacted anyway is put back as it was. That copy is the exception to there being one store of
-state, and it is a narrow one: it holds at most 64 rows, only rows that were actually at risk, and it
-is used only to undo a change nothing asked for.
+text again, which would undo the cut. A cell of the row is read back before every write, which
+converts a live row to the representation that remembers where its cells are. A row that has
+scrolled is the narrow patch recorded below.
 
 Three rules keep the answer the same however the reads fall.
 
@@ -305,7 +302,7 @@ pinned revision. All three need the same narrow published patch: a public access
 | `TerminalState::pending_wrap()` | Section 8 lists pending wrap among the restored state | The snapshot carries `None`; a reconnecting client re-derives it from the next character it places. At the bottom-right corner that character can change what scrolls, so this is a real gap and not a cosmetic one |
 | `TerminalState::saved_cursor()` as a shared reference for both buffers, with the saved rendition, character sets and origin mode among its public fields | Section 8 lists saved cursors among the restored state, and a saved cursor carrying only a position restores the wrong colours from the wrong origin | The snapshot carries `None` for each buffer; a restored session behaves as though nothing was saved until the application saves again. The snapshot's own type carries the full saved state, so only the reading of it is missing |
 | `TerminalState::inactive_screen()` | Section 8 requires a restoration sequence to reproduce **both** buffer states, and the accessor the revision exposes returns whichever buffer is active | The snapshot carries the active buffer's rows and `None` for the other. A client that reconnects while a full-screen application is running gets that application's screen and no primary-buffer content until the application exits and the shell redraws |
-| `TerminalState::restore_cursor()` leaving newline mode and the shift-out selection alone, and exposing newline mode for reading back | Restoring a cursor clears both in this revision, which xterm does not do, so a direct terminal following the same bytes ends up in a different mode | The profile applies the same rule so that there is one answer, and asks the attachment to project when that changes anything |
+| `Line::compress_for_scrollback()` keeping the cells it was given, rather than working out where they are by clustering the row's text again | The pinned width model gives a cell to every scalar that has a width of its own, and the compact representation joins adjacent scalars the library's own clustering would join, which also drops the columns they held | A row keeps its cells while it is on screen. A row that has scrolled loses the columns reserved for joined scalars: its text is all still there and the row is narrower than it was. Rows without emoji sequences or Hangul jamo are unaffected, which is nearly all of them |
 
 The last one is worth being plain about. The worker does maintain both buffers, because the library
 holds both; what is missing is a way to read the one that is not showing. Copying the primary
@@ -558,12 +555,25 @@ is refused. Validation uses checked multiplication and happens before any alloca
 names the constraint it hit. The same is true of the session budget: a geometry change that would
 not fit is refused before the grid is touched, and the current grid is unchanged.
 
+A cursor restore is a case of its own. The pinned revision clears newline mode and the shift-out
+selection when it restores a cursor, which a terminal does not: DECRC restores the cursor, the
+rendition and the character-set designations and leaves the rest of the modes where they were. So
+what it clears is noted before the restore and put back afterwards, through the same sequences an
+application would have used.
+
 The historical-row bound is enforced rather than reported. The engine measures the retained rows
 periodically, and when they pass the bound it lowers the library's scrollback row count so older
 rows are evicted as new ones arrive. The new row count is proportional to the overshoot, so the
 retained rows converge back under the bound over the following rows rather than oscillating.
 Measuring means walking the scrollback, so doing it on every read would cost more than the bound
 saves; every 64 reads keeps the overshoot to a fraction of the cache.
+
+What the rows cost includes the hyperlinks they hold: every cell inside a link holds a reference to
+the whole link, so a screen of linked cells costs far more than its text, and counting only the text
+would let an application hold tens of megabytes inside a budget that said it was using nothing. The
+links on rows that are showing are counted with the rest of the session's metadata rather than with
+the historical cache, because the screens are not part of that cache. A session that passes the
+budget stops being given new links.
 
 What the budget records is what the rows actually cost, not what they are allowed to cost. Recording
 the bound instead would make a session that is over its cache look exactly like one that is at it,
