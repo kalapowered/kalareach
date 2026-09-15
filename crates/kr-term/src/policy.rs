@@ -100,12 +100,16 @@ impl Policy {
         match event.class {
             SequenceClass::Display | SequenceClass::Mode => self.decide_grid(event),
             // A query is answered here and travels no further. It is still tracked, because a
-            // colour request may pair mutations with its questions and the mutations are real.
+            // colour request may pair mutations with its questions and the mutations are real, and
+            // where it did change something the classifier has already asked for projection.
             SequenceClass::Query => Outcome {
                 track: true,
                 answer: true,
                 diagnostic: Some((DiagnosticKind::QueryAnswered, describe(event))),
-                ..Outcome::withheld(DirectDisposition::Withhold)
+                ..Outcome::withheld(match event.disposition {
+                    DirectDisposition::RequireProjection => DirectDisposition::RequireProjection,
+                    _ => DirectDisposition::Withhold,
+                })
             },
             SequenceClass::SideEffect => self.decide_side_effect(event),
             SequenceClass::Extension => Outcome {

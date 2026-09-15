@@ -60,7 +60,7 @@
       "screen": [
         {
           "cells": 6,
-          "soft_wrapped": true,
+          "soft_wrapped": false,
           "stable_id": 0,
           "text": "abcd中"
         },
@@ -176,7 +176,7 @@
       "rows": 3,
       "screen": [
         {
-          "cells": 5,
+          "cells": 6,
           "soft_wrapped": false,
           "stable_id": 0,
           "text": "👩‍💻AB"
@@ -216,7 +216,7 @@
       "screen": [
         {
           "cells": 6,
-          "soft_wrapped": true,
+          "soft_wrapped": false,
           "stable_id": 0,
           "text": "abcd👩‍"
         },
@@ -410,7 +410,7 @@
       "rows": 3,
       "screen": [
         {
-          "cells": 4,
+          "cells": 5,
           "soft_wrapped": false,
           "stable_id": 0,
           "text": "👍🏻X"
@@ -449,7 +449,7 @@
       "rows": 3,
       "screen": [
         {
-          "cells": 2,
+          "cells": 3,
           "soft_wrapped": false,
           "stable_id": 0,
           "text": "🇿🇦X"

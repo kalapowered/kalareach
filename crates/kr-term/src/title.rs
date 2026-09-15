@@ -48,11 +48,25 @@ pub struct TitleEntry {
     pub window: String,
 }
 
+/// One entry on the virtual stack.
+///
+/// A push saves only the titles it names, so a field is either a title that was saved or nothing at
+/// all. Those are different: a pop must leave the current title alone where nothing was saved, and
+/// must set it to the empty string where an empty title was. Storing both as a plain string loses
+/// that distinction and turns a selective push into a way to clear a title it never touched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedTitle {
+    /// The icon title, when this entry saved one.
+    pub icon: Option<String>,
+    /// The window title, when this entry saved one.
+    pub window: Option<String>,
+}
+
 /// The session's titles and its virtual stack.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TitleState {
     current: TitleEntry,
-    stack: Vec<TitleEntry>,
+    stack: Vec<SavedTitle>,
     /// How many pops found an empty stack. A snapshot carries this so the diagnostic survives.
     underflows: u32,
 }
@@ -106,11 +120,14 @@ impl TitleState {
     /// At the bound the oldest entry is dropped, not the newest: an application that pushes in a
     /// loop keeps its most recent nesting, and the stack stays bounded either way.
     pub fn push(&mut self, target: TitleTarget) {
-        let mut entry = TitleEntry::default();
+        let mut entry = SavedTitle::default();
         match target {
-            TitleTarget::Icon => entry.icon = self.current.icon.clone(),
-            TitleTarget::Window => entry.window = self.current.window.clone(),
-            TitleTarget::Both => entry = self.current.clone(),
+            TitleTarget::Icon => entry.icon = Some(self.current.icon.clone()),
+            TitleTarget::Window => entry.window = Some(self.current.window.clone()),
+            TitleTarget::Both => {
+                entry.icon = Some(self.current.icon.clone());
+                entry.window = Some(self.current.window.clone());
+            }
         }
         if self.stack.len() == MAX_DEPTH {
             self.stack.remove(0);
@@ -122,27 +139,35 @@ impl TitleState {
     ///
     /// Returns whether an entry was there. An empty stack leaves the current titles alone; it never
     /// reaches past the session into a client's saved title.
+    ///
+    /// The entry is discarded whether or not it held the title that was asked for, which is what a
+    /// physical terminal does: the stack is one stack of entries, not one stack per title.
     pub fn pop(&mut self, target: TitleTarget) -> bool {
         let Some(entry) = self.stack.pop() else {
             self.underflows = self.underflows.saturating_add(1);
             return false;
         };
-        match target {
-            TitleTarget::Icon => self.current.icon = entry.icon,
-            TitleTarget::Window => self.current.window = entry.window,
-            TitleTarget::Both => self.current = entry,
+        if matches!(target, TitleTarget::Icon | TitleTarget::Both)
+            && let Some(icon) = entry.icon
+        {
+            self.current.icon = icon;
+        }
+        if matches!(target, TitleTarget::Window | TitleTarget::Both)
+            && let Some(window) = entry.window
+        {
+            self.current.window = window;
         }
         true
     }
 
     /// The saved entries, oldest first, for a snapshot.
     #[must_use]
-    pub fn entries(&self) -> &[TitleEntry] {
+    pub fn entries(&self) -> &[SavedTitle] {
         &self.stack
     }
 
     /// Restores a snapshot's titles and stack.
-    pub fn restore(&mut self, current: TitleEntry, stack: Vec<TitleEntry>, underflows: u32) {
+    pub fn restore(&mut self, current: TitleEntry, stack: Vec<SavedTitle>, underflows: u32) {
         self.current = current;
         self.stack = stack;
         self.stack.truncate(MAX_DEPTH);

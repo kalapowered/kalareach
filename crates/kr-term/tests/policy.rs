@@ -561,3 +561,113 @@ fn the_hyperlink_table_is_bounded() {
     );
     assert!(engine.budget().truncations() > 0);
 }
+
+/// An engine with no input lease, for the cases that do not need one.
+fn plain_engine() -> Engine {
+    Engine::new(EngineConfig::default()).expect("engine")
+}
+
+/// A mode is forwarded live, including the keyboard negotiation a direct terminal has to follow.
+#[test]
+fn keyboard_negotiation_is_forwarded_like_any_other_mode() {
+    let mut engine = plain_engine();
+    let outcome = engine.feed(b"\x1b[>4;2m\x1b[=3u", 0);
+    assert_eq!(
+        outcome.forward.len(),
+        1,
+        "both sequences are forwarded, as one span"
+    );
+    assert!(outcome.projection_required_at.is_none());
+    // The grid library still never sees a key encoding.
+    assert_eq!(engine.grid().unrecognised(), 0);
+
+    // An unqualified resource or sublist still stops here.
+    for input in [b"\x1b[>5;2m".as_slice(), b"\x1b[>4:99m".as_slice()] {
+        let mut engine = plain_engine();
+        let outcome = engine.feed(input, 0);
+        assert!(outcome.forward.is_empty(), "{input:?} was forwarded");
+    }
+}
+
+/// A parameter that selects an operation is never reduced to a different operation.
+#[test]
+fn a_selector_is_not_clamped_like_a_count() {
+    let mut engine = kr_term::engine::Engine::new(kr_term::engine::EngineConfig {
+        size: kr_term::budget::GridSize::new(2, 2),
+        ..kr_term::engine::EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    engine.feed(b"AA\r\nBB\r\nCC\r\nDD", 0);
+    engine.quiesce(0);
+    let before: Vec<String> = engine
+        .grid()
+        .visible_rows()
+        .iter()
+        .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+        .collect();
+    engine.feed(b"\x1b[3J", 0);
+    let after: Vec<String> = engine
+        .grid()
+        .visible_rows()
+        .iter()
+        .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+        .collect();
+    assert_eq!(before, after, "erasing the scrollback erased the screen");
+
+    // A selector outside its own set is an extension, not a smaller selector.
+    let outcome = engine.feed(b"\x1b[9J", 0);
+    assert!(outcome.forward.is_empty());
+
+    // Tab stops: clearing all of them is selector 3, which must not become selector 2.
+    let mut engine = kr_term::engine::Engine::new(kr_term::engine::EngineConfig {
+        size: kr_term::budget::GridSize::new(2, 2),
+        ..kr_term::engine::EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    engine.feed(b"\x1b[2G\x1bH\x1b[3g", 0);
+    assert!(
+        engine.grid().tab_stops().is_empty(),
+        "every tab stop is cleared"
+    );
+}
+
+/// A hyperlink target may contain the separator that divides the fields around it.
+#[test]
+fn a_hyperlink_target_keeps_its_semicolons() {
+    let mut engine = plain_engine();
+    engine.feed(
+        b"\x1b]8;;https://example.invalid/a;b\x1b\\X\x1b]8;;\x1b\\",
+        0,
+    );
+    engine.quiesce(0);
+    let rows = engine.grid().visible_rows();
+    let link = rows[0]
+        .runs
+        .iter()
+        .find_map(|run| run.hyperlink.clone())
+        .expect("the link survived");
+    assert_eq!(link, "https://example.invalid/a;b");
+}
+
+/// A selective title push saves only what it names, and a pop restores only what was saved.
+#[test]
+fn a_selective_title_save_leaves_the_other_title_alone() {
+    let mut engine = plain_engine();
+    engine.feed(
+        b"\x1b]0;initial\x07\x1b[22;1t\x1b]0;second\x07\x1b[22;2t\x1b]0;third\x07\x1b[23;1t\x1b[23;2t",
+        0,
+    );
+    let size = engine.grid().size();
+    let view = kr_term::snapshot::Viewport {
+        top_row: 0,
+        rows: size.rows,
+        left_col: 0,
+        cols: size.cols,
+    };
+    let (snapshot, _) = engine.snapshot(view, 0);
+    assert_eq!(
+        (snapshot.title.icon.as_str(), snapshot.title.window.as_str()),
+        ("third", "third"),
+        "a pop of a title nothing saved leaves it alone rather than clearing it"
+    );
+}

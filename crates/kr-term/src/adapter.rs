@@ -49,16 +49,18 @@ impl AdaptContext {
     ///
     /// A cursor movement, an insertion or a scroll cannot do more than fill the screen, so a larger
     /// value asks for work with no effect. A repeat can wrap and scroll, so it is bounded by the
-    /// whole grid instead of one dimension. Everything else keeps the general bound, because an SGR
-    /// parameter is a colour rather than a distance.
+    /// whole grid instead of one dimension. Everything else keeps the general bound.
+    ///
+    /// Only counts and coordinates are bounded here. A parameter that selects which operation to
+    /// perform, as the erase and tab-clear sequences use, means something different at every value:
+    /// reducing it would quietly perform a different operation rather than a smaller one. Those
+    /// values are checked against their own allowed set in the class table instead.
     #[must_use]
     pub fn limit_for(self, final_byte: u8) -> i64 {
         let dimension = i64::from(self.rows.max(self.cols)).max(1);
         match final_byte {
-            b'@' | b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G' | b'I' | b'J' | b'K' | b'L'
-            | b'M' | b'P' | b'S' | b'T' | b'X' | b'Z' | b'`' | b'a' | b'd' | b'e' | b'g' => {
-                dimension
-            }
+            b'@' | b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G' | b'I' | b'L' | b'M' | b'P'
+            | b'S' | b'T' | b'X' | b'Z' | b'`' | b'a' | b'd' | b'e' => dimension,
             b'b' => i64::from(self.rows).max(1) * i64::from(self.cols).max(1),
             _ => MAX_CSI_PARAM,
         }
@@ -147,10 +149,11 @@ pub fn adapt(event: &Event, context: AdaptContext) -> Adapted {
                 clamped,
             }
         }
-        EventKind::Osc { parts, .. } => {
+        EventKind::Osc { selector, parts } => {
             // The payload is rendered, so it is sanitised before the grid sees it: invalid UTF-8
             // becomes U+FFFD and a control scalar is dropped. The original bytes are still never
             // forwarded, because a terminal would frame them differently than this engine did.
+            let parts = regroup(*selector, parts);
             let sanitised: Vec<Vec<u8>> = parts.iter().map(|part| sanitise(part)).collect();
             let borrowed: Vec<&[u8]> = sanitised.iter().map(Vec::as_slice).collect();
             let osc = OperatingSystemCommand::parse(&borrowed);
@@ -181,9 +184,10 @@ pub const PROFILE_OWNED_DEC_MODES: &[u16] = &[66, 67, 1007, 1034];
 
 /// Whether the profile owns this sequence outright, so the grid library is not expected to know it.
 ///
-/// The virtual title stack is the session's own, and OSC 633 is a shell-integration convention the
-/// grid library does not model. Handing either to the library would only produce an unrecognised
-/// action, which would look like a disagreement where there is none.
+/// The virtual title stack is the session's own, OSC 633 is a shell-integration convention the grid
+/// library does not model, and the palette belongs to the session. Handing any of them to the
+/// library would give it a second owner, or produce an unrecognised action that looks like a
+/// disagreement where there is none.
 fn profile_owned(kind: &EventKind) -> bool {
     match kind {
         EventKind::Csi {
@@ -208,6 +212,18 @@ fn profile_owned(kind: &EventKind) -> bool {
             selector: Some(633),
             ..
         } => true,
+        // The palette is the session's. The engine applies every colour operation in the order the
+        // request wrote them and answers every question from the same palette, so handing the
+        // request to the grid as well would give the colours a second owner and would let the grid
+        // library generate a reply of its own.
+        EventKind::Osc {
+            selector: Some(4 | 5 | 104 | 105),
+            ..
+        } => true,
+        EventKind::Osc {
+            selector: Some(selector),
+            ..
+        } => matches!(selector, 10..=19 | 110..=119),
         _ => false,
     }
 }
@@ -227,6 +243,21 @@ fn normalise(params: &mut Vec<VtCsiParam>, final_byte: u8) {
     if final_byte == b'q' && params.as_slice() == [VtCsiParam::P(b' ')] {
         params.insert(0, VtCsiParam::Integer(0));
     }
+}
+
+/// Puts back the separators that belong to one field rather than between fields.
+///
+/// A hyperlink target is a URI, and a URI may contain a semicolon: `OSC 8 ; ; https://host/a;b` is
+/// three fields, not four. Splitting on every separator would leave the target truncated at the
+/// first semicolon, and the link would be dropped as malformed. The parameter field before it is
+/// colon-separated, so it is not affected.
+fn regroup(selector: Option<u32>, parts: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    if selector != Some(8) || parts.len() <= 3 {
+        return parts.to_vec();
+    }
+    let mut out: Vec<Vec<u8>> = parts[..2].to_vec();
+    out.push(parts[2..].join(&b';'));
+    out
 }
 
 /// Makes a control-string payload safe to render.

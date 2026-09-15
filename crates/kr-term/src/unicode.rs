@@ -65,53 +65,13 @@ pub fn is_zero_width(scalar: char) -> bool {
     grapheme_column_width(text, Some(&UnicodeModel::KR_VT_1.to_library())) == 0
 }
 
-/// Whether the pinned grid library would join `scalar` to the cell `previous` started.
+/// Whether the library's cluster reducer could disagree with this model about `text`.
 ///
-/// The profile's width model gives every scalar with a width of its own a cell of its own. The
-/// library's cluster reducer is more modern than that: it joins an emoji sequence into one cell.
-/// Three joins matter, because in each the scalar has a width of its own under this model:
-///
-/// * a scalar after a zero-width joiner,
-/// * an emoji modifier, which the library folds into the emoji before it,
-/// * the second half of a regional-indicator pair.
-///
-/// Text is cut before each of these before it reaches the library, so the library never sees the
-/// two scalars in one call and the cell count follows this model rather than the library's.
-#[must_use]
-pub fn joins_previous(previous: char, scalar: char) -> bool {
-    if previous == ZERO_WIDTH_JOINER {
-        return true;
-    }
-    if ('\u{1f3fb}'..='\u{1f3ff}').contains(&scalar) {
-        return true;
-    }
-    let regional = |value: char| ('\u{1f1e6}'..='\u{1f1ff}').contains(&value);
-    regional(previous) && regional(scalar)
-}
-
-/// Whether any scalar in `text` could make the library join two cells.
-///
-/// Every joining scalar is outside ASCII, so ordinary output answers this without decoding.
+/// It can only disagree about scalars outside ASCII, so ordinary output answers this without
+/// decoding anything.
 #[must_use]
 pub fn may_join(text: &str) -> bool {
     !text.is_ascii()
-}
-
-/// Byte offsets at which `text` must be cut before it reaches the grid library.
-///
-/// Each offset is the start of a scalar the library would otherwise fold into the cell before it.
-pub fn split_points(text: &str) -> impl Iterator<Item = usize> + '_ {
-    let mut previous: Option<char> = None;
-    text.char_indices().filter_map(move |(index, scalar)| {
-        let cut = match previous {
-            Some(previous) if !is_zero_width(scalar) && joins_previous(previous, scalar) => {
-                Some(index)
-            }
-            _ => None,
-        };
-        previous = Some(scalar);
-        cut
-    })
 }
 
 /// Byte length of the run of zero-width scalars at the start of `text`.
@@ -122,6 +82,21 @@ pub fn leading_zero_width(text: &str) -> usize {
     text.char_indices()
         .find(|&(_, scalar)| !is_zero_width(scalar))
         .map_or(text.len(), |(index, _)| index)
+}
+
+/// How many cells `text` occupies under the pinned width model.
+///
+/// The model is per scalar, so this sums the widths rather than asking the library what one cluster
+/// is worth. For one cell it is the width of that cell.
+#[must_use]
+pub fn cells_for(text: &str) -> usize {
+    text.chars()
+        .map(|scalar| {
+            let mut buffer = [0u8; 4];
+            let encoded: &str = scalar.encode_utf8(&mut buffer);
+            grapheme_column_width(encoded, Some(&UnicodeModel::KR_VT_1.to_library()))
+        })
+        .sum()
 }
 
 /// Byte offset where the last cell of `text` starts.

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use wezterm_escape_parser::Action;
-use wezterm_escape_parser::csi::{CSI, Cursor};
+
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
     Alert, AlertHandler, CellAttributes, Intensity, Terminal, TerminalConfiguration, TerminalSize,
@@ -344,10 +344,12 @@ pub struct CanonicalGrid {
 struct TailCell {
     /// The scalars in the cell.
     text: String,
-    /// How many cells back the cursor is from where it ended.
-    back: u32,
-    /// Where the cursor stood after the cell was drawn.
-    cursor: (u32, u32),
+    /// Cells it occupies.
+    width: usize,
+    /// Column of its first cell.
+    col: usize,
+    /// Row it is on, relative to the top of the visible screen.
+    row: i64,
 }
 
 impl core::fmt::Debug for CanonicalGrid {
@@ -443,9 +445,10 @@ impl CanonicalGrid {
 
     /// Draws a text run as the profile's width model says it should look.
     ///
-    /// Two things separate this from handing the whole run to the library. The run is cut wherever
-    /// the library would fold two scalars into one cell that this model gives a cell each, and the
-    /// final cell is drawn on its own so that a combining mark in a later read can still reach it.
+    /// Two things separate this from handing the whole run to the library. A run that is not plain
+    /// ASCII is cut at every cell boundary, so the library's own cluster reducer never sees two
+    /// scalars that this model gives a cell each. And the final cell is drawn on its own, so that
+    /// its position is known and a combining mark in a later read can still reach it.
     fn print(&mut self, text: &str) {
         let mut rest = text;
         let leading = crate::unicode::leading_zero_width(rest);
@@ -462,17 +465,17 @@ impl CanonicalGrid {
         if !head.is_empty() {
             self.print_cells(head);
         }
-        let before = self.cursor();
+        let before = self.cursor_cell();
         self.print_cells(last);
-        let after = self.cursor();
-        self.tail = (after.1 == before.1 && after.0 >= before.0).then(|| TailCell {
-            text: last.to_owned(),
-            back: after.0 - before.0,
-            cursor: after,
-        });
+        self.tail = self.locate(last, before);
     }
 
-    /// Draws text that starts a cell, cutting it wherever the library would join two cells.
+    /// Draws text that starts a cell, cutting it at every cell boundary where that can matter.
+    ///
+    /// Plain ASCII needs no cutting: the library's clustering and this model agree on every scalar
+    /// in it. Anything else is cut at every cell, which is both simpler and safer than listing the
+    /// joins the library performs: a list can be incomplete, and the library's list is longer than
+    /// emoji.
     fn print_cells(&mut self, text: &str) {
         if !crate::unicode::may_join(text) {
             self.terminal
@@ -480,48 +483,105 @@ impl CanonicalGrid {
             return;
         }
         let mut start = 0;
-        let points: Vec<usize> = crate::unicode::split_points(text).collect();
-        for point in points {
-            self.terminal
-                .perform_actions(vec![Action::PrintString(text[start..point].to_owned())]);
-            start = point;
+        for (index, scalar) in text.char_indices() {
+            if index > start && !crate::unicode::is_zero_width(scalar) {
+                self.print_cell(&text[start..index]);
+                start = index;
+            }
         }
+        self.print_cell(&text[start..]);
+    }
+
+    /// Draws one cell, keeping the row in the representation that remembers where its cells are.
+    ///
+    /// The library has two row representations. One stores each cell with its own content; the
+    /// other stores the row as one string and works out where the cells are when the row is read,
+    /// by clustering that string again. The second undoes the cut, because the scalars end up
+    /// adjacent in the string whichever call they arrived in. Reading a cell of the row converts it
+    /// to the first representation, so that is done before each cell is written.
+    fn print_cell(&mut self, cell: &str) {
+        let (_, row) = self.cursor_cell();
+        let _ = self.terminal.screen_mut().get_cell(0, row);
         self.terminal
-            .perform_actions(vec![Action::PrintString(text[start..].to_owned())]);
+            .perform_actions(vec![Action::PrintString(cell.to_owned())]);
+    }
+
+    /// The cursor as a cell coordinate, before or after a print.
+    fn cursor_cell(&self) -> (usize, i64) {
+        let pos = self.terminal.cursor_pos();
+        (pos.x, pos.y)
+    }
+
+    /// Finds where a just-printed cell landed, so a later combining mark can reach it.
+    ///
+    /// The cursor after a print does not say this on its own: a cell in the last column leaves the
+    /// cursor on top of itself, and a print that wrapped first leaves it on another row. Rather than
+    /// infer the answer from state the library does not expose, each candidate position is checked
+    /// against what is actually in that cell.
+    fn locate(&mut self, cell: &str, before: (usize, i64)) -> Option<TailCell> {
+        let width = crate::unicode::cells_for(cell);
+        let (col, row) = self.cursor_cell();
+        let left = self.terminal.get_left_and_right_margins().start;
+        let candidates = [
+            (before.0, before.1),
+            (col.saturating_sub(width), row),
+            (col, row),
+            (left, row),
+        ];
+        for (col, row) in candidates {
+            if self.cell_text(col, row).as_deref() == Some(cell) {
+                return Some(TailCell {
+                    text: cell.to_owned(),
+                    width,
+                    col,
+                    row,
+                });
+            }
+        }
+        None
+    }
+
+    /// The text of one cell of the active buffer.
+    fn cell_text(&mut self, col: usize, row: i64) -> Option<String> {
+        self.terminal
+            .screen_mut()
+            .get_cell(col, row)
+            .map(|cell| cell.str().to_owned())
     }
 
     /// Adds combining marks to the cell the previous text run ended on.
     ///
-    /// The cell is drawn again with the marks on it. Its width cannot change, because a zero-width
-    /// scalar adds none, so nothing beside it moves. The marks are dropped when the cursor has
-    /// moved since, which is the same answer the library gives, and when the cell has reached its
-    /// content bound.
+    /// The cell is written where it already is. Nothing moves the cursor, nothing is printed, and
+    /// insert mode plays no part, so the marks cannot shift the cells beside it or wrap the row.
+    /// The width cannot change either, because a zero-width scalar adds none.
+    ///
+    /// The marks are dropped when there is no cell to join, which is the same answer the library
+    /// gives for a leading zero-width grapheme, and when the cell has reached its content bound.
     fn rejoin(&mut self, marks: &str) {
         let Some(tail) = self.tail.take() else {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
             return;
         };
-        if tail.cursor != self.cursor() || tail.text.len() + marks.len() > self.config.cell_bytes {
+        if tail.text.len() + marks.len() > self.config.cell_bytes {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
             return;
         }
+        let Some(attributes) = self
+            .terminal
+            .screen_mut()
+            .get_cell(tail.col, tail.row)
+            .map(|cell| cell.attrs().clone())
+        else {
+            self.dropped_marks = self.dropped_marks.saturating_add(1);
+            return;
+        };
         let mut text = tail.text;
         text.push_str(marks);
-        let mut actions = Vec::with_capacity(3);
-        // Moving right by nothing cancels a pending wrap without moving the cursor, so a cell drawn
-        // in the last column is drawn again where it already is rather than on the next row.
-        actions.push(Action::CSI(CSI::Cursor(Cursor::Right(0))));
-        if tail.back > 0 {
-            actions.push(Action::CSI(CSI::Cursor(Cursor::Left(tail.back))));
-        }
-        actions.push(Action::PrintString(text.clone()));
-        self.terminal.perform_actions(actions);
-        let after = self.cursor();
-        self.tail = (after == tail.cursor).then_some(TailCell {
-            text,
-            back: tail.back,
-            cursor: after,
-        });
+        let seqno = self.terminal.current_seqno();
+        self.terminal
+            .screen_mut()
+            .set_cell_grapheme(tail.col, tail.row, &text, tail.width, attributes, seqno);
+        self.tail = Some(TailCell { text, ..tail });
     }
 
     /// How many combining marks arrived with no cell to join.
@@ -580,6 +640,20 @@ impl CanonicalGrid {
             .into_iter()
             .map(|row| i64::try_from(row).unwrap_or(0))
             .collect()
+    }
+
+    /// Debug dump.
+    pub fn dump_row0(&self) {
+        let screen = self.terminal.screen();
+        let lines = screen.lines_in_phys_range(screen.phys_range(&(0..1)));
+        for cell in lines[0].visible_cells() {
+            println!(
+                "   idx={} width={} str={:?}",
+                cell.cell_index(),
+                cell.width(),
+                cell.str()
+            );
+        }
     }
 
     /// The current graphic rendition.
@@ -868,11 +942,19 @@ fn rendition_of(attrs: &CellAttributes) -> Rendition {
 
 fn runs_of(line: &wezterm_term::Line) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
+    // A wide cell covers the column after it. Depending on how the library is storing the row at
+    // the moment, that covered column may or may not come back as a cell of its own, so it is
+    // skipped by position instead. Without this the same screen reads differently.
+    let mut next_column = 0u32;
     for cell in line.visible_cells() {
         let rendition = rendition_of(cell.attrs());
         let hyperlink = cell.attrs().hyperlink().map(|link| link.uri().to_owned());
         let column = u32::try_from(cell.cell_index()).unwrap_or(0);
         let width = u32::try_from(cell.width()).unwrap_or(1);
+        if column < next_column {
+            continue;
+        }
+        next_column = column + width.max(1);
         match runs.last_mut() {
             Some(last)
                 if last.rendition == rendition

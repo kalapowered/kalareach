@@ -45,10 +45,10 @@ pub enum ResponseKind {
     ModeReport(crate::modes::ModeKind, u16),
     /// A window or geometry report, identified by the window operation.
     GeometryReport(u16),
-    /// A setting report, identified by a key derived from the setting name.
-    SettingReport(u32),
-    /// A terminfo capability report, identified by a key derived from the capability name.
-    Capability(u32),
+    /// A setting report, identified by the setting name.
+    SettingReport(SubjectName),
+    /// A terminfo capability report, identified by the capability name.
+    Capability(SubjectName),
     /// A colour report, identified by its selector: an OSC number, or `0x1000 + index`.
     Colour(u32),
     /// The keyboard protocol state, identified by the protocol asked about.
@@ -59,19 +59,46 @@ pub enum ResponseKind {
     Clipboard,
 }
 
-impl ResponseKind {
-    /// A stable key for a name, used to tell two capability or setting reports apart.
+/// The name a capability or setting report is about.
+///
+/// The name itself is the subject rather than a hash of it. A hash has collisions, and a collision
+/// here is not a slow lookup: it lets one capability's answer stand in for a different capability's
+/// answer while the lane is shedding load, so the application reads a reply to a question it never
+/// asked. Both kinds of name are short and bounded before a reply is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SubjectName {
+    bytes: [u8; Self::MAX],
+    len: u8,
+}
+
+impl SubjectName {
+    /// The longest name a subject holds. Longer names are refused before a reply is built.
+    pub const MAX: usize = 32;
+
+    /// Builds a subject from a name, keeping at most [`Self::MAX`] bytes.
     #[must_use]
-    pub fn name_key(name: &[u8]) -> u32 {
-        // FNV-1a. It only has to separate names inside one queue, not resist anything.
-        let mut hash: u32 = 0x811c_9dc5;
-        for byte in name {
-            hash ^= u32::from(*byte);
-            hash = hash.wrapping_mul(0x0100_0193);
+    pub fn new(name: &[u8]) -> Self {
+        let len = name.len().min(Self::MAX);
+        let mut bytes = [0u8; Self::MAX];
+        bytes[..len].copy_from_slice(&name[..len]);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the length was just bounded by MAX, which is far below u8::MAX"
+        )]
+        Self {
+            bytes,
+            len: len as u8,
         }
-        hash
     }
 
+    /// The name.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl ResponseKind {
     /// Whether two pending answers of this kind may be collapsed into the newer one.
     ///
     /// A cursor report is a sequence rather than a fact, and a clipboard answer belongs to the

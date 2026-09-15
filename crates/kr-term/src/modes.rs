@@ -352,7 +352,7 @@ impl ModeState {
     /// sets and `modifyOtherKeys`. Line feed mode, the cursor modes, the mouse modes, bracketed
     /// paste, synchronised output and the backend's own input mode all survive.
     pub fn soft_reset(&mut self) {
-        for mode in [1u16, 5, 45, 69] {
+        for mode in [1u16, 5, 6, 45, 69] {
             self.dec.insert(mode, false);
         }
         self.dec.insert(7, true);

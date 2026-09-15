@@ -115,13 +115,6 @@ impl CsiView {
     pub fn first_or(&self, default: i64) -> i64 {
         self.number(0).unwrap_or(default)
     }
-
-    /// Whether every numeric slot is present and inside `range`.
-    fn all_numbers_in(&self, range: core::ops::RangeInclusive<i64>) -> bool {
-        self.numbers
-            .iter()
-            .all(|slot| slot.is_none_or(|value| range.contains(&value)))
-    }
 }
 
 /// The DEC private modes kr-vt/1 tracks as class `M`.
@@ -238,9 +231,10 @@ pub fn classify_csi(csi: &CsiView) -> SequenceClass {
     if csi.truncated {
         return SequenceClass::Extension;
     }
-    // A colon sublist belongs to SGR and nowhere else in this profile. `CSI ? 3 : 7 h` is not a
-    // request to set mode 7.
-    if csi.sub_parameters && csi.final_byte != b'm' {
+    // A colon sublist belongs to ordinary SGR and nowhere else in this profile. `CSI ? 3 : 7 h` is
+    // not a request to set mode 7, and `CSI > 4 : 99 m` is not a modifyOtherKeys level: the private
+    // forms of `m` are keyboard negotiation, which has no sublist of its own.
+    if csi.sub_parameters && (csi.final_byte != b'm' || csi.private.is_some()) {
         return SequenceClass::Extension;
     }
     match (csi.private, csi.intermediates.as_slice(), csi.final_byte) {
@@ -270,10 +264,26 @@ pub fn classify_csi(csi: &CsiView) -> SequenceClass {
         (
             None,
             [],
-            b'@' | b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G' | b'H' | b'I' | b'J' | b'K'
-            | b'L' | b'M' | b'P' | b'S' | b'X' | b'Z' | b'`' | b'a' | b'b' | b'd' | b'e' | b'f'
-            | b'm',
+            b'@' | b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G' | b'H' | b'I' | b'L' | b'M'
+            | b'P' | b'S' | b'X' | b'Z' | b'`' | b'a' | b'b' | b'd' | b'e' | b'f' | b'm',
         ) => SequenceClass::Display,
+        // Erasing takes a selector rather than a count: 0 to the end, 1 from the start, 2 the
+        // whole area, and for ED 3 the scrollback as well. Another value is a different operation,
+        // not a larger one.
+        (None, [], b'J') => {
+            if matches!(csi.first_or(0), 0..=3) {
+                SequenceClass::Display
+            } else {
+                SequenceClass::Extension
+            }
+        }
+        (None, [], b'K') => {
+            if matches!(csi.first_or(0), 0..=2) {
+                SequenceClass::Display
+            } else {
+                SequenceClass::Extension
+            }
+        }
         // SD shares its final byte with xterm's highlight mouse tracking, which kr-vt/1 does not
         // advertise. One parameter is the scroll; more parameters are the tracking request.
         (None, [], b'T') => {
@@ -405,9 +415,11 @@ fn window_op_class(csi: &CsiView) -> SequenceClass {
     match csi.first_or(0) {
         // Geometry and window-state reports.
         11 | 13 | 14 | 15 | 16 | 18 | 19 => SequenceClass::Query,
-        // The virtualised title stack. The second parameter selects which title.
+        // The virtualised title stack. The second parameter selects which title: 0 for both, 1 for
+        // the icon name and 2 for the window title. Nothing else is a title.
         22 | 23 => {
-            if csi.numbers.len() <= 2 && csi.all_numbers_in(0..=23) {
+            let target = csi.numbers.get(1).copied().flatten().unwrap_or(0);
+            if csi.numbers.len() <= 2 && matches!(target, 0..=2) {
                 SequenceClass::Mode
             } else {
                 SequenceClass::Extension
@@ -576,14 +588,6 @@ pub fn classify_osc(selector: Option<u32>, parts: &[Vec<u8>]) -> SequenceClass {
     match selector {
         // Row: OSC 0, 1 and 2 track the application title.
         0..=2 => SequenceClass::Mode,
-        // Row: the palette. `?` asks, anything else mutates. A request may pair several.
-        4 => {
-            if has_query {
-                SequenceClass::Query
-            } else {
-                SequenceClass::Mode
-            }
-        }
         // Row: OSC 7, the untrusted working-directory observation.
         7 => SequenceClass::Display,
         // Row: OSC 8 hyperlinks.
@@ -599,9 +603,24 @@ pub fn classify_osc(selector: Option<u32>, parts: &[Vec<u8>]) -> SequenceClass {
                 SequenceClass::Extension
             }
         }
+        // Row: the palette. `?` asks, a colour this palette understands mutates, and a field that
+        // is neither makes the whole request an extension. A request may pair several.
+        4 => {
+            if crate::broker::colour_request_is_qualified(4, parts) {
+                if has_query {
+                    SequenceClass::Query
+                } else {
+                    SequenceClass::Mode
+                }
+            } else {
+                SequenceClass::Extension
+            }
+        }
         // Row: the dynamic colours.
         10..=19 => {
-            if !osc_colour_is_qualified(selector) {
+            if !osc_colour_is_qualified(selector)
+                || !crate::broker::colour_request_is_qualified(selector, parts)
+            {
                 SequenceClass::Extension
             } else if has_query {
                 SequenceClass::Query
@@ -664,7 +683,32 @@ enum StopsHere {
 /// backend that owns it and is never broadcast to a remote client. A request that names mode 9001
 /// alongside other modes still stops here, so the attachment projects rather than falling out of
 /// step over the modes that did apply.
+///
+/// Keyboard negotiation is deliberately not here. It is a mode, and a mode is forwarded live: a
+/// direct terminal that did not see the negotiation would keep sending the old encoding, which is
+/// exactly the mismatch the negotiation exists to prevent. The profile still tracks it and still
+/// keeps it away from the canonical grid, which has nothing to do with key encodings.
 fn stops_here(kind: &EventKind) -> StopsHere {
+    // A colour request that both asks and changes is answered here, so its bytes stop here too.
+    // The change went into the canonical palette and a physical terminal never saw it, which it
+    // has to be told about rather than left to drift.
+    if let EventKind::Osc {
+        selector: Some(selector),
+        parts,
+    } = kind
+        && matches!(selector, 4 | 10..=19)
+    {
+        let asks = parts.iter().skip(1).any(|part| part.as_slice() == b"?");
+        let changes = parts
+            .iter()
+            .skip(1)
+            .any(|part| part.as_slice() != b"?" && !part.is_empty());
+        return if asks && changes {
+            StopsHere::Projection
+        } else {
+            StopsHere::No
+        };
+    }
     let EventKind::Csi {
         params,
         truncated,
@@ -686,10 +730,6 @@ fn stops_here(kind: &EventKind) -> StopsHere {
                 StopsHere::Withhold
             }
         }
-        // Keyboard negotiation is an input semantic the profile owns outright. Forwarding it would
-        // leave the terminal encoding keys the engine did not agree to.
-        b'm' if csi.private == Some(b'>') => StopsHere::Withhold,
-        b'u' if matches!(csi.private, Some(b'>' | b'<' | b'=')) => StopsHere::Withhold,
         _ => StopsHere::No,
     }
 }
@@ -705,13 +745,15 @@ pub fn disposition(
     class: SequenceClass,
     needs_projection: bool,
 ) -> DirectDisposition {
-    if !class.reaches_grid() {
-        return DirectDisposition::Withhold;
-    }
+    // What the profile handles itself is decided first, because a sequence can be answered here and
+    // still have changed the canonical screen on the way.
     match stops_here(kind) {
         StopsHere::Withhold => return DirectDisposition::Withhold,
         StopsHere::Projection => return DirectDisposition::RequireProjection,
         StopsHere::No => {}
+    }
+    if !class.reaches_grid() {
+        return DirectDisposition::Withhold;
     }
     if needs_projection || matches!(kind, EventKind::Replacement { .. }) {
         return DirectDisposition::RequireProjection;

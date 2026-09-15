@@ -15,7 +15,7 @@ use crate::error::{Result, TermError};
 use crate::grid::{GridRow, Rendition};
 use crate::modes::ModeKind;
 use crate::palette::{PaletteSource, Rgb};
-use crate::title::TitleEntry;
+use crate::title::{SavedTitle, TitleEntry};
 
 /// Which screen buffer is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +198,7 @@ pub struct Snapshot {
     /// The current titles.
     pub title: TitleEntry,
     /// The virtual title stack, oldest first.
-    pub title_stack: Vec<TitleEntry>,
+    pub title_stack: Vec<SavedTitle>,
     /// Hyperlink ranges in the rows carried here.
     pub hyperlinks: Vec<HyperlinkRange>,
     /// The palette.
@@ -365,7 +365,7 @@ pub enum RestoreOp {
         /// The current titles.
         title: TitleEntry,
         /// The stack, oldest first.
-        stack: Vec<TitleEntry>,
+        stack: Vec<SavedTitle>,
     },
 }
 

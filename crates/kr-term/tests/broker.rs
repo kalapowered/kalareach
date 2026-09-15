@@ -409,3 +409,74 @@ fn a_cursor_report_honours_origin_mode() {
         [b"\x1b[3;1R"]
     );
 }
+
+/// A colour request is executed once, in order, and each answer comes from the palette at that
+/// point in the request.
+#[test]
+fn a_colour_request_answers_from_the_palette_at_each_question() {
+    let mut engine = engine();
+    replies(&mut engine, b"\x1b]4;1;#112233\x07", 0);
+    let answers = replies(&mut engine, b"\x1b]4;1;?;1;#ff0000;1;?\x07", 10);
+    assert_eq!(
+        answers,
+        vec![
+            b"\x1b]4;1;rgb:1111/2222/3333\x07".to_vec(),
+            b"\x1b]4;1;rgb:ffff/0000/0000\x07".to_vec(),
+        ],
+        "the first question is about the colour before the change, not after it"
+    );
+}
+
+/// A request that both asks and changes has changed something a direct terminal never saw.
+#[test]
+fn a_colour_request_that_also_changes_requires_projection() {
+    let mut engine = engine();
+    let outcome = engine.feed(b"\x1b]4;1;#ff0000;2;?\x07", 0);
+    assert!(outcome.forward.is_empty());
+    assert!(
+        outcome.projection_required_at.is_some(),
+        "the canonical palette changed and the bytes stopped here"
+    );
+}
+
+/// A colour field that is neither a question nor a colour makes the whole request an extension.
+#[test]
+fn an_unusable_colour_field_refuses_the_whole_request() {
+    for input in [
+        b"\x1b]4;1;red\x07".as_slice(),
+        b"\x1b]4;1;?\0\x07".as_slice(),
+        b"\x1b]4;1\x07".as_slice(),
+        b"\x1b]10;chartreuse\x07".as_slice(),
+    ] {
+        let mut engine = engine();
+        let outcome = engine.feed(input, 0);
+        assert!(outcome.forward.is_empty(), "{input:?} reached a terminal");
+        assert_eq!(outcome.responses, 0, "{input:?} was answered");
+        assert_eq!(
+            engine.grid().writer_log().bytes,
+            0,
+            "{input:?} made the grid library write a reply"
+        );
+    }
+}
+
+/// Two capability names never share a reply subject, whatever they hash to.
+#[test]
+fn two_capability_answers_are_never_collapsed_into_one() {
+    let mut engine = Engine::new(EngineConfig {
+        lane: LaneLimits {
+            max_queue_bytes: 64,
+            ..LaneLimits::DEFAULT
+        },
+        ..EngineConfig::default()
+    })
+    .expect("engine");
+    // These two names collide under a 32-bit FNV-1a hash.
+    let request = format!(
+        "\x1bP+q{}\x1b\\\x1bP+q{}\x1b\\",
+        terminfo::to_hex(b"costarring"),
+        terminfo::to_hex(b"liquid")
+    );
+    let answers = replies(&mut engine, request.as_bytes(), 0);
+    assert_eq!(answers.len(), 2, "one answer stood in for the other");
+}

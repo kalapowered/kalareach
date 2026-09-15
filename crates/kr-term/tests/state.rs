@@ -774,3 +774,25 @@ fn keyboard_negotiation_has_one_owner() {
         "leaving the alternate buffer restores the primary buffer's negotiation"
     );
 }
+
+/// A soft reset and a cursor restore leave the tracker and the grid agreeing about origin mode.
+#[test]
+fn origin_mode_has_one_answer() {
+    let mut after_reset = engine();
+    after_reset.feed(b"\x1b[?6h\x1b[!p", 0);
+    assert!(!after_reset.grid().origin_mode());
+    assert!(!after_reset.modes().is_set(kr_term::modes::ModeKind::Dec, 6));
+
+    let mut after_restore = engine();
+    after_restore.feed(b"\x1b[?6h\x1b7\x1b[?6l\x1b8", 0);
+    assert!(
+        after_restore.grid().origin_mode(),
+        "the restore brought it back"
+    );
+    assert!(
+        after_restore
+            .modes()
+            .is_set(kr_term::modes::ModeKind::Dec, 6),
+        "and the tracker followed it"
+    );
+}

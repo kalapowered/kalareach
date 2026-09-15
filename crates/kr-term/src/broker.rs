@@ -394,6 +394,46 @@ pub fn colour_operations(selector: u32, parts: &[Vec<u8>]) -> Vec<ColourOperatio
     out
 }
 
+/// Whether every field of a colour request is one this profile can act on.
+///
+/// A field that is neither a colour this palette understands nor a question is not a smaller
+/// request: the canonical palette would not change while a physical terminal's might, and the two
+/// screens would then disagree about the colour of everything drawn afterwards. The class table
+/// uses this to refuse the whole request instead.
+#[must_use]
+pub fn colour_request_is_qualified(selector: u32, parts: &[Vec<u8>]) -> bool {
+    let field_ok = |part: &Vec<u8>| {
+        part.as_slice() == b"?"
+            || core::str::from_utf8(part).is_ok_and(|text| Rgb::parse(text).is_some())
+    };
+    if parts.len() < 2 {
+        return false;
+    }
+    if selector == 4 {
+        // Index and value, in pairs, with nothing left over.
+        if !(parts.len() - 1).is_multiple_of(2) {
+            return false;
+        }
+        let mut index = 1;
+        while index + 1 < parts.len() {
+            if parse_index(&parts[index]).is_none() || !field_ok(&parts[index + 1]) {
+                return false;
+            }
+            index += 2;
+        }
+        return true;
+    }
+    for (offset, part) in parts.iter().skip(1).enumerate() {
+        let Ok(offset) = u32::try_from(offset) else {
+            return false;
+        };
+        if DynamicColour::from_selector(selector + offset).is_none() || !field_ok(part) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Colour answers are built by the engine, which applies the mutations in the same pass.
 fn answer_osc(
     _selector: Option<u32>,
@@ -418,7 +458,7 @@ fn answer_dcs(
 ) -> Vec<Response> {
     match (intermediates, final_byte) {
         ([b'$'], b'q') => vec![Response::new(
-            ResponseKind::SettingReport(ResponseKind::name_key(payload)),
+            ResponseKind::SettingReport(crate::lane::SubjectName::new(payload)),
             at,
             decrqss(payload, state),
         )],
@@ -426,7 +466,7 @@ fn answer_dcs(
             .into_iter()
             .map(|reply| {
                 Response::new(
-                    ResponseKind::Capability(ResponseKind::name_key(reply.name.as_bytes())),
+                    ResponseKind::Capability(crate::lane::SubjectName::new(reply.name.as_bytes())),
                     at,
                     reply.bytes,
                 )

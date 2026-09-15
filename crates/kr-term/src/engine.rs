@@ -441,6 +441,7 @@ impl Engine {
                             "a parameter was reduced to what the grid can act on",
                         );
                     }
+                    self.sync_grid_modes();
                     if adapted.unrecognised {
                         // The class table approved it and the canonical grid does not know it.
                         // Consuming it keeps the two screens in step.
@@ -460,6 +461,11 @@ impl Engine {
             }
             if decision.answer {
                 outcome.responses += self.answer_query(event, now_ms);
+            }
+            // Colour requests are applied here whether they ask anything or not, because a request
+            // may interleave mutations and questions and every question is about the palette as it
+            // stands at that point in the request.
+            if decision.answer || decision.track {
                 outcome.responses += self.apply_colours(event, now_ms);
             }
             if let Some(selection) = decision.clipboard_answer {
@@ -526,6 +532,20 @@ impl Engine {
         outcome
     }
 
+    /// Copies back the modes the canonical grid changes on its own.
+    ///
+    /// Origin mode is the one that matters. A cursor restore, a soft reset and a buffer switch all
+    /// change it inside the reducer without a set or reset sequence of their own, so a tracker that
+    /// only watched sequences would report a frame the grid is not using, and the cursor report
+    /// would name the wrong row.
+    fn sync_grid_modes(&mut self) {
+        let origin = self.grid.origin_mode();
+        if self.modes.is_set(ModeKind::Dec, 6) != origin {
+            self.modes.set(ModeKind::Dec, 6, origin);
+            self.mark_mode(ModeKind::Dec, 6);
+        }
+    }
+
     /// Whether recording this event's hyperlink would pass the session's bound.
     fn link_budget_exceeded(&mut self, event: &Event) -> bool {
         let EventKind::Osc {
@@ -535,13 +555,15 @@ impl Engine {
         else {
             return false;
         };
-        let Some(uri) = parts.get(2) else {
+        if parts.len() < 3 {
             return false;
-        };
+        }
+        // A URI may contain the separator, so everything after the parameter field is the target.
+        let uri = parts[2..].join(&b';');
         if uri.is_empty() {
             return false;
         }
-        let uri = String::from_utf8_lossy(uri).into_owned();
+        let uri = String::from_utf8_lossy(&uri).into_owned();
         if self.links.contains(&uri) {
             return false;
         }
@@ -815,26 +837,6 @@ impl Engine {
                     .join(";");
                 self.titles.set(target, &title);
                 self.title_revision = self.next_revision();
-            }
-            4 | 10..=19 => {
-                for operation in crate::broker::colour_operations(selector, parts) {
-                    let ColourOperation::Set {
-                        selector: key,
-                        colour,
-                    } = operation
-                    else {
-                        continue;
-                    };
-                    if key >= INDEXED_BASE {
-                        if let Ok(index) = u8::try_from(key - INDEXED_BASE) {
-                            self.palette.set_indexed(index, colour);
-                            self.palette_revision = self.next_revision();
-                        }
-                    } else if let Some(which) = DynamicColour::from_selector(key) {
-                        self.palette.set_dynamic(which, colour);
-                        self.palette_revision = self.next_revision();
-                    }
-                }
             }
             104 => {
                 if parts.len() <= 1 || parts[1].is_empty() {

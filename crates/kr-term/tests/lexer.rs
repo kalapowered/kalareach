@@ -602,15 +602,27 @@ fn a_colon_sublist_outside_sgr_is_an_extension() {
     assert_eq!(classes(&events), "D");
 }
 
-/// Text is clustered the same way however the reads fall.
+/// Text lands in the same cells however the reads fall.
 #[test]
 fn clustering_does_not_depend_on_read_boundaries() {
-    fn screen(chunks: &[&[u8]], settle_between: bool) -> (u32, String) {
+    struct Case {
+        cols: u32,
+        rows: u32,
+        setup: &'static [u8],
+        text: &'static str,
+        cells: u32,
+    }
+
+    fn screen(case: &Case, chunks: &[&[u8]], settle_between: bool) -> (u32, Vec<String>) {
         let mut engine = kr_term::engine::Engine::new(kr_term::engine::EngineConfig {
-            size: kr_term::budget::GridSize::new(20, 3),
+            size: kr_term::budget::GridSize::new(case.cols, case.rows),
             ..kr_term::engine::EngineConfig::DEFAULT
         })
         .expect("engine");
+        if !case.setup.is_empty() {
+            engine.feed(case.setup, 0);
+            engine.quiesce(0);
+        }
         for chunk in chunks {
             engine.feed(chunk, 0);
             if settle_between {
@@ -620,47 +632,111 @@ fn clustering_does_not_depend_on_read_boundaries() {
         engine.quiesce(0);
         let view = kr_term::snapshot::Viewport {
             top_row: 0,
-            rows: 3,
+            rows: case.rows,
             left_col: 0,
-            cols: 20,
+            cols: case.cols,
         };
         let (snapshot, _) = engine.snapshot(view, 0);
-        let text: String = snapshot.rows[0]
-            .runs
+        let rows = snapshot
+            .rows
             .iter()
-            .map(|run| run.text.as_str())
+            .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
             .collect();
-        (snapshot.cursor.col, text)
+        (snapshot.cursor.col, rows)
     }
 
-    // The cell count each case takes under the pinned legacy codepoint-width model: every scalar
-    // with a width of its own gets a cell, and only a zero-width scalar joins the cell before it.
-    let cases: [(&[u8], u32); 6] = [
-        ("e\u{0301}X".as_bytes(), 2),
-        ("a\u{0308}\u{0323}b".as_bytes(), 2),
+    // `cells` is where the cursor ends up, which is the number of cells the text took under the
+    // pinned legacy codepoint-width model: every scalar with a width of its own gets a cell, and
+    // only a zero-width scalar joins the cell before it.
+    let cases = [
+        Case {
+            cols: 20,
+            rows: 3,
+            setup: b"",
+            text: "e\u{0301}X",
+            cells: 2,
+        },
+        Case {
+            cols: 20,
+            rows: 3,
+            setup: b"",
+            text: "a\u{0308}\u{0323}b",
+            cells: 2,
+        },
         // A woman, a joiner and a laptop: three scalars, two of which are wide, then ASCII.
-        ("\u{1f469}\u{200d}\u{1f4bb}X".as_bytes(), 5),
+        Case {
+            cols: 20,
+            rows: 3,
+            setup: b"",
+            text: "\u{1f469}\u{200d}\u{1f4bb}X",
+            cells: 5,
+        },
         // An emoji and a skin-tone modifier, which the library would fold into one cell.
-        ("\u{1f44d}\u{1f3fb}X".as_bytes(), 5),
+        Case {
+            cols: 20,
+            rows: 3,
+            setup: b"",
+            text: "\u{1f44d}\u{1f3fb}X",
+            cells: 5,
+        },
+        // Two Hangul initial jamo, which the library would fold into one syllable block.
+        Case {
+            cols: 20,
+            rows: 3,
+            setup: b"",
+            text: "\u{1100}\u{1100}ZX",
+            cells: 6,
+        },
         // A regional-indicator pair, which the library would fold into one flag. The pinned table
         // gives each indicator one cell, so the pair is two cells rather than the flag's two.
-        ("\u{1f1ff}\u{1f1e6}X".as_bytes(), 3),
+        Case {
+            cols: 20,
+            rows: 3,
+            setup: b"",
+            text: "\u{1f1ff}\u{1f1e6}X",
+            cells: 3,
+        },
         // A keycap sequence: a digit, a variation selector and an enclosing mark.
-        ("1\u{fe0f}\u{20e3}X".as_bytes(), 2),
+        Case {
+            cols: 20,
+            rows: 3,
+            setup: b"",
+            text: "1\u{fe0f}\u{20e3}X",
+            cells: 2,
+        },
+        // A mark that belongs to a cell the row wrapped after.
+        Case {
+            cols: 4,
+            rows: 3,
+            setup: b"",
+            text: "abcde\u{0301}X",
+            cells: 2,
+        },
+        // A mark arriving while insert mode is on, which must not shift the row.
+        Case {
+            cols: 10,
+            rows: 3,
+            setup: b"ABCDE\x1b[H\x1b[4h",
+            text: "e\u{0301}X",
+            cells: 2,
+        },
     ];
 
-    for (whole, cells) in cases {
-        let together = screen(&[whole], false);
+    for case in &cases {
+        let whole = case.text.as_bytes();
+        let together = screen(case, &[whole], false);
         assert_eq!(
-            together.0, cells,
-            "{whole:?} does not take the cells the width model gives it"
+            together.0, case.cells,
+            "{:?} does not take the cells the width model gives it",
+            case.text
         );
         for split in 1..whole.len() {
             for settle in [false, true] {
-                let apart = screen(&[&whole[..split], &whole[split..]], settle);
+                let apart = screen(case, &[&whole[..split], &whole[split..]], settle);
                 assert_eq!(
                     together, apart,
-                    "splitting {whole:?} at {split} (settling: {settle}) changed the screen"
+                    "splitting {:?} at {split} (settling: {settle}) changed the screen",
+                    case.text
                 );
             }
         }
@@ -669,6 +745,11 @@ fn clustering_does_not_depend_on_read_boundaries() {
         let bytes: Vec<&[u8]> = (0..whole.len())
             .map(|index| &whole[index..=index])
             .collect();
-        assert_eq!(together, screen(&bytes, true), "{whole:?} byte by byte");
+        assert_eq!(
+            together,
+            screen(case, &bytes, true),
+            "{:?} byte by byte",
+            case.text
+        );
     }
 }

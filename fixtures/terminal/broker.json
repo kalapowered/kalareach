@@ -976,7 +976,7 @@
         {
           "bytes": "1b5d343b323b3f1b5c",
           "class": "Q",
-          "disposition": "Withhold",
+          "disposition": "RequireProjection",
           "eight_bit": false,
           "ground_after": true,
           "kind": "osc",
@@ -993,7 +993,7 @@
       "ground_after": true,
       "id": "colour_index_query",
       "input": "1b5d343b323b3f1b5c",
-      "projection_required_at": null,
+      "projection_required_at": 0,
       "refusals": [],
       "responses": [
         "1b5d343b323b7267623a303030302f636463642f303030301b5c"
@@ -1025,7 +1025,7 @@
         {
           "bytes": "1b5d343b323b3f1b5c",
           "class": "Q",
-          "disposition": "Withhold",
+          "disposition": "RequireProjection",
           "eight_bit": false,
           "ground_after": true,
           "kind": "osc",
@@ -1047,7 +1047,7 @@
       "ground_after": true,
       "id": "colour_index_after_change",
       "input": "1b5d343b323b7267623a31322f33342f35361b5c1b5d343b323b3f1b5c",
-      "projection_required_at": null,
+      "projection_required_at": 20,
       "refusals": [],
       "responses": [
         "1b5d343b323b7267623a313231322f333433342f353635361b5c"
@@ -1174,7 +1174,7 @@
         {
           "bytes": "1b5b3e3575",
           "class": "M",
-          "disposition": "Withhold",
+          "disposition": "Forward",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -1198,7 +1198,12 @@
           ]
         }
       ],
-      "forward": [],
+      "forward": [
+        [
+          0,
+          5
+        ]
+      ],
       "grid_unrecognised": 0,
       "grid_writes": 0,
       "ground_after": true,
@@ -1223,7 +1228,7 @@
         {
           "bytes": "1b5b3e343b326d",
           "class": "M",
-          "disposition": "Withhold",
+          "disposition": "Forward",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -1247,7 +1252,12 @@
           ]
         }
       ],
-      "forward": [],
+      "forward": [
+        [
+          0,
+          7
+        ]
+      ],
       "grid_unrecognised": 0,
       "grid_writes": 0,
       "ground_after": true,
