@@ -26,7 +26,7 @@ use wezterm_escape_parser::{Action, ControlCode};
 
 use wezterm_escape_parser::hyperlink::Hyperlink;
 use wezterm_surface::CursorShape;
-use wezterm_term::color::ColorPalette;
+use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{
     Alert, AlertHandler, CellAttributes, Intensity, Terminal, TerminalConfiguration, TerminalSize,
     Underline, UnicodeVersion, VerticalAlign,
@@ -1181,10 +1181,22 @@ impl CanonicalGrid {
             let counted = index >= history;
             index += 1;
             if counted {
-                bytes = bytes.saturating_add(line.as_str().len() as u64);
+                bytes = bytes.saturating_add(row_content_bytes(line));
             }
         });
         bytes
+    }
+
+    /// The most one buffer's content can cost at this geometry.
+    ///
+    /// Printing is charged before it is applied, and a screen is a fixed number of cells, so the
+    /// charge is held to what those cells can hold rather than to how much was printed through
+    /// them.
+    #[must_use]
+    pub fn screen_content_ceiling(&self) -> u64 {
+        u64::from(self.size.cols)
+            .saturating_mul(u64::from(self.size.rows))
+            .saturating_mul((self.config.cell_bytes as u64).saturating_add(CELL_ATTRIBUTE_BYTES))
     }
 
     /// Bytes the hyperlinks of the rows that are showing cost.
@@ -1227,9 +1239,8 @@ impl CanonicalGrid {
             if !counted {
                 return;
             }
-            let text = line.as_str().len() as u64;
             let cells = line.len() as u64;
-            bytes = bytes.saturating_add(text + cells * CELL_OVERHEAD_BYTES);
+            bytes = bytes.saturating_add(row_content_bytes(line) + cells * CELL_OVERHEAD_BYTES);
             bytes = bytes.saturating_add(link_bytes(line));
         });
         bytes
@@ -1266,10 +1277,14 @@ fn link_bytes(line: &wezterm_term::Line) -> u64 {
 ///
 /// `text` is the parameters and the target, as one string. The bound a caller checks before it
 /// applies a link has to be the cost of the object the grid will build, not the length of what
-/// arrived.
+/// arrived. The object does not exist yet, so its strings are charged at twice what they hold,
+/// which is the most a doubling allocator keeps for them; the next measurement replaces this with
+/// what the object actually holds.
 #[must_use]
 pub fn link_cost(text: &str, parameters: usize) -> u64 {
-    LINK_OBJECT_BYTES + text.len() as u64 + parameters as u64 * PARAMETER_OVERHEAD_BYTES
+    LINK_OBJECT_BYTES
+        + 2 * text.len() as u64
+        + table_slots(parameters).saturating_mul(TABLE_SLOT_BYTES)
 }
 
 /// What one link object costs, as the pinned library holds it.
@@ -1278,19 +1293,73 @@ pub fn link_cost(text: &str, parameters: usize) -> u64 {
 /// parameters and the bookkeeping around them, which together cost far more than a short target:
 /// counting only the characters would report a screen of links as almost free.
 fn link_object_bytes(link: &Hyperlink) -> u64 {
-    let params: u64 = link
-        .params()
-        .iter()
-        .map(|(key, value)| (key.len() + value.len()) as u64 + PARAMETER_OVERHEAD_BYTES)
-        .sum();
-    LINK_OBJECT_BYTES + link.uri().len() as u64 + params
+    let params = link.params();
+    // The table as it is allocated rather than as many entries as it holds: a table keeps room it
+    // is not using, and a session that filled one would be under-charged for every link in it.
+    let mut bytes = LINK_OBJECT_BYTES
+        .saturating_add(link.uri().len() as u64)
+        .saturating_add(table_slots(params.capacity()).saturating_mul(TABLE_SLOT_BYTES));
+    for (key, value) in params {
+        bytes = bytes.saturating_add((key.capacity() + value.capacity()) as u64);
+    }
+    bytes
 }
 
-/// What one link object costs beyond its strings.
-const LINK_OBJECT_BYTES: u64 = 512;
+/// What a string costs beyond the bytes it holds: the pointer, the length and the capacity.
+pub(crate) const STRING_HANDLE_BYTES: u64 = size_of::<String>() as u64;
 
-/// What one link parameter costs beyond its key and value.
-const PARAMETER_OVERHEAD_BYTES: u64 = 128;
+/// What one link object costs before the bytes its strings hold.
+///
+/// The counted handle every cell shares it through, and the object's own fields: the target's
+/// string handle, the parameter table's own handle and the flag beside them.
+const LINK_OBJECT_BYTES: u64 = (size_of::<Hyperlink>() + 2 * size_of::<usize>()) as u64;
+
+/// What one slot of a parameter table costs: the key and value handles it holds and the control
+/// byte the table keeps beside them.
+const TABLE_SLOT_BYTES: u64 = (size_of::<(String, String)>() + 1) as u64;
+
+/// What a cell's independently allocated attributes cost when it has them.
+///
+/// A cell keeps its true colours, its underline colour, its link handle and its image list in one
+/// allocation of its own, reached through a pointer, and the grid makes that allocation as soon as
+/// any of them is more than the packed form on the cell can hold. Its fields are the three colour
+/// attributes, the link handle and the image list.
+pub(crate) const CELL_ATTRIBUTE_BYTES: u64 =
+    (3 * size_of::<ColorAttribute>() + 4 * size_of::<usize>()) as u64;
+
+/// How many slots a hash table holding `entries` keeps.
+///
+/// The table doubles as it grows and leaves an eighth of itself free, so an entry count rounds up
+/// to the next power of two above the fraction it needs.
+fn table_slots(entries: usize) -> u64 {
+    if entries == 0 {
+        return 0;
+    }
+    (entries.saturating_mul(8) / 7 + 1).next_power_of_two() as u64
+}
+
+/// Whether a cell with these attributes has an allocation of its own.
+fn attributes_are_allocated(attrs: &CellAttributes) -> bool {
+    attrs.hyperlink().is_some()
+        || attrs.underline_color() != ColorAttribute::Default
+        || attrs.foreground() != ColorAttribute::Default
+        || attrs.background() != ColorAttribute::Default
+}
+
+/// What one row holds beyond the cells the screens are already charged for.
+///
+/// The text as it is encoded, plus the allocation each cell that needs one keeps for its
+/// attributes. Counting the text alone would report a screen of coloured cells as costing what a
+/// screen of plain ones costs.
+fn row_content_bytes(line: &wezterm_term::Line) -> u64 {
+    let mut bytes = line.as_str().len() as u64;
+    for cell in line.visible_cells() {
+        if attributes_are_allocated(cell.attrs()) {
+            bytes = bytes.saturating_add(CELL_ATTRIBUTE_BYTES);
+        }
+    }
+    bytes
+}
 
 fn to_library_size(size: GridSize) -> TerminalSize {
     TerminalSize {
@@ -1302,8 +1371,7 @@ fn to_library_size(size: GridSize) -> TerminalSize {
     }
 }
 
-fn colour_of(attribute: wezterm_term::color::ColorAttribute) -> Colour {
-    use wezterm_term::color::ColorAttribute;
+fn colour_of(attribute: ColorAttribute) -> Colour {
     match attribute {
         ColorAttribute::Default => Colour::Default,
         ColorAttribute::PaletteIndex(index)

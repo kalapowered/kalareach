@@ -208,6 +208,12 @@ const LINK_MEASURE_INTERVAL: u64 = 64;
 /// How many times eviction re-measures before leaving the rest to the next read.
 const EVICTION_PASSES: u32 = 4;
 
+/// What one entry of the link table costs beyond the target it holds.
+///
+/// The set keeps its entries in a tree, and a node carries the child and parent links around the
+/// string it holds.
+const TREE_NODE_BYTES: u64 = (4 * size_of::<usize>()) as u64;
+
 /// How many rows a history page builds at a time before checking its byte bound.
 const PAGE_BATCH_ROWS: usize = 32;
 
@@ -496,6 +502,9 @@ impl Engine {
                         .get_or_insert(event.span.start());
                     disposition = DirectDisposition::Withhold;
                 } else {
+                    // What printing will add to the buffer is charged before it is applied. A
+                    // measurement is periodic and a read can fill a screen between two of them.
+                    self.reserve_content(event);
                     let adapted = self.grid.apply(event);
                     if adapted.clamped {
                         // The grid did what it could rather than what the sequence said, so the
@@ -773,6 +782,25 @@ impl Engine {
         false
     }
 
+    /// Charges what an event about to be applied can add to the buffer it draws into.
+    ///
+    /// Text is the only thing that grows a buffer, and what it can add is its own bytes plus the
+    /// allocation each cell it fills would need for attributes the packed form cannot hold.
+    fn reserve_content(&mut self, event: &Event) {
+        let cells = match &event.kind {
+            EventKind::Text { scalars } => *scalars,
+            EventKind::Replacement { count, .. } => *count,
+            _ => return,
+        };
+        let cost = (event.bytes.len() as u64)
+            .saturating_add((cells as u64).saturating_mul(crate::grid::CELL_ATTRIBUTE_BYTES));
+        self.budget.add_screen_content(
+            self.grid.alternate_active(),
+            cost,
+            self.grid.screen_content_ceiling(),
+        );
+    }
+
     /// Reports content the grid could not keep whole.
     ///
     /// A cell has a content bound, and combining marks past it are dropped rather than allowed to
@@ -808,16 +836,10 @@ impl Engine {
     /// not changing either, so the last measurement of it stands rather than being replaced by the
     /// alternate buffer's nothing.
     fn enforce_resident_state(&mut self, now_ms: u64) {
-        // The screens are small and are measured whenever anything asks: they are what an
-        // application grows quickly, and what a bound has to be checked against before the next
-        // read rather than after it.
-        let alternate = self.grid.alternate_active();
-        self.budget
-            .set_screen_links(alternate, self.grid.screen_link_bytes());
-        self.budget
-            .set_screen_content(alternate, self.grid.screen_content_bytes());
-        // The retained rows are not: measuring them walks the whole scrollback, so it happens when
-        // the rows have actually grown, when something asked, or periodically.
+        // Measuring walks every cell of the screens and every retained row, so it happens when the
+        // rows have grown, when something asked, or periodically. Between two of them the charge
+        // is the reservation each applied event made, which is never less than what was
+        // allocated, so the bound holds without a walk on every read.
         let rows = self.grid.scrollback_rows();
         let grew = rows.abs_diff(self.measured_rows) >= ROW_CACHE_ROW_STEP;
         if !grew && !self.measure_now && !self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) {
@@ -825,6 +847,12 @@ impl Engine {
         }
         self.measure_now = false;
         self.measured_rows = rows;
+        let alternate = self.grid.alternate_active();
+        self.budget
+            .set_screen_links(alternate, self.grid.screen_link_bytes());
+        self.budget
+            .set_screen_content(alternate, self.grid.screen_content_bytes());
+        self.budget.set_metadata(self.metadata_bytes());
         if alternate {
             return;
         }
@@ -851,6 +879,41 @@ impl Engine {
             );
         }
         self.budget.set_row_cache(bytes);
+    }
+
+    /// What the session's own tables hold.
+    ///
+    /// The distinct link targets and the titles, as they are allocated rather than as many
+    /// characters as they carry: a table that has grown keeps room it is not using, and a session
+    /// that filled one would otherwise be charged for the characters alone.
+    fn metadata_bytes(&self) -> u64 {
+        let links: u64 = self
+            .links
+            .iter()
+            .map(|link| {
+                (crate::grid::STRING_HANDLE_BYTES + link.capacity() as u64) + TREE_NODE_BYTES
+            })
+            .sum();
+        let titles = crate::grid::STRING_HANDLE_BYTES * 2
+            + self.titles.icon().len() as u64
+            + self.titles.window().len() as u64;
+        let stack: u64 = self
+            .titles
+            .entries()
+            .iter()
+            .map(|entry| {
+                crate::grid::STRING_HANDLE_BYTES * 2
+                    + entry
+                        .icon
+                        .as_ref()
+                        .map_or(0, |title| title.capacity() as u64)
+                    + entry
+                        .window
+                        .as_ref()
+                        .map_or(0, |title| title.capacity() as u64)
+            })
+            .sum();
+        links.saturating_add(titles).saturating_add(stack)
     }
 
     /// Whether resident state is over one of its bounds right now.

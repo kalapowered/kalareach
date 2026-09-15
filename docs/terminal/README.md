@@ -568,8 +568,10 @@ The historical-row bound is enforced rather than reported. The engine measures t
 periodically, and when they pass the bound it lowers the library's scrollback row count so older
 rows are evicted as new ones arrive. The new row count is proportional to the overshoot, so the
 retained rows converge back under the bound over the following rows rather than oscillating.
-Measuring means walking the scrollback, so doing it on every read would cost more than the bound
-saves; every 64 reads keeps the overshoot to a fraction of the cache.
+Measuring means walking the scrollback and every cell of the screens, so doing it on every read
+would cost more than the bound saves. It happens when the rows have grown, when something asks, and
+every 64 reads otherwise; between two measurements the charge is what each applied event reserved,
+which is never less than what was allocated.
 
 What the rows cost includes the hyperlinks they hold. Every cell inside a link holds a reference to
 the whole link, and the object behind that reference costs far more than its target's characters, so
@@ -577,11 +579,23 @@ what is counted is the object: each distinct one on a row, once. Counting only t
 let an application hold tens of megabytes inside a budget that said it was using nothing.
 
 Each buffer's links and its cell content are counted separately and charged together, because the
-buffer that is not showing still holds its own. A link's cost is reserved when it is applied rather than noticed at the
-next measurement: one read can carry a session's worth of links, and a bound that is only checked
-afterwards is not a bound. A link that will not fit is refused, and refusing one ends the link that
-was open, because the text that belonged to the refused link must not end up inside the previous
-one.
+buffer that is not showing still holds its own.
+
+Growth is charged as it happens rather than noticed at the next measurement, because one read can
+carry a session's worth of links or fill a screen, and a bound that is only checked afterwards is
+not a bound. A link's cost is reserved before it is applied, and a link that will not fit is
+refused; refusing one ends the link that was open, because the text that belonged to the refused
+link must not end up inside the previous one. Printing is charged the same way, held to what the
+buffer's cells can hold: a screen is a fixed number of cells, so printing through the same cell a
+thousand times costs what one cell costs. A reservation is deliberately generous, charging a
+string at twice what it holds, which is the most a doubling allocator keeps for it, so a later
+measurement never finds more than the session was already charged.
+
+What a measurement counts is what the grid is holding, not a figure standing in for it: the
+capacity of a link's parameter table rather than how many parameters it has, the capacity of each
+key and value, and the allocation a cell keeps for the colours, underline colour, link handle and
+image list that the packed form on the cell cannot hold. Counting only characters would report a
+screen of coloured, linked cells as costing what a screen of plain ones costs.
 
 What the budget records is what the rows actually cost, not what they are allowed to cost. Recording
 the bound instead would make a session that is over its cache look exactly like one that is at it,

@@ -1038,6 +1038,99 @@ fn one_large_read_is_measured_before_the_next_one() {
     );
 }
 
+/// What printing adds is charged as it is applied, so the bound holds between two measurements.
+#[test]
+fn printing_is_charged_before_anything_measures_it() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(8, 2),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // True colour, so every cell keeps an allocation of its own for its attributes.
+    engine.feed(b"\x1b[38;2;10;20;30mabcdefgh", 0);
+    let charged = engine.budget().usage().screen_content[0];
+    assert!(
+        charged > 0,
+        "what was printed is charged before a measurement looks at it"
+    );
+
+    // Printing through the same cells cannot charge more than those cells can hold, however much
+    // goes through them.
+    let ceiling = engine.grid().screen_content_ceiling();
+    for _ in 0..128 {
+        engine.feed(b"\x1b[H\x1b[38;2;10;20;30mabcdefgh", 0);
+        assert!(
+            engine.budget().usage().screen_content[0] <= ceiling,
+            "a buffer is never charged more than its cells can hold"
+        );
+    }
+    assert!(!engine.budget().session_over_budget());
+}
+
+/// A measurement never finds more than the reservation charged for, so usage never rises when
+/// someone looks.
+#[test]
+fn a_link_costs_no_more_than_what_was_reserved_for_it() {
+    let mut engine = engine();
+    let text = "id=one:two=three;https://example.invalid/path";
+    engine.feed(format!("\x1b]8;{text}\x1b\\X").as_bytes(), 0);
+    engine.quiesce(0);
+    let reserved = kr_term::grid::link_cost(text, 2);
+    let measured = engine.grid().screen_link_bytes();
+    assert!(measured > 0, "a link on the screen is resident state");
+    assert!(
+        measured <= reserved,
+        "measured {measured} bytes against a reservation of {reserved}"
+    );
+}
+
+/// A cell that keeps an allocation of its own for its attributes costs more than one that does
+/// not, so a screen of coloured cells is not charged as a screen of plain ones.
+#[test]
+fn a_cell_is_charged_for_the_attributes_it_keeps() {
+    fn content(input: &[u8]) -> u64 {
+        let mut engine = Engine::new(EngineConfig {
+            size: GridSize::new(16, 2),
+            ..EngineConfig::DEFAULT
+        })
+        .expect("engine");
+        engine.feed(input, 0);
+        engine.quiesce(0);
+        engine.grid().screen_content_bytes()
+    }
+
+    let plain = content(b"abcdefghabcdefgh");
+    let coloured = content(b"\x1b[38;2;10;20;30mabcdefghabcdefgh");
+    assert!(
+        coloured > plain,
+        "coloured cells cost {coloured} against {plain} for plain ones"
+    );
+}
+
+/// The buffer that is not showing still holds what it holds, so its charge is not replaced by the
+/// other buffer's.
+#[test]
+fn each_buffer_keeps_its_own_charge_across_a_switch() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(16, 3),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    engine.feed(b"\x1b[41mfilled with colour", 0);
+    assert!(engine.budget().usage().screen_content[0] > 0);
+
+    engine.feed(b"\x1b[?1049h", 0);
+    assert!(
+        engine.budget().usage().screen_content[0] > 0,
+        "the primary buffer still holds its rows while the alternate one is showing"
+    );
+    assert_eq!(
+        engine.budget().usage().screen_content[1],
+        0,
+        "the alternate buffer has nothing on it yet"
+    );
+}
+
 /// A hyperlink costs what the whole link costs, identifier included.
 #[test]
 fn hyperlink_identifiers_are_counted() {

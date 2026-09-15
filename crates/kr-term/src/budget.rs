@@ -286,6 +286,20 @@ impl SessionBudget {
         self.usage.screen_content[alternate as usize] = bytes;
     }
 
+    /// Charges growth to one buffer's content before it is allocated, up to `ceiling`.
+    ///
+    /// Printing cannot wait for the next measurement: one read can fill a screen, and a figure
+    /// that only goes up when someone looks is not a bound. It is held at the ceiling because a
+    /// screen is a fixed number of cells: printing through the same cell a thousand times costs
+    /// what one cell costs, and charging every character would report a session as far past a
+    /// bound it is nowhere near. The next measurement replaces the charge with what the buffer
+    /// actually holds.
+    pub const fn add_screen_content(&mut self, alternate: bool, bytes: u64, ceiling: u64) {
+        let slot = alternate as usize;
+        let charged = self.usage.screen_content[slot].saturating_add(bytes);
+        self.usage.screen_content[slot] = if charged > ceiling { ceiling } else { charged };
+    }
+
     /// Clears the recorded content cost of both buffers, after a reset emptied them.
     pub const fn clear_screen_content(&mut self) {
         self.usage.screen_content = [0, 0];
