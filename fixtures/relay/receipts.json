@@ -1,0 +1,119 @@
+{
+  "cases": [
+    {
+      "cbor_hex": "a66873657175656e6365016e62797465735f636f6e73756d65641a000400006e6c656173655f7265766973696f6e016e6f627365727665645f61745f6d731b000001a3185c77106e7265736572766174696f6e5f696450111111111111111111111111111111117172656c61795f696e7374616e63655f69645031313131313131313131313131313131",
+      "description": "The first receipt of a reservation: 256 KiB spent.",
+      "domain": "kr-relay/receipt/1",
+      "id": "receipt_first",
+      "json": {
+        "bytes_consumed": "262144",
+        "lease_revision": "1",
+        "observed_at_ms": "1800000010000",
+        "relay_instance_id": "31313131-3131-3131-3131-313131313131",
+        "reservation_id": "11111111-1111-1111-1111-111111111111",
+        "sequence": "1"
+      },
+      "sha256": "d96fe7df6be64c775264f79fbbb64a1d6e9ab5fcdaeca82b40d57ea4b5b6f9a3",
+      "signing_input_hex": "82726b722d72656c61792f726563656970742f31a66873657175656e6365016e62797465735f636f6e73756d65641a000400006e6c656173655f7265766973696f6e016e6f627365727665645f61745f6d731b000001a3185c77106e7265736572766174696f6e5f696450111111111111111111111111111111117172656c61795f696e7374616e63655f69645031313131313131313131313131313131",
+      "value": {
+        "map": [
+          [
+            "sequence",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "bytes_consumed",
+            {
+              "int": "262144"
+            }
+          ],
+          [
+            "lease_revision",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "observed_at_ms",
+            {
+              "int": "1800000010000"
+            }
+          ],
+          [
+            "reservation_id",
+            {
+              "bytes": "11111111111111111111111111111111"
+            }
+          ],
+          [
+            "relay_instance_id",
+            {
+              "bytes": "31313131313131313131313131313131"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "cbor_hex": "a66873657175656e6365026e62797465735f636f6e73756d65641a001000006e6c656173655f7265766973696f6e016e6f627365727665645f61745f6d731b000001a3185c9e206e7265736572766174696f6e5f696450111111111111111111111111111111117172656c61795f696e7374616e63655f69645031313131313131313131313131313131",
+      "description": "The next receipt of the same reservation: 1 MiB spent in total, not 1 MiB more.",
+      "domain": "kr-relay/receipt/1",
+      "id": "receipt_second",
+      "json": {
+        "bytes_consumed": "1048576",
+        "lease_revision": "1",
+        "observed_at_ms": "1800000020000",
+        "relay_instance_id": "31313131-3131-3131-3131-313131313131",
+        "reservation_id": "11111111-1111-1111-1111-111111111111",
+        "sequence": "2"
+      },
+      "sha256": "0974210a5e38e7285746f456f134418fb94fb669544890b694417e2961ad0f0e",
+      "signing_input_hex": "82726b722d72656c61792f726563656970742f31a66873657175656e6365026e62797465735f636f6e73756d65641a001000006e6c656173655f7265766973696f6e016e6f627365727665645f61745f6d731b000001a3185c9e206e7265736572766174696f6e5f696450111111111111111111111111111111117172656c61795f696e7374616e63655f69645031313131313131313131313131313131",
+      "value": {
+        "map": [
+          [
+            "sequence",
+            {
+              "int": "2"
+            }
+          ],
+          [
+            "bytes_consumed",
+            {
+              "int": "1048576"
+            }
+          ],
+          [
+            "lease_revision",
+            {
+              "int": "1"
+            }
+          ],
+          [
+            "observed_at_ms",
+            {
+              "int": "1800000020000"
+            }
+          ],
+          [
+            "reservation_id",
+            {
+              "bytes": "11111111111111111111111111111111"
+            }
+          ],
+          [
+            "relay_instance_id",
+            {
+              "bytes": "31313131313131313131313131313131"
+            }
+          ]
+        ]
+      }
+    }
+  ],
+  "description": "Signed relay consumption receipts.",
+  "name": "relay-receipts",
+  "note": "value is the object in the fixtures/cbor description grammar; cbor_hex is its canonical KR-CBOR-1 encoding; signing_input_hex is CBOR([domain, value]) and sha256 is that input's digest; json is the managed HTTP representation of the same object. bytes_consumed is cumulative for the reservation, on the same scale as the lease's byte_ceiling."
+}

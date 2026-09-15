@@ -44,7 +44,7 @@ export interface FixtureFile {
 }
 
 /** Loads one fixture document from `fixtures/<area>/<name>`. */
-export function loadFixture (area: 'cbor' | 'protocol', name: string): FixtureFile {
+export function loadFixture (area: 'cbor' | 'protocol' | 'relay', name: string): FixtureFile {
   const path = join(repositoryRoot, 'fixtures', area, name)
   return JSON.parse(readFileSync(path, 'utf8')) as FixtureFile
 }

@@ -1,0 +1,156 @@
+{
+  "cases": [
+    {
+      "cbor_hex": "a766726567696f6e6a65752d63656e7472616c6972656c61795f75726c781d68747470733a2f2f72656c61792d312e72656163682e6b616c612e746f69737563636573736f72f66c696e7374616e63655f6b6579582061616161616161616161616161616161616161616161616161616161616161616d76616c69645f66726f6d5f6d731b000001a3185c50006e76616c69645f756e74696c5f6d731b000001aa700d7c007172656c61795f696e7374616e63655f69645031313131313131313131313131313131",
+      "description": "A relay instance registers the key it signs receipts with, for one year.",
+      "domain": "kr-relay/instance/1",
+      "id": "instance_registration",
+      "json": {
+        "instance_key": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE",
+        "region": "eu-central",
+        "relay_instance_id": "31313131-3131-3131-3131-313131313131",
+        "relay_url": "https://relay-1.reach.kala.to",
+        "successor": null,
+        "valid_from_ms": "1800000000000",
+        "valid_until_ms": "1831536000000"
+      },
+      "sha256": "624bff1035498c31346f778dbee4677ecccd929c66bcb6a344ae3f9e0c60660e",
+      "signing_input_hex": "82736b722d72656c61792f696e7374616e63652f31a766726567696f6e6a65752d63656e7472616c6972656c61795f75726c781d68747470733a2f2f72656c61792d312e72656163682e6b616c612e746f69737563636573736f72f66c696e7374616e63655f6b6579582061616161616161616161616161616161616161616161616161616161616161616d76616c69645f66726f6d5f6d731b000001a3185c50006e76616c69645f756e74696c5f6d731b000001aa700d7c007172656c61795f696e7374616e63655f69645031313131313131313131313131313131",
+      "value": {
+        "map": [
+          [
+            "region",
+            {
+              "text": "eu-central"
+            }
+          ],
+          [
+            "relay_url",
+            {
+              "text": "https://relay-1.reach.kala.to"
+            }
+          ],
+          [
+            "successor",
+            {
+              "null": null
+            }
+          ],
+          [
+            "instance_key",
+            {
+              "bytes": "6161616161616161616161616161616161616161616161616161616161616161"
+            }
+          ],
+          [
+            "valid_from_ms",
+            {
+              "int": "1800000000000"
+            }
+          ],
+          [
+            "valid_until_ms",
+            {
+              "int": "1831536000000"
+            }
+          ],
+          [
+            "relay_instance_id",
+            {
+              "bytes": "31313131313131313131313131313131"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "cbor_hex": "a766726567696f6e6a65752d63656e7472616c6972656c61795f75726c781d68747470733a2f2f72656c61792d312e72656163682e6b616c612e746f69737563636573736f72a36c696e7374616e63655f6b6579582062626262626262626262626262626262626262626262626262626262626262626f6f7665726c61705f66726f6d5f6d731b000001a6966e260078197072656465636573736f725f726574697265735f61745f6d731b000001a6ba7aaa006c696e7374616e63655f6b6579582061616161616161616161616161616161616161616161616161616161616161616d76616c69645f66726f6d5f6d731b000001a3185c50006e76616c69645f756e74696c5f6d731b000001aa700d7c007172656c61795f696e7374616e63655f69645031313131313131313131313131313131",
+      "description": "The same instance announces its successor key and the week both keys are accepted.",
+      "domain": "kr-relay/instance/1",
+      "id": "instance_rotation",
+      "json": {
+        "instance_key": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE",
+        "region": "eu-central",
+        "relay_instance_id": "31313131-3131-3131-3131-313131313131",
+        "relay_url": "https://relay-1.reach.kala.to",
+        "successor": {
+          "instance_key": "YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI",
+          "overlap_from_ms": "1815000000000",
+          "predecessor_retires_at_ms": "1815604800000"
+        },
+        "valid_from_ms": "1800000000000",
+        "valid_until_ms": "1831536000000"
+      },
+      "sha256": "1e44d830ad55da1c14850c9d63702ab10a451bfd9aad9f539ecf4ad10a638430",
+      "signing_input_hex": "82736b722d72656c61792f696e7374616e63652f31a766726567696f6e6a65752d63656e7472616c6972656c61795f75726c781d68747470733a2f2f72656c61792d312e72656163682e6b616c612e746f69737563636573736f72a36c696e7374616e63655f6b6579582062626262626262626262626262626262626262626262626262626262626262626f6f7665726c61705f66726f6d5f6d731b000001a6966e260078197072656465636573736f725f726574697265735f61745f6d731b000001a6ba7aaa006c696e7374616e63655f6b6579582061616161616161616161616161616161616161616161616161616161616161616d76616c69645f66726f6d5f6d731b000001a3185c50006e76616c69645f756e74696c5f6d731b000001aa700d7c007172656c61795f696e7374616e63655f69645031313131313131313131313131313131",
+      "value": {
+        "map": [
+          [
+            "region",
+            {
+              "text": "eu-central"
+            }
+          ],
+          [
+            "relay_url",
+            {
+              "text": "https://relay-1.reach.kala.to"
+            }
+          ],
+          [
+            "successor",
+            {
+              "map": [
+                [
+                  "instance_key",
+                  {
+                    "bytes": "6262626262626262626262626262626262626262626262626262626262626262"
+                  }
+                ],
+                [
+                  "overlap_from_ms",
+                  {
+                    "int": "1815000000000"
+                  }
+                ],
+                [
+                  "predecessor_retires_at_ms",
+                  {
+                    "int": "1815604800000"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "instance_key",
+            {
+              "bytes": "6161616161616161616161616161616161616161616161616161616161616161"
+            }
+          ],
+          [
+            "valid_from_ms",
+            {
+              "int": "1800000000000"
+            }
+          ],
+          [
+            "valid_until_ms",
+            {
+              "int": "1831536000000"
+            }
+          ],
+          [
+            "relay_instance_id",
+            {
+              "bytes": "31313131313131313131313131313131"
+            }
+          ]
+        ]
+      }
+    }
+  ],
+  "description": "Relay instance registrations, including an announced key rotation.",
+  "name": "relay-instances",
+  "note": "value is the object in the fixtures/cbor description grammar; cbor_hex is its canonical KR-CBOR-1 encoding; signing_input_hex is CBOR([domain, value]) and sha256 is that input's digest; json is the managed HTTP representation of the same object."
+}
