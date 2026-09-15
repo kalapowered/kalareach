@@ -30,6 +30,7 @@
 //! | [`method`] | The method registry: one exhaustive entry per method, and the deny rule |
 //! | [`envelope`] | Request, mutation, response and notification envelopes |
 //! | [`receipt`] | Receipt states and the transition contract |
+//! | [`relay`] | Relay leases, consumption receipts and relay instance registration |
 //! | [`error`] | Error codes, retry categories and the error object |
 //! | [`frame`] | Stream headers and the length-delimited frame codec |
 //! | [`hello`] | Version negotiation and the `kr-connect/1` proof transcript |
@@ -87,6 +88,7 @@ pub mod mailbox;
 pub mod method;
 pub mod pairing;
 pub mod receipt;
+pub mod relay;
 pub mod rights;
 pub mod scalars;
 pub mod schema;

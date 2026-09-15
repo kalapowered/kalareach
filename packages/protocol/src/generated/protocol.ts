@@ -162,6 +162,10 @@ export type HelloReply =
       refused: ProtocolError
     }
 /**
+ * A managed account identifier minted by the service. It names the payer; it is not authority.
+ */
+export type AccountId = string
+/**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
 export type ActionId = string
@@ -306,6 +310,10 @@ export type OrganisationId = string
  */
 export type PairingSequence = string
 /**
+ * The service record that authorised one principal to pay for another's relay traffic.
+ */
+export type PayerAuthorisationId = string
+/**
  * A plugin identifier from its manifest.
  */
 export type PluginId = string
@@ -333,6 +341,30 @@ export type U64 = string
  * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
  */
 export type Uuid = string
+/**
+ * One relay instance. Stable across rotation of the key it signs receipts with.
+ */
+export type RelayInstanceId = string
+/**
+ * One relay lease, covering one endpoint pair for one payer.
+ */
+export type RelayLeaseId = string
+/**
+ * The revision of one relay lease. Only the issuing service advances it.
+ */
+export type RelayLeaseRevision = string
+/**
+ * The position of one consumption receipt inside its reservation's sequence.
+ */
+export type RelayReceiptSequence = string
+/**
+ * The deployment region one relay instance serves.
+ */
+export type RelayRegion = string
+/**
+ * One reserved block of relay bytes. Consumption receipts are keyed by it.
+ */
+export type RelayReservationId = string
 /**
  * One remote dispatch lease from the current controller generation.
  */
@@ -479,6 +511,20 @@ export type PairStatus =
       }
     }
 /**
+ * What the payer's client sends to a relay's control endpoint.
+ */
+export type RelayLeaseRequest =
+  | {
+      install: {
+        lease: SignedRelayLease
+      }
+    }
+  | {
+      revoke: {
+        revocation: SignedRelayLeaseRevocation
+      }
+    }
+/**
  * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
  */
 export type NetworkHint = string
@@ -505,6 +551,7 @@ export interface KalaReachProtocol {
    * Every identifier in the identity and object model. This is a vocabulary rather than a message: it exists so each identifier has one named type.
    */
   identifiers?: {
+    account_id?: AccountId
     action_id?: ActionId
     action_window_id?: ActionWindowId
     actor_id?: ActorId
@@ -550,6 +597,7 @@ export interface KalaReachProtocol {
     machine_id?: MachineId
     organisation_id?: OrganisationId
     pairing_sequence?: PairingSequence
+    payer_authorisation_id?: PayerAuthorisationId
     plugin_id?: PluginId
     project_repository_id?: ProjectRepositoryId
     question_id?: QuestionId
@@ -559,6 +607,12 @@ export interface KalaReachProtocol {
     raw_timestamp_ms?: TimestampMs
     raw_u64?: U64
     raw_uuid?: Uuid
+    relay_instance_id?: RelayInstanceId
+    relay_lease_id?: RelayLeaseId
+    relay_lease_revision?: RelayLeaseRevision
+    relay_receipt_sequence?: RelayReceiptSequence
+    relay_region?: RelayRegion
+    relay_reservation_id?: RelayReservationId
     remote_dispatch_lease_id?: RemoteDispatchLeaseId
     repository_generation?: RepositoryGeneration
     request_id?: RequestId
@@ -586,6 +640,10 @@ export interface KalaReachProtocol {
   receipt_response?: ReceiptResponse
   recovery_bundle?: RecoveryBundle
   recovery_kit?: RecoveryKit
+  relay_consumption_ack?: RelayConsumptionAck
+  relay_consumption_report?: RelayConsumptionReport
+  relay_lease_ack?: RelayLeaseAck
+  relay_lease_request?: RelayLeaseRequest
   request?: Request
   response?: Response
   revocation_acknowledgement?: RevocationAcknowledgement
@@ -595,6 +653,8 @@ export interface KalaReachProtocol {
   signed_archive_manifest?: SignedArchiveManifest
   signed_client_bundle?: SignedClientBundle
   signed_host_bundle?: SignedHostBundle
+  signed_relay_consumption_receipt?: SignedRelayConsumptionReceipt
+  signed_relay_instance_registration?: SignedRelayInstanceRegistration
   stream_header?: StreamHeader
 }
 /**
@@ -2322,6 +2382,308 @@ export interface RecoveryKit {
   service_origins: string[]
 }
 /**
+ * The service's answer to a consumption report.
+ *
+ * It states what the service has recorded rather than what the report contained, so a relay
+ * recovering from a crash learns from one exchange exactly which position to replay from.
+ */
+export interface RelayConsumptionAck {
+  /**
+   * True when the service is holding out for receipts it has not been given. The reservation
+   * stays outstanding until they arrive or until it is settled conservatively.
+   */
+  awaiting_receipts: boolean
+  /**
+   * The cumulative bytes recorded for the reservation.
+   */
+  bytes_recorded: string
+  /**
+   * The next sequence the service will accept. A relay resumes from here.
+   */
+  next_sequence: string
+  /**
+   * The highest sequence recorded for it, or null when none has been.
+   */
+  recorded_through: RelayReceiptSequence | null
+  /**
+   * The reservation the report was about.
+   */
+  reservation_id: string
+}
+/**
+ * What a relay posts to the service to report consumption.
+ *
+ * A report carries receipts for one reservation in ascending order. Reporting is idempotent, so a
+ * relay that is unsure whether a report arrived sends it again rather than skipping it, and a
+ * relay resuming after a restart replays from the last position the service acknowledged.
+ */
+export interface RelayConsumptionReport {
+  /**
+   * The receipts, in ascending sequence order.
+   */
+  receipts: SignedRelayConsumptionReceipt[]
+  /**
+   * The relay instance reporting.
+   */
+  relay_instance_id: string
+  /**
+   * The reservation being reported.
+   */
+  reservation_id: string
+}
+/**
+ * A receipt and the relay instance signature that authenticates it.
+ */
+export interface SignedRelayConsumptionReceipt {
+  receipt: RelayConsumptionReceipt
+  /**
+   * The Ed25519 signature over `CBOR(["kr-relay/receipt/1", receipt])`, by the registered key
+   * of the receipt's relay instance.
+   */
+  signature: string
+}
+/**
+ * The receipt.
+ */
+export interface RelayConsumptionReceipt {
+  /**
+   * The bytes spent from the reservation so far. Cumulative and never decreasing.
+   */
+  bytes_consumed: string
+  /**
+   * The lease revision that was in force when the count was taken.
+   */
+  lease_revision: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  observed_at_ms: string
+  /**
+   * The relay instance that counted the bytes.
+   */
+  relay_instance_id: string
+  /**
+   * The reservation the bytes were spent from.
+   */
+  reservation_id: string
+  /**
+   * The position of one consumption receipt inside its reservation's sequence.
+   */
+  sequence: string
+}
+/**
+ * A relay's answer to a control request.
+ *
+ * An exact retry of an installation answers with the same state and the same running figures: the
+ * relay keeps what it has counted, so re-sending a lease can never restore a spent ceiling.
+ */
+export interface RelayLeaseAck {
+  /**
+   * The cumulative bytes counted for its reservation so far.
+   */
+  bytes_consumed: string
+  /**
+   * The bytes still forwardable under it.
+   */
+  bytes_remaining: string
+  /**
+   * The milliseconds of grace left, or null when the pair is not in grace. Section 17 requires
+   * the remaining interval to be visible before the relay closes.
+   */
+  grace_remaining_ms: U64 | null
+  /**
+   * The lease the request named.
+   */
+  lease_id: string
+  /**
+   * The revision the relay now holds.
+   */
+  revision: string
+  /**
+   * What the relay holds for that lease.
+   */
+  state: 'installed' | 'superseded' | 'revoked' | 'expired' | 'exhausted'
+}
+/**
+ * The lease to install. Boxed because a lease is much the larger of the two requests and
+ * an unboxed variant would make every revocation carry its size.
+ */
+export interface SignedRelayLease {
+  lease: RelayLease
+  /**
+   * The Ed25519 signature over `CBOR(["kr-relay/lease/1", lease])`, by the lease's issuer key.
+   */
+  signature: string
+}
+/**
+ * The lease.
+ */
+export interface RelayLease {
+  /**
+   * The cumulative bytes this reservation may reach at the metering boundary. A refill raises
+   * it; it never falls.
+   */
+  byte_ceiling: string
+  /**
+   * The endpoint that may receive.
+   */
+  destination_endpoint_key: string
+  /**
+   * Whether the reverse direction is permitted too.
+   */
+  direction: 'source_to_destination' | 'bidirectional'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The bounded grace this pair is inside, or null when the principal is not in grace.
+   */
+  grace: RelayGrace | null
+  /**
+   * The service admission key that signs this lease. A relay accepts it only when the key is
+   * one it pins.
+   */
+  issuer_key: string
+  /**
+   * The lease identity. One lease covers one endpoint pair for one payer.
+   */
+  lease_id: string
+  /**
+   * The relay instance that counts the bytes. One of the two positions in the scope.
+   */
+  metering_relay_instance_id: string
+  /**
+   * Which of that instance's own boundaries takes the count.
+   */
+  metering_role: 'ingress' | 'egress'
+  /**
+   * Who is billed.
+   */
+  payer:
+    | {
+        account: {
+          /**
+           * The account that is billed.
+           */
+          account_id: string
+        }
+      }
+    | {
+        installation: {
+          /**
+           * The installation that is billed.
+           */
+          installation_id: string
+        }
+      }
+  /**
+   * Why that principal is the one billed.
+   */
+  payer_authorisation:
+    | 'host_selected'
+    | {
+        sponsored: {
+          /**
+           * The sponsor's authorisation record.
+           */
+          authorisation_id: string
+        }
+      }
+  relay_scope: RelayScope
+  /**
+   * The reserved block this lease spends from. It is bound for its lifetime to this lease, this
+   * payer, this pair and this metering boundary; changing any of them takes a new reservation.
+   */
+  reservation_id: string
+  /**
+   * The revision of this lease. Strictly increasing per lease identity; a relay keeps the
+   * highest revision it has seen and refuses anything lower, so a replaced lease cannot be
+   * rolled back to an earlier ceiling or an earlier deadline.
+   */
+  revision: string
+  /**
+   * The endpoint that may send.
+   */
+  source_endpoint_key: string
+}
+/**
+ * The bounded grace a principal is inside, as the service has told this relay.
+ *
+ * Section 17 grants a principal up to fifteen minutes or 100 MiB after exhaustion, whichever ends
+ * first, shared across every connection of that principal. It starts at the first exhaustion
+ * event, and reconnects, new endpoints and other regions cannot restart it: only the service knows
+ * when the principal first exhausted its allowance, and a relay only ever receives what is left of
+ * one grace period as a slice of it.
+ *
+ * The slice is expressed as a raised cumulative ceiling on the same reservation, so the relay has
+ * one number to compare its running total against whether the lease is in grace or not.
+ */
+export interface RelayGrace {
+  /**
+   * The cumulative bytes this reservation may reach inside the grace. Never below the lease's
+   * own ceiling, and above it by at most [`MAX_GRACE_BYTES`].
+   */
+  byte_ceiling: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  ends_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at_ms: string
+}
+/**
+ * The two relay positions this lease is valid at.
+ */
+export interface RelayScope {
+  /**
+   * The relay instance the destination endpoint is connected to.
+   */
+  egress_relay_instance_id: string
+  /**
+   * The relay instance the source endpoint is connected to.
+   */
+  ingress_relay_instance_id: string
+}
+/**
+ * The revocation to apply.
+ */
+export interface SignedRelayLeaseRevocation {
+  revocation: RelayLeaseRevocation
+  /**
+   * The Ed25519 signature over `CBOR(["kr-relay/revoke/1", revocation])`.
+   */
+  signature: string
+}
+/**
+ * The revocation.
+ */
+export interface RelayLeaseRevocation {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * The service admission key that signs it.
+   */
+  issuer_key: string
+  /**
+   * The lease to stop forwarding under.
+   */
+  lease_id: string
+  /**
+   * The relay instance this revocation is addressed to, so one relay's copy cannot be replayed
+   * at another.
+   */
+  relay_instance_id: string
+  /**
+   * The revision this revocation installs. Strictly higher than the revision it fences.
+   */
+  revision: string
+}
+/**
  * The host's acknowledgement of one revocation request.
  */
 export interface RevocationAcknowledgement {
@@ -2341,7 +2703,7 @@ export interface RevocationAcknowledgement {
     | {
         pending: {
           /**
-           * How many workers are still outstanding.
+           * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
            */
           pending_workers: string
         }
@@ -2733,6 +3095,75 @@ export interface ProposedGrant1 {
         }
       }
     | 'none'
+}
+/**
+ * A registration and the instance signature that proves the host holds the key.
+ *
+ * The operator submits this under service-admin authority. The authority says the submission is
+ * permitted; the signature says the key being registered is one a relay host actually has, so a
+ * mistyped key cannot become the key every later receipt is checked against.
+ */
+export interface SignedRelayInstanceRegistration {
+  registration: RelayInstanceRegistration
+  /**
+   * The Ed25519 signature over `CBOR(["kr-relay/instance/1", registration])`, by the instance
+   * key the registration currently holds.
+   */
+  signature: string
+}
+/**
+ * The registration.
+ */
+export interface RelayInstanceRegistration {
+  /**
+   * The public half of the key this instance signs receipts with.
+   */
+  instance_key: string
+  /**
+   * The deployment region this instance serves.
+   */
+  region: string
+  /**
+   * The instance identity. Stable across key rotation.
+   */
+  relay_instance_id: string
+  /**
+   * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
+   */
+  relay_url: string
+  /**
+   * The successor key and its overlap window, or null when no rotation is announced.
+   */
+  successor: RelayKeySuccession | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  valid_from_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  valid_until_ms: string
+}
+/**
+ * A successor key and the window in which both keys are accepted.
+ *
+ * Rotation cannot be instantaneous: receipts signed before the change are still in flight when the
+ * new key starts signing. The overlap is that window, stated in advance and ending at a recorded
+ * time rather than whenever somebody remembers to retire the old key.
+ */
+export interface RelayKeySuccession {
+  /**
+   * The key that takes over.
+   */
+  instance_key: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  overlap_from_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  predecessor_retires_at_ms: string
 }
 /**
  * The bounded header every stream sends first.

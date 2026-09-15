@@ -223,6 +223,33 @@ fn validate_opaque_id(value: &str) -> Result<(), OpaqueIdError> {
 }
 
 uuid_id!(
+    /// One relay lease: one endpoint pair, one payer.
+    RelayLeaseId,
+    "One relay lease, covering one endpoint pair for one payer."
+);
+uuid_id!(
+    /// One reserved block of relay bytes. Consumption is reported against it.
+    RelayReservationId,
+    "One reserved block of relay bytes. Consumption receipts are keyed by it."
+);
+uuid_id!(
+    /// One relay instance. Stable across rotation of the key it signs receipts with.
+    RelayInstanceId,
+    "One relay instance. Stable across rotation of the key it signs receipts with."
+);
+
+counter_id!(
+    /// The revision of one relay lease. Only the issuing service advances it.
+    RelayLeaseRevision,
+    "The revision of one relay lease. Only the issuing service advances it."
+);
+counter_id!(
+    /// The position of one consumption receipt inside its reservation's sequence.
+    RelayReceiptSequence,
+    "The position of one consumption receipt inside its reservation's sequence."
+);
+
+uuid_id!(
     /// A random owner-approved logical grouping of environments. Not a hardware identity.
     MachineId,
     "A logical machine group. Not a hardware identity."
@@ -536,6 +563,24 @@ opaque_id!(
     /// A build identifier reported in `hello`.
     BuildId,
     "A build identifier reported in hello."
+);
+opaque_id!(
+    /// A managed account, as the service names it.
+    ///
+    /// It names who is billed. Authority to bill them comes from the issuer's signature over the
+    /// object carrying it, never from the identifier.
+    AccountId,
+    "A managed account identifier minted by the service. It names the payer; it is not authority."
+);
+opaque_id!(
+    /// The record that authorised one principal to pay for another's relay traffic.
+    PayerAuthorisationId,
+    "The service record that authorised one principal to pay for another's relay traffic."
+);
+opaque_id!(
+    /// The deployment region one relay instance serves.
+    RelayRegion,
+    "The deployment region one relay instance serves."
 );
 opaque_id!(
     /// An opaque diagnostic identifier attached to an error.

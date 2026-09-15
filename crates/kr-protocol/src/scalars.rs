@@ -690,6 +690,27 @@ fixed_bytes!(
 );
 
 fixed_bytes!(
+    /// An Ed25519 relay instance public key.
+    ///
+    /// Its private half is generated on the relay host and never leaves it. The service records
+    /// this half and checks every consumption receipt against it.
+    RelayInstanceKey,
+    32,
+    "A 32-byte Ed25519 relay instance public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."
+);
+
+fixed_bytes!(
+    /// An Ed25519 service admission public key.
+    ///
+    /// The managed service signs relay leases and revocations with its private half. A relay pins
+    /// the admission keys it accepts, so a lease signed by any other key is refused whatever it
+    /// claims about itself.
+    ServiceAdmissionKey,
+    32,
+    "A 32-byte Ed25519 service admission public key, which signs relay leases. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."
+);
+
+fixed_bytes!(
     /// A stable identifier for one purpose-separated public key.
     ///
     /// It is the SHA-256 of the domain-separated encoding of the purpose and the key, so two

@@ -29,6 +29,10 @@ use crate::pairing::{
     RevocationAcknowledgement, RevocationRequest, SignedClientBundle, SignedHostBundle,
 };
 use crate::receipt::{Receipt, ReceiptResponse};
+use crate::relay::{
+    RelayConsumptionAck, RelayConsumptionReport, RelayLeaseAck, RelayLeaseRequest,
+    SignedRelayConsumptionReceipt, SignedRelayInstanceRegistration,
+};
 
 /// The generated JSON Schema bundle.
 pub const SCHEMA_FILE_NAME: &str = "kalareach-protocol.schema.json";
@@ -82,6 +86,10 @@ pub fn protocol_schema() -> Value {
         "protocol_error" => ProtocolError,
         "receipt" => Receipt,
         "receipt_response" => ReceiptResponse,
+        "relay_consumption_ack" => RelayConsumptionAck,
+        "relay_consumption_report" => RelayConsumptionReport,
+        "relay_lease_ack" => RelayLeaseAck,
+        "relay_lease_request" => RelayLeaseRequest,
         "recovery_bundle" => RecoveryBundle,
         "recovery_kit" => RecoveryKit,
         "request" => Request,
@@ -93,6 +101,8 @@ pub fn protocol_schema() -> Value {
         "signed_archive_manifest" => SignedArchiveManifest,
         "signed_client_bundle" => SignedClientBundle,
         "signed_host_bundle" => SignedHostBundle,
+        "signed_relay_consumption_receipt" => SignedRelayConsumptionReceipt,
+        "signed_relay_instance_registration" => SignedRelayInstanceRegistration,
         "stream_header" => StreamHeader,
     }
     properties.insert(
@@ -131,6 +141,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "raw_timestamp_ms" => crate::scalars::TimestampMs,
         "raw_duration_ms" => crate::scalars::DurationMs,
         // The identity and object model.
+        "account_id" => ids::AccountId,
         "action_id" => ids::ActionId,
         "action_window_id" => ids::ActionWindowId,
         "actor_id" => ids::ActorId,
@@ -176,10 +187,17 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "machine_id" => ids::MachineId,
         "organisation_id" => ids::OrganisationId,
         "pairing_sequence" => ids::PairingSequence,
+        "payer_authorisation_id" => ids::PayerAuthorisationId,
         "plugin_id" => ids::PluginId,
         "project_repository_id" => ids::ProjectRepositoryId,
         "question_id" => ids::QuestionId,
         "question_revision" => ids::QuestionRevision,
+        "relay_instance_id" => ids::RelayInstanceId,
+        "relay_lease_id" => ids::RelayLeaseId,
+        "relay_lease_revision" => ids::RelayLeaseRevision,
+        "relay_receipt_sequence" => ids::RelayReceiptSequence,
+        "relay_region" => ids::RelayRegion,
+        "relay_reservation_id" => ids::RelayReservationId,
         "remote_dispatch_lease_id" => ids::RemoteDispatchLeaseId,
         "repository_generation" => ids::RepositoryGeneration,
         "request_id" => ids::RequestId,
