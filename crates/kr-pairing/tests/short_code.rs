@@ -142,11 +142,7 @@ impl Harness {
             endpoint_id: *self.host_keys.transport.public(),
             keys: self.host_keys.public_keys(),
             device_key_revision: DeviceKeyRevision::new(1),
-            network_config: NetworkConfig {
-                relay_urls: Vec::new(),
-                discovery_origins: Vec::new(),
-                direct_addresses: Vec::new(),
-            },
+            network_config: NetworkConfig::empty(),
         }
     }
 

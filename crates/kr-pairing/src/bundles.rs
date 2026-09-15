@@ -411,11 +411,7 @@ mod tests {
             device_key_revision: DeviceKeyRevision::new(1),
             endpoint_id: *keys.transport.public(),
             keys: keys.public_keys(),
-            network_config: NetworkConfig {
-                relay_urls: Vec::new(),
-                discovery_origins: Vec::new(),
-                direct_addresses: Vec::new(),
-            },
+            network_config: NetworkConfig::empty(),
             proposed_grant: ProposedGrant {
                 parent_grant_id: Nullable::null(),
                 environment_selector: EnvironmentSelector::Any,

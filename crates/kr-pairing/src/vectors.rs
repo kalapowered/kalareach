@@ -306,7 +306,17 @@ fn code_vectors() -> Result<Value> {
             relay_urls: vec![
                 kr_protocol::pairing::NetworkHint::new("https://relay.kala.to").expect("a hint"),
             ],
-            discovery_origins: Vec::new(),
+            pkarr_publisher_url: kr_protocol::scalars::Nullable::some(
+                kr_protocol::pairing::NetworkHint::new("https://discovery.kala.to/pkarr")
+                    .expect("a hint"),
+            ),
+            pkarr_resolver_url: kr_protocol::scalars::Nullable::some(
+                kr_protocol::pairing::NetworkHint::new("https://discovery.kala.to/pkarr")
+                    .expect("a hint"),
+            ),
+            dns_origin: kr_protocol::scalars::Nullable::some(
+                kr_protocol::pairing::NetworkHint::new("discovery.kala.to").expect("a hint"),
+            ),
             direct_addresses: vec![
                 kr_protocol::pairing::NetworkHint::new("192.0.2.1:41234").expect("a hint"),
             ],

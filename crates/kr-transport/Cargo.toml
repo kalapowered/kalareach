@@ -1,0 +1,32 @@
+[package]
+name = "kr-transport"
+description = "KalaReach transport: iroh endpoints, the connection handshake, stream kinds, actor envelopes and dispatch leases"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+iroh.workspace = true
+iroh-mainline-address-lookup.workspace = true
+iroh-mdns-address-lookup.workspace = true
+iroh-relay.workspace = true
+kr-cbor.workspace = true
+kr-crypto.workspace = true
+kr-protocol.workspace = true
+serde.workspace = true
+rustls-pki-types.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+iroh = { workspace = true, features = ["test-utils"] }
+iroh-relay = { workspace = true, features = ["server", "test-utils"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

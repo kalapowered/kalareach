@@ -1,0 +1,221 @@
+//! Building an iroh endpoint from an explicit selection.
+//!
+//! The whole of this module exists to make one guarantee visible: an endpoint reaches exactly the
+//! services its [`EndpointConfig`] names. It starts from `presets::Minimal`, which sets the
+//! cryptographic provider and nothing else, and then adds each selected service by hand. It never
+//! uses `presets::N0`, `RelayMode::Default` or `RelayMode::Staging`, so no public default can
+//! arrive by inheritance.
+
+use std::time::Duration;
+
+use iroh::endpoint::{Builder, QuicTransportConfig, presets};
+use iroh::{Endpoint, RelayMode, SecretKey};
+use iroh_mainline_address_lookup::DhtAddressLookup;
+use iroh_mdns_address_lookup::MdnsAddressLookup;
+use iroh_relay::tls::CaTlsConfig;
+use kr_crypto::keys::TransportIdentityKeyPair;
+use kr_protocol::hello::ALPN;
+use kr_protocol::limits::{INACTIVITY_THRESHOLD, KEEPALIVE_INTERVAL};
+use rustls_pki_types::CertificateDer;
+
+use crate::config::{EndpointConfig, PublishedAddresses};
+use crate::error::{Result, TransportError};
+
+/// How often an idle connection sends a QUIC keepalive.
+///
+/// Section 23: ten seconds while active.
+pub const KEEPALIVE: Duration = Duration::from_millis(KEEPALIVE_INTERVAL.get());
+
+/// How long a connection may be silent before the transport is declared unavailable.
+///
+/// Section 23: a 30-second inactivity threshold. A mobile suspension that trips it is a normal
+/// disconnect, not a failure.
+pub const IDLE_TIMEOUT: Duration = Duration::from_millis(INACTIVITY_THRESHOLD.get());
+
+/// Builds an endpoint that listens for KalaReach connections.
+///
+/// The endpoint advertises the stable ALPN, so a peer that negotiates anything else never reaches
+/// the handshake.
+///
+/// # Errors
+///
+/// Returns [`TransportError::Configuration`] when a selected service cannot be constructed, and
+/// [`TransportError::Bind`] when the socket cannot be bound.
+pub async fn bind_listener(
+    config: &EndpointConfig,
+    identity: &TransportIdentityKeyPair,
+) -> Result<Endpoint> {
+    bind(config, identity, true).await
+}
+
+/// Builds an endpoint that only dials.
+///
+/// It is configured identically except that it advertises no ALPN, so nothing can open a
+/// connection to it. A client that never accepts connections cannot be reached by an unpaired
+/// peer at all.
+///
+/// # Errors
+///
+/// As [`bind_listener`].
+pub async fn bind_dialer(
+    config: &EndpointConfig,
+    identity: &TransportIdentityKeyPair,
+) -> Result<Endpoint> {
+    bind(config, identity, false).await
+}
+
+async fn bind(
+    config: &EndpointConfig,
+    identity: &TransportIdentityKeyPair,
+    accept: bool,
+) -> Result<Endpoint> {
+    let seed = identity.export_endpoint_seed();
+    let secret_key = SecretKey::from_bytes(seed.expose());
+    let mut builder = Endpoint::builder(presets::Minimal)
+        .secret_key(secret_key)
+        .transport_config(transport_config())
+        .relay_mode(relay_mode(config))
+        .addr_filter(address_filter(config));
+
+    if accept {
+        builder = builder.alpns(vec![ALPN.to_vec()]);
+    }
+    if !config.relay_ca_roots.is_empty() {
+        let roots = config
+            .relay_ca_roots
+            .iter()
+            .map(|der| CertificateDer::from(der.clone()));
+        builder = builder.ca_tls_config(CaTlsConfig::default().with_extra_roots(roots));
+    }
+    builder = apply_discovery(builder, config)?;
+
+    if let Some(addr) = config.bind_addr {
+        builder = builder
+            .bind_addr(addr)
+            .map_err(|error| TransportError::Configuration {
+                what: addr.to_string(),
+                kind: "bind address",
+                reason: error.to_string(),
+            })?;
+    }
+    for addr in &config.direct_addresses {
+        builder = builder.external_addr(*addr);
+    }
+
+    builder
+        .bind()
+        .await
+        .map_err(|error| TransportError::Bind(error.to_string()))
+}
+
+/// Returns the relay selection.
+///
+/// An empty relay list is [`RelayMode::Disabled`], not a fallback to the public map. A deployment
+/// that wants no relay gets no relay.
+fn relay_mode(config: &EndpointConfig) -> RelayMode {
+    if config.relays_disabled() {
+        RelayMode::Disabled
+    } else {
+        RelayMode::Custom(config.relay_map())
+    }
+}
+
+/// Returns the filter that decides which of this endpoint's own addresses are published.
+fn address_filter(config: &EndpointConfig) -> iroh::address_lookup::AddrFilter {
+    use iroh::address_lookup::AddrFilter;
+    match config.discovery.publisher.published_addresses {
+        PublishedAddresses::RelayOnly => AddrFilter::relay_only(),
+        PublishedAddresses::RelayAndDirect => AddrFilter::unfiltered(),
+    }
+}
+
+fn apply_discovery(mut builder: Builder, config: &EndpointConfig) -> Result<Builder> {
+    let discovery = &config.discovery;
+
+    if let Some(url) = &discovery.pkarr_publisher_url {
+        let publisher = iroh::address_lookup::PkarrPublisher::builder(url.clone())
+            .ttl(discovery.publisher.ttl_seconds)
+            .republish_interval(discovery.publisher.republish_interval);
+        builder = builder.address_lookup(publisher);
+    }
+    if let Some(url) = &discovery.pkarr_resolver_url {
+        builder = builder.address_lookup(iroh::address_lookup::PkarrResolver::builder(url.clone()));
+    }
+    if let Some(origin) = &discovery.dns_origin {
+        builder = builder.address_lookup(iroh::address_lookup::DnsAddressLookup::builder(
+            origin.clone(),
+        ));
+    }
+    if discovery.local_discovery {
+        builder = builder.address_lookup(MdnsAddressLookup::builder());
+    }
+    if discovery.mainline_dht {
+        builder = builder.address_lookup(DhtAddressLookup::builder());
+    }
+    Ok(builder)
+}
+
+/// Returns the transport configuration every KalaReach connection uses.
+///
+/// The keepalive and the idle timeout are the section 23 values. Setting them here rather than per
+/// connection means a connection cannot be opened without them.
+fn transport_config() -> QuicTransportConfig {
+    let idle_timeout = IDLE_TIMEOUT
+        .try_into()
+        .expect("the 30-second inactivity threshold fits an idle timeout");
+    QuicTransportConfig::builder()
+        .keep_alive_interval(KEEPALIVE)
+        .max_idle_timeout(Some(idle_timeout))
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_alpn_is_the_stable_one() {
+        assert_eq!(ALPN, b"kalareach");
+    }
+
+    #[test]
+    fn the_keepalive_and_idle_timeout_are_the_specified_values() {
+        assert_eq!(KEEPALIVE, Duration::from_secs(10));
+        assert_eq!(IDLE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn an_unselected_relay_map_disables_relaying() {
+        let config = EndpointConfig::default();
+        assert_eq!(relay_mode(&config), RelayMode::Disabled);
+    }
+
+    #[test]
+    fn a_selected_relay_map_is_custom_and_holds_only_what_was_selected() {
+        let config = EndpointConfig {
+            relay_urls: vec!["https://relay.kala.to".parse().expect("a relay URL")],
+            ..EndpointConfig::default()
+        };
+        let RelayMode::Custom(map) = relay_mode(&config) else {
+            panic!("a selected relay map is custom");
+        };
+        assert_eq!(map.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_minimal_endpoint_reaches_no_service_it_was_not_given() {
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let endpoint = bind_listener(&EndpointConfig::default(), &identity)
+            .await
+            .expect("an endpoint");
+        assert!(
+            endpoint
+                .address_lookup()
+                .expect("address lookup services")
+                .is_empty(),
+            "no discovery service is configured unless one is selected"
+        );
+        assert_eq!(endpoint.id().as_bytes(), identity.public().as_bytes());
+        endpoint.close().await;
+    }
+}

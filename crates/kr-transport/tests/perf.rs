@@ -1,0 +1,370 @@
+//! The two transport performance requirements, measured over a real connection.
+//!
+//! * KR-PERF-005: application scheduling adds less than 25 ms p95 above the measured path round
+//!   trip while a bulk transfer is running.
+//! * KR-PERF-006: after the transport is available, usable state arrives within two seconds for a
+//!   120x40 screen, excluding pairing, discovery outage and operating-system suspension.
+//!
+//! Both measure loopback, which is the floor rather than a claim about any network. What they
+//! prove is that the application's own scheduling and handshake do not add the delay, which is
+//! what the requirements are about: the path's own round trip is subtracted in the first, and
+//! pairing and discovery are excluded from the second by construction.
+//!
+//! Each test prints its numbers, so a run's output is the evidence.
+
+mod support;
+
+use std::time::{Duration, Instant};
+
+use kr_cbor::CanonicalValue;
+use kr_protocol::envelope::ParamsValue;
+use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
+use kr_protocol::hello::ALPN;
+use kr_protocol::ids::{AttachmentId, ConnectionId, EnvironmentId, SessionId, TransferId};
+use kr_protocol::scalars::{Nullable, Uuid};
+use kr_transport::clock::ManualClock;
+use kr_transport::handshake::{self, Admitted, PairedDirectory};
+use kr_transport::scheduler::{BulkLimits, StreamBudget};
+use kr_transport::streams::StreamRegistry;
+use std::sync::Arc;
+use support::{OneDevice, Side, direct_addr, epochs, ledger, paired_pair, windows};
+
+/// One input round trip, and the payload it carried.
+const INPUT_PAYLOAD: &[u8] = b"\x1b[A";
+
+/// Wraps raw bytes as the byte string a frame carries.
+///
+/// Raw terminal bytes and attachment chunks are CBOR byte strings, not arrays of integers: the
+/// profile's collection bound is 4 096 members, so a screen sent as an array would be refused.
+fn payload(bytes: &[u8]) -> ParamsValue {
+    ParamsValue::new(CanonicalValue::bytes(bytes))
+}
+
+/// Returns the bytes a frame carried.
+fn bytes_of(value: &ParamsValue) -> &[u8] {
+    match value.as_value() {
+        CanonicalValue::Bytes(bytes) => bytes,
+        other => panic!("a frame carried {other:?} rather than a byte string"),
+    }
+}
+
+/// How many round trips each measurement takes.
+const SAMPLES: usize = 200;
+
+/// A 120x40 screen, as the bytes a snapshot of one costs.
+///
+/// Four bytes a cell covers a scalar plus its attributes, which is the shape the terminal crate's
+/// canonical grid stores. The number is what matters here: the measurement is of the transport, so
+/// the payload only has to be the right size.
+const SCREEN_BYTES: usize = 120 * 40 * 4;
+
+fn percentile(samples: &mut [Duration], percentile: f64) -> Duration {
+    samples.sort_unstable();
+    let index = ((samples.len() as f64) * percentile).ceil() as usize;
+    samples[index.saturating_sub(1).min(samples.len() - 1)]
+}
+
+fn one_device(client: &Side) -> Arc<dyn PairedDirectory> {
+    Arc::new(OneDevice {
+        endpoint_id: client.record.endpoint_id,
+        record: client.record,
+    })
+}
+
+fn registry(connection_id: ConnectionId) -> Arc<StreamRegistry> {
+    Arc::new(StreamRegistry::new(
+        connection_id,
+        Arc::new(StreamBudget::new(BulkLimits::default())),
+        None,
+    ))
+}
+
+fn input_header(connection_id: ConnectionId) -> StreamHeader {
+    StreamHeader {
+        kind: StreamKind::TerminalInput,
+        connection_id,
+        stream_id: Nullable::null(),
+        resource: StreamResource {
+            environment_id: EnvironmentId::new(Uuid::from_bytes([9; 16])),
+            session_id: Nullable::some(SessionId::new(Uuid::from_bytes([8; 16]))),
+            attachment_id: Nullable::some(AttachmentId::new(Uuid::from_bytes([7; 16]))),
+            transfer_id: Nullable::null(),
+        },
+    }
+}
+
+fn attachment_header(connection_id: ConnectionId) -> StreamHeader {
+    StreamHeader {
+        kind: StreamKind::AttachmentChunks,
+        connection_id,
+        stream_id: Nullable::null(),
+        resource: StreamResource {
+            environment_id: EnvironmentId::new(Uuid::from_bytes([9; 16])),
+            session_id: Nullable::null(),
+            attachment_id: Nullable::null(),
+            transfer_id: Nullable::some(TransferId::new(Uuid::from_bytes([6; 16]))),
+        },
+    }
+}
+
+/// KR-PERF-005.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_input_stays_responsive_under_a_bulk_transfer() {
+    let (host, client) = paired_pair().await;
+    let endpoint = host.endpoint.clone();
+    let identity = Arc::clone(&host.identity);
+    let directory = one_device(&client);
+
+    // The host echoes every input frame back on the same stream, and drains anything that arrives
+    // on a bulk stream. Echoing is what makes a round trip measurable at all.
+    let serving = tokio::spawn(async move {
+        let connection = endpoint
+            .accept()
+            .await
+            .expect("an incoming connection")
+            .await
+            .expect("a connection");
+        let clock = ManualClock::new();
+        let challenges = ledger();
+        let issuer = windows(&clock);
+        let admitted = handshake::accept(
+            &connection,
+            &identity,
+            epochs(),
+            directory.as_ref(),
+            &challenges,
+            &issuer,
+        )
+        .await
+        .expect("an admitted connection");
+        let Admitted::Authorised(authorised) = admitted else {
+            panic!("a paired endpoint is authorised");
+        };
+        let streams = registry(authorised.connection_id);
+        loop {
+            let Ok(mut stream) = streams.accept(&connection).await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let kind = stream.kind();
+                loop {
+                    let echoed = match stream.reader().expect("a reader").read_payload().await {
+                        Ok(Some(frame)) => frame,
+                        _ => return,
+                    };
+                    if kind == StreamKind::TerminalInput {
+                        let writer = stream.writer().expect("a writer");
+                        if writer.write_payload(&echoed).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let streams = registry(authorised.connection_id);
+
+    let mut input = streams
+        .open(&connection, input_header(authorised.connection_id))
+        .await
+        .expect("an input stream");
+
+    let mut baseline = round_trips(&mut input, SAMPLES).await;
+    let baseline_p95 = percentile(&mut baseline, 0.95);
+
+    // A bulk transfer now fills the connection. The scheduler's job is to keep the keystroke ahead
+    // of it.
+    let bulk_connection = connection.clone();
+    let bulk_streams = Arc::clone(&streams);
+    let bulk_connection_id = authorised.connection_id;
+    let bulk = tokio::spawn(async move {
+        let mut stream = bulk_streams
+            .open(&bulk_connection, attachment_header(bulk_connection_id))
+            .await
+            .expect("a bulk stream");
+        let chunk = payload(&vec![0u8; 512 * 1024]);
+        loop {
+            let writer = stream.writer().expect("a writer");
+            if writer.write_message(&chunk).await.is_err() {
+                return;
+            }
+        }
+    });
+    // Let the transfer reach steady state before the keystrokes are measured against it.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let mut loaded = round_trips(&mut input, SAMPLES).await;
+    let loaded_p95 = percentile(&mut loaded, 0.95);
+    bulk.abort();
+
+    let added = loaded_p95.saturating_sub(baseline_p95);
+    println!(
+        "KR-PERF-005 samples={SAMPLES} idle_p95={:.3}ms loaded_p95={:.3}ms added_p95={:.3}ms limit=25.000ms",
+        baseline_p95.as_secs_f64() * 1000.0,
+        loaded_p95.as_secs_f64() * 1000.0,
+        added.as_secs_f64() * 1000.0,
+    );
+    assert!(
+        added < Duration::from_millis(25),
+        "application scheduling added {added:?} above the idle round trip"
+    );
+
+    connection.close(0u32.into(), b"done");
+    serving.abort();
+}
+
+async fn round_trips(
+    stream: &mut kr_transport::streams::DataStream,
+    samples: usize,
+) -> Vec<Duration> {
+    let mut measurements = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let started = Instant::now();
+        stream
+            .writer()
+            .expect("a writer")
+            .write_message(&payload(INPUT_PAYLOAD))
+            .await
+            .expect("the keystroke was sent");
+        let echoed = stream
+            .reader()
+            .expect("a reader")
+            .read_message::<ParamsValue>()
+            .await
+            .expect("an echo")
+            .expect("the stream did not end");
+        measurements.push(started.elapsed());
+        assert_eq!(bytes_of(&echoed), INPUT_PAYLOAD);
+    }
+    measurements
+}
+
+/// KR-PERF-006.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_reaches_usable_state_within_two_seconds() {
+    let (host, client) = paired_pair().await;
+    let endpoint = host.endpoint.clone();
+    let identity = Arc::clone(&host.identity);
+    let directory = one_device(&client);
+
+    // The host answers the first frame on a semantic-updates stream with a screen-sized snapshot,
+    // which stands for the state a client installs before it is usable.
+    let serving = tokio::spawn(async move {
+        loop {
+            let Some(incoming) = endpoint.accept().await else {
+                return;
+            };
+            let Ok(connection) = incoming.await else {
+                continue;
+            };
+            let identity = Arc::clone(&identity);
+            let directory = Arc::clone(&directory);
+            tokio::spawn(async move {
+                let clock = ManualClock::new();
+                let challenges = ledger();
+                let issuer = windows(&clock);
+                let Ok(Admitted::Authorised(authorised)) = handshake::accept(
+                    &connection,
+                    &identity,
+                    epochs(),
+                    directory.as_ref(),
+                    &challenges,
+                    &issuer,
+                )
+                .await
+                else {
+                    return;
+                };
+                let streams = registry(authorised.connection_id);
+                let Ok(mut stream) = streams.accept(&connection).await else {
+                    return;
+                };
+                let _ = stream.reader().expect("a reader").read_payload().await;
+                let snapshot = payload(&vec![0u8; SCREEN_BYTES]);
+                stream
+                    .writer()
+                    .expect("a writer")
+                    .write_message(&snapshot)
+                    .await
+                    .expect("the snapshot was sent");
+                // The connection has to outlive the write, or the snapshot never leaves.
+                let _ = connection.closed().await;
+            });
+        }
+    });
+
+    // One connection first, so the measurement is of a reconnect rather than of a cold start.
+    let first = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let _ = handshake::connect(&first, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    first.close(0u32.into(), b"reconnecting");
+
+    let started = Instant::now();
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let streams = registry(authorised.connection_id);
+    let mut stream = streams
+        .open(
+            &connection,
+            StreamHeader {
+                kind: StreamKind::SemanticUpdates,
+                connection_id: authorised.connection_id,
+                stream_id: Nullable::null(),
+                resource: StreamResource {
+                    environment_id: EnvironmentId::new(Uuid::from_bytes([9; 16])),
+                    session_id: Nullable::some(SessionId::new(Uuid::from_bytes([8; 16]))),
+                    attachment_id: Nullable::null(),
+                    transfer_id: Nullable::null(),
+                },
+            },
+        )
+        .await
+        .expect("a semantic stream");
+    stream
+        .writer()
+        .expect("a writer")
+        .write_message(&payload(b"subscribe"))
+        .await
+        .expect("the subscription was sent");
+    let snapshot = stream
+        .reader()
+        .expect("a reader")
+        .read_message::<ParamsValue>()
+        .await
+        .expect("a snapshot")
+        .expect("the stream did not end");
+    let elapsed = started.elapsed();
+
+    assert_eq!(bytes_of(&snapshot).len(), SCREEN_BYTES);
+    println!(
+        "KR-PERF-006 screen=120x40 bytes={SCREEN_BYTES} elapsed={:.3}ms limit=2000.000ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "usable state took {elapsed:?}"
+    );
+
+    connection.close(0u32.into(), b"done");
+    serving.abort();
+}
