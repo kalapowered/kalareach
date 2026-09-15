@@ -429,7 +429,11 @@ the same loop is delivering; a reply that does not fit stays where it is, includ
 The serial write loop itself belongs to the worker, which owns the pseudo-terminal: ordering a reply
 after its query event, closing paste framing on source loss, invalidating an editor fence, and
 accounting for every delivered byte are its work. This crate supplies the bounds, the ordering
-information (`Response::query_at`) and the gate it needs to do that.
+information (`Response::query_at`) and the gate it needs to do that. Those obligations are proved
+where the pseudo-terminal is, against the worker's own write path: serial delivery, a write that
+only partly completes, paste framing closed when the source is lost, replies that stay behind their
+queries, and a fence that an intervening write invalidates. A test here could only exercise a
+stand-in for the write, which would prove nothing about the write.
 
 Nothing on the lane is history. `reset` drops everything pending, and a reconnecting client is never
 sent a reply or a probe answer from before it arrived.
