@@ -425,3 +425,230 @@ async fn a_desktop_that_ends_mid_paste_publishes_the_fence_and_closes_the_paste(
         "the writer is comparing against the fence the closure moved"
     );
 }
+
+/// Returns `bytes` of input made of complete lines.
+///
+/// A line discipline in its ordinary mode holds a completed line for the application to read and
+/// stops taking more once it is holding all it can. Input without a line ending is discarded
+/// instead, which tests nothing.
+fn lines(bytes: usize) -> Vec<u8> {
+    let mut input = Vec::with_capacity(bytes);
+    while input.len() < bytes {
+        let remaining = bytes - input.len();
+        let run = remaining.min(80).saturating_sub(1);
+        input.extend(std::iter::repeat_n(b'a', run));
+        input.push(b'\n');
+    }
+    input.truncate(bytes);
+    input
+}
+
+/// Reads everything the session has retained, as raw bytes.
+///
+/// The raw history is what the application actually produced, before the canonical grid decides
+/// what any of it means, which is what a test about delivery has to look at.
+fn retained(runtime: &SessionRuntime) -> Vec<u8> {
+    let session = runtime.session();
+    let mut seen = Vec::new();
+    let mut cursor = 0_u64;
+    loop {
+        let page = session
+            .history_page(cursor, 1024 * 1024)
+            .expect("reads the retained output");
+        if page.bytes.as_slice().is_empty() {
+            break;
+        }
+        seen.extend_from_slice(page.bytes.as_slice());
+        cursor = page.next_cursor.get();
+    }
+    seen
+}
+
+/// Waits for `marker` to appear in the session's retained output.
+async fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let seen = retained(runtime);
+        if seen.windows(marker.len()).any(|window| window == marker) {
+            return seen;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
+    let host = kr_ipc::testing::TempHost::create();
+    // A shell that never reads its input. Everything written to the terminal stops at the line
+    // discipline, which is exactly the state the budget exists for.
+    let config = configuration(&host, "sleep 120");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    session
+        .attach(&terminal_attachment(session_id), requested, attachment_id)
+        .expect("attaches");
+    session
+        .acquire_input(attachment_id, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("takes the lease");
+    let epoch = session.lease().epoch.get();
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+
+    // The protocol's own frame limit, written again and again by a lease holder that is within its
+    // rights on every single frame. The lines are what make the terminal stop taking them: a line
+    // discipline holds a completed line for the application to read, so an application that never
+    // reads is a terminal that fills.
+    let frame = lines(kr_protocol::limits::MAX_INPUT_FRAME_LEN);
+    let mut refusal = None;
+    let mut accepted = 0_u64;
+    for sequence in 0..64 {
+        let outcome = {
+            let mut session = runtime.session();
+            let outcome = session.write_input(
+                attachment_id,
+                epoch,
+                sequence,
+                &frame,
+                std::time::Instant::now(),
+            );
+            if outcome.is_ok() {
+                runtime.flush_locked(&mut session);
+            }
+            outcome
+        };
+        match outcome {
+            Ok(_) => accepted += 1,
+            Err(error) => {
+                refusal = Some(error);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let refusal = refusal.expect("the queue is bounded, so the writes stop being accepted");
+    assert_eq!(
+        refusal.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "the refusal names the reason rather than acknowledging bytes nothing has taken"
+    );
+    assert!(
+        accepted > 0,
+        "an application that is not reading still accepts what fits"
+    );
+    assert!(
+        runtime
+            .session()
+            .queued_input_bytes()
+            .load(std::sync::atomic::Ordering::Acquire)
+            <= kr_worker::session::MAX_QUEUED_INPUT_BYTES,
+        "and nothing beyond the budget was ever queued"
+    );
+    let runtime = std::sync::Arc::clone(&runtime);
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_closes_a_delivered_paste_and_abandons_the_old_lease_bytes() {
+    let host = kr_ipc::testing::TempHost::create();
+    // The application reads nothing for two seconds, so the writer is inside a batch when the
+    // takeover happens, and then reads everything, so what it was given can be looked at. Its echo
+    // is off, so the output is what the application received rather than what the terminal
+    // repeated back as it arrived.
+    let config = configuration(&host, "stty -echo; sleep 2; exec cat");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let first = AttachmentId::new(kr_ipc::new_uuid());
+    let second = AttachmentId::new(kr_ipc::new_uuid());
+    for id in [first, second] {
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Input);
+        session
+            .attach(&terminal_attachment(session_id), requested, id)
+            .expect("attaches");
+    }
+    session
+        .acquire_input(first, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("takes the lease");
+    let epoch = session.lease().epoch.get();
+    session.set_bracketed_paste(true);
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+
+    // A paste that starts, a body far larger than the terminal will take while nothing is reading,
+    // and the terminator behind it. The terminator is accepted, so the framer considers the paste
+    // closed; it has not been written, so the application does not.
+    const BODY: usize = 32 * 1024;
+    let mut start = Vec::from(b"\x1b[200~");
+    start.extend(lines(BODY));
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(first, epoch, 0, &start, std::time::Instant::now())
+            .expect("writes the start of the paste");
+        session
+            .write_input(first, epoch, 1, b"\x1b[201~", std::time::Instant::now())
+            .expect("writes the terminator");
+        runtime.flush_locked(&mut session);
+    }
+
+    // Long enough for the writer to be inside the first batch and waiting for the application,
+    // which is the state the takeover has to be correct in.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let taken = {
+        let mut session = runtime.session();
+        let taken = session
+            .acquire_input(second, ConnectionId::new(kr_ipc::new_uuid()), None)
+            .expect("takes the lease over");
+        runtime.flush_locked(&mut session);
+        taken
+    };
+    assert!(
+        taken.discarded_bytes.get() > 0,
+        "the takeover reports the bytes it did not deliver: {taken:?}"
+    );
+    let next_epoch = taken.lease.epoch.get();
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(
+                second,
+                next_epoch,
+                0,
+                b"kr-new-lease\n",
+                std::time::Instant::now(),
+            )
+            .expect("the new lease writes");
+        runtime.flush_locked(&mut session);
+    }
+
+    let seen = retained_within(&runtime, b"kr-new-lease", Duration::from_secs(30)).await;
+    let text = String::from_utf8_lossy(&seen).into_owned();
+    let terminator = text
+        .find("\u{1b}[201~")
+        .expect("the application was given the end of the paste it was given the start of");
+    let new_lease = text
+        .find("kr-new-lease")
+        .expect("and then the next actor's input");
+    assert!(
+        terminator < new_lease,
+        "the paste was closed before the new lease's input reached the application"
+    );
+    // And the rest of the old lease's batch never arrived: the writer abandoned it at the
+    // takeover rather than finishing it once the application started reading.
+    let body = seen.iter().filter(|byte| **byte == b'a').count();
+    assert!(
+        body < BODY,
+        "a partly written batch of an ended lease is abandoned, not completed: {body} of {BODY}"
+    );
+    let runtime = std::sync::Arc::clone(&runtime);
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}

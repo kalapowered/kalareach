@@ -124,7 +124,22 @@ pub struct Session {
     /// what is in `pending_input` would count nothing, because every flush hands that vector to
     /// the writer, so the counter is shared with the writer and comes down as each batch is
     /// written.
-    host_reply_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Every byte queued for the pseudo-terminal, across every producer, released by the writer.
+    queued_input_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// The part of that which belongs to the current lease, and which a takeover discards.
+    ///
+    /// What is left is the response lane's share, so the two bounds section 8 and section 9 name
+    /// are read from one pair of counters rather than three.
+    queued_lease_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether the application is inside a bracketed paste, as the writer has actually delivered
+    /// it. The framer says what the accepted stream means; this says what arrived.
+    delivered_paste_open: Arc<std::sync::atomic::AtomicBool>,
+    /// Set while a lease change is queued for the writer and not yet taken.
+    ///
+    /// One is enough: the writer looks at the fence when it takes a batch, so a second would ask
+    /// the same question again. It is what keeps a caller that takes and releases the lease in a
+    /// loop from queueing without bound.
+    lease_change_queued: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Session {
@@ -188,7 +203,10 @@ impl Session {
             root_exit: None,
             engine,
             restoration_losses: crate::render::Carried::default(),
-            host_reply_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            queued_lease_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            delivered_paste_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lease_change_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
         })
     }
@@ -384,6 +402,28 @@ impl Session {
     fn note_lease_holder(&mut self) {
         let epoch = kr_protocol::ids::InputLeaseEpoch::new(self.lease.epoch());
         self.engine.set_lease_holder(self.lease.holder(), epoch);
+        // The writer is told the lease moved, so a paste the old lease left open at the
+        // application is closed even when nothing follows it. One outstanding notice answers every
+        // change that happens before the writer takes it, because what the writer then reads is
+        // the fence as it stands rather than the change that queued the notice.
+        if !self
+            .lease_change_queued
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.pending_input.push(InputBatch::LeaseChanged);
+        }
+    }
+
+    /// Returns the flag the writer clears when it has answered a lease change.
+    #[must_use]
+    pub fn lease_change_queued(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.lease_change_queued)
+    }
+
+    /// Returns the writer's record of whether the application is inside a bracketed paste.
+    #[must_use]
+    pub fn delivered_paste_open(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.delivered_paste_open)
     }
 
     /// Returns the canonical grid this session's screen lives on.
@@ -496,10 +536,7 @@ impl Session {
         let held = self.lease.holder() == Some(attachment_id);
         self.lease.release_attachment(attachment_id);
         if held {
-            let framing = self.framer.close_for_takeover();
-            if let Some(terminator) = framing.terminator {
-                self.queue_host(terminator.to_vec());
-            }
+            self.framer.close_for_takeover();
         }
         self.note_lease_holder();
         self.pump_replies();
@@ -629,19 +666,26 @@ impl Session {
         }
         // An interrupted paste is closed before the new lease writes, so the application never
         // sees a paste finished under a different actor.
-        let previous_epoch = self.lease.epoch();
         let framing = self.framer.close_for_takeover();
-        let mut discarded = self.lease.acquire(attachment_id, connection_id);
+        // Everything the previous lease handed over and the writer has not written is discarded by
+        // this takeover: the fence moves with the epoch below, and the writer drops what is left,
+        // including the rest of a batch it is part way through. It is read before the epoch moves,
+        // which is the only point at which it still names the lease that is ending.
+        let mut discarded = self
+            .queued_lease_bytes
+            .load(std::sync::atomic::Ordering::Acquire) as u64;
+        discarded += self.lease.acquire(attachment_id, connection_id);
         discarded += framing.discarded_prefix.len() as u64;
-        let closed_open_paste = framing.terminator.is_some();
-        if let Some(terminator) = framing.terminator {
-            // The terminator closes the paste the previous lease opened. It is the host's own
-            // correction rather than that lease's keystrokes: fencing it would leave the
-            // application inside a bracketed paste that nothing was ever going to end, which is
-            // exactly the failure closing it exists to prevent.
-            let _ = previous_epoch;
-            self.queue_host(terminator.to_vec());
-        }
+        // A paste is reported as closed when one was open in the stream this lease accepted, or
+        // when one is open at the application: the writer keeps the second, because a terminator
+        // the framer accepted may have been queued behind a writer that never wrote it.
+        let closed_open_paste = framing.terminator.is_some()
+            || self
+                .delivered_paste_open
+                .load(std::sync::atomic::Ordering::Acquire);
+        // Nothing is queued for the terminator here. The writer closes a paste the application is
+        // actually inside, before anything from the new lease reaches it; queueing a correction
+        // under the old lease is what let one be discarded with it.
         self.note_lease_holder();
         self.pump_replies();
         Ok(InputAcquireResult {
@@ -666,11 +710,9 @@ impl Session {
             .ok_or(WorkerError::LeaseLost)?;
         // A paste this lease opened is closed as it goes. Leaving it open would put the
         // application into a bracketed paste that nothing was ever going to end, so the next
-        // keystroke would arrive inside somebody else's paste.
-        let framing = self.framer.close_for_takeover();
-        if let Some(terminator) = framing.terminator {
-            self.queue_host(terminator.to_vec());
-        }
+        // keystroke would arrive inside somebody else's paste. The writer supplies the terminator,
+        // because it is the only thing that knows whether the application ever saw the start.
+        self.framer.close_for_takeover();
         self.note_lease_holder();
         self.pump_replies();
         Ok(self.lease.to_wire())
@@ -705,11 +747,39 @@ impl Session {
                 )));
             }
         }
+        // The budget is checked before the recogniser is fed, so a refused frame leaves the
+        // framing exactly as it was: what is refused is the whole frame, not part of it. A push
+        // can also release a prefix it was holding, which is at most one delimiter short of a
+        // whole one, so that is counted too.
+        let claimed = bytes.len().saturating_add(crate::input::PASTE_END.len());
+        let queued = self
+            .queued_input_bytes
+            .load(std::sync::atomic::Ordering::Acquire);
+        if queued.saturating_add(claimed) > MAX_QUEUED_INPUT_BYTES {
+            return Err(WorkerError::ResourceUnavailable {
+                detail: format!(
+                    "the application is not reading its input and {MAX_QUEUED_INPUT_BYTES} bytes                      are already waiting for it, so these bytes were not accepted"
+                ),
+            });
+        }
         let outcome = self.framer.push(bytes, now);
         if !outcome.forward.is_empty() {
-            self.pending_input.push(InputBatch {
-                origin: InputOrigin::Lease(epoch),
+            let paste = if outcome.paste_started || outcome.paste_ended {
+                // The framer's own state after the push is what these bytes leave the application
+                // in, because `forward` carries every delimiter the push completed and no part of
+                // one it did not.
+                if self.framer.paste_open() {
+                    PasteTransition::Opened
+                } else {
+                    PasteTransition::Closed
+                }
+            } else {
+                PasteTransition::Unchanged
+            };
+            self.queue_input(InputBatch::Lease {
+                epoch,
                 bytes: outcome.forward.clone(),
+                paste,
             });
         }
         // A paste that has just closed, or a frame that has just completed, opens the gate the
@@ -732,9 +802,13 @@ impl Session {
         let expired = match self.framer.expire(now) {
             Some(bytes) if !bytes.is_empty() => {
                 let len = bytes.len();
-                self.pending_input.push(InputBatch {
-                    origin: InputOrigin::Lease(epoch),
+                // The prefix was accepted when it arrived and counted against the budget then, so
+                // it goes through whatever the budget says now: forwarding it unchanged is what
+                // the recogniser promised, and it is at most one delimiter long.
+                self.queue_input(InputBatch::Lease {
+                    epoch,
                     bytes,
+                    paste: PasteTransition::Unchanged,
                 });
                 len
             }
@@ -914,34 +988,50 @@ impl Session {
     /// reads the answers stops being answered here rather than growing this queue without limit.
     fn queue_replies(&mut self, replies: Vec<Vec<u8>>) {
         for reply in replies {
-            let held = self
-                .host_reply_bytes
+            let queued = self
+                .queued_input_bytes
                 .load(std::sync::atomic::Ordering::Acquire);
-            if held.saturating_add(reply.len()) > MAX_PENDING_REPLY_BYTES {
+            let held = queued.saturating_sub(
+                self.queued_lease_bytes
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
+            // Two bounds, both of them this reply's: its own share, so an application that asks
+            // questions without reading the answers cannot fill the terminal by itself, and the
+            // whole budget, so its share cannot be spent on top of a full queue.
+            if held.saturating_add(reply.len()) > MAX_PENDING_REPLY_BYTES
+                || queued.saturating_add(reply.len()) > MAX_QUEUED_INPUT_BYTES
+            {
                 return;
             }
-            self.queue_host(reply);
+            self.queue_input(InputBatch::Reply { bytes: reply });
         }
     }
 
-    /// Queues bytes the host owes the application, counted against what the writer has not sent.
+    /// Queues one batch for the pseudo-terminal, counted against the session's input budget.
     ///
-    /// Every batch of this origin goes through here, because the writer releases every batch of
-    /// this origin: charging only some of them would make the count drift down until it stopped
-    /// bounding anything.
-    fn queue_host(&mut self, bytes: Vec<u8>) {
-        self.host_reply_bytes
-            .fetch_add(bytes.len(), std::sync::atomic::Ordering::AcqRel);
-        self.pending_input.push(InputBatch {
-            origin: InputOrigin::Host,
-            bytes,
-        });
+    /// Every producer goes through here, because the writer releases every piece it writes against
+    /// the same counter: charging only some of them would make the count drift down until it
+    /// stopped bounding anything.
+    fn queue_input(&mut self, batch: InputBatch) {
+        self.queued_input_bytes
+            .fetch_add(batch.len(), std::sync::atomic::Ordering::AcqRel);
+        if matches!(batch, InputBatch::Lease { .. }) {
+            self.queued_lease_bytes
+                .fetch_add(batch.len(), std::sync::atomic::Ordering::AcqRel);
+        }
+        self.pending_input.push(batch);
     }
 
-    /// Returns the counter the writer releases as it writes the host's own answers.
+    /// Returns the counter the writer releases as the application takes its input.
     #[must_use]
-    pub fn host_reply_bytes(&self) -> Arc<std::sync::atomic::AtomicUsize> {
-        Arc::clone(&self.host_reply_bytes)
+    pub fn queued_input_bytes(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.queued_input_bytes)
+    }
+
+    /// Returns the counter holding the current lease's share of the queue.
+    #[must_use]
+    pub fn queued_lease_bytes(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.queued_lease_bytes)
     }
 
     /// Returns what the response lane is allowed to write right now.
@@ -1184,10 +1274,7 @@ impl Session {
                 if let Some(holder) = self.lease.holder() {
                     self.lease.release_attachment(holder);
                 }
-                let framing = self.framer.close_for_takeover();
-                if let Some(terminator) = framing.terminator {
-                    self.queue_host(terminator.to_vec());
-                }
+                self.framer.close_for_takeover();
                 self.note_lease_holder();
                 CloseAcceptance {
                     state: SessionState::Closing,
@@ -1428,28 +1515,69 @@ impl Session {
     }
 }
 
-/// Where one batch of terminal input came from.
+/// One ordered batch of input on its way to the pseudo-terminal.
 ///
-/// The two are fenced differently, which is the whole reason the distinction exists. A person's
-/// keystrokes belong to a lease, and a takeover discards the ones the previous holder had already
-/// handed over. The host's own answer to a query the application asked belongs to the application:
-/// it was asked for, nothing else can supply it, and dropping it because the lease happened to
-/// move would leave the application waiting for a reply that will never come.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InputOrigin {
+/// The variants are fenced differently, which is the whole reason the distinction exists. A
+/// person's keystrokes belong to a lease, and a takeover discards the ones the previous holder had
+/// already handed over. The host's own answer to a query the application asked belongs to the
+/// application: it was asked for, nothing else can supply it, and dropping it because the lease
+/// happened to move would leave the application waiting for a reply that will never come.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputBatch {
     /// An attachment's input, accepted under one lease epoch.
-    Lease(u64),
+    Lease {
+        /// The epoch the lease held when these bytes were accepted.
+        epoch: u64,
+        /// The bytes, exactly as they arrived.
+        bytes: Vec<u8>,
+        /// What they do to the bracketed paste the application is inside.
+        paste: PasteTransition,
+    },
     /// The host answering the application, on the response lane.
-    Host,
+    Reply {
+        /// The bytes of the answer.
+        bytes: Vec<u8>,
+    },
+    /// A lease has changed, with nothing queued behind it.
+    ///
+    /// It carries no bytes. What it carries is the moment: the writer looks at the fence when it
+    /// takes a batch, and a lease that changed while nothing was queued would otherwise leave the
+    /// application inside a paste until somebody typed something.
+    LeaseChanged,
 }
 
-/// One ordered batch of input, and what it came from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InputBatch {
-    /// Where the batch came from, which decides whether a moved lease discards it.
-    pub origin: InputOrigin,
-    /// The bytes, exactly as they arrived.
-    pub bytes: Vec<u8>,
+impl InputBatch {
+    /// Returns how many bytes this batch is holding against the session's input budget.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Lease { bytes, .. } | Self::Reply { bytes } => bytes.len(),
+            Self::LeaseChanged => 0,
+        }
+    }
+
+    /// Returns whether this batch carries no bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// What a batch of input does to the bracketed paste the application is inside.
+///
+/// The framer decides it from the delimiters the bytes complete; the *writer* keeps it, because
+/// the writer is the only thing that knows what actually reached the application. A batch the
+/// writer drops or abandons never happened as far as the application is concerned, however the
+/// framer read it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PasteTransition {
+    /// The bytes complete no delimiter; the application's framing is unchanged.
+    #[default]
+    Unchanged,
+    /// After these bytes the application is inside a bracketed paste.
+    Opened,
+    /// After these bytes it is not.
+    Closed,
 }
 
 /// What accepting input produced.
@@ -1468,8 +1596,22 @@ pub struct InputAccepted {
 /// The response lane bounds what it queues; this bounds what has left the lane and is waiting for a
 /// terminal whose application has stopped reading its input. An application that asks questions
 /// without ever reading the answers stops being answered at this point rather than growing the
-/// queue without limit.
+/// queue without limit. It is the response lane's share of [`MAX_QUEUED_INPUT_BYTES`], so a burst
+/// of answers cannot take the whole budget and leave a person unable to type.
 pub const MAX_PENDING_REPLY_BYTES: usize = 64 * 1024;
+
+/// How much input may be waiting for the pseudo-terminal, across every producer at once.
+///
+/// One budget, because there is one pseudo-terminal and one application behind it. A lease holder's
+/// keystrokes, the host's answers to the application's own questions and everything else that is
+/// written into the terminal are counted against this together, and the writer releases each piece
+/// as the application takes it. Beyond it a lease write is refused with a named result rather than
+/// acknowledged, because an application that has stopped reading has not received those bytes and
+/// telling the person otherwise is the one answer that is certainly wrong.
+///
+/// A megabyte is far more than a person can type and far more than a terminal's own buffer, so it
+/// is only ever reached by an application that has genuinely stopped reading its input.
+pub const MAX_QUEUED_INPUT_BYTES: usize = 1024 * 1024;
 
 /// A cursor on the output stream.
 #[must_use]

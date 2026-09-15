@@ -17,11 +17,31 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::error::{Result, WorkerError};
 use crate::session::{
-    CloseAcceptance, DRAIN_PERIOD, GRACE_PERIOD, InputBatch, InputOrigin, Session,
+    CloseAcceptance, DRAIN_PERIOD, GRACE_PERIOD, InputBatch, PasteTransition, Session,
 };
 
 /// How many read batches may wait for ingestion before the read loop slows down.
 pub const READ_QUEUE_DEPTH: usize = 64;
+
+/// How much input the writer hands the pseudo-terminal in one write.
+///
+/// A whole batch in one call can block for as long as the application takes to read it, and the
+/// fence cannot be looked at while it does. A piece bounds how much of an ended lease's input can
+/// still be in flight when a takeover succeeds; four kibibytes is a comfortable multiple of a
+/// terminal's own input buffer, so an application that is reading pays nothing for it.
+pub const WRITE_PIECE_BYTES: usize = 4 * 1024;
+
+/// Gives back what a counter was holding for bytes that have reached the application or gone.
+fn release(counter: &std::sync::atomic::AtomicUsize, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let _ = counter.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |held| Some(held.saturating_sub(bytes)),
+    );
+}
 
 /// How often the root shell's status is checked, independently of the terminal.
 ///
@@ -65,7 +85,10 @@ impl SessionRuntime {
         let mut writer = session.input_writer()?;
         // What the host owes the application is bounded by what has been *written*, not by what is
         // waiting in the session, because the session hands its queue over on every flush.
-        let host_replies = session.host_reply_bytes();
+        let queued_input = session.queued_input_bytes();
+        let queued_lease = session.queued_lease_bytes();
+        let delivered_paste_open = session.delivered_paste_open();
+        let lease_change_queued = session.lease_change_queued();
         let session = Arc::new(Mutex::new(session));
         let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<InputBatch>();
         // What the writer compares every batch against. A takeover, a release, a detach or a close
@@ -112,33 +135,102 @@ impl SessionRuntime {
         });
 
         let writer_fence = Arc::clone(&fence);
-        let writer_replies = Arc::clone(&host_replies);
+        let writer_queued = Arc::clone(&queued_input);
+        let writer_lease = Arc::clone(&queued_lease);
+        let writer_paste_open = Arc::clone(&delivered_paste_open);
+        let writer_lease_change = Arc::clone(&lease_change_queued);
         std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+
+            // What the application is actually inside, which is the only thing that decides
+            // whether it needs a paste terminator. The framer says what the accepted stream means;
+            // a batch this writer never wrote never happened to the application.
+            let mut last_fence = writer_fence.load(Ordering::Acquire);
             while let Some(batch) = input_receiver.blocking_recv() {
-                let released = match batch.origin {
-                    InputOrigin::Host => batch.bytes.len(),
-                    InputOrigin::Lease(_) => 0,
+                if matches!(batch, InputBatch::LeaseChanged) {
+                    writer_lease_change.store(false, Ordering::Release);
+                }
+                let fence = writer_fence.load(Ordering::Acquire);
+                // A lease has ended. Before anything from the next one reaches the application, a
+                // paste the old lease started and never finished is closed, so the next actor's
+                // input never lands inside somebody else's paste (KR-REQ-08.64). The terminator is
+                // this writer's own correction and is never fenced: it is the one thing that can
+                // end a paste nothing else is going to end.
+                if fence != last_fence {
+                    last_fence = fence;
+                    if writer_paste_open.swap(false, Ordering::AcqRel)
+                        && (std::io::Write::write_all(&mut writer, crate::input::PASTE_END)
+                            .is_err()
+                            || std::io::Write::flush(&mut writer).is_err())
+                    {
+                        break;
+                    }
+                }
+                let (epoch, bytes, transition) = match &batch {
+                    InputBatch::Lease {
+                        epoch,
+                        bytes,
+                        paste,
+                    } => (Some(*epoch), bytes.as_slice(), *paste),
+                    InputBatch::Reply { bytes } => {
+                        (None, bytes.as_slice(), PasteTransition::Unchanged)
+                    }
+                    InputBatch::LeaseChanged => continue,
                 };
                 // Stale keystrokes are dropped here rather than written. A takeover that only
                 // stopped *new* input would still let the previous holder's last keystrokes land in
                 // the new holder's command line. The host's own answer to a query the application
                 // asked is not a keystroke and is never dropped: nothing else can supply it.
-                if let InputOrigin::Lease(epoch) = batch.origin
-                    && epoch < writer_fence.load(std::sync::atomic::Ordering::Acquire)
-                {
+                if epoch.is_some_and(|epoch| epoch < fence) {
+                    release(&writer_queued, bytes.len());
+                    release(&writer_lease, bytes.len());
                     continue;
                 }
-                if std::io::Write::write_all(&mut writer, &batch.bytes).is_err() {
-                    break;
+                // Written in pieces, with the fence looked at again before each one. A single
+                // write of a whole batch can block for as long as the application takes to read
+                // it, and a takeover that happened during it would otherwise be followed by the
+                // rest of the old lease's bytes.
+                let mut delivered = 0_usize;
+                let mut abandoned = false;
+                let mut broken = false;
+                for piece in bytes.chunks(WRITE_PIECE_BYTES) {
+                    if epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire)) {
+                        abandoned = true;
+                        break;
+                    }
+                    if std::io::Write::write_all(&mut writer, piece).is_err() {
+                        broken = true;
+                        break;
+                    }
+                    delivered += piece.len();
+                    // Released only once the application has it. Until then it is still owed.
+                    release(&writer_queued, piece.len());
+                    if epoch.is_some() {
+                        release(&writer_lease, piece.len());
+                    }
                 }
                 let _ = std::io::Write::flush(&mut writer);
-                // Released only once the application has it. Until then it is still owed.
-                if released > 0 {
-                    let _ = writer_replies.fetch_update(
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                        |held| Some(held.saturating_sub(released)),
-                    );
+                if broken {
+                    break;
+                }
+                if abandoned {
+                    // The rest of the batch belongs to a lease that has ended, so it is not
+                    // written. What was delivered is what the application has, and the takeover
+                    // reports the remainder as discarded.
+                    release(&writer_queued, bytes.len().saturating_sub(delivered));
+                    release(&writer_lease, bytes.len().saturating_sub(delivered));
+                    // Half a batch may have carried a paste start and not the delimiter that
+                    // completes it. The conservative answer is that the application may be inside
+                    // one, so the next lease change closes it.
+                    if transition == PasteTransition::Opened {
+                        writer_paste_open.store(true, Ordering::Release);
+                    }
+                    continue;
+                }
+                match transition {
+                    PasteTransition::Opened => writer_paste_open.store(true, Ordering::Release),
+                    PasteTransition::Closed => writer_paste_open.store(false, Ordering::Release),
+                    PasteTransition::Unchanged => {}
                 }
             }
         });
