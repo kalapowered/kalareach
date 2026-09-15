@@ -197,6 +197,21 @@ impl EnvironmentPaths {
         &self.state_dir
     }
 
+    /// Returns the runtime root these directories were derived from.
+    ///
+    /// A process that is given the roots can derive every environment's directories itself. A
+    /// process given one environment's directory cannot, and would build the prefix twice.
+    #[must_use]
+    pub fn runtime_root(&self) -> &Path {
+        &self.runtime_root
+    }
+
+    /// Returns the state root these directories were derived from.
+    #[must_use]
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
     /// Creates every directory this environment needs, owner-only.
     ///
     /// # Errors

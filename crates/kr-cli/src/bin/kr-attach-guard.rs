@@ -8,12 +8,16 @@
 //! * A release byte means the attach process restored the terminal itself and this one should
 //!   leave without touching anything.
 //!
-//! It is started with its own session, so it has no controlling terminal and changing the
-//! inherited one cannot stop it with `SIGTTOU`. It never promises to survive the terminal
-//! emulator itself: if that is gone there is nothing to restore.
+//! It runs in its own process group, so a signal aimed at the attach process's group does not
+//! reach it. By the time it acts that group is in the background, and a background process that
+//! changes the terminal is normally stopped with `SIGTTOU`; the guard catches that signal instead,
+//! so the change goes through. It never promises to survive the terminal emulator itself: if that
+//! is gone there is nothing to restore.
 
 use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use kr_cli::attach::GUARD_RELEASE;
@@ -47,16 +51,36 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // A background process that changes the terminal is stopped by `SIGTTOU` unless it handles the
+    // signal. Registering a handler is what lets the restoration actually happen.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    if signal_hook::flag::register(signal_hook::consts::SIGTTOU, Arc::clone(&interrupted)).is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+
     let terminal = std::io::stdout();
     let Ok(mut modes) = rustix::termios::tcgetattr(&terminal) else {
         return ExitCode::FAILURE;
     };
     saved.apply(&mut modes);
-    if rustix::termios::tcsetattr(&terminal, OptionalActions::Flush, &modes).is_err() {
+    if !set_modes(&terminal, &modes) {
         return ExitCode::FAILURE;
     }
     let mut handle = terminal.lock();
     let _ = handle.write_all(RESET_SEQUENCES);
     let _ = handle.flush();
     ExitCode::SUCCESS
+}
+
+/// Applies the modes, retrying the interruption a caught signal causes.
+fn set_modes(terminal: &std::io::Stdout, modes: &rustix::termios::Termios) -> bool {
+    for _ in 0..8 {
+        match rustix::termios::tcsetattr(terminal, OptionalActions::Flush, modes) {
+            Ok(()) => return true,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }

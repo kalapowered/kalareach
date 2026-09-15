@@ -96,11 +96,14 @@ impl RestorationGuard {
 
 #[cfg(unix)]
 fn detached(program: &std::path::Path) -> Command {
-    // The guard runs in its own session, so it has no controlling terminal of its own. Changing an
-    // inherited terminal from a process with no controlling terminal does not raise `SIGTTOU`,
-    // which would otherwise stop the guard at the moment it is needed.
-    let mut command = Command::new("/usr/bin/setsid");
-    command.arg(program);
+    use std::os::unix::process::CommandExt as _;
+
+    // The guard gets its own process group, so a signal aimed at this command's group — the one a
+    // shell sends on Ctrl-C, or on the pipeline's exit — does not reach it. It keeps the
+    // controlling terminal, because restoring that terminal is its whole purpose; it handles the
+    // background-write signal itself rather than being stopped by it.
+    let mut command = Command::new(program);
+    command.process_group(0);
     command
 }
 

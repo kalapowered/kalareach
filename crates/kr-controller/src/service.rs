@@ -35,7 +35,7 @@ use kr_protocol::local::{ControlMessage, LocalClientKind, LocalHelloAck, LocalPe
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 use kr_protocol::session::{
-    ClosureRecord, SessionCloseParams, SessionCloseResult, SessionCreateParams,
+    ClosureReason, ClosureRecord, SessionCloseParams, SessionCloseResult, SessionCreateParams,
     SessionCreateResult, SessionListParams, SessionListResult, SessionReadParams,
     SessionReadResult, SessionState, SessionSummary,
 };
@@ -49,6 +49,12 @@ use crate::error::{ControllerError, Result};
 use crate::registry::{LaunchPhase, Registry, WorkerRecord};
 use crate::singleton::SingletonLock;
 use crate::supervision::{WorkerLaunch, WorkerSupervisor};
+
+/// How long a closing worker is watched before the controller stops waiting for it to end.
+pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the rendezvous waits for the launcher to report the worker's identity.
+pub const LAUNCH_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a create waits for its worker to report itself.
 pub const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -240,10 +246,13 @@ impl Controller {
                 reservation.phase.as_str()
             )));
         }
-        let launcher = reservation
-            .launcher_identity
-            .as_ref()
-            .ok_or_else(|| ControllerError::rendezvous("the reservation has no launch identity"))?;
+        drop(registry);
+        // The launcher's identity is recorded as soon as the service manager reports it, which can
+        // be after the worker has already connected. Waiting for it is not optional: without it
+        // there is nothing to compare the connecting process against.
+        let launcher = self.await_launch_identity(claim.reservation_id).await?;
+        let launcher = &launcher;
+        let mut registry = self.registry.lock().await;
         // The connecting process must be the process the launcher started, checked by both its
         // identifier and the kernel's record of when it started.
         let peer_pid = peer
@@ -287,6 +296,30 @@ impl Controller {
             controller_generation: self.generation,
             release: self.release.clone(),
         })
+    }
+
+    /// Waits for the launcher's reported identity to reach the registry.
+    async fn await_launch_identity(
+        &self,
+        reservation_id: ReservationId,
+    ) -> Result<kr_protocol::identity::ProcessStartIdentity> {
+        let deadline = std::time::Instant::now() + LAUNCH_IDENTITY_TIMEOUT;
+        loop {
+            {
+                let registry = self.registry.lock().await;
+                if let Some(reservation) = registry.reservation(reservation_id)?
+                    && let Some(identity) = reservation.launcher_identity
+                {
+                    return Ok(identity);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ControllerError::rendezvous(
+                    "the launcher did not report the worker's identity",
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     async fn record_ready(
@@ -373,7 +406,7 @@ impl Controller {
         }
     }
 
-    async fn client(&self, connection: Connection, peer: PeerIdentity) -> Result<()> {
+    async fn client(self: &Arc<Self>, connection: Connection, peer: PeerIdentity) -> Result<()> {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         let actor_id = ActorId::new(format!("local:{}", peer.uid))
             .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal"));
@@ -422,7 +455,7 @@ impl Controller {
         Ok(())
     }
 
-    async fn read_method(&self, request: &Request) -> ControlMessage {
+    async fn read_method(self: &Arc<Self>, request: &Request) -> ControlMessage {
         let Some(method) = request.method.method() else {
             return error_reply(
                 request.request_id,
@@ -444,7 +477,11 @@ impl Controller {
         respond(request.request_id, outcome)
     }
 
-    async fn write_method(&self, actor_id: &ActorId, mutation: &MutationRequest) -> ControlMessage {
+    async fn write_method(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> ControlMessage {
         let Some(method) = mutation.method.method() else {
             return error_reply(
                 mutation.request_id,
@@ -539,23 +576,26 @@ impl Controller {
         encode(&HostDoctorResult { checks, healthy })
     }
 
-    async fn session_list(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    async fn session_list(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
         let params: SessionListParams = parse(params)?;
         let mut sessions = Vec::new();
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         for worker in workers {
-            if let Ok(summary) = self.read_from_worker(&worker).await {
-                sessions.push(summary);
+            match self.read_from_worker(&worker).await {
+                Ok(summary) => sessions.push(summary),
+                Err(_) => {
+                    let _ = self.reconcile(worker.descriptor.session_id).await;
+                }
             }
         }
         if params.include_closed {
             let registry = self.registry.lock().await;
-            for record in registry.workers()? {
-                if let Some(closure) = registry.closure(record.session_id)? {
+            for reservation in registry.closed_reservations()? {
+                if let Some(closure) = registry.closure(reservation.session_id)? {
                     sessions.push(closed_summary(
                         &closure,
                         self.paths.environment_id(),
-                        record.display_number,
+                        reservation.display_number,
                     ));
                 }
             }
@@ -564,24 +604,34 @@ impl Controller {
         encode(&SessionListResult { sessions })
     }
 
-    async fn session_read(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    async fn session_read(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
         let params: SessionReadParams = parse(params)?;
         let worker = self.directory.lock().await.get(params.session_id).cloned();
         if let Some(worker) = worker {
-            let summary = self.read_from_worker(&worker).await?;
-            return encode(&SessionReadResult {
-                session: summary,
-                endpoint: Nullable::some(worker.endpoint.as_text()),
-            });
+            match self.read_from_worker(&worker).await {
+                Ok(summary) => {
+                    return encode(&SessionReadResult {
+                        session: summary,
+                        endpoint: Nullable::some(worker.endpoint.as_text()),
+                    });
+                }
+                // A worker that cannot be reached is not necessarily gone. Reconciliation asks the
+                // kernel; only a confirmed death produces a closure record.
+                Err(error) => {
+                    if self.reconcile(params.session_id).await?.is_none() {
+                        return Err(error);
+                    }
+                }
+            }
         }
         // A closed session answers with its record. It never starts anything.
         let registry = self.registry.lock().await;
         let closure = registry.closure(params.session_id)?;
+        // The reservation row outlives the worker row, so a closed session keeps the number it was
+        // listed under.
         let display = registry
-            .workers()?
-            .into_iter()
-            .find(|record| record.session_id == params.session_id)
-            .map(|record| record.display_number);
+            .reservation_for_session(params.session_id)?
+            .map(|reservation| reservation.display_number);
         drop(registry);
         match closure {
             Some(closure) => {
@@ -625,6 +675,14 @@ impl Controller {
             },
         );
 
+        // The reservation moves to `spawned` before anything is started. A worker can reach the
+        // rendezvous socket the instant the service manager starts it, which is sooner than the
+        // launcher returns, and a reservation still recorded as merely reserved would fence its
+        // own worker.
+        {
+            let mut registry = self.registry.lock().await;
+            registry.set_phase(reservation.reservation_id, LaunchPhase::Spawned)?;
+        }
         let launch = WorkerLaunch {
             reservation_id: reservation.reservation_id,
             session_id: reservation.session_id,
@@ -632,8 +690,11 @@ impl Controller {
             display_number: reservation.display_number,
             program: self.worker_program.clone(),
             rendezvous: self.paths.rendezvous_endpoint()?.as_path().to_path_buf(),
-            runtime_directory: self.paths.runtime_dir().to_path_buf(),
-            state_directory: self.paths.state_dir().to_path_buf(),
+            // The roots, not this environment's directories: the worker derives its own paths
+            // from the environment identity, and giving it the derived directory would make it
+            // apply the prefix twice.
+            runtime_directory: self.paths.runtime_root().to_path_buf(),
+            state_directory: self.paths.state_root().to_path_buf(),
             jobs_directory: self.paths.jobs_dir(),
         };
         let identity = self.supervisor.start(&launch)?;
@@ -718,7 +779,7 @@ impl Controller {
         }
     }
 
-    async fn session_close(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    async fn session_close(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
         let params: SessionCloseParams = parse(params)?;
         let worker = self.directory.lock().await.get(params.session_id).cloned();
         let Some(worker) = worker else {
@@ -752,13 +813,123 @@ impl Controller {
                 let reply: SessionCloseResult = value
                     .to_typed()
                     .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-                if let Some(record) = reply.closure.as_ref() {
-                    self.retire(record).await?;
+                match reply.closure.as_ref() {
+                    Some(record) => self.retire(record).await?,
+                    // The worker has accepted the close and is stopping its processes. Something
+                    // has to notice when that finishes, so the tombstone is written and the
+                    // descriptor removed rather than left pointing at a process that has gone.
+                    None => {
+                        tokio::spawn(
+                            Arc::clone(self)
+                                .watch_closure(params.session_id, ClosureReason::CloseRequested),
+                        );
+                    }
                 }
                 encode(&reply)
             }
             Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
         }
+    }
+
+    /// Waits for a closing worker to end, then records its closure and retires it.
+    ///
+    /// The worker's acceptance says `closing`, because section 7 gives the requester its answer
+    /// before anything is signalled. Something still has to notice when the closure finishes, and
+    /// that is this: it watches the process identity the registry holds, and writes the record once
+    /// the kernel agrees the worker is gone.
+    pub async fn watch_closure(self: Arc<Self>, session_id: SessionId, reason: ClosureReason) {
+        let deadline = std::time::Instant::now() + CLOSURE_WATCH_TIMEOUT;
+        loop {
+            let identity = {
+                let registry = self.registry.lock().await;
+                registry
+                    .workers()
+                    .ok()
+                    .and_then(|workers| {
+                        workers
+                            .into_iter()
+                            .find(|record| record.session_id == session_id)
+                    })
+                    .map(|record| record.process_identity)
+            };
+            let Some(identity) = identity else {
+                return;
+            };
+            match kr_ipc::identity::process_state(&identity) {
+                kr_ipc::identity::ProcessState::Ended => {
+                    let _ = self.record_final(session_id, reason, &identity).await;
+                    return;
+                }
+                kr_ipc::identity::ProcessState::Running
+                | kr_ipc::identity::ProcessState::Unknown { .. } => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Reconciles a session whose worker cannot be reached.
+    ///
+    /// If the recorded process is gone the session is closed and recorded as an abnormal closure,
+    /// which is what section 24 requires when the controller detects a worker's death. If the
+    /// process is still running, or the kernel will not say, nothing is recorded: a controller that
+    /// cannot reach a worker has not established that the worker is dead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written.
+    pub async fn reconcile(&self, session_id: SessionId) -> Result<Option<ClosureRecord>> {
+        let identity = {
+            let registry = self.registry.lock().await;
+            registry
+                .workers()?
+                .into_iter()
+                .find(|record| record.session_id == session_id)
+                .map(|record| record.process_identity)
+        };
+        let Some(identity) = identity else {
+            return Ok(None);
+        };
+        match kr_ipc::identity::process_state(&identity) {
+            kr_ipc::identity::ProcessState::Ended => self
+                .record_final(session_id, ClosureReason::WorkerCrash, &identity)
+                .await
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    async fn record_final(
+        &self,
+        session_id: SessionId,
+        reason: ClosureReason,
+        identity: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> Result<ClosureRecord> {
+        if let Some(existing) = self.registry.lock().await.closure(session_id)? {
+            return Ok(existing);
+        }
+        let record = ClosureRecord {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            reason,
+            root_exit_code: Nullable::null(),
+            root_signal: Nullable::null(),
+            terminated: vec![kr_protocol::session::TerminatedProcess {
+                identity: identity.clone(),
+                name: Nullable::some("kr-worker".to_owned()),
+                forced: false,
+            }],
+            surviving: Vec::new(),
+            // The controller confirmed the worker process ended. It does not claim to have
+            // discovered every application that worker may have started.
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_ipc::now_ms(),
+        };
+        self.retire(&record).await?;
+        Ok(record)
     }
 
     /// Records a closed session, removes its descriptor and forgets its key.

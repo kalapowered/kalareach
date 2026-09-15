@@ -40,12 +40,26 @@ pub struct ControllingTerminal {
 }
 
 impl ControllingTerminal {
-    /// Opens the controlling terminal.
+    /// Opens the terminal this command is attached to.
+    ///
+    /// The command's own standard input is preferred, because that is the terminal whose bytes it
+    /// forwards and whose modes it changes. `/dev/tty` is the fallback for a command whose input
+    /// has been redirected but which still has a controlling terminal.
     ///
     /// # Errors
     ///
-    /// Returns [`CliError::NotATerminal`] when this process has no controlling terminal.
+    /// Returns [`CliError::NotATerminal`] when neither is a terminal.
     pub fn open() -> Result<Self> {
+        use std::os::fd::AsFd as _;
+
+        let standard_input = std::io::stdin();
+        if rustix::termios::isatty(&standard_input)
+            && let Ok(duplicate) = standard_input.as_fd().try_clone_to_owned()
+        {
+            return Ok(Self {
+                handle: File::from(duplicate),
+            });
+        }
         let handle = File::options()
             .read(true)
             .write(true)

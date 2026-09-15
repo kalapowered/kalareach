@@ -162,10 +162,21 @@ impl LaunchdSupervisor {
              <key>RunAtLoad</key><false/>\n\
              <key>KeepAlive</key><false/>\n\
              <key>ProcessType</key>{process_type}\
+             <key>StandardErrorPath</key>{diagnostics}\
              </dict>\n</plist>\n",
             label_value = plist_string(&label),
             arguments = arguments,
             process_type = plist_string("Interactive"),
+            // A worker that fails before it reaches the rendezvous has nowhere else to say why:
+            // it has no terminal, no connection and no journal yet. This file is the one place
+            // that diagnosis can go, and it lives in the owner-only state directory.
+            diagnostics = plist_string(
+                &launch
+                    .jobs_directory
+                    .join(format!("{label}.diagnostics"))
+                    .display()
+                    .to_string()
+            ),
         );
         kr_ipc::paths::write_owner_only_file(&path, document.as_bytes())
             .map_err(ControllerError::Ipc)?;
@@ -203,7 +214,7 @@ impl WorkerSupervisor for LaunchdSupervisor {
                 "launchctl kickstart did not report a process identifier: {output}"
             ))
         })?;
-        kr_ipc::identity::process_start_identity(pid).map_err(ControllerError::Ipc)
+        identity_when_available(pid)
     }
 
     fn describe(&self) -> String {
@@ -265,7 +276,7 @@ impl WorkerSupervisor for SystemdSupervisor {
                 "the transient service {unit} reported no main process"
             ))
         })?;
-        kr_ipc::identity::process_start_identity(pid).map_err(ControllerError::Ipc)
+        identity_when_available(pid)
     }
 
     fn describe(&self) -> String {
@@ -273,10 +284,11 @@ impl WorkerSupervisor for SystemdSupervisor {
     }
 }
 
-/// The fallback supervisor: a detached, separately sessionised process.
+/// The fallback supervisor: a detached process in its own process group.
 ///
 /// This is what a non-systemd Unix host uses, and what a macOS host without a GUI bootstrap domain
-/// falls back to. The child is reparented to init, so it outlives this daemon; it has no
+/// falls back to. The child has its own process group and no inherited terminal, so nothing aimed
+/// at this daemon reaches it, and it is reparented to init when this daemon exits. It has no
 /// parent-death signal, and the daemon reconnects to its endpoint rather than to a pipe.
 #[derive(Debug, Default)]
 pub struct DetachedSupervisor;
@@ -292,28 +304,30 @@ impl DetachedSupervisor {
 impl WorkerSupervisor for DetachedSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> Result<ProcessStartIdentity> {
         let child = detached_command(&launch.program, &launch.arguments())?;
-        kr_ipc::identity::process_start_identity(child).map_err(ControllerError::Ipc)
+        identity_when_available(child)
     }
 
     fn describe(&self) -> String {
-        "a detached, separately sessionised process reparented to init".to_owned()
+        "a detached process in its own group, reparented to init when this daemon exits".to_owned()
     }
 }
 
 #[cfg(unix)]
 fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
-    // `setsid` puts the worker in its own session, so it survives this daemon and is reparented to
-    // init. Using the system tool keeps this crate free of the unsafe pre-execution hook the same
-    // effect would otherwise need.
-    let mut command = std::process::Command::new("/usr/bin/setsid");
-    command.arg(program);
+    use std::os::unix::process::CommandExt as _;
+
+    // The worker gets its own process group and no inherited terminal, so nothing aimed at this
+    // daemon reaches it and it is reparented to init when this daemon exits. It is the fallback
+    // for a host with no service manager to ask; where one exists, that manager owns the worker.
+    let mut command = std::process::Command::new(program);
+    command.process_group(0);
     command.args(arguments);
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let child = command.spawn().map_err(|error| {
-        ControllerError::supervision(format!("setsid {}: {error}", program.display()))
+        ControllerError::supervision(format!("start {}: {error}", program.display()))
     })?;
     Ok(child.id())
 }
@@ -332,6 +346,37 @@ fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
         ControllerError::supervision(format!("start {}: {error}", program.display()))
     })?;
     Ok(child.id())
+}
+
+/// How long the launcher's reported process is given to become readable.
+pub const IDENTITY_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reads a freshly started process's start identity, allowing for the moment it takes to appear.
+///
+/// A service manager reports the process identifier as soon as it has spawned the process, which
+/// can be before the kernel will answer questions about it: the process may still be part way
+/// through replacing its image. Retrying briefly is the difference between recording the identity
+/// and refusing a worker that started perfectly well.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::Supervision`] when the identity is still unreadable at the deadline,
+/// which means the process is genuinely gone.
+pub fn identity_when_available(pid: u32) -> Result<ProcessStartIdentity> {
+    let deadline = std::time::Instant::now() + IDENTITY_SETTLE;
+    loop {
+        match kr_ipc::identity::process_start_identity(pid) {
+            Ok(identity) => return Ok(identity),
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(ControllerError::supervision(format!(
+                        "the launcher reported process {pid}, which the kernel will not describe: {error}"
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 fn run(program: &str, arguments: &[&str]) -> Result<String> {

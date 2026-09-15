@@ -478,6 +478,24 @@ impl Registry {
         )
     }
 
+    /// Reads the reservation that allocated a session.
+    ///
+    /// The reservation row survives closure, so a closed session still has a display number to be
+    /// listed under.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
+    pub fn reservation_for_session(&self, session_id: SessionId) -> Result<Option<Reservation>> {
+        self.read_reservation(
+            "SELECT reservation_id, actor_id, create_token, payload_digest, session_id,
+                    display_number, phase, launcher_pid, launcher_source, launcher_start,
+                    created_at_ms
+             FROM reservations WHERE session_id = ?1",
+            params![session_id.get().as_bytes().as_slice()],
+        )
+    }
+
     fn reservation_for_token(
         &self,
         actor_id: &ActorId,
@@ -568,6 +586,37 @@ impl Registry {
                 },
             )
             .transpose()
+    }
+
+    /// Returns every reservation whose session has closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
+    pub fn closed_reservations(&self) -> Result<Vec<Reservation>> {
+        let sessions: Vec<Vec<u8>> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT session_id FROM reservations WHERE phase = ?1 ORDER BY display_number",
+                )
+                .map_err(ControllerError::registry)?;
+            let rows = statement
+                .query_map(params![LaunchPhase::Closed.as_str()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .map_err(ControllerError::registry)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(ControllerError::registry)?
+        };
+        let mut reservations = Vec::new();
+        for session in sessions {
+            let session_id = SessionId::new(uuid_from(&session)?);
+            if let Some(reservation) = self.reservation_for_session(session_id)? {
+                reservations.push(reservation);
+            }
+        }
+        Ok(reservations)
     }
 
     /// Records a worker inside the reservation-to-live transition.

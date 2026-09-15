@@ -150,8 +150,31 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Close(arguments) => {
             let selector = session_selector(arguments.session.as_deref())?;
             let wanted = parse_environment(arguments.environment.as_deref())?;
-            let closed = match find(&paths, &selector, wanted) {
-                Ok((_, descriptor)) => {
+            // Closing goes through the control daemon where one is running, because the daemon
+            // owns the registry and writes the closure record. With no daemon the command still
+            // works: it closes the worker directly, and the daemon reconciles the record when it
+            // comes back.
+            let session_id = match find(&paths, &selector, wanted) {
+                Ok((_, descriptor)) => Some(descriptor.session_id),
+                Err(CliError::UnknownSession(_)) => resolve_identifier(&selector).ok(),
+                Err(error) => return Err(error),
+            };
+            let session_id =
+                session_id.ok_or_else(|| CliError::UnknownSession(selector.to_string()))?;
+            let closed = match open_controller(&environment, build_id()).await {
+                Ok(mut client) => {
+                    let outcome = client
+                        .mutate(
+                            Method::SessionClose,
+                            ActionId::new(kr_ipc::new_uuid()),
+                            session_target(environment_id, session_id),
+                            &SessionCloseParams { session_id },
+                        )
+                        .await?;
+                    typed::<SessionCloseResult>(outcome)?
+                }
+                Err(_) => {
+                    let (_, descriptor) = find(&paths, &selector, wanted)?;
                     let mut client = open_worker(&descriptor, build_id()).await?;
                     let outcome = client
                         .mutate(
@@ -165,22 +188,6 @@ async fn run(cli: Cli) -> Result<()> {
                         .await?;
                     typed::<SessionCloseResult>(outcome)?
                 }
-                // A session with no descriptor has already closed; the daemon answers with its
-                // record rather than starting anything.
-                Err(CliError::UnknownSession(_)) => {
-                    let mut client = open_controller(&environment, build_id()).await?;
-                    let session_id = resolve_identifier(&selector)?;
-                    let outcome = client
-                        .mutate(
-                            Method::SessionClose,
-                            ActionId::new(kr_ipc::new_uuid()),
-                            session_target(environment_id, session_id),
-                            &SessionCloseParams { session_id },
-                        )
-                        .await?;
-                    typed::<SessionCloseResult>(outcome)?
-                }
-                Err(error) => return Err(error),
             };
             if cli.json {
                 print_json(&serde_json::json!({
@@ -224,18 +231,24 @@ async fn run(cli: Cli) -> Result<()> {
             let selector = session_selector(arguments.session.as_deref())?;
             let wanted = parse_environment(arguments.environment.as_deref())?;
             let summary = match find(&paths, &selector, wanted) {
-                Ok((_, descriptor)) => {
-                    let mut client = open_worker(&descriptor, build_id()).await?;
-                    let outcome = client
-                        .request(
-                            Method::SessionRead,
-                            &SessionReadParams {
-                                session_id: descriptor.session_id,
-                            },
-                        )
-                        .await?;
-                    typed::<SessionReadResult>(outcome)?.session
-                }
+                Ok((_, descriptor)) => match read_session(&descriptor).await {
+                    Ok(summary) => summary,
+                    // A descriptor that no longer answers is a hint that has gone stale. The
+                    // daemon reconciles it and returns the closure record.
+                    Err(CliError::HostUnavailable(_)) => {
+                        let mut client = open_controller(&environment, build_id()).await?;
+                        let outcome = client
+                            .request(
+                                Method::SessionRead,
+                                &SessionReadParams {
+                                    session_id: descriptor.session_id,
+                                },
+                            )
+                            .await?;
+                        typed::<SessionReadResult>(outcome)?.session
+                    }
+                    Err(error) => return Err(error),
+                },
                 Err(CliError::UnknownSession(_)) => {
                     let mut client = open_controller(&environment, build_id()).await?;
                     let session_id = resolve_identifier(&selector)?;
@@ -306,11 +319,14 @@ async fn attach_session(
         .map_or(kr_protocol::ids::InputLeaseEpoch::new(0), |lease| {
             lease.lease.epoch
         });
+    // From the beginning of what is retained, not from the live edge: a terminal that attaches to
+    // a running session shows what is on it. The worker clamps the request to the oldest cursor it
+    // still holds and names the gap when there is one.
     kr_cli::attach::subscribe(
         &mut client,
         descriptor.session_id,
         attachment.attachment_id,
-        Some(attachment.result.output_cursor.get()),
+        Some(0),
     )
     .await?;
 
@@ -388,6 +404,21 @@ async fn attach_session(
     terminal.restore(&saved)?;
     guard.release();
     Ok(())
+}
+
+async fn read_session(
+    descriptor: &kr_protocol::worker::WorkerDescriptor,
+) -> Result<kr_protocol::session::SessionSummary> {
+    let mut client = open_worker(descriptor, build_id()).await?;
+    let outcome = client
+        .request(
+            Method::SessionRead,
+            &SessionReadParams {
+                session_id: descriptor.session_id,
+            },
+        )
+        .await?;
+    Ok(typed::<SessionReadResult>(outcome)?.session)
 }
 
 fn guard_program() -> std::path::PathBuf {

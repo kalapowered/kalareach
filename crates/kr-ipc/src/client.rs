@@ -38,6 +38,7 @@ pub struct LocalClient {
     reader: FrameReader,
     writer: FrameWriter,
     acknowledgement: LocalHelloAck,
+    generation_challenge: Option<kr_protocol::worker::GenerationChallenge>,
     next_request: u64,
 }
 
@@ -89,6 +90,7 @@ impl LocalClient {
                 capabilities: CanonicalSet::new(),
                 max_receive: ReceiveLimits::default(),
             },
+            generation_challenge: None,
             next_request: 0,
         };
         match client.reader.read_message().await? {
@@ -100,6 +102,30 @@ impl LocalClient {
                     });
                 }
                 client.acknowledgement = acknowledgement;
+                if kind == LocalClientKind::Controller {
+                    // A worker offers its generation challenge as soon as a controller announces
+                    // itself, so the nonce is bound to this connection from its first frame. It is
+                    // held until the token is presented and used exactly once.
+                    match client.reader.read_message().await? {
+                        ControlMessage::GenerationChallenge(challenge) => {
+                            client.generation_challenge = Some(challenge);
+                        }
+                        ControlMessage::Response(Response {
+                            outcome: Outcome::Error(error),
+                            ..
+                        }) => {
+                            return Err(IpcError::IdentityUnavailable {
+                                what: "the worker refused the controller connection",
+                                detail: error.to_string(),
+                            });
+                        }
+                        _ => {
+                            return Err(IpcError::UnexpectedMessage(
+                                "the worker did not offer a generation challenge",
+                            ));
+                        }
+                    }
+                }
                 Ok(client)
             }
             ControlMessage::Response(Response {
@@ -153,12 +179,12 @@ impl LocalClient {
         &mut self,
         sign: impl FnOnce(&kr_protocol::scalars::Nonce256) -> Result<ControllerGenerationToken>,
     ) -> Result<GenerationAccepted> {
-        let ControlMessage::GenerationChallenge(challenge) = self.reader.read_message().await?
-        else {
-            return Err(IpcError::UnexpectedMessage(
+        let challenge = self
+            .generation_challenge
+            .take()
+            .ok_or(IpcError::UnexpectedMessage(
                 "the worker did not issue a generation challenge",
-            ));
-        };
+            ))?;
         let token = sign(&challenge.nonce)?;
         self.writer
             .write_message(&ControlMessage::GenerationToken(Box::new(token)))
