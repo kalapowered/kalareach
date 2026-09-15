@@ -18,6 +18,7 @@
 use kr_protocol::identity::{
     BootIdentity, BootIdentitySource, ProcessStartIdentity, ProcessStartSource,
 };
+use kr_protocol::ids::BootEpoch;
 
 use crate::error::{IpcError, Result};
 
@@ -28,6 +29,32 @@ use crate::error::{IpcError, Result};
 /// Returns [`IpcError::IdentityUnavailable`] when the operating system does not answer.
 pub fn boot_identity() -> Result<BootIdentity> {
     platform::boot_identity()
+}
+
+/// Returns the compact boot epoch that binds a continuous-time deadline to one boot.
+///
+/// A [`BootIdentity`] is an opaque value of whatever length its source produces, and the wire
+/// carries the boot inside an action window as a single number. This derives that number from the
+/// identity, so the two can never disagree about which boot the host is in: it is the first eight
+/// bytes of the SHA-256 of the identity's canonical encoding, read big-endian.
+///
+/// The value is only ever compared for equality. It is not a count of boots and it does not
+/// increase from one boot to the next; what matters is that a different boot produces a different
+/// number, which a 64-bit digest of the kernel's own boot identifier does.
+///
+/// # Errors
+///
+/// Returns an error when the identity cannot be encoded canonically.
+pub fn boot_epoch(identity: &BootIdentity) -> Result<BootEpoch> {
+    let encoded =
+        kr_cbor::to_canonical_vec(identity).map_err(|error| IpcError::IdentityUnavailable {
+            what: "the boot identity could not be encoded",
+            detail: error.to_string(),
+        })?;
+    let digest = kr_cbor::sha256(&encoded);
+    let mut head = [0_u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    Ok(BootEpoch::new(u64::from_be_bytes(head)))
 }
 
 /// Reads one process's start identity.

@@ -90,18 +90,21 @@ async fn host(generation: u64) -> Host {
         .worker_endpoint(DisplayNumber::new(1))
         .expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    let service = Arc::new(WorkerService::new(
-        Arc::clone(&runtime),
-        identity,
-        endpoint.clone(),
-        ServiceBinding {
-            environment_id,
-            boot_identity: boot.clone(),
-            controller_public_key: *controller.public_key(),
-            controller_generation: ControllerGeneration::new(generation),
-            build_id: build(),
-        },
-    ));
+    let service = Arc::new(
+        WorkerService::new(
+            Arc::clone(&runtime),
+            identity,
+            endpoint.clone(),
+            ServiceBinding {
+                environment_id,
+                boot_identity: boot.clone(),
+                controller_public_key: *controller.public_key(),
+                controller_generation: ControllerGeneration::new(generation),
+                build_id: build(),
+            },
+        )
+        .expect("a worker service"),
+    );
     tokio::spawn(Arc::clone(&service).serve(listener));
     Host {
         _temp: temp,
@@ -217,8 +220,8 @@ async fn a_mutation_that_quotes_an_unknown_window_is_not_admitted() {
         })
         .expect("encodes");
     let request_id = kr_protocol::ids::RequestId::new(41);
-    let mutation =
-        kr_protocol::local::ControlMessage::Mutation(kr_protocol::envelope::MutationRequest {
+    let mutation = kr_protocol::envelope::ControlFrame::Mutation(Box::new(
+        kr_protocol::envelope::MutationRequest {
             request_id,
             method: Method::SessionClose.into(),
             method_version: kr_protocol::method::MethodVersion::V1,
@@ -230,14 +233,15 @@ async fn a_mutation_that_quotes_an_unknown_window_is_not_admitted() {
                 .expect("a window"),
             requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
             params,
-        });
+        },
+    ));
     client
         .writer()
         .write_message(&mutation)
         .await
         .expect("writes the mutation");
     let reply = client.recv().await.expect("the worker answers");
-    let kr_protocol::local::ControlMessage::Response(response) = reply else {
+    let kr_protocol::envelope::ControlFrame::Response(response) = reply else {
         panic!("the worker answered something other than a response");
     };
     let kr_protocol::envelope::Outcome::Error(error) = response.outcome else {
@@ -293,13 +297,15 @@ async fn send_mutation(
 ) -> kr_protocol::envelope::Outcome {
     client
         .writer()
-        .write_message(&kr_protocol::local::ControlMessage::Mutation(mutation))
+        .write_message(&kr_protocol::envelope::ControlFrame::Mutation(Box::new(
+            mutation,
+        )))
         .await
         .expect("writes the mutation");
     loop {
         match client.recv().await.expect("the worker answers") {
-            kr_protocol::local::ControlMessage::Response(response) => return response.outcome,
-            kr_protocol::local::ControlMessage::Notification(_) => {}
+            kr_protocol::envelope::ControlFrame::Response(response) => return response.outcome,
+            kr_protocol::envelope::ControlFrame::Notification(_) => {}
             other => panic!("the worker answered {other:?}"),
         }
     }
@@ -319,7 +325,7 @@ fn close_mutation(
         grant_id: Nullable::null(),
         target: target(host.environment_id, host.session_id),
         expected,
-        action_window_id: client.acknowledgement().action_window_id.clone(),
+        action_window_id: client.action_window().action_window_id.clone(),
         requested_ttl_ms: kr_protocol::scalars::DurationMs::new(ttl_ms),
         params: kr_protocol::envelope::ParamsValue::from_typed(
             &kr_protocol::session::SessionCloseParams {
@@ -446,7 +452,7 @@ async fn a_second_hello_cannot_change_what_a_connection_is() {
     // round the authority check, so a second hello is refused outright.
     first
         .writer()
-        .write_message(&kr_protocol::local::ControlMessage::Hello(
+        .write_message(&kr_protocol::envelope::ControlFrame::Hello(
             kr_protocol::local::LocalHello {
                 offered_versions: vec![PROTOCOL_VERSION],
                 build_id: build(),
@@ -458,7 +464,7 @@ async fn a_second_hello_cannot_change_what_a_connection_is() {
         .await
         .expect("writes the hello");
     let reply = first.recv().await.expect("the worker answers");
-    let kr_protocol::local::ControlMessage::Response(response) = reply else {
+    let kr_protocol::envelope::ControlFrame::Response(response) = reply else {
         panic!("a second hello must not be acknowledged");
     };
     assert!(matches!(
@@ -482,7 +488,7 @@ async fn only_the_controller_that_holds_authority_announces_a_revision() {
         revision: kr_protocol::ids::AuthorityRevision::new(4),
     };
     cli.writer()
-        .write_message(&kr_protocol::local::ControlMessage::AuthorityRevision(
+        .write_message(&kr_protocol::envelope::ControlFrame::AuthorityRevision(
             notice,
         ))
         .await
@@ -491,7 +497,7 @@ async fn only_the_controller_that_holds_authority_announces_a_revision() {
     assert!(
         matches!(
             reply,
-            kr_protocol::local::ControlMessage::Response(kr_protocol::envelope::Response {
+            kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
                 outcome: kr_protocol::envelope::Outcome::Error(_),
                 ..
             })
@@ -503,13 +509,13 @@ async fn only_the_controller_that_holds_authority_announces_a_revision() {
     let mut controller = controller_client(&host, 1).await;
     controller
         .writer()
-        .write_message(&kr_protocol::local::ControlMessage::AuthorityRevision(
+        .write_message(&kr_protocol::envelope::ControlFrame::AuthorityRevision(
             notice,
         ))
         .await
         .expect("writes the notice");
     let reply = controller.recv().await.expect("the worker answers");
-    let kr_protocol::local::ControlMessage::AuthorityRevisionAck(ack) = reply else {
+    let kr_protocol::envelope::ControlFrame::AuthorityRevisionAck(ack) = reply else {
         panic!("the controller's announcement is acknowledged");
     };
     assert_eq!(ack.revision.get(), 4);

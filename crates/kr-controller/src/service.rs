@@ -13,26 +13,27 @@ use std::sync::Arc;
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::framed::split;
-use kr_ipc::freshness::FreshnessWindow;
 use kr_ipc::paths::{Endpoint, EnvironmentPaths};
 use kr_ipc::peer::PeerIdentity;
 use kr_ipc::verify::{ControllerIdentity, check_rendezvous};
-use kr_protocol::envelope::{MutationRequest, Outcome, ParamsValue, Request, Response};
+use kr_protocol::envelope::{
+    ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
+};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
-use kr_protocol::hello::{PROTOCOL_VERSION, ReceiveLimits};
+use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION, ReceiveLimits};
 use kr_protocol::hostinfo::{
     DoctorCheck, DoctorStatus, EnvironmentListResult, EnvironmentSummary, HostDoctorResult,
     HostInfoResult,
 };
 use kr_protocol::identity::{BootIdentity, WorkerProfile};
 use kr_protocol::ids::{
-    ActorId, BuildId, ConnectionId, ControllerGeneration, EnvironmentId, RequestId, SessionEpoch,
-    SessionId,
+    ActorId, BootEpoch, BuildId, ConnectionId, ControllerGeneration, EnvironmentId, RequestId,
+    SessionEpoch, SessionId,
 };
-use kr_protocol::local::{ControlMessage, LocalClientKind, LocalHelloAck, LocalPeer, LocalRole};
+use kr_protocol::local::{LocalClientKind, LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
+use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs, U64};
 use kr_protocol::session::{
     ClosureReason, ClosureRecord, SessionCloseParams, SessionCloseResult, SessionCreateParams,
     SessionCreateResult, SessionListParams, SessionListResult, SessionReadParams,
@@ -41,6 +42,9 @@ use kr_protocol::session::{
 use kr_protocol::worker::{
     ReservationId, WorkerDescriptor, WorkerLaunchSpec, WorkerReady, WorkerRendezvous,
 };
+use kr_transport::clock::{ContinuousClock, SystemContinuousClock};
+use kr_transport::lease::{LeaseIssuer, LeaseRefusal, RevocationStatus};
+use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 use tokio::sync::{Mutex, oneshot};
 
 use crate::directory::{Directory, KnownWorker, Reconnect};
@@ -58,8 +62,20 @@ pub const LAUNCH_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// How long a create waits for its worker to report itself.
 pub const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long a local connection's freshness window lasts.
-pub const ACTION_WINDOW_MS: u64 = 5 * 60 * 1000;
+/// How often the daemon replaces a live connection's action window.
+///
+/// Half the window's validity, which is the schedule the transport uses: a client is never left
+/// holding a window that expired while a renewal was still in flight, and a connection that is
+/// about to submit a mutation does not have to ask for one.
+pub const WINDOW_RENEWAL: std::time::Duration =
+    std::time::Duration::from_millis(MAX_WINDOW_VALIDITY.as_millis() as u64 / 2);
+
+/// How often a local connection sends a keepalive.
+///
+/// Section 23 puts it at ten seconds while the connection is active. A network connection has the
+/// transport's own keepalive underneath it; a Unix socket or a named pipe has nothing equivalent,
+/// so the control stream carries one itself.
+pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The control daemon.
 pub struct Controller {
@@ -73,10 +89,31 @@ pub struct Controller {
     /// worker, used in order, is what stops that.
     connections: Mutex<BTreeMap<SessionId, Arc<tokio::sync::Mutex<Option<LocalClient>>>>>,
     pending: Mutex<BTreeMap<ReservationId, PendingCreate>>,
+    /// Every connection this daemon has admitted, and the authority revision it was admitted at.
+    ///
+    /// This is the daemon's authority store for live connections. A registration is written in the
+    /// same critical section as the caller's final record validation, and withdrawn when the
+    /// authority it was made under is revoked or the connection ends.
+    admitted: Mutex<BTreeMap<ConnectionId, AdmittedConnection>>,
     identity: ControllerIdentity,
     generation: ControllerGeneration,
     paths: EnvironmentPaths,
     boot_identity: BootIdentity,
+    /// The compact form of the boot above, which is what an action window is bound to.
+    boot_epoch: BootEpoch,
+    /// The suspend-aware continuous clock every deadline this daemon decides is measured on.
+    clock: Arc<SystemContinuousClock>,
+    /// The action windows of every connection this daemon serves.
+    ///
+    /// One issuer for the whole daemon, so ending a connection retires its windows and a window
+    /// can never first-admit anything through a connection it does not belong to.
+    windows: ActionWindowIssuer,
+    /// The remote dispatch leases this daemon issues to its workers.
+    ///
+    /// A lease carries the generation and the authority revision it was issued at, so advancing
+    /// the revision invalidates every outstanding lease at once and a replacement daemon cannot
+    /// renew a lease it did not issue.
+    leases: LeaseIssuer,
     supervisor: Box<dyn WorkerSupervisor>,
     worker_program: PathBuf,
     build_id: BuildId,
@@ -116,15 +153,23 @@ impl Controller {
         let mut registry = Registry::open(setup.paths.registry_database(), setup.environment_id)?;
         let generation = lock.advance(&mut registry)?;
         let identity = (setup.identity)()?;
+        let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
+        let clock = Arc::new(SystemContinuousClock::new());
+        let authority_revision = registry.authority_revision()?;
         let controller = Arc::new(Self {
             registry: Mutex::new(registry),
             directory: Mutex::new(Directory::default()),
             connections: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
+            admitted: Mutex::new(BTreeMap::new()),
             identity,
             generation,
             paths: setup.paths,
             boot_identity: setup.boot_identity,
+            boot_epoch,
+            windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
+            leases: LeaseIssuer::with_maximum_validity(generation, authority_revision),
+            clock,
             supervisor: setup.supervisor,
             worker_program: setup.worker_program,
             build_id: setup.build_id,
@@ -406,19 +451,17 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read or written.
-    pub async fn announce_authority_revision(&self) -> Result<RevisionProgress> {
+    pub async fn announce_authority_revision(&self) -> Result<RevocationStatus> {
         let revision = {
             let registry = self.registry.lock().await;
             registry.authority_revision()?
         };
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
-        let mut progress = RevisionProgress {
-            revision,
-            acknowledged: Vec::new(),
-            pending: Vec::new(),
-        };
         for worker in workers {
             let session_id = worker.descriptor.session_id;
+            // The binding is taken before the announcement travels, so an acknowledgement that
+            // arrives over a control path this daemon has already given up on lifts nothing.
+            let binding = self.leases.binding(session_id);
             let outcome = {
                 match self.worker_client(&worker).await {
                     Ok(mut held) => {
@@ -431,10 +474,14 @@ impl Controller {
                             .await;
                         if answered.is_err() {
                             *held = None;
+                            self.leases.stop_renewal(session_id, binding);
                         }
                         answered.ok()
                     }
-                    Err(_) => None,
+                    Err(_) => {
+                        self.leases.stop_renewal(session_id, binding);
+                        None
+                    }
                 }
             };
             match outcome {
@@ -442,32 +489,48 @@ impl Controller {
                     let mut registry = self.registry.lock().await;
                     registry.record_acknowledged_revision(session_id, ack.revision)?;
                     drop(registry);
-                    progress.acknowledged.push(session_id);
+                    self.leases.acknowledge(
+                        session_id,
+                        self.leases.binding(session_id),
+                        ack.revision,
+                    );
                 }
                 // A worker that is confirmed gone answers the question a different way: it can no
                 // longer act under anything.
                 _ => {
                     if self.reconcile(session_id).await?.is_some() {
-                        progress.acknowledged.push(session_id);
-                    } else {
-                        progress.pending.push(session_id);
+                        self.leases.worker_ended(session_id);
                     }
                 }
             }
         }
-        Ok(progress)
+        Ok(self.leases.status(revision))
     }
 
     /// Advances the environment's authority revision and announces it.
     ///
+    /// Advancing invalidates every outstanding dispatch lease at once, because a lease carries the
+    /// revision it was issued at, and deregisters every connection admitted under the authority
+    /// that has just been withdrawn. Both happen before the announcement travels, so nothing can
+    /// be admitted under the old revision while the new one is on its way.
+    ///
     /// # Errors
     ///
     /// Returns an error when the registry cannot be written.
-    pub async fn revoke_authority(&self) -> Result<RevisionProgress> {
-        {
+    pub async fn revoke_authority(&self) -> Result<RevocationStatus> {
+        // The store's lock order is the registry first, then the connections. Admission takes the
+        // same two in the same order, so a connection cannot be registered against a revision this
+        // has already replaced.
+        let revision = {
             let mut registry = self.registry.lock().await;
             registry.advance_authority_revision()?;
-        }
+            let revision = registry.authority_revision()?;
+            let mut admitted = self.admitted.lock().await;
+            admitted.retain(|_, connection| connection.admitted_revision >= revision);
+            drop(admitted);
+            revision
+        };
+        self.leases.revoke(revision);
         self.announce_authority_revision().await
     }
 
@@ -485,6 +548,91 @@ impl Controller {
             .filter(|worker| worker.acknowledged_revision.get() < revision.get())
             .map(|worker| worker.session_id)
             .collect())
+    }
+
+    /// Validates a local caller's record and registers its connection in one step.
+    ///
+    /// The two have to be one step. Validating first and registering afterwards leaves a gap in
+    /// which authority can be withdrawn, and a connection registered in that gap would pass every
+    /// later check. The registry lock is taken first and the connection table second, which is the
+    /// order [`Self::revoke_authority`] uses, so neither can interleave with the other.
+    async fn admit_connection(
+        &self,
+        connection_id: ConnectionId,
+        actor_id: &ActorId,
+        peer: &PeerIdentity,
+    ) -> Result<()> {
+        let registry = self.registry.lock().await;
+        let admitted_revision = registry.authority_revision()?;
+        // A local caller's record is the operating-system identity the listener authenticated.
+        // Re-checking it here, inside the same critical section as the registration, is the final
+        // validation the transport's contract names: the listener's check happened when the
+        // connection was accepted, and this one happens where the registration is written, so
+        // nothing can be admitted between the two.
+        peer.authorise(kr_ipc::paths::current_uid())?;
+        let mut admitted = self.admitted.lock().await;
+        admitted.insert(
+            connection_id,
+            AdmittedConnection {
+                actor_id: actor_id.clone(),
+                admitted_revision,
+            },
+        );
+        drop(admitted);
+        drop(registry);
+        Ok(())
+    }
+
+    /// Refuses a request on a connection whose registration has been withdrawn.
+    async fn authorised(&self, connection_id: ConnectionId) -> Result<ActorId> {
+        let admitted = self.admitted.lock().await;
+        match admitted.get(&connection_id) {
+            Some(connection) => Ok(connection.actor_id.clone()),
+            None => Err(ControllerError::PermissionDenied {
+                detail: "the authority this connection was admitted under has been withdrawn; \
+                         open a new connection"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    /// Withdraws one connection's registration.
+    async fn deregister(&self, connection_id: ConnectionId) {
+        self.admitted.lock().await.remove(&connection_id);
+    }
+
+    /// Takes the dispatch lease a remote-origin mutation needs, and returns its deadline.
+    ///
+    /// Section 9 requires a live worker-held authority lease from the current controller generation
+    /// and revision for remote dispatch. A locally authenticated caller is not remote dispatch and
+    /// needs none, which is why the ingress decides rather than the method.
+    async fn dispatch_lease(
+        &self,
+        session_id: SessionId,
+        actor: &kr_protocol::actor::ActorEnvelope,
+    ) -> Result<Option<kr_transport::clock::ContinuousInstant>> {
+        if actor.ingress != kr_protocol::actor::ActorIngress::PairedDevice {
+            return Ok(None);
+        }
+        match self
+            .leases
+            .renew(session_id, self.generation, &*self.clock)
+            .map_err(|error| ControllerError::supervision(error.to_string()))?
+        {
+            Ok(lease) => Ok(Some(lease.deadline)),
+            Err(LeaseRefusal::GenerationReplaced) => Err(ControllerError::PermissionDenied {
+                detail: "this daemon no longer holds the generation this lease was issued under"
+                    .to_owned(),
+            }),
+            Err(LeaseRefusal::RevisionNotAcknowledged | LeaseRefusal::NoLease) => {
+                Err(ControllerError::PermissionDenied {
+                    detail:
+                        "the worker has not acknowledged this environment's authority revision, \
+                             so no remote action can be dispatched to it"
+                            .to_owned(),
+                })
+            }
+        }
     }
 
     /// Returns what a worker needs to accept this daemon's authority.
@@ -538,8 +686,8 @@ impl Controller {
     async fn rendezvous(&self, connection: Connection, peer: PeerIdentity) -> Result<()> {
         let (mut reader, mut writer) = split(connection, StreamKind::Control);
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-        let hello: ControlMessage = reader.read_message().await?;
-        let ControlMessage::Hello(hello) = hello else {
+        let hello: ControlFrame = reader.read_message().await?;
+        let ControlFrame::Hello(hello) = hello else {
             return Err(ControllerError::rendezvous("the worker did not say hello"));
         };
         if hello.client != LocalClientKind::Worker {
@@ -547,34 +695,50 @@ impl Controller {
                 "only a worker's startup claim is accepted here",
             ));
         }
+        let outcome = self
+            .rendezvous_exchange(&mut reader, &mut writer, connection_id, &peer)
+            .await;
+        // A rendezvous connection is one exchange. Its window goes with it rather than staying
+        // outstanding for the life of the daemon.
+        self.windows.retire_connection(connection_id);
+        outcome
+    }
+
+    async fn rendezvous_exchange(
+        &self,
+        reader: &mut kr_ipc::framed::FrameReader,
+        writer: &mut kr_ipc::framed::FrameWriter,
+        connection_id: ConnectionId,
+        peer: &PeerIdentity,
+    ) -> Result<()> {
         writer
-            .write_message(&ControlMessage::HelloAck(self.acknowledgement(
+            .write_message(&ControlFrame::HelloAck(self.acknowledgement(
                 LocalRole::Rendezvous,
-                &self.window(connection_id),
-                &peer,
+                self.issue_window(connection_id)?,
+                peer,
             )))
             .await?;
 
-        let claim: ControlMessage = reader.read_message().await?;
-        let ControlMessage::Rendezvous(claim) = claim else {
+        let claim: ControlFrame = reader.read_message().await?;
+        let ControlFrame::Rendezvous(claim) = claim else {
             return Err(ControllerError::rendezvous(
                 "the worker did not present a startup claim",
             ));
         };
-        let specification = self.admit_rendezvous(&claim, &peer).await?;
+        let specification = self.admit_rendezvous(&claim, peer).await?;
         writer
-            .write_message(&ControlMessage::LaunchSpec(Box::new(specification)))
+            .write_message(&ControlFrame::LaunchSpec(Box::new(specification)))
             .await?;
 
-        let report: ControlMessage = reader.read_message().await?;
+        let report: ControlFrame = reader.read_message().await?;
         let reservation_id = claim.reservation_id;
         match report {
-            ControlMessage::WorkerReady(ready) => {
+            ControlFrame::WorkerReady(ready) => {
                 self.record_ready(reservation_id, &claim, &ready).await?;
                 self.resolve(reservation_id, Ok(ready)).await;
                 Ok(())
             }
-            ControlMessage::WorkerFailed(error) => {
+            ControlFrame::WorkerFailed(error) => {
                 // A worker that says it could not start resolves its own claim, but only its own:
                 // a reservation that was fenced while this report was in flight stays fenced,
                 // because the report does not answer the question fencing asked.
@@ -764,13 +928,13 @@ impl Controller {
     fn acknowledgement(
         &self,
         role: LocalRole,
-        window: &FreshnessWindow,
+        action_window: ActionWindow,
         peer: &PeerIdentity,
-    ) -> LocalHelloAck {
-        LocalHelloAck {
+    ) -> Box<LocalHelloAck> {
+        Box::new(LocalHelloAck {
             selected_version: PROTOCOL_VERSION,
             role,
-            connection_id: window.connection_id(),
+            connection_id: action_window.connection_id,
             environment_id: self.paths.environment_id(),
             boot_identity: self.boot_identity.clone(),
             peer: LocalPeer {
@@ -778,21 +942,21 @@ impl Controller {
                 gid: U64::new(u64::from(peer.gid)),
                 pid: Nullable(peer.pid.map(|pid| U64::new(u64::from(pid)))),
             },
-            action_window_id: window.id().clone(),
-            action_window_expires_at_ms: window.expires_at_ms(),
+            action_window,
             capabilities: CanonicalSet::new(),
             max_receive: ReceiveLimits::default(),
-        }
+        })
     }
 
-    /// Stamps a freshness window for one authenticated connection.
-    fn window(&self, connection_id: ConnectionId) -> FreshnessWindow {
-        FreshnessWindow::issue(
-            connection_id,
-            self.boot_identity.clone(),
-            kr_ipc::now_ms().get(),
-            ACTION_WINDOW_MS,
-        )
+    /// Issues an action window for one authenticated connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the random generator is unavailable.
+    fn issue_window(&self, connection_id: ConnectionId) -> Result<ActionWindow> {
+        self.windows
+            .issue(connection_id, self.boot_epoch)
+            .map_err(|error| ControllerError::supervision(error.to_string()))
     }
 
     /// Checks the envelope of a mutation this daemon is asked to perform.
@@ -802,10 +966,10 @@ impl Controller {
     /// reaches the registry, so an expired window never reserves a session.
     fn check_envelope(
         &self,
-        window: &FreshnessWindow,
+        connection_id: ConnectionId,
         mutation: &MutationRequest,
         method: Method,
-    ) -> Result<TimestampMs> {
+    ) -> Result<AcceptedDeadline> {
         use kr_protocol::authority::AuthorityDecision;
 
         // The registry decides first: an unlisted name, a version this build does not implement
@@ -913,55 +1077,110 @@ impl Controller {
                 "the subject preconditions are a map of the facts the caller depends on".to_owned(),
             ));
         }
-        let remaining = window
-            .admit(
+        // The accepted deadline is the earliest of what the window has left, receipt time plus the
+        // requested lifetime, and any applicable authority deadline. The caller never supplies an
+        // authoritative deadline, and nothing downstream lengthens this one.
+        self.windows
+            .accept(
                 &mutation.action_window_id,
-                &self.boot_identity,
-                kr_ipc::now_ms().get(),
+                connection_id,
+                self.boot_epoch,
+                mutation.requested_ttl_ms,
+                None,
             )
             .map_err(|refusal| ControllerError::WindowExpired {
-                detail: refusal.detail().to_owned(),
-            })?;
-        // The accepted deadline is the earliest of what the window has left, the requested
-        // lifetime and the protocol maximum. The caller never supplies an authoritative deadline,
-        // and nothing downstream lengthens this one.
-        let accepted = mutation
-            .requested_ttl_ms
-            .get()
-            .min(kr_protocol::limits::MAX_MUTATION_TTL.get())
-            .min(remaining);
-        Ok(TimestampMs::new(
-            kr_ipc::now_ms().get().saturating_add(accepted),
-        ))
+                detail: window_refusal_detail(refusal).to_owned(),
+            })
     }
 
     async fn client(self: &Arc<Self>, connection: Connection, peer: PeerIdentity) -> Result<()> {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        let (mut reader, mut writer) = split(connection, StreamKind::Control);
+        let outcome = self
+            .serve_client(&mut reader, &mut writer, connection_id, &peer)
+            .await;
+        // A connection that ends takes its windows and its registration with it. A window that
+        // outlived its connection could first-admit a request through a connection that no longer
+        // exists, and a registration that outlived it would be an authority nothing can revoke.
+        self.windows.retire_connection(connection_id);
+        self.deregister(connection_id).await;
+        outcome
+    }
+
+    async fn serve_client(
+        self: &Arc<Self>,
+        reader: &mut kr_ipc::framed::FrameReader,
+        writer: &mut kr_ipc::framed::FrameWriter,
+        connection_id: ConnectionId,
+        peer: &PeerIdentity,
+    ) -> Result<()> {
         let actor_id = ActorId::new(format!("local:{}", peer.uid))
             .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal"));
-        let (mut reader, mut writer) = split(connection, StreamKind::Control);
         let mut negotiated = false;
-        let mut window = self.window(connection_id);
+        // Both timers fire once immediately; that first tick is consumed here so a connection is
+        // not handed a replacement window before it has read the first one.
+        let mut renewal = tokio::time::interval(WINDOW_RENEWAL);
+        renewal.tick().await;
+        let mut keepalive = tokio::time::interval(LOCAL_KEEPALIVE);
+        keepalive.tick().await;
         loop {
-            let message: ControlMessage = match reader.read_message().await {
-                Ok(message) => message,
-                Err(_) => break,
+            let frame = tokio::select! {
+                frame = reader.read_message::<ControlFrame>() => match frame {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                },
+                // The window is replaced without being asked for, at half its validity. A client
+                // never has to renew before a mutation, and never holds a window that expired
+                // while its renewal was in flight.
+                _ = renewal.tick(), if negotiated => {
+                    let Ok(window) = self.issue_window(connection_id) else {
+                        break;
+                    };
+                    let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(window));
+                    if writer.write_message(&renewed).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                _ = keepalive.tick(), if negotiated => {
+                    let beat = ControlFrame::Event(ControlEvent::Keepalive);
+                    if writer.write_message(&beat).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
             };
-            let reply = match message {
-                ControlMessage::Hello(hello) => {
+            let reply = match frame {
+                ControlFrame::Hello(hello) => {
                     if hello
                         .offered_versions
                         .iter()
                         .any(|offered| offered.major == PROTOCOL_VERSION.major)
                     {
+                        // Validating the caller's record and registering the connection in the
+                        // authority store happen together, under the store's own lock, so a
+                        // revocation cannot land between the two and leave a connection admitted
+                        // under authority that has already been withdrawn.
+                        match self.admit_connection(connection_id, &actor_id, peer).await {
+                            Ok(()) => {}
+                            Err(error) => {
+                                let refusal = error_reply(
+                                    RequestId::new(0),
+                                    ErrorCode::PermissionDenied,
+                                    error.to_string(),
+                                );
+                                let _ = writer.write_message(&refusal).await;
+                                break;
+                            }
+                        }
                         negotiated = true;
-                        // The window is stamped when the connection is authenticated, so its
-                        // deadline starts from the handshake the client will quote it against.
-                        window = self.window(connection_id);
-                        ControlMessage::HelloAck(self.acknowledgement(
+                        let Ok(window) = self.issue_window(connection_id) else {
+                            break;
+                        };
+                        ControlFrame::HelloAck(self.acknowledgement(
                             LocalRole::Controller,
-                            &window,
-                            &peer,
+                            window,
+                            peer,
                         ))
                     } else {
                         error_reply(
@@ -971,40 +1190,19 @@ impl Controller {
                         )
                     }
                 }
-                ControlMessage::ActionWindowRenew(_) if negotiated => {
-                    window = window.renew(kr_ipc::now_ms().get());
-                    ControlMessage::ActionWindow(kr_protocol::local::ActionWindowGrant {
-                        connection_id,
-                        action_window_id: window.id().clone(),
-                        action_window_expires_at_ms: window.expires_at_ms(),
-                    })
-                }
-                ControlMessage::Request(request) if negotiated => self.read_method(&request).await,
-                ControlMessage::Mutation(mutation) if negotiated => {
-                    let confirm = mutation.action_id;
-                    let reply = match mutation.method.method() {
-                        Some(method) => match self.check_envelope(&window, &mutation, method) {
-                            Ok(deadline) => {
-                                self.write_method(
-                                    &actor_id,
-                                    &mutation,
-                                    method,
-                                    connection_id,
-                                    deadline,
-                                )
-                                .await
-                            }
-                            Err(error) => ControlMessage::Response(Response {
-                                request_id: mutation.request_id,
-                                outcome: Outcome::Error(error.to_protocol_error()),
-                            }),
-                        },
-                        None => error_reply(
-                            mutation.request_id,
+                ControlFrame::Request(request) if negotiated => {
+                    match self.authorised(connection_id).await {
+                        Ok(_) => self.read_method(&request).await,
+                        Err(error) => error_reply(
+                            request.request_id,
                             ErrorCode::PermissionDenied,
-                            "the method is not in the registry",
+                            error.to_string(),
                         ),
-                    };
+                    }
+                }
+                ControlFrame::Mutation(mutation) if negotiated => {
+                    let confirm = mutation.action_id;
+                    let reply = self.perform(&actor_id, connection_id, *mutation).await;
                     // The acceptance reaches the caller here. A worker that is holding a close for
                     // this action learns that it has, and only then starts signalling.
                     if writer.write_message(&reply).await.is_err() {
@@ -1026,7 +1224,60 @@ impl Controller {
         Ok(())
     }
 
-    async fn read_method(self: &Arc<Self>, request: &Request) -> ControlMessage {
+    /// Admits one mutation and performs it on an owner that outlives this connection.
+    ///
+    /// A connection task is dropped the moment its control stream ends, and dropping a future is a
+    /// cancellation: destructors run, but nothing after an outstanding `await` finishes. A durable
+    /// commit cannot be left half done by a peer going away, so the effect runs in its own task.
+    /// Dropping the handle this awaits does not stop that task; it only stops this connection
+    /// hearing the answer.
+    async fn perform(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        connection_id: ConnectionId,
+        mutation: MutationRequest,
+    ) -> ControlFrame {
+        if let Err(error) = self.authorised(connection_id).await {
+            return error_reply(
+                mutation.request_id,
+                ErrorCode::PermissionDenied,
+                error.to_string(),
+            );
+        }
+        let Some(method) = mutation.method.method() else {
+            return error_reply(
+                mutation.request_id,
+                ErrorCode::PermissionDenied,
+                "the method is not in the registry",
+            );
+        };
+        let accepted = match self.check_envelope(connection_id, &mutation, method) {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                return ControlFrame::Response(Response {
+                    request_id: mutation.request_id,
+                    outcome: Outcome::Error(error.to_protocol_error()),
+                });
+            }
+        };
+        let request_id = mutation.request_id;
+        let controller = Arc::clone(self);
+        let actor_id = actor_id.clone();
+        let effect = tokio::spawn(async move {
+            controller
+                .write_method(&actor_id, &mutation, method, connection_id, accepted)
+                .await
+        });
+        effect.await.unwrap_or_else(|_| {
+            error_reply(
+                request_id,
+                ErrorCode::OutcomeUnknown,
+                "the daemon could not report what happened to this action",
+            )
+        })
+    }
+
+    async fn read_method(self: &Arc<Self>, request: &Request) -> ControlFrame {
         let Some(method) = request.method.method() else {
             return error_reply(
                 request.request_id,
@@ -1054,14 +1305,13 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         connection_id: ConnectionId,
-        accepted_deadline_ms: TimestampMs,
-    ) -> ControlMessage {
+        accepted: AcceptedDeadline,
+    ) -> ControlFrame {
         let outcome = match method {
             Method::SessionCreate => self.session_create(actor_id, mutation).await,
             Method::SessionClose => {
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
-                self.session_close(mutation, &actor, accepted_deadline_ms)
-                    .await
+                self.session_close(mutation, &actor, accepted).await
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
@@ -1420,7 +1670,7 @@ impl Controller {
         self: &Arc<Self>,
         mutation: &MutationRequest,
         actor: &kr_protocol::actor::ActorEnvelope,
-        accepted_deadline_ms: TimestampMs,
+        accepted: AcceptedDeadline,
     ) -> Result<ParamsValue> {
         let params: SessionCloseParams = parse(&mutation.params)?;
         let worker = self.directory.lock().await.get(params.session_id).cloned();
@@ -1441,10 +1691,21 @@ impl Controller {
                 }),
             };
         };
+        // Remote dispatch additionally needs a live lease. It is taken here, at the moment the
+        // dispatch runs, rather than trusting one that was valid when the request arrived; the
+        // lease's own remaining time then bounds the deadline the worker is given.
+        let lease_deadline = self.dispatch_lease(params.session_id, actor).await?;
         let result = {
+            // What the worker is told is what remains of the accepted deadline at the instant it is
+            // forwarded, measured on this daemon's continuous clock. A deadline already spent is
+            // never forwarded as though it had time left.
+            let accepted_ttl_ms = remaining_ttl(&*self.clock, accepted.deadline, lease_deadline)
+                .ok_or_else(|| ControllerError::WindowExpired {
+                    detail: "the deadline this action was admitted under has passed".to_owned(),
+                })?;
             let mut held = self.worker_client(&worker).await?;
             let client = held.as_mut().expect("the connection is open");
-            match client.forward(mutation, actor, accepted_deadline_ms).await {
+            match client.forward(mutation, actor, accepted_ttl_ms).await {
                 Ok(result) => result,
                 Err(error) => {
                     *held = None;
@@ -1735,15 +1996,19 @@ pub fn local_actor(
     }
 }
 
-/// How far an authority revision has reached the workers it applies to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RevisionProgress {
-    /// The revision being announced.
-    pub revision: kr_protocol::ids::AuthorityRevision,
-    /// The sessions that have installed it, or that are confirmed ended.
-    pub acknowledged: Vec<SessionId>,
-    /// The sessions it has not reached, where the revocation is still pending.
-    pub pending: Vec<SessionId>,
+/// One connection this daemon has admitted, and the authority it was admitted under.
+///
+/// The transport's contract names this as the host's to keep: the final validation of the caller's
+/// record and the registration of the connection are one step, and the registration stays
+/// revocable for the life of the session. A read or a subscription on a connection that was
+/// authorised a moment before authority was withdrawn is fenced here; section 9's dispatch barrier
+/// covers a worker's dispatch and does not cover this.
+#[derive(Clone, Debug)]
+struct AdmittedConnection {
+    /// The principal the daemon assigned to the operating-system caller.
+    actor_id: ActorId,
+    /// The authority revision in force when the connection was registered.
+    admitted_revision: kr_protocol::ids::AuthorityRevision,
 }
 
 /// What a controller needs before it starts.
@@ -1795,6 +2060,48 @@ fn closed_summary(
     }
 }
 
+/// Returns what remains of an accepted deadline, bounded by any lease that also applies.
+///
+/// `None` means the deadline has already passed, which is never forwarded as though it had time
+/// left. The reading is taken at the moment of the call, so nothing between admission and dispatch
+/// can lengthen it.
+fn remaining_ttl(
+    clock: &dyn ContinuousClock,
+    accepted: kr_transport::clock::ContinuousInstant,
+    lease: Option<kr_transport::clock::ContinuousInstant>,
+) -> Option<DurationMs> {
+    let now = clock.now();
+    let deadline = lease.map_or(accepted, |lease| lease.min(accepted));
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(DurationMs::new(
+        u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+    ))
+}
+
+/// Returns the sentence a caller is given when a window cannot first-admit a request.
+const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> &'static str {
+    use kr_transport::window::WindowRefusal;
+    match refusal {
+        WindowRefusal::Unknown => {
+            "this action window is not the one this connection holds, so the request cannot be \
+             admitted for the first time"
+        }
+        WindowRefusal::WrongConnection => {
+            "this action window belongs to another connection, so it admits nothing here"
+        }
+        WindowRefusal::StaleBoot => {
+            "this action window was issued in another boot of this host, so it admits nothing"
+        }
+        WindowRefusal::Expired => {
+            "this action window has expired; the host has already replaced it, so submit a new \
+             request rather than replaying this one"
+        }
+    }
+}
+
 fn parse<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Result<T> {
     params
         .to_typed()
@@ -1806,25 +2113,21 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
 }
 
-fn respond(request_id: RequestId, outcome: Result<ParamsValue>) -> ControlMessage {
+fn respond(request_id: RequestId, outcome: Result<ParamsValue>) -> ControlFrame {
     match outcome {
-        Ok(value) => ControlMessage::Response(Response {
+        Ok(value) => ControlFrame::Response(Response {
             request_id,
             outcome: Outcome::Ok(value),
         }),
-        Err(error) => ControlMessage::Response(Response {
+        Err(error) => ControlFrame::Response(Response {
             request_id,
             outcome: Outcome::Error(error.to_protocol_error()),
         }),
     }
 }
 
-fn error_reply(
-    request_id: RequestId,
-    code: ErrorCode,
-    message: impl Into<String>,
-) -> ControlMessage {
-    ControlMessage::Response(Response {
+fn error_reply(request_id: RequestId, code: ErrorCode, message: impl Into<String>) -> ControlFrame {
+    ControlFrame::Response(Response {
         request_id,
         outcome: Outcome::Error(ProtocolError::new(code, message)),
     })

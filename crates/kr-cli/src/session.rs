@@ -9,9 +9,9 @@
 use std::sync::Arc;
 
 use kr_ipc::client::LocalClient;
+use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{InputLeaseEpoch, SessionId};
-use kr_protocol::local::ControlMessage;
 use kr_protocol::method::Method;
 use kr_protocol::session::Dimensions;
 use kr_protocol::worker::WorkerDescriptor;
@@ -205,7 +205,7 @@ async fn drive(
             biased;
             message = client.recv() => {
                 match message {
-                    Ok(ControlMessage::Notification(notification)) => {
+                    Ok(ControlFrame::Notification(notification)) => {
                         if notification.event_type.as_str() == "session.output"
                             && let Ok(event) = notification
                                 .payload
@@ -229,7 +229,7 @@ async fn drive(
                             return AttachOutcome::Detached;
                         }
                     }
-                    Ok(ControlMessage::Response(response)) => {
+                    Ok(ControlFrame::Response(response)) => {
                         let Some(sent) = outstanding.remove(&response.request_id) else {
                             continue;
                         };
@@ -284,7 +284,7 @@ async fn drive(
                         "the input could not be encoded".to_owned(),
                     );
                 };
-                let message = ControlMessage::Request(kr_protocol::envelope::Request {
+                let message = ControlFrame::Request(kr_protocol::envelope::Request {
                     request_id,
                     method: Method::InputWrite.into(),
                     method_version: kr_protocol::method::MethodVersion::V1,

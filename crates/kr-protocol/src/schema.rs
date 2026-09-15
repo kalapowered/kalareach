@@ -51,10 +51,7 @@ use crate::input::{
     InputAcquireParams, InputAcquireResult, InputInterruptParams, InputLeaseResult,
     InputLeaseState, InputReleaseParams, InputWriteParams, InputWriteResult,
 };
-use crate::local::{
-    ActionWindowGrant, ActionWindowRenew, ControlMessage, ForwardedMutation, LocalHello,
-    LocalHelloAck,
-};
+use crate::local::{ForwardedMutation, LocalHello, LocalHelloAck};
 use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
 use crate::method::{Method, REGISTRY};
 use crate::pairing::{
@@ -113,8 +110,6 @@ pub fn protocol_schema() -> Value {
         "action_cancel_result" => ActionCancelResult,
         "action_read_params" => ActionReadParams,
         "action_read_result" => ActionReadResult,
-        "action_window_grant" => ActionWindowGrant,
-        "action_window_renew" => ActionWindowRenew,
         "actor_envelope" => ActorEnvelope,
         "archive_descriptor" => ArchiveDescriptor,
         "attachment_configure_params" => AttachmentConfigureParams,
@@ -128,7 +123,6 @@ pub fn protocol_schema() -> Value {
         "connect_reply" => ConnectReply,
         "control_frame" => ControlFrame,
         "closure_record" => ClosureRecord,
-        "control_message" => ControlMessage,
         "controller_generation_token" => ControllerGenerationToken,
         "direct_challenge" => DirectChallenge,
         "direct_redeem_proof" => DirectRedeemProof,

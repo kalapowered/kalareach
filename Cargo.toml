@@ -48,6 +48,7 @@ kr-crypto = { path = "crates/kr-crypto", version = "=0.1.0" }
 kr-ipc = { path = "crates/kr-ipc", version = "=0.1.0" }
 kr-pairing = { path = "crates/kr-pairing", version = "=0.1.0" }
 kr-protocol = { path = "crates/kr-protocol", version = "=0.1.0" }
+kr-term = { path = "crates/kr-term", version = "=0.1.0" }
 kr-transport = { path = "crates/kr-transport", version = "=0.1.0" }
 kr-worker = { path = "crates/kr-worker", version = "=0.1.0" }
 libc = "=0.2.189"

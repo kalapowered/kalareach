@@ -23,11 +23,12 @@ use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::framed::split;
 use kr_ipc::paths::{Endpoint, HostPaths};
 use kr_ipc::verify::WorkerIdentity;
+use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::ids::{BuildId, EnvironmentId, SessionEpoch, SessionId};
-use kr_protocol::local::{ControlMessage, LocalClientKind, LocalHello};
+use kr_protocol::local::{LocalClientKind, LocalHello};
 use kr_protocol::scalars::Uuid;
 use kr_protocol::session::{DisplayNumber, Presentation, SessionCreateParams, ShellMode};
 use kr_protocol::worker::{ReservationId, WorkerLaunchSpec, WorkerReady};
@@ -121,7 +122,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let connection = Connection::connect(&rendezvous).await?;
     let (mut reader, mut writer) = split(connection, StreamKind::Control);
     writer
-        .write_message(&ControlMessage::Hello(LocalHello {
+        .write_message(&ControlFrame::Hello(LocalHello {
             offered_versions: vec![PROTOCOL_VERSION],
             build_id: build_id(),
             client: LocalClientKind::Worker,
@@ -129,17 +130,17 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
         }))
         .await?;
-    let acknowledgement: ControlMessage = reader.read_message().await?;
-    if !matches!(acknowledgement, ControlMessage::HelloAck(_)) {
+    let acknowledgement: ControlFrame = reader.read_message().await?;
+    if !matches!(acknowledgement, ControlFrame::HelloAck(_)) {
         return Err("the controller did not acknowledge the worker's hello".into());
     }
 
     let rendezvous_claim = identity.rendezvous(ReservationId::new(arguments.reservation))?;
     writer
-        .write_message(&ControlMessage::Rendezvous(rendezvous_claim))
+        .write_message(&ControlFrame::Rendezvous(rendezvous_claim))
         .await?;
-    let specification: ControlMessage = reader.read_message().await?;
-    let ControlMessage::LaunchSpec(specification) = specification else {
+    let specification: ControlFrame = reader.read_message().await?;
+    let ControlFrame::LaunchSpec(specification) = specification else {
         return Err("the controller did not send a launch specification".into());
     };
     // The identity this process signed with came from its job definition. A specification that
@@ -155,7 +156,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             "the launch specification does not match the reservation this worker was started for",
         );
         writer
-            .write_message(&ControlMessage::WorkerFailed(error))
+            .write_message(&ControlFrame::WorkerFailed(error))
             .await?;
         return Err("the launch specification does not match the reservation".into());
     }
@@ -168,7 +169,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             "this host implements the explicitly selected native_compat shell mode; managed mode needs a qualified shell package",
         );
         writer
-            .write_message(&ControlMessage::WorkerFailed(error))
+            .write_message(&ControlFrame::WorkerFailed(error))
             .await?;
         return Err("managed shell mode is not available on this host".into());
     }
@@ -183,7 +184,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         Err(failure) => {
             let error = ProtocolError::new(failure.error.code(), failure.error.to_string());
             writer
-                .write_message(&ControlMessage::WorkerFailed(error))
+                .write_message(&ControlFrame::WorkerFailed(error))
                 .await?;
             return Err(Box::new(failure.error));
         }
@@ -210,7 +211,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // endpoint is bound, and the controller recovers by verifying this worker with a challenge
     // rather than by starting a second one.
     let ready_reported = writer
-        .write_message(&ControlMessage::WorkerReady(ready))
+        .write_message(&ControlFrame::WorkerReady(ready))
         .await
         .is_ok();
     if !ready_reported {
@@ -234,7 +235,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             controller_generation: specification.controller_generation,
             build_id: build_id(),
         },
-    ));
+    )?);
     let serving = tokio::spawn(Arc::clone(&service).serve(listener));
     // The worker exists for its session. When the session closes, the last record is written and
     // the process ends; nothing here restarts a shell.

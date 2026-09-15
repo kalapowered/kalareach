@@ -31,20 +31,22 @@ use kr_protocol::attachment::{
     AttachmentViewportResult, GeometryResult, SessionAttachParams, SessionDetachParams,
     TerminalGeometryTransferParams, TerminalResizeParams,
 };
-use kr_protocol::envelope::{MutationRequest, Outcome, ParamsValue, Request, Response};
+use kr_protocol::envelope::{
+    ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
+};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
-use kr_protocol::hello::PROTOCOL_VERSION;
+use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION};
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{
-    ActorId, AttachmentId, ConnectionId, ControllerGeneration, EnvironmentId, RequestId, SessionId,
-    StreamId,
+    ActorId, AttachmentId, BootEpoch, ConnectionId, ControllerGeneration, EnvironmentId, RequestId,
+    SessionId, StreamId,
 };
 use kr_protocol::input::{
     InputAcquireParams, InputInterruptParams, InputLeaseResult, InputReleaseParams,
     InputWriteParams, InputWriteResult, InterruptAction,
 };
-use kr_protocol::local::{ControlMessage, LocalClientKind, LocalHello, LocalHelloAck, LocalRole};
+use kr_protocol::local::{LocalClientKind, LocalHello, LocalHelloAck, LocalRole};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{
     EventsSnapshotParams, EventsSubscribeParams, EventsSubscribeResult, HistoryPageParams,
@@ -55,14 +57,27 @@ use kr_protocol::session::{
     ClosureReason, SessionCloseResult, SessionReadParams, SessionReadResult,
 };
 use kr_protocol::worker::GenerationChallenge;
+use kr_transport::clock::{ContinuousClock, SystemContinuousClock};
+use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
 use crate::error::{Result, WorkerError};
 use crate::output::OutputDelivery;
 use crate::runtime::SessionRuntime;
 use crate::session::Session;
 
-/// How long a local connection's freshness window lasts.
-pub const ACTION_WINDOW_MS: u64 = 5 * 60 * 1000;
+/// How often the worker replaces a live connection's action window.
+///
+/// Half the window's validity, which is the schedule the transport uses: an attached terminal that
+/// stays open for hours never has to ask for a window, and never holds one that expired while its
+/// replacement was in flight.
+pub const WINDOW_RENEWAL: std::time::Duration =
+    std::time::Duration::from_millis(MAX_WINDOW_VALIDITY.as_millis() as u64 / 2);
+
+/// How often a local connection sends a keepalive.
+///
+/// Section 23 puts it at ten seconds while the connection is active. A Unix socket or a named pipe
+/// has no keepalive underneath it, so the control stream carries one itself.
+pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The event stream name output notifications carry.
 pub const OUTPUT_STREAM: &str = "session.output";
@@ -102,6 +117,12 @@ pub struct WorkerService {
     endpoint: Endpoint,
     environment_id: EnvironmentId,
     boot_identity: BootIdentity,
+    /// The compact form of the boot above, which is what an action window is bound to.
+    boot_epoch: BootEpoch,
+    /// The suspend-aware continuous clock every deadline this worker decides is measured on.
+    clock: Arc<SystemContinuousClock>,
+    /// The action windows of every connection this worker serves.
+    windows: ActionWindowIssuer,
     controller_public_key: AuthorisationKey,
     authority: Mutex<Authority>,
     /// The serial boundary every mutation and every authority change passes through.
@@ -148,19 +169,27 @@ impl std::fmt::Debug for WorkerService {
 
 impl WorkerService {
     /// Builds a service for one session.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host's boot identity cannot be reduced to a boot epoch.
     pub fn new(
         runtime: Arc<SessionRuntime>,
         identity: Arc<WorkerIdentity>,
         endpoint: Endpoint,
         binding: ServiceBinding,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let boot_epoch = kr_ipc::identity::boot_epoch(&binding.boot_identity)?;
+        let clock = Arc::new(SystemContinuousClock::new());
+        Ok(Self {
             runtime,
             identity,
             endpoint,
             environment_id: binding.environment_id,
             boot_identity: binding.boot_identity,
+            boot_epoch,
+            windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
+            clock,
             controller_public_key: binding.controller_public_key,
             authority: Mutex::new(Authority {
                 accepted_generation: Some(binding.controller_generation),
@@ -170,7 +199,7 @@ impl WorkerService {
             dispatch: Mutex::new(()),
             connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             build_id: binding.build_id,
-        }
+        })
     }
 
     /// Returns the generation this worker currently accepts.
@@ -228,11 +257,40 @@ impl WorkerService {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         let (mut reader, writer) = split(connection, StreamKind::Control);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
-        let mut state = ConnectionState::new(connection_id, &peer, self.boot_identity.clone());
+        let mut state = ConnectionState::new(connection_id, &peer);
+        // Both timers fire once immediately; that first tick is consumed here so a connection is
+        // not handed a replacement window before it has read the one in its acknowledgement.
+        let mut renewal = tokio::time::interval(WINDOW_RENEWAL);
+        renewal.tick().await;
+        let mut keepalive = tokio::time::interval(LOCAL_KEEPALIVE);
+        keepalive.tick().await;
         loop {
-            let message: ControlMessage = match reader.read_message().await {
-                Ok(message) => message,
-                Err(_) => break,
+            let message: ControlFrame = tokio::select! {
+                message = reader.read_message::<ControlFrame>() => match message {
+                    Ok(message) => message,
+                    Err(_) => break,
+                },
+                // The window is replaced without being asked for, at half its validity. An
+                // attachment that stays open for hours never has to renew before a mutation.
+                _ = renewal.tick(), if state.negotiated => {
+                    let Ok(window) = self.issue_window(connection_id) else {
+                        break;
+                    };
+                    let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(window));
+                    let mut sender = writer.lock().await;
+                    if sender.write_message(&renewed).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                _ = keepalive.tick(), if state.negotiated => {
+                    let beat = ControlFrame::Event(ControlEvent::Keepalive);
+                    let mut sender = writer.lock().await;
+                    if sender.write_message(&beat).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
             };
             let reply = self.handle(&mut state, &peer, message).await;
             if let Some(reply) = reply {
@@ -414,6 +472,9 @@ impl WorkerService {
             let mut session = self.runtime.session();
             let _ = session.detach(attachment_id);
         }
+        // A window that outlived its connection could first-admit a request through a connection
+        // that no longer exists, so the connection's windows go when it does.
+        self.windows.retire_connection(connection_id);
         Ok(())
     }
 
@@ -421,22 +482,21 @@ impl WorkerService {
         &self,
         state: &mut ConnectionState,
         peer: &PeerIdentity,
-        message: ControlMessage,
-    ) -> Option<ControlMessage> {
+        message: ControlFrame,
+    ) -> Option<ControlFrame> {
         match message {
-            ControlMessage::Hello(hello) => Some(self.hello(state, peer, &hello)),
-            ControlMessage::VerifyChallenge(challenge) => {
+            ControlFrame::Hello(hello) => Some(self.hello(state, peer, &hello)),
+            ControlFrame::VerifyChallenge(challenge) => {
                 match self.identity.answer(&challenge, &self.endpoint.as_text()) {
-                    Ok(proof) => Some(ControlMessage::VerifyProof(proof)),
+                    Ok(proof) => Some(ControlFrame::VerifyProof(proof)),
                     Err(error) => Some(failure(
                         state.next_request_id(),
                         &WorkerError::from(error).to_protocol_error(),
                     )),
                 }
             }
-            ControlMessage::GenerationToken(token) => Some(self.accept_generation(state, &token)),
-            ControlMessage::ActionWindowRenew(_) => Some(self.renew_window(state)),
-            ControlMessage::AcceptanceDelivered(action_id) => {
+            ControlFrame::GenerationToken(token) => Some(self.accept_generation(state, &token)),
+            ControlFrame::AcceptanceDelivered(action_id) => {
                 // The proxy has passed the acceptance on. Whatever it names, only the close this
                 // connection is holding can be released by it.
                 if let Some((held, delivery)) = state.pending_delivery.take() {
@@ -448,14 +508,14 @@ impl WorkerService {
                 }
                 None
             }
-            ControlMessage::AuthorityRevision(notice) => {
+            ControlFrame::AuthorityRevision(notice) => {
                 Some(self.acknowledge_revision(state, &notice))
             }
-            ControlMessage::Request(request) => Some(self.request(state, &request)),
-            ControlMessage::Mutation(mutation) => {
+            ControlFrame::Request(request) => Some(self.request(state, &request)),
+            ControlFrame::Mutation(mutation) => {
                 Some(self.mutation(state, &mutation, state.actor_id.clone(), Freshness::Window))
             }
-            ControlMessage::Forwarded(forwarded) => Some(self.forwarded(state, &forwarded)),
+            ControlFrame::Forwarded(forwarded) => Some(self.forwarded(state, &forwarded)),
             _ => Some(failure(
                 RequestId::new(0),
                 &ProtocolError::new(
@@ -471,7 +531,7 @@ impl WorkerService {
         state: &mut ConnectionState,
         peer: &PeerIdentity,
         hello: &LocalHello,
-    ) -> ControlMessage {
+    ) -> ControlFrame {
         if state.negotiated {
             // One connection, one identity. Sending a second hello would otherwise let a fenced
             // controller reintroduce itself as a local caller and skip the authority check.
@@ -532,48 +592,45 @@ impl WorkerService {
             // challenge is issued here, bound to this connection, and consumed exactly once.
             state.pending_challenge = Self::generation_challenge(state);
         }
-        // The window is stamped when the connection is authenticated, not when it was accepted,
-        // so its deadline starts from the handshake the client will quote it against.
-        state.window = kr_ipc::freshness::FreshnessWindow::issue(
-            state.connection_id,
-            self.boot_identity.clone(),
-            kr_ipc::now_ms().get(),
-            ACTION_WINDOW_MS,
-        );
-        ControlMessage::HelloAck(LocalHelloAck {
+        // The window is issued when the connection is authenticated, not when it was accepted, so
+        // its deadline starts from the handshake the client will quote it against.
+        let Ok(action_window) = self.issue_window(state.connection_id) else {
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    "this host could not issue an action window for the connection",
+                ),
+            );
+        };
+        ControlFrame::HelloAck(Box::new(LocalHelloAck {
             selected_version: PROTOCOL_VERSION,
             role: LocalRole::Worker,
             connection_id: state.connection_id,
             environment_id: self.environment_id,
             boot_identity: self.boot_identity.clone(),
             peer: peer.to_wire(),
-            action_window_id: state.window.id().clone(),
-            action_window_expires_at_ms: state.window.expires_at_ms(),
+            action_window,
             capabilities: CanonicalSet::new(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
-        })
+        }))
     }
 
-    /// Stamps a fresh window on a live authenticated connection.
-    ///
-    /// Renewal is explicit, as section 9 requires: a client asks for a new window and receives a
-    /// new identifier. Nothing extends the window a request already quoted, so an expired window
-    /// is never repaired underneath an original request that is being replayed.
-    fn renew_window(&self, state: &mut ConnectionState) -> ControlMessage {
-        state.window = state.window.renew(kr_ipc::now_ms().get());
-        ControlMessage::ActionWindow(kr_protocol::local::ActionWindowGrant {
-            connection_id: state.connection_id,
-            action_window_id: state.window.id().clone(),
-            action_window_expires_at_ms: state.window.expires_at_ms(),
-        })
+    /// Issues an action window for one authenticated connection.
+    fn issue_window(&self, connection_id: ConnectionId) -> Result<ActionWindow> {
+        self.windows
+            .issue(connection_id, self.boot_epoch)
+            .map_err(|error| WorkerError::ResourceUnavailable {
+                detail: error.to_string(),
+            })
     }
 
     /// Issues a challenge a controller must answer before it speaks for a generation.
     #[must_use]
-    pub fn generation_challenge(state: &mut ConnectionState) -> Option<ControlMessage> {
+    pub fn generation_challenge(state: &mut ConnectionState) -> Option<ControlFrame> {
         let nonce = kr_ipc::verify::fresh_challenge().ok()?.nonce;
         state.generation_nonce = Some(nonce);
-        Some(ControlMessage::GenerationChallenge(GenerationChallenge {
+        Some(ControlFrame::GenerationChallenge(GenerationChallenge {
             nonce,
         }))
     }
@@ -582,7 +639,7 @@ impl WorkerService {
         &self,
         state: &mut ConnectionState,
         token: &kr_protocol::worker::ControllerGenerationToken,
-    ) -> ControlMessage {
+    ) -> ControlFrame {
         let Some(nonce) = state.generation_nonce.take() else {
             return failure(
                 RequestId::new(0),
@@ -623,7 +680,7 @@ impl WorkerService {
                 drop(authority);
                 state.controller = true;
                 state.generation = Some(token.generation);
-                ControlMessage::GenerationAccepted(kr_protocol::worker::GenerationAccepted {
+                ControlFrame::GenerationAccepted(kr_protocol::worker::GenerationAccepted {
                     generation: token.generation,
                     fenced_previous: fenced_previous.is_some(),
                 })
@@ -651,7 +708,7 @@ impl WorkerService {
         &self,
         state: &ConnectionState,
         notice: &kr_protocol::worker::AuthorityRevisionNotice,
-    ) -> ControlMessage {
+    ) -> ControlFrame {
         let _barrier = self
             .dispatch
             .lock()
@@ -689,12 +746,10 @@ impl WorkerService {
         // Revisions are ordered and only the host issues them, so an older one never replaces a
         // newer one that has already been acknowledged.
         if held.is_some_and(|held| held.get() >= notice.revision.get()) {
-            return ControlMessage::AuthorityRevisionAck(
-                kr_protocol::worker::AuthorityRevisionAck {
-                    session_id: self.runtime.session().id(),
-                    revision: held.unwrap_or(notice.revision),
-                },
-            );
+            return ControlFrame::AuthorityRevisionAck(kr_protocol::worker::AuthorityRevisionAck {
+                session_id: self.runtime.session().id(),
+                revision: held.unwrap_or(notice.revision),
+            });
         }
         let fenced = {
             let mut session = self.runtime.session();
@@ -726,7 +781,7 @@ impl WorkerService {
             .expect("the authority lock is not poisoned");
         authority.acknowledged_revision = Some(notice.revision);
         drop(authority);
-        ControlMessage::AuthorityRevisionAck(kr_protocol::worker::AuthorityRevisionAck {
+        ControlFrame::AuthorityRevisionAck(kr_protocol::worker::AuthorityRevisionAck {
             session_id: self.runtime.session().id(),
             revision: notice.revision,
         })
@@ -771,7 +826,7 @@ impl WorkerService {
         Ok(())
     }
 
-    fn request(&self, state: &mut ConnectionState, request: &Request) -> ControlMessage {
+    fn request(&self, state: &mut ConnectionState, request: &Request) -> ControlFrame {
         if !state.negotiated {
             return failure(request.request_id, &not_negotiated());
         }
@@ -819,7 +874,7 @@ impl WorkerService {
         mutation: &MutationRequest,
         actor_id: ActorId,
         freshness: Freshness,
-    ) -> ControlMessage {
+    ) -> ControlFrame {
         if !state.negotiated {
             return failure(mutation.request_id, &not_negotiated());
         }
@@ -833,7 +888,7 @@ impl WorkerService {
             return failure(mutation.request_id, &unlisted());
         };
         match self.receipted(state, mutation, method, entry, actor_id, freshness) {
-            Ok(value) => ControlMessage::Response(Response {
+            Ok(value) => ControlFrame::Response(Response {
                 request_id: mutation.request_id,
                 outcome: Outcome::Ok(value),
             }),
@@ -851,7 +906,7 @@ impl WorkerService {
         &self,
         state: &mut ConnectionState,
         forwarded: &kr_protocol::local::ForwardedMutation,
-    ) -> ControlMessage {
+    ) -> ControlFrame {
         if state.client_kind != LocalClientKind::Controller {
             return failure(
                 forwarded.mutation.request_id,
@@ -874,7 +929,7 @@ impl WorkerService {
             state,
             &forwarded.mutation,
             forwarded.actor.actor_id.clone(),
-            Freshness::Vouched(forwarded.accepted_deadline_ms),
+            Freshness::Vouched(forwarded.accepted_ttl_ms),
         )
     }
 
@@ -911,22 +966,33 @@ impl WorkerService {
         // act on, the grant the caller claims, the preconditions the subject must still satisfy
         // and the freshness window that admits a first request.
         self.check_envelope(mutation, entry)?;
-        let accepted_deadline = match freshness {
-            Freshness::Window => {
-                let remaining = self.check_window(state, mutation)?;
-                state.accepted_deadline(mutation.requested_ttl_ms.get(), remaining)
+        // The deadline lives on the continuous clock. That is what admission, revalidation and
+        // expiry all read, so a wall clock that moves cannot lengthen or shorten an action's life.
+        let now = self.clock.now();
+        let deadline = match freshness {
+            Freshness::Window => self.check_window(state, mutation)?.deadline,
+            // The daemon derived this deadline at first admission and this is what was left of it
+            // when the mutation was forwarded. The worker anchors it on its own clock and bounds it
+            // by the protocol maximum; it never lengthens a deadline somebody else shortened.
+            Freshness::Vouched(remaining) => {
+                let remaining = std::time::Duration::from_millis(
+                    remaining
+                        .get()
+                        .min(kr_protocol::limits::MAX_MUTATION_TTL.get()),
+                );
+                now.checked_add(remaining)
+                    .ok_or_else(|| WorkerError::WindowExpired {
+                        detail: "the accepted deadline for this action is out of range".to_owned(),
+                    })?
             }
-            // The daemon derived this deadline at first admission. It is used as it is: the worker
-            // never lengthens a deadline somebody else already shortened.
-            Freshness::Vouched(deadline) => deadline,
         };
-        // The receipt carries the wall-clock deadline, because that is what a person and a wire
-        // format read. What the host decides with is the continuous reading, so a wall clock that
-        // moves cannot lengthen or shorten an action's remaining life.
-        let continuous_deadline_ms = kr_ipc::freshness::continuous_ms().saturating_add(
-            accepted_deadline
-                .get()
-                .saturating_sub(kr_ipc::now_ms().get()),
+        // The receipt carries a wall-clock deadline, because that is what a person and a wire
+        // format read. Nothing expires against it.
+        let accepted_deadline = kr_protocol::scalars::TimestampMs::new(
+            kr_ipc::now_ms().get().saturating_add(
+                u64::try_from(deadline.saturating_duration_since(now).as_millis())
+                    .unwrap_or(u64::MAX),
+            ),
         );
         let intent = kr_cbor::to_canonical_vec(mutation)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
@@ -974,7 +1040,7 @@ impl WorkerService {
                 // The deadline the host derived is the deadline it keeps, measured on the
                 // continuous clock so a wall clock that moves cannot extend it. This is also what
                 // makes a zero requested lifetime mean what it says.
-                if continuous_deadline_ms <= kr_ipc::freshness::continuous_ms() {
+                if self.clock.now() >= deadline {
                     Err(WorkerError::WindowExpired {
                         detail: "the accepted deadline for this action has passed".to_owned(),
                     })
@@ -1209,21 +1275,27 @@ impl WorkerService {
         Ok(())
     }
 
-    /// Checks the freshness window a first admission is bound to.
+    /// Checks the action window a first admission is bound to and derives its deadline.
     ///
-    /// Returns how much of the window is left, which bounds the deadline the host accepts. An
-    /// expired or unknown window admits nothing: section 9 makes replacing a window a different
-    /// request, never an automatic retry of this one.
-    fn check_window(&self, state: &ConnectionState, mutation: &MutationRequest) -> Result<u64> {
-        state
-            .window
-            .admit(
+    /// The accepted deadline is the earliest of the window's expiry and receipt time plus the
+    /// requested lifetime, on the host's suspend-aware continuous clock. An expired or unknown
+    /// window admits nothing: section 9 makes replacing a window a different request, never an
+    /// automatic retry of this one.
+    fn check_window(
+        &self,
+        state: &ConnectionState,
+        mutation: &MutationRequest,
+    ) -> Result<AcceptedDeadline> {
+        self.windows
+            .accept(
                 &mutation.action_window_id,
-                &self.boot_identity,
-                kr_ipc::now_ms().get(),
+                state.connection_id,
+                self.boot_epoch,
+                mutation.requested_ttl_ms,
+                None,
             )
             .map_err(|refusal| WorkerError::WindowExpired {
-                detail: refusal.detail().to_owned(),
+                detail: window_refusal_detail(refusal).to_owned(),
             })
     }
 
@@ -1687,10 +1759,15 @@ pub struct ReplayRange {
 /// What decides whether a mutation may be admitted for the first time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Freshness {
-    /// The freshness window this connection holds.
+    /// The action window this connection holds.
     Window,
-    /// A deadline the control daemon derived when it admitted the action for its caller.
-    Vouched(kr_protocol::scalars::TimestampMs),
+    /// What remained of the deadline the control daemon derived when it admitted the action.
+    ///
+    /// A duration rather than an instant: the two processes measure on their own continuous
+    /// clocks, whose origins mean nothing to each other. The worker anchors it on its own clock as
+    /// it reads the frame, and bounds it by the protocol maximum, so a daemon cannot hand a worker
+    /// a longer life than the protocol allows.
+    Vouched(kr_protocol::scalars::DurationMs),
 }
 
 /// The subject facts a mutation requires to still be true.
@@ -1802,8 +1879,6 @@ pub struct ConnectionState {
     pub peer_limits: kr_protocol::hello::ReceiveLimits,
     /// The generation this connection proved, when it is a controller.
     pub generation: Option<ControllerGeneration>,
-    /// The freshness window the host stamped for this connection.
-    pub window: kr_ipc::freshness::FreshnessWindow,
     /// The event stream identifier notifications carry.
     pub stream_id: StreamId,
     /// The challenge this connection issued to a controller, consumed once.
@@ -1819,7 +1894,7 @@ pub struct ConnectionState {
     /// A close whose acceptance was written and whose delivery a proxy has not yet confirmed.
     pub pending_delivery: Option<(kr_protocol::ids::ActionId, crate::runtime::PendingDelivery)>,
     /// A generation challenge waiting to be sent after the current reply.
-    pub pending_challenge: Option<ControlMessage>,
+    pub pending_challenge: Option<ControlFrame>,
     /// The retained range a new subscription replays before live output resumes.
     pub replay: Option<ReplayRange>,
     /// The delivery task this connection owns, cancelled when the connection goes.
@@ -1835,11 +1910,7 @@ pub struct ConnectionState {
 impl ConnectionState {
     /// Builds the state for a fresh connection.
     #[must_use]
-    pub fn new(
-        connection_id: ConnectionId,
-        peer: &PeerIdentity,
-        boot_identity: BootIdentity,
-    ) -> Self {
+    pub fn new(connection_id: ConnectionId, peer: &PeerIdentity) -> Self {
         Self {
             connection_id,
             negotiated: false,
@@ -1847,12 +1918,6 @@ impl ConnectionState {
             client_kind: LocalClientKind::Cli,
             peer_limits: kr_protocol::hello::ReceiveLimits::default(),
             generation: None,
-            window: kr_ipc::freshness::FreshnessWindow::issue(
-                connection_id,
-                boot_identity,
-                kr_ipc::now_ms().get(),
-                ACTION_WINDOW_MS,
-            ),
             stream_id: StreamId::new(OUTPUT_STREAM).expect("a valid stream name"),
             generation_nonce: None,
             attachments: Vec::new(),
@@ -1869,27 +1934,30 @@ impl ConnectionState {
         }
     }
 
-    /// Returns the deadline the host derives for a mutation.
-    ///
-    /// It is the earliest of what the window has left, the receipt time plus the requested
-    /// lifetime, and the protocol maximum. The client never supplies an authoritative deadline,
-    /// and the window's remainder is read from the continuous clock, so a deadline can never be
-    /// longer than the freshness that admitted it.
-    #[must_use]
-    pub fn accepted_deadline(
-        &self,
-        requested_ttl_ms: u64,
-        window_remaining_ms: u64,
-    ) -> kr_protocol::scalars::TimestampMs {
-        let requested = requested_ttl_ms
-            .min(kr_protocol::limits::MAX_MUTATION_TTL.get())
-            .min(window_remaining_ms);
-        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get().saturating_add(requested))
-    }
-
     fn next_request_id(&mut self) -> RequestId {
         self.next_request += 1;
         RequestId::new(self.next_request)
+    }
+}
+
+/// Returns the sentence a caller is given when a window cannot first-admit a request.
+const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> &'static str {
+    use kr_transport::window::WindowRefusal;
+    match refusal {
+        WindowRefusal::Unknown => {
+            "this action window is not one this host issued, so the request cannot be admitted for \
+             the first time"
+        }
+        WindowRefusal::WrongConnection => {
+            "this action window belongs to another connection, so it admits nothing here"
+        }
+        WindowRefusal::StaleBoot => {
+            "this action window was issued in another boot of this host, so it admits nothing"
+        }
+        WindowRefusal::Expired => {
+            "this action window has expired; the host has already replaced it, so submit a new \
+             request rather than replaying this one"
+        }
     }
 }
 
@@ -1903,9 +1971,9 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {
     ParamsValue::from_typed(value).map_err(|error| WorkerError::InvalidArgument(error.to_string()))
 }
 
-fn respond(request_id: RequestId, outcome: Result<ParamsValue>) -> ControlMessage {
+fn respond(request_id: RequestId, outcome: Result<ParamsValue>) -> ControlFrame {
     match outcome {
-        Ok(value) => ControlMessage::Response(Response {
+        Ok(value) => ControlFrame::Response(Response {
             request_id,
             outcome: Outcome::Ok(value),
         }),
@@ -1913,8 +1981,8 @@ fn respond(request_id: RequestId, outcome: Result<ParamsValue>) -> ControlMessag
     }
 }
 
-fn failure(request_id: RequestId, error: &ProtocolError) -> ControlMessage {
-    ControlMessage::Response(Response {
+fn failure(request_id: RequestId, error: &ProtocolError) -> ControlFrame {
+    ControlFrame::Response(Response {
         request_id,
         outcome: Outcome::Error(error.clone()),
     })
@@ -1947,8 +2015,8 @@ fn notification<T: serde::Serialize>(
     sequence: u64,
     event: &str,
     payload: &T,
-) -> Option<ControlMessage> {
-    Some(ControlMessage::Notification(
+) -> Option<ControlFrame> {
+    Some(ControlFrame::Notification(
         kr_protocol::envelope::Notification {
             stream_id: stream_id.clone(),
             sequence: kr_protocol::ids::EventSequence::new(sequence),

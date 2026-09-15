@@ -443,10 +443,24 @@ pub enum ControlEvent {
 ///
 /// Both transports carry these frames: section 23 says local Unix sockets and Windows named pipes
 /// carry the same typed frames with local peer authentication. What differs is how the connection
-/// is authenticated before the first frame, not what travels afterwards.
+/// is authenticated before the first frame, not what travels afterwards. One union rather than two
+/// is what makes that true rather than merely stated: a request, a mutation, a response, a receipt
+/// and a notification are the same types on a Unix socket as on a QUIC stream, and a host that
+/// answered them differently would have two wire contracts to keep in step.
+///
+/// Some variants only ever travel between host processes on a local endpoint: the local opening
+/// frames, the worker startup handshake, the generation and revision exchange, and a forwarded
+/// mutation. They are still part of this union, because a closed union is what makes a frame that
+/// does not belong on the ingress it arrived on a *refusal* rather than a parse failure. Each
+/// endpoint refuses the variants its role does not serve, which is an admission rule the host
+/// applies rather than a shape the wire hides.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlFrame {
+    /// A local client's opening frame.
+    Hello(crate::local::LocalHello),
+    /// The host's answer to a local opening frame.
+    HelloAck(Box<crate::local::LocalHelloAck>),
     /// A read request.
     Request(Request),
     /// A mutation request.
@@ -459,4 +473,35 @@ pub enum ControlFrame {
     Notification(Notification),
     /// An event about the connection itself.
     Event(ControlEvent),
+    /// A worker's startup claim, presented on the controller's rendezvous endpoint.
+    Rendezvous(crate::worker::WorkerRendezvous),
+    /// What the controller tells an authenticated worker to become.
+    LaunchSpec(Box<crate::worker::WorkerLaunchSpec>),
+    /// A worker reporting that its root shell is running.
+    WorkerReady(crate::worker::WorkerReady),
+    /// A worker reporting that it could not start.
+    WorkerFailed(ProtocolError),
+    /// A fresh challenge to the worker behind an endpoint.
+    VerifyChallenge(crate::worker::WorkerVerifyChallenge),
+    /// The worker's signed answer.
+    VerifyProof(crate::worker::WorkerVerifyProof),
+    /// A worker's challenge to a controller that wants to speak for a generation.
+    GenerationChallenge(crate::worker::GenerationChallenge),
+    /// A controller's signed generation token.
+    GenerationToken(Box<crate::worker::ControllerGenerationToken>),
+    /// The worker's acceptance of a generation.
+    GenerationAccepted(crate::worker::GenerationAccepted),
+    /// The authority revision the controller now holds.
+    AuthorityRevision(crate::worker::AuthorityRevisionNotice),
+    /// The worker's acknowledgement of an authority revision.
+    AuthorityRevisionAck(crate::worker::AuthorityRevisionAck),
+    /// A mutation the control daemon admitted, passed to the worker that owns its subject.
+    Forwarded(Box<crate::local::ForwardedMutation>),
+    /// A proxy's confirmation that a caller has received an action's acceptance.
+    ///
+    /// A close is accepted before anything is signalled, because the requester is often a command
+    /// inside the process group the closure will stop. When the acceptance travels through a proxy,
+    /// the worker learns it has arrived here rather than assuming its own write was the end of the
+    /// journey.
+    AcceptanceDelivered(ActionId),
 }

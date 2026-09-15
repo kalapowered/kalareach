@@ -7,6 +7,23 @@
  */
 
 /**
+ * A UTC timestamp in milliseconds, as a decimal string in JSON.
+ */
+export type TimestampMs = string
+/**
+ * An opaque diagnostic identifier. It carries no protocol meaning.
+ */
+export type DiagnosticId = string
+/**
+ * Why an action was rejected before dispatch.
+ */
+export type RejectionReason =
+  'admission_failed' | 'expired' | 'cancelled' | 'revoked' | 'stale_preconditions'
+/**
+ * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+ */
+export type ParamsValue = unknown
+/**
  * One paired device.
  */
 export type DeviceId = string
@@ -19,6 +36,21 @@ export type GrantId = string
  */
 export type AuthorityRevision = string
 /**
+ * What an attachment asks to be able to do.
+ *
+ * A request is not a grant. The host intersects these with the actor's rights, and an attachment
+ * identifier is never permission on its own.
+ */
+export type AttachmentCapability = 'observe_terminal' | 'observe_semantic' | 'input' | 'geometry'
+/**
+ * How a terminal attachment displays the canonical grid.
+ */
+export type TerminalPresentationMode = 'direct' | 'viewport'
+/**
+ * One CLI or application attachment, independently of its device.
+ */
+export type AttachmentId = string
+/**
  * One signed revocation request published by a remote owner.
  */
 export type RevocationRequestId = string
@@ -26,6 +58,10 @@ export type RevocationRequestId = string
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
 export type CapabilityId = string
+/**
+ * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+ */
+export type U64 = string
 /**
  * The host's answer to a client proof.
  */
@@ -37,10 +73,6 @@ export type ConnectReply =
       refused: ProtocolError
     }
 /**
- * An opaque diagnostic identifier. It carries no protocol meaning.
- */
-export type DiagnosticId = string
-/**
  * One frame on an authorised control stream.
  *
  * The union is closed. A receiver that cannot name the variant rejects the frame rather than
@@ -48,9 +80,25 @@ export type DiagnosticId = string
  *
  * Both transports carry these frames: section 23 says local Unix sockets and Windows named pipes
  * carry the same typed frames with local peer authentication. What differs is how the connection
- * is authenticated before the first frame, not what travels afterwards.
+ * is authenticated before the first frame, not what travels afterwards. One union rather than two
+ * is what makes that true rather than merely stated: a request, a mutation, a response, a receipt
+ * and a notification are the same types on a Unix socket as on a QUIC stream, and a host that
+ * answered them differently would have two wire contracts to keep in step.
+ *
+ * Some variants only ever travel between host processes on a local endpoint: the local opening
+ * frames, the worker startup handshake, the generation and revision exchange, and a forwarded
+ * mutation. They are still part of this union, because a closed union is what makes a frame that
+ * does not belong on the ingress it arrived on a *refusal* rather than a parse failure. Each
+ * endpoint refuses the variants its role does not serve, which is an admission rule the host
+ * applies rather than a shape the wire hides.
  */
 export type ControlFrame =
+  | {
+      hello: LocalHello
+    }
+  | {
+      hello_ack: LocalHelloAck
+    }
   | {
       request: Request
     }
@@ -69,6 +117,45 @@ export type ControlFrame =
   | {
       event: ControlEvent
     }
+  | {
+      rendezvous: WorkerRendezvous
+    }
+  | {
+      launch_spec: WorkerLaunchSpec
+    }
+  | {
+      worker_ready: WorkerReady
+    }
+  | {
+      worker_failed: ProtocolError
+    }
+  | {
+      verify_challenge: WorkerVerifyChallenge
+    }
+  | {
+      verify_proof: WorkerVerifyProof
+    }
+  | {
+      generation_challenge: GenerationChallenge
+    }
+  | {
+      generation_token: ControllerGenerationToken
+    }
+  | {
+      generation_accepted: GenerationAccepted
+    }
+  | {
+      authority_revision: AuthorityRevisionNotice
+    }
+  | {
+      authority_revision_ack: AuthorityRevisionAck
+    }
+  | {
+      forwarded: ForwardedMutation
+    }
+  | {
+      acceptance_delivered: ActionId
+    }
 /**
  * Changes when the active upstream execution owner or selected thread changes.
  */
@@ -86,19 +173,6 @@ export type SessionEpoch = string
  */
 export type SessionId = string
 /**
- * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
- */
-export type ParamsValue = unknown
-/**
- * A UTC timestamp in milliseconds, as a decimal string in JSON.
- */
-export type TimestampMs = string
-/**
- * Why an action was rejected before dispatch.
- */
-export type RejectionReason =
-  'admission_failed' | 'expired' | 'cancelled' | 'revoked' | 'stale_preconditions'
-/**
  * What the host sends on an authorised control stream outside a response.
  *
  * The control stream carries ordinary [`Notification`] events once the connection is authorised.
@@ -111,9 +185,32 @@ export type ControlEvent =
     }
   | 'keepalive'
 /**
+ * One submitted intent and its receipt, generated as a UUIDv4.
+ */
+export type ActionId = string
+/**
  * One installed OS, distribution or container environment and OS user.
  */
 export type EnvironmentId = string
+/**
+ * One transport connection, allocated by the host during hello.
+ */
+export type ConnectionId = string
+/**
+ * What the foreground of a session is doing.
+ *
+ * Application state is reported separately from the lifecycle state and from transport
+ * reachability; a busy agent and an unreachable client are different facts.
+ */
+export type ApplicationState = 'shell_ready' | 'agent_busy' | 'awaiting_input' | 'awaiting_approval'
+/**
+ * A host-derived desktop session identity binding OS user, boot identity and login-session generation.
+ */
+export type DesktopSessionId = string
+/**
+ * The event streams a session publishes.
+ */
+export type EventStream = 'session_state' | 'output' | 'attachments' | 'input_lease' | 'receipts'
 /**
  * One permitted action in a grant.
  */
@@ -162,14 +259,6 @@ export type HelloReply =
       refused: ProtocolError
     }
 /**
- * A managed account identifier minted by the service. It names the payer; it is not authority.
- */
-export type AccountId = string
-/**
- * One submitted intent and its receipt, generated as a UUIDv4.
- */
-export type ActionId = string
-/**
  * A host-issued action window identifier, bound to one authenticated connection and host boot.
  */
 export type ActionWindowId = string
@@ -189,10 +278,6 @@ export type AgentTurnId = string
  * One backup archive. The service sees only this opaque identifier.
  */
 export type ArchiveId = string
-/**
- * One CLI or application attachment, independently of its device.
- */
-export type AttachmentId = string
 /**
  * Monotonic attachment join order, used for deterministic geometry-owner succession.
  */
@@ -242,17 +327,9 @@ export type ClockEpoch = string
  */
 export type ConfirmationId = string
 /**
- * One transport connection, allocated by the host during hello.
- */
-export type ConnectionId = string
-/**
  * The controller's persistent generation, advanced on every controller start.
  */
 export type ControllerGeneration = string
-/**
- * A host-derived desktop session identity binding OS user, boot identity and login-session generation.
- */
-export type DesktopSessionId = string
 /**
  * The revision of a device's purpose-separated public keys.
  */
@@ -310,17 +387,9 @@ export type OrganisationId = string
  */
 export type PairingSequence = string
 /**
- * The service record that authorised one principal to pay for another's relay traffic.
- */
-export type PayerAuthorisationId = string
-/**
  * A plugin identifier from its manifest.
  */
 export type PluginId = string
-/**
- * The revision of an organisation's policy-signing key, advanced on every rotation.
- */
-export type PolicyKeyRevision = string
 /**
  * One environment-bound source repository.
  */
@@ -338,41 +407,9 @@ export type Bytes = string
  */
 export type DurationMs = string
 /**
- * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
- */
-export type U64 = string
-/**
  * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
  */
 export type Uuid = string
-/**
- * One relay instance. Stable across rotation of the key it signs receipts with.
- */
-export type RelayInstanceId = string
-/**
- * One relay lease, covering one endpoint pair for one payer.
- */
-export type RelayLeaseId = string
-/**
- * The revision of one relay lease. Only the issuing service advances it.
- */
-export type RelayLeaseRevision = string
-/**
- * The position of one consumption receipt inside its reservation's sequence.
- */
-export type RelayReceiptSequence = string
-/**
- * The deployment region one relay instance serves.
- */
-export type RelayRegion = string
-/**
- * The revision of one relay instance's registration. Only the instance advances it.
- */
-export type RelayRegistrationRevision = string
-/**
- * One reserved block of relay bytes. Consumption receipts are keyed by it.
- */
-export type RelayReservationId = string
 /**
  * One remote dispatch lease from the current controller generation.
  */
@@ -519,20 +556,6 @@ export type PairStatus =
       }
     }
 /**
- * What the payer's client sends to a relay's control endpoint.
- */
-export type RelayLeaseRequest =
-  | {
-      install: {
-        lease: SignedRelayLease
-      }
-    }
-  | {
-      revoke: {
-        revocation: SignedRelayLeaseRevocation
-      }
-    }
-/**
  * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
  */
 export type NetworkHint = string
@@ -541,25 +564,50 @@ export type NetworkHint = string
  * Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.
  */
 export interface KalaReachProtocol {
+  action_cancel_params?: ActionCancelParams
+  action_cancel_result?: ActionCancelResult
+  action_read_params?: ActionReadParams
+  action_read_result?: ActionReadResult
   action_window?: ActionWindow
   actor_envelope?: ActorEnvelope
   archive_descriptor?: ArchiveDescriptor
+  attachment_configure_params?: AttachmentConfigureParams
+  attachment_summary?: AttachmentSummary
+  attachment_viewport_params?: AttachmentViewportParams
+  attachment_viewport_result?: AttachmentViewportResult
+  authority_revision_ack?: AuthorityRevisionAck
+  authority_revision_notice?: AuthorityRevisionNotice
   authority_revision_record?: AuthorityRevisionRecord
   client_offer?: ClientOffer
+  closure_record?: ClosureRecord
   connect_reply?: ConnectReply
   control_frame?: ControlFrame
+  controller_generation_token?: ControllerGenerationToken
   direct_challenge?: DirectChallenge
   direct_redeem_proof?: DirectRedeemProof
   envelope_plaintext?: EnvelopePlaintext
+  environment_list_result?: EnvironmentListResult
+  events_snapshot_params?: EventsSnapshotParams
+  events_snapshot_result?: EventsSnapshotResult
+  events_subscribe_params?: EventsSubscribeParams
+  events_subscribe_result?: EventsSubscribeResult
+  forwarded_mutation?: ForwardedMutation
+  generation_accepted?: GenerationAccepted
+  generation_challenge?: GenerationChallenge
   generation_checkpoint?: GenerationCheckpoint
+  geometry_result?: GeometryResult
+  geometry_state?: GeometryState3
   grant?: Grant
   hello_reply?: HelloReply
+  history_page_params?: HistoryPageParams
+  history_page_result?: HistoryPageResult
+  host_doctor_result?: HostDoctorResult
+  host_info_result?: HostInfoResult
   host_selection?: HostSelection
   /**
    * Every identifier in the identity and object model. This is a vocabulary rather than a message: it exists so each identifier has one named type.
    */
   identifiers?: {
-    account_id?: AccountId
     action_id?: ActionId
     action_window_id?: ActionWindowId
     actor_id?: ActorId
@@ -605,9 +653,7 @@ export interface KalaReachProtocol {
     machine_id?: MachineId
     organisation_id?: OrganisationId
     pairing_sequence?: PairingSequence
-    payer_authorisation_id?: PayerAuthorisationId
     plugin_id?: PluginId
-    policy_key_revision?: PolicyKeyRevision
     project_repository_id?: ProjectRepositoryId
     question_id?: QuestionId
     question_revision?: QuestionRevision
@@ -616,13 +662,6 @@ export interface KalaReachProtocol {
     raw_timestamp_ms?: TimestampMs
     raw_u64?: U64
     raw_uuid?: Uuid
-    relay_instance_id?: RelayInstanceId
-    relay_lease_id?: RelayLeaseId
-    relay_lease_revision?: RelayLeaseRevision
-    relay_receipt_sequence?: RelayReceiptSequence
-    relay_region?: RelayRegion
-    relay_registration_revision?: RelayRegistrationRevision
-    relay_reservation_id?: RelayReservationId
     remote_dispatch_lease_id?: RemoteDispatchLeaseId
     repository_generation?: RepositoryGeneration
     request_id?: RequestId
@@ -637,37 +676,274 @@ export interface KalaReachProtocol {
     workflow_run_id?: WorkflowRunId
     workspace_id?: WorkspaceId
   }
-  membership_lease?: MembershipLease
+  input_acquire_params?: InputAcquireParams
+  input_acquire_result?: InputAcquireResult
+  input_interrupt_params?: InputInterruptParams
+  input_lease_result?: InputLeaseResult
+  input_lease_state?: InputLeaseState3
+  input_release_params?: InputReleaseParams
+  input_write_params?: InputWriteParams
+  input_write_result?: InputWriteResult
+  local_hello?: LocalHello
+  local_hello_ack?: LocalHelloAck
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
   notification?: Notification
+  output_event?: OutputEvent
   owner_confirmation_proof?: OwnerConfirmationProof
   owner_confirmation_request?: OwnerConfirmationRequest1
   pair_finish_request?: PairFinishRequest
   pair_status?: PairStatus
-  policy_authority?: PolicyAuthority
   proposed_grant?: ProposedGrant
   protocol_error?: ProtocolError
-  receipt?: Receipt1
+  receipt?: Receipt3
   receipt_response?: ReceiptResponse
   recovery_bundle?: RecoveryBundle
   recovery_kit?: RecoveryKit
-  relay_consumption_ack?: RelayConsumptionAck
-  relay_consumption_report?: RelayConsumptionReport
-  relay_lease_ack?: RelayLeaseAck
-  relay_lease_request?: RelayLeaseRequest
   request?: Request
   response?: Response
+  resync_required?: ResyncRequired
   revocation_acknowledgement?: RevocationAcknowledgement
   revocation_request?: RevocationRequest
   sealed_envelope?: SealedEnvelope
+  session_attach_params?: SessionAttachParams
+  session_attach_result?: SessionAttachResult
+  session_close_params?: SessionCloseParams
+  session_close_result?: SessionCloseResult
+  session_create_params?: SessionCreateParams1
+  session_create_result?: SessionCreateResult
+  session_detach_params?: SessionDetachParams
+  session_detach_result?: SessionDetachResult
+  session_list_params?: SessionListParams
+  session_list_result?: SessionListResult
+  session_read_params?: SessionReadParams
+  session_read_result?: SessionReadResult
   session_ref?: SessionRef
+  session_summary?: SessionSummary2
   signed_archive_manifest?: SignedArchiveManifest
   signed_client_bundle?: SignedClientBundle
   signed_host_bundle?: SignedHostBundle
-  signed_relay_consumption_receipt?: SignedRelayConsumptionReceipt
-  signed_relay_instance_registration?: SignedRelayInstanceRegistration
   stream_header?: StreamHeader
+  terminal_geometry_transfer_params?: TerminalGeometryTransferParams
+  terminal_resize_params?: TerminalResizeParams
+  worker_descriptor?: WorkerDescriptor
+  worker_launch_spec?: WorkerLaunchSpec
+  worker_ready?: WorkerReady
+  worker_rendezvous?: WorkerRendezvous
+  worker_verify_challenge?: WorkerVerifyChallenge
+  worker_verify_proof?: WorkerVerifyProof
+}
+/**
+ * What `action.cancel` names.
+ */
+export interface ActionCancelParams {
+  /**
+   * The action to cancel.
+   */
+  action_id: string
+}
+/**
+ * The receipt an undispatched action was cancelled into.
+ */
+export interface ActionCancelResult {
+  receipt: Receipt
+}
+/**
+ * The receipt after the cancellation.
+ */
+export interface Receipt {
+  /**
+   * The deadline the host derived at acceptance: the earliest of window expiry, receipt time
+   * plus the requested time to live, and any applicable authority or subject deadline. An exact
+   * retry never receives a new deadline.
+   */
+  accepted_deadline_ms: TimestampMs | null
+  /**
+   * The durable operation identity.
+   */
+  action_id: string
+  /**
+   * The verified actor that submitted it.
+   */
+  actor_id: string
+  /**
+   * The failure recorded with a refusal, rejection or unknown outcome.
+   */
+  error: ProtocolError | null
+  /**
+   * The method and version the digest covers.
+   */
+  method: string
+  /**
+   * The method version the digest covers.
+   */
+  method_version: number
+  /**
+   * The digest of the submitted payload, used to detect a reused identifier.
+   */
+  payload_digest: string
+  /**
+   * Why the action was rejected, when the state is `rejected`.
+   */
+  reason: RejectionReason | null
+  /**
+   * A monotonically increasing revision.
+   */
+  revision: string
+  /**
+   * The current state.
+   */
+  state: 'received' | 'accepted' | 'dispatching' | 'applied' | 'refused' | 'rejected' | 'unknown'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  updated_at_ms: string
+}
+/**
+ * The error object returned in a response or recorded on a receipt.
+ *
+ * The message is plain text for a person or a log. The user interface translates the code into a
+ * direct action and does not display protocol internals by default.
+ */
+export interface ProtocolError {
+  /**
+   * The stable code.
+   */
+  code:
+    | 'INVALID_ARGUMENT'
+    | 'UNSUPPORTED_SCHEMA'
+    | 'UNSUPPORTED_CAPABILITY'
+    | 'PERMISSION_DENIED'
+    | 'PAIRING_EXPIRED'
+    | 'PAIRING_REJECTED'
+    | 'PAIRING_AUTH_FAILED'
+    | 'PAIRING_ATTEMPTS_EXHAUSTED'
+    | 'RENDEZVOUS_UNAVAILABLE'
+    | 'RENDEZVOUS_CONFIG_ERROR'
+    | 'UNKNOWN_SESSION'
+    | 'AMBIGUOUS_SESSION'
+    | 'AMBIGUOUS_ATTACHMENT'
+    | 'TERMINAL_UNAVAILABLE'
+    | 'TERMINAL_PROBE_FAILED'
+    | 'INPUT_INCOMPATIBLE'
+    | 'SESSION_CLOSED'
+    | 'SESSION_LIMIT'
+    | 'RESOURCE_UNAVAILABLE'
+    | 'HOST_NOT_CONFIGURED'
+    | 'ENVIRONMENT_UNAVAILABLE'
+    | 'DESKTOP_UNAVAILABLE'
+    | 'STALE_SESSION'
+    | 'LEASE_LOST'
+    | 'GEOMETRY_NOT_OWNER'
+    | 'DRAFT_CONFLICT'
+    | 'EDITOR_BUSY'
+    | 'ID_CONFLICT'
+    | 'UPSTREAM_UNAVAILABLE'
+    | 'OUTCOME_UNKNOWN'
+    | 'RESYNC_REQUIRED'
+    | 'QUOTA_EXCEEDED'
+    | 'RATE_LIMITED'
+    | 'SERVICE_CAPACITY'
+    | 'CLOCK_UNTRUSTED'
+    | 'STORAGE_UNAVAILABLE'
+    | 'SHELL_INTEGRATION_UNSUPPORTED'
+    | 'ATTACHMENT_INTEGRITY'
+    | 'REPOSITORY_UNTRUSTED'
+    | 'PACKAGE_UNAVAILABLE_OFFLINE'
+    | 'PLUGIN_GRANT_REQUIRED'
+    | 'PLUGIN_DISABLED'
+    | 'QUESTION_RESOLVED'
+    | 'QUESTION_EXPIRED'
+    | 'NOT_IN_KR_SESSION'
+    | 'OWNER_CONFIRMATION_REQUIRED'
+    | 'CAUSAL_LIMIT'
+    | 'SOURCE_CHANGED'
+  /**
+   * An opaque identifier for correlating this failure with host diagnostics.
+   */
+  diagnostic_id: DiagnosticId | null
+  /**
+   * A plain message. It never carries credentials or command text.
+   */
+  message: string
+  /**
+   * How the client may react. It must equal [`ErrorCode::retry_category`] for the code.
+   */
+  retry: 'no_retry' | 'transient' | 'resync' | 'configuration_change' | 'outcome_unknown'
+}
+/**
+ * What `action.read` names.
+ */
+export interface ActionReadParams {
+  /**
+   * The action to read.
+   */
+  action_id: string
+}
+/**
+ * A retained receipt and the result it produced.
+ *
+ * Owning an identifier is not authority: the host checks present view authority over the subject
+ * the receipt names before it returns either half, which is why a retained result is carried here
+ * rather than handed back from the action identifier alone.
+ */
+export interface ActionReadResult {
+  receipt: Receipt1
+  /**
+   * The result the action produced, when it produced one and it is still retained.
+   */
+  result: ParamsValue | null
+}
+/**
+ * The receipt as it currently stands.
+ */
+export interface Receipt1 {
+  /**
+   * The deadline the host derived at acceptance: the earliest of window expiry, receipt time
+   * plus the requested time to live, and any applicable authority or subject deadline. An exact
+   * retry never receives a new deadline.
+   */
+  accepted_deadline_ms: TimestampMs | null
+  /**
+   * The durable operation identity.
+   */
+  action_id: string
+  /**
+   * The verified actor that submitted it.
+   */
+  actor_id: string
+  /**
+   * The failure recorded with a refusal, rejection or unknown outcome.
+   */
+  error: ProtocolError | null
+  /**
+   * The method and version the digest covers.
+   */
+  method: string
+  /**
+   * The method version the digest covers.
+   */
+  method_version: number
+  /**
+   * The digest of the submitted payload, used to detect a reused identifier.
+   */
+  payload_digest: string
+  /**
+   * Why the action was rejected, when the state is `rejected`.
+   */
+  reason: RejectionReason | null
+  /**
+   * A monotonically increasing revision.
+   */
+  revision: string
+  /**
+   * The current state.
+   */
+  state: 'received' | 'accepted' | 'dispatching' | 'applied' | 'refused' | 'rejected' | 'unknown'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  updated_at_ms: string
 }
 /**
  * A host-issued action window.
@@ -694,7 +970,7 @@ export interface ActionWindow {
    */
   connection_id: string
   /**
-   * The host's stamp of when it issued the window, in UTC milliseconds.
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   issued_at_ms: string
   /**
@@ -838,6 +1114,180 @@ export interface KeyWrapContext {
   sender_key_id: string
 }
 /**
+ * Parameters of `attachment.configure`.
+ *
+ * Withdrawing or adding an authorised claim does not change the session identity and cannot
+ * displace an existing owner.
+ */
+export interface AttachmentConfigureParams {
+  /**
+   * The attachment to reconfigure.
+   */
+  attachment_id: string
+  /**
+   * Whether it holds a geometry claim after this call.
+   */
+  claim_geometry: boolean
+}
+/**
+ * One attachment of a session.
+ */
+export interface AttachmentSummary {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  attached_at_ms: string
+  /**
+   * The attachment identity, independent of the device behind it.
+   */
+  attachment_id: string
+  /**
+   * Whether this attachment holds an eligible geometry claim.
+   */
+  claim_geometry: boolean
+  /**
+   * The attachment's own physical dimensions, reported even when it is not the owner.
+   */
+  dimensions: Dimensions | null
+  /**
+   * The capabilities the host granted, which are the requested ones intersected with the
+   * actor's rights.
+   */
+  granted: AttachmentCapability[]
+  /**
+   * What this attachment observes.
+   */
+  mode: 'semantic' | 'terminal'
+  /**
+   * The monotonic join order that decides size-owner succession.
+   */
+  ordinal: string
+  /**
+   * How the attachment displays the canonical grid.
+   */
+  presentation: TerminalPresentationMode | null
+  /**
+   * The terminal profile it presents.
+   */
+  terminal_profile_id: string | null
+}
+/**
+ * A terminal geometry in columns and rows.
+ *
+ * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
+ * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
+ */
+export interface Dimensions {
+  /**
+   * Columns, from 1 to 2,048.
+   */
+  columns: string
+  /**
+   * Rows, from 1 to 1,024.
+   */
+  rows: string
+}
+/**
+ * Parameters of `attachment.viewport`.
+ *
+ * Every terminal attachment reports its own physical dimensions, whether or not it owns the size.
+ */
+export interface AttachmentViewportParams {
+  /**
+   * The reporting attachment.
+   */
+  attachment_id: string
+  dimensions: Dimensions1
+}
+/**
+ * A terminal geometry in columns and rows.
+ *
+ * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
+ * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
+ */
+export interface Dimensions1 {
+  /**
+   * Columns, from 1 to 2,048.
+   */
+  columns: string
+  /**
+   * Rows, from 1 to 1,024.
+   */
+  rows: string
+}
+/**
+ * The result of `attachment.viewport`.
+ */
+export interface AttachmentViewportResult {
+  geometry: GeometryState
+  /**
+   * How a terminal attachment displays the canonical grid.
+   */
+  presentation: 'direct' | 'viewport'
+}
+/**
+ * The canonical geometry, which a viewport report never changes.
+ */
+export interface GeometryState {
+  dimensions: Dimensions2
+  /**
+   * The epoch, advanced by every ownership change and explicit transfer.
+   */
+  epoch: string
+  /**
+   * The current owner. Null when no eligible claim exists and the last geometry is retained.
+   */
+  owner: AttachmentId | null
+}
+/**
+ * A terminal geometry in columns and rows.
+ *
+ * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
+ * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
+ */
+export interface Dimensions2 {
+  /**
+   * Columns, from 1 to 2,048.
+   */
+  columns: string
+  /**
+   * Rows, from 1 to 1,024.
+   */
+  rows: string
+}
+/**
+ * A worker's acknowledgement that it is acting under an authority revision.
+ */
+export interface AuthorityRevisionAck {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  revision: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The host's current authority revision, announced to a worker by the controller that holds it.
+ *
+ * Authority revisions are ordered and only the host issues them. A revocation is not complete
+ * when the controller records it: it is complete when every worker that could still act on the
+ * revoked authority has acknowledged the revision that removed it. Until then the revocation
+ * reports `pending` for that worker, or the worker is confirmed ended, which answers the same
+ * question a different way.
+ */
+export interface AuthorityRevisionNotice {
+  /**
+   * The environment whose authority changed.
+   */
+  environment_id: string
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  revision: string
+}
+/**
  * One ordered authority revision, issued by the host and by nobody else.
  */
 export interface AuthorityRevisionRecord {
@@ -858,7 +1308,7 @@ export interface AuthorityRevisionRecord {
    */
   host_key_id: string
   /**
-   * When the host issued it, in UTC milliseconds.
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   issued_at_ms: string
   /**
@@ -939,6 +1389,103 @@ export interface ProtocolVersion {
   minor: number
 }
 /**
+ * The final record of one closed session.
+ */
+export interface ClosureRecord {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  closed_at_ms: string
+  /**
+   * Whether the record was written durably.
+   */
+  durability: 'durable' | 'volatile'
+  /**
+   * Whether every owned process was accounted for.
+   */
+  ownership_coverage: 'complete' | 'incomplete'
+  /**
+   * Why it closed.
+   */
+  reason:
+    | 'close_requested'
+    | 'root_exit'
+    | 'root_signal'
+    | 'root_launch_failed'
+    | 'worker_crash'
+    | 'desktop_lost'
+    | 'host_shutdown'
+  /**
+   * The root shell's exit status, when it exited normally.
+   */
+  root_exit_code: U64 | null
+  /**
+   * The signal that terminated the root shell, when one did, named as the platform names it.
+   * The host reports what it was told rather than inventing a number for it.
+   */
+  root_signal: string | null
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * Resources known to survive, such as an explicitly brokered desktop resource.
+   */
+  surviving: SurvivingResource[]
+  /**
+   * The owned processes the closure terminated, with their start identities.
+   */
+  terminated: TerminatedProcess[]
+}
+/**
+ * A resource that intentionally outlives the session.
+ */
+export interface SurvivingResource {
+  /**
+   * A description for the user.
+   */
+  detail: string
+  /**
+   * What kind of resource it is.
+   */
+  kind: string
+}
+/**
+ * One process the closure terminated.
+ */
+export interface TerminatedProcess {
+  /**
+   * True when the process needed forced termination after the grace period.
+   */
+  forced: boolean
+  identity: ProcessStartIdentity
+  /**
+   * The executable name, for diagnostics.
+   */
+  name: string | null
+}
+/**
+ * The process and its start identity, so a reused identifier is not mistaken for it.
+ */
+export interface ProcessStartIdentity {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
  * What the host returns once both proofs verify.
  */
 export interface ConnectAccepted {
@@ -962,7 +1509,7 @@ export interface ActionWindow1 {
    */
   connection_id: string
   /**
-   * The host's stamp of when it issued the window, in UTC milliseconds.
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   issued_at_ms: string
   /**
@@ -980,76 +1527,179 @@ export interface ConnectProof {
   signature: string
 }
 /**
- * The error object returned in a response or recorded on a receipt.
- *
- * The message is plain text for a person or a log. The user interface translates the code into a
- * direct action and does not display protocol internals by default.
+ * The first frame a local client sends.
  */
-export interface ProtocolError {
+export interface LocalHello {
   /**
-   * The stable code.
+   * The client build.
    */
-  code:
-    | 'INVALID_ARGUMENT'
-    | 'UNSUPPORTED_SCHEMA'
-    | 'UNSUPPORTED_CAPABILITY'
-    | 'PERMISSION_DENIED'
-    | 'PAIRING_EXPIRED'
-    | 'PAIRING_REJECTED'
-    | 'PAIRING_AUTH_FAILED'
-    | 'PAIRING_ATTEMPTS_EXHAUSTED'
-    | 'RENDEZVOUS_UNAVAILABLE'
-    | 'RENDEZVOUS_CONFIG_ERROR'
-    | 'UNKNOWN_SESSION'
-    | 'AMBIGUOUS_SESSION'
-    | 'AMBIGUOUS_ATTACHMENT'
-    | 'TERMINAL_UNAVAILABLE'
-    | 'TERMINAL_PROBE_FAILED'
-    | 'INPUT_INCOMPATIBLE'
-    | 'SESSION_CLOSED'
-    | 'SESSION_LIMIT'
-    | 'RESOURCE_UNAVAILABLE'
-    | 'HOST_NOT_CONFIGURED'
-    | 'ENVIRONMENT_UNAVAILABLE'
-    | 'DESKTOP_UNAVAILABLE'
-    | 'STALE_SESSION'
-    | 'LEASE_LOST'
-    | 'GEOMETRY_NOT_OWNER'
-    | 'DRAFT_CONFLICT'
-    | 'EDITOR_BUSY'
-    | 'ID_CONFLICT'
-    | 'UPSTREAM_UNAVAILABLE'
-    | 'OUTCOME_UNKNOWN'
-    | 'RESYNC_REQUIRED'
-    | 'QUOTA_EXCEEDED'
-    | 'RATE_LIMITED'
-    | 'SERVICE_CAPACITY'
-    | 'CLOCK_UNTRUSTED'
-    | 'STORAGE_UNAVAILABLE'
-    | 'SHELL_INTEGRATION_UNSUPPORTED'
-    | 'ATTACHMENT_INTEGRITY'
-    | 'REPOSITORY_UNTRUSTED'
-    | 'PACKAGE_UNAVAILABLE_OFFLINE'
-    | 'PLUGIN_GRANT_REQUIRED'
-    | 'PLUGIN_DISABLED'
-    | 'QUESTION_RESOLVED'
-    | 'QUESTION_EXPIRED'
-    | 'NOT_IN_KR_SESSION'
-    | 'OWNER_CONFIRMATION_REQUIRED'
-    | 'CAUSAL_LIMIT'
-    | 'SOURCE_CHANGED'
+  build_id: string
   /**
-   * An opaque identifier for correlating this failure with host diagnostics.
+   * The capabilities the client offers.
    */
-  diagnostic_id: DiagnosticId | null
+  capabilities: CapabilityId[]
   /**
-   * A plain message. It never carries credentials or command text.
+   * What kind of client this is. It says how to frame the conversation; it confers nothing.
    */
-  message: string
+  client: 'cli' | 'controller' | 'worker'
+  max_receive: ReceiveLimits1
   /**
-   * How the client may react. It must equal [`ErrorCode::retry_category`] for the code.
+   * Every protocol version the client offers.
    */
-  retry: 'no_retry' | 'transient' | 'resync' | 'configuration_change' | 'outcome_unknown'
+  offered_versions: ProtocolVersion[]
+}
+/**
+ * The client's own receive limits.
+ */
+export interface ReceiveLimits1 {
+  /**
+   * Maximum complete attachment frame, in bytes, length prefix included.
+   */
+  max_attachment_frame_len: string
+  /**
+   * Maximum complete control frame, in bytes, length prefix included.
+   */
+  max_control_frame_len: string
+  /**
+   * Maximum complete input frame, in bytes, length prefix included.
+   */
+  max_input_frame_len: string
+  /**
+   * Maximum outstanding mutations per session.
+   */
+  max_outstanding_mutations: string
+  /**
+   * Maximum queued bytes before the peer is resynchronised.
+   */
+  max_send_queue_bytes: string
+}
+/**
+ * The first frame the host sends back.
+ */
+export interface LocalHelloAck {
+  action_window: ActionWindow2
+  boot_identity: BootIdentity
+  /**
+   * The capabilities both sides will use.
+   */
+  capabilities: CapabilityId[]
+  /**
+   * The connection identity the host assigned.
+   */
+  connection_id: string
+  /**
+   * The environment this endpoint belongs to.
+   */
+  environment_id: string
+  max_receive: ReceiveLimits2
+  peer: LocalPeer
+  /**
+   * Which host process answered.
+   */
+  role: 'controller' | 'worker' | 'rendezvous'
+  selected_version: ProtocolVersion1
+}
+/**
+ * A host-issued action window.
+ *
+ * Section 9: an original online request carries a window bound to this authenticated connection
+ * and to the host's boot identity, and the host derives the accepted deadline from the earliest
+ * of window expiry, receipt time plus the requested time to live, and any authority or subject
+ * deadline. The window carries a *duration*, not an absolute wall-clock deadline: the client
+ * schedules its renewal from that duration, while the host keeps the authoritative deadline on
+ * its own suspend-aware continuous clock. `issued_at_ms` is the host's stamp, for display and
+ * diagnosis only.
+ */
+export interface ActionWindow2 {
+  /**
+   * The window identity a mutation names.
+   */
+  action_window_id: string
+  /**
+   * The host boot the window is bound to. A restart invalidates new admission through it.
+   */
+  boot_epoch: string
+  /**
+   * The connection the window is bound to.
+   */
+  connection_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * How long the window stays valid, at most [`crate::limits::MAX_ACTION_WINDOW`].
+   */
+  valid_for_ms: string
+}
+/**
+ * The boot the host is running.
+ */
+export interface BootIdentity {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * The limits both sides will use.
+ */
+export interface ReceiveLimits2 {
+  /**
+   * Maximum complete attachment frame, in bytes, length prefix included.
+   */
+  max_attachment_frame_len: string
+  /**
+   * Maximum complete control frame, in bytes, length prefix included.
+   */
+  max_control_frame_len: string
+  /**
+   * Maximum complete input frame, in bytes, length prefix included.
+   */
+  max_input_frame_len: string
+  /**
+   * Maximum outstanding mutations per session.
+   */
+  max_outstanding_mutations: string
+  /**
+   * Maximum queued bytes before the peer is resynchronised.
+   */
+  max_send_queue_bytes: string
+}
+/**
+ * The caller the host authenticated.
+ */
+export interface LocalPeer {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  gid: string
+  /**
+   * The caller's process identifier, where the platform reports one. A hint for diagnostics,
+   * never authority on its own.
+   */
+  pid: U64 | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  uid: string
+}
+/**
+ * One public protocol version.
+ */
+export interface ProtocolVersion1 {
+  /**
+   * The major version. A mismatch is not negotiable.
+   */
+  major: number
+  /**
+   * The minor version. A peer selects the highest minor both sides support.
+   */
+  minor: number
 }
 /**
  * A read request.
@@ -1064,7 +1714,7 @@ export interface Request {
    */
   method_version: number
   /**
-   * The method's parameters.
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
    */
   params: unknown
   /**
@@ -1089,7 +1739,7 @@ export interface MutationRequest {
    */
   action_window_id: string
   /**
-   * The subject preconditions this mutation requires.
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
    */
   expected: unknown
   /**
@@ -1106,7 +1756,7 @@ export interface MutationRequest {
    */
   method_version: number
   /**
-   * The method's parameters.
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
    */
   params: unknown
   /**
@@ -1172,7 +1822,7 @@ export interface Response {
  * an old action identifier to retrieve protected information.
  */
 export interface ReceiptResponse {
-  receipt: Receipt
+  receipt: Receipt2
   /**
    * The request this response correlates with.
    */
@@ -1181,7 +1831,7 @@ export interface ReceiptResponse {
 /**
  * The current receipt.
  */
-export interface Receipt {
+export interface Receipt2 {
   /**
    * The deadline the host derived at acceptance: the earliest of window expiry, receipt time
    * plus the requested time to live, and any applicable authority or subject deadline. An exact
@@ -1252,6 +1902,457 @@ export interface Notification {
    * Which stream the event belongs to.
    */
   stream_id: string
+}
+/**
+ * A worker's startup claim, signed with the key it just generated.
+ */
+export interface WorkerRendezvous {
+  boot_identity: BootIdentity1
+  process_start_identity: ProcessStartIdentity1
+  /**
+   * The reservation this worker was started for.
+   */
+  reservation_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The signature over [`rendezvous_elements`].
+   */
+  signature: string
+  /**
+   * The public half of the worker's new per-session key.
+   */
+  worker_public_key: string
+}
+/**
+ * The boot the worker started in.
+ */
+export interface BootIdentity1 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * The worker's own process identity, which the controller compares with what the launcher
+ * reported and with the connecting peer.
+ */
+export interface ProcessStartIdentity1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * What the controller tells a worker to become, over the private rendezvous channel.
+ *
+ * The job definition that started the worker carries only non-secret facts: the reservation, the
+ * rendezvous address and the runtime directory. Everything else arrives here, after the worker
+ * has proved which reservation it belongs to, so a creator's environment snapshot never sits in
+ * an argument vector or an environment variable where another process could read it.
+ */
+export interface WorkerLaunchSpec {
+  /**
+   * The generation that spawned this worker.
+   */
+  controller_generation: string
+  /**
+   * The controller's public key, recorded so the worker can check generation tokens.
+   */
+  controller_public_key: string
+  create: SessionCreateParams
+  /**
+   * The local alias, which also names the worker's endpoint.
+   */
+  display_number: string
+  /**
+   * The environment the session belongs to.
+   */
+  environment_id: string
+  /**
+   * The release string the session reports as its terminal program version.
+   */
+  release: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The create request the controller admitted.
+ */
+export interface SessionCreateParams {
+  /**
+   * The working directory. Null selects the caller's directory from the snapshot.
+   */
+  cwd: string | null
+  /**
+   * The starting geometry. Null uses the invisible default of 120x40.
+   */
+  dimensions: Dimensions | null
+  /**
+   * The environment to create in.
+   */
+  environment_id: string
+  /**
+   * The creator's environment snapshot. The host filters terminal identity and reserved
+   * KalaReach variables out of it, and execution-context values take precedence over it.
+   */
+  environment_snapshot: EnvironmentVariable[]
+  /**
+   * How the session is presented locally.
+   */
+  presentation: 'attach' | 'terminal' | 'invisible'
+  /**
+   * The shell to launch. Null selects the environment's configured default.
+   */
+  shell: string | null
+  /**
+   * The shell integration mode.
+   */
+  shell_mode: 'managed' | 'native_compat'
+  /**
+   * How long the worker's execution context should last.
+   */
+  worker_profile: 'desktop_bound' | 'headless_user'
+}
+/**
+ * One environment variable in a create request's snapshot.
+ */
+export interface EnvironmentVariable {
+  /**
+   * The name.
+   */
+  name: string
+  /**
+   * The value.
+   */
+  value: string
+}
+/**
+ * What a worker reports once its root shell is running.
+ */
+export interface WorkerReady {
+  dimensions: Dimensions3
+  /**
+   * The worker's private endpoint.
+   */
+  endpoint: string
+  root_process: ProcessStartIdentity2
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The executable actually launched.
+   */
+  shell_path: string
+}
+/**
+ * A terminal geometry in columns and rows.
+ *
+ * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
+ * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
+ */
+export interface Dimensions3 {
+  /**
+   * Columns, from 1 to 2,048.
+   */
+  columns: string
+  /**
+   * Rows, from 1 to 1,024.
+   */
+  rows: string
+}
+/**
+ * The root shell's process identity.
+ */
+export interface ProcessStartIdentity2 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * A fresh challenge sent to a worker's private endpoint.
+ */
+export interface WorkerVerifyChallenge {
+  /**
+   * Thirty-two fresh random bytes. A reused challenge proves nothing.
+   */
+  nonce: string
+}
+/**
+ * A worker's answer to a challenge.
+ *
+ * The verifier checks the signature against the descriptor's public key **and** compares every
+ * identity field with the descriptor. A worker that answers with a different session, epoch, boot
+ * or process is not the worker the descriptor named.
+ */
+export interface WorkerVerifyProof {
+  boot_identity: BootIdentity2
+  /**
+   * The endpoint the challenge arrived on.
+   */
+  endpoint: string
+  process_start_identity: ProcessStartIdentity3
+  protocol_version: ProtocolVersion2
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The signature over [`verify_elements`].
+   */
+  signature: string
+}
+/**
+ * The boot the worker is running in.
+ */
+export interface BootIdentity2 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * The worker's process identity.
+ */
+export interface ProcessStartIdentity3 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * One public protocol version.
+ */
+export interface ProtocolVersion2 {
+  /**
+   * The major version. A mismatch is not negotiable.
+   */
+  major: number
+  /**
+   * The minor version. A peer selects the highest minor both sides support.
+   */
+  minor: number
+}
+/**
+ * A worker's challenge to a controller that wants to speak for a generation.
+ */
+export interface GenerationChallenge {
+  /**
+   * Thirty-two fresh random bytes, bound to this connection and consumed once.
+   */
+  nonce: string
+}
+/**
+ * A controller's proof that it speaks for the current generation.
+ *
+ * The nonce comes from the worker, so a token cannot be replayed onto a later connection. A
+ * worker accepts its current generation again only after a fresh challenge, which fences that
+ * generation's previous connection; it rejects a lower generation outright and requires a
+ * strictly higher one from a replacement.
+ */
+export interface ControllerGenerationToken {
+  boot_identity: BootIdentity3
+  /**
+   * The environment the controller owns.
+   */
+  environment_id: string
+  /**
+   * The generation this controller holds.
+   */
+  generation: string
+  /**
+   * The challenge the worker issued.
+   */
+  nonce: string
+  /**
+   * The signature over [`generation_elements`].
+   */
+  signature: string
+}
+/**
+ * The boot the controller is running in.
+ */
+export interface BootIdentity3 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * A worker's answer to a generation token.
+ */
+export interface GenerationAccepted {
+  /**
+   * True when accepting this token fenced an earlier connection of the same generation.
+   */
+  fenced_previous: boolean
+  /**
+   * The generation the worker now accepts.
+   */
+  generation: string
+}
+/**
+ * A mutation the host admitted for a caller, passed to the component that owns its subject.
+ *
+ * The control daemon owns admission: it authenticates the caller, stamps the freshness window,
+ * checks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding
+ * carries the caller's mutation to the worker **unchanged**, because the mutation is what the
+ * payload digest covers and what the caller will retry with: rewriting any of it would give the
+ * worker a different action from the one the caller asked for.
+ *
+ * What travels beside it is what the worker cannot establish for itself: which principal the host
+ * verified, and how long the deadline the host accepted still has to run. The worker performs the
+ * action under both.
+ */
+export interface ForwardedMutation {
+  /**
+   * What remains of the deadline the host derived at first admission, at the moment it forwarded
+   * this mutation.
+   *
+   * A *duration*, not an instant, because the two processes measure on their own suspend-aware
+   * continuous clocks and neither clock's origin means anything to the other. A wall-clock
+   * instant would be comparable and would also be steppable, which is the one property a
+   * deadline cannot have. The receiving process anchors this on its own clock when it reads the
+   * frame, so the only slack is the local socket's transit, and nothing downstream lengthens it
+   * further: the subject applies its own bounds on top.
+   */
+  accepted_ttl_ms: string
+  actor: ActorEnvelope1
+  mutation: MutationRequest1
+}
+/**
+ * The actor the host verified, with the ingress it arrived on.
+ */
+export interface ActorEnvelope1 {
+  /**
+   * The stable host-issued principal for this actor.
+   */
+  actor_id: string
+  /**
+   * The connection the request arrived on. Closing the control stream revokes every associated
+   * data stream.
+   */
+  connection_id: string
+  /**
+   * The controller generation that admitted the connection. Remote dispatch is fenced when this
+   * generation is replaced.
+   */
+  controller_generation: string
+  /**
+   * The paired device, when the ingress is a device.
+   */
+  device_id: DeviceId | null
+  /**
+   * The grant the request is being checked against, when one applies.
+   */
+  grant_id: GrantId | null
+  /**
+   * The authority revision the grant was validated at.
+   */
+  grant_revision: AuthorityRevision | null
+  /**
+   * Where the request entered the host.
+   */
+  ingress:
+    'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
+}
+/**
+ * A mutation request.
+ *
+ * The payload digest covers the method and version, the actor and grant, the complete target, the
+ * preconditions, the action identifier, the freshness window and time to live, and the
+ * parameters. Replacing the window changes the digest, so it is never an automatic retry.
+ */
+export interface MutationRequest1 {
+  /**
+   * The durable operation identity, a cryptographically generated UUIDv4.
+   */
+  action_id: string
+  /**
+   * The host-issued action window this first admission is bound to.
+   */
+  action_window_id: string
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  expected: unknown
+  /**
+   * The grant this mutation is claimed under. A local caller's host-stamped context leaves this
+   * null and the host resolves its own owner authority.
+   */
+  grant_id: GrantId | null
+  /**
+   * The method name.
+   */
+  method: string
+  /**
+   * The method version.
+   */
+  method_version: number
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  params: unknown
+  /**
+   * Correlates the response. Durable operation identity is `action_id`, not this.
+   */
+  request_id: string
+  /**
+   * The requested lifetime. The host derives the accepted deadline and may shorten it. This is
+   * a duration, not permission to refresh a replay.
+   */
+  requested_ttl_ms: string
+  target: ActionTarget
 }
 /**
  * The host challenge a direct redemption starts from. Single use, and it expires with the
@@ -1419,6 +2520,293 @@ export interface EnvelopePlaintext {
   version: 'kr-mailbox/1'
 }
 /**
+ * The result of `environment.list`.
+ */
+export interface EnvironmentListResult {
+  /**
+   * The environments.
+   */
+  environments: EnvironmentSummary[]
+}
+/**
+ * One environment this host serves.
+ */
+export interface EnvironmentSummary {
+  /**
+   * The processor architecture.
+   */
+  arch: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * A label for people.
+   */
+  label: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  live_sessions: string
+  /**
+   * The operating system.
+   */
+  os: string
+  /**
+   * The OS user the environment belongs to.
+   */
+  os_user: string
+  /**
+   * The runtime directory holding sockets and worker descriptors.
+   */
+  runtime_directory: string
+  /**
+   * The state directory holding the registry, journals and spools.
+   */
+  state_directory: string
+}
+/**
+ * Parameters of `events.snapshot`.
+ */
+export interface EventsSnapshotParams {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `events.snapshot`.
+ *
+ * Every field is present state, not a replay: installing a snapshot emits no bell, no clipboard
+ * write, no notification and no query.
+ */
+export interface EventsSnapshotResult {
+  /**
+   * Every current attachment, in join order.
+   */
+  attachments: AttachmentSummary[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+  geometry: GeometryState1
+  lease: InputLeaseState
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  oldest_retained_cursor: string
+  session: SessionSummary
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  taken_at_ms: string
+}
+/**
+ * Who owns the size.
+ */
+export interface GeometryState1 {
+  dimensions: Dimensions2
+  /**
+   * The epoch, advanced by every ownership change and explicit transfer.
+   */
+  epoch: string
+  /**
+   * The current owner. Null when no eligible claim exists and the last geometry is retained.
+   */
+  owner: AttachmentId | null
+}
+/**
+ * Who holds input.
+ */
+export interface InputLeaseState {
+  /**
+   * The connection the holder's ordered input stream belongs to.
+   */
+  connection_id: ConnectionId | null
+  /**
+   * The current epoch. A takeover advances it and invalidates the previous one.
+   */
+  epoch: string
+  /**
+   * The attachment that currently holds input. Null when no attachment holds it.
+   */
+  holder: AttachmentId | null
+  /**
+   * The next input sequence the worker expects on that stream.
+   */
+  next_sequence: string
+}
+/**
+ * The session.
+ */
+export interface SessionSummary {
+  /**
+   * What the foreground is doing, where the host knows.
+   */
+  application_state: ApplicationState | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  attachment_count: string
+  /**
+   * The final record, once the session has closed.
+   */
+  closure: ClosureRecord | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The working directory the root shell started in.
+   */
+  cwd: string
+  desktop: DesktopBinding
+  dimensions: Dimensions4
+  /**
+   * The local alias.
+   */
+  display_number: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The root shell's process identity while the session is running.
+   */
+  root_process: ProcessStartIdentity4 | null
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+   * reported.
+   */
+  shell_mode: 'managed' | 'native_compat'
+  /**
+   * The executable actually launched as the root shell.
+   */
+  shell_path: string
+  /**
+   * The lifecycle state.
+   */
+  state: 'creating' | 'live' | 'closing' | 'closed'
+  /**
+   * How long the worker's execution context lasts.
+   */
+  worker_profile: 'desktop_bound' | 'headless_user'
+}
+/**
+ * The login session a desktop-bound worker is tied to.
+ */
+export interface DesktopBinding {
+  /**
+   * The desktop session this worker is bound to, for a desktop-bound profile.
+   */
+  desktop_session_id: DesktopSessionId | null
+  /**
+   * The login-session generation the binding was taken at.
+   */
+  login_generation: U64 | null
+}
+/**
+ * A terminal geometry in columns and rows.
+ *
+ * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
+ * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
+ */
+export interface Dimensions4 {
+  /**
+   * Columns, from 1 to 2,048.
+   */
+  columns: string
+  /**
+   * Rows, from 1 to 1,024.
+   */
+  rows: string
+}
+/**
+ * A process and the kernel's record of when it started.
+ *
+ * Every ownership check compares both fields. A process identifier alone can be reused by an
+ * unrelated program within milliseconds of the original exiting, so the host never terminates,
+ * adopts or trusts a process on its identifier alone.
+ */
+export interface ProcessStartIdentity4 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * Parameters of `events.subscribe`.
+ */
+export interface EventsSubscribeParams {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  /**
+   * The output cursor to resume from. Null starts from the current position.
+   */
+  from_cursor: U64 | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The streams to receive.
+   */
+  streams: EventStream[]
+}
+/**
+ * The result of `events.subscribe`.
+ */
+export interface EventsSubscribeResult {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_cursor: string
+  /**
+   * Present when the requested cursor was already evicted, so the client must discard its
+   * partial state and install a new snapshot.
+   */
+  gap: HistoryGap | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  oldest_retained_cursor: string
+  /**
+   * The stream identifier notifications will carry.
+   */
+  stream_id: string
+}
+/**
+ * A range of output the worker can no longer replay.
+ */
+export interface HistoryGap {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_cursor: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  to_cursor: string
+}
+/**
  * A stored backup checkpoint a pairing transfers.
  *
  * A fresh client needs a trusted latest-generation checkpoint to detect a service replaying an
@@ -1441,6 +2829,40 @@ export interface GenerationCheckpoint {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   observed_at_ms: string
+}
+/**
+ * The result of any operation that can change geometry ownership.
+ */
+export interface GeometryResult {
+  geometry: GeometryState2
+}
+/**
+ * The geometry after the operation.
+ */
+export interface GeometryState2 {
+  dimensions: Dimensions2
+  /**
+   * The epoch, advanced by every ownership change and explicit transfer.
+   */
+  epoch: string
+  /**
+   * The current owner. Null when no eligible claim exists and the last geometry is retained.
+   */
+  owner: AttachmentId | null
+}
+/**
+ * Who owns the session's rows and columns.
+ */
+export interface GeometryState3 {
+  dimensions: Dimensions2
+  /**
+   * The epoch, advanced by every ownership change and explicit transfer.
+   */
+  epoch: string
+  /**
+   * The current owner. Null when no eligible claim exists and the last geometry is retained.
+   */
+  owner: AttachmentId | null
 }
 /**
  * A host-issued authority object.
@@ -1578,7 +3000,7 @@ export interface HostSelection {
    */
   clock_epoch: string
   /**
-   * The connection identity the host allocated.
+   * One transport connection, allocated by the host during hello.
    */
   connection_id: string
   /**
@@ -1597,13 +3019,13 @@ export interface HostSelection {
    * A fresh host nonce.
    */
   host_nonce: string
-  limits: ReceiveLimits1
-  selected_version: ProtocolVersion1
+  limits: ReceiveLimits3
+  selected_version: ProtocolVersion3
 }
 /**
  * The negotiated limits.
  */
-export interface ReceiveLimits1 {
+export interface ReceiveLimits3 {
   /**
    * Maximum complete attachment frame, in bytes, length prefix included.
    */
@@ -1628,7 +3050,7 @@ export interface ReceiveLimits1 {
 /**
  * One public protocol version.
  */
-export interface ProtocolVersion1 {
+export interface ProtocolVersion3 {
   /**
    * The major version. A mismatch is not negotiable.
    */
@@ -1639,47 +3061,327 @@ export interface ProtocolVersion1 {
   minor: number
 }
 /**
- * A signed statement that one account held one role in one organisation.
+ * Parameters of `history.page`.
  */
-export interface MembershipLease {
-  payload: MembershipLeasePayload
+export interface HistoryPageParams {
   /**
-   * The policy-signing key's signature over [`MembershipLeasePayload::signing_input`].
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
-  signature: string
+  from_cursor: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_bytes: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
 }
 /**
- * What the organisation states.
+ * The result of `history.page`.
  */
-export interface MembershipLeasePayload {
+export interface HistoryPageResult {
   /**
-   * The account it names as a member.
+   * The retained bytes. Raw output is a byte string and need not be valid UTF-8.
    */
-  account_id: string
+  bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_cursor: string
+  /**
+   * Present when the requested range had been evicted. The page states its gap rather than
+   * returning a shorter range as if it were complete.
+   */
+  gap: HistoryGap | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  next_cursor: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  oldest_retained_cursor: string
+}
+/**
+ * The result of `host.doctor`.
+ */
+export interface HostDoctorResult {
+  /**
+   * Every check, in the order they ran.
+   */
+  checks: DoctorCheck[]
+  /**
+   * True when no check failed.
+   */
+  healthy: boolean
+}
+/**
+ * One diagnostic check.
+ */
+export interface DoctorCheck {
+  /**
+   * A plain description of the finding. Credentials are redacted.
+   */
+  detail: string
+  /**
+   * A stable identifier for the check.
+   */
+  id: string
+  /**
+   * What the user should do, when the check did not pass.
+   */
+  remedy: string | null
+  /**
+   * What it found.
+   */
+  status: 'ok' | 'warning' | 'failed' | 'not_applicable'
+  /**
+   * What it examines.
+   */
+  title: string
+}
+/**
+ * The result of `host.info`.
+ */
+export interface HostInfoResult {
+  boot_identity: BootIdentity4
+  /**
+   * The controller build.
+   */
+  build_id: string
+  /**
+   * The worker profile this host creates sessions with unless the request says otherwise.
+   */
+  default_worker_profile: 'desktop_bound' | 'headless_user'
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The controller's current generation. A replacement controller uses a strictly higher one.
+   */
+  generation: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  live_sessions: string
+  protocol_version: ProtocolVersion4
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  session_limit: string
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
-  expires_at_ms: string
+  started_at_ms: string
+}
+/**
+ * The boot this host is running.
+ */
+export interface BootIdentity4 {
   /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   * Where the value came from.
    */
-  issued_at_ms: string
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
   /**
-   * The policy-key revision that signed it.
+   * The opaque value. Compared for equality, never interpreted.
    */
-  key_revision: string
+  value: string
+}
+/**
+ * One public protocol version.
+ */
+export interface ProtocolVersion4 {
   /**
-   * The most the role may carry. A host intersects this with its own policy.
+   * The major version. A mismatch is not negotiable.
    */
-  maximum_grants: ActionRight[]
+  major: number
   /**
-   * The organisation the lease speaks for.
+   * The minor version. A peer selects the highest minor both sides support.
    */
-  organisation_id: string
+  minor: number
+}
+/**
+ * Parameters of `input.acquire`.
+ */
+export interface InputAcquireParams {
   /**
-   * The role that account held when the lease was signed.
+   * One CLI or application attachment, independently of its device.
    */
-  role: 'viewer' | 'reviewer' | 'controller' | 'owner'
+  attachment_id: string
+  /**
+   * The epoch the caller believes is current, when it wants the takeover to be conditional.
+   */
+  expected_epoch: InputLeaseEpoch | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `input.acquire`.
+ */
+export interface InputAcquireResult {
+  /**
+   * True when the worker closed an open bracketed paste before handing input over, so the
+   * application never sees a paste completed under a different actor's lease.
+   */
+  closed_open_paste: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  discarded_bytes: string
+  lease: InputLeaseState1
+}
+/**
+ * The lease after the takeover.
+ */
+export interface InputLeaseState1 {
+  /**
+   * The connection the holder's ordered input stream belongs to.
+   */
+  connection_id: ConnectionId | null
+  /**
+   * The current epoch. A takeover advances it and invalidates the previous one.
+   */
+  epoch: string
+  /**
+   * The attachment that currently holds input. Null when no attachment holds it.
+   */
+  holder: AttachmentId | null
+  /**
+   * The next input sequence the worker expects on that stream.
+   */
+  next_sequence: string
+}
+/**
+ * Parameters of `input.interrupt`.
+ */
+export interface InputInterruptParams {
+  /**
+   * The action. Only the native interrupt is accepted.
+   */
+  action: 'native_interrupt'
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  /**
+   * The current input lease epoch.
+   */
+  epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `input.interrupt` and `input.release`.
+ */
+export interface InputLeaseResult {
+  lease: InputLeaseState2
+}
+/**
+ * The lease after the operation.
+ */
+export interface InputLeaseState2 {
+  /**
+   * The connection the holder's ordered input stream belongs to.
+   */
+  connection_id: ConnectionId | null
+  /**
+   * The current epoch. A takeover advances it and invalidates the previous one.
+   */
+  epoch: string
+  /**
+   * The attachment that currently holds input. Null when no attachment holds it.
+   */
+  holder: AttachmentId | null
+  /**
+   * The next input sequence the worker expects on that stream.
+   */
+  next_sequence: string
+}
+/**
+ * The current state of the session's single input lease.
+ */
+export interface InputLeaseState3 {
+  /**
+   * The connection the holder's ordered input stream belongs to.
+   */
+  connection_id: ConnectionId | null
+  /**
+   * The current epoch. A takeover advances it and invalidates the previous one.
+   */
+  epoch: string
+  /**
+   * The attachment that currently holds input. Null when no attachment holds it.
+   */
+  holder: AttachmentId | null
+  /**
+   * The next input sequence the worker expects on that stream.
+   */
+  next_sequence: string
+}
+/**
+ * Parameters of `input.release`.
+ */
+export interface InputReleaseParams {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  /**
+   * The current input lease epoch.
+   */
+  epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * Parameters of ordered `input.write`.
+ */
+export interface InputWriteParams {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  /**
+   * The raw bytes. They are not decoded, re-encoded or normalised.
+   */
+  bytes: string
+  /**
+   * The current input lease epoch.
+   */
+  epoch: string
+  /**
+   * The position of these bytes in this connection's ordered input stream.
+   */
+  sequence: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `input.write`.
+ */
+export interface InputWriteResult {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  forwarded_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  held_prefix_bytes: string
+  /**
+   * The sequence the worker has now consumed.
+   */
+  sequence: string
 }
 /**
  * One exhaustive authority entry.
@@ -2002,6 +3704,19 @@ export interface RequiredRight {
     | 'issuing_owner'
 }
 /**
+ * One batch of output bytes on the output stream.
+ */
+export interface OutputEvent {
+  /**
+   * The bytes.
+   */
+  bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+}
+/**
  * An owner's answer to a confirmation challenge.
  *
  * The verification ceremony itself is platform code; this object records its result and binds it
@@ -2178,96 +3893,6 @@ export interface PairFinishRequest {
   transcript: string
 }
 /**
- * An organisation's policy-signing authority as it is published.
- */
-export interface PolicyAuthority {
-  /**
-   * Every revision in order, starting at the first.
-   */
-  chain: PolicyAuthorityLink[]
-  head: PolicyAuthorityHead
-  /**
-   * The organisation the chain belongs to.
-   */
-  organisation_id: string
-}
-/**
- * One step in an organisation's policy-signing authority chain.
- *
- * The first revision signs itself and names no predecessor, which is what a host pins. Every
- * later revision is signed by the revision it names, so a host that pinned the first can follow
- * the chain to the key signing now, and a link cannot be re-parented under a revision it was not
- * issued against.
- *
- * A link carries no expiry, because when a revision stops signing is not known when it is issued.
- * Its successor's `not_before_ms` is when it stopped.
- */
-export interface PolicyAuthorityLink {
-  payload: PolicyAuthorityLinkPayload
-  /**
-   * The predecessor's signature over [`PolicyAuthorityLinkPayload::signing_input`], or this
-   * revision's own at the first revision.
-   */
-  signature: string
-}
-/**
- * What this revision states.
- */
-export interface PolicyAuthorityLinkPayload {
-  /**
-   * The revision this link establishes.
-   */
-  key_revision: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  not_before_ms: string
-  /**
-   * The organisation whose chain this link belongs to.
-   */
-  organisation_id: string
-  /**
-   * The revision whose key signed it, or null at the first revision, which signs itself.
-   */
-  previous_key_revision: PolicyKeyRevision | null
-  /**
-   * The Ed25519 public key of this revision.
-   */
-  public_key: string
-}
-/**
- * Which revision signs now, signed by that revision.
- */
-export interface PolicyAuthorityHead {
-  payload: PolicyAuthorityHeadPayload
-  /**
-   * The signature of the revision the statement names, over
-   * [`PolicyAuthorityHeadPayload::signing_input`].
-   */
-  signature: string
-}
-/**
- * What the authority states.
- */
-export interface PolicyAuthorityHeadPayload {
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  expires_at_ms: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  issued_at_ms: string
-  /**
-   * The revision of an organisation's policy-signing key, advanced on every rotation.
-   */
-  key_revision: string
-  /**
-   * The organisation this statement belongs to.
-   */
-  organisation_id: string
-}
-/**
  * The rights an invitation proposes, before the host issues a grant.
  *
  * The client cannot enlarge the grant through its bundle: the host commits the grant it proposed,
@@ -2356,7 +3981,7 @@ export interface HistoryScope1 {
  * The de-duplication key is `(actor_id, action_id)`. An exact duplicate returns the stored
  * receipt; a reused identifier with a different payload digest is an `ID_CONFLICT`.
  */
-export interface Receipt1 {
+export interface Receipt3 {
   /**
    * The deadline the host derived at acceptance: the earliest of window expiry, receipt time
    * plus the requested time to live, and any applicable authority or subject deadline. An exact
@@ -2420,11 +4045,11 @@ export interface RecoveryBundle {
    */
   collections: CollectionLocator[]
   /**
-   * The bundle revision, advanced on every compare-and-swap write.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   revision: string
   /**
-   * The bundle schema version.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   schema_version: string
   /**
@@ -2456,7 +4081,7 @@ export interface ArchiveCheckpoint {
    */
   encrypted_manifest_hash: string
   /**
-   * When the owner verified it, in UTC milliseconds.
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   verified_at_ms: string
 }
@@ -2509,7 +4134,7 @@ export interface RecoveryKit {
    */
   bundle_locator: string
   /**
-   * The kit format and cryptographic profile version.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   profile_version: string
   /**
@@ -2527,306 +4152,21 @@ export interface RecoveryKit {
   service_origins: string[]
 }
 /**
- * The service's answer to a consumption report.
- *
- * It states what the service has recorded rather than what the report contained, so a relay
- * recovering from a crash learns from one exchange exactly which position to replay from.
+ * The event that tells one subscriber to discard its partial state.
  */
-export interface RelayConsumptionAck {
+export interface ResyncRequired {
   /**
-   * True when the service is holding out for receipts it has not been given. The reservation
-   * stays outstanding until they arrive or until it is settled conservatively.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
-  awaiting_receipts: boolean
+  cursor: string
   /**
-   * The cumulative bytes recorded for the reservation.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
-  bytes_recorded: string
+  oldest_retained_cursor: string
   /**
-   * The next sequence the service will accept. A relay resumes from here.
+   * Why.
    */
-  next_sequence: string
-  /**
-   * The highest sequence recorded for it, or null when none has been.
-   */
-  recorded_through: RelayReceiptSequence | null
-  /**
-   * The reservation the report was about.
-   */
-  reservation_id: string
-}
-/**
- * What a relay posts to the service to report consumption.
- *
- * A report carries receipts for one reservation in ascending order. Reporting is idempotent, so a
- * relay that is unsure whether a report arrived sends it again rather than skipping it, and a
- * relay resuming after a restart replays from the last position the service acknowledged.
- */
-export interface RelayConsumptionReport {
-  /**
-   * The receipts, in ascending sequence order.
-   */
-  receipts: SignedRelayConsumptionReceipt[]
-  /**
-   * The relay instance reporting.
-   */
-  relay_instance_id: string
-  /**
-   * The reservation being reported.
-   */
-  reservation_id: string
-}
-/**
- * A receipt and the relay instance signature that authenticates it.
- */
-export interface SignedRelayConsumptionReceipt {
-  receipt: RelayConsumptionReceipt
-  /**
-   * The Ed25519 signature over `CBOR(["kr-relay/receipt/1", receipt])`, by the registered key
-   * of the receipt's relay instance.
-   */
-  signature: string
-}
-/**
- * The receipt.
- */
-export interface RelayConsumptionReceipt {
-  /**
-   * The bytes spent from the reservation so far. Cumulative and never decreasing.
-   */
-  bytes_consumed: string
-  /**
-   * The lease revision that was in force when the count was taken.
-   */
-  lease_revision: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  observed_at_ms: string
-  /**
-   * The relay instance that counted the bytes.
-   */
-  relay_instance_id: string
-  /**
-   * The reservation the bytes were spent from.
-   */
-  reservation_id: string
-  /**
-   * The position of one consumption receipt inside its reservation's sequence.
-   */
-  sequence: string
-}
-/**
- * A relay's answer to a control request.
- *
- * An exact retry of an installation answers with the same state and the same running figures: the
- * relay keeps what it has counted, so re-sending a lease can never restore a spent ceiling.
- */
-export interface RelayLeaseAck {
-  /**
-   * The cumulative bytes counted for its reservation so far.
-   */
-  bytes_consumed: string
-  /**
-   * The bytes still forwardable under it.
-   */
-  bytes_remaining: string
-  /**
-   * The milliseconds of grace left, or null when the pair is not in grace. Section 17 requires
-   * the remaining interval to be visible before the relay closes.
-   */
-  grace_remaining_ms: U64 | null
-  /**
-   * The lease the request named.
-   */
-  lease_id: string
-  /**
-   * The revision the relay now holds.
-   */
-  revision: string
-  /**
-   * What the relay holds for that lease.
-   */
-  state: 'installed' | 'superseded' | 'revoked' | 'expired' | 'exhausted'
-}
-/**
- * The lease to install. Boxed because a lease is much the larger of the two requests and
- * an unboxed variant would make every revocation carry its size.
- */
-export interface SignedRelayLease {
-  lease: RelayLease
-  /**
-   * The Ed25519 signature over `CBOR(["kr-relay/lease/1", lease])`, by the lease's issuer key.
-   */
-  signature: string
-}
-/**
- * The lease.
- */
-export interface RelayLease {
-  /**
-   * The cumulative bytes this reservation may reach at the metering boundary. A refill raises
-   * it; it never falls.
-   */
-  byte_ceiling: string
-  /**
-   * The endpoint that may receive.
-   */
-  destination_endpoint_key: string
-  /**
-   * Whether the reverse direction is permitted too.
-   */
-  direction: 'source_to_destination' | 'bidirectional'
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  expires_at_ms: string
-  /**
-   * The bounded grace this pair is inside, or null when the principal is not in grace.
-   */
-  grace: RelayGrace | null
-  /**
-   * The service admission key that signs this lease. A relay accepts it only when the key is
-   * one it pins.
-   */
-  issuer_key: string
-  /**
-   * The lease identity. One lease covers one endpoint pair for one payer.
-   */
-  lease_id: string
-  /**
-   * The relay instance that counts the bytes. One of the two positions in the scope.
-   */
-  metering_relay_instance_id: string
-  /**
-   * Which of that instance's own boundaries takes the count.
-   */
-  metering_role: 'ingress' | 'egress'
-  /**
-   * Who is billed.
-   */
-  payer:
-    | {
-        account: {
-          /**
-           * The account that is billed.
-           */
-          account_id: string
-        }
-      }
-    | {
-        installation: {
-          /**
-           * The installation that is billed.
-           */
-          installation_id: string
-        }
-      }
-  /**
-   * Why that principal is the one billed.
-   */
-  payer_authorisation:
-    | 'host_selected'
-    | {
-        sponsored: {
-          /**
-           * The sponsor's authorisation record.
-           */
-          authorisation_id: string
-        }
-      }
-  relay_scope: RelayScope
-  /**
-   * The reserved block this lease spends from. It is bound for its lifetime to this lease, this
-   * payer, this pair and this metering boundary; changing any of them takes a new reservation.
-   */
-  reservation_id: string
-  /**
-   * The revision of this lease. Strictly increasing per lease identity; a relay keeps the
-   * highest revision it has seen and refuses anything lower, so a replaced lease cannot be
-   * rolled back to an earlier ceiling or an earlier deadline.
-   */
-  revision: string
-  /**
-   * The endpoint that may send.
-   */
-  source_endpoint_key: string
-}
-/**
- * The bounded grace a principal is inside, as the service has told this relay.
- *
- * Section 17 grants a principal up to fifteen minutes or 100 MiB after exhaustion, whichever ends
- * first, shared across every connection of that principal. It starts at the first exhaustion
- * event, and reconnects, new endpoints and other regions cannot restart it: only the service knows
- * when the principal first exhausted its allowance, and a relay only ever receives what is left of
- * one grace period as a slice of it.
- *
- * The slice is expressed as a raised cumulative ceiling on the same reservation, so the relay has
- * one number to compare its running total against whether the lease is in grace or not.
- */
-export interface RelayGrace {
-  /**
-   * The cumulative bytes this reservation may reach inside the grace. Never below the lease's
-   * own ceiling, and above it by at most [`MAX_GRACE_BYTES`].
-   */
-  byte_ceiling: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  ends_at_ms: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  started_at_ms: string
-}
-/**
- * The two relay positions this lease is valid at.
- */
-export interface RelayScope {
-  /**
-   * The relay instance the destination endpoint is connected to.
-   */
-  egress_relay_instance_id: string
-  /**
-   * The relay instance the source endpoint is connected to.
-   */
-  ingress_relay_instance_id: string
-}
-/**
- * The revocation to apply.
- */
-export interface SignedRelayLeaseRevocation {
-  revocation: RelayLeaseRevocation
-  /**
-   * The Ed25519 signature over `CBOR(["kr-relay/revoke/1", revocation])`.
-   */
-  signature: string
-}
-/**
- * The revocation.
- */
-export interface RelayLeaseRevocation {
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  issued_at_ms: string
-  /**
-   * The service admission key that signs it.
-   */
-  issuer_key: string
-  /**
-   * The lease to stop forwarding under.
-   */
-  lease_id: string
-  /**
-   * The relay instance this revocation is addressed to, so one relay's copy cannot be replayed
-   * at another.
-   */
-  relay_instance_id: string
-  /**
-   * The revision this revocation installs. Strictly higher than the revision it fences.
-   */
-  revision: string
+  reason: 'send_queue_full' | 'history_evicted' | 'projection_reset'
 }
 /**
  * The host's acknowledgement of one revocation request.
@@ -2949,11 +4289,469 @@ export interface EnvelopeRouting {
    */
   sender_key_id: string
   /**
-   * The declared size bucket, in bytes: the length of the padded plaintext that was encrypted.
-   *
-   * Quota accounting measures the complete stored ciphertext rather than this figure.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   size_bucket_bytes: string
+}
+/**
+ * Parameters of `session.attach`.
+ *
+ * The request does not bypass grants and does not acquire a remote input lease.
+ */
+export interface SessionAttachParams {
+  /**
+   * Whether this attachment registers a geometry claim. Semantic mode requires false.
+   */
+  claim_geometry: boolean
+  /**
+   * The attachment's physical dimensions, required in terminal mode.
+   */
+  dimensions: Dimensions | null
+  /**
+   * What this attachment observes.
+   */
+  mode: 'semantic' | 'terminal'
+  /**
+   * The observation and input capabilities the attachment asks for.
+   */
+  requested: AttachmentCapability[]
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The terminal profile this attachment presents.
+   */
+  terminal_profile_id: string | null
+}
+/**
+ * The result of `session.attach`.
+ */
+export interface SessionAttachResult {
+  attachment: AttachmentSummary1
+  geometry: GeometryState4
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  output_cursor: string
+}
+/**
+ * One attachment of a session.
+ */
+export interface AttachmentSummary1 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  attached_at_ms: string
+  /**
+   * The attachment identity, independent of the device behind it.
+   */
+  attachment_id: string
+  /**
+   * Whether this attachment holds an eligible geometry claim.
+   */
+  claim_geometry: boolean
+  /**
+   * The attachment's own physical dimensions, reported even when it is not the owner.
+   */
+  dimensions: Dimensions | null
+  /**
+   * The capabilities the host granted, which are the requested ones intersected with the
+   * actor's rights.
+   */
+  granted: AttachmentCapability[]
+  /**
+   * What this attachment observes.
+   */
+  mode: 'semantic' | 'terminal'
+  /**
+   * The monotonic join order that decides size-owner succession.
+   */
+  ordinal: string
+  /**
+   * How the attachment displays the canonical grid.
+   */
+  presentation: TerminalPresentationMode | null
+  /**
+   * The terminal profile it presents.
+   */
+  terminal_profile_id: string | null
+}
+/**
+ * Who owns the geometry after this attachment joined.
+ */
+export interface GeometryState4 {
+  dimensions: Dimensions2
+  /**
+   * The epoch, advanced by every ownership change and explicit transfer.
+   */
+  epoch: string
+  /**
+   * The current owner. Null when no eligible claim exists and the last geometry is retained.
+   */
+  owner: AttachmentId | null
+}
+/**
+ * Parameters of `session.close`.
+ */
+export interface SessionCloseParams {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `session.close`.
+ *
+ * The initiating request receives this acceptance before the worker's own process can end.
+ * Duplicate requests return the existing state rather than a second closure.
+ */
+export interface SessionCloseResult {
+  /**
+   * The final record, once closure has finished.
+   */
+  closure: ClosureRecord | null
+  /**
+   * Whether the closure was recorded durably.
+   */
+  durability: 'durable' | 'volatile'
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The state at the moment of the reply.
+   */
+  state: 'creating' | 'live' | 'closing' | 'closed'
+}
+/**
+ * Parameters of `session.create`.
+ */
+export interface SessionCreateParams1 {
+  /**
+   * The working directory. Null selects the caller's directory from the snapshot.
+   */
+  cwd: string | null
+  /**
+   * The starting geometry. Null uses the invisible default of 120x40.
+   */
+  dimensions: Dimensions | null
+  /**
+   * The environment to create in.
+   */
+  environment_id: string
+  /**
+   * The creator's environment snapshot. The host filters terminal identity and reserved
+   * KalaReach variables out of it, and execution-context values take precedence over it.
+   */
+  environment_snapshot: EnvironmentVariable[]
+  /**
+   * How the session is presented locally.
+   */
+  presentation: 'attach' | 'terminal' | 'invisible'
+  /**
+   * The shell to launch. Null selects the environment's configured default.
+   */
+  shell: string | null
+  /**
+   * The shell integration mode.
+   */
+  shell_mode: 'managed' | 'native_compat'
+  /**
+   * How long the worker's execution context should last.
+   */
+  worker_profile: 'desktop_bound' | 'headless_user'
+}
+/**
+ * The result of `session.create`.
+ */
+export interface SessionCreateResult {
+  /**
+   * True when this result was replayed for a repeated create token rather than created now.
+   */
+  deduplicated: boolean
+  /**
+   * The endpoint the creator can attach to without another controller call. Null when the
+   * session has already closed, which a repeated create token can return.
+   */
+  endpoint: string | null
+  /**
+   * The presentation failure, when the session was created and its terminal could not be
+   * opened. The session above is real and usable; a failed presentation never retries
+   * execution and never creates a second session.
+   */
+  presentation_error: ProtocolError | null
+  session: SessionSummary1
+}
+/**
+ * The created session.
+ */
+export interface SessionSummary1 {
+  /**
+   * What the foreground is doing, where the host knows.
+   */
+  application_state: ApplicationState | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  attachment_count: string
+  /**
+   * The final record, once the session has closed.
+   */
+  closure: ClosureRecord | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The working directory the root shell started in.
+   */
+  cwd: string
+  desktop: DesktopBinding
+  dimensions: Dimensions4
+  /**
+   * The local alias.
+   */
+  display_number: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The root shell's process identity while the session is running.
+   */
+  root_process: ProcessStartIdentity4 | null
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+   * reported.
+   */
+  shell_mode: 'managed' | 'native_compat'
+  /**
+   * The executable actually launched as the root shell.
+   */
+  shell_path: string
+  /**
+   * The lifecycle state.
+   */
+  state: 'creating' | 'live' | 'closing' | 'closed'
+  /**
+   * How long the worker's execution context lasts.
+   */
+  worker_profile: 'desktop_bound' | 'headless_user'
+}
+/**
+ * Parameters of `session.detach`.
+ */
+export interface SessionDetachParams {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+}
+/**
+ * The result of `session.detach`.
+ */
+export interface SessionDetachResult {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  geometry: GeometryState5
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  remaining: string
+}
+/**
+ * Who owns the geometry after succession.
+ */
+export interface GeometryState5 {
+  dimensions: Dimensions2
+  /**
+   * The epoch, advanced by every ownership change and explicit transfer.
+   */
+  epoch: string
+  /**
+   * The current owner. Null when no eligible claim exists and the last geometry is retained.
+   */
+  owner: AttachmentId | null
+}
+/**
+ * Parameters of `session.list`.
+ */
+export interface SessionListParams {
+  /**
+   * Restrict to one environment. Null lists every environment the caller may see.
+   */
+  environment_id: EnvironmentId | null
+  /**
+   * Include sessions that have already closed.
+   */
+  include_closed: boolean
+}
+/**
+ * The result of `session.list`.
+ */
+export interface SessionListResult {
+  /**
+   * The sessions, in display-number order.
+   */
+  sessions: SessionSummary2[]
+}
+/**
+ * What a client knows about one session.
+ */
+export interface SessionSummary2 {
+  /**
+   * What the foreground is doing, where the host knows.
+   */
+  application_state: ApplicationState | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  attachment_count: string
+  /**
+   * The final record, once the session has closed.
+   */
+  closure: ClosureRecord | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The working directory the root shell started in.
+   */
+  cwd: string
+  desktop: DesktopBinding
+  dimensions: Dimensions4
+  /**
+   * The local alias.
+   */
+  display_number: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The root shell's process identity while the session is running.
+   */
+  root_process: ProcessStartIdentity4 | null
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+   * reported.
+   */
+  shell_mode: 'managed' | 'native_compat'
+  /**
+   * The executable actually launched as the root shell.
+   */
+  shell_path: string
+  /**
+   * The lifecycle state.
+   */
+  state: 'creating' | 'live' | 'closing' | 'closed'
+  /**
+   * How long the worker's execution context lasts.
+   */
+  worker_profile: 'desktop_bound' | 'headless_user'
+}
+/**
+ * Parameters of `session.read`.
+ */
+export interface SessionReadParams {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `session.read`.
+ */
+export interface SessionReadResult {
+  /**
+   * The endpoint a local client can attach to, while the session is running.
+   */
+  endpoint: string | null
+  session: SessionSummary3
+}
+/**
+ * What a client knows about one session.
+ */
+export interface SessionSummary3 {
+  /**
+   * What the foreground is doing, where the host knows.
+   */
+  application_state: ApplicationState | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  attachment_count: string
+  /**
+   * The final record, once the session has closed.
+   */
+  closure: ClosureRecord | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The working directory the root shell started in.
+   */
+  cwd: string
+  desktop: DesktopBinding
+  dimensions: Dimensions4
+  /**
+   * The local alias.
+   */
+  display_number: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The root shell's process identity while the session is running.
+   */
+  root_process: ProcessStartIdentity4 | null
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+   * reported.
+   */
+  shell_mode: 'managed' | 'native_compat'
+  /**
+   * The executable actually launched as the root shell.
+   */
+  shell_path: string
+  /**
+   * The lifecycle state.
+   */
+  state: 'creating' | 'live' | 'closing' | 'closed'
+  /**
+   * How long the worker's execution context lasts.
+   */
+  worker_profile: 'desktop_bound' | 'headless_user'
 }
 /**
  * A session and the epoch it was addressed in.
@@ -2995,7 +4793,7 @@ export interface ArchiveManifest {
    */
   backup_generation: string
   /**
-   * When the producer wrote it, in UTC milliseconds.
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   created_at_ms: string
   /**
@@ -3242,86 +5040,11 @@ export interface ProposedGrant1 {
     | 'none'
 }
 /**
- * A registration and the instance signature that proves the host holds the key.
- *
- * The operator submits this under service-admin authority. The authority says the submission is
- * permitted; the signature says the key being registered is one a relay host actually has, so a
- * mistyped key cannot become the key every later receipt is checked against.
- */
-export interface SignedRelayInstanceRegistration {
-  registration: RelayInstanceRegistration
-  /**
-   * The Ed25519 signature over `CBOR(["kr-relay/instance/1", registration])`, by the instance
-   * key the registration currently holds.
-   */
-  signature: string
-}
-/**
- * The registration.
- */
-export interface RelayInstanceRegistration {
-  /**
-   * The public half of the key this instance signs receipts with.
-   */
-  instance_key: string
-  /**
-   * The deployment region this instance serves.
-   */
-  region: string
-  /**
-   * The instance identity. Stable across key rotation.
-   */
-  relay_instance_id: string
-  /**
-   * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
-   */
-  relay_url: string
-  /**
-   * The revision of this registration. Strictly increasing per instance, so a registration the
-   * instance has replaced cannot be replayed to undo the replacement. The same revision is
-   * accepted again only for a byte-identical retry.
-   */
-  revision: string
-  /**
-   * The successor key and its overlap window, or null when no rotation is announced.
-   */
-  successor: RelayKeySuccession | null
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  valid_from_ms: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  valid_until_ms: string
-}
-/**
- * A successor key and the window in which both keys are accepted.
- *
- * Rotation cannot be instantaneous: receipts signed before the change are still in flight when the
- * new key starts signing. The overlap is that window, stated in advance and ending at a recorded
- * time rather than whenever somebody remembers to retire the old key.
- */
-export interface RelayKeySuccession {
-  /**
-   * The key that takes over.
-   */
-  instance_key: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  overlap_from_ms: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  predecessor_retires_at_ms: string
-}
-/**
  * The bounded header every stream sends first.
  */
 export interface StreamHeader {
   /**
-   * The control connection this stream is validated against.
+   * One transport connection, allocated by the host during hello.
    */
   connection_id: string
   /**
@@ -3354,4 +5077,144 @@ export interface StreamResource {
    * The transfer, for attachment chunk streams.
    */
   transfer_id: TransferId | null
+}
+/**
+ * Parameters of `terminal.geometry.transfer`.
+ *
+ * This is the deliberate "use this terminal's size" action. Ordinary attach and input takeover
+ * never move size ownership.
+ */
+export interface TerminalGeometryTransferParams {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  /**
+   * The geometry epoch the caller believes is current.
+   */
+  expected_geometry_epoch: string
+}
+/**
+ * Parameters of `terminal.resize`.
+ *
+ * Only the current geometry owner changes the pseudo-terminal.
+ */
+export interface TerminalResizeParams {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  dimensions: Dimensions5
+  /**
+   * The geometry epoch the caller believes is current.
+   */
+  expected_geometry_epoch: string
+}
+/**
+ * A terminal geometry in columns and rows.
+ *
+ * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
+ * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
+ */
+export interface Dimensions5 {
+  /**
+   * Columns, from 1 to 2,048.
+   */
+  columns: string
+  /**
+   * Rows, from 1 to 1,024.
+   */
+  rows: string
+}
+/**
+ * What the controller publishes so a client can reach a worker without asking the controller.
+ *
+ * Section 5 requires this file to be owner-only, published atomically and free of secrets. A
+ * filename and a process identifier are hints; the public key here is what a challenge is checked
+ * against, and the identity fields are what the challenge's answer must match.
+ */
+export interface WorkerDescriptor {
+  boot_identity: BootIdentity5
+  /**
+   * The local alias.
+   */
+  display_number: string
+  /**
+   * The worker's private endpoint.
+   */
+  endpoint: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  process_start_identity: ProcessStartIdentity5
+  protocol_version: ProtocolVersion5
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  published_at_ms: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How long the worker's execution context lasts.
+   */
+  worker_profile: 'desktop_bound' | 'headless_user'
+  /**
+   * The public half of the worker's per-session key. The private half exists only in the
+   * worker's memory.
+   */
+  worker_public_key: string
+}
+/**
+ * The boot the worker started in.
+ */
+export interface BootIdentity5 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * A process and the kernel's record of when it started.
+ *
+ * Every ownership check compares both fields. A process identifier alone can be reused by an
+ * unrelated program within milliseconds of the original exiting, so the host never terminates,
+ * adopts or trusts a process on its identifier alone.
+ */
+export interface ProcessStartIdentity5 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * One public protocol version.
+ */
+export interface ProtocolVersion5 {
+  /**
+   * The major version. A mismatch is not negotiable.
+   */
+  major: number
+  /**
+   * The minor version. A peer selects the highest minor both sides support.
+   */
+  minor: number
 }

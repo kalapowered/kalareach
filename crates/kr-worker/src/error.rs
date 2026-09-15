@@ -75,6 +75,12 @@ pub enum WorkerError {
         /// What went wrong.
         detail: String,
     },
+    /// A resource this host needs was not available.
+    #[error("{detail}")]
+    ResourceUnavailable {
+        /// What was unavailable.
+        detail: String,
+    },
     /// The subject preconditions the mutation requires did not hold.
     #[error("{detail}")]
     PreconditionFailed {
@@ -118,7 +124,7 @@ impl WorkerError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Storage { .. } | Self::JournalUnavailable { .. } => ErrorCode::StorageUnavailable,
-            Self::Pty { .. } => ErrorCode::ResourceUnavailable,
+            Self::Pty { .. } | Self::ResourceUnavailable { .. } => ErrorCode::ResourceUnavailable,
             Self::Dimensions(_) | Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::UnknownAttachment { .. } => ErrorCode::AmbiguousAttachment,
             Self::LeaseLost => ErrorCode::LeaseLost,

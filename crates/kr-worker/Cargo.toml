@@ -17,6 +17,8 @@ clap.workspace = true
 kr-cbor.workspace = true
 kr-ipc.workspace = true
 kr-protocol.workspace = true
+kr-term.workspace = true
+kr-transport.workspace = true
 portable-pty.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 rustix = { workspace = true, features = ["process", "termios"] }

@@ -87,18 +87,21 @@ async fn hosted(script: &str) -> Hosted {
 
     let endpoint = environment.worker_endpoint(display).expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    let service = Arc::new(WorkerService::new(
-        Arc::clone(&runtime),
-        Arc::clone(&identity),
-        endpoint.clone(),
-        ServiceBinding {
-            environment_id,
-            boot_identity: boot.clone(),
-            controller_public_key: *controller.public_key(),
-            controller_generation: ControllerGeneration::new(1),
-            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
-        },
-    ));
+    let service = Arc::new(
+        WorkerService::new(
+            Arc::clone(&runtime),
+            Arc::clone(&identity),
+            endpoint.clone(),
+            ServiceBinding {
+                environment_id,
+                boot_identity: boot.clone(),
+                controller_public_key: *controller.public_key(),
+                controller_generation: ControllerGeneration::new(1),
+                build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            },
+        )
+        .expect("a worker service"),
+    );
     tokio::spawn(Arc::clone(&service).serve(listener));
 
     kr_ipc::descriptor::publish(
@@ -211,15 +214,21 @@ fn unsafe_free_borrow(raw: std::os::fd::RawFd) -> std::os::fd::BorrowedFd<'stati
 }
 
 /// Returns how many restoration guards are running.
-fn guard_count() -> usize {
-    let listing = std::process::Command::new("ps")
-        .args(["-o", "command=", "-ax"])
+fn guards_of(attach: u32) -> usize {
+    let listing = std::process::Command::new("pgrep")
+        .args(["-P", &attach.to_string()])
         .output()
-        .expect("lists processes");
+        .expect("lists child processes");
     String::from_utf8_lossy(&listing.stdout)
         .lines()
-        .filter(|line| {
-            line.trim_start()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| {
+            let named = std::process::Command::new("ps")
+                .args(["-o", "command=", "-p", &pid.to_string()])
+                .output()
+                .expect("names the process");
+            String::from_utf8_lossy(&named.stdout)
+                .trim_start()
                 .starts_with(env!("CARGO_BIN_EXE_kr-attach-guard"))
         })
         .count()
@@ -323,10 +332,16 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
         "the attachment put the terminal into raw mode"
     );
 
-    // Killed outright. No handler runs, no destructor runs; only the guard is left.
-    assert_eq!(guard_count(), 1, "the attachment armed a restoration guard");
     let attach = attach_process(shell.process_id().expect("the shell has an identifier"))
         .expect("the shell started the attach command");
+    // Killed outright. No handler runs, no destructor runs; only the guard is left. The guard is
+    // counted among this attachment's own children, because the tests in this file run beside each
+    // other and each one arms a guard of its own.
+    assert_eq!(
+        guards_of(attach),
+        1,
+        "the attachment armed a restoration guard"
+    );
     // A real `SIGKILL`, not a hang-up. No handler runs, no destructor runs; the only thing left is
     // the guard, which is the whole point of it being a separate process.
     let killed = std::process::Command::new("kill")

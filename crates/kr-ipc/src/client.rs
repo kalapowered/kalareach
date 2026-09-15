@@ -14,12 +14,14 @@
 //! A controller additionally answers the worker's own challenge with a generation token, which is
 //! what fences the connection that spoke for the previous generation.
 
-use kr_protocol::envelope::{MutationRequest, Outcome, ParamsValue, Request, Response};
+use kr_protocol::envelope::{
+    ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
+};
 use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{PROTOCOL_VERSION, ReceiveLimits};
 use kr_protocol::ids::{ActionId, BuildId, RequestId};
-use kr_protocol::local::{ControlMessage, LocalClientKind, LocalHello, LocalHelloAck};
+use kr_protocol::local::{LocalClientKind, LocalHello, LocalHelloAck};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable};
 use kr_protocol::worker::{
@@ -55,9 +57,9 @@ impl LocalClient {
         build_id: BuildId,
     ) -> Result<Self> {
         let connection = Connection::connect(endpoint).await?;
-        let (reader, mut writer) = split(connection, StreamKind::Control);
+        let (mut reader, mut writer) = split(connection, StreamKind::Control);
         writer
-            .write_message(&ControlMessage::Hello(LocalHello {
+            .write_message(&ControlFrame::Hello(LocalHello {
                 offered_versions: vec![PROTOCOL_VERSION],
                 build_id,
                 client: kind,
@@ -65,80 +67,63 @@ impl LocalClient {
                 max_receive: ReceiveLimits::default(),
             }))
             .await?;
+        // The acknowledgement is read before the client exists, so there is never a moment when a
+        // `LocalClient` holds an invented connection identity or an invented action window.
+        let acknowledgement = match reader.read_message().await? {
+            ControlFrame::HelloAck(acknowledgement) => *acknowledgement,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(error),
+                ..
+            }) => {
+                return Err(IpcError::IdentityUnavailable {
+                    what: "the host refused the connection",
+                    detail: error.to_string(),
+                });
+            }
+            _ => {
+                return Err(IpcError::UnexpectedMessage(
+                    "the host did not acknowledge the hello",
+                ));
+            }
+        };
+        if acknowledgement.selected_version.major != PROTOCOL_VERSION.major {
+            return Err(IpcError::VersionMismatch {
+                host: PROTOCOL_VERSION.to_string(),
+                offered: acknowledgement.selected_version.to_string(),
+            });
+        }
         let mut client = Self {
             reader,
             writer,
-            acknowledgement: LocalHelloAck {
-                selected_version: PROTOCOL_VERSION,
-                role: kr_protocol::local::LocalRole::Worker,
-                connection_id: kr_protocol::ids::ConnectionId::new(kr_protocol::scalars::Uuid::NIL),
-                environment_id: kr_protocol::ids::EnvironmentId::new(
-                    kr_protocol::scalars::Uuid::NIL,
-                ),
-                boot_identity: kr_protocol::identity::BootIdentity {
-                    source: kr_protocol::identity::BootIdentitySource::BootTime,
-                    value: kr_protocol::scalars::Bytes::new(Vec::new()),
-                },
-                peer: kr_protocol::local::LocalPeer {
-                    uid: kr_protocol::scalars::U64::ZERO,
-                    gid: kr_protocol::scalars::U64::ZERO,
-                    pid: Nullable::null(),
-                },
-                action_window_id: kr_protocol::ids::ActionWindowId::new("pending")
-                    .expect("a valid window"),
-                action_window_expires_at_ms: kr_protocol::scalars::TimestampMs::new(0),
-                capabilities: CanonicalSet::new(),
-                max_receive: ReceiveLimits::default(),
-            },
+            acknowledgement,
             generation_challenge: None,
             next_request: 0,
         };
-        match client.reader.read_message().await? {
-            ControlMessage::HelloAck(acknowledgement) => {
-                if acknowledgement.selected_version.major != PROTOCOL_VERSION.major {
-                    return Err(IpcError::VersionMismatch {
-                        host: PROTOCOL_VERSION.to_string(),
-                        offered: acknowledgement.selected_version.to_string(),
+        if kind == LocalClientKind::Controller {
+            // A worker offers its generation challenge as soon as a controller announces itself, so
+            // the nonce is bound to this connection from its first frame. It is held until the
+            // token is presented and used exactly once.
+            match client.read_frame().await? {
+                ControlFrame::GenerationChallenge(challenge) => {
+                    client.generation_challenge = Some(challenge);
+                }
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Error(error),
+                    ..
+                }) => {
+                    return Err(IpcError::IdentityUnavailable {
+                        what: "the worker refused the controller connection",
+                        detail: error.to_string(),
                     });
                 }
-                client.acknowledgement = acknowledgement;
-                if kind == LocalClientKind::Controller {
-                    // A worker offers its generation challenge as soon as a controller announces
-                    // itself, so the nonce is bound to this connection from its first frame. It is
-                    // held until the token is presented and used exactly once.
-                    match client.reader.read_message().await? {
-                        ControlMessage::GenerationChallenge(challenge) => {
-                            client.generation_challenge = Some(challenge);
-                        }
-                        ControlMessage::Response(Response {
-                            outcome: Outcome::Error(error),
-                            ..
-                        }) => {
-                            return Err(IpcError::IdentityUnavailable {
-                                what: "the worker refused the controller connection",
-                                detail: error.to_string(),
-                            });
-                        }
-                        _ => {
-                            return Err(IpcError::UnexpectedMessage(
-                                "the worker did not offer a generation challenge",
-                            ));
-                        }
-                    }
+                _ => {
+                    return Err(IpcError::UnexpectedMessage(
+                        "the worker did not offer a generation challenge",
+                    ));
                 }
-                Ok(client)
             }
-            ControlMessage::Response(Response {
-                outcome: Outcome::Error(error),
-                ..
-            }) => Err(IpcError::IdentityUnavailable {
-                what: "the host refused the connection",
-                detail: error.to_string(),
-            }),
-            _ => Err(IpcError::UnexpectedMessage(
-                "the host did not acknowledge the hello",
-            )),
         }
+        Ok(client)
     }
 
     /// Returns what the host said about this connection.
@@ -159,9 +144,9 @@ impl LocalClient {
     ) -> Result<WorkerVerifyProof> {
         let challenge = fresh_challenge().map_err(IpcError::from)?;
         self.writer
-            .write_message(&ControlMessage::VerifyChallenge(challenge))
+            .write_message(&ControlFrame::VerifyChallenge(challenge))
             .await?;
-        let ControlMessage::VerifyProof(proof) = self.reader.read_message().await? else {
+        let ControlFrame::VerifyProof(proof) = self.read_frame().await? else {
             return Err(IpcError::UnexpectedMessage(
                 "the worker did not answer the challenge",
             ));
@@ -189,9 +174,9 @@ impl LocalClient {
     ) -> Result<WorkerVerifyProof> {
         let challenge = fresh_challenge().map_err(IpcError::from)?;
         self.writer
-            .write_message(&ControlMessage::VerifyChallenge(challenge))
+            .write_message(&ControlFrame::VerifyChallenge(challenge))
             .await?;
-        let ControlMessage::VerifyProof(proof) = self.reader.read_message().await? else {
+        let ControlFrame::VerifyProof(proof) = self.read_frame().await? else {
             return Err(IpcError::UnexpectedMessage(
                 "the worker did not answer the challenge",
             ));
@@ -225,11 +210,11 @@ impl LocalClient {
             ))?;
         let token = sign(&challenge.nonce)?;
         self.writer
-            .write_message(&ControlMessage::GenerationToken(Box::new(token)))
+            .write_message(&ControlFrame::GenerationToken(Box::new(token)))
             .await?;
-        match self.reader.read_message().await? {
-            ControlMessage::GenerationAccepted(accepted) => Ok(accepted),
-            ControlMessage::Response(Response {
+        match self.read_frame().await? {
+            ControlFrame::GenerationAccepted(accepted) => Ok(accepted),
+            ControlFrame::Response(Response {
                 outcome: Outcome::Error(error),
                 ..
             }) => Err(IpcError::IdentityUnavailable {
@@ -242,49 +227,15 @@ impl LocalClient {
         }
     }
 
-    /// Asks the host for a fresh freshness window on this connection.
+    /// Returns the action window this connection currently holds.
     ///
-    /// A window lasts five minutes. A connection that stays open longer than that — an attached
-    /// terminal, for instance — renews it before submitting a mutation, because section 9 refuses a
-    /// first admission through an expired window and replacing the window is a new request rather
-    /// than an automatic retry of the old one.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the host refuses or the transport fails.
-    pub async fn renew_window(&mut self) -> Result<()> {
-        self.writer
-            .write_message(&ControlMessage::ActionWindowRenew(
-                kr_protocol::local::ActionWindowRenew {
-                    connection_id: self.acknowledgement.connection_id,
-                },
-            ))
-            .await?;
-        loop {
-            match self.reader.read_message().await? {
-                ControlMessage::ActionWindow(granted) => {
-                    self.acknowledgement.action_window_id = granted.action_window_id;
-                    self.acknowledgement.action_window_expires_at_ms =
-                        granted.action_window_expires_at_ms;
-                    return Ok(());
-                }
-                ControlMessage::Notification(_) => {}
-                ControlMessage::Response(Response {
-                    outcome: Outcome::Error(error),
-                    ..
-                }) => {
-                    return Err(IpcError::IdentityUnavailable {
-                        what: "the host refused to renew this connection's action window",
-                        detail: error.to_string(),
-                    });
-                }
-                _ => {
-                    return Err(IpcError::UnexpectedMessage(
-                        "the host answered something other than a window",
-                    ));
-                }
-            }
-        }
+    /// The host issues the first window with the acknowledgement and replaces it on its own
+    /// schedule, so a caller never asks for one and never computes its expiry. Section 9 refuses a
+    /// first admission through an expired or unknown window, and replacing a window changes the
+    /// payload digest, so a renewal is never an automatic retry of an older request.
+    #[must_use]
+    pub const fn action_window(&self) -> &kr_protocol::hello::ActionWindow {
+        &self.acknowledgement.action_window
     }
 
     /// Calls a read method.
@@ -301,7 +252,7 @@ impl LocalClient {
         let params = ParamsValue::from_typed(params)
             .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))?;
         self.writer
-            .write_message(&ControlMessage::Request(Request {
+            .write_message(&ControlFrame::Request(Request {
                 request_id,
                 method: method.into(),
                 method_version: MethodVersion::V1,
@@ -330,7 +281,7 @@ impl LocalClient {
         let params = ParamsValue::from_typed(params)
             .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))?;
         self.writer
-            .write_message(&ControlMessage::Mutation(MutationRequest {
+            .write_message(&ControlFrame::Mutation(Box::new(MutationRequest {
                 request_id,
                 method: method.into(),
                 method_version: MethodVersion::V1,
@@ -338,10 +289,10 @@ impl LocalClient {
                 grant_id: Nullable::null(),
                 target,
                 expected: ParamsValue::empty(),
-                action_window_id: self.acknowledgement.action_window_id.clone(),
+                action_window_id: self.acknowledgement.action_window.action_window_id.clone(),
                 requested_ttl_ms: DurationMs::new(kr_protocol::limits::DEFAULT_MUTATION_TTL.get()),
                 params,
-            }))
+            })))
             .await?;
         self.await_response(request_id).await
     }
@@ -353,7 +304,7 @@ impl LocalClient {
     /// Returns a transport failure.
     pub async fn confirm_delivery(&mut self, action_id: ActionId) -> Result<()> {
         self.writer
-            .write_message(&ControlMessage::AcceptanceDelivered(action_id))
+            .write_message(&ControlFrame::AcceptanceDelivered(action_id))
             .await
     }
 
@@ -370,13 +321,13 @@ impl LocalClient {
         notice: kr_protocol::worker::AuthorityRevisionNotice,
     ) -> Result<kr_protocol::worker::AuthorityRevisionAck> {
         self.writer
-            .write_message(&ControlMessage::AuthorityRevision(notice))
+            .write_message(&ControlFrame::AuthorityRevision(notice))
             .await?;
         loop {
-            match self.reader.read_message().await? {
-                ControlMessage::AuthorityRevisionAck(ack) => return Ok(ack),
-                ControlMessage::Notification(_) => {}
-                ControlMessage::Response(Response {
+            match self.read_frame().await? {
+                ControlFrame::AuthorityRevisionAck(ack) => return Ok(ack),
+                ControlFrame::Notification(_) => {}
+                ControlFrame::Response(Response {
                     outcome: Outcome::Error(error),
                     ..
                 }) => {
@@ -397,8 +348,8 @@ impl LocalClient {
     /// Passes a mutation the host admitted to the component that owns its subject.
     ///
     /// The mutation travels unchanged, because it is what the payload digest covers and what the
-    /// caller will retry with. Only the actor the host verified and the deadline it accepted
-    /// travel beside it.
+    /// caller will retry with. Only the actor the host verified and what remains of the deadline it
+    /// accepted travel beside it.
     ///
     /// # Errors
     ///
@@ -407,28 +358,31 @@ impl LocalClient {
         &mut self,
         mutation: &MutationRequest,
         actor: &kr_protocol::actor::ActorEnvelope,
-        accepted_deadline_ms: kr_protocol::scalars::TimestampMs,
+        accepted_ttl_ms: kr_protocol::scalars::DurationMs,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         let request_id = mutation.request_id;
         self.writer
-            .write_message(&ControlMessage::Forwarded(Box::new(
+            .write_message(&ControlFrame::Forwarded(Box::new(
                 kr_protocol::local::ForwardedMutation {
                     mutation: mutation.clone(),
                     actor: actor.clone(),
-                    accepted_deadline_ms,
+                    accepted_ttl_ms,
                 },
             )))
             .await?;
         self.await_response(request_id).await
     }
 
-    /// Reads the next message, which may be a notification.
+    /// Reads the next frame, which may be a notification.
+    ///
+    /// A window the host pushed is applied here rather than returned: it is the connection's own
+    /// resource, not an answer to anything a caller asked for.
     ///
     /// # Errors
     ///
     /// Returns a transport failure.
-    pub async fn recv(&mut self) -> Result<ControlMessage> {
-        self.reader.read_message().await
+    pub async fn recv(&mut self) -> Result<ControlFrame> {
+        self.read_frame().await
     }
 
     /// Returns the writing half, for a caller that streams input.
@@ -442,20 +396,38 @@ impl LocalClient {
         (self.reader, self.writer, self.acknowledgement)
     }
 
+    /// Reads one frame, applying anything that belongs to the connection rather than to a caller.
+    ///
+    /// The host renews this connection's action window without being asked, at half the window's
+    /// validity. Absorbing that here is what lets every call site read frames without each of them
+    /// having to know about a resource none of them asked for. The reader keeps its position
+    /// inside a frame, so a cancelled read resumes rather than restarting, and a renewal that has
+    /// already been applied is not lost by the cancellation.
+    async fn read_frame(&mut self) -> Result<ControlFrame> {
+        loop {
+            let frame: ControlFrame = self.reader.read_message().await?;
+            if let ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) = frame {
+                self.acknowledgement.action_window = window;
+                continue;
+            }
+            return Ok(frame);
+        }
+    }
+
     async fn await_response(
         &mut self,
         request_id: RequestId,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         loop {
-            match self.reader.read_message().await? {
-                ControlMessage::Response(response) if response.request_id == request_id => {
+            match self.read_frame().await? {
+                ControlFrame::Response(response) if response.request_id == request_id => {
                     return Ok(match response.outcome {
                         Outcome::Ok(value) => Ok(value),
                         Outcome::Error(error) => Err(error),
                     });
                 }
                 // A notification that arrives while a call is outstanding is not an answer to it.
-                ControlMessage::Notification(_) => {}
+                ControlFrame::Notification(_) => {}
                 _ => {
                     return Err(IpcError::UnexpectedMessage(
                         "the host answered something other than this request",

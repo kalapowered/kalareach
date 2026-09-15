@@ -13,10 +13,11 @@ use kr_crypto::store::open_store;
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
+use kr_protocol::envelope::ControlFrame;
 use kr_protocol::envelope::{ActionTarget, Outcome, ParamsValue};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, SessionEpoch, SessionId};
-use kr_protocol::local::{ControlMessage, LocalClientKind};
+use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{Presentation, SessionCloseParams, SessionCreateParams, ShellMode};
@@ -189,7 +190,7 @@ async fn a_mutation_that_quotes_an_unknown_window_is_not_admitted() {
     let request_id = kr_protocol::ids::RequestId::new(77);
     client
         .writer()
-        .write_message(&ControlMessage::Mutation(
+        .write_message(&ControlFrame::Mutation(Box::new(
             kr_protocol::envelope::MutationRequest {
                 request_id,
                 method: Method::SessionCreate.into(),
@@ -203,11 +204,10 @@ async fn a_mutation_that_quotes_an_unknown_window_is_not_admitted() {
                 requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
                 params,
             },
-        ))
+        )))
         .await
         .expect("writes the mutation");
-    let ControlMessage::Response(response) = client.recv().await.expect("the daemon answers")
-    else {
+    let ControlFrame::Response(response) = client.recv().await.expect("the daemon answers") else {
         panic!("the daemon answered something other than a response");
     };
     let Outcome::Error(error) = response.outcome else {

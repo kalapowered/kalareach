@@ -1,25 +1,19 @@
-//! The local IPC handshake and the control-stream message union.
+//! The local IPC handshake.
 //!
-//! Local sockets and named pipes carry the same typed frames as the network transport. What
-//! differs is authentication: there is no paired device and no endpoint proof. The host
-//! authenticates the operating-system caller through peer credentials and then stamps the
-//! freshness context itself, so a local caller never pretends to be a paired network device and
-//! never supplies its own action window.
+//! Local sockets and named pipes carry the same typed frames as the network transport: one
+//! [`crate::envelope::ControlFrame`] union serves both. What differs is authentication. There is no
+//! paired device and no endpoint proof, so the host authenticates the operating-system caller
+//! through peer credentials and then issues the action window itself. A local caller never
+//! pretends to be a paired network device and never supplies its own window.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::{MutationRequest, Notification, Request, Response};
-use crate::hello::{ProtocolVersion, ReceiveLimits};
+use crate::envelope::MutationRequest;
+use crate::hello::{ActionWindow, ProtocolVersion, ReceiveLimits};
 use crate::identity::BootIdentity;
-use crate::ids::{ActionWindowId, BuildId, CapabilityId, ConnectionId, EnvironmentId};
-use crate::receipt::ReceiptResponse;
-use crate::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
-use crate::worker::{
-    AuthorityRevisionAck, AuthorityRevisionNotice, ControllerGenerationToken, GenerationAccepted,
-    GenerationChallenge, WorkerLaunchSpec, WorkerReady, WorkerRendezvous, WorkerVerifyChallenge,
-    WorkerVerifyProof,
-};
+use crate::ids::{BuildId, CapabilityId, ConnectionId, EnvironmentId};
+use crate::scalars::{CanonicalSet, DurationMs, Nullable, U64};
 
 /// Which host process a local endpoint belongs to.
 #[derive(
@@ -110,40 +104,17 @@ pub struct LocalHelloAck {
     pub boot_identity: BootIdentity,
     /// The caller the host authenticated.
     pub peer: LocalPeer,
-    /// The freshness window the host stamped for this connection.
-    pub action_window_id: ActionWindowId,
-    /// When that window expires by the wall clock, for display. Expiry itself is decided on the
-    /// host's suspend-aware continuous clock, so a wall clock that moves cannot extend it.
-    pub action_window_expires_at_ms: TimestampMs,
+    /// The first action window of this connection.
+    ///
+    /// It carries a validity *duration*, not a deadline: the authoritative deadline lives on the
+    /// host's suspend-aware continuous clock, and the host renews the window on this connection
+    /// without being asked. A client schedules its own expectations from the duration and never
+    /// computes an expiry the host will honour.
+    pub action_window: ActionWindow,
     /// The capabilities both sides will use.
     pub capabilities: CanonicalSet<CapabilityId>,
     /// The limits both sides will use.
     pub max_receive: ReceiveLimits,
-}
-
-/// A client's request for a fresh freshness window on this live connection.
-///
-/// Section 9 renews a window explicitly on a live authorised connection. Nothing extends the
-/// window a request already quoted: a renewal produces a new identifier, and a request that
-/// quoted the old one is not repaired by it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ActionWindowRenew {
-    /// The connection asking, which is the connection the window belongs to.
-    pub connection_id: ConnectionId,
-}
-
-/// A freshly stamped freshness window.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ActionWindowGrant {
-    /// The connection the window belongs to.
-    pub connection_id: ConnectionId,
-    /// The window identifier a first admission quotes.
-    pub action_window_id: ActionWindowId,
-    /// When it expires by the wall clock, for display. Expiry is decided on the host's continuous
-    /// clock, so a wall clock that moves cannot extend it.
-    pub action_window_expires_at_ms: TimestampMs,
 }
 
 /// A mutation the host admitted for a caller, passed to the component that owns its subject.
@@ -155,7 +126,8 @@ pub struct ActionWindowGrant {
 /// worker a different action from the one the caller asked for.
 ///
 /// What travels beside it is what the worker cannot establish for itself: which principal the host
-/// verified, and the deadline the host accepted. The worker performs the action under both.
+/// verified, and how long the deadline the host accepted still has to run. The worker performs the
+/// action under both.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardedMutation {
@@ -163,86 +135,35 @@ pub struct ForwardedMutation {
     pub mutation: MutationRequest,
     /// The actor the host verified, with the ingress it arrived on.
     pub actor: crate::actor::ActorEnvelope,
-    /// The deadline the host derived at first admission. It is never extended downstream.
-    pub accepted_deadline_ms: TimestampMs,
-}
-
-/// One message on a local control stream.
-///
-/// The union is closed. A receiver that cannot name the variant rejects the frame rather than
-/// guessing, which is what keeps an unknown method a correlated error instead of a parse failure.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlMessage {
-    /// A client's opening frame.
-    Hello(LocalHello),
-    /// The host's answer to the opening frame.
-    HelloAck(LocalHelloAck),
-    /// A read request.
-    Request(Request),
-    /// A mutation request.
-    Mutation(MutationRequest),
-    /// A response correlated to a request.
-    Response(Response),
-    /// The receipt of a mutation.
-    Receipt(ReceiptResponse),
-    /// An event on a subscribed stream.
-    Notification(Notification),
-    /// A worker's startup claim, presented on the controller's rendezvous socket.
-    Rendezvous(WorkerRendezvous),
-    /// What the controller tells an authenticated worker to become.
-    LaunchSpec(Box<WorkerLaunchSpec>),
-    /// A worker reporting that its root shell is running.
-    WorkerReady(WorkerReady),
-    /// A worker reporting that it could not start.
-    WorkerFailed(crate::error::ProtocolError),
-    /// A fresh challenge to the worker behind an endpoint.
-    VerifyChallenge(WorkerVerifyChallenge),
-    /// The worker's signed answer.
-    VerifyProof(WorkerVerifyProof),
-    /// A worker's challenge to a controller that wants to speak for a generation.
-    GenerationChallenge(GenerationChallenge),
-    /// A controller's signed generation token.
-    GenerationToken(Box<ControllerGenerationToken>),
-    /// The worker's acceptance of a generation.
-    GenerationAccepted(GenerationAccepted),
-    /// The authority revision the controller now holds.
-    AuthorityRevision(AuthorityRevisionNotice),
-    /// The worker's acknowledgement of an authority revision.
-    AuthorityRevisionAck(AuthorityRevisionAck),
-    /// A client's request for a fresh freshness window.
-    ActionWindowRenew(ActionWindowRenew),
-    /// The host's freshly stamped freshness window.
-    ActionWindow(ActionWindowGrant),
-    /// A mutation the control daemon admitted, passed to the worker that owns its subject.
-    Forwarded(Box<ForwardedMutation>),
-    /// A proxy's confirmation that a caller has received an action's acceptance.
+    /// What remains of the deadline the host derived at first admission, at the moment it forwarded
+    /// this mutation.
     ///
-    /// A close is accepted before anything is signalled, because the requester is often a command
-    /// inside the process group the closure will stop. When the acceptance travels through a proxy,
-    /// the worker learns it has arrived here rather than assuming its own write was the end of the
-    /// journey.
-    AcceptanceDelivered(crate::ids::ActionId),
+    /// A *duration*, not an instant, because the two processes measure on their own suspend-aware
+    /// continuous clocks and neither clock's origin means anything to the other. A wall-clock
+    /// instant would be comparable and would also be steppable, which is the one property a
+    /// deadline cannot have. The receiving process anchors this on its own clock when it reads the
+    /// frame, so the only slack is the local socket's transit, and nothing downstream lengthens it
+    /// further: the subject applies its own bounds on top.
+    pub accepted_ttl_ms: DurationMs,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::envelope::ParamsValue;
+    use crate::envelope::{ControlFrame, ParamsValue, Request};
     use crate::ids::RequestId;
     use crate::method::{Method, MethodVersion};
 
     #[test]
-    fn a_control_message_round_trips_through_the_canonical_encoding() {
-        let message = ControlMessage::Request(Request {
+    fn a_local_control_frame_round_trips_through_the_canonical_encoding() {
+        let frame = ControlFrame::Request(Request {
             request_id: RequestId::new(7),
             method: Method::SessionList.into(),
             method_version: MethodVersion::V1,
             params: ParamsValue::empty(),
         });
-        let bytes = kr_cbor::to_canonical_vec(&message).expect("encodes");
-        let decoded: ControlMessage =
+        let bytes = kr_cbor::to_canonical_vec(&frame).expect("encodes");
+        let decoded: ControlFrame =
             kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
-        assert_eq!(decoded, message);
+        assert_eq!(decoded, frame);
     }
 }

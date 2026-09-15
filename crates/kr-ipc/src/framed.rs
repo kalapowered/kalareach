@@ -205,17 +205,17 @@ impl FrameWriter {
 
 #[cfg(test)]
 mod tests {
+    use kr_protocol::envelope::ControlFrame;
     use kr_protocol::envelope::{ParamsValue, Request};
     use kr_protocol::ids::RequestId;
-    use kr_protocol::local::ControlMessage;
     use kr_protocol::method::{Method, MethodVersion};
 
     use super::*;
     use crate::paths::Endpoint;
     use crate::testing::TempHost;
 
-    fn request(id: u64) -> ControlMessage {
-        ControlMessage::Request(Request {
+    fn request(id: u64) -> ControlFrame {
+        ControlFrame::Request(Request {
             request_id: RequestId::new(id),
             method: Method::SessionList.into(),
             method_version: MethodVersion::V1,
@@ -238,14 +238,14 @@ mod tests {
             assert_eq!(peer.uid, crate::paths::current_uid());
             assert!(peer.pid.is_some(), "the platform reports the peer process");
             let (mut reader, mut writer) = split(connection, StreamKind::Control);
-            let received: ControlMessage = reader.read_message().await.expect("reads");
+            let received: ControlFrame = reader.read_message().await.expect("reads");
             writer.write_message(&received).await.expect("writes");
             received
         });
         let client = Connection::connect(&endpoint).await.expect("connects");
         let (mut reader, mut writer) = split(client, StreamKind::Control);
         writer.write_message(&request(9)).await.expect("writes");
-        let echoed: ControlMessage = reader.read_message().await.expect("reads");
+        let echoed: ControlFrame = reader.read_message().await.expect("reads");
         assert_eq!(echoed, request(9));
         assert_eq!(server.await.expect("server task"), request(9));
     }
@@ -280,14 +280,14 @@ mod tests {
         let server = tokio::spawn(async move {
             let (connection, _) = listener.accept().await.expect("accepts");
             let (mut reader, mut writer) = split(connection, StreamKind::Control);
-            let first: ControlMessage = reader.read_message().await.expect("reads the frame");
+            let first: ControlFrame = reader.read_message().await.expect("reads the frame");
             writer.write_message(&first).await.expect("acknowledges");
             reader.read_payload().await.expect_err("reports truncation")
         });
         let client = Connection::connect(&endpoint).await.expect("connects");
         let (mut reader, mut writer) = split(client, StreamKind::Control);
         writer.write_message(&request(1)).await.expect("writes");
-        let _acknowledged: ControlMessage = reader.read_message().await.expect("reads the reply");
+        let _acknowledged: ControlFrame = reader.read_message().await.expect("reads the reply");
         // Two bytes of a four-byte length prefix, then the connection goes.
         writer
             .write_frame(&[0, 0])
@@ -309,7 +309,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (connection, _) = listener.accept().await.expect("accepts");
             let (mut reader, mut writer) = split(connection, StreamKind::Control);
-            let first: ControlMessage = reader.read_message().await.expect("reads the frame");
+            let first: ControlFrame = reader.read_message().await.expect("reads the frame");
             // The reply tells the client that this end has accepted and authenticated it, so the
             // close below happens after authentication rather than racing it.
             writer.write_message(&first).await.expect("acknowledges");
@@ -318,7 +318,7 @@ mod tests {
         let client = Connection::connect(&endpoint).await.expect("connects");
         let (mut reader, mut writer) = split(client, StreamKind::Control);
         writer.write_message(&request(1)).await.expect("writes");
-        let _acknowledged: ControlMessage = reader.read_message().await.expect("reads the reply");
+        let _acknowledged: ControlFrame = reader.read_message().await.expect("reads the reply");
         // Both halves must go: the stream stays open while either one is alive.
         drop((reader, writer));
         assert!(matches!(

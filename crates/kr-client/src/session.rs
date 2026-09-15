@@ -604,7 +604,28 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) {
             *state.action_window.lock().await = window;
         }
         ControlFrame::Event(ControlEvent::Keepalive) => {}
-        // A client never receives a request or a mutation: the host does not call the client.
-        ControlFrame::Request(_) | ControlFrame::Mutation(_) => {}
+        // A client never receives a request or a mutation: the host does not call the client. The
+        // rest of the union belongs to the host's own local endpoints — the local opening frames,
+        // a worker's startup handshake, the generation and revision exchange, and a mutation one
+        // host process forwarded to another. None of them is a frame a network peer may send a
+        // client, so each is dropped rather than acted on. They are named rather than swept up by
+        // a wildcard, so a variant added later has to be decided here instead of silently ignored.
+        ControlFrame::Request(_)
+        | ControlFrame::Mutation(_)
+        | ControlFrame::Hello(_)
+        | ControlFrame::HelloAck(_)
+        | ControlFrame::Rendezvous(_)
+        | ControlFrame::LaunchSpec(_)
+        | ControlFrame::WorkerReady(_)
+        | ControlFrame::WorkerFailed(_)
+        | ControlFrame::VerifyChallenge(_)
+        | ControlFrame::VerifyProof(_)
+        | ControlFrame::GenerationChallenge(_)
+        | ControlFrame::GenerationToken(_)
+        | ControlFrame::GenerationAccepted(_)
+        | ControlFrame::AuthorityRevision(_)
+        | ControlFrame::AuthorityRevisionAck(_)
+        | ControlFrame::Forwarded(_)
+        | ControlFrame::AcceptanceDelivered(_) => {}
     }
 }

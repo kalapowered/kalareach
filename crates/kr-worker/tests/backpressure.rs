@@ -14,10 +14,11 @@ use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
 use kr_protocol::envelope::ActionTarget;
+use kr_protocol::envelope::ControlFrame;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{ActionId, BuildId, ControllerGeneration, SessionEpoch, SessionId};
-use kr_protocol::local::{ControlMessage, LocalClientKind};
+use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
@@ -58,7 +59,10 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         kr_ipc::verify::ControllerIdentity::initialise(store.store.as_ref(), environment_id)
             .expect("a controller identity");
 
-    // A shell that produces far more than one attachment's queue can hold.
+    // A shell that keeps producing for the whole test, rather than in one burst at startup. A
+    // burst would be a race: a client that attached a moment late would subscribe past most of it
+    // and never reach its bound. Roughly 140 KiB a second is many times one attachment's queue over
+    // the window this test leaves a client not reading, and nothing at all for a client that reads.
     let config = SessionConfig {
         session_id,
         session_epoch: SessionEpoch::V1,
@@ -68,7 +72,7 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
             program: "/bin/sh".to_owned(),
             arguments: vec![
                 "-c".to_owned(),
-                "i=0; while [ $i -lt 4000 ]; do printf 'line-%s-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' $i; i=$((i+1)); done; while true; do printf 'alive\\n'; sleep 1; done".to_owned(),
+                "while true; do i=0; while [ $i -lt 2000 ]; do printf 'line-%s-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' $i; i=$((i+1)); done; sleep 1; done".to_owned(),
             ],
             cwd: "/".to_owned(),
             environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
@@ -88,18 +92,21 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
 
     let endpoint = environment.worker_endpoint(display).expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    let service = Arc::new(WorkerService::new(
-        Arc::clone(&runtime),
-        identity,
-        endpoint.clone(),
-        ServiceBinding {
-            environment_id,
-            boot_identity: boot,
-            controller_public_key: *controller.public_key(),
-            controller_generation: ControllerGeneration::new(1),
-            build_id: build(),
-        },
-    ));
+    let service = Arc::new(
+        WorkerService::new(
+            Arc::clone(&runtime),
+            identity,
+            endpoint.clone(),
+            ServiceBinding {
+                environment_id,
+                boot_identity: boot,
+                controller_public_key: *controller.public_key(),
+                controller_generation: ControllerGeneration::new(1),
+                build_id: build(),
+            },
+        )
+        .expect("a worker service"),
+    );
     tokio::spawn(Arc::clone(&service).serve(listener));
 
     // Two clients over the real endpoint. Neither knows about the other.
@@ -112,7 +119,7 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     let draining = tokio::spawn(async move {
         let mut quick = quick;
         while let Ok(message) = quick.recv().await {
-            if let ControlMessage::Notification(notification) = message {
+            if let ControlFrame::Notification(notification) = message {
                 match notification.event_type.as_str() {
                     "session.output" => {
                         counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -155,11 +162,13 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     let mut resynchronised = false;
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        let Ok(Ok(message)) = tokio::time::timeout(Duration::from_secs(10), slow.recv()).await
+        // A timeout here is not an answer. The loop keeps looking until its own deadline rather
+        // than concluding from one quiet moment that nothing is coming.
+        let Ok(Ok(message)) = tokio::time::timeout(Duration::from_secs(5), slow.recv()).await
         else {
-            break;
+            continue;
         };
-        if let ControlMessage::Notification(notification) = message
+        if let ControlFrame::Notification(notification) = message
             && notification.event_type.as_str() == "session.resync"
         {
             resynchronised = true;

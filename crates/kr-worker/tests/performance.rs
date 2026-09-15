@@ -224,13 +224,21 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
     let elapsed = started.elapsed().as_secs_f64();
     let cores = (after - before) / elapsed;
 
-    let resident: u64 = workers.iter().map(|pid| resident_kib(*pid)).sum::<u64>()
-        + resident_kib(daemon);
+    let resident: u64 =
+        workers.iter().map(|pid| resident_kib(*pid)).sum::<u64>() + resident_kib(daemon);
 
     println!("KR-PERF-003 measurement");
-    println!("  conditions: {IDLE_SESSIONS} idle sessions, {ATTACHED_VIEWS} attached views, a release build, no application running");
-    println!("  processor: {cores:.5} of one core averaged over {:.0} seconds", elapsed);
-    println!("  resident: {resident} KiB across {} worker processes and the daemon", workers.len());
+    println!(
+        "  conditions: {IDLE_SESSIONS} idle sessions, {ATTACHED_VIEWS} attached views, a release build, no application running"
+    );
+    println!(
+        "  processor: {cores:.5} of one core averaged over {:.0} seconds",
+        elapsed
+    );
+    println!(
+        "  resident: {resident} KiB across {} worker processes and the daemon",
+        workers.len()
+    );
     println!(
         "  not measured: allocated terminal grids and their caches, because the terminal engine is a separate component and no grid is allocated by this build; and the whole-product figure with adapters and a model active"
     );
@@ -252,10 +260,9 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
 async fn attach_to_a_usable_screen() {
     let host = host().await;
     let created = create(&host).await;
-    let endpoint = kr_ipc::paths::Endpoint::from_path(
-        created.endpoint.as_ref().expect("a live session"),
-    )
-    .expect("an endpoint");
+    let endpoint =
+        kr_ipc::paths::Endpoint::from_path(created.endpoint.as_ref().expect("a live session"))
+            .expect("an endpoint");
 
     let mut samples = Vec::new();
     for _ in 0..5 {

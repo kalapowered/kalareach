@@ -1,16 +1,78 @@
 {
   "$defs": {
-    "AccountId": {
-      "description": "A managed account identifier minted by the service. It names the payer; it is not authority.",
-      "maxLength": 256,
-      "minLength": 1,
-      "type": "string"
+    "ActionCancelParams": {
+      "additionalProperties": false,
+      "description": "What `action.cancel` names.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action to cancel."
+        }
+      },
+      "required": [
+        "action_id"
+      ],
+      "type": "object"
+    },
+    "ActionCancelResult": {
+      "additionalProperties": false,
+      "description": "The receipt an undispatched action was cancelled into.",
+      "properties": {
+        "receipt": {
+          "$ref": "#/$defs/Receipt",
+          "description": "The receipt after the cancellation."
+        }
+      },
+      "required": [
+        "receipt"
+      ],
+      "type": "object"
     },
     "ActionId": {
       "description": "One submitted intent and its receipt, generated as a UUIDv4.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "ActionReadParams": {
+      "additionalProperties": false,
+      "description": "What `action.read` names.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action to read."
+        }
+      },
+      "required": [
+        "action_id"
+      ],
+      "type": "object"
+    },
+    "ActionReadResult": {
+      "additionalProperties": false,
+      "description": "A retained receipt and the result it produced.\n\nOwning an identifier is not authority: the host checks present view authority over the subject\nthe receipt names before it returns either half, which is why a retained result is carried here\nrather than handed back from the action identifier alone.",
+      "properties": {
+        "receipt": {
+          "$ref": "#/$defs/Receipt",
+          "description": "The receipt as it currently stands."
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ParamsValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The result the action produced, when it produced one and it is still retained."
+        }
+      },
+      "required": [
+        "receipt",
+        "result"
+      ],
+      "type": "object"
     },
     "ActionRight": {
       "description": "One permitted action in a grant.",
@@ -353,6 +415,31 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "ApplicationState": {
+      "description": "What the foreground of a session is doing.\n\nApplication state is reported separately from the lifecycle state and from transport\nreachability; a busy agent and an unreachable client are different facts.",
+      "oneOf": [
+        {
+          "const": "shell_ready",
+          "description": "The root shell is at a prompt.",
+          "type": "string"
+        },
+        {
+          "const": "agent_busy",
+          "description": "An agent is working.",
+          "type": "string"
+        },
+        {
+          "const": "awaiting_input",
+          "description": "A foreground application is waiting for input.",
+          "type": "string"
+        },
+        {
+          "const": "awaiting_approval",
+          "description": "A pending approval is waiting for a decision.",
+          "type": "string"
+        }
+      ]
+    },
     "ApprovalRequestId": {
       "description": "An upstream approval request identifier. Opaque to KalaReach.",
       "maxLength": 256,
@@ -473,6 +560,65 @@
       ],
       "type": "object"
     },
+    "AttachMode": {
+      "description": "What an attachment observes.",
+      "oneOf": [
+        {
+          "const": "semantic",
+          "description": "Structured application state rather than terminal cells. A semantic attachment never\nclaims geometry.",
+          "type": "string"
+        },
+        {
+          "const": "terminal",
+          "description": "Terminal output, either as raw bytes in direct mode or as a projection.",
+          "type": "string"
+        }
+      ]
+    },
+    "AttachmentCapability": {
+      "description": "What an attachment asks to be able to do.\n\nA request is not a grant. The host intersects these with the actor's rights, and an attachment\nidentifier is never permission on its own.",
+      "oneOf": [
+        {
+          "const": "observe_terminal",
+          "description": "Receive terminal output.",
+          "type": "string"
+        },
+        {
+          "const": "observe_semantic",
+          "description": "Receive structured application state.",
+          "type": "string"
+        },
+        {
+          "const": "input",
+          "description": "Hold the input lease and write input.",
+          "type": "string"
+        },
+        {
+          "const": "geometry",
+          "description": "Register a geometry claim and resize while owner.",
+          "type": "string"
+        }
+      ]
+    },
+    "AttachmentConfigureParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `attachment.configure`.\n\nWithdrawing or adding an authorised claim does not change the session identity and cannot\ndisplace an existing owner.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment to reconfigure."
+        },
+        "claim_geometry": {
+          "description": "Whether it holds a geometry claim after this call.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "attachment_id",
+        "claim_geometry"
+      ],
+      "type": "object"
+    },
     "AttachmentId": {
       "description": "One CLI or application attachment, independently of its device.",
       "format": "uuid",
@@ -483,6 +629,123 @@
       "description": "Monotonic attachment join order, used for deterministic geometry-owner succession.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "AttachmentSummary": {
+      "additionalProperties": false,
+      "description": "One attachment of a session.",
+      "properties": {
+        "attached_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it joined."
+        },
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment identity, independent of the device behind it."
+        },
+        "claim_geometry": {
+          "description": "Whether this attachment holds an eligible geometry claim.",
+          "type": "boolean"
+        },
+        "dimensions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Dimensions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The attachment's own physical dimensions, reported even when it is not the owner."
+        },
+        "granted": {
+          "description": "The capabilities the host granted, which are the requested ones intersected with the\nactor's rights.",
+          "items": {
+            "$ref": "#/$defs/AttachmentCapability"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "mode": {
+          "$ref": "#/$defs/AttachMode",
+          "description": "What this attachment observes."
+        },
+        "ordinal": {
+          "$ref": "#/$defs/AttachmentOrdinal",
+          "description": "The monotonic join order that decides size-owner succession."
+        },
+        "presentation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalPresentationMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the attachment displays the canonical grid."
+        },
+        "terminal_profile_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The terminal profile it presents."
+        }
+      },
+      "required": [
+        "attachment_id",
+        "ordinal",
+        "mode",
+        "claim_geometry",
+        "dimensions",
+        "presentation",
+        "terminal_profile_id",
+        "granted",
+        "attached_at_ms"
+      ],
+      "type": "object"
+    },
+    "AttachmentViewportParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `attachment.viewport`.\n\nEvery terminal attachment reports its own physical dimensions, whether or not it owns the size.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The reporting attachment."
+        },
+        "dimensions": {
+          "$ref": "#/$defs/Dimensions",
+          "description": "Its current physical dimensions."
+        }
+      },
+      "required": [
+        "attachment_id",
+        "dimensions"
+      ],
+      "type": "object"
+    },
+    "AttachmentViewportResult": {
+      "additionalProperties": false,
+      "description": "The result of `attachment.viewport`.",
+      "properties": {
+        "geometry": {
+          "$ref": "#/$defs/GeometryState",
+          "description": "The canonical geometry, which a viewport report never changes."
+        },
+        "presentation": {
+          "$ref": "#/$defs/TerminalPresentationMode",
+          "description": "How this attachment now displays the canonical grid."
+        }
+      },
+      "required": [
+        "geometry",
+        "presentation"
+      ],
+      "type": "object"
     },
     "AttemptId": {
       "description": "One pairing attempt by one candidate: 128 random bits.",
@@ -500,6 +763,44 @@
       "description": "The host's ordered authority revision. Only the host issues its own revisions.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "AuthorityRevisionAck": {
+      "additionalProperties": false,
+      "description": "A worker's acknowledgement that it is acting under an authority revision.",
+      "properties": {
+        "revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The revision the worker now holds."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session that acknowledged it."
+        }
+      },
+      "required": [
+        "session_id",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "AuthorityRevisionNotice": {
+      "additionalProperties": false,
+      "description": "The host's current authority revision, announced to a worker by the controller that holds it.\n\nAuthority revisions are ordered and only the host issues them. A revocation is not complete\nwhen the controller records it: it is complete when every worker that could still act on the\nrevoked authority has acknowledged the revision that removed it. Until then the revocation\nreports `pending` for that worker, or the worker is confirmed ended, which answers the same\nquestion a different way.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment whose authority changed."
+        },
+        "revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The revision now in force."
+        }
+      },
+      "required": [
+        "environment_id",
+        "revision"
+      ],
+      "type": "object"
     },
     "AuthorityRevisionRecord": {
       "additionalProperties": false,
@@ -564,6 +865,45 @@
       "description": "The host boot epoch, which binds continuous-time deadlines to one boot.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "BootIdentity": {
+      "additionalProperties": false,
+      "description": "The identity of the host's current boot.\n\nA worker is bound to the boot it started in. After a reboot every previous session is closed,\nso a descriptor naming an older boot is stale whatever its file says.",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/BootIdentitySource",
+          "description": "Where the value came from."
+        },
+        "value": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The opaque value. Compared for equality, never interpreted."
+        }
+      },
+      "required": [
+        "source",
+        "value"
+      ],
+      "type": "object"
+    },
+    "BootIdentitySource": {
+      "description": "Where a boot identity came from.",
+      "oneOf": [
+        {
+          "const": "linux_boot_id",
+          "description": "Linux `/proc/sys/kernel/random/boot_id`: a fresh identifier for each boot.",
+          "type": "string"
+        },
+        {
+          "const": "macos_boot_session_uuid",
+          "description": "macOS `kern.bootsessionuuid`: a fresh identifier for each boot.",
+          "type": "string"
+        },
+        {
+          "const": "boot_time",
+          "description": "The host's recorded boot time, used where the kernel offers no boot identifier.",
+          "type": "string"
+        }
+      ]
     },
     "BuildId": {
       "description": "A build identifier reported in hello.",
@@ -732,6 +1072,125 @@
       "description": "The host clock epoch, advanced when wall-clock trust changes.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "ClosureReason": {
+      "description": "Why a session closed.",
+      "oneOf": [
+        {
+          "const": "close_requested",
+          "description": "An authorised `session.close`.",
+          "type": "string"
+        },
+        {
+          "const": "root_exit",
+          "description": "The root shell exited normally, including through its own end-of-file behaviour.",
+          "type": "string"
+        },
+        {
+          "const": "root_signal",
+          "description": "The root shell was terminated by a signal.",
+          "type": "string"
+        },
+        {
+          "const": "root_launch_failed",
+          "description": "The root shell never started.",
+          "type": "string"
+        },
+        {
+          "const": "worker_crash",
+          "description": "The worker process ended without completing closure; the controller recorded the closure.",
+          "type": "string"
+        },
+        {
+          "const": "desktop_lost",
+          "description": "The login session a desktop-bound worker was bound to ended.",
+          "type": "string"
+        },
+        {
+          "const": "host_shutdown",
+          "description": "The host is shutting down.",
+          "type": "string"
+        }
+      ]
+    },
+    "ClosureRecord": {
+      "additionalProperties": false,
+      "description": "The final record of one closed session.",
+      "properties": {
+        "closed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the session finished closing."
+        },
+        "durability": {
+          "$ref": "#/$defs/Durability",
+          "description": "Whether the record was written durably."
+        },
+        "ownership_coverage": {
+          "$ref": "#/$defs/OwnershipCoverage",
+          "description": "Whether every owned process was accounted for."
+        },
+        "reason": {
+          "$ref": "#/$defs/ClosureReason",
+          "description": "Why it closed."
+        },
+        "root_exit_code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The root shell's exit status, when it exited normally."
+        },
+        "root_signal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The signal that terminated the root shell, when one did, named as the platform names it.\nThe host reports what it was told rather than inventing a number for it."
+        },
+        "session_epoch": {
+          "$ref": "#/$defs/SessionEpoch",
+          "description": "The epoch that closed."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session that closed."
+        },
+        "surviving": {
+          "description": "Resources known to survive, such as an explicitly brokered desktop resource.",
+          "items": {
+            "$ref": "#/$defs/SurvivingResource"
+          },
+          "type": "array"
+        },
+        "terminated": {
+          "description": "The owned processes the closure terminated, with their start identities.",
+          "items": {
+            "$ref": "#/$defs/TerminatedProcess"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "session_id",
+        "session_epoch",
+        "reason",
+        "root_exit_code",
+        "root_signal",
+        "terminated",
+        "surviving",
+        "ownership_coverage",
+        "durability",
+        "closed_at_ms"
+      ],
+      "type": "object"
     },
     "CollectionLocator": {
       "additionalProperties": false,
@@ -917,8 +1376,34 @@
       ]
     },
     "ControlFrame": {
-      "description": "One frame on an authorised control stream.\n\nThe union is closed. A receiver that cannot name the variant rejects the frame rather than\nguessing, which is what keeps an unknown method a correlated error instead of a parse failure.\n\nBoth transports carry these frames: section 23 says local Unix sockets and Windows named pipes\ncarry the same typed frames with local peer authentication. What differs is how the connection\nis authenticated before the first frame, not what travels afterwards.",
+      "description": "One frame on an authorised control stream.\n\nThe union is closed. A receiver that cannot name the variant rejects the frame rather than\nguessing, which is what keeps an unknown method a correlated error instead of a parse failure.\n\nBoth transports carry these frames: section 23 says local Unix sockets and Windows named pipes\ncarry the same typed frames with local peer authentication. What differs is how the connection\nis authenticated before the first frame, not what travels afterwards. One union rather than two\nis what makes that true rather than merely stated: a request, a mutation, a response, a receipt\nand a notification are the same types on a Unix socket as on a QUIC stream, and a host that\nanswered them differently would have two wire contracts to keep in step.\n\nSome variants only ever travel between host processes on a local endpoint: the local opening\nframes, the worker startup handshake, the generation and revision exchange, and a forwarded\nmutation. They are still part of this union, because a closed union is what makes a frame that\ndoes not belong on the ingress it arrived on a *refusal* rather than a parse failure. Each\nendpoint refuses the variants its role does not serve, which is an admission rule the host\napplies rather than a shape the wire hides.",
       "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A local client's opening frame.",
+          "properties": {
+            "hello": {
+              "$ref": "#/$defs/LocalHello"
+            }
+          },
+          "required": [
+            "hello"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host's answer to a local opening frame.",
+          "properties": {
+            "hello_ack": {
+              "$ref": "#/$defs/LocalHelloAck"
+            }
+          },
+          "required": [
+            "hello_ack"
+          ],
+          "type": "object"
+        },
         {
           "additionalProperties": false,
           "description": "A read request.",
@@ -996,6 +1481,175 @@
             "event"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A worker's startup claim, presented on the controller's rendezvous endpoint.",
+          "properties": {
+            "rendezvous": {
+              "$ref": "#/$defs/WorkerRendezvous"
+            }
+          },
+          "required": [
+            "rendezvous"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "What the controller tells an authenticated worker to become.",
+          "properties": {
+            "launch_spec": {
+              "$ref": "#/$defs/WorkerLaunchSpec"
+            }
+          },
+          "required": [
+            "launch_spec"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A worker reporting that its root shell is running.",
+          "properties": {
+            "worker_ready": {
+              "$ref": "#/$defs/WorkerReady"
+            }
+          },
+          "required": [
+            "worker_ready"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A worker reporting that it could not start.",
+          "properties": {
+            "worker_failed": {
+              "$ref": "#/$defs/ProtocolError"
+            }
+          },
+          "required": [
+            "worker_failed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A fresh challenge to the worker behind an endpoint.",
+          "properties": {
+            "verify_challenge": {
+              "$ref": "#/$defs/WorkerVerifyChallenge"
+            }
+          },
+          "required": [
+            "verify_challenge"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's signed answer.",
+          "properties": {
+            "verify_proof": {
+              "$ref": "#/$defs/WorkerVerifyProof"
+            }
+          },
+          "required": [
+            "verify_proof"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A worker's challenge to a controller that wants to speak for a generation.",
+          "properties": {
+            "generation_challenge": {
+              "$ref": "#/$defs/GenerationChallenge"
+            }
+          },
+          "required": [
+            "generation_challenge"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A controller's signed generation token.",
+          "properties": {
+            "generation_token": {
+              "$ref": "#/$defs/ControllerGenerationToken"
+            }
+          },
+          "required": [
+            "generation_token"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's acceptance of a generation.",
+          "properties": {
+            "generation_accepted": {
+              "$ref": "#/$defs/GenerationAccepted"
+            }
+          },
+          "required": [
+            "generation_accepted"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The authority revision the controller now holds.",
+          "properties": {
+            "authority_revision": {
+              "$ref": "#/$defs/AuthorityRevisionNotice"
+            }
+          },
+          "required": [
+            "authority_revision"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's acknowledgement of an authority revision.",
+          "properties": {
+            "authority_revision_ack": {
+              "$ref": "#/$defs/AuthorityRevisionAck"
+            }
+          },
+          "required": [
+            "authority_revision_ack"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A mutation the control daemon admitted, passed to the worker that owns its subject.",
+          "properties": {
+            "forwarded": {
+              "$ref": "#/$defs/ForwardedMutation"
+            }
+          },
+          "required": [
+            "forwarded"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A proxy's confirmation that a caller has received an action's acceptance.\n\nA close is accepted before anything is signalled, because the requester is often a command\ninside the process group the closure will stop. When the acceptance travels through a proxy,\nthe worker learns it has arrived here rather than assuming its own write was the end of the\njourney.",
+          "properties": {
+            "acceptance_delivered": {
+              "$ref": "#/$defs/ActionId"
+            }
+          },
+          "required": [
+            "acceptance_delivered"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1003,6 +1657,73 @@
       "description": "The controller's persistent generation, advanced on every controller start.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "ControllerGenerationToken": {
+      "additionalProperties": false,
+      "description": "A controller's proof that it speaks for the current generation.\n\nThe nonce comes from the worker, so a token cannot be replayed onto a later connection. A\nworker accepts its current generation again only after a fresh challenge, which fences that\ngeneration's previous connection; it rejects a lower generation outright and requires a\nstrictly higher one from a replacement.",
+      "properties": {
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot the controller is running in."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the controller owns."
+        },
+        "generation": {
+          "$ref": "#/$defs/ControllerGeneration",
+          "description": "The generation this controller holds."
+        },
+        "nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The challenge the worker issued."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The signature over [`generation_elements`]."
+        }
+      },
+      "required": [
+        "environment_id",
+        "generation",
+        "boot_identity",
+        "nonce",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "DesktopBinding": {
+      "additionalProperties": false,
+      "description": "The login session a desktop-bound worker is tied to.\n\n`desktop_session_id` binds the OS user, the boot identity and the login-session generation. A\nreusable console or session number alone is not an identity, so a new login never rebinds a\nworker that lost its desktop.",
+      "properties": {
+        "desktop_session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DesktopSessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The desktop session this worker is bound to, for a desktop-bound profile."
+        },
+        "login_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The login-session generation the binding was taken at."
+        }
+      },
+      "required": [
+        "desktop_session_id",
+        "login_generation"
+      ],
+      "type": "object"
     },
     "DesktopSessionId": {
       "description": "A host-derived desktop session identity binding OS user, boot identity and login-session generation.",
@@ -1097,6 +1818,25 @@
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },
+    "Dimensions": {
+      "additionalProperties": false,
+      "description": "A terminal geometry in columns and rows.\n\nEvery constraint of section 8 is checked by [`Dimensions::validate`] before anything is\nallocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.",
+      "properties": {
+        "columns": {
+          "$ref": "#/$defs/U64",
+          "description": "Columns, from 1 to 2,048."
+        },
+        "rows": {
+          "$ref": "#/$defs/U64",
+          "description": "Rows, from 1 to 1,024."
+        }
+      },
+      "required": [
+        "columns",
+        "rows"
+      ],
+      "type": "object"
+    },
     "DirectChallenge": {
       "additionalProperties": false,
       "description": "The host challenge a direct redemption starts from. Single use, and it expires with the\ninvitation.",
@@ -1190,6 +1930,77 @@
       ],
       "type": "object"
     },
+    "DisplayNumber": {
+      "description": "A local session alias, allocated in increasing order per environment and never reused.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "DoctorCheck": {
+      "additionalProperties": false,
+      "description": "One diagnostic check.",
+      "properties": {
+        "detail": {
+          "description": "A plain description of the finding. Credentials are redacted.",
+          "type": "string"
+        },
+        "id": {
+          "description": "A stable identifier for the check.",
+          "type": "string"
+        },
+        "remedy": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the user should do, when the check did not pass."
+        },
+        "status": {
+          "$ref": "#/$defs/DoctorStatus",
+          "description": "What it found."
+        },
+        "title": {
+          "description": "What it examines.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "status",
+        "detail",
+        "remedy"
+      ],
+      "type": "object"
+    },
+    "DoctorStatus": {
+      "description": "What one diagnostic check found.",
+      "oneOf": [
+        {
+          "const": "ok",
+          "description": "The check passed.",
+          "type": "string"
+        },
+        {
+          "const": "warning",
+          "description": "The check passed with something worth knowing.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The check failed.",
+          "type": "string"
+        },
+        {
+          "const": "not_applicable",
+          "description": "The check does not apply to this platform or configuration.",
+          "type": "string"
+        }
+      ]
+    },
     "DraftId": {
       "description": "One durable device-owned draft, independent of an attachment.",
       "format": "uuid",
@@ -1200,6 +2011,21 @@
       "description": "The exact version of a draft.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "Durability": {
+      "description": "Whether a result was recorded durably.",
+      "oneOf": [
+        {
+          "const": "durable",
+          "description": "The result is committed to the durable journal.",
+          "type": "string"
+        },
+        {
+          "const": "volatile",
+          "description": "The journal was unavailable, so the result used current in-memory authority and identities.\nStorage failure must not prevent an authorised stop; the response says so outright.",
+          "type": "string"
+        }
+      ]
     },
     "DurationMs": {
       "description": "A duration in milliseconds, as a decimal string in JSON.",
@@ -1404,6 +2230,23 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "EnvironmentListResult": {
+      "additionalProperties": false,
+      "description": "The result of `environment.list`.",
+      "properties": {
+        "environments": {
+          "description": "The environments.",
+          "items": {
+            "$ref": "#/$defs/EnvironmentSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "environments"
+      ],
+      "type": "object"
+    },
     "EnvironmentSelector": {
       "description": "Which environments a grant covers.",
       "oneOf": [
@@ -1440,6 +2283,74 @@
           "type": "object"
         }
       ]
+    },
+    "EnvironmentSummary": {
+      "additionalProperties": false,
+      "description": "One environment this host serves.",
+      "properties": {
+        "arch": {
+          "description": "The processor architecture.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment identity. It binds one installation and one OS user."
+        },
+        "label": {
+          "description": "A label for people.",
+          "type": "string"
+        },
+        "live_sessions": {
+          "$ref": "#/$defs/U64",
+          "description": "How many sessions are live or creating."
+        },
+        "os": {
+          "description": "The operating system.",
+          "type": "string"
+        },
+        "os_user": {
+          "description": "The OS user the environment belongs to.",
+          "type": "string"
+        },
+        "runtime_directory": {
+          "description": "The runtime directory holding sockets and worker descriptors.",
+          "type": "string"
+        },
+        "state_directory": {
+          "description": "The state directory holding the registry, journals and spools.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "environment_id",
+        "label",
+        "os",
+        "arch",
+        "os_user",
+        "runtime_directory",
+        "state_directory",
+        "live_sessions"
+      ],
+      "type": "object"
+    },
+    "EnvironmentVariable": {
+      "additionalProperties": false,
+      "description": "One environment variable in a create request's snapshot.",
+      "properties": {
+        "name": {
+          "description": "The name.",
+          "type": "string"
+        },
+        "value": {
+          "description": "The value.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
     },
     "ErrorCode": {
       "description": "A stable protocol error code.",
@@ -1691,11 +2602,202 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "EventStream": {
+      "description": "The event streams a session publishes.",
+      "oneOf": [
+        {
+          "const": "session_state",
+          "description": "Lifecycle and application-state changes.",
+          "type": "string"
+        },
+        {
+          "const": "output",
+          "description": "Raw terminal output bytes with their cursors.",
+          "type": "string"
+        },
+        {
+          "const": "attachments",
+          "description": "Attachment joins, departures, geometry ownership and viewport reports.",
+          "type": "string"
+        },
+        {
+          "const": "input_lease",
+          "description": "Input lease changes.",
+          "type": "string"
+        },
+        {
+          "const": "receipts",
+          "description": "Action receipts.",
+          "type": "string"
+        }
+      ]
+    },
     "EventType": {
       "description": "The type of one notification event.",
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
+    },
+    "EventsSnapshotParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `events.snapshot`.",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session to snapshot."
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "EventsSnapshotResult": {
+      "additionalProperties": false,
+      "description": "The result of `events.snapshot`.\n\nEvery field is present state, not a replay: installing a snapshot emits no bell, no clipboard\nwrite, no notification and no query.",
+      "properties": {
+        "attachments": {
+          "description": "Every current attachment, in join order.",
+          "items": {
+            "$ref": "#/$defs/AttachmentSummary"
+          },
+          "type": "array"
+        },
+        "cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor this snapshot was taken at. Subsequent updates resume from here."
+        },
+        "geometry": {
+          "$ref": "#/$defs/GeometryState",
+          "description": "Who owns the size."
+        },
+        "lease": {
+          "$ref": "#/$defs/InputLeaseState",
+          "description": "Who holds input."
+        },
+        "oldest_retained_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The oldest output cursor still retained."
+        },
+        "session": {
+          "$ref": "#/$defs/SessionSummary",
+          "description": "The session."
+        },
+        "taken_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the snapshot was taken."
+        }
+      },
+      "required": [
+        "cursor",
+        "session",
+        "geometry",
+        "lease",
+        "attachments",
+        "oldest_retained_cursor",
+        "taken_at_ms"
+      ],
+      "type": "object"
+    },
+    "EventsSubscribeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `events.subscribe`.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment the subscription belongs to."
+        },
+        "from_cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The output cursor to resume from. Null starts from the current position."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session to subscribe to."
+        },
+        "streams": {
+          "description": "The streams to receive.",
+          "items": {
+            "$ref": "#/$defs/EventStream"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "session_id",
+        "attachment_id",
+        "streams",
+        "from_cursor"
+      ],
+      "type": "object"
+    },
+    "EventsSubscribeResult": {
+      "additionalProperties": false,
+      "description": "The result of `events.subscribe`.",
+      "properties": {
+        "from_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor the subscription starts from."
+        },
+        "gap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HistoryGap"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present when the requested cursor was already evicted, so the client must discard its\npartial state and install a new snapshot."
+        },
+        "oldest_retained_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The oldest cursor the worker can still replay. A requested cursor below this returns a gap."
+        },
+        "stream_id": {
+          "$ref": "#/$defs/StreamId",
+          "description": "The stream identifier notifications will carry."
+        }
+      },
+      "required": [
+        "stream_id",
+        "from_cursor",
+        "oldest_retained_cursor",
+        "gap"
+      ],
+      "type": "object"
+    },
+    "ForwardedMutation": {
+      "additionalProperties": false,
+      "description": "A mutation the host admitted for a caller, passed to the component that owns its subject.\n\nThe control daemon owns admission: it authenticates the caller, stamps the freshness window,\nchecks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding\ncarries the caller's mutation to the worker **unchanged**, because the mutation is what the\npayload digest covers and what the caller will retry with: rewriting any of it would give the\nworker a different action from the one the caller asked for.\n\nWhat travels beside it is what the worker cannot establish for itself: which principal the host\nverified, and how long the deadline the host accepted still has to run. The worker performs the\naction under both.",
+      "properties": {
+        "accepted_ttl_ms": {
+          "$ref": "#/$defs/DurationMs",
+          "description": "What remains of the deadline the host derived at first admission, at the moment it forwarded\nthis mutation.\n\nA *duration*, not an instant, because the two processes measure on their own suspend-aware\ncontinuous clocks and neither clock's origin means anything to the other. A wall-clock\ninstant would be comparable and would also be steppable, which is the one property a\ndeadline cannot have. The receiving process anchors this on its own clock when it reads the\nframe, so the only slack is the local socket's transit, and nothing downstream lengthens it\nfurther: the subject applies its own bounds on top."
+        },
+        "actor": {
+          "$ref": "#/$defs/ActorEnvelope",
+          "description": "The actor the host verified, with the ingress it arrived on."
+        },
+        "mutation": {
+          "$ref": "#/$defs/MutationRequest",
+          "description": "The caller's mutation, exactly as it arrived at the host."
+        }
+      },
+      "required": [
+        "mutation",
+        "actor",
+        "accepted_ttl_ms"
+      ],
+      "type": "object"
     },
     "FreshnessRequirement": {
       "description": "Which freshness context a request must carry.",
@@ -1726,6 +2828,39 @@
           "type": "string"
         }
       ]
+    },
+    "GenerationAccepted": {
+      "additionalProperties": false,
+      "description": "A worker's answer to a generation token.",
+      "properties": {
+        "fenced_previous": {
+          "description": "True when accepting this token fenced an earlier connection of the same generation.",
+          "type": "boolean"
+        },
+        "generation": {
+          "$ref": "#/$defs/ControllerGeneration",
+          "description": "The generation the worker now accepts."
+        }
+      },
+      "required": [
+        "generation",
+        "fenced_previous"
+      ],
+      "type": "object"
+    },
+    "GenerationChallenge": {
+      "additionalProperties": false,
+      "description": "A worker's challenge to a controller that wants to speak for a generation.",
+      "properties": {
+        "nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "Thirty-two fresh random bytes, bound to this connection and consumed once."
+        }
+      },
+      "required": [
+        "nonce"
+      ],
+      "type": "object"
     },
     "GenerationCheckpoint": {
       "additionalProperties": false,
@@ -1760,6 +2895,51 @@
       "description": "The current geometry-owner epoch, separate from the input lease.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "GeometryResult": {
+      "additionalProperties": false,
+      "description": "The result of any operation that can change geometry ownership.",
+      "properties": {
+        "geometry": {
+          "$ref": "#/$defs/GeometryState",
+          "description": "The geometry after the operation."
+        }
+      },
+      "required": [
+        "geometry"
+      ],
+      "type": "object"
+    },
+    "GeometryState": {
+      "additionalProperties": false,
+      "description": "Who owns the session's rows and columns.",
+      "properties": {
+        "dimensions": {
+          "$ref": "#/$defs/Dimensions",
+          "description": "The canonical geometry the pseudo-terminal is currently set to."
+        },
+        "epoch": {
+          "$ref": "#/$defs/GeometryEpoch",
+          "description": "The epoch, advanced by every ownership change and explicit transfer."
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachmentId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The current owner. Null when no eligible claim exists and the last geometry is retained."
+        }
+      },
+      "required": [
+        "owner",
+        "epoch",
+        "dimensions"
+      ],
+      "type": "object"
     },
     "Grant": {
       "additionalProperties": false,
@@ -1938,6 +3118,90 @@
         }
       ]
     },
+    "HistoryGap": {
+      "additionalProperties": false,
+      "description": "A range of output the worker can no longer replay.",
+      "properties": {
+        "from_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The first cursor that is missing."
+        },
+        "to_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The first cursor that is present again."
+        }
+      },
+      "required": [
+        "from_cursor",
+        "to_cursor"
+      ],
+      "type": "object"
+    },
+    "HistoryPageParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `history.page`.",
+      "properties": {
+        "from_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor to read from."
+        },
+        "max_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "The largest page the caller will accept, bounded by [`MAX_HISTORY_PAGE_BYTES`]."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session to read."
+        }
+      },
+      "required": [
+        "session_id",
+        "from_cursor",
+        "max_bytes"
+      ],
+      "type": "object"
+    },
+    "HistoryPageResult": {
+      "additionalProperties": false,
+      "description": "The result of `history.page`.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The retained bytes. Raw output is a byte string and need not be valid UTF-8."
+        },
+        "from_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor this page starts at, after any gap."
+        },
+        "gap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HistoryGap"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present when the requested range had been evicted. The page states its gap rather than\nreturning a shorter range as if it were complete."
+        },
+        "next_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor to request next."
+        },
+        "oldest_retained_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The oldest cursor still retained when the page was built."
+        }
+      },
+      "required": [
+        "from_cursor",
+        "next_cursor",
+        "bytes",
+        "oldest_retained_cursor",
+        "gap"
+      ],
+      "type": "object"
+    },
     "HistoryScope": {
       "additionalProperties": false,
       "description": "How far back a grant may see, and which current resources it names explicitly.\n\nThe lower bound is enforced once, in shared host-side filtering used by event pages, snapshots,\nloaded conversations, attachment references, exports, summaries, changed-since-last-visit and\nvoice context. A later snapshot or a freshly generated summary never makes older underlying\ncontent newly authorised.",
@@ -2023,6 +3287,82 @@
         "keys",
         "network_config",
         "proposed_grant"
+      ],
+      "type": "object"
+    },
+    "HostDoctorResult": {
+      "additionalProperties": false,
+      "description": "The result of `host.doctor`.",
+      "properties": {
+        "checks": {
+          "description": "Every check, in the order they ran.",
+          "items": {
+            "$ref": "#/$defs/DoctorCheck"
+          },
+          "type": "array"
+        },
+        "healthy": {
+          "description": "True when no check failed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "checks",
+        "healthy"
+      ],
+      "type": "object"
+    },
+    "HostInfoResult": {
+      "additionalProperties": false,
+      "description": "The result of `host.info`.",
+      "properties": {
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot this host is running."
+        },
+        "build_id": {
+          "$ref": "#/$defs/BuildId",
+          "description": "The controller build."
+        },
+        "default_worker_profile": {
+          "$ref": "#/$defs/WorkerProfile",
+          "description": "The worker profile this host creates sessions with unless the request says otherwise."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment this controller owns."
+        },
+        "generation": {
+          "$ref": "#/$defs/ControllerGeneration",
+          "description": "The controller's current generation. A replacement controller uses a strictly higher one."
+        },
+        "live_sessions": {
+          "$ref": "#/$defs/U64",
+          "description": "How many sessions are live or creating."
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The protocol version this build implements."
+        },
+        "session_limit": {
+          "$ref": "#/$defs/U64",
+          "description": "The configured admission limit."
+        },
+        "started_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When this controller process started serving."
+        }
+      },
+      "required": [
+        "build_id",
+        "protocol_version",
+        "environment_id",
+        "generation",
+        "boot_identity",
+        "started_at_ms",
+        "live_sessions",
+        "session_limit",
+        "default_worker_profile"
       ],
       "type": "object"
     },
@@ -2137,21 +3477,254 @@
         }
       ]
     },
+    "InputAcquireParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `input.acquire`.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment that will hold the lease."
+        },
+        "expected_epoch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputLeaseEpoch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The epoch the caller believes is current, when it wants the takeover to be conditional."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "attachment_id",
+        "expected_epoch"
+      ],
+      "type": "object"
+    },
+    "InputAcquireResult": {
+      "additionalProperties": false,
+      "description": "The result of `input.acquire`.",
+      "properties": {
+        "closed_open_paste": {
+          "description": "True when the worker closed an open bracketed paste before handing input over, so the\napplication never sees a paste completed under a different actor's lease.",
+          "type": "boolean"
+        },
+        "discarded_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Undelivered bytes the previous epoch lost. Input an application already processed cannot\nbe undone; this counts only what was still buffered."
+        },
+        "lease": {
+          "$ref": "#/$defs/InputLeaseState",
+          "description": "The lease after the takeover."
+        }
+      },
+      "required": [
+        "lease",
+        "discarded_bytes",
+        "closed_open_paste"
+      ],
+      "type": "object"
+    },
+    "InputInterruptParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `input.interrupt`.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/InterruptAction",
+          "description": "The action. Only the native interrupt is accepted."
+        },
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment asking for the interrupt."
+        },
+        "epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch",
+          "description": "The lease epoch it holds."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "attachment_id",
+        "epoch",
+        "action"
+      ],
+      "type": "object"
+    },
     "InputLeaseEpoch": {
       "description": "The current input lease epoch.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "InputLeaseResult": {
+      "additionalProperties": false,
+      "description": "The result of `input.interrupt` and `input.release`.",
+      "properties": {
+        "lease": {
+          "$ref": "#/$defs/InputLeaseState",
+          "description": "The lease after the operation."
+        }
+      },
+      "required": [
+        "lease"
+      ],
+      "type": "object"
+    },
+    "InputLeaseState": {
+      "additionalProperties": false,
+      "description": "The current state of the session's single input lease.",
+      "properties": {
+        "connection_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The connection the holder's ordered input stream belongs to."
+        },
+        "epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch",
+          "description": "The current epoch. A takeover advances it and invalidates the previous one."
+        },
+        "holder": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachmentId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The attachment that currently holds input. Null when no attachment holds it."
+        },
+        "next_sequence": {
+          "$ref": "#/$defs/InputSequence",
+          "description": "The next input sequence the worker expects on that stream."
+        }
+      },
+      "required": [
+        "epoch",
+        "holder",
+        "connection_id",
+        "next_sequence"
+      ],
+      "type": "object"
+    },
+    "InputReleaseParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `input.release`.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment releasing the lease."
+        },
+        "epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch",
+          "description": "The epoch it holds."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "attachment_id",
+        "epoch"
+      ],
+      "type": "object"
     },
     "InputSequence": {
       "description": "An increasing sequence number inside one raw input stream.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "InputWriteParams": {
+      "additionalProperties": false,
+      "description": "Parameters of ordered `input.write`.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment writing."
+        },
+        "bytes": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The raw bytes. They are not decoded, re-encoded or normalised."
+        },
+        "epoch": {
+          "$ref": "#/$defs/InputLeaseEpoch",
+          "description": "The lease epoch the bytes belong to. A stale epoch is `LEASE_LOST` and never acquires\nimplicitly."
+        },
+        "sequence": {
+          "$ref": "#/$defs/InputSequence",
+          "description": "The position of these bytes in this connection's ordered input stream."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "attachment_id",
+        "epoch",
+        "sequence",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "InputWriteResult": {
+      "additionalProperties": false,
+      "description": "The result of `input.write`.",
+      "properties": {
+        "forwarded_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Bytes forwarded to the pseudo-terminal."
+        },
+        "held_prefix_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Bytes held as an incomplete paste delimiter prefix, pending the recogniser deadline."
+        },
+        "sequence": {
+          "$ref": "#/$defs/InputSequence",
+          "description": "The sequence the worker has now consumed."
+        }
+      },
+      "required": [
+        "sequence",
+        "forwarded_bytes",
+        "held_prefix_bytes"
+      ],
+      "type": "object"
+    },
     "InstallationId": {
       "description": "One native application installation registered with a push gateway.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "InterruptAction": {
+      "description": "What an interrupt may do.\n\nThe method accepts only the configured native interrupt action. It never accepts arbitrary\ncommand bytes, and it bypasses the reader-transition hold.",
+      "oneOf": [
+        {
+          "const": "native_interrupt",
+          "description": "The terminal's configured interrupt character, as the session's line discipline defines it.",
+          "type": "string"
+        }
+      ]
     },
     "InvitationId": {
       "description": "One pairing invitation: 128 random bits, not necessarily a UUIDv4.",
@@ -2239,6 +3812,176 @@
         }
       ]
     },
+    "LocalClientKind": {
+      "description": "What kind of client opened a local connection.",
+      "oneOf": [
+        {
+          "const": "cli",
+          "description": "The `kr` command-line client.",
+          "type": "string"
+        },
+        {
+          "const": "controller",
+          "description": "The control daemon connecting to a worker.",
+          "type": "string"
+        },
+        {
+          "const": "worker",
+          "description": "A worker connecting to the control daemon.",
+          "type": "string"
+        }
+      ]
+    },
+    "LocalHello": {
+      "additionalProperties": false,
+      "description": "The first frame a local client sends.",
+      "properties": {
+        "build_id": {
+          "$ref": "#/$defs/BuildId",
+          "description": "The client build."
+        },
+        "capabilities": {
+          "description": "The capabilities the client offers.",
+          "items": {
+            "$ref": "#/$defs/CapabilityId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "client": {
+          "$ref": "#/$defs/LocalClientKind",
+          "description": "What kind of client this is. It says how to frame the conversation; it confers nothing."
+        },
+        "max_receive": {
+          "$ref": "#/$defs/ReceiveLimits",
+          "description": "The client's own receive limits."
+        },
+        "offered_versions": {
+          "description": "Every protocol version the client offers.",
+          "items": {
+            "$ref": "#/$defs/ProtocolVersion"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "offered_versions",
+        "build_id",
+        "client",
+        "capabilities",
+        "max_receive"
+      ],
+      "type": "object"
+    },
+    "LocalHelloAck": {
+      "additionalProperties": false,
+      "description": "The first frame the host sends back.",
+      "properties": {
+        "action_window": {
+          "$ref": "#/$defs/ActionWindow",
+          "description": "The first action window of this connection.\n\nIt carries a validity *duration*, not a deadline: the authoritative deadline lives on the\nhost's suspend-aware continuous clock, and the host renews the window on this connection\nwithout being asked. A client schedules its own expectations from the duration and never\ncomputes an expiry the host will honour."
+        },
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot the host is running."
+        },
+        "capabilities": {
+          "description": "The capabilities both sides will use.",
+          "items": {
+            "$ref": "#/$defs/CapabilityId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "connection_id": {
+          "$ref": "#/$defs/ConnectionId",
+          "description": "The connection identity the host assigned."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment this endpoint belongs to."
+        },
+        "max_receive": {
+          "$ref": "#/$defs/ReceiveLimits",
+          "description": "The limits both sides will use."
+        },
+        "peer": {
+          "$ref": "#/$defs/LocalPeer",
+          "description": "The caller the host authenticated."
+        },
+        "role": {
+          "$ref": "#/$defs/LocalRole",
+          "description": "Which host process answered."
+        },
+        "selected_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The version both sides will use."
+        }
+      },
+      "required": [
+        "selected_version",
+        "role",
+        "connection_id",
+        "environment_id",
+        "boot_identity",
+        "peer",
+        "action_window",
+        "capabilities",
+        "max_receive"
+      ],
+      "type": "object"
+    },
+    "LocalPeer": {
+      "additionalProperties": false,
+      "description": "The authenticated operating-system caller.\n\nThe host stamps this from the socket's peer credentials. It proves an OS identity, not human\nintent: rights-enlarging owner operations still require the owner-confirmation contract.",
+      "properties": {
+        "gid": {
+          "$ref": "#/$defs/U64",
+          "description": "The caller's primary group identifier."
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The caller's process identifier, where the platform reports one. A hint for diagnostics,\nnever authority on its own."
+        },
+        "uid": {
+          "$ref": "#/$defs/U64",
+          "description": "The caller's user identifier."
+        }
+      },
+      "required": [
+        "uid",
+        "gid",
+        "pid"
+      ],
+      "type": "object"
+    },
+    "LocalRole": {
+      "description": "Which host process a local endpoint belongs to.",
+      "oneOf": [
+        {
+          "const": "controller",
+          "description": "The per-environment control daemon.",
+          "type": "string"
+        },
+        {
+          "const": "worker",
+          "description": "One session worker's private endpoint.",
+          "type": "string"
+        },
+        {
+          "const": "rendezvous",
+          "description": "The controller's owner-only rendezvous socket, which accepts only a worker's startup\nhandshake.",
+          "type": "string"
+        }
+      ]
+    },
     "Mac256": {
       "contentEncoding": "base64url",
       "description": "A 32-byte HMAC-SHA-256 tag. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
@@ -2294,88 +4037,6 @@
         "filename"
       ],
       "type": "object"
-    },
-    "MembershipLease": {
-      "additionalProperties": false,
-      "description": "A signed statement that one account held one role in one organisation.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/MembershipLeasePayload",
-          "description": "What the organisation states."
-        },
-        "signature": {
-          "$ref": "#/$defs/Signature64",
-          "description": "The policy-signing key's signature over [`MembershipLeasePayload::signing_input`]."
-        }
-      },
-      "required": [
-        "payload",
-        "signature"
-      ],
-      "type": "object"
-    },
-    "MembershipLeasePayload": {
-      "additionalProperties": false,
-      "description": "What a membership lease states, and exactly what its signature covers.",
-      "properties": {
-        "account_id": {
-          "$ref": "#/$defs/AccountId",
-          "description": "The account it names as a member."
-        },
-        "expires_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When it stops being usable, at most [`MEMBERSHIP_LEASE_MAX_LIFETIME_MS`] later."
-        },
-        "issued_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the authority signed it, in UTC milliseconds."
-        },
-        "key_revision": {
-          "$ref": "#/$defs/PolicyKeyRevision",
-          "description": "The policy-key revision that signed it."
-        },
-        "maximum_grants": {
-          "description": "The most the role may carry. A host intersects this with its own policy.",
-          "items": {
-            "$ref": "#/$defs/ActionRight"
-          },
-          "type": "array",
-          "uniqueItems": true
-        },
-        "organisation_id": {
-          "$ref": "#/$defs/OrganisationId",
-          "description": "The organisation the lease speaks for."
-        },
-        "role": {
-          "$ref": "#/$defs/TeamRole",
-          "description": "The role that account held when the lease was signed."
-        }
-      },
-      "required": [
-        "organisation_id",
-        "account_id",
-        "role",
-        "maximum_grants",
-        "issued_at_ms",
-        "expires_at_ms",
-        "key_revision"
-      ],
-      "type": "object"
-    },
-    "MeteringRole": {
-      "description": "A forwarding boundary inside one relay instance.\n\nA payload crosses two boundaries at a relay: it is read from the sending connection and it is\nwritten to the receiving one. They are not the same event. A payload counted as it arrives may\nstill be fenced by a revocation, dropped for a full queue or lost to a closing connection before\nit is delivered, so which boundary counts decides what the payer pays for.",
-      "oneOf": [
-        {
-          "const": "ingress",
-          "description": "Count the payload as it is read from the sending connection.",
-          "type": "string"
-        },
-        {
-          "const": "egress",
-          "description": "Count the payload as it is written to the receiving connection.",
-          "type": "string"
-        }
-      ]
     },
     "Method": {
       "description": "Every method in the section 23 method-groups table.",
@@ -3498,6 +5159,25 @@
         }
       ]
     },
+    "OutputEvent": {
+      "additionalProperties": false,
+      "description": "One batch of output bytes on the output stream.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The bytes."
+        },
+        "cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor these bytes start at."
+        }
+      },
+      "required": [
+        "cursor",
+        "bytes"
+      ],
+      "type": "object"
+    },
     "OwnerConfirmationProof": {
       "additionalProperties": false,
       "description": "An owner's answer to a confirmation challenge.\n\nThe verification ceremony itself is platform code; this object records its result and binds it\nto the exact challenge. The host's acceptance record keeps the user-presence evidence and the\nchallenge-consumption transition together.",
@@ -3591,6 +5271,21 @@
         "expires_at_ms"
       ],
       "type": "object"
+    },
+    "OwnershipCoverage": {
+      "description": "How completely the closure covered the session's owned processes.",
+      "oneOf": [
+        {
+          "const": "complete",
+          "description": "Every process the worker owned was accounted for.",
+          "type": "string"
+        },
+        {
+          "const": "incomplete",
+          "description": "One or more owned processes could not be confirmed. The record never claims that every\npossible application was discovered.",
+          "type": "string"
+        }
+      ]
     },
     "PairFinishRequest": {
       "additionalProperties": false,
@@ -3817,241 +5512,75 @@
       "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.",
       "tsType": "unknown"
     },
-    "PayerAuthorisation": {
-      "description": "Why this payer is the one billed.\n\nA relay credential cannot move the bill to another account. A sponsored lease names the\nauthorisation the sponsor gave, so the service can show which record made the transfer lawful\nand can refuse a lease that names none.",
-      "oneOf": [
-        {
-          "const": "host_selected",
-          "description": "The host's own selected account or installation pays, which is the default.",
-          "type": "string"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Another principal sponsors this pair under a recorded authorisation.",
-          "properties": {
-            "sponsored": {
-              "additionalProperties": false,
-              "properties": {
-                "authorisation_id": {
-                  "$ref": "#/$defs/PayerAuthorisationId",
-                  "description": "The sponsor's authorisation record."
-                }
-              },
-              "required": [
-                "authorisation_id"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "sponsored"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "PayerAuthorisationId": {
-      "description": "The service record that authorised one principal to pay for another's relay traffic.",
-      "maxLength": 256,
-      "minLength": 1,
-      "type": "string"
-    },
-    "PayerPrincipal": {
-      "description": "Who pays for a lease.\n\nSection 17 bills one account or one anonymous installation. An installation is not proof of a\nnew person, which is why anonymous capacity carries its own global and per-network budgets.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "A managed account.",
-          "properties": {
-            "account": {
-              "additionalProperties": false,
-              "properties": {
-                "account_id": {
-                  "$ref": "#/$defs/AccountId",
-                  "description": "The account that is billed."
-                }
-              },
-              "required": [
-                "account_id"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "account"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "An anonymous installation drawing on the free allowance.",
-          "properties": {
-            "installation": {
-              "additionalProperties": false,
-              "properties": {
-                "installation_id": {
-                  "$ref": "#/$defs/InstallationId",
-                  "description": "The installation that is billed."
-                }
-              },
-              "required": [
-                "installation_id"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "installation"
-          ],
-          "type": "object"
-        }
-      ]
-    },
     "PluginId": {
       "description": "A plugin identifier from its manifest.",
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
     },
-    "PolicyAuthority": {
+    "Presentation": {
+      "description": "How a new session is presented locally.\n\nThe three are mutually exclusive. `attach` is the default when standard input and output are\nterminals; otherwise the caller states one.",
+      "oneOf": [
+        {
+          "const": "attach",
+          "description": "Create and attach in the calling terminal.",
+          "type": "string"
+        },
+        {
+          "const": "terminal",
+          "description": "Create and open an installed terminal application running `kr attach`.",
+          "type": "string"
+        },
+        {
+          "const": "invisible",
+          "description": "Create without any local terminal attachment.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProcessStartIdentity": {
       "additionalProperties": false,
-      "description": "An organisation's policy-signing authority as it is published.",
+      "description": "A process and the kernel's record of when it started.\n\nEvery ownership check compares both fields. A process identifier alone can be reused by an\nunrelated program within milliseconds of the original exiting, so the host never terminates,\nadopts or trusts a process on its identifier alone.",
       "properties": {
-        "chain": {
-          "description": "Every revision in order, starting at the first.",
-          "items": {
-            "$ref": "#/$defs/PolicyAuthorityLink"
-          },
-          "type": "array"
+        "pid": {
+          "$ref": "#/$defs/U64",
+          "description": "The operating-system process identifier."
         },
-        "head": {
-          "$ref": "#/$defs/PolicyAuthorityHead",
-          "description": "Which revision signs now, signed by that revision."
+        "source": {
+          "$ref": "#/$defs/ProcessStartSource",
+          "description": "Where the start value came from."
         },
-        "organisation_id": {
-          "$ref": "#/$defs/OrganisationId",
-          "description": "The organisation the chain belongs to."
+        "start_value": {
+          "$ref": "#/$defs/U64",
+          "description": "The kernel's start value in the source's own units."
         }
       },
       "required": [
-        "organisation_id",
-        "chain",
-        "head"
+        "pid",
+        "source",
+        "start_value"
       ],
       "type": "object"
     },
-    "PolicyAuthorityHead": {
-      "additionalProperties": false,
-      "description": "The signed statement of which revision is signing right now.\n\nIt expires, so a captured statement stops being usable, and a host that has accepted a later\nrevision refuses one naming an earlier revision. A retained private key of a retired revision\ncan still sign statements naming that revision, which is why rotation destroys it.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/PolicyAuthorityHeadPayload",
-          "description": "What the authority states."
+    "ProcessStartSource": {
+      "description": "Where a process start identity came from.",
+      "oneOf": [
+        {
+          "const": "linux_proc_stat",
+          "description": "Linux `/proc/<pid>/stat` field 22: start time in clock ticks since boot.",
+          "type": "string"
         },
-        "signature": {
-          "$ref": "#/$defs/Signature64",
-          "description": "The signature of the revision the statement names, over\n[`PolicyAuthorityHeadPayload::signing_input`]."
+        {
+          "const": "macos_proc_bsd_info",
+          "description": "macOS `proc_pidinfo(PROC_PIDTBSDINFO)`: start time in microseconds since the epoch.",
+          "type": "string"
+        },
+        {
+          "const": "windows_process_start_seconds",
+          "description": "Windows: the process creation time in whole seconds since the epoch.\n\nThe kernel records 100-nanosecond intervals, and the safe reader this host uses reports\nwhole seconds. Two processes that share an identifier within one second are therefore\nindistinguishable by this value alone, which is why a Windows worker also owns a per-session\nJob Object that a recycled identifier cannot join.",
+          "type": "string"
         }
-      },
-      "required": [
-        "payload",
-        "signature"
-      ],
-      "type": "object"
-    },
-    "PolicyAuthorityHeadPayload": {
-      "additionalProperties": false,
-      "description": "Which revision signs right now, and exactly what its signature covers.",
-      "properties": {
-        "expires_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When it stops, at most [`POLICY_AUTHORITY_HEAD_MAX_LIFETIME_MS`] later."
-        },
-        "issued_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the authority made the statement, in UTC milliseconds."
-        },
-        "key_revision": {
-          "$ref": "#/$defs/PolicyKeyRevision",
-          "description": "The last revision of the chain, which signs leases now."
-        },
-        "organisation_id": {
-          "$ref": "#/$defs/OrganisationId",
-          "description": "The organisation this statement belongs to."
-        }
-      },
-      "required": [
-        "organisation_id",
-        "key_revision",
-        "issued_at_ms",
-        "expires_at_ms"
-      ],
-      "type": "object"
-    },
-    "PolicyAuthorityLink": {
-      "additionalProperties": false,
-      "description": "One step in an organisation's policy-signing authority chain.\n\nThe first revision signs itself and names no predecessor, which is what a host pins. Every\nlater revision is signed by the revision it names, so a host that pinned the first can follow\nthe chain to the key signing now, and a link cannot be re-parented under a revision it was not\nissued against.\n\nA link carries no expiry, because when a revision stops signing is not known when it is issued.\nIts successor's `not_before_ms` is when it stopped.",
-      "properties": {
-        "payload": {
-          "$ref": "#/$defs/PolicyAuthorityLinkPayload",
-          "description": "What this revision states."
-        },
-        "signature": {
-          "$ref": "#/$defs/Signature64",
-          "description": "The predecessor's signature over [`PolicyAuthorityLinkPayload::signing_input`], or this\nrevision's own at the first revision."
-        }
-      },
-      "required": [
-        "payload",
-        "signature"
-      ],
-      "type": "object"
-    },
-    "PolicyAuthorityLinkPayload": {
-      "additionalProperties": false,
-      "description": "One revision of an organisation's policy-signing key, and exactly what its signature covers.",
-      "properties": {
-        "key_revision": {
-          "$ref": "#/$defs/PolicyKeyRevision",
-          "description": "The revision this link establishes."
-        },
-        "not_before_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When this revision took over signing, in UTC milliseconds."
-        },
-        "organisation_id": {
-          "$ref": "#/$defs/OrganisationId",
-          "description": "The organisation whose chain this link belongs to."
-        },
-        "previous_key_revision": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PolicyKeyRevision"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The revision whose key signed it, or null at the first revision, which signs itself."
-        },
-        "public_key": {
-          "$ref": "#/$defs/AuthorisationKey",
-          "description": "The Ed25519 public key of this revision."
-        }
-      },
-      "required": [
-        "organisation_id",
-        "key_revision",
-        "previous_key_revision",
-        "public_key",
-        "not_before_ms"
-      ],
-      "type": "object"
-    },
-    "PolicyKeyRevision": {
-      "description": "The revision of an organisation's policy-signing key, advanced on every rotation.",
-      "pattern": "^(0|[1-9][0-9]*)$",
-      "type": "string"
+      ]
     },
     "ProjectRepositoryId": {
       "description": "One environment-bound source repository.",
@@ -4488,548 +6017,6 @@
         }
       ]
     },
-    "RelayConsumptionAck": {
-      "additionalProperties": false,
-      "description": "The service's answer to a consumption report.\n\nIt states what the service has recorded rather than what the report contained, so a relay\nrecovering from a crash learns from one exchange exactly which position to replay from.",
-      "properties": {
-        "awaiting_receipts": {
-          "description": "True when the service is holding out for receipts it has not been given. The reservation\nstays outstanding until they arrive or until it is settled conservatively.",
-          "type": "boolean"
-        },
-        "bytes_recorded": {
-          "$ref": "#/$defs/U64",
-          "description": "The cumulative bytes recorded for the reservation."
-        },
-        "next_sequence": {
-          "$ref": "#/$defs/RelayReceiptSequence",
-          "description": "The next sequence the service will accept. A relay resumes from here."
-        },
-        "recorded_through": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RelayReceiptSequence"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The highest sequence recorded for it, or null when none has been."
-        },
-        "reservation_id": {
-          "$ref": "#/$defs/RelayReservationId",
-          "description": "The reservation the report was about."
-        }
-      },
-      "required": [
-        "reservation_id",
-        "recorded_through",
-        "next_sequence",
-        "bytes_recorded",
-        "awaiting_receipts"
-      ],
-      "type": "object"
-    },
-    "RelayConsumptionReceipt": {
-      "additionalProperties": false,
-      "description": "A relay's signed statement of what one reservation has spent.\n\nThe count is cumulative for the reservation, so a duplicate delivery of a receipt costs nothing\nand a later receipt states the whole figure rather than an increment. It does not make a missing\nreceipt harmless: the service records receipts in order, and a relay that cannot supply the one\nin between has lost the evidence for that stretch, which is settled conservatively rather than\nassumed away.",
-      "properties": {
-        "bytes_consumed": {
-          "$ref": "#/$defs/U64",
-          "description": "The bytes spent from the reservation so far. Cumulative and never decreasing."
-        },
-        "lease_revision": {
-          "$ref": "#/$defs/RelayLeaseRevision",
-          "description": "The lease revision that was in force when the count was taken."
-        },
-        "observed_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the relay took the count, in UTC milliseconds."
-        },
-        "relay_instance_id": {
-          "$ref": "#/$defs/RelayInstanceId",
-          "description": "The relay instance that counted the bytes."
-        },
-        "reservation_id": {
-          "$ref": "#/$defs/RelayReservationId",
-          "description": "The reservation the bytes were spent from."
-        },
-        "sequence": {
-          "$ref": "#/$defs/RelayReceiptSequence",
-          "description": "The position of this receipt in that reservation's own sequence. It starts at\n[`FIRST_RECEIPT_SEQUENCE`] and increases by one, so a gap is detectable and a repeat is\nrecognisable."
-        }
-      },
-      "required": [
-        "relay_instance_id",
-        "reservation_id",
-        "sequence",
-        "bytes_consumed",
-        "lease_revision",
-        "observed_at_ms"
-      ],
-      "type": "object"
-    },
-    "RelayConsumptionReport": {
-      "additionalProperties": false,
-      "description": "What a relay posts to the service to report consumption.\n\nA report carries receipts for one reservation in ascending order. Reporting is idempotent, so a\nrelay that is unsure whether a report arrived sends it again rather than skipping it, and a\nrelay resuming after a restart replays from the last position the service acknowledged.",
-      "properties": {
-        "receipts": {
-          "description": "The receipts, in ascending sequence order.",
-          "items": {
-            "$ref": "#/$defs/SignedRelayConsumptionReceipt"
-          },
-          "type": "array"
-        },
-        "relay_instance_id": {
-          "$ref": "#/$defs/RelayInstanceId",
-          "description": "The relay instance reporting."
-        },
-        "reservation_id": {
-          "$ref": "#/$defs/RelayReservationId",
-          "description": "The reservation being reported."
-        }
-      },
-      "required": [
-        "relay_instance_id",
-        "reservation_id",
-        "receipts"
-      ],
-      "type": "object"
-    },
-    "RelayDirection": {
-      "description": "Which way a lease permits a payload to travel.",
-      "oneOf": [
-        {
-          "const": "source_to_destination",
-          "description": "Only from the source endpoint to the destination endpoint.",
-          "type": "string"
-        },
-        {
-          "const": "bidirectional",
-          "description": "Both ways between the two endpoints.",
-          "type": "string"
-        }
-      ]
-    },
-    "RelayGrace": {
-      "additionalProperties": false,
-      "description": "The bounded grace a principal is inside, as the service has told this relay.\n\nSection 17 grants a principal up to fifteen minutes or 100 MiB after exhaustion, whichever ends\nfirst, shared across every connection of that principal. It starts at the first exhaustion\nevent, and reconnects, new endpoints and other regions cannot restart it: only the service knows\nwhen the principal first exhausted its allowance, and a relay only ever receives what is left of\none grace period as a slice of it.\n\nThe slice is expressed as a raised cumulative ceiling on the same reservation, so the relay has\none number to compare its running total against whether the lease is in grace or not.",
-      "properties": {
-        "byte_ceiling": {
-          "$ref": "#/$defs/U64",
-          "description": "The cumulative bytes this reservation may reach inside the grace. Never below the lease's\nown ceiling, and above it by at most [`MAX_GRACE_BYTES`]."
-        },
-        "ends_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When it ends, in UTC milliseconds."
-        },
-        "started_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the principal's grace began, in UTC milliseconds."
-        }
-      },
-      "required": [
-        "started_at_ms",
-        "ends_at_ms",
-        "byte_ceiling"
-      ],
-      "type": "object"
-    },
-    "RelayInstanceId": {
-      "description": "One relay instance. Stable across rotation of the key it signs receipts with.",
-      "format": "uuid",
-      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-      "type": "string"
-    },
-    "RelayInstanceKey": {
-      "contentEncoding": "base64url",
-      "description": "A 32-byte Ed25519 relay instance public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
-      "type": "string"
-    },
-    "RelayInstanceRegistration": {
-      "additionalProperties": false,
-      "description": "A relay instance's registration with the service.\n\nThe instance key is generated on the relay host and never leaves it, so the service learns the\npublic half here and verifies every later receipt against it.\n\nA registration is replaced rather than amended, and [`Self::replaces`] is the whole rule for\nwhen one may replace another. Two things make that rule necessary: a registration is a signed\ndocument, so without a revision an old one could be replayed to cancel a rotation, and a\nsuccessor that could install itself the moment its overlap opened would strand every receipt its\npredecessor had signed but not yet delivered.",
-      "properties": {
-        "instance_key": {
-          "$ref": "#/$defs/RelayInstanceKey",
-          "description": "The public half of the key this instance signs receipts with."
-        },
-        "region": {
-          "$ref": "#/$defs/RelayRegion",
-          "description": "The deployment region this instance serves."
-        },
-        "relay_instance_id": {
-          "$ref": "#/$defs/RelayInstanceId",
-          "description": "The instance identity. Stable across key rotation."
-        },
-        "relay_url": {
-          "$ref": "#/$defs/NetworkHint",
-          "description": "The URL clients reach this instance at."
-        },
-        "revision": {
-          "$ref": "#/$defs/RelayRegistrationRevision",
-          "description": "The revision of this registration. Strictly increasing per instance, so a registration the\ninstance has replaced cannot be replayed to undo the replacement. The same revision is\naccepted again only for a byte-identical retry."
-        },
-        "successor": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RelayKeySuccession"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The successor key and its overlap window, or null when no rotation is announced."
-        },
-        "valid_from_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the registration starts being valid, in UTC milliseconds."
-        },
-        "valid_until_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When it stops being valid, in UTC milliseconds."
-        }
-      },
-      "required": [
-        "relay_instance_id",
-        "revision",
-        "instance_key",
-        "relay_url",
-        "region",
-        "valid_from_ms",
-        "valid_until_ms",
-        "successor"
-      ],
-      "type": "object"
-    },
-    "RelayKeySuccession": {
-      "additionalProperties": false,
-      "description": "A successor key and the window in which both keys are accepted.\n\nRotation cannot be instantaneous: receipts signed before the change are still in flight when the\nnew key starts signing. The overlap is that window, stated in advance and ending at a recorded\ntime rather than whenever somebody remembers to retire the old key.",
-      "properties": {
-        "instance_key": {
-          "$ref": "#/$defs/RelayInstanceKey",
-          "description": "The key that takes over."
-        },
-        "overlap_from_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the successor starts being accepted, in UTC milliseconds."
-        },
-        "predecessor_retires_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the key it replaces stops being accepted, in UTC milliseconds."
-        }
-      },
-      "required": [
-        "instance_key",
-        "overlap_from_ms",
-        "predecessor_retires_at_ms"
-      ],
-      "type": "object"
-    },
-    "RelayLease": {
-      "additionalProperties": false,
-      "description": "A signed service capability to forward between one pair of endpoints.\n\nThis is the object section 17 requires a relay to hold before it forwards a peer payload. Every\nfield is inside the signature, so a relay that trusts its pinned issuer keys, and keeps the\ndurable state named at the top of this module, needs nothing else to decide whether a payload\nmay cross a boundary.",
-      "properties": {
-        "byte_ceiling": {
-          "$ref": "#/$defs/U64",
-          "description": "The cumulative bytes this reservation may reach at the metering boundary. A refill raises\nit; it never falls."
-        },
-        "destination_endpoint_key": {
-          "$ref": "#/$defs/EndpointKey",
-          "description": "The endpoint that may receive."
-        },
-        "direction": {
-          "$ref": "#/$defs/RelayDirection",
-          "description": "Whether the reverse direction is permitted too."
-        },
-        "expires_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the lease stops being valid, in UTC milliseconds."
-        },
-        "grace": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RelayGrace"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The bounded grace this pair is inside, or null when the principal is not in grace."
-        },
-        "issuer_key": {
-          "$ref": "#/$defs/ServiceAdmissionKey",
-          "description": "The service admission key that signs this lease. A relay accepts it only when the key is\none it pins."
-        },
-        "lease_id": {
-          "$ref": "#/$defs/RelayLeaseId",
-          "description": "The lease identity. One lease covers one endpoint pair for one payer."
-        },
-        "metering_relay_instance_id": {
-          "$ref": "#/$defs/RelayInstanceId",
-          "description": "The relay instance that counts the bytes. One of the two positions in the scope."
-        },
-        "metering_role": {
-          "$ref": "#/$defs/MeteringRole",
-          "description": "Which of that instance's own boundaries takes the count."
-        },
-        "payer": {
-          "$ref": "#/$defs/PayerPrincipal",
-          "description": "Who is billed."
-        },
-        "payer_authorisation": {
-          "$ref": "#/$defs/PayerAuthorisation",
-          "description": "Why that principal is the one billed."
-        },
-        "relay_scope": {
-          "$ref": "#/$defs/RelayScope",
-          "description": "The two relay positions this lease is valid at."
-        },
-        "reservation_id": {
-          "$ref": "#/$defs/RelayReservationId",
-          "description": "The reserved block this lease spends from. It is bound for its lifetime to this lease, this\npayer, this pair and this metering boundary; changing any of them takes a new reservation."
-        },
-        "revision": {
-          "$ref": "#/$defs/RelayLeaseRevision",
-          "description": "The revision of this lease. Strictly increasing per lease identity; a relay keeps the\nhighest revision it has seen and refuses anything lower, so a replaced lease cannot be\nrolled back to an earlier ceiling or an earlier deadline."
-        },
-        "source_endpoint_key": {
-          "$ref": "#/$defs/EndpointKey",
-          "description": "The endpoint that may send."
-        }
-      },
-      "required": [
-        "lease_id",
-        "revision",
-        "reservation_id",
-        "source_endpoint_key",
-        "destination_endpoint_key",
-        "direction",
-        "payer",
-        "payer_authorisation",
-        "byte_ceiling",
-        "expires_at_ms",
-        "relay_scope",
-        "metering_relay_instance_id",
-        "metering_role",
-        "grace",
-        "issuer_key"
-      ],
-      "type": "object"
-    },
-    "RelayLeaseAck": {
-      "additionalProperties": false,
-      "description": "A relay's answer to a control request.\n\nAn exact retry of an installation answers with the same state and the same running figures: the\nrelay keeps what it has counted, so re-sending a lease can never restore a spent ceiling.",
-      "properties": {
-        "bytes_consumed": {
-          "$ref": "#/$defs/U64",
-          "description": "The cumulative bytes counted for its reservation so far."
-        },
-        "bytes_remaining": {
-          "$ref": "#/$defs/U64",
-          "description": "The bytes still forwardable under it."
-        },
-        "grace_remaining_ms": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/U64"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The milliseconds of grace left, or null when the pair is not in grace. Section 17 requires\nthe remaining interval to be visible before the relay closes."
-        },
-        "lease_id": {
-          "$ref": "#/$defs/RelayLeaseId",
-          "description": "The lease the request named."
-        },
-        "revision": {
-          "$ref": "#/$defs/RelayLeaseRevision",
-          "description": "The revision the relay now holds."
-        },
-        "state": {
-          "$ref": "#/$defs/RelayLeaseState",
-          "description": "What the relay holds for that lease."
-        }
-      },
-      "required": [
-        "lease_id",
-        "revision",
-        "state",
-        "bytes_consumed",
-        "bytes_remaining",
-        "grace_remaining_ms"
-      ],
-      "type": "object"
-    },
-    "RelayLeaseId": {
-      "description": "One relay lease, covering one endpoint pair for one payer.",
-      "format": "uuid",
-      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-      "type": "string"
-    },
-    "RelayLeaseRequest": {
-      "description": "What the payer's client sends to a relay's control endpoint.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "Install a lease, or replace an installed one with a higher revision.",
-          "properties": {
-            "install": {
-              "additionalProperties": false,
-              "properties": {
-                "lease": {
-                  "$ref": "#/$defs/SignedRelayLease",
-                  "description": "The lease to install. Boxed because a lease is much the larger of the two requests and\nan unboxed variant would make every revocation carry its size."
-                }
-              },
-              "required": [
-                "lease"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "install"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Stop forwarding under a lease and fence traffic that is queued but not yet forwarded.",
-          "properties": {
-            "revoke": {
-              "additionalProperties": false,
-              "properties": {
-                "revocation": {
-                  "$ref": "#/$defs/SignedRelayLeaseRevocation",
-                  "description": "The revocation to apply."
-                }
-              },
-              "required": [
-                "revocation"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "revoke"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "RelayLeaseRevision": {
-      "description": "The revision of one relay lease. Only the issuing service advances it.",
-      "pattern": "^(0|[1-9][0-9]*)$",
-      "type": "string"
-    },
-    "RelayLeaseRevocation": {
-      "additionalProperties": false,
-      "description": "A service instruction to stop forwarding under a lease.\n\nRevocation carries the revision it installs, so it orders against lease installation on one\nscale: a relay that has already seen a higher revision ignores it, and a lease that arrives\nafterwards at a lower revision is ignored in turn.",
-      "properties": {
-        "issued_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the service issued it, in UTC milliseconds."
-        },
-        "issuer_key": {
-          "$ref": "#/$defs/ServiceAdmissionKey",
-          "description": "The service admission key that signs it."
-        },
-        "lease_id": {
-          "$ref": "#/$defs/RelayLeaseId",
-          "description": "The lease to stop forwarding under."
-        },
-        "relay_instance_id": {
-          "$ref": "#/$defs/RelayInstanceId",
-          "description": "The relay instance this revocation is addressed to, so one relay's copy cannot be replayed\nat another."
-        },
-        "revision": {
-          "$ref": "#/$defs/RelayLeaseRevision",
-          "description": "The revision this revocation installs. Strictly higher than the revision it fences."
-        }
-      },
-      "required": [
-        "lease_id",
-        "revision",
-        "relay_instance_id",
-        "issued_at_ms",
-        "issuer_key"
-      ],
-      "type": "object"
-    },
-    "RelayLeaseState": {
-      "description": "What a relay holds for a lease identity after a control request.",
-      "oneOf": [
-        {
-          "const": "installed",
-          "description": "The revision is installed and forwarding.",
-          "type": "string"
-        },
-        {
-          "const": "superseded",
-          "description": "A higher revision replaced this one.",
-          "type": "string"
-        },
-        {
-          "const": "revoked",
-          "description": "The service revoked it.",
-          "type": "string"
-        },
-        {
-          "const": "expired",
-          "description": "Its deadline passed.",
-          "type": "string"
-        },
-        {
-          "const": "exhausted",
-          "description": "Its reserved bytes are spent.",
-          "type": "string"
-        }
-      ]
-    },
-    "RelayReceiptSequence": {
-      "description": "The position of one consumption receipt inside its reservation's sequence.",
-      "pattern": "^(0|[1-9][0-9]*)$",
-      "type": "string"
-    },
-    "RelayRegion": {
-      "description": "The deployment region one relay instance serves.",
-      "maxLength": 256,
-      "minLength": 1,
-      "type": "string"
-    },
-    "RelayRegistrationRevision": {
-      "description": "The revision of one relay instance's registration. Only the instance advances it.",
-      "pattern": "^(0|[1-9][0-9]*)$",
-      "type": "string"
-    },
-    "RelayReservationId": {
-      "description": "One reserved block of relay bytes. Consumption receipts are keyed by it.",
-      "format": "uuid",
-      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-      "type": "string"
-    },
-    "RelayScope": {
-      "additionalProperties": false,
-      "description": "The two relay positions one lease is valid at.\n\nThis is the lease's relay scope. It names positions rather than a set of permitted instances,\nbecause a set says which relays may forward without saying which route they are forwarding on:\na pair could then use a second relay of the set and never pass the boundary that counts. The\ningress position is where the source endpoint's payloads enter the relay tier and the egress\nposition is where they leave it. A single-relay route names the same instance twice, which is\nthe ordinary case.",
-      "properties": {
-        "egress_relay_instance_id": {
-          "$ref": "#/$defs/RelayInstanceId",
-          "description": "The relay instance the destination endpoint is connected to."
-        },
-        "ingress_relay_instance_id": {
-          "$ref": "#/$defs/RelayInstanceId",
-          "description": "The relay instance the source endpoint is connected to."
-        }
-      },
-      "required": [
-        "ingress_relay_instance_id",
-        "egress_relay_instance_id"
-      ],
-      "type": "object"
-    },
     "RemoteDispatchLeaseId": {
       "description": "One remote dispatch lease from the current controller generation.",
       "format": "uuid",
@@ -5167,6 +6154,10 @@
       ],
       "type": "object"
     },
+    "ReservationId": {
+      "$ref": "#/$defs/Uuid",
+      "description": "Identifies one spawn reservation.\n\nThe controller records a reservation durably before it starts anything, and exactly one\nrendezvous per reservation succeeds. A second attempt is rejected, recorded and fences the\nreservation, because two processes claiming one reservation means the host does not know which\nof them owns the session."
+    },
     "ResourceSelectorKind": {
       "description": "Which resource identities a request names and the host resolves before the authority check.\n\nAn attachment's identifier alone is not permission: it selects a resource, and the rights check\nstill runs against the resolved resource.",
       "oneOf": [
@@ -5303,6 +6294,50 @@
       "required": [
         "request_id",
         "outcome"
+      ],
+      "type": "object"
+    },
+    "ResyncReason": {
+      "description": "Why a subscriber must resynchronise.",
+      "oneOf": [
+        {
+          "const": "send_queue_full",
+          "description": "The subscriber's queue reached its bound. The pseudo-terminal read loop is never held for\na slow client.",
+          "type": "string"
+        },
+        {
+          "const": "history_evicted",
+          "description": "The subscriber's cursor fell out of the retained window.",
+          "type": "string"
+        },
+        {
+          "const": "projection_reset",
+          "description": "The canonical grid was replaced, for instance by a buffer switch.",
+          "type": "string"
+        }
+      ]
+    },
+    "ResyncRequired": {
+      "additionalProperties": false,
+      "description": "The event that tells one subscriber to discard its partial state.",
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor the worker is currently at."
+        },
+        "oldest_retained_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The oldest cursor still retained."
+        },
+        "reason": {
+          "$ref": "#/$defs/ResyncReason",
+          "description": "Why."
+        }
+      },
+      "required": [
+        "reason",
+        "cursor",
+        "oldest_retained_cursor"
       ],
       "type": "object"
     },
@@ -5711,11 +6746,290 @@
         }
       ]
     },
-    "ServiceAdmissionKey": {
-      "contentEncoding": "base64url",
-      "description": "A 32-byte Ed25519 service admission public key, which signs relay leases. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
-      "type": "string"
+    "SessionAttachParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.attach`.\n\nThe request does not bypass grants and does not acquire a remote input lease.",
+      "properties": {
+        "claim_geometry": {
+          "description": "Whether this attachment registers a geometry claim. Semantic mode requires false.",
+          "type": "boolean"
+        },
+        "dimensions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Dimensions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The attachment's physical dimensions, required in terminal mode."
+        },
+        "mode": {
+          "$ref": "#/$defs/AttachMode",
+          "description": "What this attachment observes."
+        },
+        "requested": {
+          "description": "The observation and input capabilities the attachment asks for.",
+          "items": {
+            "$ref": "#/$defs/AttachmentCapability"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session to attach to."
+        },
+        "terminal_profile_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The terminal profile this attachment presents."
+        }
+      },
+      "required": [
+        "session_id",
+        "mode",
+        "claim_geometry",
+        "dimensions",
+        "terminal_profile_id",
+        "requested"
+      ],
+      "type": "object"
+    },
+    "SessionAttachResult": {
+      "additionalProperties": false,
+      "description": "The result of `session.attach`.",
+      "properties": {
+        "attachment": {
+          "$ref": "#/$defs/AttachmentSummary",
+          "description": "The new attachment."
+        },
+        "geometry": {
+          "$ref": "#/$defs/GeometryState",
+          "description": "Who owns the geometry after this attachment joined."
+        },
+        "output_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The output cursor this attachment's stream starts from. A client subscribes from a cursor\nbefore it installs a snapshot."
+        }
+      },
+      "required": [
+        "attachment",
+        "geometry",
+        "output_cursor"
+      ],
+      "type": "object"
+    },
+    "SessionCloseParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.close`.",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session to close."
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "SessionCloseResult": {
+      "additionalProperties": false,
+      "description": "The result of `session.close`.\n\nThe initiating request receives this acceptance before the worker's own process can end.\nDuplicate requests return the existing state rather than a second closure.",
+      "properties": {
+        "closure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClosureRecord"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The final record, once closure has finished."
+        },
+        "durability": {
+          "$ref": "#/$defs/Durability",
+          "description": "Whether the closure was recorded durably."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session that is closing or has closed."
+        },
+        "state": {
+          "$ref": "#/$defs/SessionState",
+          "description": "The state at the moment of the reply."
+        }
+      },
+      "required": [
+        "session_id",
+        "state",
+        "durability",
+        "closure"
+      ],
+      "type": "object"
+    },
+    "SessionCreateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.create`.",
+      "properties": {
+        "cwd": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The working directory. Null selects the caller's directory from the snapshot."
+        },
+        "dimensions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Dimensions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The starting geometry. Null uses the invisible default of 120x40."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment to create in."
+        },
+        "environment_snapshot": {
+          "description": "The creator's environment snapshot. The host filters terminal identity and reserved\nKalaReach variables out of it, and execution-context values take precedence over it.",
+          "items": {
+            "$ref": "#/$defs/EnvironmentVariable"
+          },
+          "type": "array"
+        },
+        "presentation": {
+          "$ref": "#/$defs/Presentation",
+          "description": "How the session is presented locally."
+        },
+        "shell": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The shell to launch. Null selects the environment's configured default."
+        },
+        "shell_mode": {
+          "$ref": "#/$defs/ShellMode",
+          "description": "The shell integration mode."
+        },
+        "worker_profile": {
+          "$ref": "#/$defs/WorkerProfile",
+          "description": "How long the worker's execution context should last."
+        }
+      },
+      "required": [
+        "environment_id",
+        "presentation",
+        "shell",
+        "shell_mode",
+        "cwd",
+        "dimensions",
+        "worker_profile",
+        "environment_snapshot"
+      ],
+      "type": "object"
+    },
+    "SessionCreateResult": {
+      "additionalProperties": false,
+      "description": "The result of `session.create`.",
+      "properties": {
+        "deduplicated": {
+          "description": "True when this result was replayed for a repeated create token rather than created now.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The endpoint the creator can attach to without another controller call. Null when the\nsession has already closed, which a repeated create token can return."
+        },
+        "presentation_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProtocolError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The presentation failure, when the session was created and its terminal could not be\nopened. The session above is real and usable; a failed presentation never retries\nexecution and never creates a second session."
+        },
+        "session": {
+          "$ref": "#/$defs/SessionSummary",
+          "description": "The created session."
+        }
+      },
+      "required": [
+        "session",
+        "endpoint",
+        "deduplicated",
+        "presentation_error"
+      ],
+      "type": "object"
+    },
+    "SessionDetachParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.detach`.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment to remove."
+        }
+      },
+      "required": [
+        "attachment_id"
+      ],
+      "type": "object"
+    },
+    "SessionDetachResult": {
+      "additionalProperties": false,
+      "description": "The result of `session.detach`.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment that was removed."
+        },
+        "geometry": {
+          "$ref": "#/$defs/GeometryState",
+          "description": "Who owns the geometry after succession."
+        },
+        "remaining": {
+          "$ref": "#/$defs/U64",
+          "description": "How many attachments remain. A live session may have none."
+        }
+      },
+      "required": [
+        "attachment_id",
+        "geometry",
+        "remaining"
+      ],
+      "type": "object"
     },
     "SessionEpoch": {
       "description": "The session epoch, fixed at 1 in protocol version 1.",
@@ -5727,6 +7041,89 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "SessionListParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.list`.",
+      "properties": {
+        "environment_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EnvironmentId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Restrict to one environment. Null lists every environment the caller may see."
+        },
+        "include_closed": {
+          "description": "Include sessions that have already closed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "environment_id",
+        "include_closed"
+      ],
+      "type": "object"
+    },
+    "SessionListResult": {
+      "additionalProperties": false,
+      "description": "The result of `session.list`.",
+      "properties": {
+        "sessions": {
+          "description": "The sessions, in display-number order.",
+          "items": {
+            "$ref": "#/$defs/SessionSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions"
+      ],
+      "type": "object"
+    },
+    "SessionReadParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.read`.",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session to read."
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "SessionReadResult": {
+      "additionalProperties": false,
+      "description": "The result of `session.read`.",
+      "properties": {
+        "endpoint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The endpoint a local client can attach to, while the session is running."
+        },
+        "session": {
+          "$ref": "#/$defs/SessionSummary",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session",
+        "endpoint"
+      ],
+      "type": "object"
     },
     "SessionRef": {
       "additionalProperties": false,
@@ -5785,6 +7182,156 @@
         {
           "const": "none",
           "description": "No session. The grant covers host-level effects only.",
+          "type": "string"
+        }
+      ]
+    },
+    "SessionState": {
+      "description": "The session lifecycle of section 7.",
+      "oneOf": [
+        {
+          "const": "creating",
+          "description": "The controller has reserved the session and the worker has not yet reported a live shell.",
+          "type": "string"
+        },
+        {
+          "const": "live",
+          "description": "The root shell is running. The session may have no attachments.",
+          "type": "string"
+        },
+        {
+          "const": "closing",
+          "description": "Closure has begun: input is rejected and owned processes are being stopped.",
+          "type": "string"
+        },
+        {
+          "const": "closed",
+          "description": "Closure has finished and the closure record is final.",
+          "type": "string"
+        }
+      ]
+    },
+    "SessionSummary": {
+      "additionalProperties": false,
+      "description": "What a client knows about one session.",
+      "properties": {
+        "application_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApplicationState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the foreground is doing, where the host knows."
+        },
+        "attachment_count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many attachments the session currently has. A live session may have none."
+        },
+        "closure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClosureRecord"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The final record, once the session has closed."
+        },
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the session was created."
+        },
+        "cwd": {
+          "description": "The working directory the root shell started in.",
+          "type": "string"
+        },
+        "desktop": {
+          "$ref": "#/$defs/DesktopBinding",
+          "description": "The login session a desktop-bound worker is tied to."
+        },
+        "dimensions": {
+          "$ref": "#/$defs/Dimensions",
+          "description": "The current canonical geometry."
+        },
+        "display_number": {
+          "$ref": "#/$defs/DisplayNumber",
+          "description": "The local alias."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns it."
+        },
+        "root_process": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessStartIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The root shell's process identity while the session is running."
+        },
+        "session_epoch": {
+          "$ref": "#/$defs/SessionEpoch",
+          "description": "The epoch. Fixed at 1 in this version."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session identity."
+        },
+        "shell_mode": {
+          "$ref": "#/$defs/ShellMode",
+          "description": "How the root shell is integrated. A `native_compat` session is labelled everywhere it is\nreported."
+        },
+        "shell_path": {
+          "description": "The executable actually launched as the root shell.",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/SessionState",
+          "description": "The lifecycle state."
+        },
+        "worker_profile": {
+          "$ref": "#/$defs/WorkerProfile",
+          "description": "How long the worker's execution context lasts."
+        }
+      },
+      "required": [
+        "session_id",
+        "session_epoch",
+        "environment_id",
+        "display_number",
+        "state",
+        "shell_mode",
+        "shell_path",
+        "cwd",
+        "worker_profile",
+        "desktop",
+        "created_at_ms",
+        "dimensions",
+        "attachment_count",
+        "application_state",
+        "root_process",
+        "closure"
+      ],
+      "type": "object"
+    },
+    "ShellMode": {
+      "description": "How the root shell is integrated.",
+      "oneOf": [
+        {
+          "const": "managed",
+          "description": "A KalaReach-qualified shell package with the reader mailbox, the pre-EOF hook and the\nfenced launch transaction.",
+          "type": "string"
+        },
+        {
+          "const": "native_compat",
+          "description": "An explicitly selected stock shell. Create, attach, detach, close, transfer and terminal\npresentation all work. Empty-prompt Ctrl-D, fenced `shell.launch` and authoritative\neditor-buffer observation do not: Ctrl-D follows the shell's own behaviour and can close\nthe session, and `kr detach` remains available.",
           "type": "string"
         }
       ]
@@ -5863,82 +7410,6 @@
       "required": [
         "bundle",
         "transcript",
-        "signature"
-      ],
-      "type": "object"
-    },
-    "SignedRelayConsumptionReceipt": {
-      "additionalProperties": false,
-      "description": "A receipt and the relay instance signature that authenticates it.",
-      "properties": {
-        "receipt": {
-          "$ref": "#/$defs/RelayConsumptionReceipt",
-          "description": "The receipt."
-        },
-        "signature": {
-          "$ref": "#/$defs/Signature64",
-          "description": "The Ed25519 signature over `CBOR([\"kr-relay/receipt/1\", receipt])`, by the registered key\nof the receipt's relay instance."
-        }
-      },
-      "required": [
-        "receipt",
-        "signature"
-      ],
-      "type": "object"
-    },
-    "SignedRelayInstanceRegistration": {
-      "additionalProperties": false,
-      "description": "A registration and the instance signature that proves the host holds the key.\n\nThe operator submits this under service-admin authority. The authority says the submission is\npermitted; the signature says the key being registered is one a relay host actually has, so a\nmistyped key cannot become the key every later receipt is checked against.",
-      "properties": {
-        "registration": {
-          "$ref": "#/$defs/RelayInstanceRegistration",
-          "description": "The registration."
-        },
-        "signature": {
-          "$ref": "#/$defs/Signature64",
-          "description": "The Ed25519 signature over `CBOR([\"kr-relay/instance/1\", registration])`, by the instance\nkey the registration currently holds."
-        }
-      },
-      "required": [
-        "registration",
-        "signature"
-      ],
-      "type": "object"
-    },
-    "SignedRelayLease": {
-      "additionalProperties": false,
-      "description": "A lease and the service admission signature that authorises it.",
-      "properties": {
-        "lease": {
-          "$ref": "#/$defs/RelayLease",
-          "description": "The lease."
-        },
-        "signature": {
-          "$ref": "#/$defs/Signature64",
-          "description": "The Ed25519 signature over `CBOR([\"kr-relay/lease/1\", lease])`, by the lease's issuer key."
-        }
-      },
-      "required": [
-        "lease",
-        "signature"
-      ],
-      "type": "object"
-    },
-    "SignedRelayLeaseRevocation": {
-      "additionalProperties": false,
-      "description": "A revocation and the service admission signature that authorises it.",
-      "properties": {
-        "revocation": {
-          "$ref": "#/$defs/RelayLeaseRevocation",
-          "description": "The revocation."
-        },
-        "signature": {
-          "$ref": "#/$defs/Signature64",
-          "description": "The Ed25519 signature over `CBOR([\"kr-relay/revoke/1\", revocation])`."
-        }
-      },
-      "required": [
-        "revocation",
         "signature"
       ],
       "type": "object"
@@ -6082,30 +7553,113 @@
       ],
       "type": "object"
     },
-    "TeamRole": {
-      "description": "An organisation role, from the least to the most authority.\n\nA role is a label for a grant ceiling. A host authorises from the grants a lease names, never\nfrom the label: [`TeamRole::maximum_grants`] is the most a role may ever carry, and a lease may\nname less.",
+    "SurvivingResource": {
+      "additionalProperties": false,
+      "description": "A resource that intentionally outlives the session.",
+      "properties": {
+        "detail": {
+          "description": "A description for the user.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "What kind of resource it is.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "TerminalGeometryTransferParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `terminal.geometry.transfer`.\n\nThis is the deliberate \"use this terminal's size\" action. Ordinary attach and input takeover\nnever move size ownership.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The eligible attachment that should own the size."
+        },
+        "expected_geometry_epoch": {
+          "$ref": "#/$defs/GeometryEpoch",
+          "description": "The geometry epoch the caller believes is current."
+        }
+      },
+      "required": [
+        "attachment_id",
+        "expected_geometry_epoch"
+      ],
+      "type": "object"
+    },
+    "TerminalPresentationMode": {
+      "description": "How a terminal attachment displays the canonical grid.",
       "oneOf": [
         {
-          "const": "viewer",
-          "description": "Watch a shared session.",
+          "const": "direct",
+          "description": "The attachment's own size matches the canonical grid and it receives the filtered live byte\nstream unchanged.",
           "type": "string"
         },
         {
-          "const": "reviewer",
-          "description": "Watch a shared session and read the diffs and files it selects.",
-          "type": "string"
-        },
-        {
-          "const": "controller",
-          "description": "Take part in a session: input and answers as well as reading.",
-          "type": "string"
-        },
-        {
-          "const": "owner",
-          "description": "Everything a controller may do, plus sharing and closing a session.",
+          "const": "viewport",
+          "description": "The attachment displays a clipped viewport of the canonical grid. A smaller display pans;\na larger one leaves the unused area blank. Nothing is reflowed.",
           "type": "string"
         }
       ]
+    },
+    "TerminalResizeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `terminal.resize`.\n\nOnly the current geometry owner changes the pseudo-terminal.",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/AttachmentId",
+          "description": "The attachment asking for the resize."
+        },
+        "dimensions": {
+          "$ref": "#/$defs/Dimensions",
+          "description": "The new canonical geometry."
+        },
+        "expected_geometry_epoch": {
+          "$ref": "#/$defs/GeometryEpoch",
+          "description": "The geometry epoch the caller believes is current."
+        }
+      },
+      "required": [
+        "attachment_id",
+        "dimensions",
+        "expected_geometry_epoch"
+      ],
+      "type": "object"
+    },
+    "TerminatedProcess": {
+      "additionalProperties": false,
+      "description": "One process the closure terminated.",
+      "properties": {
+        "forced": {
+          "description": "True when the process needed forced termination after the grace period.",
+          "type": "boolean"
+        },
+        "identity": {
+          "$ref": "#/$defs/ProcessStartIdentity",
+          "description": "The process and its start identity, so a reused identifier is not mistaken for it."
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The executable name, for diagnostics."
+        }
+      },
+      "required": [
+        "identity",
+        "name",
+        "forced"
+      ],
+      "type": "object"
     },
     "TimestampMs": {
       "description": "A UTC timestamp in milliseconds, as a decimal string in JSON.",
@@ -6153,6 +7707,265 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "WorkerDescriptor": {
+      "additionalProperties": false,
+      "description": "What the controller publishes so a client can reach a worker without asking the controller.\n\nSection 5 requires this file to be owner-only, published atomically and free of secrets. A\nfilename and a process identifier are hints; the public key here is what a challenge is checked\nagainst, and the identity fields are what the challenge's answer must match.",
+      "properties": {
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot the worker started in."
+        },
+        "display_number": {
+          "$ref": "#/$defs/DisplayNumber",
+          "description": "The local alias."
+        },
+        "endpoint": {
+          "description": "The worker's private endpoint.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the session belongs to."
+        },
+        "process_start_identity": {
+          "$ref": "#/$defs/ProcessStartIdentity",
+          "description": "The worker process and the kernel's record of when it started."
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The protocol version the worker speaks."
+        },
+        "published_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the descriptor was published."
+        },
+        "session_epoch": {
+          "$ref": "#/$defs/SessionEpoch",
+          "description": "The session epoch."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session this worker owns."
+        },
+        "worker_profile": {
+          "$ref": "#/$defs/WorkerProfile",
+          "description": "How long the worker's execution context lasts."
+        },
+        "worker_public_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The public half of the worker's per-session key. The private half exists only in the\nworker's memory."
+        }
+      },
+      "required": [
+        "session_id",
+        "session_epoch",
+        "environment_id",
+        "display_number",
+        "boot_identity",
+        "process_start_identity",
+        "protocol_version",
+        "endpoint",
+        "worker_public_key",
+        "worker_profile",
+        "published_at_ms"
+      ],
+      "type": "object"
+    },
+    "WorkerLaunchSpec": {
+      "additionalProperties": false,
+      "description": "What the controller tells a worker to become, over the private rendezvous channel.\n\nThe job definition that started the worker carries only non-secret facts: the reservation, the\nrendezvous address and the runtime directory. Everything else arrives here, after the worker\nhas proved which reservation it belongs to, so a creator's environment snapshot never sits in\nan argument vector or an environment variable where another process could read it.",
+      "properties": {
+        "controller_generation": {
+          "$ref": "#/$defs/ControllerGeneration",
+          "description": "The generation that spawned this worker."
+        },
+        "controller_public_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The controller's public key, recorded so the worker can check generation tokens."
+        },
+        "create": {
+          "$ref": "#/$defs/SessionCreateParams",
+          "description": "The create request the controller admitted."
+        },
+        "display_number": {
+          "$ref": "#/$defs/DisplayNumber",
+          "description": "The local alias, which also names the worker's endpoint."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the session belongs to."
+        },
+        "release": {
+          "description": "The release string the session reports as its terminal program version.",
+          "type": "string"
+        },
+        "session_epoch": {
+          "$ref": "#/$defs/SessionEpoch",
+          "description": "The session epoch."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the worker will own."
+        }
+      },
+      "required": [
+        "session_id",
+        "session_epoch",
+        "environment_id",
+        "display_number",
+        "create",
+        "controller_public_key",
+        "controller_generation",
+        "release"
+      ],
+      "type": "object"
+    },
+    "WorkerProfile": {
+      "description": "How long a worker's execution context lasts.\n\nThe profile is recorded on every worker. It decides what a logout means: a desktop-bound worker\nis closed with `desktop_lost` when its login-session generation ends, while a headless worker\nsurvives logout where the platform's user service manager does.",
+      "oneOf": [
+        {
+          "const": "desktop_bound",
+          "description": "Bound to the boot identity and the current graphical login-session generation.",
+          "type": "string"
+        },
+        {
+          "const": "headless_user",
+          "description": "Bound to the boot identity and the OS user, independently of a graphical login.",
+          "type": "string"
+        }
+      ]
+    },
+    "WorkerReady": {
+      "additionalProperties": false,
+      "description": "What a worker reports once its root shell is running.",
+      "properties": {
+        "dimensions": {
+          "$ref": "#/$defs/Dimensions",
+          "description": "The geometry the shell started at."
+        },
+        "endpoint": {
+          "description": "The worker's private endpoint.",
+          "type": "string"
+        },
+        "root_process": {
+          "$ref": "#/$defs/ProcessStartIdentity",
+          "description": "The root shell's process identity."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the worker owns."
+        },
+        "shell_path": {
+          "description": "The executable actually launched.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "endpoint",
+        "root_process",
+        "shell_path",
+        "dimensions"
+      ],
+      "type": "object"
+    },
+    "WorkerRendezvous": {
+      "additionalProperties": false,
+      "description": "A worker's startup claim, signed with the key it just generated.",
+      "properties": {
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot the worker started in."
+        },
+        "process_start_identity": {
+          "$ref": "#/$defs/ProcessStartIdentity",
+          "description": "The worker's own process identity, which the controller compares with what the launcher\nreported and with the connecting peer."
+        },
+        "reservation_id": {
+          "$ref": "#/$defs/ReservationId",
+          "description": "The reservation this worker was started for."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the reservation allocated."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The signature over [`rendezvous_elements`]."
+        },
+        "worker_public_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The public half of the worker's new per-session key."
+        }
+      },
+      "required": [
+        "reservation_id",
+        "session_id",
+        "worker_public_key",
+        "boot_identity",
+        "process_start_identity",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "WorkerVerifyChallenge": {
+      "additionalProperties": false,
+      "description": "A fresh challenge sent to a worker's private endpoint.",
+      "properties": {
+        "nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "Thirty-two fresh random bytes. A reused challenge proves nothing."
+        }
+      },
+      "required": [
+        "nonce"
+      ],
+      "type": "object"
+    },
+    "WorkerVerifyProof": {
+      "additionalProperties": false,
+      "description": "A worker's answer to a challenge.\n\nThe verifier checks the signature against the descriptor's public key **and** compares every\nidentity field with the descriptor. A worker that answers with a different session, epoch, boot\nor process is not the worker the descriptor named.",
+      "properties": {
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot the worker is running in."
+        },
+        "endpoint": {
+          "description": "The endpoint the challenge arrived on.",
+          "type": "string"
+        },
+        "process_start_identity": {
+          "$ref": "#/$defs/ProcessStartIdentity",
+          "description": "The worker's process identity."
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The protocol version the worker speaks."
+        },
+        "session_epoch": {
+          "$ref": "#/$defs/SessionEpoch",
+          "description": "The session epoch."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the worker owns."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The signature over [`verify_elements`]."
+        }
+      },
+      "required": [
+        "session_id",
+        "session_epoch",
+        "boot_identity",
+        "process_start_identity",
+        "protocol_version",
+        "endpoint",
+        "signature"
+      ],
+      "type": "object"
+    },
     "WorkflowId": {
       "description": "One automation definition.",
       "format": "uuid",
@@ -6175,6 +7988,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.",
   "properties": {
+    "action_cancel_params": {
+      "$ref": "#/$defs/ActionCancelParams"
+    },
+    "action_cancel_result": {
+      "$ref": "#/$defs/ActionCancelResult"
+    },
+    "action_read_params": {
+      "$ref": "#/$defs/ActionReadParams"
+    },
+    "action_read_result": {
+      "$ref": "#/$defs/ActionReadResult"
+    },
     "action_window": {
       "$ref": "#/$defs/ActionWindow"
     },
@@ -6184,17 +8009,41 @@
     "archive_descriptor": {
       "$ref": "#/$defs/ArchiveDescriptor"
     },
+    "attachment_configure_params": {
+      "$ref": "#/$defs/AttachmentConfigureParams"
+    },
+    "attachment_summary": {
+      "$ref": "#/$defs/AttachmentSummary"
+    },
+    "attachment_viewport_params": {
+      "$ref": "#/$defs/AttachmentViewportParams"
+    },
+    "attachment_viewport_result": {
+      "$ref": "#/$defs/AttachmentViewportResult"
+    },
+    "authority_revision_ack": {
+      "$ref": "#/$defs/AuthorityRevisionAck"
+    },
+    "authority_revision_notice": {
+      "$ref": "#/$defs/AuthorityRevisionNotice"
+    },
     "authority_revision_record": {
       "$ref": "#/$defs/AuthorityRevisionRecord"
     },
     "client_offer": {
       "$ref": "#/$defs/ClientOffer"
     },
+    "closure_record": {
+      "$ref": "#/$defs/ClosureRecord"
+    },
     "connect_reply": {
       "$ref": "#/$defs/ConnectReply"
     },
     "control_frame": {
       "$ref": "#/$defs/ControlFrame"
+    },
+    "controller_generation_token": {
+      "$ref": "#/$defs/ControllerGenerationToken"
     },
     "direct_challenge": {
       "$ref": "#/$defs/DirectChallenge"
@@ -6205,8 +8054,38 @@
     "envelope_plaintext": {
       "$ref": "#/$defs/EnvelopePlaintext"
     },
+    "environment_list_result": {
+      "$ref": "#/$defs/EnvironmentListResult"
+    },
+    "events_snapshot_params": {
+      "$ref": "#/$defs/EventsSnapshotParams"
+    },
+    "events_snapshot_result": {
+      "$ref": "#/$defs/EventsSnapshotResult"
+    },
+    "events_subscribe_params": {
+      "$ref": "#/$defs/EventsSubscribeParams"
+    },
+    "events_subscribe_result": {
+      "$ref": "#/$defs/EventsSubscribeResult"
+    },
+    "forwarded_mutation": {
+      "$ref": "#/$defs/ForwardedMutation"
+    },
+    "generation_accepted": {
+      "$ref": "#/$defs/GenerationAccepted"
+    },
+    "generation_challenge": {
+      "$ref": "#/$defs/GenerationChallenge"
+    },
     "generation_checkpoint": {
       "$ref": "#/$defs/GenerationCheckpoint"
+    },
+    "geometry_result": {
+      "$ref": "#/$defs/GeometryResult"
+    },
+    "geometry_state": {
+      "$ref": "#/$defs/GeometryState"
     },
     "grant": {
       "$ref": "#/$defs/Grant"
@@ -6214,15 +8093,24 @@
     "hello_reply": {
       "$ref": "#/$defs/HelloReply"
     },
+    "history_page_params": {
+      "$ref": "#/$defs/HistoryPageParams"
+    },
+    "history_page_result": {
+      "$ref": "#/$defs/HistoryPageResult"
+    },
+    "host_doctor_result": {
+      "$ref": "#/$defs/HostDoctorResult"
+    },
+    "host_info_result": {
+      "$ref": "#/$defs/HostInfoResult"
+    },
     "host_selection": {
       "$ref": "#/$defs/HostSelection"
     },
     "identifiers": {
       "description": "Every identifier in the identity and object model. This is a vocabulary rather than a message: it exists so each identifier has one named type.",
       "properties": {
-        "account_id": {
-          "$ref": "#/$defs/AccountId"
-        },
         "action_id": {
           "$ref": "#/$defs/ActionId"
         },
@@ -6358,14 +8246,8 @@
         "pairing_sequence": {
           "$ref": "#/$defs/PairingSequence"
         },
-        "payer_authorisation_id": {
-          "$ref": "#/$defs/PayerAuthorisationId"
-        },
         "plugin_id": {
           "$ref": "#/$defs/PluginId"
-        },
-        "policy_key_revision": {
-          "$ref": "#/$defs/PolicyKeyRevision"
         },
         "project_repository_id": {
           "$ref": "#/$defs/ProjectRepositoryId"
@@ -6390,27 +8272,6 @@
         },
         "raw_uuid": {
           "$ref": "#/$defs/Uuid"
-        },
-        "relay_instance_id": {
-          "$ref": "#/$defs/RelayInstanceId"
-        },
-        "relay_lease_id": {
-          "$ref": "#/$defs/RelayLeaseId"
-        },
-        "relay_lease_revision": {
-          "$ref": "#/$defs/RelayLeaseRevision"
-        },
-        "relay_receipt_sequence": {
-          "$ref": "#/$defs/RelayReceiptSequence"
-        },
-        "relay_region": {
-          "$ref": "#/$defs/RelayRegion"
-        },
-        "relay_registration_revision": {
-          "$ref": "#/$defs/RelayRegistrationRevision"
-        },
-        "relay_reservation_id": {
-          "$ref": "#/$defs/RelayReservationId"
         },
         "remote_dispatch_lease_id": {
           "$ref": "#/$defs/RemoteDispatchLeaseId"
@@ -6454,8 +8315,35 @@
       },
       "type": "object"
     },
-    "membership_lease": {
-      "$ref": "#/$defs/MembershipLease"
+    "input_acquire_params": {
+      "$ref": "#/$defs/InputAcquireParams"
+    },
+    "input_acquire_result": {
+      "$ref": "#/$defs/InputAcquireResult"
+    },
+    "input_interrupt_params": {
+      "$ref": "#/$defs/InputInterruptParams"
+    },
+    "input_lease_result": {
+      "$ref": "#/$defs/InputLeaseResult"
+    },
+    "input_lease_state": {
+      "$ref": "#/$defs/InputLeaseState"
+    },
+    "input_release_params": {
+      "$ref": "#/$defs/InputReleaseParams"
+    },
+    "input_write_params": {
+      "$ref": "#/$defs/InputWriteParams"
+    },
+    "input_write_result": {
+      "$ref": "#/$defs/InputWriteResult"
+    },
+    "local_hello": {
+      "$ref": "#/$defs/LocalHello"
+    },
+    "local_hello_ack": {
+      "$ref": "#/$defs/LocalHelloAck"
     },
     "method_entry": {
       "$ref": "#/$defs/MethodEntry"
@@ -6465,6 +8353,9 @@
     },
     "notification": {
       "$ref": "#/$defs/Notification"
+    },
+    "output_event": {
+      "$ref": "#/$defs/OutputEvent"
     },
     "owner_confirmation_proof": {
       "$ref": "#/$defs/OwnerConfirmationProof"
@@ -6477,9 +8368,6 @@
     },
     "pair_status": {
       "$ref": "#/$defs/PairStatus"
-    },
-    "policy_authority": {
-      "$ref": "#/$defs/PolicyAuthority"
     },
     "proposed_grant": {
       "$ref": "#/$defs/ProposedGrant"
@@ -6499,23 +8387,14 @@
     "recovery_kit": {
       "$ref": "#/$defs/RecoveryKit"
     },
-    "relay_consumption_ack": {
-      "$ref": "#/$defs/RelayConsumptionAck"
-    },
-    "relay_consumption_report": {
-      "$ref": "#/$defs/RelayConsumptionReport"
-    },
-    "relay_lease_ack": {
-      "$ref": "#/$defs/RelayLeaseAck"
-    },
-    "relay_lease_request": {
-      "$ref": "#/$defs/RelayLeaseRequest"
-    },
     "request": {
       "$ref": "#/$defs/Request"
     },
     "response": {
       "$ref": "#/$defs/Response"
+    },
+    "resync_required": {
+      "$ref": "#/$defs/ResyncRequired"
     },
     "revocation_acknowledgement": {
       "$ref": "#/$defs/RevocationAcknowledgement"
@@ -6526,8 +8405,47 @@
     "sealed_envelope": {
       "$ref": "#/$defs/SealedEnvelope"
     },
+    "session_attach_params": {
+      "$ref": "#/$defs/SessionAttachParams"
+    },
+    "session_attach_result": {
+      "$ref": "#/$defs/SessionAttachResult"
+    },
+    "session_close_params": {
+      "$ref": "#/$defs/SessionCloseParams"
+    },
+    "session_close_result": {
+      "$ref": "#/$defs/SessionCloseResult"
+    },
+    "session_create_params": {
+      "$ref": "#/$defs/SessionCreateParams"
+    },
+    "session_create_result": {
+      "$ref": "#/$defs/SessionCreateResult"
+    },
+    "session_detach_params": {
+      "$ref": "#/$defs/SessionDetachParams"
+    },
+    "session_detach_result": {
+      "$ref": "#/$defs/SessionDetachResult"
+    },
+    "session_list_params": {
+      "$ref": "#/$defs/SessionListParams"
+    },
+    "session_list_result": {
+      "$ref": "#/$defs/SessionListResult"
+    },
+    "session_read_params": {
+      "$ref": "#/$defs/SessionReadParams"
+    },
+    "session_read_result": {
+      "$ref": "#/$defs/SessionReadResult"
+    },
     "session_ref": {
       "$ref": "#/$defs/SessionRef"
+    },
+    "session_summary": {
+      "$ref": "#/$defs/SessionSummary"
     },
     "signed_archive_manifest": {
       "$ref": "#/$defs/SignedArchiveManifest"
@@ -6538,14 +8456,32 @@
     "signed_host_bundle": {
       "$ref": "#/$defs/SignedHostBundle"
     },
-    "signed_relay_consumption_receipt": {
-      "$ref": "#/$defs/SignedRelayConsumptionReceipt"
-    },
-    "signed_relay_instance_registration": {
-      "$ref": "#/$defs/SignedRelayInstanceRegistration"
-    },
     "stream_header": {
       "$ref": "#/$defs/StreamHeader"
+    },
+    "terminal_geometry_transfer_params": {
+      "$ref": "#/$defs/TerminalGeometryTransferParams"
+    },
+    "terminal_resize_params": {
+      "$ref": "#/$defs/TerminalResizeParams"
+    },
+    "worker_descriptor": {
+      "$ref": "#/$defs/WorkerDescriptor"
+    },
+    "worker_launch_spec": {
+      "$ref": "#/$defs/WorkerLaunchSpec"
+    },
+    "worker_ready": {
+      "$ref": "#/$defs/WorkerReady"
+    },
+    "worker_rendezvous": {
+      "$ref": "#/$defs/WorkerRendezvous"
+    },
+    "worker_verify_challenge": {
+      "$ref": "#/$defs/WorkerVerifyChallenge"
+    },
+    "worker_verify_proof": {
+      "$ref": "#/$defs/WorkerVerifyProof"
     }
   },
   "title": "KalaReach protocol",
