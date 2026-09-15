@@ -8,6 +8,12 @@
 //! [`crate::codec::FrameWriter::set_priority`]. Admission is ours: [`StreamBudget`] refuses a new
 //! bulk stream, or a write that would push the queue past its ceiling, before anything is sent.
 //! One keystroke behind a file transfer is the case both exist for.
+//!
+//! What the budget counts is what the application has handed the connection and not yet finished
+//! writing, framing included. What it cannot count is what the connection has accepted and the peer
+//! has not yet acknowledged: QUIC holds those bytes in the connection's send window, and nothing
+//! iroh exposes says when they leave it. Priority is what keeps control ahead of bulk while the
+//! window has capacity; the budget is what stops the application filling it faster than it drains.
 
 use std::sync::{Arc, Mutex};
 
@@ -77,11 +83,12 @@ pub struct BulkLimits {
     pub max_queued_bytes: usize,
 }
 
-/// How much of the peer's send budget is kept back for control and input.
+/// How much of the peer's declared send budget the application never hands to a bulk transfer.
 ///
-/// Section 23 requires that bulk streams cannot consume the entire send budget. The connection's
-/// own send window is that budget; this is the part of it a bulk transfer may never occupy, so a
-/// keystroke or a receipt always has somewhere to go.
+/// Section 23 requires that bulk streams cannot consume the entire send budget. This is the part of
+/// that budget the application will not give them. It is not a reservation inside the connection:
+/// bytes the connection has already accepted still occupy its window until the peer acknowledges
+/// them, and the transport has no way to observe when they drain.
 pub const CONTROL_RESERVE_BYTES: usize = 1024 * 1024;
 
 impl Default for BulkLimits {
@@ -333,7 +340,7 @@ mod tests {
         assert_eq!(limits.max_queued_bytes, 7 * 1024 * 1024);
         assert!(
             limits.max_queued_bytes + CONTROL_RESERVE_BYTES <= MAX_SEND_QUEUE_BYTES,
-            "bulk traffic never occupies the whole send budget"
+            "the application never hands a transfer the whole send budget"
         );
     }
 }

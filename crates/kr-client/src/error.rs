@@ -42,6 +42,15 @@ pub enum ClientError {
         /// The negotiated bound.
         limit: usize,
     },
+    /// This client already holds as many unresolved actions as it will track.
+    ///
+    /// An unresolved action is never forgotten, so a client that cannot reach its host eventually
+    /// stops submitting rather than accumulating uncertainty without bound.
+    #[error("{limit} actions are already unresolved")]
+    TooManyUnresolvedActions {
+        /// The bound.
+        limit: usize,
+    },
     /// The host has not issued an action window for this connection.
     #[error("no action window is current")]
     NoActionWindow,
@@ -75,9 +84,9 @@ impl ClientError {
             Self::Transport(error) => error.to_protocol_error().code,
             Self::Cbor(_) | Self::WrongEffect { .. } => ErrorCode::InvalidArgument,
             Self::UnsupportedVersion { .. } => ErrorCode::UnsupportedSchema,
-            Self::TooManyOutstandingMutations { .. } | Self::NoActionWindow => {
-                ErrorCode::ResourceUnavailable
-            }
+            Self::TooManyOutstandingMutations { .. }
+            | Self::TooManyUnresolvedActions { .. }
+            | Self::NoActionWindow => ErrorCode::ResourceUnavailable,
             Self::ConnectionEnded => ErrorCode::ResourceUnavailable,
             Self::SubmissionUncertain { .. } => ErrorCode::OutcomeUnknown,
             Self::ResyncRequired => ErrorCode::ResyncRequired,

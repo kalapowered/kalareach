@@ -148,10 +148,16 @@ impl StreamCursors {
         // starts at the sequence after its base. Then the received position is the end of that run,
         // and the next event is contiguous rather than a gap. A run that starts anywhere else says
         // nothing about this snapshot, and the snapshot stands alone.
+        // The run continues the snapshot when it covers everything after the base and reaches at
+        // least as far: it may start before the base, because a snapshot can repeat events the run
+        // already carried, and it may start exactly one past it. Anything that leaves a hole
+        // between the base and the run's start says nothing about this snapshot.
         let queued = self
             .since_discard
             .remove(stream_id)
-            .filter(|(first, _)| first.get() == sequence.get().saturating_add(1))
+            .filter(|(first, last)| {
+                first.get() <= sequence.get().saturating_add(1) && last.get() >= sequence.get()
+            })
             .map(|(_, last)| last);
         let received = queued.unwrap_or(sequence);
         let received = self
@@ -494,6 +500,22 @@ mod tests {
 
         // The snapshot's base is 10, so those two continue it and 13 is the next event, not a gap.
         cursors.installed_snapshot(&stream_id, EventSequence::new(10));
+        cursors.applied(&stream_id, EventSequence::new(12));
+        assert_eq!(cursors.accept(&event(&stream_id, 13)), Delivery::Received);
+        assert_eq!(cursors.position(&stream_id), Some(EventSequence::new(12)));
+    }
+
+    #[test]
+    fn a_snapshot_that_overlaps_the_queued_events_still_continues_them() {
+        let mut cursors = StreamCursors::new();
+        let stream_id = stream("session:1");
+        cursors.discard(&stream_id);
+        cursors.accept(&event(&stream_id, 11));
+        cursors.accept(&event(&stream_id, 11));
+        cursors.accept(&event(&stream_id, 12));
+
+        // The snapshot's base is 11, which the run already carried. Event 12 still continues it.
+        cursors.installed_snapshot(&stream_id, EventSequence::new(11));
         cursors.applied(&stream_id, EventSequence::new(12));
         assert_eq!(cursors.accept(&event(&stream_id, 13)), Delivery::Received);
         assert_eq!(cursors.position(&stream_id), Some(EventSequence::new(12)));

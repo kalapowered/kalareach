@@ -97,7 +97,7 @@ impl HostHandler for TestHandler {
                     std::mem::forget(stream);
                 }
             });
-            while let Ok(Some(_frame)) = session.control.recv().await {}
+            while session.control.recv().await.is_some() {}
             accepting.abort();
         })
     }

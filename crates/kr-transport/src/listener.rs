@@ -227,7 +227,7 @@ pub trait HostHandler: PairedDirectory + Send + Sync + 'static {
 #[derive(Debug)]
 pub struct ControlChannel {
     writer: Arc<Mutex<FrameWriter>>,
-    reader: FrameReader,
+    frames: tokio::sync::mpsc::Receiver<ControlFrame>,
     lost: Arc<tokio::sync::Notify>,
 }
 
@@ -246,20 +246,14 @@ impl ControlChannel {
         outcome
     }
 
-    /// Reads the next control frame, or `None` when the peer ended the stream.
+    /// Returns the next control frame, or `None` once the stream has ended.
     ///
-    /// The end of the stream, however it comes, is reported to the connection's supervisor before
-    /// this returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns a framing error when the frame is refused.
-    pub async fn recv(&mut self) -> Result<Option<ControlFrame>> {
-        let outcome = self.reader.read_message().await;
-        if !matches!(outcome, Ok(Some(_))) {
-            self.lost.notify_waiters();
-        }
-        outcome
+    /// The stream is read by the connection itself, not by this call: a handler that is waiting on
+    /// a worker must not be what decides whether the control stream is still alive. Frames are
+    /// queued for the handler up to [`CONTROL_QUEUE_DEPTH`]; a handler that falls that far behind
+    /// loses the connection rather than holding the transport open.
+    pub async fn recv(&mut self) -> Option<ControlFrame> {
+        self.frames.recv().await
     }
 
     /// Returns a handle that can send without holding the channel.
@@ -605,11 +599,18 @@ async fn serve_authorised<H: HostHandler>(
         authorised.selection.limits,
     ));
     let lost = Arc::new(tokio::sync::Notify::new());
+    let (frames_in, frames) = tokio::sync::mpsc::channel(CONTROL_QUEUE_DEPTH);
     let control = ControlChannel {
         writer: Arc::new(Mutex::new(authorised.control_writer)),
-        reader: authorised.control_reader,
+        frames,
         lost: Arc::clone(&lost),
     };
+    let control_reader = tokio::spawn(control_read_loop(
+        authorised.control_reader,
+        frames_in,
+        connection.clone(),
+        Arc::clone(&lost),
+    ));
     // While this flag is set the keepalive may issue a window. The guard clears it before it
     // retires the connection, and the keepalive retires any window it issued after the flag was
     // cleared, so no window can outlive the connection whichever order the two run in.
@@ -621,6 +622,7 @@ async fn serve_authorised<H: HostHandler>(
         windows: Arc::clone(&state.windows),
         connection_id,
         keepalive: None,
+        control_reader: None,
         issuing: Arc::clone(&issuing),
         connection: connection.clone(),
     };
@@ -645,6 +647,7 @@ async fn serve_authorised<H: HostHandler>(
     // the host's handler, a cancellation of this task, or the connection ending underneath it.
     let mut cleanup = cleanup;
     cleanup.keepalive = Some(keepalive);
+    cleanup.control_reader = Some(control_reader);
 
     let session = AuthorisedSession {
         connection: connection.clone(),
@@ -684,6 +687,7 @@ struct ConnectionCleanup {
     windows: Arc<ActionWindowIssuer>,
     connection_id: ConnectionId,
     keepalive: Option<tokio::task::JoinHandle<()>>,
+    control_reader: Option<tokio::task::JoinHandle<()>>,
     issuing: Arc<std::sync::atomic::AtomicBool>,
     connection: Connection,
 }
@@ -698,11 +702,44 @@ impl Drop for ConnectionCleanup {
         if let Some(keepalive) = self.keepalive.take() {
             keepalive.abort();
         }
+        if let Some(control_reader) = self.control_reader.take() {
+            control_reader.abort();
+        }
         self.connection
             .close(CONTROL_LOST.into(), b"the connection ended");
         self.streams.revoke_all();
         self.windows.retire_connection(self.connection_id);
     }
+}
+
+/// How many control frames the connection holds for a handler that has not read them yet.
+///
+/// Section 9's rule for a slow peer applies to a slow handler too: it is told, rather than allowed
+/// to hold the read loop. A handler this far behind loses its connection.
+pub const CONTROL_QUEUE_DEPTH: usize = 64;
+
+/// Reads the control stream for one connection, whatever its handler is doing.
+///
+/// This is what makes the end of the control stream a fact about the connection rather than about
+/// the handler's progress: section 23 gives that end a consequence, and the consequence cannot wait
+/// for a handler that is blocked on a worker.
+async fn control_read_loop(
+    mut reader: FrameReader,
+    frames: tokio::sync::mpsc::Sender<ControlFrame>,
+    connection: Connection,
+    lost: Arc<tokio::sync::Notify>,
+) {
+    while let Ok(Some(frame)) = reader.read_message::<ControlFrame>().await {
+        match frames.try_send(frame) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                connection.close(CONTROL_LOST.into(), b"the control queue overflowed");
+                break;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+        }
+    }
+    lost.notify_waiters();
 }
 
 /// The QUIC application error code an unpaired connection is closed with when pairing is not open.

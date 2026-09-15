@@ -687,3 +687,41 @@ async fn a_cancelled_mutation_returns_its_place_in_the_outstanding_bound() {
     session.close();
     serving.abort();
 }
+
+#[tokio::test]
+async fn an_unsettled_submission_carries_the_intent_it_was_made_for() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    let receipt = session
+        .mutate(
+            Method::SessionCreate,
+            ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("a receipt");
+
+    // The receipt was `accepted`, which is not terminal, so the action is still unsettled and the
+    // record says which operation it was rather than only which identifier.
+    let submitted = session.submitted_actions().await;
+    assert_eq!(submitted.len(), 1);
+    assert_eq!(submitted[0].action_id, receipt.action_id);
+    assert_eq!(submitted[0].method, Method::SessionCreate);
+    assert_eq!(
+        submitted[0].target.environment_id,
+        EnvironmentId::new(Uuid::from_bytes([9; 16]))
+    );
+
+    let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
+    assert_eq!(carried.unresolved_actions(), vec![receipt.action_id]);
+
+    session.close();
+    serving.abort();
+}

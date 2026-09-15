@@ -15,7 +15,7 @@
 //! * the current action window is whatever the host last issued, and the host renews it on the live
 //!   connection without being asked.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -63,6 +63,23 @@ struct Waiters {
     ended: bool,
 }
 
+/// One mutation this client sent and has not seen settled.
+///
+/// The identifier alone is not enough to act on: a person asking what happened needs to know which
+/// intent is uncertain, and two cancelled calls leave two identifiers that would otherwise be
+/// indistinguishable. The record is immutable, and it is what a reconnect carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmittedAction {
+    /// The durable operation identity.
+    pub action_id: ActionId,
+    /// The method it asked for.
+    pub method: Method,
+    /// The exact subject it named.
+    pub target: ActionTarget,
+    /// The request it was sent as, which correlates the host's answer.
+    pub request_id: RequestId,
+}
+
 /// What this client knows about its own mutations.
 ///
 /// `correlations` is what lets the reader settle an action whose caller has gone: a correlated
@@ -70,7 +87,7 @@ struct Waiters {
 #[derive(Clone, Debug, Default)]
 struct Outcomes {
     receipts: ReceiptTracker,
-    submitted: BTreeSet<ActionId>,
+    submitted: BTreeMap<ActionId, SubmittedAction>,
     correlations: HashMap<RequestId, ActionId>,
 }
 
@@ -81,7 +98,29 @@ impl Outcomes {
             self.submitted.remove(&action_id);
         }
     }
+
+    /// Records one submission, or refuses when too many are already unresolved.
+    fn submit(&mut self, action: SubmittedAction) -> Result<()> {
+        if self.submitted.len() >= MAX_UNRESOLVED_ACTIONS
+            && !self.submitted.contains_key(&action.action_id)
+        {
+            return Err(ClientError::TooManyUnresolvedActions {
+                limit: MAX_UNRESOLVED_ACTIONS,
+            });
+        }
+        self.correlations
+            .insert(action.request_id, action.action_id);
+        self.submitted.insert(action.action_id, action);
+        Ok(())
+    }
 }
+
+/// How many of this client's actions may be unresolved at once.
+///
+/// An unresolved action is one whose outcome nobody knows, and section 9 forbids forgetting one.
+/// The bound is what stops "never forget" becoming "grow for ever": a client that has this many
+/// uncertain actions has a host it cannot reach, and submitting more would only add to the pile.
+pub const MAX_UNRESOLVED_ACTIONS: usize = 1024;
 
 /// The shared state of one connection.
 #[derive(Debug)]
@@ -196,14 +235,14 @@ impl Session {
     ///
     /// A reconnecting client asks the host about these. It never resubmits one: section 9 forbids
     /// dispatching an identifier again because its receipt is incomplete.
-    pub async fn submitted_actions(&self) -> Vec<ActionId> {
+    pub async fn submitted_actions(&self) -> Vec<SubmittedAction> {
         self.state
             .outcomes
             .lock()
             .await
             .submitted
-            .iter()
-            .copied()
+            .values()
+            .cloned()
             .collect()
     }
 
@@ -211,11 +250,11 @@ impl Session {
     ///
     /// A reconnect takes both in one step: a receipt that arrives between two separate reads would
     /// be missing from one and already removed from the other.
-    pub async fn outcomes(&self) -> (ReceiptTracker, Vec<ActionId>) {
+    pub async fn outcomes(&self) -> (ReceiptTracker, Vec<SubmittedAction>) {
         let outcomes = self.state.outcomes.lock().await;
         (
             outcomes.receipts.clone(),
-            outcomes.submitted.iter().copied().collect(),
+            outcomes.submitted.values().cloned().collect(),
         )
     }
 
@@ -344,6 +383,7 @@ impl Session {
         let action_id = ActionId::new(kr_transport::random::fresh_uuid_v4()?);
         let request_id = self.next_request_id();
         let waiter = self.register(request_id)?;
+        let target_record = target.clone();
         let mutation = MutationRequest {
             request_id,
             method: method.into(),
@@ -375,11 +415,12 @@ impl Session {
         // Recorded before the send: once the frame is on the wire the host may dispatch it, and a
         // client that cannot name the action cannot ask what happened to it. The correlation goes
         // in at the same time, so the reader can settle this action even if this caller goes away.
-        {
-            let mut outcomes = self.state.outcomes.lock().await;
-            outcomes.submitted.insert(action_id);
-            outcomes.correlations.insert(request_id, action_id);
-        }
+        self.state.outcomes.lock().await.submit(SubmittedAction {
+            action_id,
+            method,
+            target: target_record,
+            request_id,
+        })?;
         if self.transport.send(&frame).await.is_err() {
             // The frame may or may not have reached the host, so the action stays on the pending
             // list and the caller is told the outcome is unknown.

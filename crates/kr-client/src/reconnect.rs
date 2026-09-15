@@ -26,9 +26,11 @@ pub struct ClientState {
     pub receipts: ReceiptTracker,
     /// Actions that were sent and whose outcome the client never saw settled.
     ///
-    /// These are exactly the ones a receipt tracker cannot name, because no receipt arrived. The
-    /// next connection asks the host what became of them; it never submits them again.
-    pub submitted: Vec<kr_protocol::ids::ActionId>,
+    /// These are exactly the ones a receipt tracker cannot name, because no receipt arrived. Each
+    /// carries the intent it was submitted for, so a person can be told which operation is
+    /// uncertain rather than which identifier is. The next connection asks the host what became of
+    /// them; it never submits them again.
+    pub submitted: Vec<crate::session::SubmittedAction>,
     /// What the ended connection left uncertain, when it had an input lane.
     pub interruption: Option<InputInterruption>,
 }
@@ -65,9 +67,9 @@ impl ClientState {
     #[must_use]
     pub fn unresolved_actions(&self) -> Vec<kr_protocol::ids::ActionId> {
         let mut actions = self.receipts.unresolved();
-        for action_id in &self.submitted {
-            if !actions.contains(action_id) {
-                actions.push(*action_id);
+        for action in &self.submitted {
+            if !actions.contains(&action.action_id) {
+                actions.push(action.action_id);
             }
         }
         actions.sort_unstable();

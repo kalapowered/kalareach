@@ -150,9 +150,13 @@ impl DataStream {
         }
         // The queue ceiling exists so a transfer cannot consume the whole send budget and leave a
         // keystroke waiting. It is charged here, where the bytes are actually handed to the
-        // connection, and released when the write completes.
+        // connection, and released when the write completes. The charge covers the complete frame,
+        // its length prefix included, because that is what the connection is given.
+        let framed = payload
+            .len()
+            .saturating_add(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN);
         let _reservation = match class_of(self.header.kind) {
-            StreamClass::Bulk => Some(self.budget.reserve(payload.len())?),
+            StreamClass::Bulk => Some(self.budget.reserve(framed)?),
             _ => None,
         };
         let writer = self

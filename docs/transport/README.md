@@ -257,7 +257,11 @@ left unacknowledged is reported as an interruption, not resent.
 
 The client restores state through cursors and receipts. `Restoration` enforces the order, and
 refuses a step taken out of it: subscribe from the cursor *first*, then install the snapshot the
-subscription returned, then apply the queued updates.
+subscription returned, then apply the queued updates. The steps are the consumer's to take: the
+session tracks positions and delivers events, and the consumer calls `Session::applied`,
+`Session::installed_snapshot` and `Session::discard_stream` as it folds them into its state. A
+`RESYNC_REQUIRED` answer is returned as `ClientError::ResyncRequired`; discarding the stream it
+names is the consumer's call, because only the consumer knows which stream it asked about.
 
 Receiving an event is not applying it. The session records what arrived; a consumer records what it
 folded into its state, and only that moves the position a reconnect subscribes from. An event that
@@ -265,10 +269,13 @@ was delivered and never applied arrives again rather than being skipped. A gap i
 `RESYNC_REQUIRED` from the host, leaves the stream owing a snapshot: nothing it delivers establishes
 a position until one is installed.
 
-Receipts are carried across, and so are the identifiers of actions that were sent without any
-receipt arriving, which is the one case a receipt tracker cannot name. A client reports both as
-unresolved and asks the host what became of them; it never redispatches an action whose receipt is
-incomplete.
+Receipts are carried across, and so are the actions that were sent without any receipt arriving,
+which is the one case a receipt tracker cannot name. Each of those carries the intent it was
+submitted for — the method and the exact subject — so a person can be told which operation is
+uncertain rather than which identifier is. A client reports both as unresolved and asks the host
+what became of them; it never redispatches an action whose receipt is incomplete. It stops
+submitting once 1,024 actions are unresolved, because an unresolved action is never forgotten and a
+client that cannot reach its host would otherwise accumulate uncertainty without bound.
 
 ## Actor envelopes
 
