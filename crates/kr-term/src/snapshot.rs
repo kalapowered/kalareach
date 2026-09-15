@@ -237,6 +237,16 @@ pub struct Delta {
     pub cursor: CursorState,
     /// Modes that changed since the base.
     pub modes: Vec<ModeEntry>,
+    /// The scroll region, when the presentation state changed since the base.
+    pub margins: Option<Margins>,
+    /// The current graphic rendition, when the presentation state changed since the base.
+    pub rendition: Option<Rendition>,
+    /// The tab stops, when the presentation state changed since the base.
+    pub tab_stops: Option<Vec<u32>>,
+    /// The designated character sets, when the presentation state changed since the base.
+    pub charsets: Option<Charsets>,
+    /// Hyperlink ranges in the rows carried here.
+    pub hyperlinks: Vec<HyperlinkRange>,
     /// The titles, when they changed since the base.
     pub title: Option<TitleEntry>,
     /// The keyboard negotiation, when it changed since the base.

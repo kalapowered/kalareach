@@ -211,13 +211,18 @@ fn a_delta_names_its_base_and_carries_only_what_changed() {
     let base = engine.output_cursor();
 
     // Nothing has changed since the base, so the delta is empty but valid.
-    let delta: Delta = engine.delta(base).expect("the base is inside the window");
+    let generation = engine.projection_generation();
+    let delta: Delta = engine
+        .delta(base, generation)
+        .expect("the base is inside the window");
     assert_eq!(delta.base_cursor, base);
     assert!(delta.rows.is_empty());
 
     // One more line changes one row, and a mode change travels with it.
     engine.feed(b"\x1b[?25lsecond", 0);
-    let delta = engine.delta(base).expect("still inside the window");
+    let delta = engine
+        .delta(base, generation)
+        .expect("still inside the window");
     assert!(!delta.rows.is_empty(), "the changed row is carried");
     assert!(
         delta
@@ -229,12 +234,14 @@ fn a_delta_names_its_base_and_carries_only_what_changed() {
     assert_eq!(delta.next_cursor, engine.output_cursor());
 
     // A base the engine no longer holds is refused.
-    let error = engine.delta(base + 1).expect_err("gap");
+    let error = engine.delta(base + 1, generation).expect_err("gap");
     assert!(matches!(error, TermError::CursorGap { .. }));
 
     // So is a base from before a projection reset.
     engine.feed(b"\x1b[?1049h", 0);
-    let error = engine.delta(base).expect_err("the projection was reset");
+    let error = engine
+        .delta(base, generation)
+        .expect_err("the projection was reset");
     assert!(matches!(error, TermError::CursorGap { .. }));
 }
 
@@ -650,12 +657,13 @@ fn a_delta_belongs_to_the_base_it_names() {
     engine.feed(b"\x1b[?25l", 0);
 
     // The client on the newer base sees only the mode change.
-    let recent = engine.delta(newer).expect("inside the window");
+    let generation = engine.projection_generation();
+    let recent = engine.delta(newer, generation).expect("inside the window");
     assert!(recent.title.is_none(), "the title changed before this base");
     assert!(recent.modes.iter().any(|entry| entry.mode == 25));
 
     // The client on the older base still sees the title, after the other client read.
-    let behind = engine.delta(older).expect("inside the window");
+    let behind = engine.delta(older, generation).expect("inside the window");
     assert_eq!(
         behind.title.as_ref().map(|entry| entry.window.as_str()),
         Some("renamed"),
@@ -664,7 +672,7 @@ fn a_delta_belongs_to_the_base_it_names() {
     assert!(behind.modes.iter().any(|entry| entry.mode == 25));
 
     // Reading again returns the same answer: nothing was consumed.
-    let again = engine.delta(older).expect("inside the window");
+    let again = engine.delta(older, generation).expect("inside the window");
     assert_eq!(behind.title, again.title);
 }
 
@@ -694,7 +702,9 @@ fn a_snapshot_returns_the_output_its_own_settling_made() {
     );
 
     // A delta from the snapshot's own cursor reports nothing outstanding.
-    let delta = engine.delta(snapshot.output_cursor).expect("its own base");
+    let delta = engine
+        .delta(snapshot.output_cursor, snapshot.projection_generation)
+        .expect("its own base");
     assert!(delta.rows.is_empty(), "the snapshot already carried it");
 }
 
@@ -795,4 +805,41 @@ fn origin_mode_has_one_answer() {
             .is_set(kr_term::modes::ModeKind::Dec, 6),
         "and the tracker followed it"
     );
+}
+
+/// A base cursor names one state, and a delta carries everything a repaint needs.
+#[test]
+fn a_delta_carries_the_presentation_state_that_changed() {
+    let mut painted = engine();
+    let view = viewport(&painted);
+    let (snapshot, _) = painted.snapshot(view, 0);
+    painted.feed(
+        b"\x1b[2;3r\x1b[31m\x1bH\x1b(0\x1b]8;;https://example.invalid/\x1b\\link",
+        0,
+    );
+    painted.quiesce(0);
+    let delta = painted
+        .delta(snapshot.output_cursor, snapshot.projection_generation)
+        .expect("inside the window");
+    assert!(delta.margins.is_some(), "the scroll region changed");
+    assert!(delta.rendition.is_some(), "the pen changed");
+    assert!(delta.tab_stops.is_some(), "a tab stop was set");
+    assert!(delta.charsets.is_some(), "a character set was designated");
+    assert!(
+        !delta.hyperlinks.is_empty(),
+        "the rows carry their hyperlink ranges"
+    );
+
+    // A geometry change resets the projection, because every row reflows.
+    let mut resized = engine();
+    let view = viewport(&resized);
+    let (snapshot, _) = resized.snapshot(view, 0);
+    resized
+        .resize(kr_term::budget::GridSize::new(40, 12))
+        .expect("valid geometry");
+    resized.quiesce(0);
+    let error = resized
+        .delta(snapshot.output_cursor, snapshot.projection_generation)
+        .expect_err("the base no longer describes anything");
+    assert!(matches!(error, TermError::CursorGap { .. }));
 }

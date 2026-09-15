@@ -152,7 +152,7 @@ pub struct Lexer {
     /// Whether retention stopped because the sequence passed its byte bound.
     pending_truncated: bool,
     /// Whether a control byte other than NUL or DEL appeared inside the sequence prelude.
-    pending_control: bool,
+    pending_controls: Vec<u8>,
     /// Bytes of the text run under construction.
     text: Vec<u8>,
     text_start: u64,
@@ -205,7 +205,7 @@ impl Lexer {
             pending_start: 0,
             pending_len: 0,
             pending_truncated: false,
-            pending_control: false,
+            pending_controls: Vec::new(),
             text: Vec::new(),
             text_start: 0,
             text_scalars: 0,
@@ -636,7 +636,7 @@ impl Lexer {
             }
             0x30..=0x7e => {
                 self.retain(byte);
-                let rejected = self.pending_truncated || self.pending_control;
+                let rejected = self.pending_truncated;
                 self.finish_pending(
                     EventKind::Esc {
                         intermediate: None,
@@ -662,8 +662,7 @@ impl Lexer {
             0x30..=0x7e => {
                 self.retain(byte);
                 let intermediate = self.intermediates.first().copied();
-                let extra =
-                    self.extra_intermediates || self.pending_truncated || self.pending_control;
+                let extra = self.extra_intermediates || self.pending_truncated;
                 self.finish_pending(
                     EventKind::Esc {
                         intermediate,
@@ -779,10 +778,7 @@ impl Lexer {
             self.push_param(CsiParam::Punct(byte));
         }
         let params = core::mem::take(&mut self.params);
-        let truncated = self.truncated
-            || self.extra_intermediates
-            || self.pending_truncated
-            || self.pending_control;
+        let truncated = self.truncated || self.extra_intermediates || self.pending_truncated;
         self.finish_pending(
             EventKind::Csi {
                 params,
@@ -867,7 +863,7 @@ impl Lexer {
 
     fn hook_dcs(&mut self, final_byte: u8) {
         self.finish_param();
-        if self.pending_truncated || self.pending_control || self.extra_intermediates {
+        if self.pending_truncated || !self.pending_controls.is_empty() || self.extra_intermediates {
             // The prelude is not one this profile can act on, but its string body still has to be
             // consumed rather than executed.
             self.dcs_final = 0;
@@ -1087,7 +1083,7 @@ impl Lexer {
             self.pending.clear();
             self.pending_len = 0;
             self.pending_truncated = false;
-            self.pending_control = false;
+            self.pending_controls.clear();
             self.state = State::Ground;
             let decoded = undouble_escapes(&payload[4..]);
             let mut inner = Lexer::nested(self.limits, self.depth + 1);
@@ -1128,7 +1124,7 @@ impl Lexer {
         self.pending.push(byte);
         self.pending_len = 1;
         self.pending_truncated = false;
-        self.pending_control = false;
+        self.pending_controls.clear();
         self.offset += 1;
         self.eight_bit = false;
     }
@@ -1171,11 +1167,16 @@ impl Lexer {
             }
             // NUL and DEL are padding that every terminal discards, so the sequence carries on.
             0x00 | 0x7f => self.retain(byte),
-            // Any other embedded control would be executed by a physical terminal and not by this
-            // engine, so the sequence becomes an extension: consumed here, forwarded nowhere.
+            // Any other embedded control is performed where it appears, and the sequence carries
+            // on being collected around it. Past the bound the sequence becomes an extension, so a
+            // stream of controls inside one prelude cannot grow this list.
             0x01..=0x17 | 0x19 | 0x1c..=0x1f => {
                 self.retain(byte);
-                self.pending_control = true;
+                if self.pending_controls.len() < MAX_EMBEDDED_CONTROLS {
+                    self.pending_controls.push(byte);
+                } else {
+                    self.pending_truncated = true;
+                }
             }
             _ => {
                 self.abandon(out);
@@ -1191,13 +1192,20 @@ impl Lexer {
     fn finish_pending(&mut self, kind: EventKind, out: &mut Vec<Event>) {
         let span = self.pending_span();
         let bytes = core::mem::take(&mut self.pending);
-        let truncated = self.pending_truncated || self.pending_control;
+        let truncated = self.pending_truncated;
+        let embedded = core::mem::take(&mut self.pending_controls);
         self.pending_len = 0;
         self.pending_truncated = false;
-        self.pending_control = false;
         self.state = State::Ground;
         let direct_safe = !truncated && kind.payload_is_direct_safe();
-        let event = self.build(span, SeqBytes::from_vec(bytes), kind, true, direct_safe);
+        let event = self.build_with(
+            span,
+            SeqBytes::from_vec(bytes),
+            kind,
+            true,
+            direct_safe,
+            embedded,
+        );
         out.push(event);
     }
 
@@ -1259,7 +1267,7 @@ impl Lexer {
         self.pending.clear();
         self.pending_len = 0;
         self.pending_truncated = false;
-        self.pending_control = false;
+        self.pending_controls.clear();
         self.text.clear();
         self.text_scalars = 0;
         self.text_cluster = 0;
@@ -1281,9 +1289,21 @@ impl Lexer {
         ground_after: bool,
         direct_safe: bool,
     ) -> Event {
+        self.build_with(span, bytes, kind, ground_after, direct_safe, Vec::new())
+    }
+
+    fn build_with(
+        &self,
+        span: ByteSpan,
+        bytes: SeqBytes,
+        kind: EventKind,
+        ground_after: bool,
+        direct_safe: bool,
+        embedded: Vec<u8>,
+    ) -> Event {
         let class = crate::classify::classify(&kind);
-        let disposition =
-            crate::classify::disposition(&kind, class, self.eight_bit || !direct_safe);
+        let needs_projection = self.eight_bit || !direct_safe || !embedded.is_empty();
+        let disposition = crate::classify::disposition(&kind, class, needs_projection);
         Event {
             span,
             bytes,
@@ -1293,6 +1313,7 @@ impl Lexer {
             ground_after,
             passthrough_depth: self.depth,
             eight_bit_introducer: self.eight_bit,
+            embedded,
         }
     }
 }
@@ -1302,6 +1323,9 @@ impl Default for Lexer {
         Self::new()
     }
 }
+
+/// The most control bytes one sequence may carry before it stops being a sequence.
+const MAX_EMBEDDED_CONTROLS: usize = 8;
 
 /// Counts the scalars in a run of valid UTF-8.
 fn count_scalars(bytes: &[u8]) -> usize {

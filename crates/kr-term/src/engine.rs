@@ -35,6 +35,7 @@ use crate::snapshot::{
     Margins, ModeEntry, PaletteSnapshot, Snapshot, Viewport,
 };
 use crate::span::ByteSpan;
+use crate::span::SeqBytes;
 use crate::title::{TitleState, TitleTarget};
 
 /// Where an untrusted observation came from.
@@ -172,6 +173,7 @@ struct Revisions {
     palette: u64,
     dimensions: u64,
     keyboard: u64,
+    presentation: u64,
 }
 
 /// One point a delta may be built against.
@@ -219,6 +221,7 @@ pub struct Engine {
     title_revision: u64,
     palette_revision: u64,
     dimensions_revision: u64,
+    presentation_revision: u64,
     keyboard_revision: u64,
     feeds: u32,
     scratch: Vec<Event>,
@@ -256,6 +259,7 @@ impl Engine {
             title_revision: 0,
             palette_revision: 0,
             dimensions_revision: 0,
+            presentation_revision: 0,
             keyboard_revision: 0,
             feeds: 0,
             scratch: Vec::new(),
@@ -417,6 +421,11 @@ impl Engine {
         };
         let generation_before = self.projection_generation;
         for event in events {
+            // A control inside a sequence is performed where it appeared, before the sequence it
+            // was found in, which is the order a terminal performs them in.
+            if !event.embedded.is_empty() {
+                self.apply_embedded(event, &mut outcome, now_ms);
+            }
             let decision = self.policy.decide(event);
             let mut disposition = decision.disposition;
             if decision.apply_to_grid {
@@ -442,6 +451,14 @@ impl Engine {
                         );
                     }
                     self.sync_grid_modes();
+                    // Anything but printed text can move a margin, change the pen, a tab stop or a
+                    // character set, and a delta has to carry those for a client to repaint from.
+                    if !matches!(
+                        event.kind,
+                        EventKind::Text { .. } | EventKind::Replacement { .. }
+                    ) {
+                        self.presentation_revision = self.next_revision();
+                    }
                     if adapted.unrecognised {
                         // The class table approved it and the canonical grid does not know it.
                         // Consuming it keeps the two screens in step.
@@ -530,6 +547,43 @@ impl Engine {
         outcome.ground_boundary = self.ground_boundary();
         outcome.projection_reset = self.projection_generation != generation_before;
         outcome
+    }
+
+    /// Performs the controls that arrived inside a sequence.
+    ///
+    /// Each one is decided on its own, so a bell inside a cursor movement still reaches the lease
+    /// holder and a line feed still moves the screen. The bytes of the sequence they were found in
+    /// are not forwarded, so nothing performs them a second time.
+    fn apply_embedded(&mut self, event: &Event, outcome: &mut FeedOutcome, now_ms: u64) {
+        for byte in event.embedded.clone() {
+            let inner = Event {
+                span: event.span,
+                bytes: SeqBytes::new(&[byte]),
+                kind: EventKind::Control { byte },
+                class: crate::classify::classify(&EventKind::Control { byte }),
+                disposition: DirectDisposition::Withhold,
+                ground_after: false,
+                passthrough_depth: event.passthrough_depth,
+                eight_bit_introducer: false,
+                embedded: Vec::new(),
+            };
+            let decision = self.policy.decide(&inner);
+            if decision.apply_to_grid {
+                self.grid.apply(&inner);
+                self.revision = self.next_revision();
+            }
+            if let Some(kind) = decision.side_effect {
+                outcome.side_effects.push(SideEffect {
+                    kind,
+                    destination: self.lease.destination(),
+                    at: inner.span.start(),
+                });
+            }
+            if let Some((kind, detail)) = decision.diagnostic {
+                self.diagnostics
+                    .record(kind, inner.span.start(), now_ms, detail);
+            }
+        }
     }
 
     /// Copies back the modes the canonical grid changes on its own.
@@ -642,6 +696,7 @@ impl Engine {
             palette: self.palette_revision,
             dimensions: self.dimensions_revision,
             keyboard: self.keyboard_revision,
+            presentation: self.presentation_revision,
         }
     }
 
@@ -920,19 +975,32 @@ impl Engine {
         accepted
     }
 
-    const fn advance_projection(&mut self) {
+    /// Resets the projection, so that no client continues from a base taken before it.
+    ///
+    /// The bases are dropped rather than left to be refused one at a time. A base is a byte cursor,
+    /// and a reset can happen without any byte arriving, so a new base at the same cursor would
+    /// otherwise look like the old one and a client would be told nothing had changed.
+    fn advance_projection(&mut self) {
         self.projection_generation = self.projection_generation.wrapping_add(1);
+        self.checkpoints.clear();
     }
 
-    /// Resizes the canonical grid.
+    /// Changes the canonical geometry.
+    ///
+    /// A geometry change resets the projection. Every row a client holds was laid out for the old
+    /// width and the rows reflow, so a client cannot continue from a base it took before the
+    /// change; it asks for a fresh snapshot instead. It also settles the question of what a base
+    /// cursor names, because output does not have to arrive for the screen to change here.
     ///
     /// # Errors
     ///
-    /// Returns [`TermError::Geometry`] or [`TermError::Budget`]. The current grid is unchanged in
-    /// either case.
+    /// Returns [`TermError::Geometry`] for dimensions outside the three simultaneous constraints
+    /// and [`TermError::Budget`] when the new screens would not fit. The grid is unchanged in both
+    /// cases, and so is the projection.
     pub fn resize(&mut self, size: GridSize) -> Result<()> {
         self.grid.resize(size, &mut self.budget)?;
         self.dimensions_revision = self.next_revision();
+        self.advance_projection();
         Ok(())
     }
 
@@ -1054,7 +1122,17 @@ impl Engine {
     ///
     /// Returns [`TermError::CursorGap`] when the base is outside the replay window, or when the
     /// projection was reset since then. A client answers both by taking a fresh snapshot.
-    pub fn delta(&self, base_cursor: u64) -> Result<Delta> {
+    pub fn delta(&self, base_cursor: u64, base_generation: u64) -> Result<Delta> {
+        // The generation is part of the base, not a second check on it. A projection reset can
+        // happen without a byte arriving, so the same cursor can name two different screens; a
+        // client that names the generation it holds is told to start again rather than handed a
+        // delta against a screen it never saw.
+        if base_generation != self.projection_generation {
+            return Err(TermError::CursorGap {
+                requested: base_cursor,
+                available: self.lexer.committed_offset(),
+            });
+        }
         let Some(base) = self
             .checkpoints
             .iter()
@@ -1087,6 +1165,9 @@ impl Engine {
             .filter(|row| changed.contains(&row.stable_id))
             .collect();
         let (col, row) = self.grid.cursor();
+        let (top, bottom) = self.grid.margins_vertical();
+        let (left, right) = self.grid.margins_horizontal();
+        let hyperlinks = hyperlinks_of(&rows);
         Ok(Delta {
             base_cursor,
             next_cursor: self.lexer.committed_offset(),
@@ -1100,6 +1181,27 @@ impl Engine {
                 pending_wrap: None,
             },
             modes: self.changed_modes(base.revisions.any),
+            margins: (self.presentation_revision > base.revisions.presentation).then_some(
+                Margins {
+                    top,
+                    bottom,
+                    left,
+                    right,
+                },
+            ),
+            rendition: (self.presentation_revision > base.revisions.presentation)
+                .then(|| self.grid.pen()),
+            tab_stops: (self.presentation_revision > base.revisions.presentation)
+                .then(|| self.grid.tab_stops()),
+            charsets: (self.presentation_revision > base.revisions.presentation).then(|| {
+                let (g0, g1) = self.grid.charsets();
+                Charsets {
+                    g0,
+                    g1,
+                    shift_out: self.grid.shift_out(),
+                }
+            }),
+            hyperlinks,
             title: (self.title_revision > base.revisions.title).then(|| crate::title::TitleEntry {
                 icon: self.titles.icon().to_owned(),
                 window: self.titles.window().to_owned(),

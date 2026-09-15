@@ -671,3 +671,42 @@ fn a_selective_title_save_leaves_the_other_title_alone() {
         "a pop of a title nothing saved leaves it alone rather than clearing it"
     );
 }
+
+/// A control that arrives inside a sequence still happens, and so does the sequence.
+#[test]
+fn an_embedded_control_is_performed_where_it_appears() {
+    fn engine_at(cols: u32, rows: u32) -> Engine {
+        let mut engine = Engine::new(EngineConfig {
+            size: kr_term::budget::GridSize::new(cols, rows),
+            ..EngineConfig::DEFAULT
+        })
+        .expect("engine");
+        engine.set_lease_holder(LeaseHolder::new(attachment(), InputLeaseEpoch(U64::new(3))));
+        engine
+    }
+
+    // A bell inside a cursor movement rings once, and the movement still happens.
+    let mut engine = engine_at(20, 3);
+    let outcome = engine.feed(b"\x1b[5\x07C", 0);
+    assert_eq!(
+        engine.grid().cursor(),
+        (5, 0),
+        "the movement still happened"
+    );
+    assert_eq!(outcome.side_effects.len(), 1, "the bell still rang");
+    assert!(
+        outcome.forward.is_empty() && outcome.projection_required_at.is_some(),
+        "the bytes stop here, so nothing performs the bell twice"
+    );
+
+    // So does a line feed.
+    let mut engine = engine_at(20, 3);
+    engine.feed(b"\x1b[5\nC", 0);
+    assert_eq!(engine.grid().cursor(), (5, 1));
+
+    // A sequence stuffed with controls is an extension rather than an unbounded list of them.
+    let mut engine = engine_at(20, 3);
+    let outcome = engine.feed(b"\x1b[5\x07\x07\x07\x07\x07\x07\x07\x07\x07C", 0);
+    assert!(outcome.forward.is_empty());
+    assert_eq!(engine.grid().cursor(), (0, 0), "nothing was performed");
+}

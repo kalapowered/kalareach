@@ -255,6 +255,13 @@ pub struct Event {
     /// Section 8 classifies both forms identically, but a raw C1 byte is not valid UTF-8, so its
     /// bytes never reach a physical terminal.
     pub eight_bit_introducer: bool,
+    /// Control bytes that arrived inside the sequence.
+    ///
+    /// A terminal performs these where they appear and carries on collecting the sequence around
+    /// them, so they are kept rather than discarded: the engine performs each one in order before
+    /// the sequence itself. The sequence's own bytes stop here, because performing a control twice,
+    /// once by this engine and once by a terminal reading the same bytes, is worse than repainting.
+    pub embedded: Vec<u8>,
 }
 
 impl Event {
