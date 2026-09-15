@@ -13,25 +13,6 @@ use serde_json::{Map, Value, json};
 
 use crate::actor::ActorEnvelope;
 use crate::archive::{ArchiveDescriptor, RecoveryBundle, RecoveryKit, SignedArchiveManifest};
-use crate::authority::MethodEntry;
-use crate::envelope::{ControlFrame, MutationRequest, Notification, Request, Response};
-use crate::error::ProtocolError;
-use crate::frame::StreamHeader;
-use crate::grant::Grant;
-use crate::hello::{ActionWindow, ClientOffer, ConnectReply, HelloReply, HostSelection};
-use crate::ids;
-use crate::ids::SessionRef;
-use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
-use crate::method::{Method, REGISTRY};
-use crate::pairing::{
-    AuthorityRevisionRecord, DirectChallenge, DirectRedeemProof, GenerationCheckpoint,
-    OwnerConfirmationProof, OwnerConfirmationRequest, PairFinishRequest, PairStatus, ProposedGrant,
-    RevocationAcknowledgement, RevocationRequest, SignedClientBundle, SignedHostBundle,
-};
-use crate::receipt::{Receipt, ReceiptResponse};
-use crate::relay::{
-    RelayConsumptionAck, RelayConsumptionReport, RelayLeaseAck, RelayLeaseRequest,
-    SignedRelayConsumptionReceipt, SignedRelayInstanceRegistration,
 use crate::attachment::{
     AttachmentConfigureParams, AttachmentSummary, AttachmentViewportParams,
     AttachmentViewportResult, GeometryResult, GeometryState, SessionAttachParams,
@@ -66,6 +47,10 @@ use crate::receipt::{
 use crate::recovery::{
     EventsSnapshotParams, EventsSnapshotResult, EventsSubscribeParams, EventsSubscribeResult,
     HistoryPageParams, HistoryPageResult, OutputEvent, ResyncRequired,
+};
+use crate::relay::{
+    RelayConsumptionAck, RelayConsumptionReport, RelayLeaseAck, RelayLeaseRequest,
+    SignedRelayConsumptionReceipt, SignedRelayInstanceRegistration,
 };
 use crate::session::{
     ClosureRecord, SessionCloseParams, SessionCloseResult, SessionCreateParams,
@@ -105,11 +90,11 @@ pub fn protocol_schema() -> Value {
     let mut properties = Map::new();
     roots! {
         generator, properties,
-        "action_window" => ActionWindow,
         "action_cancel_params" => ActionCancelParams,
         "action_cancel_result" => ActionCancelResult,
         "action_read_params" => ActionReadParams,
         "action_read_result" => ActionReadResult,
+        "action_window" => ActionWindow,
         "actor_envelope" => ActorEnvelope,
         "archive_descriptor" => ArchiveDescriptor,
         "attachment_configure_params" => AttachmentConfigureParams,
@@ -120,9 +105,9 @@ pub fn protocol_schema() -> Value {
         "authority_revision_notice" => AuthorityRevisionNotice,
         "authority_revision_record" => AuthorityRevisionRecord,
         "client_offer" => ClientOffer,
+        "closure_record" => ClosureRecord,
         "connect_reply" => ConnectReply,
         "control_frame" => ControlFrame,
-        "closure_record" => ClosureRecord,
         "controller_generation_token" => ControllerGenerationToken,
         "direct_challenge" => DirectChallenge,
         "direct_redeem_proof" => DirectRedeemProof,
@@ -167,12 +152,12 @@ pub fn protocol_schema() -> Value {
         "protocol_error" => ProtocolError,
         "receipt" => Receipt,
         "receipt_response" => ReceiptResponse,
+        "recovery_bundle" => RecoveryBundle,
+        "recovery_kit" => RecoveryKit,
         "relay_consumption_ack" => RelayConsumptionAck,
         "relay_consumption_report" => RelayConsumptionReport,
         "relay_lease_ack" => RelayLeaseAck,
         "relay_lease_request" => RelayLeaseRequest,
-        "recovery_bundle" => RecoveryBundle,
-        "recovery_kit" => RecoveryKit,
         "request" => Request,
         "response" => Response,
         "resync_required" => ResyncRequired,

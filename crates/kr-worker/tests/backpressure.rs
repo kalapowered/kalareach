@@ -146,11 +146,16 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     );
     let before = received.load(std::sync::atomic::Ordering::Relaxed);
     assert!(before > 0, "the client that kept reading received output");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(
-        received.load(std::sync::atomic::Ordering::Relaxed) > before,
-        "the client that kept reading is still receiving while the other is not reading"
-    );
+    // Waited for rather than sampled over a fixed window: what this asserts is that more arrives,
+    // not how quickly a loaded machine delivers it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while received.load(std::sync::atomic::Ordering::Relaxed) <= before {
+        assert!(
+            Instant::now() < deadline,
+            "the client that kept reading is still receiving while the other is not reading"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(
         !draining.is_finished(),
         "the client that kept reading was not resynchronised"
