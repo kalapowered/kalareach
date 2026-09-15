@@ -41,9 +41,7 @@ use std::sync::{Arc, Mutex};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::ReceiveLimits;
-use kr_protocol::limits::{
-    MAX_ATTACHMENT_FRAME_LEN, MAX_CONTROL_FRAME_LEN, MAX_INPUT_FRAME_LEN, MAX_SEND_QUEUE_BYTES,
-};
+use kr_protocol::limits::{MAX_ATTACHMENT_FRAME_LEN, MAX_SEND_QUEUE_BYTES};
 
 use crate::error::{Result, TransportError};
 
@@ -60,18 +58,36 @@ pub enum StreamClass {
 
 /// The smallest send queue a peer can declare and still hold a usable connection.
 ///
-/// A connection has to be able to hand the peer one complete attachment frame without touching the
-/// control reserve. A peer that declares less than this could never be sent a transfer, so the
-/// handshake refuses it instead of establishing a connection that silently cannot carry one.
+/// A connection has to be able to hand the peer one complete attachment frame while the control
+/// reserve is still intact. A peer that declares less could be sent smaller frames, but never the
+/// full chunk allowance sections 14 and 23 define, so the handshake refuses it instead of
+/// establishing a connection whose transfers would fail at the first full chunk.
 pub const MIN_SEND_QUEUE_BYTES: usize = MAX_ATTACHMENT_FRAME_LEN + CONTROL_RESERVE_BYTES;
+
+/// The smallest control frame bound a peer can negotiate.
+///
+/// Section 9 makes the 1 MiB control bound a configurable resource limit, so a peer may declare
+/// less. What it may not do is declare less than the connection's own traffic needs: after `hello`
+/// the transport still sends keepalives, action-window renewals and refusals of its own, and the
+/// handshake's read bound is the largest frame this layer defines on a control stream.
+pub const MIN_CONTROL_FRAME_LEN: usize = crate::handshake::MAX_OFFER_LEN;
+
+/// The smallest input frame bound a peer can negotiate.
+///
+/// An input frame is an actor envelope around a batch of keystrokes. The envelope alone is a few
+/// hundred bytes of identity, lease epoch and sequence, so a kibibyte is the smallest bound that
+/// still leaves room for the keystrokes the frame exists to carry.
+pub const MIN_INPUT_FRAME_LEN: usize = 1024;
 
 /// Checks that negotiated limits leave a connection able to carry what the protocol requires.
 ///
-/// The frame bounds are floors, not preferences. A peer may declare more than this version uses,
-/// which is how a later version raises them, but a peer that declares less has agreed to a
-/// connection on which some message the protocol requires could never be sent. The send queue is
-/// the one genuine policy knob: a peer with less memory may declare less, as long as one complete
-/// attachment frame still fits beside the control reserve.
+/// Section 9 calls these configurable resource limits, so a peer is free to declare less than the
+/// protocol default and this build holds it to what it declared. Each floor here is what the
+/// connection itself could not work below: the control and input bounds are what the transport's
+/// own frames and one envelope of keystrokes need, the attachment bound is the complete chunk
+/// allowance sections 14 and 23 define, and the send queue has to fit one such chunk beside the
+/// control reserve. A declaration above a floor is always accepted; this build clamps it to its own
+/// codec maxima, which is how a later version raises a bound without breaking this one.
 ///
 /// # Errors
 ///
@@ -82,12 +98,12 @@ pub fn check_negotiated(limits: ReceiveLimits) -> core::result::Result<(), Proto
         (
             "max_control_frame_len",
             limits.max_control_frame_len.get(),
-            MAX_CONTROL_FRAME_LEN as u64,
+            MIN_CONTROL_FRAME_LEN as u64,
         ),
         (
             "max_input_frame_len",
             limits.max_input_frame_len.get(),
-            MAX_INPUT_FRAME_LEN as u64,
+            MIN_INPUT_FRAME_LEN as u64,
         ),
         (
             "max_attachment_frame_len",
@@ -110,8 +126,8 @@ pub fn check_negotiated(limits: ReceiveLimits) -> core::result::Result<(), Proto
             return Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 format!(
-                    "a negotiated {field} of {declared} is below the {floor} this protocol version \
-                     requires; some message it defines could never be sent"
+                    "a negotiated {field} of {declared} is below the {floor} this connection needs \
+                     to carry its own traffic"
                 ),
             ));
         }
@@ -241,7 +257,9 @@ impl SendLimits {
                 self.max_bulk_queued_bytes
             ));
         }
-        if self.max_bulk_queued_bytes + CONTROL_RESERVE_BYTES > self.max_queued_bytes {
+        // Subtraction rather than addition: the check above already put `max_queued_bytes` above
+        // the control reserve, and a bulk ceiling near `usize::MAX` would make the addition wrap.
+        if self.max_bulk_queued_bytes > self.max_queued_bytes - CONTROL_RESERVE_BYTES {
             return refuse(format!(
                 "max_bulk_queued_bytes is {}, which leaves less than the {CONTROL_RESERVE_BYTES} \
                  control reserve inside a {} budget",
@@ -603,15 +621,13 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_bound_below_what_this_version_defines_is_refused() {
+    fn a_frame_bound_below_what_the_connection_needs_is_refused() {
         use kr_protocol::scalars::U64;
-        // Every frame bound is a floor: a peer may declare more, which is how a later version
-        // raises them, but never less than a message this version defines.
         for (name, smaller) in [
             (
                 "control",
                 ReceiveLimits {
-                    max_control_frame_len: U64::new(MAX_CONTROL_FRAME_LEN as u64 - 1),
+                    max_control_frame_len: U64::new(MIN_CONTROL_FRAME_LEN as u64 - 1),
                     ..ReceiveLimits::default()
                 },
             ),
@@ -638,9 +654,74 @@ mod tests {
             ),
         ] {
             let error = check_negotiated(smaller)
-                .expect_err("a bound below what this version defines is refused");
+                .expect_err("a bound below what the connection needs is refused");
             assert_eq!(error.code, ErrorCode::InvalidArgument, "the {name} bound");
         }
+    }
+
+    #[test]
+    fn a_peer_may_negotiate_frame_bounds_below_the_protocol_defaults() {
+        use kr_protocol::scalars::U64;
+        // Section 9 calls these configurable resource limits. A peer that wants smaller frames than
+        // the defaults gets them, as long as the connection's own traffic still fits.
+        check_negotiated(ReceiveLimits {
+            max_control_frame_len: U64::new(MIN_CONTROL_FRAME_LEN as u64),
+            max_input_frame_len: U64::new(MIN_INPUT_FRAME_LEN as u64),
+            max_outstanding_mutations: U64::new(1),
+            ..ReceiveLimits::default()
+        })
+        .expect("the floors themselves are workable");
+        check_negotiated(ReceiveLimits {
+            max_control_frame_len: U64::new(64 * 1024),
+            max_input_frame_len: U64::new(1024),
+            ..ReceiveLimits::default()
+        })
+        .expect("a smaller but workable declaration is accepted");
+    }
+
+    #[test]
+    fn the_frame_floors_cover_the_traffic_the_connection_itself_sends() {
+        use kr_protocol::envelope::{ControlEvent, ControlFrame};
+        use kr_protocol::hello::ActionWindow;
+        use kr_protocol::ids::{
+            ActionWindowId, ActorId, BootEpoch, ConnectionId, ControllerGeneration,
+            MAX_OPAQUE_ID_LEN,
+        };
+        use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
+
+        let framed = |bytes: Vec<u8>| bytes.len() + kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN;
+        let renewal = ControlFrame::Event(ControlEvent::ActionWindowRenewed(ActionWindow {
+            action_window_id: ActionWindowId::new("a".repeat(MAX_OPAQUE_ID_LEN))
+                .expect("the longest identity the protocol allows"),
+            connection_id: ConnectionId::new(Uuid::from_bytes([1; 16])),
+            boot_epoch: BootEpoch::new(u64::MAX),
+            issued_at_ms: TimestampMs::new(u64::MAX),
+            valid_for_ms: kr_protocol::limits::MAX_ACTION_WINDOW,
+        }));
+        let keepalive = ControlFrame::Event(ControlEvent::Keepalive);
+        for frame in [renewal, keepalive] {
+            let encoded = framed(kr_cbor::to_canonical_vec(&frame).expect("a control frame"));
+            assert!(
+                encoded <= MIN_CONTROL_FRAME_LEN,
+                "the control floor has to carry the connection's own frames: {encoded}"
+            );
+        }
+
+        let envelope = kr_protocol::actor::ActorEnvelope {
+            actor_id: ActorId::new("a".repeat(MAX_OPAQUE_ID_LEN))
+                .expect("the longest identity the protocol allows"),
+            ingress: kr_protocol::actor::ActorIngress::PairedDevice,
+            device_id: Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([2; 16]))),
+            grant_id: Nullable::some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([3; 16]))),
+            grant_revision: Nullable::some(kr_protocol::ids::AuthorityRevision::new(u64::MAX)),
+            controller_generation: ControllerGeneration::new(u64::MAX),
+            connection_id: ConnectionId::new(Uuid::from_bytes([4; 16])),
+        };
+        let encoded = framed(kr_cbor::to_canonical_vec(&envelope).expect("an actor envelope"));
+        assert!(
+            encoded * 2 <= MIN_INPUT_FRAME_LEN,
+            "the input floor has to leave room for keystrokes beside the envelope: {encoded}"
+        );
     }
 
     #[test]
@@ -685,6 +766,40 @@ mod tests {
             .is_err(),
             "a bulk ceiling equal to the budget leaves nothing for control"
         );
+        assert!(
+            SendLimits {
+                max_bulk_queued_bytes: usize::MAX,
+                max_queued_bytes: MIN_SEND_QUEUE_BYTES,
+                ..default
+            }
+            .check()
+            .is_err(),
+            "a ceiling at the top of the address space is refused, not wrapped"
+        );
+    }
+
+    #[test]
+    fn limits_that_pass_both_checks_still_pass_after_negotiation() {
+        use kr_protocol::scalars::U64;
+        let local = SendLimits::default();
+        local.check().expect("the defaults are workable");
+        for declared in [
+            MIN_SEND_QUEUE_BYTES,
+            MIN_SEND_QUEUE_BYTES + 1,
+            3 * 1024 * 1024,
+            MAX_SEND_QUEUE_BYTES,
+            MAX_SEND_QUEUE_BYTES * 4,
+        ] {
+            let limits = ReceiveLimits {
+                max_send_queue_bytes: U64::new(declared as u64),
+                ..ReceiveLimits::default()
+            };
+            check_negotiated(limits).expect("the declaration is workable");
+            local
+                .negotiated(limits)
+                .check()
+                .expect("negotiation never produces limits the connection cannot use");
+        }
     }
 
     #[test]

@@ -268,20 +268,20 @@ There is a floor under that negotiation, and `hello` is where it is applied. Bot
 negotiated result and refuse the connection with `INVALID_ARGUMENT` naming the field, rather than
 establishing one that silently cannot carry something the protocol defines:
 
-| Negotiated field | Floor |
-| --- | --- |
-| `max_control_frame_len` | 1 MiB |
-| `max_input_frame_len` | 64 KiB |
-| `max_attachment_frame_len` | 1 MiB + 4 KiB |
-| `max_outstanding_mutations` | 1 |
-| `max_send_queue_bytes` | 2 MiB + 4 KiB |
+| Negotiated field | Floor | Why that number |
+| --- | --- | --- |
+| `max_control_frame_len` | 16 KiB | The largest frame this layer defines on a control stream: the `hello` read bound, and after it the keepalives, action-window renewals and refusals the connection sends on its own account |
+| `max_input_frame_len` | 1 KiB | One actor envelope with room left for the keystrokes it carries |
+| `max_attachment_frame_len` | 1 MiB + 4 KiB | The complete chunk allowance sections 14 and 23 define |
+| `max_outstanding_mutations` | 1 | Below it no mutation could ever be in flight |
+| `max_send_queue_bytes` | 2 MiB + 4 KiB | One complete attachment frame beside the control reserve |
 
-The frame bounds are floors rather than preferences: a peer may declare more, which is how a later
-version raises them, but a peer that declares less has agreed to a connection on which a message
-this version defines could never be sent. The send queue is the one genuine policy knob — a peer
-with less memory may declare less — and its floor is one complete attachment frame beside the
-control reserve. Below that, the full chunk size sections 14 and 23 require could never be admitted,
-even though smaller frames still would be.
+Section 9 calls these configurable resource limits, and they are: a peer that wants smaller frames
+than the protocol defaults gets them, and is held to what it declared. Each floor is only what the
+connection itself could not work below. A declaration above a floor is always accepted and then
+clamped to this build's own codec maxima, which is how a later version raises a bound without
+breaking this one. Below the send-queue floor a connection could still carry smaller frames; what it
+could never carry is the full chunk size a transfer needs, which is why the floor is there.
 
 The same check is applied to a host's or client's own configured budget when it starts, so limits
 that could never carry a transfer are refused at registration rather than at the first attachment.
