@@ -45,6 +45,12 @@ pub enum WorkerError {
     /// The caller does not hold the input lease at the epoch it claimed.
     #[error("the input lease has moved on")]
     LeaseLost,
+    /// The presentation this attachment needs is not one this host can serve.
+    #[error("{detail}")]
+    PresentationUnsupported {
+        /// What is missing, and what would make it work.
+        detail: String,
+    },
     /// The caller is not the geometry owner.
     #[error("only the geometry owner changes the session's size")]
     NotGeometryOwner,
@@ -116,6 +122,7 @@ impl WorkerError {
             Self::Dimensions(_) | Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::UnknownAttachment { .. } => ErrorCode::AmbiguousAttachment,
             Self::LeaseLost => ErrorCode::LeaseLost,
+            Self::PresentationUnsupported { .. } => ErrorCode::UnsupportedCapability,
             Self::NotGeometryOwner => ErrorCode::GeometryNotOwner,
             Self::SessionClosed => ErrorCode::SessionClosed,
             Self::IdConflict { .. } => ErrorCode::IdConflict,

@@ -14,6 +14,7 @@
 //! | [`journal`] | The private receipt journal: acceptance, dispatch markers, de-duplication and retention |
 //! | [`output`] | Fan-out with bounded per-attachment queues and explicit resynchronisation |
 //! | [`ownership`] | Which processes a session owns, and how much of that the host can account for |
+//! | [`projection`] | The boundary a terminal of another size is served through |
 //! | [`pty`] | The pseudo-terminal, created before the root shell, and the shell it runs |
 //! | [`session`] | The session: lifecycle, the serial order every change shares, and closure |
 //! | [`runtime`] | The reader, the writer, the recogniser timer and the closure sequence |
@@ -28,6 +29,7 @@ pub mod input;
 pub mod journal;
 pub mod output;
 pub mod ownership;
+pub mod projection;
 pub mod pty;
 pub mod runtime;
 pub mod service;

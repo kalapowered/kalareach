@@ -67,6 +67,12 @@ pub const ACTION_WINDOW_MS: u64 = 5 * 60 * 1000;
 /// The event stream name output notifications carry.
 pub const OUTPUT_STREAM: &str = "session.output";
 
+/// How many connections one session serves at once.
+///
+/// Every attachment needs one, and a client that is between attachments needs one more, so the
+/// bound is the attachment limit with room to reconnect rather than the attachment limit exactly.
+pub const MAX_CONNECTIONS: usize = kr_protocol::limits::MAX_CONCURRENT_ATTACHMENTS * 2;
+
 /// The largest replay page one notification carries.
 ///
 /// A control frame is bounded at 1 MiB including its metadata, so a replay page stays well inside
@@ -106,6 +112,8 @@ pub struct WorkerService {
     /// what makes the check mean something by the time the effect happens. Authority changes take
     /// it too, so one cannot slip between the two halves of the other.
     dispatch: Mutex<()>,
+    /// How many connections this session is serving.
+    connections: Arc<std::sync::atomic::AtomicUsize>,
     build_id: kr_protocol::ids::BuildId,
 }
 
@@ -160,6 +168,7 @@ impl WorkerService {
                 acknowledged_revision: None,
             }),
             dispatch: Mutex::new(()),
+            connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             build_id: binding.build_id,
         }
     }
@@ -194,9 +203,19 @@ impl WorkerService {
     pub async fn serve(self: Arc<Self>, listener: Listener) -> Result<()> {
         loop {
             let (connection, peer) = listener.accept().await?;
+            // One session serves a bounded number of connections at once. Without a bound a caller
+            // that opened connections and never spoke would take this worker's memory a frame
+            // buffer at a time.
+            let held = Arc::clone(&self.connections);
+            if held.load(std::sync::atomic::Ordering::Acquire) >= MAX_CONNECTIONS {
+                drop(connection);
+                continue;
+            }
+            held.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let service = Arc::clone(&self);
             tokio::spawn(async move {
                 let _ = service.run_connection(connection, peer).await;
+                held.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             });
         }
     }
@@ -462,6 +481,33 @@ impl WorkerService {
         }
         state.negotiated = true;
         state.client_kind = hello.client;
+        // The peer's offered limits bound what this worker sends it, and never raise this host's
+        // own: a client that offers more than this host will accept does not get more.
+        state.peer_limits = kr_protocol::hello::ReceiveLimits {
+            max_control_frame_len: kr_protocol::scalars::U64::new(
+                hello
+                    .max_receive
+                    .max_control_frame_len
+                    .get()
+                    .min(kr_protocol::limits::MAX_CONTROL_FRAME_LEN as u64),
+            ),
+            max_input_frame_len: kr_protocol::scalars::U64::new(
+                hello
+                    .max_receive
+                    .max_input_frame_len
+                    .get()
+                    .min(kr_protocol::limits::MAX_INPUT_FRAME_LEN as u64),
+            ),
+            max_attachment_frame_len: hello.max_receive.max_attachment_frame_len,
+            max_outstanding_mutations: hello.max_receive.max_outstanding_mutations,
+            max_send_queue_bytes: kr_protocol::scalars::U64::new(
+                hello
+                    .max_receive
+                    .max_send_queue_bytes
+                    .get()
+                    .min(kr_protocol::limits::MAX_SEND_QUEUE_BYTES as u64),
+            ),
+        };
         if hello.client == LocalClientKind::Controller {
             // A controller has to prove which generation it speaks for before it acts. The
             // challenge is issued here, bound to this connection, and consumed exactly once.
@@ -722,7 +768,7 @@ impl WorkerService {
         let outcome = match method {
             Method::SessionRead => self.session_read(&request.params),
             Method::EventsSnapshot => self.events_snapshot(&request.params),
-            Method::HistoryPage => self.history_page(&request.params),
+            Method::HistoryPage => self.history_page(state, &request.params),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params),
             Method::ActionRead => self.action_read(state, &request.params),
             Method::InputWrite => self.input_write(state, &request.params),
@@ -1344,11 +1390,21 @@ impl WorkerService {
         encode(&session.snapshot())
     }
 
-    fn history_page(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    fn history_page(&self, state: &ConnectionState, params: &ParamsValue) -> Result<ParamsValue> {
         let params: HistoryPageParams = parse(params)?;
         let session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
-        let page = session.history_page(params.from_cursor.get(), params.max_bytes.get())?;
+        // A page that filled the control frame exactly would not fit once its own metadata was
+        // encoded around it, so the request is clamped to what the frame can actually carry, and
+        // to what the peer said it can receive.
+        let bound = state
+            .peer_limits
+            .max_control_frame_len
+            .get()
+            .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN as u64)
+            .min(MAX_REPLAY_PAGE_BYTES);
+        let page =
+            session.history_page(params.from_cursor.get(), params.max_bytes.get().min(bound))?;
         encode(&page)
     }
 
@@ -1430,6 +1486,14 @@ impl WorkerService {
     ) -> Result<ParamsValue> {
         let params: InputWriteParams = parse(params)?;
         Self::check_attachment(state, params.attachment_id)?;
+        // Raw input is its own stream with its own bound. Travelling inside a control frame does
+        // not give a keystroke batch the control frame's allowance.
+        if params.bytes.len() > kr_protocol::limits::MAX_INPUT_FRAME_LEN {
+            return Err(WorkerError::InvalidArgument(format!(
+                "an input batch is at most {} bytes",
+                kr_protocol::limits::MAX_INPUT_FRAME_LEN
+            )));
+        }
         let accepted = {
             let mut session = self.runtime.session();
             Self::check_session(&session, params.session_id)?;
@@ -1715,6 +1779,8 @@ pub struct ConnectionState {
     pub controller: bool,
     /// Which kind of client opened this connection, as it declared in its hello.
     pub client_kind: LocalClientKind,
+    /// What the peer said it can receive. Nothing this worker sends exceeds it.
+    pub peer_limits: kr_protocol::hello::ReceiveLimits,
     /// The generation this connection proved, when it is a controller.
     pub generation: Option<ControllerGeneration>,
     /// The freshness window the host stamped for this connection.
@@ -1760,6 +1826,7 @@ impl ConnectionState {
             negotiated: false,
             controller: false,
             client_kind: LocalClientKind::Cli,
+            peer_limits: kr_protocol::hello::ReceiveLimits::default(),
             generation: None,
             window: kr_ipc::freshness::FreshnessWindow::issue(
                 connection_id,

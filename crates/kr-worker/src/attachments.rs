@@ -129,6 +129,17 @@ impl AttachmentTable {
         }
     }
 
+    /// Restores the geometry exactly as it was, including its epoch.
+    ///
+    /// A change the kernel refused never happened, and a change that never happened did not
+    /// advance an epoch. Putting the epoch back is what stops a refused resize from invalidating
+    /// every client's next request.
+    pub const fn restore_geometry(&mut self, previous: &GeometryState) {
+        self.owner = previous.owner.0;
+        self.epoch = previous.epoch.get();
+        self.dimensions = previous.dimensions;
+    }
+
     /// Returns the canonical dimensions.
     #[must_use]
     pub const fn dimensions(&self) -> Dimensions {
@@ -182,6 +193,14 @@ impl AttachmentTable {
         id: AttachmentId,
         now: TimestampMs,
     ) -> Result<(AttachmentSummary, GeometryChange)> {
+        // A session serves a bounded number of attachments. The bound is the protocol's, and it
+        // is checked before an identifier is allocated so a refused attach leaves nothing behind.
+        if self.attachments.len() >= kr_protocol::limits::MAX_CONCURRENT_ATTACHMENTS {
+            return Err(WorkerError::InvalidArgument(format!(
+                "this session already has its maximum of {} attachments",
+                kr_protocol::limits::MAX_CONCURRENT_ATTACHMENTS
+            )));
+        }
         if params.claim_geometry && !params.mode.may_claim_geometry() {
             return Err(WorkerError::InvalidArgument(
                 "a semantic attachment cannot claim geometry".to_owned(),

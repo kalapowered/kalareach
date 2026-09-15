@@ -98,14 +98,21 @@ pub async fn run(
     let size = terminal.size()?;
     let dimensions = Dimensions::new(u64::from(size.columns), u64::from(size.rows));
     let mut client = crate::resolve::open_worker(descriptor, crate::build_id()).await?;
-    let attachment: Attachment = crate::attach::attach(
-        &mut client,
-        descriptor,
-        dimensions,
-        options.take_geometry,
-        !options.no_probe,
-    )
-    .await?;
+    // A terminal attachment claims the session's size. Section 8 makes that the default: a
+    // terminal that did not claim it would be shown a projection of somebody else's size, which is
+    // exactly what a lone attachment does not need. `--take-geometry` goes further and takes the
+    // claim from whoever holds it.
+    let attachment: Attachment =
+        crate::attach::attach(&mut client, descriptor, dimensions, true, !options.no_probe).await?;
+    if options.take_geometry {
+        crate::attach::take_geometry(
+            &mut client,
+            descriptor,
+            attachment.attachment_id,
+            attachment.result.geometry.epoch,
+        )
+        .await?;
+    }
     let epoch = attachment
         .lease
         .as_ref()
@@ -145,13 +152,18 @@ pub async fn run(
         .map_err(|error| CliError::Terminal(error.to_string()))?;
     let mut input = crate::attach::spawn_input_reader(input_handle);
 
+    // The terminal's size can change while the attachment runs. The session is told, so the
+    // application sees the resize the way it would in any other terminal.
+    let mut resized = window_changes();
     let outcome = drive(
         &mut client,
-        descriptor.session_id,
+        descriptor,
         attachment.attachment_id,
         epoch,
         &mut input,
         &handle,
+        &terminal,
+        resized.as_mut(),
     )
     .await;
 
@@ -163,15 +175,25 @@ pub async fn run(
 }
 
 /// Runs the attachment's input, output and connection in one loop.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an attachment is input, output, connection, terminal and size; the loop needs all of \
+              them and splitting it would split the thing that has to end together"
+)]
 async fn drive(
     client: &mut LocalClient,
-    session_id: SessionId,
+    descriptor: &WorkerDescriptor,
     attachment_id: kr_protocol::ids::AttachmentId,
     epoch: InputLeaseEpoch,
     input: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    terminal: &Arc<std::fs::File>,
+    output: &Arc<std::fs::File>,
+    terminal: &ControllingTerminal,
+    resized: Option<&mut WindowChanges>,
 ) -> AttachOutcome {
     use std::io::Write as _;
+
+    let session_id = descriptor.session_id;
+    let mut resized = resized;
 
     let mut sequence = 0_u64;
     let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, u64> =
@@ -189,7 +211,7 @@ async fn drive(
                                 .payload
                                 .to_typed::<kr_protocol::recovery::OutputEvent>()
                         {
-                            let mut handle = terminal.as_ref();
+                            let mut handle = output.as_ref();
                             if handle.write_all(event.bytes.as_slice()).is_err() {
                                 return AttachOutcome::Disconnected;
                             }
@@ -219,6 +241,23 @@ async fn drive(
                     }
                     Ok(_) => {}
                     Err(_) => return AttachOutcome::Disconnected,
+                }
+            }
+            () = wait_for_resize(&mut resized) => {
+                // The outer terminal changed size. The session is told, so the application is
+                // redrawn at the size the person is actually looking at.
+                if let Ok(size) = terminal.size() {
+                    let params = kr_protocol::attachment::TerminalResizeParams {
+                        attachment_id,
+                        dimensions: Dimensions::new(
+                            u64::from(size.columns),
+                            u64::from(size.rows),
+                        ),
+                        expected_geometry_epoch: kr_protocol::ids::GeometryEpoch::new(0),
+                    };
+                    // A size change is reported, not insisted on: another attachment may own the
+                    // geometry, and this one is then shown that size rather than taking it.
+                    let _ = crate::attach::resize(client, descriptor, &params).await;
                 }
             }
             bytes = input.recv() => {
@@ -258,4 +297,44 @@ async fn drive(
             }
         }
     }
+}
+
+/// How this platform reports that the terminal changed size.
+///
+/// Unix delivers a signal. Windows delivers a console input record instead, which arrives on the
+/// input stream this loop is already reading, so there is nothing separate to wait on there.
+#[cfg(unix)]
+pub type WindowChanges = tokio::signal::unix::Signal;
+
+/// How this platform reports that the terminal changed size.
+#[cfg(not(unix))]
+pub type WindowChanges = std::convert::Infallible;
+
+/// Returns the stream of window-size changes, where the platform has one.
+#[cfg(unix)]
+fn window_changes() -> Option<WindowChanges> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).ok()
+}
+
+/// Returns the stream of window-size changes, where the platform has one.
+#[cfg(not(unix))]
+const fn window_changes() -> Option<WindowChanges> {
+    None
+}
+
+/// Waits for the next window-size change, or for ever when the platform reports none.
+#[cfg(unix)]
+async fn wait_for_resize(resized: &mut Option<&mut WindowChanges>) {
+    match resized {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Waits for the next window-size change, or for ever when the platform reports none.
+#[cfg(not(unix))]
+async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
+    std::future::pending().await
 }

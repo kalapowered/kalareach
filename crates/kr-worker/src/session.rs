@@ -114,6 +114,7 @@ pub struct Session {
     pending_input: Vec<InputBatch>,
     owned: Option<OwnedProcesses>,
     root_exit: Option<ShellExit>,
+    projection: Option<Arc<dyn crate::projection::TerminalProjection>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -174,6 +175,7 @@ impl Session {
             pending_input: Vec::new(),
             owned: None,
             root_exit: None,
+            projection: None,
             config,
         })
     }
@@ -342,6 +344,24 @@ impl Session {
         self.lease.to_wire()
     }
 
+    /// Installs the terminal engine this session projects its screen through.
+    ///
+    /// Without one, a terminal of the session's own size is served the raw stream and a terminal of
+    /// any other size is refused: the raw stream assumes a column count, and sending it to a
+    /// terminal of another width produces wrapped lines and a cursor in the wrong place.
+    pub fn install_projection(
+        &mut self,
+        projection: Arc<dyn crate::projection::TerminalProjection>,
+    ) {
+        self.projection = Some(projection);
+    }
+
+    /// Returns the engine this session projects through, when one is installed.
+    #[must_use]
+    pub fn projection(&self) -> Option<&Arc<dyn crate::projection::TerminalProjection>> {
+        self.projection.as_ref()
+    }
+
     /// Adds an attachment.
     ///
     /// # Errors
@@ -354,16 +374,32 @@ impl Session {
         attachment_id: AttachmentId,
     ) -> Result<SessionAttachResult> {
         self.require_running()?;
+        let previous = self.attachments.geometry();
         let (attachment, change) =
             self.attachments
                 .attach(params, granted, attachment_id, kr_ipc::now_ms())?;
         if change.resize_required
             && let Err(error) = self.pty.resize(change.state.dimensions)
         {
-            // The kernel refused the size, so the attachment never happened. Undoing it here keeps
-            // the table and the terminal agreeing with each other.
+            // The kernel refused the size, so the attachment never happened. The table and the
+            // geometry both go back to exactly what they were, epoch included: a refused change
+            // that left the epoch moved would invalidate every client's next request over
+            // something that did not happen.
             let _ = self.attachments.detach(attachment_id);
+            self.attachments.restore_geometry(&previous);
             return Err(error);
+        }
+        // A presentation this host cannot serve is refused here rather than served wrongly. The
+        // attachment is undone first, so a refusal leaves nothing behind.
+        if attachment.presentation.as_ref() == Some(&TerminalPresentationMode::Viewport)
+            && self.projection.is_none()
+        {
+            let _ = self.attachments.detach(attachment_id);
+            return Err(WorkerError::PresentationUnsupported {
+                detail: crate::projection::PresentationRefusal::NoProjection
+                    .detail()
+                    .to_owned(),
+            });
         }
         Ok(SessionAttachResult {
             attachment,
@@ -394,9 +430,16 @@ impl Session {
             }
         }
         self.hub.unsubscribe(attachment_id);
+        let previous = self.attachments.geometry();
         let change = self.attachments.detach(attachment_id)?;
-        if change.resize_required && self.state.is_running() {
-            self.pty.resize(change.state.dimensions)?;
+        if change.resize_required
+            && self.state.is_running()
+            && let Err(error) = self.pty.resize(change.state.dimensions)
+        {
+            // The attachment is gone either way — it asked to leave — but the geometry it would
+            // have handed on is not moved when the kernel refuses the size.
+            self.attachments.restore_geometry(&previous);
+            return Err(error);
         }
         Ok(SessionDetachResult {
             attachment_id,
@@ -428,9 +471,14 @@ impl Session {
         attachment_id: AttachmentId,
         claim_geometry: bool,
     ) -> Result<GeometryState> {
+        let previous = self.attachments.geometry();
         let change = self.attachments.configure(attachment_id, claim_geometry)?;
-        if change.resize_required && self.state.is_running() {
-            self.pty.resize(change.state.dimensions)?;
+        if change.resize_required
+            && self.state.is_running()
+            && let Err(error) = self.pty.resize(change.state.dimensions)
+        {
+            self.attachments.restore_geometry(&previous);
+            return Err(error);
         }
         Ok(change.state)
     }
@@ -470,9 +518,15 @@ impl Session {
         expected_epoch: u64,
     ) -> Result<GeometryState> {
         self.require_running()?;
+        let previous = self.attachments.geometry();
         let change = self.attachments.transfer(attachment_id, expected_epoch)?;
-        if change.resize_required {
-            self.pty.resize(change.state.dimensions)?;
+        if change.resize_required
+            && let Err(error) = self.pty.resize(change.state.dimensions)
+        {
+            // The transfer is undone, owner and epoch together: a half-completed handover would
+            // leave the session with an owner whose size it never took.
+            self.attachments.restore_geometry(&previous);
+            return Err(error);
         }
         Ok(change.state)
     }

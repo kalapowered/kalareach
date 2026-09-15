@@ -214,6 +214,42 @@ pub async fn attach(
     })
 }
 
+/// Takes the session's size ownership for this attachment.
+///
+/// # Errors
+///
+/// Returns the host's refusal, or a transport failure.
+pub async fn take_geometry(
+    client: &mut LocalClient,
+    descriptor: &WorkerDescriptor,
+    attachment_id: AttachmentId,
+    expected_epoch: kr_protocol::ids::GeometryEpoch,
+) -> Result<kr_protocol::attachment::GeometryResult> {
+    call(
+        client,
+        Method::TerminalGeometryTransfer,
+        target(descriptor),
+        &kr_protocol::attachment::TerminalGeometryTransferParams {
+            attachment_id,
+            expected_geometry_epoch: expected_epoch,
+        },
+    )
+    .await
+}
+
+/// Reports this terminal's new size to the session.
+///
+/// # Errors
+///
+/// Returns the host's refusal, or a transport failure.
+pub async fn resize(
+    client: &mut LocalClient,
+    descriptor: &WorkerDescriptor,
+    params: &kr_protocol::attachment::TerminalResizeParams,
+) -> Result<kr_protocol::attachment::GeometryResult> {
+    call(client, Method::TerminalResize, target(descriptor), params).await
+}
+
 /// Returns the guard executable that sits beside this one.
 #[must_use]
 pub fn guard_program() -> std::path::PathBuf {
