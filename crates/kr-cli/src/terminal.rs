@@ -44,16 +44,14 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// encoding the terminal is using, and a person left in one of those has a terminal that behaves
 /// like somebody else's.
 ///
-/// The order matters, and the keyboard protocols are why. Each buffer has its own Kitty stack and
-/// its own `modifyOtherKeys` level, and a terminal can be left in either buffer, so both are
-/// visited: cleared where the terminal is, then in the alternate buffer, then in the primary one it
-/// is left in. Entering and leaving the alternate buffer through `?1049` saves and restores the
-/// cursor, so the primary screen is not disturbed by the visit. Leaving a terminal in an enhanced key encoding is the failure a
-/// person cannot work around: their shell receives escape sequences where it expects characters.
+/// They begin by leaving the alternate screen, so everything after them lands in the buffer the
+/// person is left looking at.
 ///
-/// These cover the modes an application can leave enabled *other than* the keyboard protocols. Those
-/// are given back by [`KEYBOARD_RESTORE_SEQUENCES`], and only by a cleanup that follows an
+/// These cover the modes an application can leave enabled *other than* the keyboard protocols.
+/// Those are given back by [`KEYBOARD_RESTORE_SEQUENCES`], and only by a cleanup that follows an
 /// attachment which began forwarding, because only such an attachment could have changed them.
+/// Leaving a terminal in an enhanced key encoding is the failure a person cannot work around: their
+/// shell receives escape sequences where it expects characters.
 pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
 
 /// The sequence that opens the attachment's own entry in the terminal's keyboard stack.
