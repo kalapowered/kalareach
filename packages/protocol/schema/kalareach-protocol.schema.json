@@ -954,7 +954,7 @@
     },
     "BackupPolicy": {
       "additionalProperties": false,
-      "description": "What an organisation requires of its members' backups.",
+      "description": "What an organisation requires of its members' backups.\n\nThe two fields are independent, as section 17 has them. An organisation may require that its\nmembers keep managed backups without being able to read one: requiring a backup is a rule about\nwhether an archive exists, and organisation recovery is a recipient an archive is also wrapped\nfor. Recovery applies exactly when a recipient is named, and never by implication.",
       "properties": {
         "recovery_recipient": {
           "anyOf": [

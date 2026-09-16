@@ -934,6 +934,224 @@ export function descriptorEncodedLength (descriptor: ArchiveDescriptor): number 
   return encodeCanonical(descriptorValue(descriptor)).length
 }
 
+/** The descriptor version this contract publishes and accepts. */
+export const ARCHIVE_DESCRIPTOR_VERSION = 1n
+
+/** Why an archive descriptor is not one this contract admits. */
+export type DescriptorRefusal =
+  | { readonly reason: 'too_large'; readonly len: number; readonly limit: number }
+  | { readonly reason: 'unsupported_version'; readonly version: bigint }
+  | { readonly reason: 'too_many_recipients'; readonly count: number; readonly limit: number }
+  | { readonly reason: 'wrap_purpose'; readonly purpose: string }
+  | { readonly reason: 'wrap_archive' }
+  | { readonly reason: 'wrap_object'; readonly named: string }
+  | { readonly reason: 'wrap_hash' }
+  | { readonly reason: 'duplicate_recipient' }
+
+/**
+ * Every check one archive descriptor passes, or null.
+ *
+ * The twin of `ArchiveDescriptor::validate`, in the same order and with the same rules. Section 20
+ * bounds a descriptor to 64 KiB and 128 recipients and refuses an invalid one before anything is
+ * allocated for it, and what makes a descriptor invalid is more than its size: a wrap that names
+ * another archive, another generation, another object or another hash is a wrap for something else,
+ * and a second wrap for one recipient says nothing the first did not.
+ *
+ * Call it on a descriptor read through {@link readArchiveDescriptor}, whose fields are canonical
+ * text: a comparison of two spellings of one value would otherwise be a comparison of two texts.
+ *
+ * @throws {ServicesSchemaError} when the descriptor is not one this contract can encode at all.
+ */
+export function checkArchiveDescriptor (descriptor: ArchiveDescriptor): DescriptorRefusal | null {
+  // The byte limit first, so an oversized descriptor costs nothing beyond the bytes that were
+  // already received.
+  const len = descriptorEncodedLength(descriptor)
+  if (len > MAX_ARCHIVE_DESCRIPTOR_LEN) {
+    return { reason: 'too_large', len, limit: MAX_ARCHIVE_DESCRIPTOR_LEN }
+  }
+
+  const version = jsonToU64(descriptor.version)
+  if (version !== ARCHIVE_DESCRIPTOR_VERSION) {
+    return { reason: 'unsupported_version', version }
+  }
+  if (descriptor.manifest_key_wraps.length > MAX_ARCHIVE_RECIPIENTS) {
+    return {
+      reason: 'too_many_recipients',
+      count: descriptor.manifest_key_wraps.length,
+      limit: MAX_ARCHIVE_RECIPIENTS
+    }
+  }
+
+  const generation = jsonToU64(descriptor.backup_generation)
+  const recipients = new Set<string>()
+  for (const wrap of descriptor.manifest_key_wraps) {
+    const context = wrap.context
+    if (context.purpose !== 'manifest_key') {
+      return { reason: 'wrap_purpose', purpose: context.purpose }
+    }
+    if (
+      context.archive_id !== descriptor.archive_id ||
+      jsonToU64(context.backup_generation) !== generation
+    ) {
+      return { reason: 'wrap_archive' }
+    }
+    if (context.object_id !== descriptor.encrypted_manifest.object_id) {
+      return { reason: 'wrap_object', named: context.object_id }
+    }
+    if (context.encrypted_object_hash !== descriptor.encrypted_manifest.encrypted_object_hash) {
+      return { reason: 'wrap_hash' }
+    }
+    if (recipients.has(context.recipient_key_id)) {
+      return { reason: 'duplicate_recipient' }
+    }
+    recipients.add(context.recipient_key_id)
+  }
+
+  return null
+}
+
+/**
+ * One archive descriptor, read against its closed schema.
+ *
+ * For the reason {@link readSealedEnvelope} states: a service stores this and serves it back, so it
+ * stores the descriptor and nothing beside it, in one spelling.
+ *
+ * @throws {ServicesSchemaError} naming the rule the descriptor breaks.
+ */
+export function readArchiveDescriptor (value: unknown): ArchiveDescriptor {
+  const descriptor = closed('an archive descriptor', value, DESCRIPTOR_FIELDS)
+  const wraps = descriptor['manifest_key_wraps']
+  if (!Array.isArray(wraps)) {
+    refuse('manifest_key_wraps is an array')
+  }
+  if (wraps.length > MAX_ARCHIVE_RECIPIENTS) {
+    refuse(`an archive descriptor names at most ${String(MAX_ARCHIVE_RECIPIENTS)} recipients`)
+  }
+
+  return {
+    archive_id: uuidToJson(identifierBytes('an archive identifier', descriptor['archive_id'])),
+    backup_generation: counterText('a backup generation', descriptor['backup_generation']),
+    encrypted_manifest: readObjectRef('an encrypted manifest', descriptor['encrypted_manifest']),
+    manifest_key_wraps: (wraps as unknown[]).map(readKeyWrap),
+    version: counterText('a descriptor version', descriptor['version'])
+  }
+}
+
+function readObjectRef (what: string, value: unknown): ArchiveDescriptor['encrypted_manifest'] {
+  const record = closed(what, value, OBJECT_REF_FIELDS)
+  return {
+    encrypted_len: counterText(`${what} length`, record['encrypted_len']),
+    encrypted_object_hash: bytesToBase64Url(
+      fixedBytes(`${what} hash`, record['encrypted_object_hash'], DIGEST_BYTES)
+    ),
+    object_id: uuidToJson(identifierBytes(`${what} identifier`, record['object_id']))
+  }
+}
+
+function readKeyWrap (value: unknown): ArchiveDescriptor['manifest_key_wraps'][number] {
+  const wrap = closed('a manifest key wrap', value, WRAP_FIELDS)
+  const context = closed('a key wrap context', wrap['context'], WRAP_CONTEXT_FIELDS)
+
+  return {
+    ciphertext: bytesToBase64Url(opaqueBytes('a key wrap ciphertext', wrap['ciphertext'])),
+    context: {
+      archive_id: uuidToJson(identifierBytes('an archive identifier', context['archive_id'])),
+      backup_generation: counterText('a backup generation', context['backup_generation']),
+      encrypted_object_hash: bytesToBase64Url(
+        fixedBytes('a wrapped object hash', context['encrypted_object_hash'], DIGEST_BYTES)
+      ),
+      format: member('a key wrap format', context['format'], ['kr-keywrap/1'] as const),
+      object_id: uuidToJson(identifierBytes('a wrapped object identifier', context['object_id'])),
+      purpose: member('a key wrap purpose', context['purpose'], [
+        'manifest_key',
+        'object_key'
+      ] as const),
+      recipient_key_id: bytesToBase64Url(
+        fixedBytes('a recipient key identifier', context['recipient_key_id'], KEY_ID_BYTES)
+      ),
+      sender_key_id: bytesToBase64Url(
+        fixedBytes('a sender key identifier', context['sender_key_id'], KEY_ID_BYTES)
+      )
+    },
+    nonce: bytesToBase64Url(fixedBytes('a key wrap nonce', wrap['nonce'], ENVELOPE_NONCE_BYTES))
+  }
+}
+
+const SIGNED_RECORD_FIELDS = ['payload', 'signature'] as const
+
+const SIGNATURE_BYTES = 64
+
+/** A signature read back in one spelling. */
+function signature (what: string, value: unknown): string {
+  return bytesToBase64Url(fixedBytes(what, value, SIGNATURE_BYTES))
+}
+
+/**
+ * One owner's writer enrolment, read against its closed schema.
+ *
+ * A service stores the record so a later publication can be checked against it, so it stores the
+ * record and nothing beside it: a field nobody agreed on would be stored, served back and covered
+ * by no signature.
+ *
+ * @throws {ServicesSchemaError} naming the rule the record breaks.
+ */
+export function readBackupWriterRecord (value: unknown): {
+  readonly payload: BackupWriterRecordPayload
+  readonly signature: string
+} {
+  const record = closed('a writer enrolment', value, SIGNED_RECORD_FIELDS)
+  const payload = closed('a writer enrolment payload', record['payload'], WRITER_RECORD_FIELDS)
+  const writer = closed('an enrolled writer', payload['writer'], TRUSTED_WRITER_FIELDS)
+
+  return {
+    payload: {
+      archive_id: uuidToJson(identifierBytes('an archive identifier', payload['archive_id'])),
+      enrolled_at_ms: counterText("an owner's enrolment time", payload['enrolled_at_ms']),
+      owner_key_id: bytesToBase64Url(
+        fixedBytes('an owner key identifier', payload['owner_key_id'], KEY_ID_BYTES)
+      ),
+      writer: {
+        enrolled_at_ms: counterText("a writer's enrolment time", writer['enrolled_at_ms']),
+        signing_key: bytesToBase64Url(
+          fixedBytes('a writer signing key', writer['signing_key'], KEY_BYTES)
+        ),
+        writer_key_id: bytesToBase64Url(
+          fixedBytes('a writer key identifier', writer['writer_key_id'], KEY_ID_BYTES)
+        )
+      },
+      writer_revision: counterText('a writer revision', payload['writer_revision'])
+    },
+    signature: signature("an owner's signature", record['signature'])
+  }
+}
+
+/**
+ * One writer's generation publication, read against its closed schema.
+ *
+ * For the reason {@link readBackupWriterRecord} states. The descriptor inside it is read the same
+ * way, so what a service stores and serves back is the descriptor the writer signed.
+ *
+ * @throws {ServicesSchemaError} naming the rule the publication breaks.
+ */
+export function readBackupGenerationPublication (value: unknown): {
+  readonly payload: BackupGenerationPublicationPayload
+  readonly signature: string
+} {
+  const record = closed('a generation publication', value, SIGNED_RECORD_FIELDS)
+  const payload = closed('a generation publication payload', record['payload'], PUBLICATION_FIELDS)
+
+  return {
+    payload: {
+      descriptor: readArchiveDescriptor(payload['descriptor']),
+      published_at_ms: counterText('a publication time', payload['published_at_ms']),
+      writer_key_id: bytesToBase64Url(
+        fixedBytes('a writer key identifier', payload['writer_key_id'], KEY_ID_BYTES)
+      )
+    },
+    signature: signature("a writer's signature", record['signature'])
+  }
+}
+
 const RECOVERY_RECIPIENT_FIELDS = [
   'name',
   'named_at_ms',
@@ -1097,7 +1315,6 @@ export type PolicyRefusal =
   | { readonly reason: 'grant_lifetime'; readonly lifetime: bigint }
   | { readonly reason: 'empty_allowlist' }
   | { readonly reason: 'allowlist_too_long'; readonly count: number }
-  | { readonly reason: 'recovery_recipient_missing' }
 
 /**
  * Every check a policy passes before it is signed or accepted, or null.
@@ -1125,8 +1342,8 @@ export function checkOrganisationPolicy (payload: OrganisationPolicyPayload): Po
       return { reason: 'allowlist_too_long', count: payload.adapter_allowlist.length }
     }
   }
-  if (payload.backup.required && payload.backup.recovery_recipient === null) {
-    return { reason: 'recovery_recipient_missing' }
-  }
+  // Nothing here couples the two backup fields. An organisation that requires backups and names
+  // no recipient requires an archive it cannot read, which is the ordinary case; recovery is what
+  // naming a recipient establishes, and a host enrols visibly for it.
   return null
 }

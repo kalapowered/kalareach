@@ -384,6 +384,11 @@ pub struct OrganisationRecoveryRecipient {
 }
 
 /// What an organisation requires of its members' backups.
+///
+/// The two fields are independent, as section 17 has them. An organisation may require that its
+/// members keep managed backups without being able to read one: requiring a backup is a rule about
+/// whether an archive exists, and organisation recovery is a recipient an archive is also wrapped
+/// for. Recovery applies exactly when a recipient is named, and never by implication.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BackupPolicy {
@@ -458,9 +463,6 @@ pub enum PolicyError {
         /// The limit.
         limit: usize,
     },
-    /// Backups are required and no recipient is named for the organisation's own recovery.
-    #[error("organisation recovery needs a named encryption recipient")]
-    RecoveryRecipientMissing,
 }
 
 impl OrganisationPolicyPayload {
@@ -517,13 +519,9 @@ impl OrganisationPolicyPayload {
             }
         }
 
-        // A required backup with nowhere for the organisation to recover from is a requirement
-        // nobody can meet, and naming the recipient is what makes organisation recovery visible
-        // rather than assumed.
-        if self.backup.required && !self.backup.recovery_recipient.is_present() {
-            return Err(PolicyError::RecoveryRecipientMissing);
-        }
-
+        // Nothing here couples the two backup fields. An organisation that requires backups and
+        // names no recipient requires an archive it cannot read, which is the ordinary case;
+        // recovery is what naming a recipient establishes, and a host enrols visibly for it.
         Ok(())
     }
 

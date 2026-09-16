@@ -42,7 +42,11 @@ import {
   bytesToBase64Url,
   canonicalBody,
   canonicalBodyDigest,
+  checkArchiveDescriptor,
   checkOrganisationPolicy,
+  readArchiveDescriptor,
+  readBackupGenerationPublication,
+  readBackupWriterRecord,
   checkSealedEnvelope,
   checkSealedSyncObject,
   envelopeStoredBytes,
@@ -450,6 +454,9 @@ describe('settings sync', () => {
   })
 })
 
+/** An identifier no vector uses, for a field that is meant to name something else. */
+const OTHER_IDENTIFIER = '2f1c7a10-0000-4000-8000-000000000001'
+
 describe('backup manifests', () => {
   it('covers the bytes a writer enrolment is signed over', () => {
     const enrolment = vector('backup_writer_record')
@@ -469,6 +476,136 @@ describe('backup manifests', () => {
         )
       )
     ).toBe(publication.cbor_hex)
+  })
+
+  it('admits the published descriptor and refuses every wrap that is for something else', () => {
+    const publication = readBackupGenerationPublication(
+      vector('backup_generation_publication').json
+    )
+    const descriptor = publication.payload.descriptor
+    const wrap = descriptor.manifest_key_wraps[0]
+    if (wrap === undefined) {
+      throw new Error('the published descriptor names a recipient')
+    }
+
+    expect(checkArchiveDescriptor(descriptor)).toBeNull()
+
+    // A signed descriptor says who signed it and nothing about what it is for. Each of these is a
+    // descriptor a writer could sign and a service must not store: section 20 refuses an invalid
+    // descriptor before anything is allocated for it.
+    const refusals = [
+      [{ ...descriptor, version: '2' }, 'unsupported_version'],
+      [
+        {
+          ...descriptor,
+          manifest_key_wraps: [{ ...wrap, context: { ...wrap.context, purpose: 'object_key' } }]
+        },
+        'wrap_purpose'
+      ],
+      [
+        {
+          ...descriptor,
+          manifest_key_wraps: [
+            { ...wrap, context: { ...wrap.context, archive_id: OTHER_IDENTIFIER } }
+          ]
+        },
+        'wrap_archive'
+      ],
+      [
+        {
+          ...descriptor,
+          manifest_key_wraps: [
+            { ...wrap, context: { ...wrap.context, backup_generation: '99' } }
+          ]
+        },
+        'wrap_archive'
+      ],
+      [
+        {
+          ...descriptor,
+          manifest_key_wraps: [
+            { ...wrap, context: { ...wrap.context, object_id: OTHER_IDENTIFIER } }
+          ]
+        },
+        'wrap_object'
+      ],
+      [
+        {
+          ...descriptor,
+          manifest_key_wraps: [
+            {
+              ...wrap,
+              context: { ...wrap.context, encrypted_object_hash: bytesToBase64Url(new Uint8Array(32)) }
+            }
+          ]
+        },
+        'wrap_hash'
+      ],
+      [{ ...descriptor, manifest_key_wraps: [wrap, wrap] }, 'duplicate_recipient']
+    ] as const
+
+    for (const [tampered, reason] of refusals) {
+      expect(checkArchiveDescriptor(tampered as never)?.reason, reason).toBe(reason)
+    }
+  })
+
+  it('refuses a descriptor above the bound before it is read for anything else', () => {
+    const descriptor = readBackupGenerationPublication(
+      vector('backup_generation_publication').json
+    ).payload.descriptor
+    const wrap = descriptor.manifest_key_wraps[0]
+    if (wrap === undefined) {
+      throw new Error('the published descriptor names a recipient')
+    }
+
+    // One wrap per recipient, each with a recipient of its own, until the encoding passes 64 KiB.
+    const wraps = Array.from({ length: 96 }, (_, index) => ({
+      ...wrap,
+      ciphertext: bytesToBase64Url(new Uint8Array(700).fill(index + 1)),
+      context: {
+        ...wrap.context,
+        recipient_key_id: bytesToBase64Url(new Uint8Array(32).fill(index + 1))
+      }
+    }))
+    const refusal = checkArchiveDescriptor({ ...descriptor, manifest_key_wraps: wraps })
+    expect(refusal?.reason).toBe('too_large')
+  })
+
+  it('reads a writer enrolment and a publication against their closed schemas', () => {
+    const enrolment = vector('backup_writer_record').json as BackupWriterRecord
+    expect(readBackupWriterRecord(enrolment)).toEqual(enrolment)
+
+    const publication = vector('backup_generation_publication').json as BackupGenerationPublication
+    expect(readBackupGenerationPublication(publication)).toEqual(publication)
+    expect(readArchiveDescriptor(publication.payload.descriptor)).toEqual(
+      publication.payload.descriptor
+    )
+
+    // What a service stores is the record and nothing beside it, at every level of it.
+    expect(() =>
+      readBackupWriterRecord({ ...enrolment, stored_at: '1' })
+    ).toThrow(ServicesSchemaError)
+    expect(() =>
+      readBackupWriterRecord({
+        ...enrolment,
+        payload: { ...enrolment.payload, writer: { ...enrolment.payload.writer, label: 'x' } }
+      })
+    ).toThrow(ServicesSchemaError)
+    expect(() =>
+      readBackupGenerationPublication({
+        ...publication,
+        payload: {
+          ...publication.payload,
+          descriptor: {
+            ...publication.payload.descriptor,
+            encrypted_manifest: {
+              ...publication.payload.descriptor.encrypted_manifest,
+              filename: 'notes.txt'
+            }
+          }
+        }
+      })
+    ).toThrow(ServicesSchemaError)
   })
 
   it('refuses a publication carrying a descriptor field nobody agreed on', () => {
@@ -522,16 +659,18 @@ describe('organisation policy', () => {
     ).toBe('allowlist_too_long')
   })
 
-  it('refuses a required backup with no organisation recipient named', () => {
+  it('lets an organisation require backups it cannot read', () => {
     const payload = (policy.json as OrganisationPolicy).payload
+    // Section 17 keeps the two apart: requiring a backup is a rule about whether an archive
+    // exists, and organisation recovery is a recipient an archive is also wrapped for.
+    // Administering billing or membership gives nobody a content key, so an organisation that
+    // names no recipient requires an archive it cannot decrypt, which is the ordinary case.
     expect(
       checkOrganisationPolicy({
         ...payload,
         backup: { required: true, recovery_recipient: null }
-      })?.reason
-    ).toBe('recovery_recipient_missing')
-    // Administering an organisation gives nobody a content key: with no recipient named, the
-    // organisation simply requires nothing it cannot read.
+      })
+    ).toBeNull()
     expect(
       checkOrganisationPolicy({
         ...payload,
