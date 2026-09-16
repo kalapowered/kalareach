@@ -46,7 +46,9 @@ use kr_protocol::input::{
     InputAcquireParams, InputInterruptParams, InputLeaseResult, InputReleaseParams,
     InputWriteParams, InputWriteResult, InterruptAction,
 };
-use kr_protocol::local::{LocalClientKind, LocalHello, LocalHelloAck, LocalRole};
+use kr_protocol::local::{
+    ControllerConnectionRole, LocalClientKind, LocalHello, LocalHelloAck, LocalRole,
+};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{
     EventsSnapshotParams, EventsSubscribeParams, EventsSubscribeResult, HistoryPageParams,
@@ -100,12 +102,21 @@ pub const MAX_REPLAY_PAGE_BYTES: u64 = 512 * 1024;
 /// can never install a generation without also installing the connection it arrived on. A request
 /// from a controller connection that is not the bound one is refused, which is what makes fencing
 /// something the dispatch path enforces rather than something the handshake merely records.
+///
+/// A daemon also opens a connection for each caller it is proxying, because the worker's
+/// attachments, subscriptions and input lane all belong to the connection that created them, and a
+/// device's own attachment cannot share a connection with the daemon's housekeeping. Those
+/// connections declare themselves proxies before they present a token, so they never take the
+/// authority binding and never fence the connection that holds it. A token for a *higher*
+/// generation fences every one of them along with the authority itself.
 #[derive(Clone, Debug)]
 struct Authority {
     /// The highest generation this worker has accepted.
     accepted_generation: Option<ControllerGeneration>,
     /// The connection that presented it.
     bound_connection: Option<ConnectionId>,
+    /// The proxy connections of that same generation.
+    proxy_connections: std::collections::BTreeSet<ConnectionId>,
     /// The authority revision the controller last announced and this worker acknowledged.
     acknowledged_revision: Option<kr_protocol::ids::AuthorityRevision>,
 }
@@ -205,6 +216,7 @@ impl WorkerService {
             authority: Mutex::new(Authority {
                 accepted_generation: Some(binding.controller_generation),
                 bound_connection: None,
+                proxy_connections: std::collections::BTreeSet::new(),
                 acknowledged_revision: None,
             }),
             dispatch: Mutex::new(()),
@@ -608,6 +620,7 @@ impl WorkerService {
                     )),
                 }
             }
+            ControlFrame::ControllerRole(role) => Some(Self::declare_role(state, role)),
             ControlFrame::GenerationToken(token) => Some(self.accept_generation(state, &token)),
             ControlFrame::AcceptanceDelivered(action_id) => {
                 // The proxy has passed the acceptance on. Whatever it names, only the close this
@@ -624,11 +637,19 @@ impl WorkerService {
             ControlFrame::AuthorityRevision(notice) => {
                 Some(self.acknowledge_revision(state, &notice))
             }
-            ControlFrame::Request(request) => Some(self.request(state, &request)),
-            ControlFrame::Mutation(mutation) => {
-                Some(self.mutation(state, &mutation, state.actor_id.clone(), Freshness::Window))
+            ControlFrame::Request(request) => {
+                let actor_id = state.actor_id.clone();
+                Some(self.request(state, &request, &actor_id, ActorIngress::LocalIpc))
             }
+            ControlFrame::Mutation(mutation) => Some(self.mutation(
+                state,
+                &mutation,
+                state.actor_id.clone(),
+                ActorIngress::LocalIpc,
+                Freshness::Window,
+            )),
             ControlFrame::Forwarded(forwarded) => Some(self.forwarded(state, &forwarded)),
+            ControlFrame::ForwardedRead(forwarded) => Some(self.forwarded_read(state, &forwarded)),
             _ => Some(failure(
                 RequestId::new(0),
                 &ProtocolError::new(
@@ -748,6 +769,35 @@ impl WorkerService {
         }))
     }
 
+    /// Records what a controller connection is for, before it presents a token.
+    ///
+    /// It is declared once and only before the token: a connection that could relabel itself
+    /// afterwards could take the authority binding away from the connection that holds it, or give
+    /// its own proxy the authority to announce a revocation.
+    fn declare_role(state: &mut ConnectionState, role: ControllerConnectionRole) -> ControlFrame {
+        if state.client_kind != LocalClientKind::Controller {
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "only a control-daemon connection has a role to declare",
+                ),
+            );
+        }
+        if state.controller {
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this connection has already presented a generation; open another one to \
+                     change what it is for",
+                ),
+            );
+        }
+        state.controller_role = role;
+        ControlFrame::ControllerRole(role)
+    }
+
     fn accept_generation(
         &self,
         state: &mut ConnectionState,
@@ -785,23 +835,50 @@ impl WorkerService {
         };
         match check_generation_token(&acceptance, &nonce, token) {
             Ok(()) => {
+                // A token for a higher generation replaces the authority, so the connection that
+                // held it and every proxy of it are fenced together. Anything a previous generation
+                // opened stops being served, whatever it was for.
+                let superseded = authority
+                    .accepted_generation
+                    .is_none_or(|accepted| token.generation.get() > accepted.get());
+                let mut fenced = Vec::new();
+                if superseded {
+                    fenced.extend(authority.bound_connection.take());
+                    fenced.extend(std::mem::take(&mut authority.proxy_connections));
+                }
                 authority.accepted_generation = Some(token.generation);
-                // Installing this connection fences whatever was bound before it, including an
-                // earlier connection of the same generation.
-                let fenced_previous = authority.bound_connection.replace(state.connection_id);
+                match state.controller_role {
+                    // Installing this connection fences whatever held the authority before it,
+                    // including an earlier connection of the same generation.
+                    ControllerConnectionRole::Authority => {
+                        if let Some(previous) =
+                            authority.bound_connection.replace(state.connection_id)
+                            && previous != state.connection_id
+                            && !fenced.contains(&previous)
+                        {
+                            fenced.push(previous);
+                        }
+                    }
+                    // A proxy takes no authority binding, so it displaces nothing: it serves one
+                    // caller the daemon authenticated, and the daemon's own connection goes on
+                    // holding the authority.
+                    ControllerConnectionRole::Proxy => {
+                        authority.proxy_connections.insert(state.connection_id);
+                    }
+                }
                 drop(authority);
-                // Refusing the fenced connection's next request is not enough on its own: a
+                // Refusing a fenced connection's next request is not enough on its own: a
                 // subscription it already started would keep delivering this session's output down
                 // a connection whose authority has been withdrawn. Withdrawing the registration
                 // ends that connection, which takes its delivery task and its attachments with it.
-                if let Some(previous) = fenced_previous {
-                    self.withdraw(previous);
+                for previous in &fenced {
+                    self.withdraw(*previous);
                 }
                 state.controller = true;
                 state.generation = Some(token.generation);
                 ControlFrame::GenerationAccepted(kr_protocol::worker::GenerationAccepted {
                     generation: token.generation,
-                    fenced_previous: fenced_previous.is_some(),
+                    fenced_previous: !fenced.is_empty(),
                 })
             }
             Err(error) => {
@@ -834,12 +911,15 @@ impl WorkerService {
             .expect("the dispatch barrier is not poisoned");
         // Only the controller that holds current authority may announce one. A revocation is what
         // this answers; a caller that the revocation might be about must not be able to satisfy it.
-        if state.client_kind != LocalClientKind::Controller {
+        if state.client_kind != LocalClientKind::Controller
+            || state.controller_role != ControllerConnectionRole::Authority
+        {
             return failure(
                 RequestId::new(0),
                 &ProtocolError::new(
                     ErrorCode::PermissionDenied,
-                    "only the control daemon announces an authority revision",
+                    "only the control daemon's authority connection announces an authority \
+                     revision",
                 ),
             );
         }
@@ -946,6 +1026,9 @@ impl WorkerService {
     /// * the latch is set, so a write already waiting for the peer abandons what it was writing;
     /// * the attachments are detached, so the connection owns nothing of the session.
     fn withdraw(&self, connection_id: ConnectionId) {
+        // The authority binding goes with the registration. A connection whose registration has
+        // been withdrawn must not still be one a generation speaks through.
+        self.unbind(connection_id);
         let held = self
             .admitted
             .lock()
@@ -987,8 +1070,21 @@ impl WorkerService {
         }
     }
 
+    /// Removes one connection from whatever the accepted generation speaks through.
+    fn unbind(&self, connection_id: ConnectionId) {
+        let mut authority = self
+            .authority
+            .lock()
+            .expect("the authority lock is not poisoned");
+        if authority.bound_connection == Some(connection_id) {
+            authority.bound_connection = None;
+        }
+        authority.proxy_connections.remove(&connection_id);
+    }
+
     /// Removes a connection that has ended of its own accord.
     fn deregister(&self, connection_id: ConnectionId) {
+        self.unbind(connection_id);
         self.admitted
             .lock()
             .expect("the connection registry is not poisoned")
@@ -1015,7 +1111,15 @@ impl WorkerService {
             .authority
             .lock()
             .expect("the authority lock is not poisoned");
-        if authority.bound_connection != Some(state.connection_id) {
+        let bound = match state.controller_role {
+            ControllerConnectionRole::Authority => {
+                authority.bound_connection == Some(state.connection_id)
+            }
+            ControllerConnectionRole::Proxy => {
+                authority.proxy_connections.contains(&state.connection_id)
+            }
+        };
+        if !bound {
             return Err(WorkerError::GenerationFenced {
                 detail: "a later controller connection holds this environment's authority"
                     .to_owned(),
@@ -1034,7 +1138,13 @@ impl WorkerService {
         Ok(())
     }
 
-    fn request(&self, state: &mut ConnectionState, request: &Request) -> ControlFrame {
+    fn request(
+        &self,
+        state: &mut ConnectionState,
+        request: &Request,
+        actor_id: &ActorId,
+        ingress: ActorIngress,
+    ) -> ControlFrame {
         if !state.negotiated {
             return failure(request.request_id, &not_negotiated());
         }
@@ -1044,7 +1154,7 @@ impl WorkerService {
         let Some(method) = request.method.method() else {
             return failure(request.request_id, &unlisted());
         };
-        if Self::entry(method, request.method_version).is_none() {
+        if Self::entry(method, request.method_version, ingress).is_none() {
             return failure(request.request_id, &unlisted());
         }
         let outcome = match method {
@@ -1052,7 +1162,7 @@ impl WorkerService {
             Method::EventsSnapshot => self.events_snapshot(&request.params),
             Method::HistoryPage => self.history_page(state, &request.params),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params),
-            Method::ActionRead => self.action_read(state, &request.params),
+            Method::ActionRead => self.action_read(actor_id, &request.params),
             Method::InputWrite => self.input_write(state, &request.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
@@ -1090,6 +1200,7 @@ impl WorkerService {
         state: &mut ConnectionState,
         mutation: &MutationRequest,
         actor_id: ActorId,
+        ingress: ActorIngress,
         freshness: Freshness,
     ) -> ControlFrame {
         if !state.negotiated {
@@ -1101,7 +1212,7 @@ impl WorkerService {
         let Some(method) = mutation.method.method() else {
             return failure(mutation.request_id, &unlisted());
         };
-        let Some(entry) = Self::entry(method, mutation.method_version) else {
+        let Some(entry) = Self::entry(method, mutation.method_version, ingress) else {
             return failure(mutation.request_id, &unlisted());
         };
         match self.receipted(state, mutation, method, entry, actor_id, freshness) {
@@ -1133,12 +1244,33 @@ impl WorkerService {
                 ),
             );
         }
-        if forwarded.actor.ingress != ActorIngress::LocalIpc {
+        // The daemon vouches for where the caller entered the host, and the registry decides which
+        // ingress may reach which method. A paired device is the one remote ingress a worker
+        // serves, because the daemon is the only thing that can authenticate one: an unpaired peer
+        // reaches the pairing surface and nothing else, and a plugin, a workflow or a service
+        // credential is not something this endpoint admits at all.
+        if !matches!(
+            forwarded.actor.ingress,
+            ActorIngress::LocalIpc | ActorIngress::PairedDevice
+        ) {
             return failure(
                 forwarded.mutation.request_id,
                 &ProtocolError::new(
                     ErrorCode::PermissionDenied,
-                    "this endpoint serves the local ingress",
+                    "this endpoint serves the local and paired-device ingresses",
+                ),
+            );
+        }
+        // A device envelope names the device, which is what makes the receipt attributable. One
+        // that does not is malformed rather than merely unusual.
+        if forwarded.actor.ingress == ActorIngress::PairedDevice
+            && !forwarded.actor.device_id.is_present()
+        {
+            return failure(
+                forwarded.mutation.request_id,
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "a paired-device envelope names the device it acts for",
                 ),
             );
         }
@@ -1163,7 +1295,60 @@ impl WorkerService {
             state,
             &forwarded.mutation,
             forwarded.actor.actor_id.clone(),
+            forwarded.actor.ingress,
             Freshness::Vouched(deadline),
+        )
+    }
+
+    /// Serves a read the control daemon admitted for somebody else.
+    ///
+    /// A read has no deadline to honour and no receipt to write, so what forwarding adds is the
+    /// attribution: the request is served as the caller rather than as the daemon, and the method
+    /// is checked against the ingress the daemon vouched for. Without that, a read that asks about
+    /// an action would ask about the daemon's own actions, and a method the registry keeps to
+    /// private IPC would be reachable from the network through the proxy.
+    fn forwarded_read(
+        &self,
+        state: &mut ConnectionState,
+        forwarded: &kr_protocol::local::ForwardedRequest,
+    ) -> ControlFrame {
+        if state.client_kind != LocalClientKind::Controller {
+            return failure(
+                forwarded.request.request_id,
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "only the control daemon forwards an admitted read",
+                ),
+            );
+        }
+        if !matches!(
+            forwarded.actor.ingress,
+            ActorIngress::LocalIpc | ActorIngress::PairedDevice
+        ) {
+            return failure(
+                forwarded.request.request_id,
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this endpoint serves the local and paired-device ingresses",
+                ),
+            );
+        }
+        if forwarded.actor.ingress == ActorIngress::PairedDevice
+            && !forwarded.actor.device_id.is_present()
+        {
+            return failure(
+                forwarded.request.request_id,
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "a paired-device envelope names the device it acts for",
+                ),
+            );
+        }
+        self.request(
+            state,
+            &forwarded.request,
+            &forwarded.actor.actor_id,
+            forwarded.actor.ingress,
         )
     }
 
@@ -1661,15 +1846,18 @@ impl WorkerService {
         }
     }
 
-    /// Returns the registry entry that governs a request from a local caller.
+    /// Returns the registry entry that governs a request from this ingress.
     ///
     /// Anything unlisted, unreachable from this ingress or at an unsupported version has no entry,
-    /// and the request is refused before a parameter is parsed.
+    /// and the request is refused before a parameter is parsed. The ingress is the one the daemon
+    /// vouched for rather than the socket this frame arrived on, so a method the registry keeps to
+    /// private IPC is refused for a paired device even though the frame came over a Unix socket.
     fn entry(
         method: Method,
         version: MethodVersion,
+        ingress: ActorIngress,
     ) -> Option<&'static kr_protocol::authority::MethodEntry> {
-        match kr_protocol::method::decide(method.as_str(), version, ActorIngress::LocalIpc) {
+        match kr_protocol::method::decide(method.as_str(), version, ingress) {
             kr_protocol::authority::AuthorityDecision::Listed(entry) => Some(entry),
             kr_protocol::authority::AuthorityDecision::Denied(_) => None,
         }
@@ -1813,7 +2001,7 @@ impl WorkerService {
     /// find this caller's own action. An identifier belonging to somebody else simply is not
     /// present, which is what keeps an action identifier from being a way to read another actor's
     /// result.
-    fn action_read(&self, state: &ConnectionState, params: &ParamsValue) -> Result<ParamsValue> {
+    fn action_read(&self, actor_id: &ActorId, params: &ParamsValue) -> Result<ParamsValue> {
         let params: kr_protocol::receipt::ActionReadParams = parse(params)?;
         let mut session = self.runtime.session();
         let journal = session
@@ -1822,11 +2010,11 @@ impl WorkerService {
                 detail: "this session retains no receipts, so none can be read".to_owned(),
             })?;
         let receipt = journal
-            .read(state.actor_id.clone(), params.action_id)?
+            .read(actor_id.clone(), params.action_id)?
             .ok_or_else(|| {
                 WorkerError::InvalidArgument(format!("no receipt for action {}", params.action_id))
             })?;
-        let retained = journal.read_result(&state.actor_id, params.action_id)?;
+        let retained = journal.read_result(actor_id, params.action_id)?;
         drop(session);
         let result = retained
             .map(|bytes| {
@@ -2163,6 +2351,8 @@ pub struct ConnectionState {
     pub peer_limits: kr_protocol::hello::ReceiveLimits,
     /// The generation this connection proved, when it is a controller.
     pub generation: Option<ControllerGeneration>,
+    /// What a controller connection is for, as it declared before presenting a token.
+    pub controller_role: ControllerConnectionRole,
     /// The event stream identifier notifications carry.
     pub stream_id: StreamId,
     /// The challenge this connection issued to a controller, consumed once.
@@ -2212,6 +2402,7 @@ impl ConnectionState {
             client_kind: LocalClientKind::Cli,
             peer_limits: kr_protocol::hello::ReceiveLimits::default(),
             generation: None,
+            controller_role: ControllerConnectionRole::Authority,
             stream_id: StreamId::new(OUTPUT_STREAM).expect("a valid stream name"),
             generation_nonce: None,
             attachments,
