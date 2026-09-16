@@ -485,13 +485,20 @@ impl TransferModule {
     /// # Errors
     ///
     /// Returns the refusal the service decided.
-    pub async fn sweep(&self, controller: &Controller) -> Answer<Sweep> {
-        let retention = controller
-            .session_retention()
-            .await
-            .map_err(|error| error.to_protocol_error())?;
+    pub async fn sweep(&self, controller: &Arc<Controller>) -> Answer<Sweep> {
+        // The registry scan and the sweep are both storage work, so both run on the same blocking
+        // task. Reading the registry means holding its lock, and that lock is a task-aware one, so
+        // it is taken in its blocking form *inside* the blocking task rather than awaited on the
+        // reactor and handed over.
+        let owner = Arc::clone(controller);
         let service = Arc::clone(&self.service);
-        blocking(move || service.sweep(&retention).map_err(Into::into)).await
+        blocking(move || {
+            let retention = owner
+                .session_retention()
+                .map_err(|error| error.to_protocol_error())?;
+            service.sweep(&retention).map_err(Into::into)
+        })
+        .await
     }
 }
 
@@ -537,8 +544,10 @@ impl Controller {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the registry cannot be read.
-    pub async fn session_retention(&self) -> Result<RegistryRetention> {
-        let registry = self.registry_handle().lock().await;
+    /// This is a synchronous read of the registry's own store, so it is called from a blocking
+    /// task: the lock is taken in its blocking form, which is only correct off the reactor.
+    pub fn session_retention(&self) -> Result<RegistryRetention> {
+        let registry = self.registry_handle().blocking_lock();
         let mut retention = RegistryRetention::default();
         for phase in EVERY_PHASE {
             for reservation in registry.reservations_in(*phase)? {
