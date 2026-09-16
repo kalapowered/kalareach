@@ -485,16 +485,16 @@ impl TransferService {
         match self.fill_snapshot(&reserved, &stored, &mut source, before, now) {
             Ok(result) => Ok(result),
             Err(error) => {
-                // The reservation goes with the failure, and its payload with it.
-                let closed = self.locked()?.close_snapshot(
+                // The reservation goes with the failure, and its payload with it. The removal is
+                // unconditional: this call created that file, and whether something else closed
+                // the row first does not change whose file it is.
+                let _ = self.locked()?.close_snapshot(
                     transfer_id,
                     SnapshotState::Failed,
                     Some(&error.to_string()),
                     now,
-                )?;
-                if closed {
-                    let _ = self.discard_snapshot_payload(&reserved);
-                }
+                );
+                let _ = self.discard_snapshot_payload(&reserved);
                 Err(error)
             }
         }
@@ -509,7 +509,15 @@ impl TransferService {
         before: SourceState,
         now: TimestampMs,
     ) -> Result<DownloadBeginResult> {
-        let (immutability, copied) = match clone_file(source, self.staging.snapshots(), stored) {
+        let cloned = if self
+            .copy_snapshots
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            Err(std::io::Error::other("this service was asked to copy"))
+        } else {
+            clone_file(source, self.staging.snapshots(), stored)
+        };
+        let (immutability, copied) = match cloned {
             // A clone is atomic with respect to the source, so nothing a writer does afterwards
             // can reach it and the before-and-after comparison is a formality.
             Ok(()) => (DownloadImmutability::ClonedSnapshot, before.byte_len),
@@ -538,12 +546,13 @@ impl TransferService {
         // A clone copies the source's mode bits, so an executable source would otherwise produce
         // an executable payload. The payload policy is this host's, not the source's.
         normalise_payload(&destination)?;
-        // The copy path flushed its own writes; a clone never went through this host's handle, so
-        // its data is flushed here, before the record that says the snapshot serves bytes.
-        destination
-            .handle()
-            .sync_data()
-            .map_err(TransferError::staging)?;
+        if immutability == DownloadImmutability::ClonedSnapshot {
+            // The copy path flushed the handle it wrote through. A clone wrote through no handle
+            // of this host's, so its data is flushed here, before the record that says the
+            // snapshot serves bytes. Only a clone: Windows refuses a flush on a handle opened for
+            // reading, and Windows has no clone.
+            flush_payload(&destination)?;
+        }
         let (content_digest, byte_len) = digest_of(&mut destination)?;
         if byte_len != before.byte_len {
             return Err(TransferError::integrity(
@@ -568,7 +577,7 @@ impl TransferService {
             // same number of bytes and restored the modification time passes the comparison above,
             // so the source is read again and its digest compared with the copy's: equal digests
             // mean the copy is byte-for-byte a state the source actually held.
-            let (source_digest, source_len) = digest_of(source)?;
+            let (source_digest, source_len) = digest_bounded(source, before.byte_len)?;
             if source_len != byte_len || source_digest != content_digest {
                 return Err(TransferError::source_changed(format!(
                     "{} does not match the copy taken of it, so this snapshot covers no single \
@@ -727,6 +736,58 @@ fn clone_file(
     Err(std::io::Error::other(
         "this platform offers no filesystem clone",
     ))
+}
+
+/// Flushes a cloned payload's data to storage.
+///
+/// A flush through a handle opened for reading is a Unix operation; Windows requires write access
+/// for it, and Windows never takes the clone path this is for.
+#[cfg(unix)]
+fn flush_payload(file: &AuthorisedFile) -> Result<()> {
+    use std::os::fd::AsFd as _;
+
+    rustix::fs::fsync(file.handle().as_fd())
+        .map_err(|error| TransferError::staging(std::io::Error::from(error)))
+}
+
+#[cfg(not(unix))]
+fn flush_payload(_file: &AuthorisedFile) -> Result<()> {
+    Ok(())
+}
+
+/// Digests at most `bound` bytes of a file, refusing one that has more.
+///
+/// A verification read is work, and work a source can decide the size of is work this host does
+/// not do. The source was admitted at a length; a source with more bytes than that is one that
+/// grew, which is the answer rather than a longer read.
+fn digest_bounded(file: &mut AuthorisedFile, bound: u64) -> Result<(Digest256, u64)> {
+    use sha2::Digest as _;
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    file.handle_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(TransferError::staging)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0_u8; COPY_BUFFER_LEN];
+    let mut read_total = 0_u64;
+    loop {
+        let read = file
+            .handle_mut()
+            .read(&mut buffer)
+            .map_err(TransferError::staging)?;
+        if read == 0 {
+            break;
+        }
+        read_total = read_total.saturating_add(read as u64);
+        if read_total > bound {
+            return Err(TransferError::source_changed(
+                "the source grew past the length this transfer was admitted at",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok((Digest256::from_bytes(digest), read_total))
 }
 
 /// Applies this host's payload permissions to a staged snapshot.
@@ -1053,17 +1114,18 @@ impl<'destination> DownloadWriter<'destination> {
                     });
                 }
             }
-            // The link this call created has to name the verified object. If it does not, the name
-            // did not exist before this call, so removing it leaves the destination exactly as it
-            // was rather than holding something nobody asked for.
+            // The link named the object this call verified, because the name it copied was
+            // checked immediately above. So a destination that now holds something else is one
+            // something else replaced *after* this download published, and that file is not this
+            // call's to remove: it belongs to whoever wrote it. The refusal says what happened
+            // and leaves the destination as it found it.
             let published = self
                 .destination
                 .open_read(&self.final_name, ObjectPolicy::ReadableFile)?;
             if published.identity() != verified {
-                drop(published);
-                let _ = self.destination.remove(&self.final_name);
                 return Err(TransferError::integrity(format!(
-                    "{} does not hold the object this download verified, so it was not published",
+                    "{} was replaced after this download published it, so what it holds is not \
+                     the object this transfer verified",
                     self.placement.destination_name
                 )));
             }

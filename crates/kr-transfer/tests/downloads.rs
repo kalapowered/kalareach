@@ -1531,3 +1531,134 @@ fn a_replaced_temporary_file_is_never_published() {
         "nothing was published"
     );
 }
+
+/// KR-ACC-019, KR-REQ-14.15: a source rewritten in place while it is being copied never produces a
+/// snapshot that mixes two revisions.
+///
+/// This is the byte-copy path, which every filesystem without a clone takes and which this machine
+/// has to be asked for. The writer rewrites the same bytes in place rather than replacing the name,
+/// so the copy can genuinely read half of each revision: what has to hold is that such a copy is
+/// refused rather than served.
+#[test]
+fn a_source_rewritten_in_place_while_it_is_copied_is_refused_rather_than_mixed() {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let harness = Harness::create();
+    harness.service.copy_snapshots(true);
+    let tree = source_tree();
+    // Two revisions of the same length, which is what makes an in-place rewrite invisible to a
+    // size comparison.
+    let first = pattern(2 * 1024 * 1024);
+    let second: Vec<u8> = first.iter().map(|byte| byte ^ 0xff).collect();
+    let source = tree.path().join("notes.bin");
+    std::fs::write(&source, &first).expect("writes the first revision");
+    let scope = harness
+        .service
+        .register_scope("a review tree", tree.path())
+        .expect("registers the scope");
+    let digests = [digest(&first), digest(&second)];
+    let stop = AtomicBool::new(false);
+    let served = AtomicUsize::new(0);
+    let refused = AtomicUsize::new(0);
+
+    std::thread::scope(|threads| {
+        let writer = threads.spawn(|| {
+            let mut handle = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&source)
+                .expect("opens the source for writing");
+            let mut turn = 0_usize;
+            while turn < 400 && !stop.load(Ordering::Relaxed) {
+                let bytes: &[u8] = if turn.is_multiple_of(2) {
+                    &second
+                } else {
+                    &first
+                };
+                handle.seek(SeekFrom::Start(0)).expect("rewinds");
+                handle.write_all(bytes).expect("rewrites in place");
+                handle.flush().expect("flushes");
+                turn += 1;
+            }
+        });
+
+        for _ in 0..10 {
+            match harness.service.download_begin(
+                &harness.actor,
+                &DownloadBeginParams {
+                    environment_id: harness.environment_id(),
+                    resume_transfer_id: Nullable::null(),
+                    source: Nullable::some(DownloadSource::Scope {
+                        scope_id: scope,
+                        relative_path: "notes.bin".to_owned(),
+                    }),
+                    device_id: Nullable::null(),
+                },
+            ) {
+                Ok(begun) => {
+                    assert_eq!(
+                        begun.immutability,
+                        DownloadImmutability::StagedSnapshot,
+                        "this run asked for the copy path"
+                    );
+                    assert!(
+                        digests.contains(&begun.content_digest),
+                        "a snapshot that was served is one whole revision of the source"
+                    );
+                    let mut assembled = Vec::new();
+                    for index in 0..begun.layout.chunk_count.get() {
+                        let chunk = harness
+                            .service
+                            .download_chunk(
+                                &harness.actor,
+                                &DownloadChunkParams {
+                                    transfer_id: begun.transfer_id,
+                                    index: U64::new(index),
+                                },
+                            )
+                            .expect("the snapshot serves its own bytes");
+                        assembled.extend_from_slice(chunk.bytes.as_slice());
+                    }
+                    assert_eq!(digest(&assembled), begun.content_digest);
+                    harness
+                        .service
+                        .download_release(&harness.actor, begun.transfer_id)
+                        .expect("releases it");
+                    served.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error.code(),
+                            ErrorCode::SourceChanged
+                                | ErrorCode::AttachmentIntegrity
+                                | ErrorCode::StorageUnavailable
+                        ),
+                        "the refusal names what happened: {error}"
+                    );
+                    refused.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("the writer did not panic");
+    });
+
+    println!(
+        "{} snapshots served, {} refused",
+        served.load(Ordering::Relaxed),
+        refused.load(Ordering::Relaxed)
+    );
+    // Whatever the interleaving was, nothing is left charged or staged.
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        0
+    );
+    assert_eq!(
+        std::fs::read_dir(harness.service.staging().snapshots().display_path())
+            .expect("reads the snapshot area")
+            .count(),
+        0
+    );
+}
