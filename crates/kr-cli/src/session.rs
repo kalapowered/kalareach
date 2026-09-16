@@ -152,10 +152,17 @@ pub async fn run(
     } else {
         attachment.result.geometry.clone()
     };
-    let epoch = attachment
-        .lease
-        .as_ref()
-        .map_or(InputLeaseEpoch::new(0), |lease| lease.lease.epoch);
+    // `None` where the host would not let this terminal type: section 8 requires it to check that
+    // a controller can supply the encoding the application reads, and a terminal nobody was allowed
+    // to ask about cannot be shown to. The attachment stands and watches, and the person is told
+    // which of the two they have before the screen arrives over it.
+    let epoch = attachment.lease.as_ref().map(|lease| lease.lease.epoch);
+    if epoch.is_none() {
+        eprintln!(
+            "kr: this terminal was not asked what it is, so the host will not let it type. \
+             Attach without --no-probe to control the session."
+        );
+    }
 
     // From the cursor the attachment was allocated at, not from the beginning of what is retained.
     // Replaying historical bytes into this terminal would replay whatever they contained: a
@@ -233,7 +240,9 @@ pub async fn run(
 #[derive(Clone, Copy, Debug)]
 struct Attached {
     attachment_id: kr_protocol::ids::AttachmentId,
-    lease_epoch: InputLeaseEpoch,
+    /// The input lease, where this attachment was given one. `None` is an attachment that watches:
+    /// the host would not let this terminal type, because what its keys mean was never established.
+    lease_epoch: Option<InputLeaseEpoch>,
     /// The geometry epoch this terminal last saw. A resize quotes it, so a claim that moved while
     /// the window was being dragged is refused rather than silently applied to a stale view.
     geometry_epoch: kr_protocol::ids::GeometryEpoch,
@@ -273,6 +282,10 @@ async fn drive(
 
     let session_id = descriptor.session_id;
     let attachment_id = attached.attachment_id;
+    // `None` where this terminal may not type. What it types is then dropped rather than sent:
+    // the host has already refused it the lease, so every keystroke would be one refused request,
+    // and the attachment would end on the first of them. Watching is what is left, and watching is
+    // what this attachment asked for when it chose not to be asked about.
     let epoch = attached.lease_epoch;
     let mut geometry_epoch = attached.geometry_epoch;
     let mut owns_geometry = attached.owns_geometry;
@@ -286,7 +299,9 @@ async fn drive(
     // What the person typed while the host was asking the terminal what it was. It was buffered
     // rather than discarded, and it is the first thing the application receives, in the order it
     // was typed in.
-    if !typed_during_the_probe.is_empty() {
+    if !typed_during_the_probe.is_empty()
+        && let Some(epoch) = epoch
+    {
         let request_id = kr_protocol::ids::RequestId::new(next_request);
         next_request += 1;
         if !send_input(
@@ -465,6 +480,11 @@ async fn drive(
                 let Some(bytes) = bytes else {
                     // The terminal's own input ended. Nothing is left to forward.
                     return AttachOutcome::Detached;
+                };
+                let Some(epoch) = epoch else {
+                    // This terminal may not type. The bytes go nowhere, and the attachment goes on
+                    // watching rather than ending on a refusal it already knows about.
+                    continue;
                 };
                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                 next_request += 1;

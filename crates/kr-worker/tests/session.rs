@@ -986,12 +986,16 @@ async fn a_succession_the_budget_refuses_leaves_the_size_unowned_rather_than_wit
         "the terminal the application is looking at did not move"
     );
     assert!(
-        after
-            .owner
-            .0
-            .is_none_or(|owner| owner != before.owner.0.unwrap_or(owner)),
+        after.owner.0.is_none(),
         "and the size is not left with the attachment that has gone: {:?}",
         after.owner
+    );
+    assert!(
+        after.epoch.get() > before.epoch.get(),
+        "the ownership that changed advanced the epoch, so a client holding the state from before \
+         the owner left cannot transfer the size against it: {} then {}",
+        before.epoch.get(),
+        after.epoch.get()
     );
     let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
     runtime.close(ClosureReason::CloseRequested).1.release();
@@ -1006,11 +1010,12 @@ fn undeclared_attachment(session_id: SessionId) -> SessionAttachParams {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_controller_that_cannot_send_what_the_application_negotiated_is_refused_the_keys() {
-    // Section 8: `input.acquire` checks that the attachment can supply the application's keyboard
-    // protocol. An attachment nobody was allowed to ask about is left in whatever encoding its
-    // terminal already had, and the host will not put it into another; giving it the lease over an
-    // application reading Kitty key events would send bytes that mean different keys.
+async fn a_controller_whose_keys_cannot_be_established_is_refused_the_keys() {
+    // Section 8: `input.acquire` checks that the attachment can supply the encoding the application
+    // reads. An attachment nobody was allowed to ask about is left in whatever encoding its
+    // terminal already had, and the host will not put it into another: it cannot be shown to send
+    // what the application reads, in either direction, so it is refused control and keeps
+    // everything else.
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(&host, "sleep 120");
     let session_id = config.session_id;
@@ -1033,21 +1038,27 @@ async fn a_controller_that_cannot_send_what_the_application_negotiated_is_refuse
         .attach(&undeclared_attachment(session_id), requested, undeclared)
         .expect("attaches the one that declared nothing");
 
-    // Before the application negotiates anything, every attachment sends what it always sent.
-    session
+    // The application has negotiated nothing, which is the case the previous round allowed: a
+    // terminal left in an enhanced protocol by whatever ran before this attachment sends key
+    // events this application reads as something else entirely.
+    let refused = session
         .acquire_input(undeclared, ConnectionId::new(kr_ipc::new_uuid()), None)
-        .expect("an ordinary encoding is one anybody can send");
+        .expect_err("what its keys mean was never established");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::InputIncompatible,
+        "and it is refused as the incompatibility it is: {refused}"
+    );
 
-    // The application asks for all keys as escape codes.
+    // And the other direction: the application asks for all keys as escape codes.
     session.ingest_output(b"\x1b[=8;1u");
-
     let refused = session
         .acquire_input(undeclared, ConnectionId::new(kr_ipc::new_uuid()), None)
         .expect_err("the keys it would send are not the keys the application reads");
     assert_eq!(
         refused.to_protocol_error().code,
         kr_protocol::error::ErrorCode::InputIncompatible,
-        "and it is refused as the incompatibility it is: {refused}"
+        "under an enhanced protocol too: {refused}"
     );
     assert!(
         session.subscribe(undeclared).is_ok(),
@@ -1056,52 +1067,6 @@ async fn a_controller_that_cannot_send_what_the_application_negotiated_is_refuse
     session
         .acquire_input(declared, ConnectionId::new(kr_ipc::new_uuid()), None)
         .expect("the one whose terminal the host may put into the protocol takes the keys");
-
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
-    runtime.close(ClosureReason::CloseRequested).1.release();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_application_that_negotiates_mid_session_takes_the_keys_from_a_holder_that_cannot_follow()
- {
-    // Section 8 again: a mid-session mode change re-evaluates every controller, and an incompatible
-    // one loses the lease explicitly rather than going on sending an encoding it advertises and the
-    // application does not read.
-    let host = kr_ipc::testing::TempHost::create();
-    let config = configuration(&host, "sleep 120");
-    let session_id = config.session_id;
-    let mut session = Session::open(config).expect("opens");
-    session.launch().expect("launches");
-
-    let mut requested = CanonicalSet::new();
-    requested.insert(AttachmentCapability::ObserveTerminal);
-    requested.insert(AttachmentCapability::Input);
-    let undeclared = AttachmentId::new(kr_ipc::new_uuid());
-    session
-        .attach(&undeclared_attachment(session_id), requested, undeclared)
-        .expect("attaches");
-    let held = session
-        .acquire_input(undeclared, ConnectionId::new(kr_ipc::new_uuid()), None)
-        .expect("takes the keys of an application that negotiated nothing");
-    let epoch = held.lease.epoch.get();
-    assert_eq!(session.lease().holder.as_ref(), Some(&undeclared));
-
-    // The application turns on the protocol while that attachment is typing into it.
-    session.ingest_output(b"\x1b[>4;2m");
-
-    assert_eq!(
-        session.lease().holder.as_ref(),
-        None,
-        "the lease does not stay with a controller that cannot send what the application now reads"
-    );
-    let refused = session
-        .write_input(undeclared, epoch, 1, b"x", std::time::Instant::now())
-        .expect_err("and its next keystroke is refused");
-    assert_eq!(
-        refused.to_protocol_error().code,
-        kr_protocol::error::ErrorCode::LeaseLost,
-        "under the epoch that has gone: {refused}"
-    );
 
     let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
     runtime.close(ClosureReason::CloseRequested).1.release();

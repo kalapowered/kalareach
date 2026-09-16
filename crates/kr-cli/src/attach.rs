@@ -282,7 +282,12 @@ pub async fn attach(
     // Implicit acquisition, because this is the local operating-system path: the worker
     // authenticated the caller by peer credentials. A network client cannot assert that, and the
     // lease is taken here so the first keystroke does not have to wait for a second exchange.
-    let lease: InputAcquireResult = call(
+    //
+    // A host that will not let this terminal type is not a failed attach. Section 8 has the host
+    // check that a controller can supply the encoding the application reads, and a terminal nobody
+    // was allowed to ask about cannot be shown to: the attachment stands, it watches, and the
+    // caller is told which of the two it got.
+    let lease = match call::<_, InputAcquireResult>(
         client,
         Method::InputAcquire,
         target(descriptor),
@@ -292,10 +297,19 @@ pub async fn attach(
             expected_epoch: Nullable::null(),
         },
     )
-    .await?;
+    .await
+    {
+        Ok(lease) => Some(lease),
+        Err(CliError::Refused(error))
+            if error.code == kr_protocol::error::ErrorCode::InputIncompatible =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
     Ok(Attachment {
         attachment_id,
-        lease: Some(lease),
+        lease,
         result,
     })
 }

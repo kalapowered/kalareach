@@ -232,21 +232,20 @@ impl TerminalEngine {
         self.collect(&outcome, gate, now_ms)
     }
 
-    /// Returns what the application has negotiated for its keys, when that is not the plain one.
+    /// Returns the encoding an input path must produce to control this application.
     ///
-    /// `None` means an ordinary terminal's own encoding, which every attachment can send. Anything
-    /// else is a protocol the terminal has to have been put into: a controller whose terminal was
-    /// never put into it sends the plain encoding, and the application reads it as different keys.
+    /// The canonical parser is the only thing that knows it. Every answer is a demand on the
+    /// controller, the ordinary one included: a terminal left in an enhanced protocol by whatever
+    /// ran before this attachment sends key events an application expecting the ordinary encoding
+    /// reads as something else entirely, which is the same failure as the other direction.
     #[must_use]
-    pub fn negotiated_keyboard(&self) -> Option<String> {
+    pub fn keyboard_in_force(&self) -> String {
         match self.engine.modes().keyboard_encoding() {
-            KeyboardEncoding::Legacy => None,
+            KeyboardEncoding::Legacy => "the ordinary terminal encoding".to_owned(),
             KeyboardEncoding::Kitty(flags) => {
-                Some(format!("the Kitty keyboard protocol with flags {flags}"))
+                format!("the Kitty keyboard protocol with flags {flags}")
             }
-            KeyboardEncoding::ModifyOtherKeys(level) => {
-                Some(format!("modifyOtherKeys level {level}"))
-            }
+            KeyboardEncoding::ModifyOtherKeys(level) => format!("modifyOtherKeys level {level}"),
         }
     }
 

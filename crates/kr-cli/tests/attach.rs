@@ -876,7 +876,28 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
         "the session's output reached the terminal: {}",
         output.text().escape_debug()
     );
+    // Section 8: the host checks that a controller can supply the encoding the application reads,
+    // and a terminal nobody was allowed to ask about cannot be shown to. The attachment is not
+    // refused - it watches - and the person is told which of the two they have.
+    assert!(
+        output.wait_for(b"will not let it type", Duration::from_secs(10)),
+        "the person is told that this attachment watches rather than types: {}",
+        output.text().escape_debug()
+    );
     let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
+
+    // And typing does not end it: the bytes go nowhere rather than becoming a refused request.
+    pty.master
+        .take_writer()
+        .expect("a writer")
+        .write_all(b"x")
+        .expect("types into the terminal");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !output.contains(b"attach-finished-"),
+        "the attachment is still watching after a keystroke: {}",
+        output.text().escape_debug()
+    );
 
     let attach = attach_process(shell.process_id().expect("the shell has an identifier"))
         .expect("the shell started the attach command");

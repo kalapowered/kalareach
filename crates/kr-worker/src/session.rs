@@ -742,18 +742,19 @@ impl Session {
         {
             return Err(WorkerError::LeaseLost);
         }
-        // Section 8: the lease goes to a controller that can supply what the application
-        // negotiated. Refusing here leaves this attachment everything else it has - it goes on
-        // watching, and its typed actions are unaffected - rather than letting it send an encoding
-        // the application reads as different keys.
-        if let Some(required) = self.engine.negotiated_keyboard()
-            && !self.attachments.keys_follow_the_negotiation(attachment_id)
-        {
+        // Section 8: the lease goes to a controller that can supply the encoding this application
+        // reads. Refusing here leaves the attachment everything else it has - it goes on watching,
+        // and its typed actions are unaffected - rather than letting it send an encoding that means
+        // other keys. It is refused whichever way the mismatch runs: a terminal nobody was allowed
+        // to ask about is as likely to be in an enhanced protocol somebody else left it in as it is
+        // to be in the ordinary one, and neither this host nor that terminal can say which.
+        if !self.attachments.keys_follow_the_negotiation(attachment_id) {
             return Err(WorkerError::InputIncompatible {
-                required,
+                required: self.engine.keyboard_in_force(),
                 offered: UNDECLARED_TERMINAL.to_owned(),
             });
         }
+
         // An interrupted paste is closed before the new lease writes, so the application never
         // sees a paste finished under a different actor.
         let framing = self.framer.close_for_takeover();
@@ -1045,32 +1046,7 @@ impl Session {
         // which is the first moment the answer exists.
         self.framer
             .set_bracketed_paste(self.engine.bracketed_paste());
-        self.withdraw_an_incompatible_lease();
         self.deliver(filtered)
-    }
-
-    /// Ends a lease whose holder cannot send what the application has just negotiated.
-    ///
-    /// Section 8 re-evaluates every controller when the application changes its keyboard protocol,
-    /// and an incompatible one loses the lease explicitly rather than going on sending an encoding
-    /// it advertises and the application does not read. The holder learns the same way it learns of
-    /// a takeover: its next write is refused, because the epoch it wrote under has gone.
-    fn withdraw_an_incompatible_lease(&mut self) {
-        let Some(holder) = self.lease.holder() else {
-            return;
-        };
-        if self.attachments.keys_follow_the_negotiation(holder)
-            || self.engine.negotiated_keyboard().is_none()
-        {
-            return;
-        }
-        let epoch = self.lease.epoch();
-        if self.lease.release(holder, epoch).is_none() {
-            return;
-        }
-        self.framer.close_for_takeover();
-        let _ = self.end_lease();
-        self.pump_replies();
     }
 
     /// Settles the screen when the terminal's output goes quiet.
@@ -1727,8 +1703,14 @@ impl PasteTransition {
 }
 
 /// What an attachment that never declared its terminal can offer.
-const UNDECLARED_TERMINAL: &str = "this attachment never declared what terminal it is, so its keys are whatever its terminal \
-     already sent";
+///
+/// Nothing that can be checked. Section 8 re-evaluates every controller when the application
+/// changes its keyboard protocol; this host has nothing for that pass to change, because what it
+/// checks does not depend on which protocol is in force: an attachment that cannot be put into one
+/// and cannot be asked about one is refused control under every one of them, the ordinary encoding
+/// included.
+const UNDECLARED_TERMINAL: &str = "this attachment never declared what terminal it is, so what its keys mean cannot be \
+     established";
 
 /// What accepting input produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -89,7 +89,9 @@ pub struct NewArguments {
 pub struct AttachArguments {
     /// The session, by display number or identifier.
     pub session: String,
-    /// Do not probe the outer terminal's capabilities.
+    /// Do not probe the outer terminal's capabilities. The attachment then watches: the host
+    /// changes nothing about this terminal's keyboard and will not let it type, because what its
+    /// keys mean was never established.
     #[arg(long)]
     pub no_probe: bool,
     /// Take size ownership for this terminal. Ordinary attach never moves it.
