@@ -612,16 +612,42 @@ impl RemoteConnection {
             // link is also what asks the worker for the acknowledgement a dispatch lease needs,
             // which a device closing a session it never attached to has not caused yet.
             Method::SessionClose => {
+                let Some(session_id) = mutation.target.session_id.as_ref().copied() else {
+                    return failure(
+                        mutation.request_id,
+                        ProtocolError::new(
+                            ErrorCode::InvalidArgument,
+                            "this mutation names the session it acts on",
+                        ),
+                    );
+                };
+                if let Err(error) = self.claim_route(mutation, session_id) {
+                    return failure(mutation.request_id, error);
+                }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
                 let envelope = self.envelope(validated);
                 let request_id = mutation.request_id;
-                let effect = tokio::spawn(async move {
+                // The answer comes back before the link that carried the close is released,
+                // because releasing it is what tells the worker the acceptance was delivered.
+                let (answer, answered) = tokio::sync::oneshot::channel();
+                let (tell, delivered) = tokio::sync::oneshot::channel();
+                self.output().on_delivery(request_id, tell);
+                tokio::spawn(async move {
                     controller
-                        .close_remote_session(&mutation, &envelope, accepted)
-                        .await
+                        .close_remote_session(&mutation, &envelope, accepted, answer, delivered)
+                        .await;
                 });
-                settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
+                match tokio::time::timeout(EFFECT_WAIT, answered).await {
+                    Ok(Ok(Ok(value))) => ControlFrame::Response(Response {
+                        request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Ok(Ok(Err(error))) => failure(request_id, error.to_protocol_error()),
+                    // The close is running on a task that outlives this connection, so a wait
+                    // that ended says the outcome is not known rather than that it failed.
+                    Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
+                }
             }
             // Everything else belongs to the worker that owns the session.
             _ => self.proxied_mutation(mutation, accepted, validated).await,

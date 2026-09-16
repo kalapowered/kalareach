@@ -894,15 +894,38 @@ impl Controller {
     /// otherwise hold that connection for as long as it liked, and the close is dispatched from a
     /// task that outlives the connection that asked for it.
     ///
-    /// # Errors
-    ///
-    /// Returns an error when the session is unknown, when the link cannot be opened, when the
-    /// exchange does not complete inside the proxy's bound, or when the worker refuses the close.
+    /// `answer` receives what the close settled as: the session is unknown, the link cannot be
+    /// opened, the exchange does not complete inside the proxy's bound, or the worker refuses or
+    /// accepts. `delivered` is how this learns that the acceptance reached the device, which is
+    /// the moment the link may be released: section 7 has the worker hold the session's
+    /// termination until its acceptance has been delivered, and closing this link is what says it
+    /// has. A device that disconnects, or a hold that runs out, releases it too.
     pub(crate) async fn close_remote_session(
         self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
         actor: &kr_protocol::actor::ActorEnvelope,
         accepted: AcceptedDeadline,
+        answer: tokio::sync::oneshot::Sender<Result<kr_protocol::envelope::ParamsValue>>,
+        delivered: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let mut link = None;
+        let settled = self
+            .close_through(mutation, actor, accepted, &mut link)
+            .await;
+        let _ = answer.send(settled);
+        if let Some(proxy) = link {
+            let _ = tokio::time::timeout(CLOSE_DELIVERY, delivered).await;
+            proxy.close();
+        }
+    }
+
+    /// The close itself. `link` receives the link it opened, whichever way the close ended.
+    async fn close_through(
+        self: &Arc<Self>,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        accepted: AcceptedDeadline,
+        link: &mut Option<Arc<WorkerProxy>>,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         let params: kr_protocol::session::SessionCloseParams =
             crate::service::parse(&mutation.params)?;
@@ -936,13 +959,15 @@ impl Controller {
                 Arc::new(tokio::sync::Notify::new()),
             )
             .await?;
-        let answered = proxy.forward_mutation(mutation, actor, deadline).await;
-        proxy.close();
-        let response = answered?;
+        *link = Some(Arc::clone(&proxy));
+        let response = proxy.forward_mutation(mutation, actor, deadline).await?;
         let value = match response.outcome {
             kr_protocol::envelope::Outcome::Ok(value) => value,
+            // The worker's own code, carried through rather than flattened. A reused action
+            // identifier is `ID_CONFLICT` and expired authority is `PERMISSION_DENIED`, and
+            // section 9 gives the caller something to do with each of them.
             kr_protocol::envelope::Outcome::Error(error) => {
-                return Err(ControllerError::InvalidArgument(error.to_string()));
+                return Err(ControllerError::refused(&error));
             }
         };
         let reply: kr_protocol::session::SessionCloseResult = value
