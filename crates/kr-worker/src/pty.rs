@@ -507,6 +507,31 @@ mod tests {
     }
 
     #[test]
+    fn a_wait_of_a_whole_second_is_a_wait_rather_than_a_refusal() {
+        // A nanosecond field of a second or more is not a duration `poll` accepts: it is refused,
+        // and a refusal reads as a terminal that has gone, which would stop a session's output for
+        // good the first time its application paused.
+        let whole = deadline(std::time::Duration::from_secs(1));
+        assert_eq!((whole.tv_sec, whole.tv_nsec), (1, 0));
+        let mixed = deadline(std::time::Duration::from_millis(1_020));
+        assert_eq!((mixed.tv_sec, mixed.tv_nsec), (1, 20_000_000));
+        let small = deadline(std::time::Duration::from_millis(20));
+        assert_eq!((small.tv_sec, small.tv_nsec), (0, 20_000_000));
+
+        // And the wait it expresses is a wait: a terminal with nothing to read has nothing to read,
+        // and has not gone.
+        let pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let waiter = pty.output_waiter().expect("a waiter");
+        let started = std::time::Instant::now();
+        assert_eq!(waiter.wait(std::time::Duration::from_secs(1)), Room::NotYet);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn a_shell_runs_in_the_terminal_and_its_output_is_read_back() {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut reader = pty.reader().expect("a reader");
@@ -688,10 +713,7 @@ fn wait_for(
 
     let handle = handle.as_fd();
     let mut fds = [rustix::event::PollFd::new(&handle, interest)];
-    let timeout = rustix::event::Timespec {
-        tv_sec: 0,
-        tv_nsec: i64::try_from(timeout.as_nanos()).unwrap_or(0),
-    };
+    let timeout = deadline(timeout);
     match rustix::event::poll(&mut fds, Some(&timeout)) {
         // Interrupted, or nothing happened before the deadline. Neither says the terminal is ready,
         // and neither says it never will be; the caller looks at its own state and asks again.
@@ -719,6 +741,19 @@ fn wait_for(
             }
         }
         Err(_) => Room::Gone,
+    }
+}
+
+/// Expresses a wait the way the system call wants it.
+///
+/// Whole seconds and the nanoseconds left over. A nanosecond field of a second or more is not a
+/// duration this call accepts: it is refused, and a refusal reads as a terminal that has gone, which
+/// would stop a session's output for good the first time its application paused.
+#[cfg(unix)]
+fn deadline(timeout: std::time::Duration) -> rustix::event::Timespec {
+    rustix::event::Timespec {
+        tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(timeout.subsec_nanos()),
     }
 }
 
