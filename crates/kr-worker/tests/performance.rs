@@ -306,14 +306,13 @@ async fn attach_to_a_usable_screen() {
         "  projected, a terminal of 80x24 onto the same session: {}",
         report(&projected)
     );
-    let worst = direct
-        .iter()
-        .chain(projected.iter())
-        .max()
-        .copied()
-        .expect("samples");
-    // Closed before the bound is checked, for the same reason.
+    let worst = direct.iter().chain(projected.iter()).max().copied();
+    // Closed before anything is checked, so a measurement that fell short still leaves nothing
+    // running: an assertion here would otherwise skip every close.
     close_all(&host, std::slice::from_ref(&created)).await;
+    assert_eq!(direct.len(), 5, "every direct attachment reached a screen");
+    assert_eq!(projected.len(), 5, "and so did every projected attachment");
+    let worst = worst.expect("samples");
     assert!(
         worst < ATTACH_BOUND,
         "the slowest attach reached a usable screen within {ATTACH_BOUND:?}: {worst:?}"
@@ -340,6 +339,10 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
     )
     .await
     .expect("connects to the daemon");
+    // Every session is asked, whatever any one of them answers. Stopping at the first refusal
+    // would leave the rest running, which is the thing this exists to prevent; what each one
+    // answered is reported at the end.
+    let mut refused = Vec::new();
     for created in sessions {
         let outcome = client
             .mutate(
@@ -358,12 +361,14 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
             )
             .await
             .expect("the call reaches the daemon");
-        assert!(
-            outcome.is_ok(),
-            "the daemon accepted the close of {}: {outcome:?}",
-            created.session.session_id
-        );
+        if let Err(error) = outcome {
+            refused.push((created.session.session_id, error));
+        }
     }
+    assert!(
+        refused.is_empty(),
+        "the daemon accepted every close: {refused:?}"
+    );
     let wanted: std::collections::BTreeSet<_> = sessions
         .iter()
         .map(|created| created.session.session_id)
@@ -508,7 +513,11 @@ async fn attach_samples(
         })
         .await
         .unwrap_or(false);
-        assert!(screen, "the attachment was delivered a screen it can draw");
+        // A sample that never reached a screen is not a sample. It is reported as the absence of
+        // one rather than panicking here, because the caller has sessions to close first.
+        if !screen {
+            return Vec::new();
+        }
         samples.push(started.elapsed());
     }
     samples
