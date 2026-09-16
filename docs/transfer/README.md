@@ -53,7 +53,7 @@ them; nothing in the protocol depends on the defaults.
 | unfinished upload | 24 hours | `UNFINISHED_UPLOAD_LIFETIME` |
 | unused attachment | 7 days | `UNUSED_ATTACHMENT_LIFETIME` |
 | download snapshot | 24 hours | `DOWNLOAD_SNAPSHOT_LIFETIME` |
-| one reply | 768 KiB encoded | `MAX_TRANSFER_RESULT_BYTES`, checked on every draft method before it commits |
+| one reply | 768 KiB encoded | `MAX_TRANSFER_RESULT_BYTES`, checked on `draft.create`, `draft.update`, `agent.draft.add_attachment`, the insertion outcome and the draft read, before each commits |
 | one insertion detail | 4096 characters | `MAX_INSERTION_DETAIL_LEN`, on the evidence or the reason an adapter reports |
 
 A submitted attachment follows its session's retention instead of the seven-day window, which is why
@@ -339,10 +339,14 @@ never verified, detection is not enough and it stages its own copy.
 Handle-based resolution removes the race between checking a path and using it, because there is no
 path to re-resolve: the boundary is a descriptor. What it does not remove is what happens *inside*
 one resolution of a multi-component name. Something that moves a component while a read is
-resolving it can make that read reach an object the caller did not name; what the boundary
-guarantees is that whatever it reaches is beneath the authorised directory, and what the identity
-check then guarantees is that a handle recorded earlier is refused if it is not the same object.
-The open itself is not atomic with respect to the tree it walks, and no read here claims to be.
+resolving it can make that read reach an object the caller did not name.
+
+Containment is `cap-std`'s to enforce, by `RESOLVE_BENEATH` where the platform has it and by its own
+component-wise resolution otherwise, and its documentation is the authority on what each of those
+leaves open. What this crate adds on top is the identity check, which refuses a handle that is not
+the object recorded earlier, and the single-component rule on everything that changes what a
+directory holds. A multi-component read is not atomic with respect to the tree it walks, and no
+read here claims to be.
 
 Every operation that *changes* what a directory holds takes a single component, so nothing above it
 is resolved at all: a create, a write, a removal, a rename and a link each name one entry in the
@@ -505,11 +509,14 @@ charge belongs to the pins in the manifest and is re-derived when they move.
 It bounds the *pixel* buffers, which is what image dimensions decide. It does not bound every
 structure a codec can allocate from its own metadata: the pinned lossless WebP decoder derives a
 Huffman group count from a sixteen-bit field, and a small file can ask for tables far larger than
-its pixels. There the library's own allocation limit, which it documents as advisory, is the only
-bound, and this is recorded as a dependency risk against the pin rather than presented as enforced.
+its pixels. Those allocations are outside the enforced budget entirely, because the pinned wrapper
+passes no allocation accounting down to them. It is recorded as a dependency risk against the pin
+rather than presented as enforced, and closing it needs either a decoder that accounts for its own
+structures or a decode that runs somewhere its memory can be capped from outside.
 
-An image inside the pixel limit whose charge is above the budget publishes as a file: in practice
-the budget is the
+An image whose charge is above the budget publishes as a file. What that establishes is a bound on
+the *pixel* buffers of an accepted image, not a proof that an accepted image cannot make a decoder
+allocate more: the paragraph above says where it does not reach. In practice the budget is the
 binding limit, at sixteen megapixels rather than forty.
 
 The dimensions that are charged are the ones that get allocated, which is not always the ones a
