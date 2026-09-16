@@ -222,8 +222,15 @@ impl AttachmentTable {
     /// A change the kernel refused never happened, and a change that never happened did not
     /// advance an epoch. Putting the epoch back is what stops a refused resize from invalidating
     /// every client's next request.
-    pub const fn restore_geometry(&mut self, previous: &GeometryState) {
-        self.owner = previous.owner.0;
+    pub fn restore_geometry(&mut self, previous: &GeometryState) {
+        // An owner that has since left is not an owner. A refused succession puts the size back,
+        // but naming a departed attachment as holding it would leave the session reporting an
+        // owner nothing can reach, and the next eligible claim would have nowhere to go; the size
+        // goes back unowned instead, which is a state the succession can act on.
+        self.owner = previous
+            .owner
+            .0
+            .filter(|owner| self.by_id.contains_key(owner));
         self.epoch = previous.epoch.get();
         self.dimensions = previous.dimensions;
     }

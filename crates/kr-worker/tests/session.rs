@@ -941,3 +941,53 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
     let runtime = std::sync::Arc::clone(&runtime);
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_succession_the_budget_refuses_leaves_the_size_unowned_rather_than_with_who_left() {
+    // The attachment that owned the size has gone, and the one next in line asks for a geometry
+    // this session cannot afford. The size stays where it was, because nothing moved it, but it
+    // cannot stay with an attachment that is not there any more: a session naming an owner nobody
+    // can reach is a session whose next eligible claim has nowhere to go.
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 120");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+
+    let owner = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Geometry);
+    session
+        .attach(&terminal_attachment(session_id), requested.clone(), owner)
+        .expect("attaches the owner");
+
+    // The one next in line, at a size whose two screen buffers do not fit the session's budget.
+    let waiting = AttachmentId::new(kr_ipc::new_uuid());
+    let mut params = terminal_attachment(session_id);
+    params.claim_geometry = true;
+    params.dimensions = Nullable::some(Dimensions::new(2_048, 128));
+    session
+        .attach(&params, requested, waiting)
+        .expect("attaches the one next in line");
+
+    let before = session.geometry();
+    let refused = session.detach(owner).expect_err("the succession is refused");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "and it is refused for what it would cost: {refused}"
+    );
+    let after = session.geometry();
+    assert_eq!(
+        after.dimensions, before.dimensions,
+        "the terminal the application is looking at did not move"
+    );
+    assert!(
+        after.owner.0.is_none_or(|owner| owner != before.owner.0.unwrap_or(owner)),
+        "and the size is not left with the attachment that has gone: {:?}",
+        after.owner
+    );
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
