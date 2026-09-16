@@ -57,13 +57,36 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// enhanced encoding gets that encoding back rather than having it taken away.
 pub const RESET_SEQUENCES: &[u8] = b"\x1b[<65535u\x1b[>4;0m\x1b[?1049h\x1b[<65535u\x1b[>4;0m\x1b[?1049l\x1b[<65535u\x1b[>4;0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
 
-/// How long the outer terminal is given to answer the keyboard queries.
+/// The whole probe's deadline.
 ///
-/// The queries end with a primary device attributes request, which every terminal answers, so the
-/// answer normally arrives in microseconds. This is the bound for a terminal that answers nothing:
-/// an attachment must not sit waiting for one, and a terminal that says nothing has nothing to
-/// restore.
-pub const KEYBOARD_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// Section 8 fixes it at one second for the bounded synchronous handshake, which ends with the
+/// device-attributes terminator. A terminal that has not finished answering by then has failed the
+/// handshake, and the attachment fails with it rather than forwarding live input on a stream that
+/// may still receive a late reply.
+pub const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What a bounded probe of the outer terminal established.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Probe {
+    /// The keyboard protocols the terminal reported.
+    pub keyboard: KeyboardState,
+    /// The bytes that were not part of any answer: what the person typed while the host was asking.
+    ///
+    /// Section 8 keeps these separate rather than discarding them or letting them pass for replies,
+    /// and they are the first input the attachment forwards.
+    pub typed: Vec<u8>,
+}
+
+impl Probe {
+    /// The result of not asking, which is what `--no-probe` chooses.
+    #[must_use]
+    pub const fn unasked() -> Self {
+        Self {
+            keyboard: KeyboardState::EMPTY,
+            typed: Vec::new(),
+        }
+    }
+}
 
 /// The keyboard protocols the outer terminal had negotiated before the attachment began.
 ///
@@ -123,52 +146,73 @@ impl KeyboardState {
         out
     }
 
-    /// Reads the state out of a terminal's answers.
+    /// Reads the answers out of what the terminal sent, keeping everything else.
+    ///
+    /// Returns the state the answers describe, whether the device-attributes terminator was among
+    /// them, and the bytes that were not answers at all. That last part is the point: section 8
+    /// requires the replies never to enter the application's input and the person's own typing
+    /// never to be mistaken for a reply, so this separates the two rather than scanning the stream
+    /// afterwards for anything reply-shaped.
     #[must_use]
-    pub fn parse(answer: &[u8]) -> Self {
+    pub fn read(answer: &[u8]) -> (Self, bool, Vec<u8>) {
         let mut state = Self::default();
+        let mut answered = false;
+        let mut typed = Vec::new();
         let mut index = 0;
         while index < answer.len() {
-            let Some(start) = answer[index..].iter().position(|byte| *byte == 0x1B) else {
-                break;
-            };
-            let start = index + start;
-            let rest = &answer[start..];
-            index = start + 1;
-            // A control sequence is the introducer, its parameters and one final byte. Both answers
-            // are `CSI`, and the final byte says which question was answered.
+            let rest = &answer[index..];
             let Some(body) = rest.strip_prefix(b"\x1b[") else {
+                typed.push(answer[index]);
+                index += 1;
                 continue;
             };
             let Some(end) = body
                 .iter()
                 .position(|byte| byte.is_ascii_alphabetic() || *byte == b'~')
             else {
-                continue;
+                // An incomplete sequence at the end of what has arrived so far. Nothing is decided
+                // about it here; the caller reads again, and whatever is left when the exchange
+                // ends is the person's.
+                typed.extend_from_slice(rest);
+                break;
             };
             let parameters = &body[..end];
-            match (parameters.first(), body[end]) {
+            let consumed = match (parameters.first(), body[end]) {
                 // `CSI ? flags u` is the Kitty protocol's answer.
                 (Some(b'?'), b'u') => {
                     state.kitty = std::str::from_utf8(&parameters[1..])
                         .ok()
                         .and_then(|text| text.parse().ok());
+                    true
                 }
                 // `CSI > 4 ; level m` is xterm's answer for `modifyOtherKeys`.
                 (Some(b'>'), b'm') => {
                     let mut fields = parameters[1..].split(|byte| *byte == b';');
-                    if fields.next() == Some(b"4") {
+                    let matched = fields.next() == Some(b"4");
+                    if matched {
                         state.modify_other_keys = fields
                             .next()
                             .and_then(|field| std::str::from_utf8(field).ok())
                             .and_then(|text| text.parse().ok());
                     }
+                    matched
                 }
-                _ => {}
+                // `CSI ? … c` is the device-attributes answer that ends the exchange.
+                (Some(b'?'), b'c') => {
+                    answered = true;
+                    true
+                }
+                _ => false,
+            };
+            if consumed {
+                index += 2 + end + 1;
+            } else {
+                // A sequence this exchange did not ask for is the person's, not an answer.
+                typed.extend_from_slice(&rest[..2 + end + 1]);
+                index += 2 + end + 1;
             }
-            index = start + 2 + end + 1;
         }
-        state
+        (state, answered, typed)
     }
 
     /// Renders the state as one argument for the guard.
@@ -233,7 +277,7 @@ mod unix {
 
     use rustix::termios::{OptionalActions, SpecialCodeIndex, Termios, Winsize};
 
-    use super::{KEYBOARD_QUERY_TIMEOUT, KeyboardState, RESET_SEQUENCES, TerminalSize};
+    use super::{KeyboardState, PROBE_DEADLINE, Probe, RESET_SEQUENCES, TerminalSize};
     use crate::error::{CliError, Result};
 
     /// A handle on this process's controlling terminal.
@@ -339,28 +383,31 @@ mod unix {
             Ok(())
         }
 
-        /// Asks the terminal which keyboard protocols it has negotiated.
+        /// Runs the bounded capability handshake section 8 describes.
         ///
-        /// The terminal has to be readable a byte at a time for its answer to arrive, so this puts
-        /// it into that state for the length of the exchange and puts it back afterwards, before
-        /// anything else has touched it. A terminal that answers nothing costs
-        /// [`KEYBOARD_QUERY_TIMEOUT`] once, at attach, and has nothing to restore.
+        /// The terminal is asked which keyboard protocols it has negotiated, and the exchange ends
+        /// with the device-attributes request every terminal answers. The terminal has to be
+        /// readable a byte at a time for its answers to arrive, so this puts it into that state for
+        /// the length of the exchange and puts it back afterwards, before anything else has touched
+        /// it.
+        ///
+        /// What the person typed while the host was asking comes back with the answers rather than
+        /// being discarded or mistaken for one of them.
         ///
         /// # Errors
         ///
-        /// Returns an error when the terminal's modes cannot be read or set.
-        pub fn keyboard_state(&self) -> Result<KeyboardState> {
+        /// Returns [`CliError::TerminalProbeFailed`] when the terminator does not arrive inside
+        /// [`PROBE_DEADLINE`], because the input stream may still receive a late reply and live
+        /// forwarding must not begin on one that might. Returns [`CliError::Terminal`] when the
+        /// terminal's modes cannot be read or set.
+        pub fn probe(&self) -> Result<Probe> {
             let saved = self.modes()?;
             let mut asking = saved.clone();
             asking.make_raw();
             // A read that returns what has arrived rather than waiting for a line, with its own
-            // bound in tenths of a second, so a terminal that says nothing does not hold the
-            // attachment up.
+            // bound in tenths of a second, so the deadline below is the one that decides.
             asking.special_codes[SpecialCodeIndex::VMIN] = 0;
-            asking.special_codes[SpecialCodeIndex::VTIME] =
-                u8::try_from(KEYBOARD_QUERY_TIMEOUT.as_millis() / 100)
-                    .unwrap_or(2)
-                    .max(1);
+            asking.special_codes[SpecialCodeIndex::VTIME] = 1;
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Flush, &asking).map_err(
                 |error| CliError::Terminal(format!("set the terminal's modes: {error}")),
             )?;
@@ -368,7 +415,14 @@ mod unix {
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Flush, &saved).map_err(
                 |error| CliError::Terminal(format!("restore the terminal's modes: {error}")),
             )?;
-            Ok(KeyboardState::parse(&answer))
+            let (keyboard, answered, typed) = KeyboardState::read(&answer);
+            if !answered {
+                return Err(CliError::TerminalProbeFailed(
+                    "the terminal did not finish the capability handshake; attach with --no-probe                      to use the conservative profile without asking it anything"
+                        .to_owned(),
+                ));
+            }
+            Ok(Probe { keyboard, typed })
         }
 
         /// Writes the queries and reads until the device-attributes answer arrives or time runs out.
@@ -379,7 +433,7 @@ mod unix {
             if handle.write_all(queries).is_err() || handle.flush().is_err() {
                 return Vec::new();
             }
-            let deadline = std::time::Instant::now() + KEYBOARD_QUERY_TIMEOUT;
+            let deadline = std::time::Instant::now() + PROBE_DEADLINE;
             let mut answer = Vec::new();
             let mut buffer = [0_u8; 256];
             while std::time::Instant::now() < deadline {
@@ -389,7 +443,7 @@ mod unix {
                         answer.extend_from_slice(&buffer[..read]);
                         // The device-attributes answer is the last of the three, so its arrival
                         // ends the exchange rather than the clock doing it.
-                        if answer.last() == Some(&b'c') {
+                        if KeyboardState::read(&answer).1 {
                             break;
                         }
                     }
@@ -595,9 +649,11 @@ mod tests {
     #[test]
     fn a_terminals_answers_are_read_back_as_the_state_it_reported() {
         // Both protocols, then the device attributes that end the exchange.
-        let state = KeyboardState::parse(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+        let (state, answered, typed) = KeyboardState::read(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
         assert_eq!(state.kitty, Some(5));
         assert_eq!(state.modify_other_keys, Some(2));
+        assert!(answered, "the terminator arrived");
+        assert!(typed.is_empty(), "and nothing of it was the person's");
         assert_eq!(
             state.restore_sequences(),
             b"\x1b[=5;1u\x1b[>4;2m".to_vec(),
@@ -609,11 +665,37 @@ mod tests {
     fn a_terminal_that_answers_nothing_leaves_nothing_to_restore() {
         // Only the device attributes: the terminal implements neither protocol, so the clearing in
         // the reset sequences is the whole restoration.
-        let state = KeyboardState::parse(b"\x1b[?62;22c");
+        let (state, answered, typed) = KeyboardState::read(b"\x1b[?62;22c");
         assert_eq!(state, KeyboardState::EMPTY);
+        assert!(answered);
+        assert!(typed.is_empty());
         assert!(!state.is_known());
         assert!(state.restore_sequences().is_empty());
-        assert_eq!(KeyboardState::parse(b""), KeyboardState::EMPTY);
+        let (state, answered, typed) = KeyboardState::read(b"");
+        assert_eq!(state, KeyboardState::EMPTY);
+        assert!(!answered, "and a terminal that said nothing did not finish");
+        assert!(typed.is_empty());
+    }
+
+    #[test]
+    fn what_the_person_typed_during_the_exchange_is_kept_apart_from_the_answers() {
+        // Somebody types while the host is asking. Their bytes are theirs: they are not answers,
+        // they are not discarded, and a control sequence among them is not mistaken for one.
+        let (state, answered, typed) =
+            KeyboardState::read(b"\x1b[?5uhel\x1b[Alo\x1b[>4;2m!\x1b[?62;22c");
+        assert_eq!(state.kitty, Some(5));
+        assert_eq!(state.modify_other_keys, Some(2));
+        assert!(answered);
+        assert_eq!(typed, b"hel\x1b[Alo!".to_vec());
+    }
+
+    #[test]
+    fn a_typed_letter_does_not_end_the_exchange() {
+        // The exchange ends with the device-attributes answer, which is a control sequence. A
+        // person who types the same letter it ends with has not answered anything.
+        let (_, answered, typed) = KeyboardState::read(b"c");
+        assert!(!answered);
+        assert_eq!(typed, b"c".to_vec());
     }
 
     #[test]

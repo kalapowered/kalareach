@@ -304,6 +304,29 @@ fn answer_keyboard_queries(output: &TerminalOutput, mut writer: Box<dyn std::io:
     });
 }
 
+/// Answers the keyboard queries and types something in the middle of the exchange.
+///
+/// Section 8 keeps what a person types during the bounded handshake apart from the terminal's
+/// answers, and forwards it once the attachment begins rather than discarding it or reading it as
+/// a reply.
+fn answer_and_type(
+    output: &TerminalOutput,
+    mut writer: Box<dyn std::io::Write + Send>,
+    typed: &'static [u8],
+) {
+    let output = output.clone();
+    std::thread::spawn(move || {
+        if !output.wait_for(b"\x1b[?u", Duration::from_secs(20)) {
+            return;
+        }
+        let mut answer = Vec::from(b"\x1b[?5u".as_slice());
+        answer.extend_from_slice(typed);
+        answer.extend_from_slice(b"\x1b[>4;2m\x1b[?62;22c");
+        let _ = writer.write_all(&answer);
+        let _ = writer.flush();
+    });
+}
+
 /// The sequences that put this test's terminal back into the state it reported.
 const KEYBOARD_RESTORED: &[u8] = b"\x1b[=5;1u";
 
@@ -501,6 +524,95 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
     assert!(
         output.contains(MODIFY_OTHER_KEYS_RESTORED),
         "and its modifyOtherKeys level: {}",
+        output.text().escape_debug()
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_that_does_not_finish_the_handshake_fails_the_attach_and_keeps_its_modes() {
+    // Section 8: the capability handshake is bounded and ends with the device-attributes
+    // terminator. A terminal that never sends it may still send a late reply, so the attachment
+    // fails rather than beginning to forward live input on that stream.
+    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
+
+    let display = hosted.display.get().to_string();
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!(
+                "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
+                env!("CARGO_BIN_EXE_kr")
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    // Nothing answers. The handshake's own deadline ends it.
+    assert!(
+        output.wait_for(b"attach-finished-6", Duration::from_secs(30)),
+        "the attach failed with the terminal's own exit code rather than forwarding input: {}",
+        output.text().escape_debug()
+    );
+    let after = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
+    assert_eq!(
+        after.local_modes.bits(),
+        before.local_modes.bits(),
+        "and the terminal it borrowed for the handshake came back"
+    );
+    assert!(
+        !output.contains(b"ready"),
+        "no session output reached a terminal whose handshake failed: {}",
+        output.text().escape_debug()
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_was_typed_during_the_handshake_reaches_the_application() {
+    // The session echoes whatever it is given, so a byte that reached the application comes back
+    // to this terminal. What is being checked is that the bytes typed while the host was asking
+    // the terminal what it is were kept rather than discarded or read as part of an answer.
+    let hosted = hosted("exec cat").await;
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let display = hosted.display.get().to_string();
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!(
+                "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
+                env!("CARGO_BIN_EXE_kr")
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    answer_and_type(
+        &output,
+        pty.master.take_writer().expect("a writer"),
+        b"kr-typed-early\n",
+    );
+    assert!(
+        output.wait_for(b"kr-typed-early", Duration::from_secs(30)),
+        "the bytes typed during the handshake reached the application: {}",
         output.text().escape_debug()
     );
     let _ = shell.kill();

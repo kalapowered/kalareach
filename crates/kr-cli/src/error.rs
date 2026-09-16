@@ -34,6 +34,9 @@ pub enum CliError {
     /// The terminal could not be read or changed.
     #[error("{0}")]
     Terminal(String),
+    /// The outer terminal did not complete the bounded capability handshake.
+    #[error("{0}")]
+    TerminalProbeFailed(String),
     /// The host refused the request.
     #[error("{0}")]
     Refused(kr_protocol::error::ProtocolError),
@@ -55,7 +58,7 @@ impl CliError {
             Self::UnknownSession(_) | Self::NotInSession => 4,
             Self::AmbiguousSession(_) => 5,
             Self::ShellIntegrationUnsupported(_) => 2,
-            Self::NotATerminal | Self::Terminal(_) => 6,
+            Self::NotATerminal | Self::Terminal(_) | Self::TerminalProbeFailed(_) => 6,
             Self::TerminalUnavailable(_) => 7,
             Self::Refused(_) => 8,
             Self::Ipc(_) => 3,
@@ -89,7 +92,7 @@ impl CliError {
             Self::AmbiguousSession(_) => kr_protocol::error::ErrorCode::AmbiguousSession
                 .as_str()
                 .to_owned(),
-            Self::NotATerminal | Self::Terminal(_) => {
+            Self::NotATerminal | Self::Terminal(_) | Self::TerminalProbeFailed(_) => {
                 kr_protocol::error::ErrorCode::TerminalProbeFailed
                     .as_str()
                     .to_owned()

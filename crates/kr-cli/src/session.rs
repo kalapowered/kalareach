@@ -97,6 +97,38 @@ pub async fn run(
     let terminal = ControllingTerminal::open()?;
     let size = terminal.size()?;
     let dimensions = Dimensions::new(u64::from(size.columns), u64::from(size.rows));
+
+    // Everything that touches this terminal happens after the guard is holding its state. The
+    // capability handshake changes the terminal's modes to read the answers, so it is inside that
+    // protection too: a process killed during the handshake must still leave a terminal somebody
+    // can put back.
+    let saved = terminal.modes()?;
+    let mut guard = RestorationGuard::arm(
+        &crate::attach::guard_program(),
+        &terminal,
+        &crate::terminal::SavedModes::from_state(&saved),
+    )?;
+    // Section 8's bounded synchronous handshake, before any application input. It asks the terminal
+    // what keyboard protocols it has negotiated, so that what is put back afterwards is this
+    // terminal's own state rather than nothing at all, and it ends with the device-attributes
+    // terminator. A terminal that does not finish it fails this attach rather than forwarding live
+    // input on a stream that may still receive a late reply. `--no-probe` asks nothing, and then
+    // there is nothing to put back and the clearing stands.
+    let probe = if options.no_probe {
+        crate::terminal::Probe::unasked()
+    } else {
+        match terminal.probe() {
+            Ok(probe) => probe,
+            Err(error) => {
+                let _ = terminal.restore(&saved, &crate::terminal::KeyboardState::EMPTY);
+                guard.release();
+                return Err(error);
+            }
+        }
+    };
+    guard.learn_keyboard(&probe.keyboard);
+    let keyboard = probe.keyboard;
+
     let mut client = crate::resolve::open_worker(descriptor, crate::build_id()).await?;
     // A terminal attachment claims the session's size. Section 8 makes that the default: a
     // terminal that did not claim it would be shown a projection of somebody else's size, which is
@@ -135,25 +167,6 @@ pub async fn run(
     )
     .await?;
 
-    // What this terminal had negotiated for itself, asked before anything is changed. Its answer
-    // is what makes the restoration a restoration rather than a clearing: a person whose shell had
-    // an enhanced key encoding gets it back. `--no-probe` withholds the question, and then there is
-    // nothing to put back and the clearing stands.
-    let keyboard = if options.no_probe {
-        crate::terminal::KeyboardState::default()
-    } else {
-        terminal.keyboard_state()?
-    };
-    // The guard is armed before the terminal is touched, and it confirms that it is holding the
-    // state before this returns, so there is no window in which the terminal is raw and nothing is
-    // holding its previous state.
-    let saved = terminal.modes()?;
-    let guard = RestorationGuard::arm(
-        &crate::attach::guard_program(),
-        &terminal,
-        &crate::terminal::SavedModes::from_state(&saved),
-        &keyboard,
-    )?;
     let raw_replaced = terminal.enter_raw_mode()?;
 
     let handle = Arc::new(
@@ -174,6 +187,7 @@ pub async fn run(
     let outcome = drive(
         &mut client,
         descriptor,
+        probe.typed,
         Attached {
             attachment_id: attachment.attachment_id,
             lease_epoch: epoch,
@@ -220,9 +234,14 @@ enum Outstanding {
 }
 
 /// Runs the attachment's input, output and connection in one loop.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one attachment is its client, its session, its terminal and everything it started with"
+)]
 async fn drive(
     client: &mut LocalClient,
     descriptor: &WorkerDescriptor,
+    typed_during_the_probe: Vec<u8>,
     attached: Attached,
     input: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     output: &Arc<std::fs::File>,
@@ -242,6 +261,31 @@ async fn drive(
     let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding> =
         std::collections::BTreeMap::new();
     let mut next_request = 1_u64;
+
+    // What the person typed while the host was asking the terminal what it was. It was buffered
+    // rather than discarded, and it is the first thing the application receives, in the order it
+    // was typed in.
+    if !typed_during_the_probe.is_empty() {
+        let request_id = kr_protocol::ids::RequestId::new(next_request);
+        next_request += 1;
+        if !send_input(
+            client,
+            request_id,
+            session_id,
+            attachment_id,
+            epoch,
+            sequence,
+            typed_during_the_probe,
+        )
+        .await
+        {
+            return AttachOutcome::DeliveryUncertain(
+                "the connection ended while input was being sent".to_owned(),
+            );
+        }
+        outstanding.insert(request_id, Outstanding::Input(sequence));
+        sequence += 1;
+    }
     loop {
         tokio::select! {
             // Biased towards the worker, so output and refusals are seen before more input is sent.
@@ -403,25 +447,17 @@ async fn drive(
                 };
                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                 next_request += 1;
-                let params = kr_protocol::input::InputWriteParams {
+                if !send_input(
+                    client,
+                    request_id,
                     session_id,
                     attachment_id,
                     epoch,
-                    sequence: kr_protocol::ids::InputSequence::new(sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(bytes),
-                };
-                let Ok(params) = kr_protocol::envelope::ParamsValue::from_typed(&params) else {
-                    return AttachOutcome::DeliveryUncertain(
-                        "the input could not be encoded".to_owned(),
-                    );
-                };
-                let message = ControlFrame::Request(kr_protocol::envelope::Request {
-                    request_id,
-                    method: Method::InputWrite.into(),
-                    method_version: kr_protocol::method::MethodVersion::V1,
-                    params,
-                });
-                if client.writer().write_message(&message).await.is_err() {
+                    sequence,
+                    bytes,
+                )
+                .await
+                {
                     // The bytes were handed to a connection that has gone. Whether they arrived
                     // cannot be established from here, and the exit code says so.
                     return AttachOutcome::DeliveryUncertain(
@@ -465,6 +501,41 @@ async fn resubscribe(
     client
         .writer()
         .write_message(&ControlFrame::Request(request))
+        .await
+        .is_ok()
+}
+
+/// Writes one batch of terminal input on this loop's own connection.
+///
+/// Returns whether it reached the socket. Its answer comes back through the loop, like every other
+/// answer on this connection.
+async fn send_input(
+    client: &mut LocalClient,
+    request_id: kr_protocol::ids::RequestId,
+    session_id: SessionId,
+    attachment_id: kr_protocol::ids::AttachmentId,
+    epoch: InputLeaseEpoch,
+    sequence: u64,
+    bytes: Vec<u8>,
+) -> bool {
+    let params = kr_protocol::input::InputWriteParams {
+        session_id,
+        attachment_id,
+        epoch,
+        sequence: kr_protocol::ids::InputSequence::new(sequence),
+        bytes: kr_protocol::scalars::Bytes::new(bytes),
+    };
+    let Ok(params) = kr_protocol::envelope::ParamsValue::from_typed(&params) else {
+        return false;
+    };
+    client
+        .writer()
+        .write_message(&ControlFrame::Request(kr_protocol::envelope::Request {
+            request_id,
+            method: Method::InputWrite.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            params,
+        }))
         .await
         .is_ok()
 }

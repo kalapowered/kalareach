@@ -23,7 +23,7 @@ use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
 
 use clap::Parser;
-use kr_cli::attach::{GUARD_READY, GUARD_RELEASE};
+use kr_cli::attach::{GUARD_KEYBOARD, GUARD_READY, GUARD_RELEASE};
 #[cfg(unix)]
 use kr_cli::terminal::RESET_SEQUENCES;
 use kr_cli::terminal::{KeyboardState, SavedModes};
@@ -38,17 +38,11 @@ struct Arguments {
     /// The terminal state to restore.
     #[arg(long)]
     modes: String,
-    /// The keyboard protocols the terminal had negotiated before the attachment began.
-    #[arg(long)]
-    keyboard: String,
 }
 
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
     let Ok(saved) = SavedModes::decode(&arguments.modes) else {
-        return ExitCode::FAILURE;
-    };
-    let Ok(keyboard) = KeyboardState::decode(&arguments.keyboard) else {
         return ExitCode::FAILURE;
     };
 
@@ -68,12 +62,35 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mut signal = [0_u8; 1];
-    let released =
-        matches!(std::io::stdin().read(&mut signal), Ok(1) if signal[0] == GUARD_RELEASE);
-    if released {
-        // The attach process restored the terminal itself.
-        return ExitCode::SUCCESS;
+    // What the attach process has to say, until it says it is done or it is gone. It sends the
+    // keyboard protocols this terminal had once it has read them, which it cannot do before this
+    // guard is holding the terminal's modes, and then either the release byte or nothing at all.
+    let mut keyboard = KeyboardState::EMPTY;
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    let mut input = std::io::stdin();
+    loop {
+        match input.read(&mut byte) {
+            // The attach process is gone, however it went. The terminal is restored.
+            Ok(0) | Err(_) => break,
+            Ok(_) => match byte[0] {
+                // It restored the terminal itself.
+                GUARD_RELEASE => return ExitCode::SUCCESS,
+                b'\n' => {
+                    if let Some(state) = line
+                        .strip_prefix(&[GUARD_KEYBOARD])
+                        .and_then(|rest| std::str::from_utf8(rest).ok())
+                        .and_then(|text| KeyboardState::decode(text).ok())
+                    {
+                        keyboard = state;
+                    }
+                    line.clear();
+                }
+                // A line longer than any message this protocol has is not one of them.
+                other if line.len() < 64 => line.push(other),
+                _ => line.clear(),
+            },
+        }
     }
 
     if restore(&saved, &keyboard) {

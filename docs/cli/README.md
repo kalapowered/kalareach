@@ -82,16 +82,27 @@ and taking input never moves it either.
 A broken connection must not leave a terminal in raw mode, and the restoration has to survive the
 attach process being killed — which no in-process handler can do, because `SIGKILL` runs no handler.
 
-So the saved state lives in another process. Before the terminal is touched, `kr attach` asks the
-terminal which keyboard protocols it has negotiated (the Kitty protocol's flags and xterm's
-`modifyOtherKeys` level, neither of which termios describes), then starts `kr-attach-guard` and
-gives it one end of a pipe, its own handle on the terminal, the terminal's complete mode state and
-those answers.
+So the saved state lives in another process. `kr attach` starts `kr-attach-guard` before anything
+touches the terminal and gives it one end of a pipe, its own handle on the terminal and the
+terminal's complete mode state.
 
-Both paths out put all of it back: the mode words, the control characters, the sequences that undo
+Only then does it ask the terminal anything. The capability handshake is bounded and synchronous: it
+asks which keyboard protocols the terminal has negotiated (the Kitty protocol's flags and xterm's
+`modifyOtherKeys` level, neither of which termios describes) and ends with the device-attributes
+request every terminal answers. Reading the answers means putting the terminal into a mode where
+they arrive, which is why the guard exists first. The answers then reach the guard over the same
+pipe.
+
+A terminal that does not finish the handshake within a second fails this attach with
+`TERMINAL_PROBE_FAILED` and exit code 6; it does not begin forwarding input on a stream that may
+still receive a late reply. What the person typed while the host was asking is kept apart from the
+answers and is the first input the attachment forwards.
+
+Both paths out put everything back: the mode words, the control characters, the sequences that undo
 what an application may have left enabled, and then the keyboard protocols the terminal had chosen
-for itself. A terminal that answers neither question has nothing to put back, and the clearing
-stands. `--no-probe` withholds the question with the same effect.
+for itself. `--no-probe` asks the terminal nothing at all, which is what makes it the choice for a
+terminal that does not answer; with nothing read there is nothing to put back, and the clearing
+stands.
 
 * A clean exit restores the terminal and sends the guard a byte, and the guard leaves without
   acting.

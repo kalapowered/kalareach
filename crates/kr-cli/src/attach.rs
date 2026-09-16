@@ -31,6 +31,12 @@ use crate::terminal::{ControllingTerminal, KeyboardState, SavedModes};
 /// The byte that tells the guard the terminal has already been restored.
 pub const GUARD_RELEASE: u8 = b'R';
 
+/// The byte that introduces the keyboard state the guard is to restore, followed by a line.
+///
+/// It reaches the guard after it is already armed, because the state can only be read by changing
+/// the terminal, and nothing may change the terminal before something is holding what it had.
+pub const GUARD_KEYBOARD: u8 = b'K';
+
 /// The byte a guard sends once it is holding the terminal's state.
 pub const GUARD_READY: u8 = b'A';
 
@@ -66,7 +72,6 @@ impl RestorationGuard {
         program: &std::path::Path,
         terminal: &ControllingTerminal,
         saved: &SavedModes,
-        keyboard: &KeyboardState,
     ) -> Result<Self> {
         let (reader, writer) = std::io::pipe()
             .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
@@ -80,8 +85,6 @@ impl RestorationGuard {
         command
             .arg("--modes")
             .arg(saved.encode())
-            .arg("--keyboard")
-            .arg(keyboard.encode())
             .stdin(Stdio::from(reader))
             .stdout(Stdio::from(handle))
             .stderr(Stdio::from(ready_writer));
@@ -118,6 +121,24 @@ impl RestorationGuard {
             ));
         }
         Ok(guard)
+    }
+
+    /// Tells the guard what keyboard protocols this terminal had before the attachment began.
+    ///
+    /// The guard is armed before anything touches the terminal, and reading this state is itself a
+    /// change to it, so the answer arrives here rather than as a starting argument. A guard that
+    /// never hears it restores the terminal's modes and clears the keyboard protocols, which is
+    /// what a terminal that was never asked gets.
+    pub fn learn_keyboard(&mut self, keyboard: &KeyboardState) {
+        use std::io::Write as _;
+
+        if let Some(writer) = self.release.as_mut() {
+            let mut line = vec![GUARD_KEYBOARD];
+            line.extend_from_slice(keyboard.encode().as_bytes());
+            line.push(b'\n');
+            let _ = writer.write_all(&line);
+            let _ = writer.flush();
+        }
     }
 
     /// Releases the guard without it acting, after the caller has restored the terminal itself.
