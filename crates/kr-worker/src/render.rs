@@ -117,14 +117,31 @@ pub struct Restoration {
     pub carried: Carried,
 }
 
+/// Whether a restoration may change the terminal's keyboard protocols.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Keyboard {
+    /// The session's keyboard state is installed, because this terminal said what it is and its
+    /// own state was read before the attachment began, so it can be put back exactly.
+    #[default]
+    Install,
+    /// Nothing about the keyboard is changed, because nobody was allowed to ask this terminal what
+    /// it had negotiated and nothing else can put back what an install would take away.
+    ///
+    /// This is what an attachment that asked its terminal nothing is served: section 8's
+    /// conservative profile is one that does not touch what it cannot restore. What the session
+    /// holds is counted as something the restoration did not carry.
+    Withhold,
+}
+
 /// Renders a restoration for a terminal showing `viewport` of the canonical grid.
 ///
 /// The viewport decides which canonical rows land on which screen lines and which columns are
 /// shown, so a terminal smaller than the session sees the part it is looking at rather than a
-/// wrapped approximation of the whole.
+/// wrapped approximation of the whole. `keyboard` decides whether this terminal's keyboard
+/// protocols may be changed at all.
 #[must_use]
-pub fn render(operations: &[RestoreOp], viewport: Viewport) -> Restoration {
-    let mut writer = Writer::new(viewport);
+pub fn render(operations: &[RestoreOp], viewport: Viewport, keyboard: Keyboard) -> Restoration {
+    let mut writer = Writer::new(viewport, keyboard);
     for operation in operations {
         writer.apply(operation);
     }
@@ -166,6 +183,8 @@ struct Writer {
     /// margins and origin mode are in force. The screen is therefore painted with neither, and both
     /// are installed afterwards together with the cursor, which is the only thing whose position
     /// they then apply to.
+    /// Whether this terminal's keyboard protocols may be changed at all.
+    keyboard: Keyboard,
     margins: Option<Margins>,
     /// Whether the snapshot had origin mode set, held back for the same reason.
     origin_mode: bool,
@@ -173,7 +192,7 @@ struct Writer {
 }
 
 impl Writer {
-    fn new(viewport: Viewport) -> Self {
+    fn new(viewport: Viewport, keyboard: Keyboard) -> Self {
         Self {
             out: Vec::new(),
             viewport,
@@ -185,6 +204,7 @@ impl Writer {
             inactive: Vec::new(),
             margins: None,
             origin_mode: false,
+            keyboard,
             carried: Carried::default(),
         }
     }
@@ -359,15 +379,27 @@ impl Writer {
     }
 
     fn keyboard(&mut self, keyboard: &KeyboardSnapshot) {
+        let (kitty, other) = match self.active {
+            ActiveBuffer::Primary => (&keyboard.primary, &keyboard.alternate),
+            ActiveBuffer::Alternate => (&keyboard.alternate, &keyboard.primary),
+        };
+        if self.keyboard == Keyboard::Withhold {
+            // Nobody was allowed to ask this terminal what it had negotiated, so nothing here
+            // changes it: a level or a flag installed now could not be put back, and a person left
+            // in an encoding their shell does not expect is the failure they cannot work around.
+            // What the session holds is counted as something this restoration did not carry, which
+            // is what keeps such an attachment on a projection.
+            if keyboard.modify_other_keys != 0 || kitty.flags.is_some() {
+                self.carried.other_keyboard = true;
+            }
+            self.carried.keyboard_stack += kitty.stack.len();
+            return;
+        }
         let mut body = b">".to_vec();
         body.extend_from_slice(b"4;");
         body.extend_from_slice(keyboard.modify_other_keys.to_string().as_bytes());
         body.push(b'm');
         self.csi(&body);
-        let (kitty, other) = match self.active {
-            ActiveBuffer::Primary => (&keyboard.primary, &keyboard.alternate),
-            ActiveBuffer::Alternate => (&keyboard.alternate, &keyboard.primary),
-        };
         // The other buffer's negotiation has no sequence that installs it without switching to that
         // buffer, which a restoration must not do.
         if other.flags.is_some() || !other.stack.is_empty() {
@@ -1060,7 +1092,7 @@ mod tests {
                 },
             },
         ];
-        let rendered = render(&operations, viewport(24, 80));
+        let rendered = render(&operations, viewport(24, 80), Keyboard::Install);
         let bytes = rendered.bytes;
         assert!(
             !bytes.windows(2).any(|pair| pair == b"\x1b]52"),
@@ -1081,6 +1113,7 @@ mod tests {
                 row: row(2, 0, "text"),
             }],
             viewport(24, 80),
+            Keyboard::Install,
         );
         // Line three, cleared, then the text.
         assert_eq!(
@@ -1096,6 +1129,7 @@ mod tests {
                 row: row(40, 0, "below"),
             }],
             viewport(24, 80),
+            Keyboard::Install,
         );
         assert!(rendered.bytes.is_empty());
     }
@@ -1109,6 +1143,7 @@ mod tests {
                 row: row(0, 0, "abcdefghij"),
             }],
             viewport(24, 4),
+            Keyboard::Install,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert!(text.ends_with("abcd"), "{text:?}");
@@ -1122,6 +1157,7 @@ mod tests {
                 row: row(0, 0, "a\u{4e00}"),
             }],
             viewport(24, 2),
+            Keyboard::Install,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert!(text.ends_with('a'), "{text:?}");
@@ -1141,6 +1177,7 @@ mod tests {
                 },
             }],
             viewport(24, 40),
+            Keyboard::Install,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert!(text.ends_with("\x1b[?25l"), "{text:?}");
@@ -1177,7 +1214,7 @@ mod tests {
                 },
             },
         ];
-        let rendered = render(&operations, viewport(24, 80));
+        let rendered = render(&operations, viewport(24, 80), Keyboard::Install);
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         let painted = text.find("top").expect("the row is painted");
         let region = text.find("\x1b[6;21r").expect("the scroll region is set");
@@ -1202,6 +1239,7 @@ mod tests {
                 },
             }],
             viewport(24, 80),
+            Keyboard::Install,
         );
         assert!(
             rendered.bytes.is_empty(),
@@ -1222,6 +1260,7 @@ mod tests {
                 row: row(11, 6, "ab"),
             }],
             looking_at,
+            Keyboard::Install,
         );
         // Canonical row 11 is the second line shown; canonical column 6 is the third column shown.
         assert_eq!(rendered.bytes, b"\x1b[2;1H\x1b[K\x1b[3G\x1b[0mab".to_vec());
@@ -1248,7 +1287,7 @@ mod tests {
                 },
             },
         ];
-        let rendered = render(&operations, viewport(24, 80));
+        let rendered = render(&operations, viewport(24, 80), Keyboard::Install);
         assert_eq!(rendered.bytes, b"\x1b[?1049h\x1b[?7h".to_vec());
     }
 
@@ -1263,6 +1302,7 @@ mod tests {
         let rendered = render(
             &[RestoreOp::SetRendition { rendition: bold }],
             viewport(24, 80),
+            Keyboard::Install,
         );
         assert_eq!(rendered.bytes, b"\x1b[0;1;91;48:2::1:2:3m".to_vec());
     }
@@ -1282,7 +1322,7 @@ mod tests {
                 row: row(0, 0, "application"),
             },
         ];
-        let rendered = render(&operations, viewport(24, 80));
+        let rendered = render(&operations, viewport(24, 80), Keyboard::Install);
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         let into_primary = text
             .find("\x1b[?47l")
@@ -1321,7 +1361,7 @@ mod tests {
                 },
             },
         ];
-        let rendered = render(&operations, viewport(24, 80));
+        let rendered = render(&operations, viewport(24, 80), Keyboard::Install);
         assert_eq!(rendered.carried.other_saved_cursors, 1);
         assert!(!rendered.carried.complete());
     }
@@ -1346,7 +1386,7 @@ mod tests {
                 },
             },
         ];
-        let rendered = render(&operations, viewport(24, 4));
+        let rendered = render(&operations, viewport(24, 4), Keyboard::Install);
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert_eq!(text.matches("abcd").count(), 1, "{text:?}");
         assert!(rendered.carried.pending_wrap);
@@ -1367,6 +1407,7 @@ mod tests {
                 }],
             }],
             viewport(24, 80),
+            Keyboard::Install,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert!(
@@ -1385,7 +1426,11 @@ mod tests {
     fn a_control_character_cannot_travel_back_through_a_row() {
         let mut dangerous = row(0, 0, "a\u{7}b");
         dangerous.runs[0].cells = 3;
-        let rendered = render(&[RestoreOp::PaintRow { row: dangerous }], viewport(24, 80));
+        let rendered = render(
+            &[RestoreOp::PaintRow { row: dangerous }],
+            viewport(24, 80),
+            Keyboard::Install,
+        );
         assert!(!rendered.bytes.contains(&0x07));
     }
 
@@ -1398,6 +1443,7 @@ mod tests {
                 uri: Some("https://example.invalid/".to_owned()),
             }],
             viewport(24, 80),
+            Keyboard::Install,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert_eq!(text, "\x1b]8;;https://example.invalid/\x1b\\");
@@ -1413,6 +1459,7 @@ mod tests {
                 RestoreOp::SetHyperlink { uri: None },
             ],
             viewport(24, 80),
+            Keyboard::Install,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert!(text.ends_with("\x1b]8;;\x1b\\"), "{text:?}");
@@ -1435,6 +1482,7 @@ mod tests {
                 },
             }],
             viewport(24, 80),
+            Keyboard::Install,
         );
         // The level and the flags in force, and nothing that touches the terminal's stack: the
         // entry the attachment saved its owner's negotiation in sits there, and a restoration that
@@ -1449,6 +1497,53 @@ mod tests {
             "so the terminal is not handed the stream with a stack it would pop into \
              somebody else's state"
         );
+    }
+
+    #[test]
+    fn a_terminal_that_was_asked_nothing_is_never_given_a_keyboard_protocol() {
+        // `--no-probe` asks the terminal nothing, so nothing it has negotiated is known and nothing
+        // could put back what installing a protocol would take away. The restoration leaves it
+        // alone and counts what the session holds as something it could not carry.
+        let keyboard = KeyboardSnapshot {
+            modify_other_keys: 2,
+            primary: KittyKeyboard {
+                flags: Some(5),
+                stack: vec![1],
+            },
+            alternate: KittyKeyboard {
+                flags: None,
+                stack: Vec::new(),
+            },
+        };
+        let withheld = render(
+            &[RestoreOp::SetKeyboard {
+                keyboard: keyboard.clone(),
+            }],
+            viewport(24, 80),
+            Keyboard::Withhold,
+        );
+        assert!(
+            withheld.bytes.is_empty(),
+            "nothing about the keyboard is written: {:?}",
+            String::from_utf8_lossy(&withheld.bytes)
+        );
+        assert!(
+            withheld.carried.other_keyboard,
+            "and what the session holds is counted as something this could not carry"
+        );
+        assert!(
+            !withheld.carried.continues_the_stream(),
+            "so the terminal is not handed the stream either"
+        );
+
+        // A terminal that said what it is gets the session's state, because the client read its own
+        // before anything happened to it and can put that back exactly.
+        let installed = render(
+            &[RestoreOp::SetKeyboard { keyboard }],
+            viewport(24, 80),
+            Keyboard::Install,
+        );
+        assert_eq!(installed.bytes, b"\x1b[>4;2m\x1b[=5;1u".to_vec());
     }
 
     #[test]
@@ -1471,6 +1566,7 @@ mod tests {
                 },
             }],
             viewport(24, 80),
+            Keyboard::Install,
         );
         assert_eq!(rendered.bytes, b"\x1b[>4;0m\x1b[=0;1u".to_vec());
         assert_eq!(rendered.carried.keyboard_stack, 0);

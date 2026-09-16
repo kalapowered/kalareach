@@ -302,6 +302,7 @@ impl TerminalEngine {
         dimensions: Dimensions,
         gate: LaneGate,
         now_ms: u64,
+        keyboard: crate::render::Keyboard,
     ) -> (u64, Restoration, Filtered) {
         let mut viewport = self.viewport_for(dimensions);
         let (mut snapshot, settled) = self.engine.snapshot(viewport, now_ms);
@@ -315,7 +316,7 @@ impl TerminalEngine {
         let operations = restoration_operations(&snapshot);
         (
             snapshot.output_cursor,
-            render(&operations, viewport),
+            render(&operations, viewport, keyboard),
             settled,
         )
     }
@@ -498,8 +499,12 @@ mod tests {
     fn a_restoration_describes_the_screen_rather_than_the_bytes_that_made_it() {
         let mut engine = engine();
         engine.feed(0, b"\x07before\x1b[c after", LaneGate::default(), 0);
-        let (cursor, restoration, _) =
-            engine.restoration(dimensions(80, 24), LaneGate::default(), 0);
+        let (cursor, restoration, _) = engine.restoration(
+            dimensions(80, 24),
+            LaneGate::default(),
+            0,
+            crate::render::Keyboard::Install,
+        );
         assert!(cursor > 0);
         let text = String::from_utf8_lossy(&restoration.bytes).into_owned();
         assert!(text.contains("before"), "the screen's text is drawn");

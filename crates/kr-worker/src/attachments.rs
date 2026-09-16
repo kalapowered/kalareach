@@ -463,6 +463,27 @@ impl AttachmentTable {
         }
     }
 
+    /// Returns whether a restoration for this attachment may change its keyboard protocols.
+    ///
+    /// Only an attachment that declared what terminal it is may have them changed. That
+    /// declaration is what says the client asked the terminal about itself before anything
+    /// happened to it, and therefore that it can put back exactly what it found; an attachment
+    /// that asked nothing, which is what `--no-probe` chooses, is served a screen that leaves its
+    /// keyboard alone, because nothing could restore what installing one would take away.
+    #[must_use]
+    pub fn keyboard_control(&self, id: AttachmentId) -> crate::render::Keyboard {
+        if self
+            .by_id
+            .get(&id)
+            .and_then(|ordinal| self.attachments.get(ordinal))
+            .is_some_and(|attachment| attachment.terminal_profile_id.is_some())
+        {
+            crate::render::Keyboard::Install
+        } else {
+            crate::render::Keyboard::Withhold
+        }
+    }
+
     /// Returns an attachment's own physical dimensions, when it has reported them.
     ///
     /// The outer `Option` says whether the attachment exists; the inner one says whether it has

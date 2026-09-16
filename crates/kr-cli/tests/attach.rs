@@ -722,11 +722,11 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_attachment_that_asked_nothing_still_gives_the_keyboard_state_back() {
-    // `--no-probe` is chosen before any query is sent and asks the terminal nothing, so there is no
-    // answer to write back on the way out. The terminal's own keyboard stack holds the state
-    // instead: the attachment pushes an entry as it begins forwarding and the cleanup pops it, so a
-    // person who had negotiated a keyboard protocol for themselves still has it afterwards.
+async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_found_it() {
+    // `--no-probe` is chosen before any query is sent and asks the terminal nothing. Nothing may
+    // then change its keyboard protocols: the host serves such an attachment a screen that installs
+    // none, and the command opens no stack entry of its own, so a person who had negotiated a
+    // keyboard protocol for themselves still has exactly that afterwards.
     let hosted = hosted("while true; do echo ready; sleep 1; done").await;
     let pty = native_pty_system()
         .openpty(PtySize {
@@ -753,11 +753,7 @@ async fn an_attachment_that_asked_nothing_still_gives_the_keyboard_state_back() 
         "the session's output reached the terminal: {}",
         output.text().escape_debug()
     );
-    assert!(
-        output.contains(KEYBOARD_PUSHED),
-        "the attachment opened its own entry in the terminal's keyboard stack: {}",
-        output.text().escape_debug()
-    );
+    let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
 
     let attach = attach_process(shell.process_id().expect("the shell has an identifier"))
         .expect("the shell started the attach command");
@@ -767,32 +763,40 @@ async fn an_attachment_that_asked_nothing_still_gives_the_keyboard_state_back() 
         .expect("sends the signal");
     assert!(killed.success(), "the attach process was killed");
 
-    assert!(
-        output.wait_for(KEYBOARD_POPPED, Duration::from_secs(10)),
-        "and the guard gave the terminal its keyboard state back: {}",
-        output.text().escape_debug()
-    );
-    // And what follows the pop sets nothing: the session's own restoration installs the flags it
-    // holds while the attachment runs, but the cleanup has nothing to put back that anybody read.
-    let seen = output.text();
-    let after_the_pop = seen
-        .rfind("\u{1b}[<1u")
-        .map_or("", |at| &seen[at..])
-        .to_owned();
-    assert!(
-        !after_the_pop.contains("\u{1b}[="),
-        "the cleanup set no keyboard state nobody ever read: {}",
-        after_the_pop.escape_debug()
-    );
-    // One push, one pop, whichever process was alive for each. The guard owns both, because a
-    // stack operation cannot be repeated or skipped without leaving the terminal in a state
-    // nothing can name.
+    // The guard puts the modes back, which is how this test knows the cleanup ran at all.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let after =
+            rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
+        if after
+            .local_modes
+            .contains(rustix::termios::LocalModes::ICANON)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Nothing about the keyboard was ever written to this terminal: no entry was opened, none was
+    // given back, no level was imposed and no flags were set. A terminal nobody was allowed to ask
+    // keeps exactly what its owner set up.
     assert_eq!(
         (output.count(KEYBOARD_PUSHED), output.count(KEYBOARD_POPPED)),
-        (1, 1),
-        "the entry was opened once and given back once: {}",
+        (0, 0),
+        "no keyboard stack entry was opened or taken off: {}",
         output.text().escape_debug()
     );
+    assert!(
+        !output.contains(b"\x1b[>4;"),
+        "no modifyOtherKeys level was imposed: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        !output.contains(b"\x1b[="),
+        "and no Kitty flags were set: {}",
+        output.text().escape_debug()
+    );
+    let _ = before;
     let _ = shell.kill();
     let _ = shell.wait();
 }

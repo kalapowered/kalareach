@@ -169,15 +169,22 @@ pub async fn run(
     .await?;
 
     // Forwarding begins here, and the terminal's keyboard protocols are dealt with at this exact
-    // boundary and not before. The guard is told what was read, including that nothing was, and
-    // then opens this attachment's entry in the terminal's own keyboard stack: whatever the
-    // terminal had negotiated is held by the terminal itself and comes back on the way out whether
-    // or not anything ever read it. The guard does the push because it is the process that is
-    // certain to be there for the pop, and it confirms before this returns, so nothing is
-    // forwarded until the state is held. An attach that failed on its way here opened nothing and
-    // changed nothing.
-    guard.learn_keyboard(&keyboard);
-    guard.begin_keyboard()?;
+    // boundary and not before.
+    //
+    // An attachment that asked its terminal nothing changes nothing about its keyboard: the host
+    // serves it a screen that installs no protocol, because nothing could put back what installing
+    // one would take away. There is then no entry to open and none to give back.
+    //
+    // One that did ask opens an entry in the terminal's own keyboard stack, so whatever that
+    // terminal had negotiated is held by the terminal itself, and the answers it gave are written
+    // back after the entry comes off, which is what corrects an application inside the session
+    // that emptied the stack on its way past. The guard does both, because it is the process that
+    // is certain to be there for the second one, and it confirms before this returns, so nothing
+    // is forwarded until the state is held. An attach that failed on its way here opened nothing.
+    if !options.no_probe {
+        guard.learn_keyboard(&keyboard);
+        guard.begin_keyboard()?;
+    }
     let raw_replaced = terminal.enter_raw_mode()?;
 
     let handle = Arc::new(
