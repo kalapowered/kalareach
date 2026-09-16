@@ -1814,7 +1814,7 @@ fn the_row_arrays_are_reserved_with_their_scrollback() {
     assert_eq!(
         footprint.row_arrays,
         (24 + grid.scrollback_rows as u64 + 24) * kr_term::grid::ROW_SLOT_BYTES
-            + grid.scrollback_rows as u64 * kr_term::grid::HISTORY_CHARGE_BYTES,
+            + kr_term::budget::history_account_bytes(grid.scrollback_rows),
         "the primary buffer's array holds the screen and the scrollback and the alternate keeps no \
          history; the retained rows' account holds one charge a retained row"
     );
@@ -2611,10 +2611,9 @@ fn a_restored_keyboard_stack_is_bounded_and_qualified() {
 
 /// The account of what the retained rows cost is resident state, and it is measured.
 ///
-/// It is one charge a retained row, in an array of its own beside the rows, and it keeps the room
-/// it grew to after eviction or an erasure gives the rows back. A session that emptied its
-/// scrollback is still holding that room, so the measurement says so rather than reporting the
-/// account as free the moment its entries go.
+/// It is one charge a retained row, in an array of its own beside the rows. The geometry reserves
+/// for it, the measurement reads the room it is holding rather than the charges on it, and it
+/// gives that room back when the rows go.
 #[test]
 fn the_retained_rows_account_is_reserved_and_measured() {
     let mut engine = Engine::new(EngineConfig {
@@ -2641,13 +2640,40 @@ fn the_retained_rows_account_is_reserved_and_measured() {
         "and the geometry reserved room for them"
     );
 
-    // The scrollback goes, and the room its charges sat in does not.
+    // The scrollback goes, and so does the room its charges sat in.
     engine.feed(b"\x1b[3J", 0);
     engine.quiesce(0);
     assert_eq!(engine.grid().history_bytes(), 0, "the rows are gone");
     assert!(
-        engine.grid().buffer_bytes().row_records > empty,
-        "the room the account kept for them is not"
+        engine.grid().buffer_bytes().row_records
+            <= empty + kr_term::grid::HISTORY_ACCOUNT_MINIMUM_BYTES,
+        "and the account is holding no more than its smallest allocation"
     );
     assert_eq!(engine.budget().excess(), 0);
+}
+
+/// The reservation covers the account's smallest allocation, which no geometry is below.
+///
+/// An array that grows by doubling does not start at one entry. A session whose scrollback is a
+/// single row still holds the smallest allocation there is, and a reservation worked out from the
+/// row count alone would be under it.
+#[test]
+fn a_session_of_one_retained_row_is_reserved_for_what_its_account_allocates() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(1, 1),
+        grid: kr_term::grid::GridConfig {
+            scrollback_rows: 1,
+            ..kr_term::grid::GridConfig::DEFAULT
+        },
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    engine.feed(b"a\r\nb\r\nc\r\n", 0);
+    engine.quiesce(0);
+    assert_eq!(engine.grid().scrollback_rows(), 1, "one row is retained");
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "and the smallest geometry there is reserved for what its account allocates"
+    );
 }

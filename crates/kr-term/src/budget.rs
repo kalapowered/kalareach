@@ -12,8 +12,8 @@
 use crate::error::{Result, TermError};
 use crate::grid::{
     ALERT_LIST_BYTES, CELL_ATTRIBUTE_BYTES, CELL_TEXT_HEAP_BYTES, GRID_TITLE_BYTES,
-    HISTORY_CHARGE_BYTES, LINK_TABLE_ENTRY_BYTES, LINK_TABLE_NODE_BYTES, ROW_SLOT_BYTES,
-    ROW_STORAGE_BYTES, STRING_HANDLE_BYTES,
+    HISTORY_ACCOUNT_MINIMUM_BYTES, HISTORY_CHARGE_BYTES, LINK_TABLE_ENTRY_BYTES,
+    LINK_TABLE_NODE_BYTES, ROW_SLOT_BYTES, ROW_STORAGE_BYTES, STRING_HANDLE_BYTES,
 };
 
 /// The maximum number of columns.
@@ -158,6 +158,21 @@ pub const CELL_OVERHEAD_BYTES: u64 = 128;
 #[must_use]
 pub const fn cell_content_bytes(cell_bytes: u64) -> u64 {
     2 * cell_bytes + CELL_ATTRIBUTE_BYTES + CELL_TEXT_HEAP_BYTES
+}
+
+/// What the account of what the retained rows cost can be holding, at `scrollback_rows` of history.
+///
+/// One charge a row, in an array that grows by doubling and gives the room back when the charges
+/// on it go, so it holds at most twice the rows the scrollback keeps. Never less than the smallest
+/// allocation there is, which is what a session of one or two retained rows is still holding.
+#[must_use]
+pub const fn history_account_bytes(scrollback_rows: usize) -> u64 {
+    let charges = (scrollback_rows as u64).saturating_mul(HISTORY_CHARGE_BYTES);
+    if charges < HISTORY_ACCOUNT_MINIMUM_BYTES {
+        HISTORY_ACCOUNT_MINIMUM_BYTES
+    } else {
+        charges
+    }
 }
 
 /// The worst-case resident footprint of one geometry.
@@ -331,7 +346,7 @@ impl SessionBudget {
                 .saturating_add(scrollback_rows as u64)
                 .saturating_add(rows)
                 .saturating_mul(ROW_SLOT_BYTES)
-                .saturating_add((scrollback_rows as u64).saturating_mul(HISTORY_CHARGE_BYTES)),
+                .saturating_add(history_account_bytes(scrollback_rows)),
             links: self.limits.link_envelope(),
             // The session's own titles and stack, and the copy the grid keeps of each title.
             titles: crate::title::MAX_RESIDENT_BYTES.saturating_add(GRID_TITLE_BYTES),
