@@ -37,7 +37,14 @@ pub const GUARD_RELEASE: u8 = b'R';
 /// the terminal, and nothing may change the terminal before something is holding what it had.
 pub const GUARD_KEYBOARD: u8 = b'K';
 
-/// The byte a guard sends once it is holding the terminal's state.
+/// The byte that asks the guard to open this attachment's entry in the terminal's keyboard stack.
+///
+/// The guard does it, and not the attach process, because the operation is not repeatable: a push
+/// that happened and a pop that answers it have to be one pair, whichever process is alive to send
+/// it. A guard that pushed pops on its way out however this attachment ended.
+pub const GUARD_BEGIN: u8 = b'B';
+
+/// The byte a guard sends once it is holding the terminal's state, and again once it has pushed.
 pub const GUARD_READY: u8 = b'A';
 
 /// How long the attach process waits for its guard to report that it is armed.
@@ -56,6 +63,9 @@ pub const GUARD_ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub struct RestorationGuard {
     child: std::process::Child,
     release: Option<std::io::PipeWriter>,
+    /// The pipe the guard confirms on: once when it is armed, and once for each thing it is asked
+    /// to do to the terminal on this attachment's behalf.
+    confirmations: Option<std::io::PipeReader>,
 }
 
 impl RestorationGuard {
@@ -75,7 +85,7 @@ impl RestorationGuard {
     ) -> Result<Self> {
         let (reader, writer) = std::io::pipe()
             .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
-        let (mut ready_reader, ready_writer) = std::io::pipe()
+        let (ready_reader, ready_writer) = std::io::pipe()
             .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
         let handle = terminal
             .handle()
@@ -94,41 +104,91 @@ impl RestorationGuard {
         let mut guard = Self {
             child,
             release: Some(writer),
+            confirmations: Some(ready_reader),
         };
         // The readiness byte. A guard that never sends it is stopped rather than trusted, because
         // the whole point of it is to be holding the state before the terminal changes.
-        let armed = std::thread::spawn(move || {
-            let mut answer = [0_u8; 1];
-            matches!(ready_reader.read(&mut answer), Ok(1) if answer[0] == GUARD_READY)
-        });
-        let deadline = std::time::Instant::now() + GUARD_ARM_TIMEOUT;
-        while !armed.is_finished() {
-            if std::time::Instant::now() >= deadline {
-                let _ = guard.child.kill();
-                let _ = guard.child.wait();
-                return Err(CliError::Terminal(
-                    "the restoration guard did not report that it was holding the terminal"
-                        .to_owned(),
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        if !armed.join().unwrap_or(false) {
+        if !guard.confirmed() {
             let _ = guard.child.kill();
             let _ = guard.child.wait();
             return Err(CliError::Terminal(
-                "the restoration guard could not hold the terminal".to_owned(),
+                "the restoration guard did not report that it was holding the terminal".to_owned(),
             ));
         }
         Ok(guard)
     }
 
+    /// Waits for the guard's next confirmation, for as long as arming is allowed to take.
+    ///
+    /// The read happens on a thread because a guard that has died sends nothing at all, and a
+    /// blocking read for a byte that is not coming would outlast any deadline this could set.
+    fn confirmed(&mut self) -> bool {
+        let Some(reader) = self.confirmations.take() else {
+            return false;
+        };
+        let answer = std::thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            let mut reader = reader;
+            let confirmed = matches!(reader.read(&mut byte), Ok(1) if byte[0] == GUARD_READY);
+            (reader, confirmed)
+        });
+        let deadline = std::time::Instant::now() + GUARD_ARM_TIMEOUT;
+        while !answer.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        match answer.join() {
+            Ok((reader, confirmed)) => {
+                self.confirmations = Some(reader);
+                confirmed
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Asks the guard to open this attachment's entry in the terminal's keyboard stack.
+    ///
+    /// It returns once the guard has done it, so forwarding begins after the terminal is holding
+    /// what it had negotiated and not before. The push and the pop that answers it belong to the
+    /// guard together: it is the process that is still there however this attachment ends, and a
+    /// push this process made and a pop the guard made would be two operations on one stack with
+    /// nothing keeping them in step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the guard does not confirm.
+    pub fn begin_keyboard(&mut self) -> Result<()> {
+        use std::io::Write as _;
+
+        let Some(writer) = self.release.as_mut() else {
+            return Err(CliError::Terminal(
+                "the restoration guard is no longer listening".to_owned(),
+            ));
+        };
+        if writer.write_all(&[GUARD_BEGIN, b'\n']).is_err() || writer.flush().is_err() {
+            return Err(CliError::Terminal(
+                "the restoration guard could not be asked to hold the keyboard state".to_owned(),
+            ));
+        }
+        if self.confirmed() {
+            Ok(())
+        } else {
+            Err(CliError::Terminal(
+                "the restoration guard did not report that it was holding the keyboard state"
+                    .to_owned(),
+            ))
+        }
+    }
+
     /// Tells the guard what keyboard protocols this terminal had before the attachment began.
     ///
     /// The guard is armed before anything touches the terminal, and reading this state is itself a
-    /// change to it, so the answer arrives here rather than as a starting argument. A guard that
-    /// never hears it restores the terminal's modes and clears the keyboard protocols, which is
-    /// what a terminal that was never asked gets.
+    /// change to it, so the answer arrives here rather than as a starting argument. It is what the
+    /// guard writes after the pop, to correct the one thing a pop cannot: an application inside the
+    /// session that pushed an entry of its own and left without popping it. A guard that never
+    /// hears it pops and writes nothing more, which is what a terminal that was never asked gets.
     pub fn learn_keyboard(&mut self, keyboard: &KeyboardState) {
         use std::io::Write as _;
 
@@ -141,7 +201,10 @@ impl RestorationGuard {
         }
     }
 
-    /// Releases the guard without it acting, after the caller has restored the terminal itself.
+    /// Releases the guard after the caller has restored the terminal's modes itself.
+    ///
+    /// What the guard pushed is still the guard's to pop, so it does that on its way out. This
+    /// waits for it to finish, which is what keeps the two halves of the restoration in order.
     pub fn release(mut self) {
         use std::io::Write as _;
 

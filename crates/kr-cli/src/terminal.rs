@@ -317,10 +317,7 @@ mod unix {
 
     use rustix::termios::{OptionalActions, SpecialCodeIndex, Termios, Winsize};
 
-    use super::{
-        KEYBOARD_BEGIN_SEQUENCES, KeyboardState, PROBE_DEADLINE, Probe, RESET_SEQUENCES,
-        TerminalSize,
-    };
+    use super::{KeyboardState, PROBE_DEADLINE, Probe, RESET_SEQUENCES, TerminalSize};
     use crate::error::{CliError, Result};
 
     /// A handle on this process's controlling terminal.
@@ -404,19 +401,6 @@ mod unix {
                 |error| CliError::Terminal(format!("set the terminal's modes: {error}")),
             )?;
             Ok(saved)
-        }
-
-        /// Opens this attachment's entry in the terminal's keyboard stack.
-        ///
-        /// Written once, where forwarding begins. It is what makes the outer terminal's keyboard
-        /// state restorable without having read it, and it is paired with the pop in
-        /// [`KeyboardState::cleanup_sequences`].
-        pub fn begin_keyboard(&self) {
-            use std::io::Write as _;
-
-            let mut handle = &self.handle;
-            let _ = handle.write_all(KEYBOARD_BEGIN_SEQUENCES);
-            let _ = handle.flush();
         }
 
         /// Restores saved modes and undoes the modes an application may have left enabled.

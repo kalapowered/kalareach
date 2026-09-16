@@ -278,6 +278,15 @@ impl TerminalOutput {
             .is_ok_and(|seen| seen.windows(marker.len()).any(|window| window == marker))
     }
 
+    /// How many times a sequence appears in what the terminal has been sent.
+    fn count(&self, marker: &[u8]) -> usize {
+        self.seen.lock().map_or(0, |seen| {
+            seen.windows(marker.len())
+                .filter(|window| *window == marker)
+                .count()
+        })
+    }
+
     fn text(&self) -> String {
         self.seen
             .lock()
@@ -531,6 +540,15 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
         "and its modifyOtherKeys level: {}",
         output.text().escape_debug()
     );
+    // An attachment that ended of its own accord opened the entry once and gave it back once, the
+    // same as one that was killed: the guard owns both halves, so neither is repeated by the
+    // process that restored the modes.
+    assert_eq!(
+        (output.count(KEYBOARD_PUSHED), output.count(KEYBOARD_POPPED)),
+        (1, 1),
+        "the entry was opened once and given back once: {}",
+        output.text().escape_debug()
+    );
     let _ = shell.kill();
     let _ = shell.wait();
 }
@@ -757,6 +775,15 @@ async fn an_attachment_that_asked_nothing_still_gives_the_keyboard_state_back() 
     assert!(
         !output.contains(b"\x1b[="),
         "without setting it to anything nobody ever read: {}",
+        output.text().escape_debug()
+    );
+    // One push, one pop, whichever process was alive for each. The guard owns both, because a
+    // stack operation cannot be repeated or skipped without leaving the terminal in a state
+    // nothing can name.
+    assert_eq!(
+        (output.count(KEYBOARD_PUSHED), output.count(KEYBOARD_POPPED)),
+        (1, 1),
+        "the entry was opened once and given back once: {}",
         output.text().escape_debug()
     );
     let _ = shell.kill();

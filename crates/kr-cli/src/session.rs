@@ -169,14 +169,15 @@ pub async fn run(
     .await?;
 
     // Forwarding begins here, and the terminal's keyboard protocols are dealt with at this exact
-    // boundary and not before. The push opens this attachment's own entry in the terminal's
-    // keyboard stack, so whatever the terminal had negotiated is held by the terminal itself and
-    // comes back on the way out whether or not anything ever read it. The guard is told the same
-    // thing at the same moment, including that nothing was read: being told at all is what says
-    // the entry exists and the protocols are this attachment's to put back. An attach that failed
-    // on its way here pushed nothing and changed nothing.
-    terminal.begin_keyboard();
+    // boundary and not before. The guard is told what was read, including that nothing was, and
+    // then opens this attachment's entry in the terminal's own keyboard stack: whatever the
+    // terminal had negotiated is held by the terminal itself and comes back on the way out whether
+    // or not anything ever read it. The guard does the push because it is the process that is
+    // certain to be there for the pop, and it confirms before this returns, so nothing is
+    // forwarded until the state is held. An attach that failed on its way here opened nothing and
+    // changed nothing.
     guard.learn_keyboard(&keyboard);
+    guard.begin_keyboard()?;
     let raw_replaced = terminal.enter_raw_mode()?;
 
     let handle = Arc::new(
@@ -213,7 +214,9 @@ pub async fn run(
 
     // The terminal comes back here on every path out of the loop, and the guard is released only
     // once it has.
-    terminal.restore(&raw_replaced, Some(&keyboard))?;
+    // The modes are this process's to put back; the keyboard entry is the guard's, and it gives
+    // that back as it is released, which is what keeps one push answered by exactly one pop.
+    terminal.restore(&raw_replaced, None)?;
     guard.release();
     Ok((outcome, descriptor.session_id))
 }
