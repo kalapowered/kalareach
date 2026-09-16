@@ -18,6 +18,8 @@
 //! | Module | What it holds |
 //! | --- | --- |
 //! | [`transport`] | The shape both transports share, and the iroh connection |
+//! | [`encoder`] | The shared terminal input encoder: keys, modifiers, pointers and pastes |
+//! | [`viewport`] | The clipped window onto the canonical grid, and the presentation switch |
 //! | [`session`] | Requests, receipts, events and the action window |
 //! | [`cursors`] | Cursors, receipts and the order state is restored in |
 //! | [`reconnect`] | The reconnect loop and what it refuses to carry across |
@@ -32,11 +34,13 @@
 #![forbid(unsafe_code)]
 
 pub mod cursors;
+pub mod encoder;
 pub mod error;
 pub mod reconnect;
 pub mod services;
 pub mod session;
 pub mod transport;
+pub mod viewport;
 
 pub use error::{ClientError, Result};
 pub use session::Session;
