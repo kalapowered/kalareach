@@ -541,9 +541,10 @@ mod unix {
     impl SavedModes {
         /// Reads the complete state out of a terminal's modes.
         #[must_use]
-        #[expect(
+        #[allow(
             clippy::useless_conversion,
-            reason = "the mode words are 32-bit on some platforms and 64-bit on others"
+            reason = "the mode words are 32-bit on some platforms and 64-bit on others, so the \
+                      widening below is a conversion on one of them and nothing on the other"
         )]
         pub fn from_state(modes: &Termios) -> Self {
             Self {
