@@ -114,22 +114,27 @@ struct Authorisation {
     grant_deadline: Option<kr_transport::clock::ContinuousInstant>,
     /// Set the first time the grant is found to have run out. It never comes back.
     expired: AtomicBool,
+    /// Set once the expiry above has been written down, so it is written once.
+    recorded: AtomicBool,
 }
 
 impl Authorisation {
     /// Returns whether this connection may still be served.
     async fn stands(&self) -> bool {
-        self.grant_is_current() && self.controller.authorised(self.connection_id).await.is_ok()
+        if !self.has_time_left() {
+            self.note_expiry();
+            return false;
+        }
+        self.controller.authorised(self.connection_id).await.is_ok()
     }
 
-    /// Returns whether this connection's grant has time left, and records it when it has not.
+    /// Returns whether this connection's grant still has time on it.
     ///
-    /// The record is what makes the decision outlive this connection: the grant's expiry is a UTC
-    /// moment, and the next connection would read it against a wall clock that can be stepped
-    /// backwards. Section 9 does not let withdrawn authority come back, so the first observation
-    /// of an expiry is written down, against a UTC moment that never goes earlier than the latest
-    /// this host has recorded.
-    fn grant_is_current(&self) -> bool {
+    /// Nothing but a clock read and two atomics, because this is also what decides at every
+    /// attempt to write a frame: a decision made inside a poll cannot wait on a lock or a
+    /// database. Writing the expiry down is [`Self::note_expiry`], which the checks that can
+    /// afford it call.
+    fn has_time_left(&self) -> bool {
         if self.expired.load(Ordering::Acquire) {
             return false;
         }
@@ -139,23 +144,35 @@ impl Authorisation {
         if self.controller.clock.now() < deadline {
             return true;
         }
-        if !self.expired.swap(true, Ordering::AcqRel) {
-            self.record_expiry();
-        }
+        self.expired.store(true, Ordering::Release);
         false
+    }
+
+    /// Writes down an expiry this connection has observed, once.
+    ///
+    /// The record is what makes the decision outlive this connection: the grant's expiry is a UTC
+    /// moment, and the next connection would read it against a wall clock that can be stepped
+    /// backwards. Section 9 does not let withdrawn authority come back, so the first observation
+    /// of an expiry is written down, against a UTC moment that never goes earlier than the latest
+    /// this host has recorded.
+    fn note_expiry(&self) {
+        if !self.expired.load(Ordering::Acquire) || self.recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.record_expiry();
     }
 
     /// Writes down that this device's grant has run out.
     ///
     /// A failure to write it cannot make this connection current again: it is fenced either way,
-    /// and the next connection re-derives the expiry from the grant it reads. What is lost is only
-    /// the defence against a wall clock stepped backwards, so the failure is reported rather than
+    /// and the boot-bound deadline this host holds is what the next connection reads. What is lost
+    /// is only the tombstone a later boot would have read, so the failure is reported rather than
     /// dropped.
     fn record_expiry(&self) {
         let now = self
             .devices
             .utc_at_least(kr_ipc::now_ms())
-            .unwrap_or_else(|_| kr_ipc::now_ms());
+            .map_or_else(|_| kr_ipc::now_ms(), |observed| observed.now);
         if let Err(error) = self.devices.record_expiry(self.device_id, now) {
             eprintln!(
                 "kr-controller: could not record that device {} has run out of grant: {error}",
@@ -307,6 +324,7 @@ impl RemoteConnection {
             devices: Arc::clone(&devices),
             connection_id: session.connection_id,
             expired: AtomicBool::new(false),
+            recorded: AtomicBool::new(false),
         });
         Self {
             controller,
@@ -353,7 +371,11 @@ impl RemoteConnection {
     /// The deadline was anchored on the continuous clock when the connection was admitted, and
     /// once it has passed it stays passed: a wall clock stepped backwards revives nothing.
     pub fn grant_is_current(&self) -> bool {
-        self.authority.grant_is_current()
+        if self.authority.has_time_left() {
+            return true;
+        }
+        self.authority.note_expiry();
+        false
     }
 
     /// Answers one frame from the device.
@@ -499,6 +521,16 @@ impl RemoteConnection {
             .await
         {
             return retained;
+        }
+        // A worker holds the receipts of its own actions, and the route says which worker. Section
+        // 9 has an existing receipt readable under current authority after the window that
+        // admitted it has expired, and answers a duplicate from a still-authorised actor from that
+        // receipt without dispatching anything: so the receipt is asked for before the window is
+        // considered, and a reused identifier carrying a different payload is refused here.
+        match self.retained_remotely(mutation, validated).await {
+            Ok(Some(answered)) => return answered,
+            Ok(None) => {}
+            Err(error) => return failure(mutation.request_id, error),
         }
         let accepted = match self.check_envelope(mutation, entry) {
             Ok(accepted) => accepted,
@@ -650,18 +682,8 @@ impl RemoteConnection {
             Ok(proxy) => proxy,
             Err(error) => return failure(mutation.request_id, error.to_protocol_error()),
         };
-        // Where this action is going is written down before it goes. A receipt lives in the
-        // journal of the session the action was performed on, and a device whose connection ends
-        // before the answer arrives has nothing else left to say which session that was. An
-        // action whose route cannot be recorded is not dispatched: an unrecoverable result is
-        // worse than a refusal the device can retry under the same action identity.
-        if let Err(error) = self.devices.record_action_route(
-            &self.device.principal(),
-            mutation.action_id,
-            session_id,
-            kr_ipc::now_ms(),
-        ) {
-            return failure(mutation.request_id, error.to_protocol_error());
+        if let Err(error) = self.claim_route(mutation, session_id) {
+            return failure(mutation.request_id, error);
         }
         let envelope = self.envelope(validated);
         let deadline = match self
@@ -732,6 +754,126 @@ impl RemoteConnection {
     ///
     /// A device's receipts are in the journal of the session it acted on, and this connection acts
     /// on one session. A connection that has not attached to anything has no receipts to read.
+    /// Claims this action's route before it is dispatched, and refuses a reused identifier.
+    ///
+    /// Where the action is going is written down before it goes. A receipt lives in the journal of
+    /// the session the action was performed on, and a device whose connection ends before the
+    /// answer arrives has nothing else left to say which session that was. An action whose route
+    /// cannot be recorded is not dispatched: an unrecoverable result is worse than a refusal the
+    /// device can submit again under the same identity.
+    ///
+    /// The claim is also this host's `(verified actor, action)` uniqueness check. Section 9 makes
+    /// a reused identifier carrying a different payload `ID_CONFLICT`, and the digest the route
+    /// holds is what a second submission is compared against.
+    fn claim_route(
+        &self,
+        mutation: &MutationRequest,
+        session_id: SessionId,
+    ) -> std::result::Result<(), ProtocolError> {
+        let actor_id = self.device.principal();
+        let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        let claimed = self
+            .devices
+            .claim_action_route(
+                &actor_id,
+                mutation.action_id,
+                session_id,
+                digest,
+                kr_ipc::now_ms(),
+            )
+            .map_err(|error| error.to_protocol_error())?;
+        match claimed {
+            super::devices::ActionRoute::Recorded => Ok(()),
+            super::devices::ActionRoute::Existing(existing)
+                if existing.payload_digest == digest && existing.session_id == session_id =>
+            {
+                Ok(())
+            }
+            super::devices::ActionRoute::Existing(_) => Err(ProtocolError::new(
+                ErrorCode::IdConflict,
+                format!(
+                    "action {} was already used with a different request",
+                    mutation.action_id
+                ),
+            )),
+        }
+    }
+
+    /// Answers a resubmitted action from the receipt the worker that ran it still holds.
+    ///
+    /// Only an action this host has already dispatched is looked up, so an ordinary first
+    /// submission costs nothing. A digest that does not match the route's is a reused identifier,
+    /// which section 9 refuses; a matching digest is the same action, and the worker's own receipt
+    /// is the answer. A worker that holds no receipt for it leaves the request to the ordinary
+    /// first-admission path, where its window decides.
+    async fn retained_remotely(
+        &self,
+        mutation: &MutationRequest,
+        validated: AuthorityRevision,
+    ) -> std::result::Result<Option<ControlFrame>, ProtocolError> {
+        let actor_id = self.device.principal();
+        let Some(routed) = self
+            .devices
+            .action_route(&actor_id, mutation.action_id)
+            .map_err(|error| error.to_protocol_error())?
+        else {
+            return Ok(None);
+        };
+        let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        if digest != routed.payload_digest {
+            return Err(ProtocolError::new(
+                ErrorCode::IdConflict,
+                format!(
+                    "action {} was already used with a different request",
+                    mutation.action_id
+                ),
+            ));
+        }
+        // A link that cannot be opened is not an answer. The ordinary path decides what this
+        // request gets, which for a session whose worker has gone is that session's own refusal
+        // rather than a second dispatch.
+        let Ok(proxy) = self.proxy_for(routed.session_id).await else {
+            return Ok(None);
+        };
+        let request = Request {
+            request_id: mutation.request_id,
+            method: Method::ActionRead.into(),
+            method_version: Method::ActionRead.entry().version,
+            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+                action_id: mutation.action_id,
+            })
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?,
+        };
+        let envelope = self.envelope(validated);
+        let authority = self.authority_deadline();
+        let Ok(response) = proxy.forward_read(&request, &envelope, authority).await else {
+            // The link failed, not the lookup. The ordinary path decides what happens next.
+            return Ok(None);
+        };
+        let Outcome::Ok(value) = response.outcome else {
+            // No receipt for it there, or the worker refused the read. Either way this is not an
+            // answer, and the request goes on to be admitted or refused on its own terms.
+            return Ok(None);
+        };
+        let Ok(read) = value.to_typed::<kr_protocol::receipt::ActionReadResult>() else {
+            return Ok(None);
+        };
+        // The result when the action produced one, and the receipt when it has not: a caller that
+        // resubmitted is told what became of its action, and nothing is dispatched again.
+        Ok(Some(match read.result.0 {
+            Some(result) => ControlFrame::Response(Response {
+                request_id: mutation.request_id,
+                outcome: Outcome::Ok(result),
+            }),
+            None => ControlFrame::Receipt(Box::new(kr_protocol::receipt::ReceiptResponse {
+                request_id: mutation.request_id,
+                receipt: read.receipt,
+            })),
+        }))
+    }
+
     /// Returns the link to the worker holding one action's receipt.
     ///
     /// The route is durable, so a device that lost its connection, or found this host restarted,
@@ -751,6 +893,7 @@ impl RemoteConnection {
             .devices
             .action_route(&self.device.principal(), params.action_id)
             .map_err(|error| error.to_protocol_error())?;
+        let routed = routed.map(|routed| routed.session_id);
         let session_id = routed.ok_or_else(|| {
             // The same answer the worker gives for a receipt it does not hold: an action nobody
             // recorded is not an action this device can be told about.

@@ -383,20 +383,28 @@ impl NetworkHost {
     /// Returns when this device's grant runs out, anchoring it the first time it is asked.
     ///
     /// One anchor per device, shared by every connection it makes, so the answer does not depend
-    /// on what the wall clock said at each connection.
+    /// on what the wall clock said at each connection. Behind that anchor is a deadline on the
+    /// machine's own continuous clock, written down and bound to this boot:
     ///
-    /// The lifetime is derived once, from a UTC moment that is never earlier than the latest this
-    /// host has recorded, and measured from a continuous instant sampled *before* that moment is
-    /// read: sampling the other way round would count the time between the two samples, and a
-    /// machine suspended there would wake with a longer grant than it went to sleep with. A grant
-    /// already past its expiry is recorded as expired instead, and that record is what every later
-    /// connection and every later run reads.
+    /// * Within the boot it was derived in, that deadline is the answer. A restart of this daemon
+    ///   does not re-derive it, so a connection that sat idle past its expiry and came back after
+    ///   a restart is refused rather than given a fresh lifetime from a wall clock that has since
+    ///   been stepped backwards.
+    /// * In a new boot there is nothing to reuse, so the lifetime comes from the grant's UTC
+    ///   expiry, decided against a moment that is never earlier than the latest this host has
+    ///   recorded. A wall clock that is *behind* that mark by more than [`CLOCK_TOLERANCE`] is not
+    ///   a clock this host will decide an expiry against, and the connection is refused as such.
+    ///
+    /// Either way the continuous instant is sampled *before* the moment it is measured against:
+    /// sampling the other way round would count the time between the two samples, and a machine
+    /// suspended there would wake with a longer grant than it went to sleep with.
     ///
     /// # Errors
     ///
-    /// Returns an error when an observed expiry cannot be recorded. A grant that has run out and
-    /// cannot be written down is not served: the alternative is a device that keeps reconnecting
-    /// on a grant this host has already decided is over.
+    /// Returns an error when the grant has run out, when the wall clock cannot be trusted to say
+    /// whether it has, or when the deadline or an observed expiry cannot be written down. A grant
+    /// whose end this host cannot record is not served: the alternative is a device that keeps
+    /// reconnecting on a grant this host has already decided is over.
     fn grant_deadline(&self, record: &DeviceRecord) -> Result<Option<ContinuousInstant>> {
         let mut held = self
             .grant_deadlines
@@ -409,13 +417,21 @@ impl NetworkHost {
             held.insert(record.device_id, GrantDeadline { deadline: None });
             return Ok(None);
         };
+        let controller = self.daemon()?;
         let anchor = self.clock.now();
-        let now = self.devices.utc_at_least(kr_ipc::now_ms())?;
-        let remaining = expires_at_ms.get().saturating_sub(now.get());
+        let boot_now = controller.shared_clock.boot_elapsed_ms();
+        let recorded = self
+            .devices
+            .grant_deadline_in(record.device_id, &controller.boot_identity)?;
+        let remaining = match recorded {
+            Some(deadline) => deadline.saturating_sub(boot_now),
+            None => self.derive_lifetime(record, expires_at_ms, boot_now)?,
+        };
         if remaining == 0 {
-            // Run out. Recording it is what stops a wall clock stepped backwards from making the
-            // same grant look current on the next connection, or after a restart.
-            self.devices.record_expiry(record.device_id, now)?;
+            // Run out. The tombstone is what a later boot reads, where this boot's deadline means
+            // nothing any more.
+            self.devices
+                .record_expiry(record.device_id, kr_ipc::now_ms())?;
             return Err(ControllerError::PermissionDenied {
                 detail: "this device's grant has run out; pair again".to_owned(),
             });
@@ -423,6 +439,38 @@ impl NetworkHost {
         let deadline = anchor.checked_add(std::time::Duration::from_millis(remaining));
         held.insert(record.device_id, GrantDeadline { deadline });
         Ok(deadline)
+    }
+
+    /// Derives how much of one grant's life is left, and writes the deadline down.
+    ///
+    /// Only reached in a boot that has no deadline for this device yet. The wall clock decides,
+    /// against the latest moment this host has recorded, and the answer is written as a moment on
+    /// the machine's continuous clock so nothing has to ask the wall clock again.
+    fn derive_lifetime(
+        &self,
+        record: &DeviceRecord,
+        expires_at_ms: kr_protocol::scalars::TimestampMs,
+        boot_now: u64,
+    ) -> Result<u64> {
+        let controller = self.daemon()?;
+        let observed = self.devices.utc_at_least(kr_ipc::now_ms())?;
+        if observed.behind_ms > CLOCK_TOLERANCE_MS {
+            return Err(ControllerError::ClockUntrusted {
+                detail: format!(
+                    "this host's wall clock is {} ms behind the latest moment it has recorded, so                      it cannot say whether this device's grant has run out",
+                    observed.behind_ms
+                ),
+            });
+        }
+        let remaining = expires_at_ms.get().saturating_sub(observed.now.get());
+        if remaining > 0 {
+            self.devices.record_grant_deadline(
+                record.device_id,
+                &controller.boot_identity,
+                boot_now.saturating_add(remaining),
+            )?;
+        }
+        Ok(remaining)
     }
 
     /// Serves one authorised connection until it ends.
@@ -569,6 +617,20 @@ impl NetworkHost {
             .ok_or_else(|| ControllerError::NotConfigured("this daemon has stopped".to_owned()))
     }
 }
+
+/// How far behind its own recorded mark this host's wall clock may be and still decide an expiry.
+///
+/// A small step is ordinary: a clock corrected by a time service, or two reads either side of a
+/// write. A larger one says the wall clock is not currently a clock this host can measure a grant
+/// against, and section 9 does not let it guess in the device's favour.
+pub const CLOCK_TOLERANCE_MS: u64 = 5_000;
+
+/// How long a close's link is held for the acceptance to reach the device that asked for it.
+///
+/// It bounds a hold, not the close: the close itself has already happened. A device that has gone
+/// releases the link at once, because the thing that would have told this that the acceptance
+/// arrived goes with the connection.
+pub const CLOSE_DELIVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Relays one connection's subscribed notifications, while it is still authorised to receive them.
 async fn relay_loop(

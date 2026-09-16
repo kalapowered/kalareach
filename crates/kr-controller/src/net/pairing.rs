@@ -532,7 +532,9 @@ impl PairingHost {
             .devices
             .record_for_endpoint(peer.endpoint_id())
             .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?
-            .filter(|record| record.committed_invitation_id == invitation_id)
+            // A record that does not say which invitation it came from is not an answer about
+            // this one. It stays paired; it simply has no committed result to be told about.
+            .filter(|record| record.committed_invitation_id == Some(invitation_id))
             .ok_or_else(unknown)?;
         Ok(PairStatusResult {
             status: PairStatus::Committed {
@@ -624,7 +626,7 @@ fn device_record(commitment: &PairingCommitment) -> std::result::Result<DeviceRe
         paired_at_ms: commitment.committed_at_ms,
         revoked_at_ms: None,
         expired_at_ms: None,
-        committed_invitation_id: commitment.invitation_id,
+        committed_invitation_id: Some(commitment.invitation_id),
     })
 }
 

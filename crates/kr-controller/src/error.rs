@@ -88,6 +88,29 @@ pub enum ControllerError {
         /// What is not known.
         detail: String,
     },
+    /// This host's clock cannot currently say whether something has expired.
+    ///
+    /// The wall clock is behind a moment this host has already recorded, by more than a
+    /// correction accounts for. Section 9 does not let a host decide an expiry in the caller's
+    /// favour on a clock it cannot trust.
+    #[error("{detail}")]
+    ClockUntrusted {
+        /// What is wrong with the clock.
+        detail: String,
+    },
+    /// A subject this daemon forwarded to refused the request, in its own words.
+    ///
+    /// The code is the subject's. A worker that refuses a reused action identifier with
+    /// `ID_CONFLICT`, or expired authority with `PERMISSION_DENIED`, is telling the caller
+    /// something section 9 gives a defined meaning; reporting all of it as an invalid argument
+    /// would throw that away.
+    #[error("{detail}")]
+    Refused {
+        /// The subject's own code.
+        code: ErrorCode,
+        /// The subject's own words.
+        detail: String,
+    },
     /// Local IPC failed.
     #[error("{0}")]
     Ipc(#[from] kr_ipc::IpcError),
@@ -111,6 +134,15 @@ impl ControllerError {
     pub fn supervision(detail: impl std::fmt::Display) -> Self {
         Self::Supervision {
             detail: detail.to_string(),
+        }
+    }
+
+    /// Builds a refusal from what a subject answered.
+    #[must_use]
+    pub fn refused(error: &ProtocolError) -> Self {
+        Self::Refused {
+            code: error.code,
+            detail: error.message.clone(),
         }
     }
 
@@ -138,6 +170,8 @@ impl ControllerError {
             Self::NotListed { .. } | Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::Uncertain { .. } => ErrorCode::OutcomeUnknown,
+            Self::ClockUntrusted { .. } => ErrorCode::ClockUntrusted,
+            Self::Refused { code, .. } => *code,
             Self::Ipc(error) => error.code(),
             Self::NotConfigured(_) => ErrorCode::HostNotConfigured,
         }

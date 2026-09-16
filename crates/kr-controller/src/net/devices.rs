@@ -21,13 +21,41 @@ use std::path::Path;
 
 use kr_crypto::connect::PairedPeer;
 use kr_protocol::grant::Grant;
+use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{ActorId, DeviceId, DeviceKeyRevision, GrantId};
 use kr_protocol::pairing::{DeviceName, DevicePlatform};
-use kr_protocol::scalars::{AuthorisationKey, EndpointKey, TimestampMs, Uuid};
+use kr_protocol::scalars::{AuthorisationKey, Digest256, EndpointKey, TimestampMs, Uuid};
 use kr_transport::handshake::PairedDirectory;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::error::{ControllerError, Result};
+
+/// What this host makes of the wall clock, against the latest moment it has recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedUtc {
+    /// The moment to decide against: the wall clock, or the recorded mark when that is later.
+    pub now: TimestampMs,
+    /// How far the wall clock is behind the mark. Zero when it is not behind it.
+    pub behind_ms: u64,
+}
+
+/// Where one action went, as this host recorded it before dispatching it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoutedAction {
+    /// The session the action was dispatched to.
+    pub session_id: kr_protocol::ids::SessionId,
+    /// The digest of the payload that was dispatched under this identifier.
+    pub payload_digest: Digest256,
+}
+
+/// What claiming one action's route found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionRoute {
+    /// This host had no record of the action, and now holds this one.
+    Recorded,
+    /// This host had already dispatched the action, as recorded here.
+    Existing(RoutedAction),
+}
 
 /// One paired device, as the host recorded it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,11 +78,13 @@ pub struct DeviceRecord {
     pub paired_at_ms: TimestampMs,
     /// When the host revoked it, in UTC milliseconds, while it still holds a grant.
     pub revoked_at_ms: Option<TimestampMs>,
-    /// The invitation this pairing was committed from.
+    /// The invitation this pairing was committed from, where the record says.
     ///
     /// A candidate asks about an invitation, and the answer has to be about that invitation: a
-    /// device that paired through one has no committed result to be told about another.
-    pub committed_invitation_id: kr_protocol::ids::InvitationId,
+    /// device that paired through one has no committed result to be told about another. A row
+    /// written before this host recorded it has none, and that device stays paired: what it loses
+    /// is the ability to be told about an invitation, not its authority.
+    pub committed_invitation_id: Option<kr_protocol::ids::InvitationId>,
     /// When the host first found its grant to have run out, in UTC milliseconds.
     ///
     /// Recorded so the decision survives a restart and a wall clock stepped backwards. A grant
@@ -164,8 +194,14 @@ impl DeviceDirectory {
                      actor_id TEXT NOT NULL,
                      action_id BLOB NOT NULL,
                      session_id BLOB NOT NULL,
+                     payload_digest BLOB NOT NULL,
                      recorded_at_ms INTEGER NOT NULL,
                      PRIMARY KEY (actor_id, action_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS network_grant_deadlines (
+                     device_id BLOB PRIMARY KEY NOT NULL,
+                     boot_value BLOB NOT NULL,
+                     deadline_boot_ms INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS network_clock (
                      id INTEGER PRIMARY KEY NOT NULL CHECK (id = 0),
@@ -236,7 +272,9 @@ impl DeviceDirectory {
                         record.grant.grant_id.get().as_bytes().as_slice(),
                         grant,
                         i64::try_from(record.paired_at_ms.get()).unwrap_or(i64::MAX),
-                        record.committed_invitation_id.get().as_bytes().as_slice(),
+                        record
+                            .committed_invitation_id
+                            .map(|invitation| invitation.get().as_bytes().to_vec()),
                     ],
                 )
                 .map(|_| ())
@@ -330,7 +368,7 @@ impl DeviceDirectory {
         Ok(())
     }
 
-    /// Records which session one remote action was dispatched to, before it is dispatched.
+    /// Claims the route of one remote action, before it is dispatched.
     ///
     /// A receipt lives in the journal of the session the action was performed on, and a device
     /// that reconnects to ask for its own result has nothing left to say where that was. The route
@@ -339,36 +377,49 @@ impl DeviceDirectory {
     /// unfindable in exactly the case that needs it: the connection ended before the answer
     /// arrived.
     ///
-    /// The first route for an action stays. `(actor_id, action_id)` is one durable operation, and
-    /// a repeat submission of it is the same action on the same session.
+    /// The claim is what makes `(actor_id, action_id)` one durable operation on this host. The
+    /// first route for an action stays, and a second submission is told what the first one was:
+    /// section 9 answers an exact duplicate from the receipt the first produced and refuses a
+    /// reused identifier carrying a different payload. Reading and writing are one statement pair
+    /// inside one immediate transaction, so two submissions of the same identifier cannot both be
+    /// told they are the first.
     ///
     /// # Errors
     ///
-    /// Returns an error when the row cannot be written.
-    pub fn record_action_route(
+    /// Returns an error when the row cannot be read or written.
+    pub fn claim_action_route(
         &self,
         actor_id: &ActorId,
         action_id: kr_protocol::ids::ActionId,
         session_id: kr_protocol::ids::SessionId,
+        payload_digest: Digest256,
         now_ms: TimestampMs,
-    ) -> Result<()> {
+    ) -> Result<ActionRoute> {
         self.with(|connection| {
-            connection.execute(
-                "INSERT INTO network_actions (actor_id, action_id, session_id, recorded_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (actor_id, action_id) DO NOTHING",
+            let transaction = connection.unchecked_transaction()?;
+            let existing = read_route(&transaction, actor_id, action_id)?;
+            if let Some(existing) = existing {
+                transaction.commit()?;
+                return Ok::<ActionRoute, rusqlite::Error>(ActionRoute::Existing(existing));
+            }
+            transaction.execute(
+                "INSERT INTO network_actions
+                     (actor_id, action_id, session_id, payload_digest, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     actor_id.as_str(),
                     action_id.get().as_bytes().as_slice(),
                     session_id.get().as_bytes().as_slice(),
+                    payload_digest.as_bytes().as_slice(),
                     i64::try_from(now_ms.get()).unwrap_or(i64::MAX),
                 ],
-            )
-        })?;
-        Ok(())
+            )?;
+            transaction.commit()?;
+            Ok(ActionRoute::Recorded)
+        })
     }
 
-    /// Returns which session one actor's action was dispatched to.
+    /// Returns where one actor's action went, and what payload it carried.
     ///
     /// # Errors
     ///
@@ -377,19 +428,8 @@ impl DeviceDirectory {
         &self,
         actor_id: &ActorId,
         action_id: kr_protocol::ids::ActionId,
-    ) -> Result<Option<kr_protocol::ids::SessionId>> {
-        let routed: Option<Vec<u8>> = self.with(|connection| {
-            connection
-                .query_row(
-                    "SELECT session_id FROM network_actions WHERE actor_id = ?1 AND action_id = ?2",
-                    params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
-                    |row| row.get(0),
-                )
-                .optional()
-        })?;
-        routed
-            .map(|bytes| uuid(&bytes).map(kr_protocol::ids::SessionId::new))
-            .transpose()
+    ) -> Result<Option<RoutedAction>> {
+        self.with(|connection| read_route(connection, actor_id, action_id))
     }
 
     /// Returns the current UTC millisecond, never earlier than the latest this host has seen.
@@ -403,7 +443,7 @@ impl DeviceDirectory {
     /// # Errors
     ///
     /// Returns an error when the mark cannot be read or written.
-    pub fn utc_at_least(&self, now_ms: TimestampMs) -> Result<TimestampMs> {
+    pub fn utc_at_least(&self, now_ms: TimestampMs) -> Result<ObservedUtc> {
         let now = i64::try_from(now_ms.get()).unwrap_or(i64::MAX);
         let observed: i64 = self.with(|connection| {
             connection.query_row(
@@ -414,9 +454,77 @@ impl DeviceDirectory {
                 |row| row.get(0),
             )
         })?;
-        Ok(TimestampMs::new(
-            u64::try_from(observed).unwrap_or_else(|_| now_ms.get()),
-        ))
+        let observed = TimestampMs::new(u64::try_from(observed).unwrap_or_else(|_| now_ms.get()));
+        let behind = observed.get().saturating_sub(now_ms.get());
+        Ok(ObservedUtc {
+            now: observed,
+            behind_ms: behind,
+        })
+    }
+
+    /// Records when one device's grant runs out, on the machine's own continuous clock.
+    ///
+    /// The deadline is bound to the boot it was derived in, because that is the clock it is
+    /// measured on: milliseconds since this boot mean nothing after the next one. Within a boot it
+    /// is the answer, restart of this daemon included, which is what stops an idle connection's
+    /// expiry being re-derived from a wall clock that has since been stepped backwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn record_grant_deadline(
+        &self,
+        device_id: DeviceId,
+        boot: &BootIdentity,
+        deadline_boot_ms: u64,
+    ) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO network_grant_deadlines (device_id, boot_value, deadline_boot_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (device_id) DO UPDATE
+                     SET boot_value = ?2, deadline_boot_ms = ?3",
+                params![
+                    device_id.get().as_bytes().as_slice(),
+                    boot.value.as_slice(),
+                    i64::try_from(deadline_boot_ms).unwrap_or(i64::MAX),
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Returns the deadline this host derived for one device in the boot it is running in.
+    ///
+    /// A deadline from an earlier boot is not returned: the clock it was measured on has gone with
+    /// that boot, and a number of milliseconds since a boot that has ended says nothing about this
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table cannot be read.
+    pub fn grant_deadline_in(
+        &self,
+        device_id: DeviceId,
+        boot: &BootIdentity,
+    ) -> Result<Option<u64>> {
+        let row: Option<(Vec<u8>, i64)> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT boot_value, deadline_boot_ms FROM network_grant_deadlines
+                     WHERE device_id = ?1",
+                    params![device_id.get().as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+        })?;
+        let Some((recorded, deadline)) = row else {
+            return Ok(None);
+        };
+        if recorded.as_slice() != boot.value.as_slice() {
+            return Ok(None);
+        }
+        Ok(Some(u64::try_from(deadline).unwrap_or_default()))
     }
 
     /// Marks one device as revoked, and reports whether this call was the one that did it.
@@ -468,7 +576,7 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
     let paired_at_ms: i64 = row.get(7).map_err(ControllerError::registry)?;
     let revoked_at_ms: Option<i64> = row.get(8).map_err(ControllerError::registry)?;
     let expired_at_ms: Option<i64> = row.get(9).map_err(ControllerError::registry)?;
-    let invitation: Vec<u8> = row.get(10).map_err(ControllerError::registry)?;
+    let invitation: Option<Vec<u8>> = row.get(10).map_err(ControllerError::registry)?;
     Ok(DeviceRecord {
         device_id: DeviceId::new(uuid(&device_id)?),
         endpoint_id: EndpointKey::from_bytes(key(&endpoint_id)?),
@@ -486,7 +594,10 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
             .map(|at| TimestampMs::new(u64::try_from(at).unwrap_or_default())),
         expired_at_ms: expired_at_ms
             .map(|at| TimestampMs::new(u64::try_from(at).unwrap_or_default())),
-        committed_invitation_id: kr_protocol::ids::InvitationId::new(uuid(&invitation)?),
+        committed_invitation_id: invitation
+            .as_deref()
+            .map(|bytes| uuid(bytes).map(kr_protocol::ids::InvitationId::new))
+            .transpose()?,
     })
 }
 
@@ -494,6 +605,34 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
 #[must_use]
 pub fn grant_id_of(record: &DeviceRecord) -> GrantId {
     record.grant.grant_id
+}
+
+/// Reads one action's route on a connection the caller already holds.
+fn read_route(
+    connection: &Connection,
+    actor_id: &ActorId,
+    action_id: kr_protocol::ids::ActionId,
+) -> rusqlite::Result<Option<RoutedAction>> {
+    let row: Option<(Vec<u8>, Vec<u8>)> = connection
+        .query_row(
+            "SELECT session_id, payload_digest FROM network_actions
+             WHERE actor_id = ?1 AND action_id = ?2",
+            params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((session, digest)) = row else {
+        return Ok(None);
+    };
+    // A row this host wrote holds sixteen bytes of session and thirty-two of digest. One that does
+    // not is a row nothing here wrote, and it names no action.
+    let (Ok(session), Ok(digest)) = (<[u8; 16]>::try_from(session), key(&digest)) else {
+        return Ok(None);
+    };
+    Ok(Some(RoutedAction {
+        session_id: kr_protocol::ids::SessionId::new(Uuid::from_bytes(session)),
+        payload_digest: Digest256::from_bytes(digest),
+    }))
 }
 
 fn uuid(bytes: &[u8]) -> Result<Uuid> {
@@ -561,9 +700,9 @@ mod tests {
             paired_at_ms: TimestampMs::new(1_764_003_600_000),
             revoked_at_ms: None,
             expired_at_ms: None,
-            committed_invitation_id: kr_protocol::ids::InvitationId::new(Uuid::from_bytes(
+            committed_invitation_id: Some(kr_protocol::ids::InvitationId::new(Uuid::from_bytes(
                 [byte ^ 0x0f; 16],
-            )),
+            ))),
         }
     }
 
