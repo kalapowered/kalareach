@@ -34,6 +34,35 @@ fn processors() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
+/// What the platform calls this processor, where it says.
+///
+/// Section 27 records the host beside every figure because a rate depends on it, and two hosts of
+/// the same architecture are not the same processor.
+fn processor_model() -> String {
+    let read = |path: &str, field: &str| -> Option<String> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let line = text.lines().find(|line| line.starts_with(field))?;
+        Some(line.split_once(':')?.1.trim().to_owned())
+    };
+    if cfg!(target_os = "linux")
+        && let Some(model) = read("/proc/cpuinfo", "model name")
+    {
+        return model;
+    }
+    if cfg!(target_os = "macos") {
+        let output = std::process::Command::new("sysctl")
+            .arg("-n")
+            .arg("machdep.cpu.brand_string")
+            .output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            return String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        }
+    }
+    "not reported here".to_owned()
+}
+
 /// How much of a stream that scrolls is drained.
 ///
 /// Scrolling output is where an unoptimised build is slowest — two orders of magnitude, for
@@ -125,6 +154,7 @@ fn build_scrolling_stream(bytes: usize) -> Vec<u8> {
     out
 }
 
+#[derive(Clone)]
 struct Run {
     bytes: usize,
     elapsed_secs: f64,
@@ -135,9 +165,12 @@ struct Run {
     peak_pending_events: usize,
     degraded: bool,
     /// The most the session budget was holding at any read, not the reading at the end. A bound
-    /// that was passed halfway through and given back is a bound that was passed.
+    /// that was passed halfway through and given back is a bound that was passed. It is the
+    /// accounting the engine keeps, sampled between reads: it says nothing about what a single
+    /// read held while it was inside one, and nothing about what an allocator was holding.
     peak_session_bytes: u64,
-    /// The most the historical row cache was holding at any read, against its own bound.
+    /// The most the historical row cache was holding at any read, against its own bound, sampled
+    /// the same way.
     peak_row_cache_bytes: u64,
 }
 
@@ -145,10 +178,9 @@ struct Run {
 ///
 /// A rate is a property of the engine, and the first pass through a fresh process is not: it pays
 /// for the allocator growing its arena and for the first touch of every page the grid and the row
-/// cache end up holding. Nor is a pass the machine interrupted, which is what section 27's idle
-/// host is about. So the warm-up pass is discarded, each measured pass is printed, and the rate is
-/// the best of them. Every bound is checked on every pass, because a bound holds whatever the
-/// machine was doing.
+/// cache end up holding. So the warm-up pass is discarded, each measured pass is printed, and the
+/// rate is what the measured passes sustained together. Every bound is checked on every pass, the
+/// warm-up included, because a bound holds whatever the machine was doing.
 const PASSES: usize = if cfg!(debug_assertions) { 1 } else { 3 };
 
 /// Drains `stream` once to warm the process, then `PASSES` times.
@@ -161,7 +193,10 @@ fn drain_passes(stream: &[u8], drain_replies: bool) -> (Run, Vec<Run>) {
     (warm, measured)
 }
 
-/// The fastest of several passes, which is what the engine reached when nothing interfered.
+/// The fastest pass observed, reported beside the sustained figure and deciding nothing.
+///
+/// It is the fastest of what was measured and no more than that: nothing here establishes that
+/// anything interfered with the others, or that this one had the machine to itself.
 fn fastest(runs: &[Run]) -> &Run {
     runs.iter()
         .max_by(|left, right| {
@@ -244,6 +279,17 @@ fn sustained_mib_per_second(runs: &[Run]) -> f64 {
     mib / seconds.max(f64::MIN_POSITIVE)
 }
 
+/// The largest each sampled peak reached across every pass, the warm-up included.
+fn peaks(runs: &[Run]) -> (usize, u64, u64) {
+    runs.iter().fold((0, 0, 0), |(lane, session, cache), run| {
+        (
+            lane.max(run.peak_lane_bytes),
+            session.max(run.peak_session_bytes),
+            cache.max(run.peak_row_cache_bytes),
+        )
+    })
+}
+
 /// Asserts every bound the run had to stay inside, whatever the machine was doing.
 fn assert_bounds_held(runs: &[Run]) {
     let limits = kr_term::budget::BudgetLimits::DEFAULT;
@@ -283,6 +329,10 @@ fn drains_five_mebibytes_without_unbounded_queues() {
     let (warm, runs) = drain_passes(&stream, true);
     let sustained = sustained_mib_per_second(&runs);
     let best = fastest(&runs);
+    // Every pass a bound had to hold through, the discarded warm-up included.
+    let passes: Vec<Run> = std::iter::once(warm.clone())
+        .chain(runs.iter().cloned())
+        .collect();
 
     println!("KR-PERF-007 kr-term output handling");
     println!(
@@ -295,6 +345,7 @@ fn drains_five_mebibytes_without_unbounded_queues() {
     );
     println!("  host              {HOST_OS} {HOST_ARCH}");
     println!("  processors        {}", processors());
+    println!("  processor         {}", processor_model());
     println!("  stream            {} bytes", stream.len());
     println!("  chunk             {CHUNK_BYTES} bytes");
     println!(
@@ -311,26 +362,30 @@ fn drains_five_mebibytes_without_unbounded_queues() {
         "  sustained         {sustained:.2} MiB/s over every pass, against a \
          {TARGET_MIB_PER_SECOND:.1} MiB/s target"
     );
-    println!("  best pass         {:.2} MiB/s", best.mib_per_second);
+    println!(
+        "  fastest pass      {:.2} MiB/s, observed",
+        best.mib_per_second
+    );
     println!("  events            {}", best.events);
     println!("  replies accepted  {}", best.responses);
+    println!("  peak events/chunk {}", best.peak_pending_events);
+    println!("  degraded          {}", best.degraded);
+    let (lane, session, cache) = peaks(&passes);
     println!(
-        "  peak lane bytes   {} of {}",
-        best.peak_lane_bytes,
+        "  peak lane bytes   {lane} of {}, over every pass",
         LaneLimits::DEFAULT.max_queue_bytes
     );
-    println!("  peak events/chunk {}", best.peak_pending_events);
-    println!("  peak session      {} bytes", best.peak_session_bytes);
-    println!("  peak row cache    {} bytes", best.peak_row_cache_bytes);
-    println!("  degraded          {}", best.degraded);
+    println!("  peak session      {session} bytes, over every pass");
+    println!("  peak row cache    {cache} bytes, over every pass");
 
+    // Before the rate, so a host too slow for the target still reports whether anything grew
+    // without bound. The rate is the figure a host can fail; these are the ones nothing may.
+    assert_bounds_held(&passes);
     assert!(
         cfg!(debug_assertions) || sustained >= TARGET_MIB_PER_SECOND,
         "the passes sustained {sustained:.2} MiB/s, below the {TARGET_MIB_PER_SECOND:.1} MiB/s \
          target"
     );
-    assert_bounds_held(&runs);
-    assert_bounds_held(std::slice::from_ref(&warm));
 }
 
 /// The target again, on a stream that scrolls.
@@ -345,10 +400,14 @@ fn drains_a_scrolling_stream_at_the_target_rate() {
     let (warm, runs) = drain_passes(&stream, true);
     let sustained = sustained_mib_per_second(&runs);
     let best = fastest(&runs);
+    let passes: Vec<Run> = std::iter::once(warm.clone())
+        .chain(runs.iter().cloned())
+        .collect();
 
     println!("KR-PERF-007 kr-term scrolling output");
     println!("  host              {HOST_OS} {HOST_ARCH}");
     println!("  processors        {}", processors());
+    println!("  processor         {}", processor_model());
     println!("  stream            {} bytes", stream.len());
     println!(
         "  warm-up pass      {:.3} s, {:.2} MiB/s, discarded",
@@ -364,22 +423,26 @@ fn drains_a_scrolling_stream_at_the_target_rate() {
         "  sustained         {sustained:.2} MiB/s over every pass, against a \
          {TARGET_MIB_PER_SECOND:.1} MiB/s target"
     );
-    println!("  best pass         {:.2} MiB/s", best.mib_per_second);
+    println!(
+        "  fastest pass      {:.2} MiB/s, observed",
+        best.mib_per_second
+    );
     println!("  events            {}", best.events);
-    println!("  peak session      {} bytes", best.peak_session_bytes);
-    println!("  peak row cache    {} bytes", best.peak_row_cache_bytes);
+    let (_, session, cache) = peaks(&passes);
+    println!("  peak session      {session} bytes, over every pass");
+    println!("  peak row cache    {cache} bytes, over every pass");
 
+    // Before the rate, for the reason above.
+    assert!(
+        cache > 0,
+        "the rows that scrolled off have to reach the cache for this to say anything"
+    );
+    assert_bounds_held(&passes);
     assert!(
         cfg!(debug_assertions) || sustained >= TARGET_MIB_PER_SECOND,
         "the passes sustained {sustained:.2} MiB/s, below the {TARGET_MIB_PER_SECOND:.1} MiB/s \
          target"
     );
-    assert!(
-        best.peak_row_cache_bytes > 0,
-        "the rows that scrolled off have to reach the cache for this to say anything"
-    );
-    assert_bounds_held(&runs);
-    assert_bounds_held(std::slice::from_ref(&warm));
 }
 
 /// A client that never reads its replies does not make the engine grow.
