@@ -1084,7 +1084,10 @@ impl TransferService {
             let _ = self.staging.incomplete().remove(&storage.incomplete()?);
             sweep.expired_uploads += 1;
         }
-        for row in self.locked()?.uploads_in(&[UploadState::Published])? {
+        // Bound to a local first. A guard in the head of a `for` loop lives for the whole body,
+        // and the body takes the journal again.
+        let published = self.locked()?.uploads_in(&[UploadState::Published])?;
+        for row in published {
             // A submitted attachment follows its session, and a session the host still retains
             // keeps it whatever its own expiry says.
             if let Some(session_id) = row.session_id
@@ -1107,7 +1110,8 @@ impl TransferService {
             let _ = self.staging.complete().remove(&storage.published()?);
             sweep.expired_attachments += 1;
         }
-        for row in self.locked()?.snapshots_in(SnapshotState::Open)? {
+        let snapshots = self.locked()?.snapshots_in(SnapshotState::Open)?;
+        for row in snapshots {
             if row.expires_at_ms.get() > now.get() {
                 continue;
             }

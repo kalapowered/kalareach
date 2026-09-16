@@ -29,6 +29,7 @@ windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 
 [dev-dependencies]
 kr-ipc = { workspace = true, features = ["testing"] }
+serde_json.workspace = true
 tempfile.workspace = true
 
 # The workspace forbids unsafe code, which a crate that creates a Windows directory with an
