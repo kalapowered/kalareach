@@ -1,0 +1,463 @@
+{
+  "what": "The projected renderer's corpus: what a client draws for a canonical screen, and what it must never do to the destination.",
+  "covers": [
+    "KR-REQ-08.40",
+    "KR-ACC-023"
+  ],
+  "rules": [
+    "Autowrap is cleared before the first cell of every frame and the session's own value is put back after the last.",
+    "Every run is placed with an absolute cursor address, so a glyph the destination measures differently moves nothing after it.",
+    "A cluster the window's edge falls inside is replaced by one space for each cell of it that is inside, never half drawn.",
+    "A run whose text does not measure the cell span the session gave it is replaced by spaces for that span and counted.",
+    "No frame contains a line feed, an index, a scroll or a line insertion, so nothing the renderer writes can scroll the destination.",
+    "Each expected line is one entry per destination cell: the cluster drawn there, or an empty string for the second cell of a wide cluster."
+  ],
+  "cases": [
+    {
+      "id": "emoji_then_ascii",
+      "why": "A multi-codepoint emoji followed by ASCII, as the engine's own width corpus records it: the pinned model measures per scalar, so the joined sequence is two cells and two cells with the joiner belonging to the first, and the ASCII after it lands on its own canonical columns rather than wherever the destination's advance left it.",
+      "window": {
+        "top_row": 0,
+        "left_column": 0,
+        "rows": 2,
+        "columns": 10
+      },
+      "rows": [
+        {
+          "row": 0,
+          "soft_wrapped": false,
+          "runs": [
+            {
+              "column": 0,
+              "cells": 6,
+              "text": "👩‍💻AB"
+            }
+          ]
+        }
+      ],
+      "cursor": {
+        "column": 6,
+        "row": 0,
+        "visible": true,
+        "style": 1,
+        "pending_wrap": false
+      },
+      "lines": [
+        [
+          "👩‍",
+          "",
+          "💻",
+          "",
+          "A",
+          "B",
+          " ",
+          " ",
+          " ",
+          " "
+        ],
+        [
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " "
+        ]
+      ],
+      "cursor_cell": [
+        0,
+        6
+      ],
+      "expect": {
+        "runs_replaced": 0,
+        "clusters_replaced": 0,
+        "cells_clipped": 0,
+        "soft_wraps": 0,
+        "pending_wrap": false,
+        "cursor_outside": false
+      }
+    },
+    {
+      "id": "right_margin_splits_a_wide_cluster",
+      "why": "The window's right edge falls inside a wide cluster. Half a wide character is not a narrower character, so the cell inside the window gets a space and the cluster is counted as replaced; the run beyond the edge is clipped entirely.",
+      "window": {
+        "top_row": 0,
+        "left_column": 0,
+        "rows": 1,
+        "columns": 5
+      },
+      "rows": [
+        {
+          "row": 0,
+          "soft_wrapped": false,
+          "runs": [
+            {
+              "column": 0,
+              "cells": 4,
+              "text": "near"
+            },
+            {
+              "column": 4,
+              "cells": 2,
+              "text": "😀"
+            },
+            {
+              "column": 6,
+              "cells": 3,
+              "text": "far"
+            }
+          ]
+        }
+      ],
+      "cursor": {
+        "column": 0,
+        "row": 0,
+        "visible": true,
+        "style": 1,
+        "pending_wrap": false
+      },
+      "lines": [
+        [
+          "n",
+          "e",
+          "a",
+          "r",
+          " "
+        ]
+      ],
+      "cursor_cell": [
+        0,
+        0
+      ],
+      "expect": {
+        "runs_replaced": 0,
+        "clusters_replaced": 1,
+        "cells_clipped": 4,
+        "soft_wraps": 0,
+        "pending_wrap": false,
+        "cursor_outside": false
+      }
+    },
+    {
+      "id": "left_margin_splits_a_wide_cluster",
+      "why": "The same at the other margin. A window panned one column into a wide cluster shows one cell of it, and that cell is a space rather than the right half of a glyph.",
+      "window": {
+        "top_row": 0,
+        "left_column": 1,
+        "rows": 1,
+        "columns": 4
+      },
+      "rows": [
+        {
+          "row": 0,
+          "soft_wrapped": false,
+          "runs": [
+            {
+              "column": 0,
+              "cells": 2,
+              "text": "😀"
+            },
+            {
+              "column": 2,
+              "cells": 3,
+              "text": "xyz"
+            }
+          ]
+        }
+      ],
+      "cursor": {
+        "column": 2,
+        "row": 0,
+        "visible": true,
+        "style": 1,
+        "pending_wrap": false
+      },
+      "lines": [
+        [
+          " ",
+          "x",
+          "y",
+          "z"
+        ]
+      ],
+      "cursor_cell": [
+        0,
+        1
+      ],
+      "expect": {
+        "runs_replaced": 0,
+        "clusters_replaced": 1,
+        "cells_clipped": 1,
+        "soft_wraps": 0,
+        "pending_wrap": false,
+        "cursor_outside": false
+      }
+    },
+    {
+      "id": "the_last_column_and_a_delayed_wrap",
+      "why": "A row that fills the window exactly, with the canonical cursor in the last column and a wrap pending. The last cell is drawn and nothing wraps, and the pending wrap is reported rather than reproduced: every cursor placement clears one, so a renderer that places the cursor cannot leave a destination in it.",
+      "window": {
+        "top_row": 0,
+        "left_column": 0,
+        "rows": 2,
+        "columns": 4
+      },
+      "rows": [
+        {
+          "row": 0,
+          "soft_wrapped": true,
+          "runs": [
+            {
+              "column": 0,
+              "cells": 4,
+              "text": "full"
+            }
+          ]
+        },
+        {
+          "row": 1,
+          "soft_wrapped": false,
+          "runs": [
+            {
+              "column": 0,
+              "cells": 4,
+              "text": "next"
+            }
+          ]
+        }
+      ],
+      "cursor": {
+        "column": 3,
+        "row": 0,
+        "visible": true,
+        "style": 1,
+        "pending_wrap": true
+      },
+      "lines": [
+        [
+          "f",
+          "u",
+          "l",
+          "l"
+        ],
+        [
+          "n",
+          "e",
+          "x",
+          "t"
+        ]
+      ],
+      "cursor_cell": [
+        0,
+        3
+      ],
+      "expect": {
+        "runs_replaced": 0,
+        "clusters_replaced": 0,
+        "cells_clipped": 0,
+        "soft_wraps": 1,
+        "pending_wrap": true,
+        "cursor_outside": false
+      }
+    },
+    {
+      "id": "the_bottom_row_scrolls_without_scrolling_the_destination",
+      "why": "The session scrolled: the window's top row advanced and every line now holds a different canonical row. The destination is redrawn line by line at absolute addresses; nothing indexes it, so its own scrollback is untouched.",
+      "window": {
+        "top_row": 1,
+        "left_column": 0,
+        "rows": 3,
+        "columns": 6
+      },
+      "rows": [
+        {
+          "row": 1,
+          "soft_wrapped": false,
+          "runs": [
+            {
+              "column": 0,
+              "cells": 6,
+              "text": "second"
+            }
+          ]
+        },
+        {
+          "row": 2,
+          "soft_wrapped": false,
+          "runs": [
+            {
+              "column": 0,
+              "cells": 5,
+              "text": "third"
+            }
+          ]
+        },
+        {
+          "row": 3,
+          "soft_wrapped": false,
+          "runs": [
+            {
+              "column": 0,
+              "cells": 6,
+              "text": "fourth"
+            }
+          ]
+        }
+      ],
+      "cursor": {
+        "column": 5,
+        "row": 2,
+        "visible": true,
+        "style": 1,
+        "pending_wrap": false
+      },
+      "lines": [
+        [
+          "s",
+          "e",
+          "c",
+          "o",
+          "n",
+          "d"
+        ],
+        [
+          "t",
+          "h",
+          "i",
+          "r",
+          "d",
+          " "
+        ],
+        [
+          "f",
+          "o",
+          "u",
+          "r",
+          "t",
+          "h"
+        ]
+      ],
+      "cursor_cell": [
+        2,
+        5
+      ],
+      "expect": {
+        "runs_replaced": 0,
+        "clusters_replaced": 0,
+        "cells_clipped": 0,
+        "soft_wraps": 0,
+        "pending_wrap": false,
+        "cursor_outside": false
+      }
+    },
+    {
+      "id": "a_width_disagreement_is_rejected",
+      "why": "A run whose text does not measure the cell span the session gave it. The destination's width behaviour cannot reproduce the span, so the span is filled with spaces rather than drawn, and the rejection is counted instead of being discovered by the person reading the screen.",
+      "window": {
+        "top_row": 0,
+        "left_column": 0,
+        "rows": 1,
+        "columns": 8
+      },
+      "rows": [
+        {
+          "row": 0,
+          "soft_wrapped": false,
+          "runs": [
+            {
+              "column": 0,
+              "cells": 2,
+              "text": "ok"
+            },
+            {
+              "column": 2,
+              "cells": 3,
+              "text": "wrongwidth"
+            }
+          ]
+        }
+      ],
+      "cursor": {
+        "column": 5,
+        "row": 0,
+        "visible": true,
+        "style": 1,
+        "pending_wrap": false
+      },
+      "lines": [
+        [
+          "o",
+          "k",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " "
+        ]
+      ],
+      "cursor_cell": [
+        0,
+        5
+      ],
+      "expect": {
+        "runs_replaced": 1,
+        "clusters_replaced": 0,
+        "cells_clipped": 0,
+        "soft_wraps": 0,
+        "pending_wrap": false,
+        "cursor_outside": false
+      }
+    },
+    {
+      "id": "a_cursor_outside_the_window_is_hidden",
+      "why": "A destination narrower than the grid, with the canonical cursor in a column it cannot show. A cursor drawn in the wrong cell is worse than no cursor, because a person types where it appears to be.",
+      "window": {
+        "top_row": 0,
+        "left_column": 0,
+        "rows": 1,
+        "columns": 3
+      },
+      "rows": [
+        {
+          "row": 0,
+          "soft_wrapped": false,
+          "runs": [
+            {
+              "column": 0,
+              "cells": 6,
+              "text": "abcdef"
+            }
+          ]
+        }
+      ],
+      "cursor": {
+        "column": 5,
+        "row": 0,
+        "visible": true,
+        "style": 1,
+        "pending_wrap": false
+      },
+      "lines": [
+        [
+          "a",
+          "b",
+          "c"
+        ]
+      ],
+      "cursor_hidden": true,
+      "expect": {
+        "runs_replaced": 0,
+        "clusters_replaced": 0,
+        "cells_clipped": 3,
+        "soft_wraps": 0,
+        "pending_wrap": false,
+        "cursor_outside": true
+      }
+    }
+  ]
+}

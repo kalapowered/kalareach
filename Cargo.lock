@@ -3195,6 +3195,7 @@ dependencies = [
  "kr-crypto",
  "kr-ipc",
  "kr-protocol",
+ "kr-term",
  "kr-transport",
  "serde",
  "serde_json",

@@ -14,6 +14,7 @@ kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-ipc.workspace = true
 kr-protocol.workspace = true
+kr-term.workspace = true
 kr-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
