@@ -494,9 +494,12 @@ pub fn identity_when_available(pid: u32) -> Result<ProcessStartIdentity> {
 
 /// Why a launcher command did not produce an answer.
 ///
+/// Only the service managers use this, and only two platforms have one.
+///
 /// The two are not the same. A command that never ran started nothing. A command that ran and
 /// failed part way through may have reached the service manager first, and treating that as
 /// "nothing started" would free a slot something may still be occupying.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Clone, Debug)]
 enum RunFailure {
     /// The command could not be started at all.
@@ -505,6 +508,7 @@ enum RunFailure {
     Failed(String),
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl RunFailure {
     fn detail(&self) -> String {
         match self {
@@ -513,6 +517,8 @@ impl RunFailure {
     }
 }
 
+/// Runs a service manager's command and returns what it printed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(program: &str, arguments: &[&str]) -> std::result::Result<String, RunFailure> {
     let output = std::process::Command::new(program)
         .args(arguments)

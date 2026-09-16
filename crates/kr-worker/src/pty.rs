@@ -386,8 +386,6 @@ impl RootShell {
 
     #[cfg(not(unix))]
     fn signal_group(&mut self, signal: Signal) -> Result<()> {
-        use portable_pty::ChildKiller as _;
-
         match signal {
             // The per-session Job Object carries group termination on Windows; the child killer
             // ends the shell itself.

@@ -113,6 +113,17 @@ impl Connection {
         rustix::io::fcntl_dupfd_cloexec(self.0.as_fd(), 0)
             .map_err(|error| IpcError::socket("duplicate the connection", error.into()))
     }
+
+    /// Returns a handle on this connection's writability.
+    ///
+    /// The same thing the Unix descriptor above is: this connection's own pipe, duplicated, so that
+    /// writing to it and waiting for it borrow nothing the frame writer holds. The duplicate is an
+    /// overlapped handle, because the pipe it comes from is one, which is what makes the write
+    /// below able to answer rather than wait.
+    #[cfg(windows)]
+    pub(crate) fn writability(&self) -> Result<platform::Writable> {
+        self.0.writability()
+    }
 }
 
 impl AsyncRead for Connection {
@@ -446,7 +457,7 @@ mod platform {
 }
 
 #[cfg(windows)]
-mod platform {
+pub(crate) mod platform {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -502,14 +513,133 @@ mod platform {
                 .accept()
                 .await
                 .map_err(|error| IpcError::socket("accept", error))?;
-            let connection = Connection(stream);
+            let connection = Connection(stream, Side::Server);
             let peer = connection.peer()?;
             Ok((super::Connection(connection), peer))
         }
     }
 
+    /// What a frame writer writes through, and waits on, without borrowing the connection.
+    ///
+    /// One duplicated overlapped handle, adopted by the runtime as the end of the pipe it is.
+    /// `try_write` is the attempt that never waits and `ready` is the wait, which is the same shape
+    /// the Unix side has: the boundary that decides whether a frame may be sent holds neither.
     #[derive(Debug)]
-    pub(super) struct Connection(interprocess::local_socket::tokio::Stream);
+    pub(crate) enum Writable {
+        /// The end that connected.
+        Client(tokio::net::windows::named_pipe::NamedPipeClient),
+        /// The end the listener accepted.
+        Server(tokio::net::windows::named_pipe::NamedPipeServer),
+    }
+
+    impl Writable {
+        /// Writes what the pipe will take now, or says it will take nothing.
+        pub(crate) fn try_write(&self, bytes: &[u8]) -> std::io::Result<usize> {
+            match self {
+                Self::Client(pipe) => pipe.try_write(bytes),
+                Self::Server(pipe) => pipe.try_write(bytes),
+            }
+        }
+
+        /// Waits until the pipe will take more.
+        pub(crate) async fn ready(&self) -> std::io::Result<()> {
+            match self {
+                Self::Client(pipe) => pipe.writable().await,
+                Self::Server(pipe) => pipe.writable().await,
+            }
+        }
+    }
+
+    /// The one place in this crate that takes a handle the operating system owns.
+    ///
+    /// This crate denies unsafe code and relaxes the rule here and in [`crate::clock`] alone.
+    /// Duplicating a handle and handing it to the runtime has no safe form: the first is a call
+    /// with an out-parameter, and the second is a promise about a handle's provenance that only the
+    /// caller can make.
+    mod handle {
+        #![expect(
+            unsafe_code,
+            reason = "duplicating a handle and adopting it are calls with no safe form"
+        )]
+
+        use std::os::windows::io::{
+            BorrowedHandle, FromRawHandle as _, IntoRawHandle as _, OwnedHandle,
+        };
+
+        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        /// Returns a handle of this process's own on the same pipe.
+        ///
+        /// The duplicate keeps every flag the original was created with, `FILE_FLAG_OVERLAPPED`
+        /// among them, which is what the runtime requires of a handle it adopts.
+        pub(super) fn duplicate(handle: BorrowedHandle<'_>) -> std::io::Result<OwnedHandle> {
+            use std::os::windows::io::AsRawHandle as _;
+
+            let mut duplicate = std::ptr::null_mut();
+            // SAFETY: the source handle is borrowed for this call and is open for its whole
+            // lifetime; the destination is a pointer to a local this thread owns. The call writes
+            // the new handle there and returns non-zero, or writes nothing and returns zero.
+            let copied = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    handle.as_raw_handle(),
+                    GetCurrentProcess(),
+                    &raw mut duplicate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            if copied == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `DuplicateHandle` reported success, so `duplicate` is a handle this process
+            // owns and nothing else holds.
+            Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+        }
+
+        /// Hands a duplicated pipe handle to the runtime as the end of the pipe it is.
+        pub(super) fn adopt(
+            handle: OwnedHandle,
+            side: super::Side,
+        ) -> std::io::Result<super::Writable> {
+            use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer};
+
+            let raw = handle.into_raw_handle();
+            // SAFETY: the handle was just duplicated from a named pipe this process opened with
+            // `FILE_FLAG_OVERLAPPED`, nothing else holds it, and ownership passes to the runtime
+            // here. On failure it is taken back below so that it is closed rather than leaked.
+            let adopted = unsafe {
+                match side {
+                    super::Side::Client => {
+                        NamedPipeClient::from_raw_handle(raw).map(super::Writable::Client)
+                    }
+                    super::Side::Server => {
+                        NamedPipeServer::from_raw_handle(raw).map(super::Writable::Server)
+                    }
+                }
+            };
+            adopted.map_err(|error| {
+                // SAFETY: the runtime refused it, so nothing else owns this handle; taking it back
+                // is what closes it.
+                drop(unsafe { OwnedHandle::from_raw_handle(raw) });
+                error
+            })
+        }
+    }
+
+    /// Which end of the pipe a connection is, which decides how a duplicate of it is adopted.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Side {
+        /// The end that connected.
+        Client,
+        /// The end the listener accepted.
+        Server,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Connection(interprocess::local_socket::tokio::Stream, Side);
 
     impl Connection {
         pub(super) async fn connect(endpoint: &Endpoint) -> Result<Self> {
@@ -519,8 +649,19 @@ mod platform {
                 .map_err(|error| IpcError::socket("connect", error))?;
             interprocess::local_socket::tokio::Stream::connect(name)
                 .await
-                .map(Self)
+                .map(|stream| Self(stream, Side::Client))
                 .map_err(|error| IpcError::socket("connect", error))
+        }
+
+        /// Returns this connection's own overlapped handle on the pipe.
+        pub(super) fn writability(&self) -> Result<Writable> {
+            use std::os::windows::io::AsHandle as _;
+
+            let interprocess::local_socket::tokio::Stream::NamedPipe(pipe) = &self.0;
+            let duplicate = handle::duplicate(pipe.as_handle())
+                .map_err(|error| IpcError::socket("duplicate the connection", error))?;
+            handle::adopt(duplicate, self.1)
+                .map_err(|error| IpcError::socket("adopt the connection", error))
         }
 
         pub(super) fn peer(&self) -> Result<PeerIdentity> {
