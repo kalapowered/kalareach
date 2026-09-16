@@ -389,6 +389,10 @@ impl WorkerService {
                 // moment a withdrawal could stop it.
                 let (start, started) = tokio::sync::oneshot::channel::<()>();
                 let sender = Arc::clone(&writer);
+                // The latch the connection's own writes watch. This task watches it too, because
+                // aborting the task only takes effect where it yields, and a task with every chunk
+                // ready to go does not yield between them.
+                let delivery_withdrawn = Arc::clone(&registration.withdrawn);
                 let stream_id = state.stream_id.clone();
                 let restoration = state.restoration.take();
                 let task = tokio::spawn(async move {
@@ -410,13 +414,14 @@ impl WorkerService {
                                 notification(&stream_id, sequence, "session.gap", gap)
                         {
                             sequence += 1;
-                            let mut sender = sender.lock().await;
-                            if sender.write_message(&notification).await.is_err() {
+                            if !write_frame(&sender, &notification, &delivery_withdrawn, true).await
+                            {
                                 return;
                             }
                         }
                         if !send_screen(
                             &sender,
+                            &delivery_withdrawn,
                             &stream_id,
                             &mut sequence,
                             joined.cursor,
@@ -444,6 +449,7 @@ impl WorkerService {
                                     .min(bytes.len());
                                 send_stream(
                                     &sender,
+                                    &delivery_withdrawn,
                                     &stream_id,
                                     &mut sequence,
                                     cursor + skip as u64,
@@ -455,8 +461,15 @@ impl WorkerService {
                             // takes: its cursor is the state it describes rather than an offset,
                             // so the parts do not carry advancing cursors of their own.
                             OutputDelivery::Screen { cursor, bytes } => {
-                                send_screen(&sender, &stream_id, &mut sequence, cursor, &bytes)
-                                    .await
+                                send_screen(
+                                    &sender,
+                                    &delivery_withdrawn,
+                                    &stream_id,
+                                    &mut sequence,
+                                    cursor,
+                                    &bytes,
+                                )
+                                .await
                             }
                             OutputDelivery::Resync(marker) => {
                                 let Some(notification) =
@@ -465,8 +478,7 @@ impl WorkerService {
                                     continue;
                                 };
                                 sequence += 1;
-                                let mut sender = sender.lock().await;
-                                sender.write_message(&notification).await.is_ok()
+                                write_frame(&sender, &notification, &delivery_withdrawn, true).await
                             }
                             OutputDelivery::Detached => {
                                 // The attachment has ended. The client is told so it can put its
@@ -477,8 +489,13 @@ impl WorkerService {
                                     "session.detached",
                                     &kr_protocol::attachment::SessionDetachParams { attachment_id },
                                 ) {
-                                    let mut sender = sender.lock().await;
-                                    let _ = sender.write_message(&notification).await;
+                                    let _ = write_frame(
+                                        &sender,
+                                        &notification,
+                                        &delivery_withdrawn,
+                                        true,
+                                    )
+                                    .await;
                                 }
                                 return;
                             }
@@ -2306,6 +2323,7 @@ async fn write_frame(
 /// one stream.
 async fn send_stream(
     sender: &Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
+    withdrawn: &Withdrawal,
     stream_id: &StreamId,
     sequence: &mut u64,
     cursor: u64,
@@ -2322,11 +2340,13 @@ async fn send_stream(
             return false;
         };
         *sequence += 1;
-        let mut sender = sender.lock().await;
-        if sender.write_message(&notification).await.is_err() {
+        // Every frame goes through the same boundary, so a span that takes several of them stops
+        // at the first one after the withdrawal rather than finishing the span it had begun.
+        // Stopping the task is not enough on its own: a task whose chunks are all ready writes
+        // them without ever yielding to the abort.
+        if !write_frame(sender, &notification, withdrawn, true).await {
             return false;
         }
-        drop(sender);
         at += chunk.len() as u64;
     }
     true
@@ -2338,6 +2358,7 @@ async fn send_stream(
 /// consecutive positions in a stream, and a client draws them in the order they arrive.
 async fn send_screen(
     sender: &Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
+    withdrawn: &Withdrawal,
     stream_id: &StreamId,
     sequence: &mut u64,
     cursor: u64,
@@ -2356,8 +2377,7 @@ async fn send_screen(
             return false;
         };
         *sequence += 1;
-        let mut sender = sender.lock().await;
-        if sender.write_message(&notification).await.is_err() {
+        if !write_frame(sender, &notification, withdrawn, true).await {
             return false;
         }
     }
@@ -2511,7 +2531,10 @@ mod tests {
 
     use kr_transport::clock::ManualClock;
 
-    use super::{ContinuousClock, ContinuousInstant, vouched_deadline};
+    use super::{
+        ContinuousClock, ContinuousInstant, MAX_OUTPUT_EVENT_BYTES, StreamId, Withdrawal,
+        send_stream, vouched_deadline,
+    };
 
     /// Two clocks with one pause between the first reading and the second.
     ///
@@ -2620,6 +2643,68 @@ mod tests {
             anchored.saturating_duration_since(start),
             Duration::from_millis(kr_protocol::limits::MAX_MUTATION_TTL.get()),
             "a daemon cannot hand a worker a longer life than the protocol allows"
+        );
+    }
+
+    /// A connected pair of frame halves, on an endpoint of this test's own.
+    async fn connected() -> (
+        kr_ipc::testing::TempHost,
+        Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
+        kr_ipc::framed::FrameReader,
+    ) {
+        let temp = kr_ipc::testing::TempHost::create();
+        let endpoint = temp
+            .environment()
+            .worker_endpoint(kr_protocol::session::DisplayNumber::new(9))
+            .expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds");
+        let accepting = tokio::spawn(async move { listener.accept().await });
+        let client = kr_ipc::endpoint::Connection::connect(&endpoint)
+            .await
+            .expect("connects");
+        let (server, _) = accepting
+            .await
+            .expect("the accept finishes")
+            .expect("accepts");
+        let (_, writer) = kr_ipc::framed::split(server, kr_protocol::frame::StreamKind::Control);
+        let (reader, _) = kr_ipc::framed::split(client, kr_protocol::frame::StreamKind::Control);
+        (temp, Arc::new(tokio::sync::Mutex::new(writer)), reader)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_withdrawn_registration_stops_a_span_that_takes_several_frames() {
+        // A span larger than one frame is written as several, and the authority behind it can be
+        // withdrawn between any two of them. Stopping the task that writes them is not enough on
+        // its own: a task whose frames are all ready writes them without ever yielding to the
+        // abort. Each frame therefore passes the withdrawal itself.
+        let (_temp, writer, mut reader) = connected().await;
+        let withdrawn = Withdrawal::default();
+        let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
+        let bytes = vec![b'a'; MAX_OUTPUT_EVENT_BYTES * 3];
+        let mut sequence = 0_u64;
+
+        withdrawn.set();
+        // Bounded, because the failure this guards against is a writer that goes on writing into a
+        // socket nobody is reading: without the boundary the call does not return at all.
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_stream(&writer, &withdrawn, &stream_id, &mut sequence, 0, &bytes),
+        )
+        .await
+        .expect("a withdrawn registration stops rather than waiting for a peer");
+        assert!(!sent, "a withdrawn registration is delivered nothing");
+        assert!(
+            !writer.lock().await.is_mid_frame(),
+            "and nothing was left half written"
+        );
+        let nothing = tokio::time::timeout(
+            Duration::from_millis(200),
+            reader.read_message::<kr_protocol::envelope::ControlFrame>(),
+        )
+        .await;
+        assert!(
+            nothing.is_err(),
+            "the peer receives no frame of a span whose authority has gone"
         );
     }
 }
