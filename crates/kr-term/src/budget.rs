@@ -12,8 +12,8 @@
 use crate::error::{Result, TermError};
 use crate::grid::{
     ALERT_LIST_BYTES, CELL_ATTRIBUTE_BYTES, CELL_TEXT_HEAP_BYTES, GRID_TITLE_BYTES,
-    LINK_TABLE_ENTRY_BYTES, LINK_TABLE_NODE_BYTES, ROW_SLOT_BYTES, ROW_STORAGE_BYTES,
-    STRING_HANDLE_BYTES,
+    HISTORY_CHARGE_BYTES, LINK_TABLE_ENTRY_BYTES, LINK_TABLE_NODE_BYTES, ROW_SLOT_BYTES,
+    ROW_STORAGE_BYTES, STRING_HANDLE_BYTES,
 };
 
 /// The maximum number of columns.
@@ -172,7 +172,8 @@ pub struct Footprint {
     pub cell_slots: u64,
     /// What the cells of both buffers can hold: text, attribute allocations and text headers.
     pub cell_content: u64,
-    /// The arrays the rows of both buffers sit in, the scrollback slots included.
+    /// The arrays the rows of both buffers sit in, the scrollback slots included, and the array
+    /// beside them that holds what each retained row costs.
     pub row_arrays: u64,
     /// The hyperlink envelope: the table of distinct targets and the objects the rows hold.
     pub links: u64,
@@ -204,7 +205,8 @@ pub struct BudgetUsage {
     pub screen_content: [u64; 2],
     /// Bytes the cells of those rows take in the slots they sit in.
     pub cell_slots: u64,
-    /// Bytes every row record of both buffers takes in the array it sits in.
+    /// Bytes every row record of both buffers takes in the array it sits in, and the room the
+    /// retained rows' account keeps for its charges.
     pub row_records: u64,
     /// Bytes the hyperlink state holds: the objects the rows of both buffers keep, the link the
     /// pen is inside, the links the saved cursors carry, and the table of distinct targets.
@@ -298,7 +300,9 @@ impl SessionBudget {
     ///
     /// Both buffers, because a session can fill the primary one, switch, and fill the alternate as
     /// well. The scrollback slots are in it because the rows of the history sit in the same array
-    /// as the rows of the screen; what those rows *hold* is the row cache's own bound.
+    /// as the rows of the screen; what those rows *hold* is the row cache's own bound. The account
+    /// of what each retained row costs is a slot a row too, in an array of its own, so it is
+    /// reserved beside them.
     #[must_use]
     pub const fn footprint(
         &self,
@@ -321,11 +325,13 @@ impl SessionBudget {
                 .saturating_mul(cell_content_bytes(cell_bytes))
                 .saturating_add(2u64.saturating_mul(rows).saturating_mul(ROW_STORAGE_BYTES)),
             // The primary buffer's array holds the screen and the history; the alternate buffer
-            // keeps no history.
+            // keeps no history. Beside them is the retained rows' account, one charge a retained
+            // row.
             row_arrays: rows
                 .saturating_add(scrollback_rows as u64)
                 .saturating_add(rows)
-                .saturating_mul(ROW_SLOT_BYTES),
+                .saturating_mul(ROW_SLOT_BYTES)
+                .saturating_add((scrollback_rows as u64).saturating_mul(HISTORY_CHARGE_BYTES)),
             links: self.limits.link_envelope(),
             // The session's own titles and stack, and the copy the grid keeps of each title.
             titles: crate::title::MAX_RESIDENT_BYTES.saturating_add(GRID_TITLE_BYTES),

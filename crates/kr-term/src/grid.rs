@@ -214,7 +214,7 @@ pub struct BufferBytes {
     /// historical cache instead, where the rest of what they hold is counted.
     pub cell_slots: u64,
     /// What every row record of both buffers costs in the array it sits in, retained rows
-    /// included.
+    /// included, and the room the retained rows' account keeps for its charges.
     pub row_records: u64,
     /// What every hyperlink object the grid holds costs: the objects on the rows of both buffers,
     /// the objects on the retained rows, the link the pen is inside and the links the saved
@@ -1418,7 +1418,12 @@ impl CanonicalGrid {
         BufferBytes {
             content,
             cell_slots: rows.cell_slots,
-            row_records: rows.records,
+            // The retained rows' account is an array of row slots like the screens' own, and it
+            // keeps the room it grew to: eviction gives the charges back but not the room they sat
+            // in, so what is measured is the capacity rather than the entries.
+            row_records: rows.records.saturating_add(
+                (self.history.charges.capacity() as u64).saturating_mul(size_of::<u64>() as u64),
+            ),
             links,
         }
     }
@@ -1686,6 +1691,14 @@ pub const LINK_TABLE_NODE_BYTES: u64 = (11 * size_of::<String>() + 4 * size_of::
 pub fn link_table_entry_bytes(target: &String) -> u64 {
     STRING_HANDLE_BYTES + target.capacity() as u64 + LINK_TABLE_ENTRY_BYTES
 }
+
+/// What one retained row costs in the account of what the retained rows cost.
+///
+/// One charge a row, in one array, and the array grows by doubling, so it can be holding room for
+/// twice the rows it has. A retained row is a slot here as well as a slot in its screen's own
+/// array, and the account keeps the room it grew to after eviction gives rows back, so this is
+/// reserved for every row the scrollback may hold and measured at the room it is holding.
+pub const HISTORY_CHARGE_BYTES: u64 = 2 * size_of::<u64>() as u64;
 
 /// What one row costs in the array its screen keeps, whether or not anything is on it.
 ///

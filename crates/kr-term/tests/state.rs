@@ -1804,7 +1804,8 @@ fn a_cell_with_its_text_on_the_heap_is_charged_for_the_header() {
 }
 
 /// The array a screen keeps its rows in is reserved with the scrollback slots it can grow to, so
-/// an empty row and the slot it sits in are not free.
+/// an empty row and the slot it sits in are not free. Beside it is the array of what each retained
+/// row costs, which is a slot a retained row of its own.
 #[test]
 fn the_row_arrays_are_reserved_with_their_scrollback() {
     let budget = SessionBudget::new();
@@ -1812,9 +1813,10 @@ fn the_row_arrays_are_reserved_with_their_scrollback() {
     let footprint = budget.footprint(GridSize::new(80, 24), grid.scrollback_rows, 64);
     assert_eq!(
         footprint.row_arrays,
-        (24 + grid.scrollback_rows as u64 + 24) * kr_term::grid::ROW_SLOT_BYTES,
-        "the primary buffer's array holds the screen and the scrollback; the alternate keeps no \
-         history"
+        (24 + grid.scrollback_rows as u64 + 24) * kr_term::grid::ROW_SLOT_BYTES
+            + grid.scrollback_rows as u64 * kr_term::grid::HISTORY_CHARGE_BYTES,
+        "the primary buffer's array holds the screen and the scrollback and the alternate keeps no \
+         history; the retained rows' account holds one charge a retained row"
     );
     assert!(
         footprint.cell_content >= 48 * kr_term::grid::ROW_STORAGE_BYTES,
@@ -2605,4 +2607,47 @@ fn a_restored_keyboard_stack_is_bounded_and_qualified() {
         "and every entry on it is qualified too"
     );
     assert_eq!(stack.capacity(), stack.len(), "with no room kept beyond it");
+}
+
+/// The account of what the retained rows cost is resident state, and it is measured.
+///
+/// It is one charge a retained row, in an array of its own beside the rows, and it keeps the room
+/// it grew to after eviction or an erasure gives the rows back. A session that emptied its
+/// scrollback is still holding that room, so the measurement says so rather than reporting the
+/// account as free the moment its entries go.
+#[test]
+fn the_retained_rows_account_is_reserved_and_measured() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(40, 8),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let empty = engine.grid().buffer_bytes().row_records;
+
+    let mut input = String::new();
+    for index in 0..600u32 {
+        input.push_str(&format!("row {index} with some content\r\n"));
+    }
+    engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+    let filled = engine.grid().buffer_bytes().row_records;
+    assert!(
+        filled >= empty + 600 * kr_term::grid::HISTORY_CHARGE_BYTES / 2,
+        "the charges of six hundred retained rows are in the measurement: {filled} against {empty}"
+    );
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "and the geometry reserved room for them"
+    );
+
+    // The scrollback goes, and the room its charges sat in does not.
+    engine.feed(b"\x1b[3J", 0);
+    engine.quiesce(0);
+    assert_eq!(engine.grid().history_bytes(), 0, "the rows are gone");
+    assert!(
+        engine.grid().buffer_bytes().row_records > empty,
+        "the room the account kept for them is not"
+    );
+    assert_eq!(engine.budget().excess(), 0);
 }

@@ -605,22 +605,23 @@ The rest of the reservation:
 | Part | Bytes | Why |
 | --- | --- | --- |
 | Row arrays | 288 a row | The array slot of every row of both buffers, the primary buffer's 3,500 scrollback slots included, at twice the rows they hold |
+| The retained rows' account | 16 a retained row | One charge a retained row, in an array beside the rows, at twice the rows it holds. It keeps the room it grew to after eviction gives rows back |
 | Row storage | 136 a screen row | What a row allocates for itself before anything is on it: eighty bytes of room for its text, and a header each for the cell offsets and the wide-cell bits. A retained row's own storage is the row cache's to carry |
 | Hyperlink envelope | 17,137,960 | 4,096 targets of 2,048 bytes, at twice what they hold, with the table slots and the first node. One envelope holds every link object the grid keeps, on a screen or on a retained row, so a row scrolling off moves no charge |
 | Titles and the virtual stack | 50,208 | Ten entries of two 1,024-byte titles, at twice what they hold, the current pair, and the copy of each title the grid keeps |
 | Alert channel | 1,073,152 | 256 alerts of two 1,024-byte strings, at twice what the list holds |
 
-So an 80 by 24 session reserves 20,764,232 bytes of its 67,108,864, and the default invisible
-120 by 40 reserves 22,989,640. A full-width 2,048 by 24 terminal is admitted; so is every grid at
+So an 80 by 24 session reserves 20,820,232 bytes of its 67,108,864, and the default invisible
+120 by 40 reserves 23,045,640. A full-width 2,048 by 24 terminal is admitted; so is every grid at
 that height, because 2,048 columns is the widest section 8 allows. The largest grid the dimensions
-allow, 2,048 by 128, would need 220,704,456 bytes, so it is refused before anything is allocated
+allow, 2,048 by 128, would need 220,760,456 bytes, so it is refused before anything is allocated
 for it.
 
 There is no single boundary in cells, because a row costs something of its own: the largest cell
-count any shape is admitted at is 2,008 by 31, or 62,248 cells, and 60 by 1,020 is refused at
-61,200. The boundary by height is what a client cares about, and
-`fixtures/terminal/admission.json` records it: 1,556 columns are admitted at 40 rows and 1,557 are
-not; 485 at 128 rows and 486 are not; 249 by 249 is the largest square and 250 by 250 is refused;
+count any shape is admitted at is 1,943 by 32, or 62,176 cells, and 61 by 1,002 is refused at
+61,122. The boundary by height is what a client cares about, and
+`fixtures/terminal/admission.json` records it: 1,554 columns are admitted at 40 rows and 1,555 are
+not; 484 at 128 rows and 485 are not; 248 by 248 is the largest square and 249 by 249 is refused;
 59 columns are admitted at the full 1,024 rows.
 
 The historical row cache is not in that figure. Section 8 gives it its own 8 MiB bound beside the
