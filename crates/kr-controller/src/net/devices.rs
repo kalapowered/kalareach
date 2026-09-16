@@ -42,10 +42,14 @@ pub struct ObservedUtc {
 /// Where one action went, as this host recorded it before dispatching it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoutedAction {
-    /// The session the action was dispatched to.
-    pub session_id: kr_protocol::ids::SessionId,
-    /// The digest of the payload that was dispatched under this identifier.
-    pub payload_digest: Digest256,
+    /// The session the action was dispatched to, absent when this host itself holds the receipt.
+    pub session_id: Option<kr_protocol::ids::SessionId>,
+    /// The digest of the payload dispatched under this identifier.
+    ///
+    /// Absent for a row written before this host recorded digests. Such an identifier is spent:
+    /// nothing here can say whether a second submission carries the same payload, and section 9
+    /// does not let a host guess.
+    pub payload_digest: Option<Digest256>,
 }
 
 /// What claiming one action's route found.
@@ -193,8 +197,8 @@ impl DeviceDirectory {
                  CREATE TABLE IF NOT EXISTS network_actions (
                      actor_id TEXT NOT NULL,
                      action_id BLOB NOT NULL,
-                     session_id BLOB NOT NULL,
-                     payload_digest BLOB NOT NULL,
+                     session_id BLOB,
+                     payload_digest BLOB,
                      recorded_at_ms INTEGER NOT NULL,
                      PRIMARY KEY (actor_id, action_id)
                  );
@@ -205,7 +209,8 @@ impl DeviceDirectory {
                  );
                  CREATE TABLE IF NOT EXISTS network_clock (
                      id INTEGER PRIMARY KEY NOT NULL CHECK (id = 0),
-                     observed_ms INTEGER NOT NULL
+                     observed_ms INTEGER NOT NULL,
+                     untrusted_at_ms INTEGER
                  );",
             )
         })?;
@@ -213,8 +218,53 @@ impl DeviceDirectory {
         // leaves an older table exactly as it was, and every read below names these columns. A
         // host upgraded in place would otherwise find its own paired devices unreadable.
         for column in ["expired_at_ms INTEGER", "committed_invitation_id BLOB"] {
-            self.add_column(column)?;
+            self.add_column("network_devices", column)?;
         }
+        self.add_column("network_clock", "untrusted_at_ms INTEGER")?;
+        self.rebuild_actions()?;
+        Ok(())
+    }
+
+    /// Brings an older action table up to the shape every read below names.
+    ///
+    /// The columns changed twice: a payload digest was added, and the session became optional for
+    /// an action this host itself owns the receipt of. Neither can be done with `ADD COLUMN`
+    /// alone, because one of them relaxes a constraint, so the table is rebuilt and its rows are
+    /// carried across. What they cannot carry is a digest nothing recorded: those identifiers keep
+    /// their route and are spent, which refuses a second submission rather than dispatching one.
+    fn rebuild_actions(&self) -> Result<()> {
+        let columns: Vec<(String, i32)> = self.with(|connection| {
+            let mut statement = connection.prepare("PRAGMA table_info(network_actions)")?;
+            let rows = statement.query_map([], |row| Ok((row.get(1)?, row.get(3)?)))?;
+            rows.collect()
+        })?;
+        let current = columns.iter().any(|(name, _)| name == "payload_digest")
+            && columns
+                .iter()
+                .any(|(name, notnull)| name == "session_id" && *notnull == 0);
+        if current {
+            return Ok(());
+        }
+        self.with(|connection| {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE network_actions RENAME TO network_actions_superseded;
+                 CREATE TABLE network_actions (
+                     actor_id TEXT NOT NULL,
+                     action_id BLOB NOT NULL,
+                     session_id BLOB,
+                     payload_digest BLOB,
+                     recorded_at_ms INTEGER NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
+                 );
+                 INSERT INTO network_actions
+                     (actor_id, action_id, session_id, payload_digest, recorded_at_ms)
+                     SELECT actor_id, action_id, session_id, NULL, recorded_at_ms
+                     FROM network_actions_superseded;
+                 DROP TABLE network_actions_superseded;
+                 COMMIT;",
+            )
+        })?;
         Ok(())
     }
 
@@ -222,8 +272,8 @@ impl DeviceDirectory {
     ///
     /// SQLite has no conditional `ADD COLUMN`, and a duplicate is the ordinary case on every start
     /// after the first, so that one failure is the success case and anything else is not.
-    fn add_column(&self, definition: &str) -> Result<()> {
-        let statement = format!("ALTER TABLE network_devices ADD COLUMN {definition}");
+    fn add_column(&self, table: &str, definition: &str) -> Result<()> {
+        let statement = format!("ALTER TABLE {table} ADD COLUMN {definition}");
         let outcome = self.with(|connection| connection.execute(&statement, []));
         match outcome {
             Ok(_) => Ok(()),
@@ -391,12 +441,18 @@ impl DeviceDirectory {
         &self,
         actor_id: &ActorId,
         action_id: kr_protocol::ids::ActionId,
-        session_id: kr_protocol::ids::SessionId,
+        session_id: Option<kr_protocol::ids::SessionId>,
         payload_digest: Digest256,
         now_ms: TimestampMs,
     ) -> Result<ActionRoute> {
         self.with(|connection| {
-            let transaction = connection.unchecked_transaction()?;
+            // Immediate, not deferred. A deferred transaction takes its read snapshot first, and
+            // the daemon's own connection on this file can commit between that snapshot and this
+            // insert, which SQLite answers by refusing the write rather than by serialising it.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                connection,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let existing = read_route(&transaction, actor_id, action_id)?;
             if let Some(existing) = existing {
                 transaction.commit()?;
@@ -409,7 +465,7 @@ impl DeviceDirectory {
                 params![
                     actor_id.as_str(),
                     action_id.get().as_bytes().as_slice(),
-                    session_id.get().as_bytes().as_slice(),
+                    session_id.map(|session| session.get().as_bytes().to_vec()),
                     payload_digest.as_bytes().as_slice(),
                     i64::try_from(now_ms.get()).unwrap_or(i64::MAX),
                 ],
@@ -527,6 +583,63 @@ impl DeviceDirectory {
         Ok(Some(u64::try_from(deadline).unwrap_or_default()))
     }
 
+    /// Records that this host's wall clock could not be trusted to decide an expiry.
+    ///
+    /// It is durable because the decision has to outlive the connection that found it and the run
+    /// that was serving it: a clock that went backwards once, and then reads plausibly again,
+    /// would otherwise let the next connection decide a grant's life against it. What clears it is
+    /// [`Self::trust_clock`], and only a clock that has caught up with everything this host has
+    /// already recorded reaches that.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn note_clock_untrusted(&self, now_ms: TimestampMs) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO network_clock (id, observed_ms, untrusted_at_ms)
+                 VALUES (0, ?1, ?1)
+                 ON CONFLICT (id) DO UPDATE
+                     SET untrusted_at_ms = COALESCE(untrusted_at_ms, ?1)",
+                params![i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Returns whether this host has recorded its wall clock as untrustworthy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be read.
+    pub fn clock_untrusted(&self) -> Result<bool> {
+        let recorded: Option<Option<i64>> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT untrusted_at_ms FROM network_clock WHERE id = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+        })?;
+        Ok(recorded.flatten().is_some())
+    }
+
+    /// Clears the record above, for a clock that has caught up with what this host observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn trust_clock(&self) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE network_clock SET untrusted_at_ms = NULL WHERE id = 0",
+                [],
+            )
+        })?;
+        Ok(())
+    }
+
     /// Marks one device as revoked, and reports whether this call was the one that did it.
     ///
     /// Revoking twice is not an error: the second call finds the row already revoked and says so,
@@ -613,7 +726,10 @@ fn read_route(
     actor_id: &ActorId,
     action_id: kr_protocol::ids::ActionId,
 ) -> rusqlite::Result<Option<RoutedAction>> {
-    let row: Option<(Vec<u8>, Vec<u8>)> = connection
+    /// The two nullable columns of one route row, as SQLite hands them over.
+    type Row = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+    let row: Option<Row> = connection
         .query_row(
             "SELECT session_id, payload_digest FROM network_actions
              WHERE actor_id = ?1 AND action_id = ?2",
@@ -624,14 +740,16 @@ fn read_route(
     let Some((session, digest)) = row else {
         return Ok(None);
     };
-    // A row this host wrote holds sixteen bytes of session and thirty-two of digest. One that does
-    // not is a row nothing here wrote, and it names no action.
-    let (Ok(session), Ok(digest)) = (<[u8; 16]>::try_from(session), key(&digest)) else {
-        return Ok(None);
-    };
+    // A session is sixteen bytes and a digest is thirty-two. Anything else is a value nothing here
+    // wrote, and it is read as absent rather than guessed at: an unknown owner and an unknown
+    // payload both refuse a second submission.
     Ok(Some(RoutedAction {
-        session_id: kr_protocol::ids::SessionId::new(Uuid::from_bytes(session)),
-        payload_digest: Digest256::from_bytes(digest),
+        session_id: session
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+            .map(|bytes| kr_protocol::ids::SessionId::new(Uuid::from_bytes(bytes))),
+        payload_digest: digest
+            .and_then(|bytes| key(&bytes).ok())
+            .map(Digest256::from_bytes),
     }))
 }
 

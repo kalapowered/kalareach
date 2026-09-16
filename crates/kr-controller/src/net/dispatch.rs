@@ -61,6 +61,26 @@ use super::proxy::{RELAY_QUEUED_BYTES, RelayBudget, Relayed, WorkerProxy};
 use crate::error::{ControllerError, Result};
 use crate::service::Controller;
 
+/// Why a claim on an action's identity did not succeed.
+///
+/// The two are answered differently. A conflict is this host's answer about the action: section 9
+/// makes a reused identifier carrying a different payload `ID_CONFLICT`, and nothing is dispatched
+/// under it. Storage being unavailable says nothing about the action, and section 7 does not let a
+/// storage failure stop an authorised stop, so a close goes on without its route while every other
+/// mutation is refused.
+enum RouteRefusal {
+    Conflict(ProtocolError),
+    Unavailable(ProtocolError),
+}
+
+impl RouteRefusal {
+    fn into_error(self) -> ProtocolError {
+        match self {
+            Self::Conflict(error) | Self::Unavailable(error) => error,
+        }
+    }
+}
+
 /// The QUIC application error code a withdrawn connection is closed with.
 pub const WITHDRAWN: u32 = 4;
 
@@ -164,10 +184,15 @@ impl Authorisation {
     /// of an expiry is written down, against a UTC moment that never goes earlier than the latest
     /// this host has recorded.
     fn note_expiry(&self) {
-        if !self.expired.load(Ordering::Acquire) || self.recorded.swap(true, Ordering::AcqRel) {
+        if !self.expired.load(Ordering::Acquire) || self.recorded.load(Ordering::Acquire) {
             return;
         }
-        self.record_expiry();
+        // Marked as recorded only once it is recorded. A write that failed leaves the next caller
+        // to try again, because the flag is what stops this being written twice and a flag set
+        // over a failed write would stop it being written at all.
+        if self.record_expiry() {
+            self.recorded.store(true, Ordering::Release);
+        }
     }
 
     /// Writes down that this device's grant has run out.
@@ -176,16 +201,20 @@ impl Authorisation {
     /// and the boot-bound deadline this host holds is what the next connection reads. What is lost
     /// is only the tombstone a later boot would have read, so the failure is reported rather than
     /// dropped.
-    fn record_expiry(&self) {
+    fn record_expiry(&self) -> bool {
         let now = self
             .devices
             .utc_at_least(kr_ipc::now_ms())
             .map_or_else(|_| kr_ipc::now_ms(), |observed| observed.now);
-        if let Err(error) = self.devices.record_expiry(self.device_id, now) {
-            eprintln!(
-                "kr-controller: could not record that device {} has run out of grant: {error}",
-                self.device_id
-            );
+        match self.devices.record_expiry(self.device_id, now) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "kr-controller: could not record that device {} has run out of grant: {error}",
+                    self.device_id
+                );
+                false
+            }
         }
     }
 }
@@ -204,24 +233,28 @@ impl RemoteOutput {
 
     /// Sends one frame, and returns whether it was sent.
     ///
-    /// The authority is read at the write itself, inside the stream's writer, and again for as
-    /// long as the write waits:
+    /// The authority is read at every attempt to put bytes on the stream, not once before the
+    /// wait for one:
     ///
     /// * The turn keeps this connection's frames in order, one at a time.
     /// * The writer is shared with the keepalive and the window renewal, so a frame can wait for
-    ///   it. The latch and the registration are read after it has been taken, which is the moment
-    ///   the bytes would go: a frame that waited there is never written under authority that went
-    ///   while it waited.
-    /// * A write that has begun can still wait for the peer to make room. That wait is watched,
-    ///   and an authority that goes closes the connection, which is what stops the bytes reaching
-    ///   a peer no longer authorised to receive them. The abandoned frame leaves the stream in
-    ///   pieces, which is exactly right for a connection being fenced.
+    ///   it. The fence is read after it has been taken.
+    /// * A frame that has the writer can still wait for the peer to make room. The fence is read
+    ///   in the same poll as each attempt to hand bytes over, so no byte goes under authority that
+    ///   went while the frame waited. An abandoned frame leaves the stream in pieces, which is
+    ///   exactly right for a connection being fenced: the connection is closed with it.
+    /// * The registration cannot be read from a poll, so it is read here, by every request, and by
+    ///   the watch below. A revocation that withdraws one closes the connection itself, which is
+    ///   what stops a frame that is already waiting.
     pub async fn send(&self, frame: &ControlFrame) -> bool {
         let _turn = self.turn.lock().await;
         if self.has_withdrawn() {
             return false;
         }
         if !self.fence() {
+            // Outside the poll, where a durable write belongs: the fence itself only reads the
+            // clock, and an expiry it observed has to be written down by something that can.
+            self.authority.note_expiry();
             self.withdraw();
             return false;
         }
@@ -241,6 +274,7 @@ impl RemoteOutput {
             // Refused at the boundary: the authority this connection writes under has gone, so the
             // connection goes with it rather than waiting to be asked for something else.
             Ok(false) => {
+                self.authority.note_expiry();
                 self.withdraw();
                 false
             }
@@ -596,6 +630,13 @@ impl RemoteConnection {
             // dropping a future is a cancellation and a durable commit cannot be left half done
             // because a peer went away.
             Method::SessionCreate => {
+                // A create claims the same action identity every other mutation claims, with this
+                // host named as the owner of what it produces. Without it, an identifier spent on
+                // a create would be free for a mutation on a worker, and section 9 makes
+                // `(verified actor, action)` one operation whoever ends up holding its receipt.
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
                 let request_id = mutation.request_id;
@@ -621,8 +662,14 @@ impl RemoteConnection {
                         ),
                     );
                 };
-                if let Err(error) = self.claim_route(mutation, session_id) {
-                    return failure(mutation.request_id, error);
+                // A conflicting identifier refuses the close; storage that cannot record the
+                // route does not. Section 7 has an authorised stop go ahead when storage fails,
+                // and the worker reports what its own durability then was.
+                match self.claim_route(mutation, Some(session_id)) {
+                    Ok(()) | Err(RouteRefusal::Unavailable(_)) => {}
+                    Err(RouteRefusal::Conflict(error)) => {
+                        return failure(mutation.request_id, error);
+                    }
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -721,7 +768,10 @@ impl RemoteConnection {
             Err(error) => return failure(request.request_id, error),
         };
         let envelope = self.envelope(validated);
-        let authority = self.authority_deadline();
+        let authority = match self.authority_deadline() {
+            Ok(authority) => authority,
+            Err(error) => return failure(request.request_id, error),
+        };
         match proxy.forward_read(request, &envelope, authority).await {
             Ok(response) => ControlFrame::Response(Response {
                 request_id: request.request_id,
@@ -755,8 +805,8 @@ impl RemoteConnection {
             Ok(proxy) => proxy,
             Err(error) => return failure(mutation.request_id, error.to_protocol_error()),
         };
-        if let Err(error) = self.claim_route(mutation, session_id) {
-            return failure(mutation.request_id, error);
+        if let Err(refusal) = self.claim_route(mutation, Some(session_id)) {
+            return failure(mutation.request_id, refusal.into_error());
         }
         let envelope = self.envelope(validated);
         let deadline = match self
@@ -823,10 +873,6 @@ impl RemoteConnection {
         Ok(proxy)
     }
 
-    /// Returns the link this connection already has, for a read that names no session.
-    ///
-    /// A device's receipts are in the journal of the session it acted on, and this connection acts
-    /// on one session. A connection that has not attached to anything has no receipts to read.
     /// Claims this action's route before it is dispatched, and refuses a reused identifier.
     ///
     /// Where the action is going is written down before it goes. A receipt lives in the journal of
@@ -841,11 +887,16 @@ impl RemoteConnection {
     fn claim_route(
         &self,
         mutation: &MutationRequest,
-        session_id: SessionId,
-    ) -> std::result::Result<(), ProtocolError> {
+        session_id: Option<SessionId>,
+    ) -> std::result::Result<(), RouteRefusal> {
         let actor_id = self.device.principal();
-        let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
-            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        let digest =
+            kr_protocol::digest::mutation_digest(mutation, &actor_id).map_err(|error| {
+                RouteRefusal::Conflict(ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    error.to_string(),
+                ))
+            })?;
         let claimed = self
             .devices
             .claim_action_route(
@@ -855,21 +906,23 @@ impl RemoteConnection {
                 digest,
                 kr_ipc::now_ms(),
             )
-            .map_err(|error| error.to_protocol_error())?;
+            .map_err(|error| RouteRefusal::Unavailable(error.to_protocol_error()))?;
         match claimed {
             super::devices::ActionRoute::Recorded => Ok(()),
             super::devices::ActionRoute::Existing(existing)
-                if existing.payload_digest == digest && existing.session_id == session_id =>
+                if existing.payload_digest == Some(digest) && existing.session_id == session_id =>
             {
                 Ok(())
             }
-            super::devices::ActionRoute::Existing(_) => Err(ProtocolError::new(
-                ErrorCode::IdConflict,
-                format!(
-                    "action {} was already used with a different request",
-                    mutation.action_id
-                ),
-            )),
+            super::devices::ActionRoute::Existing(_) => {
+                Err(RouteRefusal::Conflict(ProtocolError::new(
+                    ErrorCode::IdConflict,
+                    format!(
+                        "action {} was already used with a different request",
+                        mutation.action_id
+                    ),
+                )))
+            }
         }
     }
 
@@ -895,7 +948,7 @@ impl RemoteConnection {
         };
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
-        if digest != routed.payload_digest {
+        if routed.payload_digest != Some(digest) {
             return Err(ProtocolError::new(
                 ErrorCode::IdConflict,
                 format!(
@@ -904,10 +957,29 @@ impl RemoteConnection {
                 ),
             ));
         }
+        // An action this host itself owns the receipt of is answered by the daemon or not at all.
+        // Asking a worker about it would ask the wrong journal.
+        let Some(session_id) = routed.session_id else {
+            return Ok(None);
+        };
+        // Reading a receipt is `action.read`, and it is admitted as `action.read`: the rights that
+        // method requires over the session the receipt belongs to, not the rights the mutation
+        // needed. Section 23 has the host check present view authority over the subject before it
+        // returns either half of a retained result, and a device that may act on a session without
+        // being able to observe it does not learn what its action produced by resubmitting it.
+        let Ok(entry) = self.admit(
+            Method::ActionRead.as_str(),
+            Method::ActionRead.entry().version,
+        ) else {
+            return Ok(None);
+        };
+        if self.check_grant(Some(session_id), entry, false).is_err() {
+            return Ok(None);
+        }
         // A link that cannot be opened is not an answer. The ordinary path decides what this
         // request gets, which for a session whose worker has gone is that session's own refusal
         // rather than a second dispatch.
-        let Ok(proxy) = self.proxy_for(routed.session_id).await else {
+        let Ok(proxy) = self.proxy_for(session_id).await else {
             return Ok(None);
         };
         let request = Request {
@@ -920,7 +992,7 @@ impl RemoteConnection {
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?,
         };
         let envelope = self.envelope(validated);
-        let authority = self.authority_deadline();
+        let authority = self.authority_deadline()?;
         let Ok(response) = proxy.forward_read(&request, &envelope, authority).await else {
             // The link failed, not the lookup. The ordinary path decides what happens next.
             return Ok(None);
@@ -966,10 +1038,10 @@ impl RemoteConnection {
             .devices
             .action_route(&self.device.principal(), params.action_id)
             .map_err(|error| error.to_protocol_error())?;
-        let routed = routed.map(|routed| routed.session_id);
-        let session_id = routed.ok_or_else(|| {
-            // The same answer the worker gives for a receipt it does not hold: an action nobody
-            // recorded is not an action this device can be told about.
+        // The same answer the worker gives for a receipt it does not hold: an action nobody
+        // recorded is not an action this device can be told about, and neither is one whose
+        // receipt this host itself owns, which is the daemon's own journal to answer from.
+        let session_id = routed.and_then(|routed| routed.session_id).ok_or_else(|| {
             ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 format!("no receipt for action {}", params.action_id),
@@ -999,16 +1071,30 @@ impl RemoteConnection {
     /// deadline of its own, and raw input is a read: without this, a batch admitted a moment
     /// before the grant expired could still be written to the application after it. Null when the
     /// grant does not expire.
-    fn authority_deadline(&self) -> kr_protocol::scalars::Nullable<kr_protocol::scalars::U64> {
+    fn authority_deadline(
+        &self,
+    ) -> std::result::Result<kr_protocol::scalars::Nullable<kr_protocol::scalars::U64>, ProtocolError>
+    {
         let Some(deadline) = self.authority.grant_deadline else {
-            return kr_protocol::scalars::Nullable::null();
+            return Ok(kr_protocol::scalars::Nullable::null());
         };
-        kr_protocol::scalars::Nullable(crate::service::remaining_deadline(
+        // Null means "this authority does not expire", so a deadline that has already passed can
+        // never be sent as null: that would forward expired authority as unlimited authority. It
+        // is a refusal instead, and this connection is fenced with it.
+        let remaining = crate::service::remaining_deadline(
             &*self.controller.shared_clock,
             &*self.controller.clock,
             deadline,
             None,
-        ))
+        )
+        .ok_or_else(|| {
+            self.authority.note_expiry();
+            ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "this device's grant has run out",
+            )
+        })?;
+        Ok(kr_protocol::scalars::Nullable(Some(remaining)))
     }
 
     /// Returns the envelope every request on this connection is attributed to.
