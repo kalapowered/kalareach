@@ -13,6 +13,19 @@ pub enum ClientError {
     /// The host answered with an error.
     #[error("{}: {}", .0.code.as_str(), .0.message)]
     Host(ProtocolError),
+    /// A managed service refused the request, and said when the same one could be sent again.
+    ///
+    /// The refusal is the protocol error a caller branches on; the delay is what the service asked
+    /// for, in seconds. It is separate from [`Self::Host`] because honouring it is the difference
+    /// between backing off and being refused again, and a delay inside a message is a delay nothing
+    /// can act on.
+    #[error("{}: {} (retry after {retry_after_seconds}s)", .error.code.as_str(), .error.message)]
+    Refused {
+        /// What the service said was wrong.
+        error: ProtocolError,
+        /// Seconds to wait before sending the same request again.
+        retry_after_seconds: u64,
+    },
     /// A value could not be encoded or decoded as KR-CBOR-1.
     #[error("the message was not canonical: {0}")]
     Cbor(#[from] kr_cbor::CborError),
@@ -80,7 +93,7 @@ impl ClientError {
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
-            Self::Host(error) => error.code,
+            Self::Host(error) | Self::Refused { error, .. } => error.code,
             Self::Transport(error) => error.to_protocol_error().code,
             Self::Cbor(_) | Self::WrongEffect { .. } => ErrorCode::InvalidArgument,
             Self::UnsupportedVersion { .. } => ErrorCode::UnsupportedSchema,

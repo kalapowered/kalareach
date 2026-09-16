@@ -73,9 +73,19 @@ pub const RELAY_LEASE_REVOKE_PATH: &str = "/api/relay/lease/revoke";
 
 /// One HTTP exchange, as the embedder performs it.
 ///
-/// The body is JSON and the answer is whatever the service sent, status and bytes. Nothing here
-/// retries: asking again for a pair that already holds a lease revises that lease, so whether to
-/// ask again is the caller's decision rather than a library's.
+/// What an implementation owes this client, because the answers above are read on these terms:
+///
+/// - send the body as `application/json` and read the answer as bytes, whatever its content type:
+///   an error page from something in front of the service is an answer this client classifies
+///   rather than a case an implementation has to recognise;
+/// - return the status and the body for every answer, including a refusal, because the envelope a
+///   refusal carries is what names the reason and the delay;
+/// - bound what is read, and treat a body that exceeds that bound as an error rather than a
+///   truncated answer: half an envelope is not a refusal. A relay lease answer is a few kilobytes;
+/// - never retry. Asking again for a pair that already holds a lease revises that lease, and a
+///   request that was delivered and not answered may have issued one, so whether to ask again is
+///   the caller's decision. An exchange that failed after the request left is an error; this client
+///   reports an answer it cannot read as an unknown outcome for the same reason.
 pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
     /// Posts a JSON body and returns what came back.
     fn post_json<'a>(
@@ -90,7 +100,8 @@ pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
 pub struct ServiceHttpAnswer {
     /// The status the service answered with.
     pub status: u16,
-    /// The body, which is the service's envelope whether the status was a success or not.
+    /// The body as it arrived. It is this service's envelope when the answer came from this
+    /// service, and something else when it came from anything in front of it.
     pub body: Vec<u8>,
 }
 
@@ -551,8 +562,14 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                     signing_input,
                 )
                 .await?;
-            let answer: TaggedAnswer = serde_json::from_value(data)
-                .map_err(|error| malformed(format!("a lease answer: {error}")))?;
+            let answer: TaggedAnswer = serde_json::from_value(data).map_err(|error| {
+                // The service answered, so a lease may have been issued and installed. What this
+                // client cannot do is say which answer it was, and a caller must not retry blindly.
+                unreadable(
+                    200,
+                    &format!("this client cannot read its lease answer: {error}"),
+                )
+            })?;
             Ok(answer.into())
         })
     }
@@ -573,8 +590,14 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                     signing_input,
                 )
                 .await?;
-            serde_json::from_value(data)
-                .map_err(|error| malformed(format!("a revocation answer: {error}")))
+            serde_json::from_value(data).map_err(|error| {
+                // The lease may be fenced and its reservation settling. Asking again is safe, which
+                // is why a revocation is idempotent, but this client cannot say what happened.
+                unreadable(
+                    200,
+                    &format!("this client cannot read its revocation answer: {error}"),
+                )
+            })
         })
     }
 }
@@ -582,8 +605,13 @@ impl RelayLeaseService for ManagedRelayLeaseService {
 /// The `data` of a service envelope, or the refusal it carried.
 ///
 /// A refusal is the service's answer about the request rather than a transport failure, so it
-/// arrives as the error the service named. The codes are the ones every route of this service uses;
-/// the mapping is to the protocol's own, so a caller reacts to one vocabulary.
+/// arrives as the error the service named, with the delay it asked for when it named one. The codes
+/// are the ones every route of this service uses; the mapping is to the protocol's own, so a caller
+/// reacts to one vocabulary.
+///
+/// A body that is not this service's envelope is not a refusal at all, and it is not this caller's
+/// mistake either: it is a proxy's error page, a truncated answer, or something that is not this
+/// service. [`unreadable`] is what those become, classified by the status that carried them.
 fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     #[derive(Deserialize)]
     struct Envelope {
@@ -598,29 +626,44 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     struct Refusal {
         code: String,
         message: String,
+        /// The service names this in camel case, as its whole envelope does.
+        #[serde(default, rename = "retryAfterSeconds")]
+        retry_after_seconds: Option<u64>,
     }
 
-    let envelope: Envelope = serde_json::from_slice(&answer.body)
-        .map_err(|error| malformed(format!("a service answer: {error}")))?;
+    let Ok(envelope) = serde_json::from_slice::<Envelope>(&answer.body) else {
+        return Err(unreadable(
+            answer.status,
+            "its answer is not one this client reads",
+        ));
+    };
 
     if envelope.ok {
         return envelope
             .data
-            .ok_or_else(|| malformed("a service answer carries data".to_owned()));
+            .ok_or_else(|| unreadable(answer.status, "its answer carries no data"));
     }
 
-    let refusal = envelope
-        .error
-        .ok_or_else(|| malformed("a refusal carries an error".to_owned()))?;
+    let Some(refusal) = envelope.error else {
+        return Err(unreadable(answer.status, "its refusal names no error"));
+    };
 
-    Err(ClientError::Host(ProtocolError::new(
-        code_of(&refusal.code),
-        refusal.message,
-    )))
+    let error = ProtocolError::new(code_of(&refusal.code, answer.status), refusal.message);
+
+    Err(match refusal.retry_after_seconds {
+        Some(retry_after_seconds) => ClientError::Refused {
+            error,
+            retry_after_seconds,
+        },
+        None => ClientError::Host(error),
+    })
 }
 
 /// The protocol code one service error code means.
-fn code_of(code: &str) -> ErrorCode {
+///
+/// The status decides the codes this service does not name, because a body carrying an unknown code
+/// is either a newer service or something in front of it: a fault is not a field the caller chose.
+fn code_of(code: &str, status: u16) -> ErrorCode {
     match code {
         "UNAUTHENTICATED" | "FORBIDDEN" | "REAUTHENTICATION_REQUIRED" => {
             ErrorCode::PermissionDenied
@@ -629,11 +672,36 @@ fn code_of(code: &str) -> ErrorCode {
         "QUOTA_EXHAUSTED" => ErrorCode::QuotaExceeded,
         "NOT_CONFIGURED" => ErrorCode::HostNotConfigured,
         "INTERNAL" => ErrorCode::UpstreamUnavailable,
+        "INVALID_REQUEST" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" => ErrorCode::InvalidArgument,
+        _ if status >= 500 => ErrorCode::UpstreamUnavailable,
         _ => ErrorCode::InvalidArgument,
     }
 }
 
-/// An answer this client could not read, as the error a caller reacts to.
+/// An answer this client could not read, classified by the status that carried it.
+///
+/// What a caller may do about it turns on one question: whether the request may have been carried
+/// out. A success status with an unreadable body is the dangerous case, because a lease may now
+/// exist, a reservation may be held and a relay may be carrying it, so it is reported as an unknown
+/// outcome and never retried automatically. A fault or a rate limit is transient. Anything else
+/// without an envelope never reached this service's own routes, which is a configuration between
+/// here and it rather than a value this caller chose.
+fn unreadable(status: u16, what: &str) -> ClientError {
+    let code = if (200..300).contains(&status) {
+        ErrorCode::OutcomeUnknown
+    } else if status >= 500 || status == 408 || status == 429 {
+        ErrorCode::UpstreamUnavailable
+    } else {
+        ErrorCode::HostNotConfigured
+    };
+
+    ClientError::Host(ProtocolError::new(
+        code,
+        format!("the service answered {status} and {what}"),
+    ))
+}
+
+/// A request this client could not build, which is a local fault rather than an answer.
 fn malformed(message: String) -> ClientError {
     ClientError::Host(ProtocolError::new(ErrorCode::InvalidArgument, message))
 }

@@ -60,6 +60,21 @@ pub enum RelayDirection {
 /// the issuer key and a revision. The client's half of that is everything below; the payer, the
 /// route, the signature and the revision are the service's, because a client that chose its own
 /// metering boundary could choose one that counts nothing.
+///
+/// The service refuses a request outside these ranges, and it refuses it before anything is held,
+/// so a caller that respects them is a caller whose refusals are about capacity:
+///
+/// - the two endpoints differ;
+/// - `byte_ceiling` is at least 64 KiB and fits an unsigned 64-bit counter, and it is the
+///   *cumulative* figure for the reservation rather than an increment;
+/// - `duration_seconds` is between 30 and 900;
+/// - `payer`, when it names an account, carries that account's identifier and the identifier of the
+///   authorisation it gave this caller, which is a lower-case hyphenated UUID;
+/// - `lease_id`, when it names one, is a lower-case hyphenated UUID.
+///
+/// The payer's own bound applies on top: an account authorisation states the most one lease may
+/// hold outstanding under it, and an installation paying for itself is bounded by the free
+/// allowance and by the 8 MiB aggregate section 17 gives every principal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaseRequest {
     /// The endpoint the traffic comes from.
@@ -68,15 +83,21 @@ pub struct LeaseRequest {
     pub destination: EndpointKey,
     /// Which way the lease permits traffic to flow.
     pub direction: RelayDirection,
-    /// The cumulative bytes the payer is asking to reserve.
+    /// The cumulative bytes the payer is asking to reserve. At least 64 KiB.
     pub byte_ceiling: u64,
-    /// How long the lease should last, in seconds.
+    /// How long the lease should last, in seconds. Between 30 and 900.
     pub duration_seconds: u32,
     /// The region the requester would rather be carried in, or null for no preference. A hint.
     pub region_preference: Option<String>,
     /// Who pays, or null for the default: the account this caller has selected, else itself.
     pub payer: Option<LeasePayer>,
-    /// The lease to refill, or null to ask for a new one.
+    /// The lease to refill.
+    ///
+    /// Null does not mean a new lease. It means the caller is not naming one, and the service then
+    /// refills whatever live lease that pair already holds, because one conversation holds one
+    /// reservation: a second lease for the same pair would hold bytes from the same aggregate while
+    /// knowing nothing about what the first had spent. Naming a lease that is not live, or one
+    /// issued to another caller, is refused rather than answered with a new one.
     pub lease_id: Option<RelayLeaseId>,
 }
 
@@ -133,19 +154,32 @@ pub trait AccountService: Send + Sync + std::fmt::Debug {
 /// Where relay leases are obtained.
 ///
 /// The service holds the ledger the lease spends from, signs the lease with the admission key the
-/// relay pins, and installs it on the relay before answering, so what a client receives is a
-/// capability that is already in force. Endpoint admission alone never authorises peer traffic or
-/// billing, and nothing a client says decides who pays.
+/// relay pins, and tries to install it on the relay before answering. Endpoint admission alone
+/// never authorises peer traffic or billing, and nothing a client says decides who pays.
 ///
 /// An answer is not always a lease. An allowance that is spent and a service with no relay to offer
 /// are answers about capacity, carrying what is left of the bounded grace and the paths that still
 /// work, and [`RelayLeaseAnswer`] is that distinction: section 17 requires an exhausted managed
 /// allowance to be reported as unavailable capacity with alternatives rather than as a failure.
+///
+/// Nor is a lease always installed. `installed` on a grant is the relay's own acknowledgement, and
+/// null means the service could not get one: the relay may be carrying the lease and may not, and
+/// the service keeps the bytes held either way rather than releasing capacity that might be
+/// spending. A client holding such a grant may use it, and should expect the relay to refuse its
+/// first payload if the installation never landed; asking again for the same pair is the retry, and
+/// it is answered with the lease that is installed rather than a second one.
+///
+/// A revocation is the same shape. Its settlement can come back `pending`, which means the bytes
+/// are still held while the evidence completes: the service settles it from the receipts or charges
+/// the remainder at the deadline, without the caller doing anything.
 pub trait RelayLeaseService: Send + Sync + std::fmt::Debug {
     /// Obtains a lease for a pair of endpoints, or a refill of the one that pair holds.
     fn issue<'a>(&'a self, request: &'a LeaseRequest) -> ServiceFuture<'a, RelayLeaseAnswer>;
 
     /// Ends a lease, so the relay stops carrying the pair and the reservation is settled.
+    ///
+    /// Idempotent: a repeat finishes whatever the first attempt could not, which is why a caller
+    /// that is unsure whether its revocation arrived asks again rather than assuming.
     fn revoke<'a>(
         &'a self,
         lease_id: RelayLeaseId,

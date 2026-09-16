@@ -24,7 +24,7 @@ use kr_client::services::{
 use kr_client::{ClientError, Result};
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign, verify};
-use kr_protocol::error::ErrorCode;
+use kr_protocol::error::{ErrorCode, RetryCategory};
 use kr_protocol::ids::RelayLeaseId;
 use kr_protocol::scalars::{AuthorisationKey, EndpointKey, Signature64, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
@@ -399,13 +399,61 @@ async fn a_refusal_arrives_as_the_code_the_service_named() {
         .expect_err("a refusal");
     assert_eq!(error.code(), ErrorCode::HostNotConfigured);
 
-    // An answer this client cannot read is an answer it says it cannot read, rather than a lease.
+    // A rate limit carries the delay the service asked for, where a caller can act on it.
+    http.answer_with(
+        429,
+        &serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "RATE_LIMITED",
+                "message": "Too many requests from this network.",
+                "retryAfterSeconds": 42
+            }
+        })
+        .to_string(),
+    );
+    let error = service
+        .issue(&issue_request())
+        .await
+        .expect_err("a rate limit");
+    assert_eq!(error.code(), ErrorCode::RateLimited);
+    assert!(matches!(
+        error,
+        ClientError::Refused {
+            retry_after_seconds: 42,
+            ..
+        }
+    ));
+
+    // An answer this client cannot read, after a request the service accepted. A lease may exist,
+    // so the outcome is unknown rather than an argument the caller got wrong, and nothing retries
+    // an unknown outcome on its own.
     http.answer_with(200, "{\"ok\":true,\"data\":{\"state\":\"something-else\"}}");
     let error = service
         .issue(&issue_request())
         .await
         .expect_err("an unreadable answer");
-    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(error.code().retry_category(), RetryCategory::OutcomeUnknown);
+
+    // A proxy's error page is not a refusal and not a caller's mistake: it is transient, because
+    // asking again after it may well work.
+    http.answer_with(502, "<html><body>Bad Gateway</body></html>");
+    let error = service
+        .issue(&issue_request())
+        .await
+        .expect_err("a gateway fault");
+    assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+    assert_eq!(error.code().retry_category(), RetryCategory::Transient);
+
+    // And an answer from something that is not this service's routes at all is a configuration
+    // between here and it, which no amount of retrying fixes.
+    http.answer_with(404, "not found");
+    let error = service
+        .issue(&issue_request())
+        .await
+        .expect_err("a wrong origin");
+    assert_eq!(error.code(), ErrorCode::HostNotConfigured);
 }
 
 #[tokio::test]
