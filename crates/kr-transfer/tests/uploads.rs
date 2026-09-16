@@ -1404,10 +1404,12 @@ fn interrupt_publish(
     store
         .begin_publish(
             transfer_id,
-            digest,
-            payload_identity,
-            None,
-            None,
+            &kr_transfer::store::Publication {
+                content_digest: digest,
+                payload_identity,
+                preview: None,
+                preview_unavailable: None,
+            },
             kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
             None,
         )

@@ -806,10 +806,12 @@ impl TransferService {
         let claim = action.map(|action| action.claimed(now));
         let claim_outcome = store.begin_publish(
             row.transfer_id,
-            digest,
-            payload_identity,
-            encoded_preview.as_deref(),
-            preview_unavailable.as_deref(),
+            &crate::store::Publication {
+                content_digest: digest,
+                payload_identity,
+                preview: encoded_preview.as_deref(),
+                preview_unavailable: preview_unavailable.as_deref(),
+            },
             now,
             claim.as_ref(),
         )?;

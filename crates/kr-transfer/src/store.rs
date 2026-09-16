@@ -334,6 +334,22 @@ pub enum ActionOutcome {
     AlreadyPerformed,
 }
 
+/// What a publication records before the payload file moves.
+///
+/// The four facts that make an interrupted publish resolvable: what the verification computed, the
+/// object it computed it from, and the preview it produced or the reason it did not.
+#[derive(Clone, Copy, Debug)]
+pub struct Publication<'bytes> {
+    /// The whole-file digest the verification computed.
+    pub content_digest: Digest256,
+    /// The filesystem identity of the object that was verified.
+    pub payload_identity: ObjectIdentity,
+    /// The encoded preview, where one was produced.
+    pub preview: Option<&'bytes [u8]>,
+    /// Why no preview was produced, where none was.
+    pub preview_unavailable: Option<&'bytes str>,
+}
+
 /// A retained mutation result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionRecord {
@@ -1075,10 +1091,7 @@ impl Store {
     pub fn begin_publish(
         &mut self,
         transfer_id: TransferId,
-        content_digest: Digest256,
-        payload_identity: ObjectIdentity,
-        preview: Option<&[u8]>,
-        preview_unavailable: Option<&str>,
+        publication: &Publication<'_>,
         at_ms: TimestampMs,
         action: Option<&RetainedAction>,
     ) -> Result<ActionOutcome> {
@@ -1095,11 +1108,11 @@ impl Store {
                 params![
                     uuid_sql(transfer_id.get()),
                     UploadState::Publishing.as_str(),
-                    content_digest.as_bytes().as_slice(),
-                    preview,
-                    preview_unavailable,
-                    identity_sql(payload_identity.device),
-                    identity_sql(payload_identity.file_id),
+                    publication.content_digest.as_bytes().as_slice(),
+                    publication.preview,
+                    publication.preview_unavailable,
+                    identity_sql(publication.payload_identity.device),
+                    identity_sql(publication.payload_identity.file_id),
                 ],
             )
             .map_err(TransferError::store)?;
@@ -2557,13 +2570,15 @@ mod tests {
         store
             .begin_publish(
                 transfer(1),
-                Digest256::from_bytes([1; 32]),
-                ObjectIdentity {
-                    device: 1,
-                    file_id: 2,
+                &Publication {
+                    content_digest: Digest256::from_bytes([1; 32]),
+                    payload_identity: ObjectIdentity {
+                        device: 1,
+                        file_id: 2,
+                    },
+                    preview: None,
+                    preview_unavailable: None,
                 },
-                None,
-                None,
                 TimestampMs::new(2000),
                 None,
             )
