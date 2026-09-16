@@ -238,33 +238,37 @@ impl DeviceDirectory {
             let rows = statement.query_map([], |row| Ok((row.get(1)?, row.get(3)?)))?;
             rows.collect()
         })?;
-        let current = columns.iter().any(|(name, _)| name == "payload_digest")
-            && columns
-                .iter()
-                .any(|(name, notnull)| name == "session_id" && *notnull == 0);
-        if current {
+        let has_digest = columns.iter().any(|(name, _)| name == "payload_digest");
+        let owner_optional = columns
+            .iter()
+            .any(|(name, notnull)| name == "session_id" && *notnull == 0);
+        if has_digest && owner_optional {
             return Ok(());
         }
-        self.with(|connection| {
-            connection.execute_batch(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE network_actions RENAME TO network_actions_superseded;
-                 CREATE TABLE network_actions (
-                     actor_id TEXT NOT NULL,
-                     action_id BLOB NOT NULL,
-                     session_id BLOB,
-                     payload_digest BLOB,
-                     recorded_at_ms INTEGER NOT NULL,
-                     PRIMARY KEY (actor_id, action_id)
-                 );
-                 INSERT INTO network_actions
-                     (actor_id, action_id, session_id, payload_digest, recorded_at_ms)
-                     SELECT actor_id, action_id, session_id, NULL, recorded_at_ms
-                     FROM network_actions_superseded;
-                 DROP TABLE network_actions_superseded;
-                 COMMIT;",
-            )
-        })?;
+        // The digest is carried across when the old table had one. A row loses it only when
+        // nothing ever recorded it, because a digest is what identifies an exact duplicate: a
+        // row that arrived with one and left without it would turn a caller's own retry into a
+        // reused identifier.
+        let digest = if has_digest { "payload_digest" } else { "NULL" };
+        let batch = format!(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE network_actions RENAME TO network_actions_superseded;
+             CREATE TABLE network_actions (
+                 actor_id TEXT NOT NULL,
+                 action_id BLOB NOT NULL,
+                 session_id BLOB,
+                 payload_digest BLOB,
+                 recorded_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY (actor_id, action_id)
+             );
+             INSERT INTO network_actions
+                 (actor_id, action_id, session_id, payload_digest, recorded_at_ms)
+                 SELECT actor_id, action_id, session_id, {digest}, recorded_at_ms
+                 FROM network_actions_superseded;
+             DROP TABLE network_actions_superseded;
+             COMMIT;"
+        );
+        self.with(|connection| connection.execute_batch(&batch))?;
         Ok(())
     }
 
