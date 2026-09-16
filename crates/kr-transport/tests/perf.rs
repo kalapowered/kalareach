@@ -59,7 +59,7 @@ use kr_transport::handshake::{self, Admitted, PairedDirectory};
 use kr_transport::scheduler::{SendLimits, StreamBudget};
 use kr_transport::streams::StreamRegistry;
 use std::sync::Arc;
-use support::conditions::{Host, SchedulingProbe, StolenTime};
+use support::conditions::{Host, MAX_STOLEN_SHARE, SchedulingProbe, StolenTime};
 use support::{OneDevice, Side, direct_addr, epochs, ledger, paired_pair, windows};
 
 /// One input round trip, and the payload it carried.
@@ -223,13 +223,15 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         .await
         .expect("an input stream");
 
-    // Both phases, and the guest's stolen time across both, because a host that was taken away
-    // from during either one produced neither figure under section 27's conditions.
-    let stolen = StolenTime::start();
+    // The guest's stolen time is read once a phase, because a phase that lost a tenth of its
+    // processor and a phase that lost nothing average to a figure that describes neither, and both
+    // percentiles go into the difference the target is about.
+    let mut stolen = StolenTime::start();
     let probe = SchedulingProbe::start(PROBE_INTERVAL);
 
     let mut baseline = round_trips(&mut input, SAMPLES).await;
     let baseline_p95 = percentile(&mut baseline, 0.95);
+    let stolen_idle = stolen.take();
 
     // A bulk transfer now fills the connection. The scheduler's job is to keep the keystroke ahead
     // of it.
@@ -256,10 +258,17 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
     // Let the transfer reach steady state before the keystrokes are measured against it.
     tokio::time::sleep(Duration::from_millis(250)).await;
 
+    // The transfer's own warm-up is behind us, so this span is the loaded phase alone.
+    let _ = stolen.take();
     let before = chunks.load(Ordering::Relaxed);
     let mut loaded = round_trips(&mut input, SAMPLES).await;
     let during = chunks.load(Ordering::Relaxed) - before;
-    let stolen_share = stolen.share();
+    let stolen_loaded = stolen.take();
+    // The worse of the two phases: a figure is inside the cutoff only if both phases were.
+    let stolen_share = match (stolen_idle, stolen_loaded) {
+        (Some(idle), Some(loaded)) => Some(idle.max(loaded)),
+        (single, None) | (None, single) => single,
+    };
     let mut lateness = probe.stop();
     bulk.abort();
     // Before the percentile, which has no answer for an empty set.
@@ -283,10 +292,15 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
     );
     println!(
         "  taken by the host {}",
-        stolen_share.map_or_else(
-            || "not accounted for here, so unverified".to_owned(),
-            |share| format!("{:.2}% of the measurement", share * 100.0)
-        )
+        match (stolen_idle, stolen_loaded) {
+            (Some(idle), Some(loaded)) => format!(
+                "{:.2}% of the idle phase and {:.2}% of the loaded one, against a {:.2}% cutoff",
+                idle * 100.0,
+                loaded * 100.0,
+                MAX_STOLEN_SHARE * 100.0
+            ),
+            _ => "not accounted for here, so unverified".to_owned(),
+        }
     );
     println!("  samples           {SAMPLES} round trips");
     println!("  transfer          {during} chunks of 512 KiB while they ran");
@@ -313,7 +327,10 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
 
     let shortfalls = host.shortfalls(stolen_share);
     if shortfalls.is_empty() {
-        println!("  conditions        section 27's are met, so the target is asserted here");
+        println!(
+            "  conditions        no measured shortfall, so the target is asserted here; what the \
+             lines above call unverified stays unverified"
+        );
         assert!(
             added < ADDED_LIMIT,
             "application scheduling added {added:?} above the measured path round trip"

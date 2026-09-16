@@ -15,12 +15,19 @@
 //!
 //! And a condition never rests on something the application under test could have caused. Section
 //! 27's idle host is the hard one: no interface reports whether the machine underneath a shared
-//! virtual one is quiet. What this module reads is the time the hypervisor took the processor away
-//! from the whole guest, which is a host fact the measured application cannot produce. Beside it,
-//! as evidence rather than as a condition, a thread of its own asks to be woken at a steady
-//! interval and records how late each wake was; that thread is outside the runtime the measurement
-//! runs on, so it reports contention rather than the application's own work, but lateness alone
-//! cannot tell a busy neighbour from a slow processor and it decides nothing.
+//! virtual one is quiet. What this module reads is the share of the processor time the hypervisor
+//! took away from the whole guest, which is a host fact the measured application cannot produce.
+//! Beside it, as evidence rather than as a condition, a thread of its own asks to be woken at a
+//! steady interval and records how late each wake was; that thread is outside the runtime the
+//! measurement runs on, so it reports contention rather than the application's own work, but
+//! lateness alone cannot tell a busy neighbour from a slow processor and it decides nothing.
+//!
+//! What the stolen share cannot do is prove the opposite. A zero reading means the hypervisor
+//! reported no loss, which is not the same as an idle host: an environment that does not account
+//! for stolen time reads zero, and throttling and a neighbour inside the same guest cost time
+//! without being stolen. So the cutoff below is this harness's own exclusion rule rather than a
+//! threshold section 27 states, and a figure it admits is a figure with no measured shortfall
+//! rather than a certified reference-host measurement.
 //!
 //! Recording the shortfall is the point. A run that could not assert its target still prints the
 //! number it measured and names what was missing, so the run is evidence either way.
@@ -35,12 +42,14 @@ pub const REFERENCE_CORES: usize = 4;
 /// The memory section 27 asks a reference host for.
 pub const REFERENCE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// The share of a measurement the hypervisor may take from the guest before the host cannot be
-/// called idle.
+/// The share of a measurement the hypervisor may take from the guest before this harness stops
+/// asserting a target on it.
 ///
 /// One part in a hundred. Above that the processor spent a material part of the measurement
-/// running something outside this machine, which is exactly the condition section 27 excludes and
-/// is not something the application under test can cause.
+/// running something outside this machine, which is the one part of section 27's idle host that
+/// can be read and is not something the application under test can cause. The number is this
+/// harness's exclusion rule: section 27 states the reference host's processors and memory and says
+/// the host is idle, and quantifies nothing about how idle.
 pub const MAX_STOLEN_SHARE: f64 = 0.01;
 
 /// The host a measurement ran on, as far as it can be read.
@@ -57,6 +66,10 @@ pub struct Host {
     pub cores: usize,
     /// Total memory, where the platform reports it. `None` leaves the condition unverified.
     pub memory_bytes: Option<u64>,
+    /// What the platform calls this processor. Section 27 records the host beside every figure
+    /// because a rate depends on it, and two hosts of the same architecture are not the same
+    /// processor.
+    pub processor: Option<String>,
     /// The one-minute load average, where the platform reports it. Evidence rather than a
     /// condition: it is an average over the minute before the run, so a build that has just
     /// finished still shows in it, and the measurement's own load shows in it too.
@@ -72,15 +85,16 @@ impl Host {
             arch: std::env::consts::ARCH,
             cores: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             memory_bytes: total_memory_bytes(),
+            processor: processor_model(),
             load_average: load_average(),
         }
     }
 
     /// Names every condition section 27 states that this host can be shown not to meet.
     ///
-    /// `stolen` is what [`StolenTime`] measured across the whole run, where the platform reports
-    /// it. A condition that cannot be read is left out: it is recorded as unverified by
-    /// [`Host::lines`] rather than counted against the host.
+    /// `stolen` is the largest share [`StolenTime`] measured over any one phase of the run, where
+    /// the platform accounts for it. A condition that cannot be read is left out: it is recorded as
+    /// unverified by [`Host::lines`] rather than counted against the host.
     pub fn shortfalls(&self, stolen: Option<f64>) -> Vec<String> {
         let mut missing = Vec::new();
         if !self.optimised {
@@ -123,6 +137,12 @@ impl Host {
             ),
             format!("  host              {} {}", self.os, self.arch),
             format!(
+                "  processor         {}",
+                self.processor
+                    .clone()
+                    .unwrap_or_else(|| "not reported here".to_owned())
+            ),
+            format!(
                 "  processors        {} against the reference host's {REFERENCE_CORES}",
                 self.cores
             ),
@@ -150,23 +170,27 @@ impl Host {
 
 /// How much of a measurement the hypervisor took from this guest.
 ///
-/// The one condition section 27 states that nothing else can answer. "An idle host" is not a
-/// property a process can look up, and a shared machine's own load is invisible from inside it,
-/// but the time the processor was taken from the whole guest *is* reported where a platform
-/// accounts for it. It is a host fact: the application under test cannot produce it, which is what
-/// makes it safe to gate on. A platform that does not account for it leaves the condition
-/// unverified.
+/// The one part of section 27's idle host that can be read. "An idle host" is not a property a
+/// process can look up, and a shared machine's own load is invisible from inside it, but the share
+/// of the processor time the hypervisor took from the whole guest *is* accounted for where a
+/// platform keeps it. It is a host fact: the application under test cannot produce it, which is
+/// what makes it safe to gate on. A platform that does not account for it leaves the condition
+/// unverified, and so does a counter that went backwards between two readings.
+///
+/// The share is a ratio of the same counters, so nothing here depends on the kernel's tick rate or
+/// on how many processors the reading covers: stolen ticks over every tick the whole processor line
+/// accounts for. `guest` and `guest_nice` are left out because they repeat time already counted in
+/// `user` and `nice`.
 #[derive(Debug)]
 pub struct StolenTime {
     started: Option<StolenSample>,
 }
 
+/// The processor line's counters at one moment, in whatever ticks the kernel counts in.
 #[derive(Debug, Clone, Copy)]
 struct StolenSample {
-    stolen_ticks: u64,
-    at: Instant,
-    ticks_per_second: f64,
-    cores: f64,
+    stolen: u64,
+    total: u64,
 }
 
 impl StolenTime {
@@ -177,30 +201,35 @@ impl StolenTime {
         }
     }
 
-    /// Returns the share of the elapsed processor time the hypervisor took, where this platform
-    /// accounts for it.
-    pub fn share(&self) -> Option<f64> {
+    /// Returns the share of the processor time the hypervisor took since [`StolenTime::start`],
+    /// where this platform accounts for it, and starts a fresh span from this reading.
+    ///
+    /// Reading it per phase is what lets a run say that each phase stayed inside the cutoff. One
+    /// average over a whole run cannot: a phase that lost a tenth of its processor and a phase
+    /// that lost nothing average to a figure that looks like neither.
+    pub fn take(&mut self) -> Option<f64> {
         let first = self.started?;
         let last = stolen_sample()?;
-        let elapsed = last.at.duration_since(first.at).as_secs_f64();
-        if elapsed <= 0.0 {
+        self.started = Some(last);
+        let stolen = last.stolen.checked_sub(first.stolen)?;
+        let total = last.total.checked_sub(first.total)?;
+        if total == 0 {
             return None;
         }
-        let ticks = last.stolen_ticks.saturating_sub(first.stolen_ticks);
         #[expect(
             clippy::cast_precision_loss,
             reason = "a tick count over one measurement is far inside f64's exact range"
         )]
-        let seconds = ticks as f64 / first.ticks_per_second;
-        Some(seconds / (elapsed * first.cores))
+        let share = stolen as f64 / total as f64;
+        Some(share)
     }
 }
 
-/// Reads the guest's stolen-time counter, where the platform keeps one.
+/// Reads the aggregate processor line's counters, where the platform keeps them.
 ///
-/// Linux reports it as the eighth field of the aggregate processor line of `/proc/stat`, in the
-/// kernel's own tick units. No other supported platform accounts for it, so the condition is
-/// unverified there.
+/// Linux reports them on the first line of `/proc/stat`: `user nice system idle iowait irq softirq
+/// steal guest guest_nice`. No other supported platform accounts for stolen time, so the condition
+/// is unverified there.
 fn stolen_sample() -> Option<StolenSample> {
     if !cfg!(target_os = "linux") {
         return None;
@@ -211,19 +240,18 @@ fn stolen_sample() -> Option<StolenSample> {
     if fields.next()? != "cpu" {
         return None;
     }
-    let stolen_ticks: u64 = fields.nth(7)?.parse().ok()?;
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a processor count is a small integer"
-    )]
-    let cores = cores as f64;
+    // The first eight fields are the processor's time; `guest` and `guest_nice` after them repeat
+    // time `user` and `nice` already counted.
+    let counters: Vec<u64> = fields
+        .take(8)
+        .map(|field| field.parse().ok())
+        .collect::<Option<_>>()?;
+    if counters.len() < 8 {
+        return None;
+    }
     Some(StolenSample {
-        stolen_ticks,
-        at: Instant::now(),
-        // The kernel's user-space tick rate, which is 100 on every Linux this build supports.
-        ticks_per_second: 100.0,
-        cores,
+        stolen: counters[7],
+        total: counters.iter().copied().try_fold(0u64, u64::checked_add)?,
     })
 }
 
@@ -320,6 +348,19 @@ fn load_average() -> Option<f64> {
             .nth(1)?
             .parse()
             .ok();
+    }
+    None
+}
+
+/// What the platform calls this processor, where it says.
+fn processor_model() -> Option<String> {
+    if cfg!(target_os = "linux") {
+        let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        let line = text.lines().find(|line| line.starts_with("model name"))?;
+        return Some(line.split_once(':')?.1.trim().to_owned());
+    }
+    if cfg!(target_os = "macos") {
+        return sysctl("machdep.cpu.brand_string");
     }
     None
 }
