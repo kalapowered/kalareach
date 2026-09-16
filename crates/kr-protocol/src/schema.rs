@@ -75,6 +75,15 @@ use crate::session::{
     SessionReadResult, SessionSummary,
 };
 use crate::sync::{SyncConflictCopy, SyncObjectRecord};
+use crate::transfer::{
+    AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
+    AttachmentHandle, AttachmentReadGrant, DownloadBeginParams, DownloadBeginResult,
+    DownloadChunkParams, DownloadChunkResult, DownloadPlacement, DraftCreateParams,
+    DraftCreateResult, DraftRecord, DraftUpdateParams, DraftUpdateResult, UploadBeginParams,
+    UploadBeginResult, UploadCancelParams, UploadCancelResult, UploadChunkParams,
+    UploadChunkResult, UploadFinishParams, UploadFinishResult, UploadStatusParams,
+    UploadStatusResult,
+};
 use crate::worker::{
     AuthorityRevisionAck, AuthorityRevisionNotice, ControllerGenerationToken, GenerationAccepted,
     GenerationChallenge, WorkerDescriptor, WorkerLaunchSpec, WorkerReady, WorkerRendezvous,
@@ -244,6 +253,33 @@ pub fn protocol_schema() -> Value {
         "worker_rendezvous" => WorkerRendezvous,
         "worker_verify_challenge" => WorkerVerifyChallenge,
         "worker_verify_proof" => WorkerVerifyProof,
+        // Transfers. The generated document sorts its own properties, so this block is appended
+        // rather than interleaved.
+        "agent_draft_add_attachment_params" => AgentDraftAddAttachmentParams,
+        "agent_draft_add_attachment_result" => AgentDraftAddAttachmentResult,
+        "attachment_contribution" => AttachmentContribution,
+        "attachment_handle" => AttachmentHandle,
+        "attachment_read_grant" => AttachmentReadGrant,
+        "download_begin_params" => DownloadBeginParams,
+        "download_begin_result" => DownloadBeginResult,
+        "download_chunk_params" => DownloadChunkParams,
+        "download_chunk_result" => DownloadChunkResult,
+        "download_placement" => DownloadPlacement,
+        "draft_create_params" => DraftCreateParams,
+        "draft_create_result" => DraftCreateResult,
+        "draft_record" => DraftRecord,
+        "draft_update_params" => DraftUpdateParams,
+        "draft_update_result" => DraftUpdateResult,
+        "upload_begin_params" => UploadBeginParams,
+        "upload_begin_result" => UploadBeginResult,
+        "upload_cancel_params" => UploadCancelParams,
+        "upload_cancel_result" => UploadCancelResult,
+        "upload_chunk_params" => UploadChunkParams,
+        "upload_chunk_result" => UploadChunkResult,
+        "upload_finish_params" => UploadFinishParams,
+        "upload_finish_result" => UploadFinishResult,
+        "upload_status_params" => UploadStatusParams,
+        "upload_status_result" => UploadStatusResult,
     }
     properties.insert(
         "identifiers".to_owned(),

@@ -119,5 +119,6 @@ pub mod semantic;
 pub mod service;
 pub mod session;
 pub mod sync;
+pub mod transfer;
 pub mod vectors;
 pub mod worker;

@@ -445,6 +445,54 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "AgentDraftAddAttachmentParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent.draft.add_attachment`.\n\nThis binds a completed handle to a draft and records what the adapter reported. It never\nsubmits: `agent.prompt.submit` is a separate action, and a failed insertion keeps both the\ndraft and the upload.",
+      "properties": {
+        "contribution": {
+          "$ref": "#/$defs/AttachmentContribution",
+          "description": "The contribution the integration declared for this operation."
+        },
+        "draft_id": {
+          "$ref": "#/$defs/DraftId",
+          "description": "The draft."
+        },
+        "expected_revision": {
+          "$ref": "#/$defs/DraftRevision",
+          "description": "The revision the caller expects."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The completed attachment."
+        }
+      },
+      "required": [
+        "draft_id",
+        "expected_revision",
+        "transfer_id",
+        "contribution"
+      ],
+      "type": "object"
+    },
+    "AgentDraftAddAttachmentResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent.draft.add_attachment`.",
+      "properties": {
+        "attachment": {
+          "$ref": "#/$defs/DraftAttachment",
+          "description": "The binding this call recorded."
+        },
+        "draft": {
+          "$ref": "#/$defs/DraftRecord",
+          "description": "The draft after the binding."
+        }
+      },
+      "required": [
+        "draft",
+        "attachment"
+      ],
+      "type": "object"
+    },
     "AgentThreadId": {
       "description": "The upstream agent's conversation identifier, where available. Correlation data, not authority.",
       "maxLength": 256,
@@ -667,6 +715,143 @@
       ],
       "type": "object"
     },
+    "AttachmentContribution": {
+      "additionalProperties": false,
+      "description": "What one integration declares it accepts for one operation.\n\nSection 11 requires the declaration to exist before anything is offered: accepted media types,\nthe selected model's limits, counts, the insertion method and any external destination. A\ncontribution receives completed opaque handles; it never performs the transfer itself.",
+      "properties": {
+        "accepted_media_types": {
+          "description": "The media types the installed agent accepts, exactly as declared.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "external_destination": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The external destination bytes reach, when the operation has one. Null means the bytes stay\nin this environment."
+        },
+        "insertion_method": {
+          "$ref": "#/$defs/InsertionMethod",
+          "description": "How the handle reaches the agent."
+        },
+        "max_byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The largest file the selected model accepts, in bytes."
+        },
+        "max_count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many attachments one draft may carry."
+        },
+        "model_media_capability": {
+          "description": "True when the selected model advertises a media capability for these types.\n\nAn adapter verifies this before offering an image; a false value means the file transfers\nbut is not presented as a model image.",
+          "type": "boolean"
+        },
+        "operation_id": {
+          "description": "The operation this declaration covers.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id",
+        "accepted_media_types",
+        "max_byte_len",
+        "max_count",
+        "insertion_method",
+        "external_destination",
+        "model_media_capability"
+      ],
+      "type": "object"
+    },
+    "AttachmentHandle": {
+      "additionalProperties": false,
+      "description": "A completed, verified attachment.\n\nThis is the opaque handle section 14 requires. It names the environment that owns the bytes, the\ntransfer that produced them and the digest that was verified before anything was published. It\ncarries no host path: an adapter that needs a readable location asks for an\n[`AttachmentReadGrant`] instead.",
+      "properties": {
+        "byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The verified length in bytes."
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The verified whole-file SHA-256 digest."
+        },
+        "declared_media_type": {
+          "description": "The media type the client declared. Declared, not sniffed: it says what the client believes\nit sent.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns the file. A handle never crosses environments."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When an unused attachment expires. Submission replaces this with the session's retention."
+        },
+        "original_file_name": {
+          "description": "The original filename, kept as metadata only.",
+          "type": "string"
+        },
+        "presented_as_image": {
+          "description": "True only when the bytes decoded as one of [`PreviewFormat`]'s formats.\n\nUnsupported media transfers as a file and is never presented as a model image, so an adapter\nreads this rather than guessing from the declared media type or the filename.",
+          "type": "boolean"
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachmentPreview"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The bounded preview, when one could be produced. A failed preview leaves this null and the\nfile itself is unaffected."
+        },
+        "published_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the handle was published."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session the upload was bound to, when it had one."
+        },
+        "submitted": {
+          "description": "True once a draft binding holding this attachment was submitted.",
+          "type": "boolean"
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The transfer that produced it, which is also this attachment's durable identity."
+        }
+      },
+      "required": [
+        "environment_id",
+        "transfer_id",
+        "session_id",
+        "byte_len",
+        "content_digest",
+        "declared_media_type",
+        "original_file_name",
+        "preview",
+        "presented_as_image",
+        "published_at_ms",
+        "expires_at_ms",
+        "submitted"
+      ],
+      "type": "object"
+    },
     "AttachmentId": {
       "description": "One CLI or application attachment, independently of its device.",
       "format": "uuid",
@@ -677,6 +862,84 @@
       "description": "Monotonic attachment join order, used for deterministic geometry-owner succession.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "AttachmentPreview": {
+      "additionalProperties": false,
+      "description": "A bounded thumbnail of a completed attachment.",
+      "properties": {
+        "height": {
+          "$ref": "#/$defs/U64",
+          "description": "The thumbnail's height in pixels."
+        },
+        "source_format": {
+          "$ref": "#/$defs/PreviewFormat",
+          "description": "The format the source was decoded from."
+        },
+        "source_height": {
+          "$ref": "#/$defs/U64",
+          "description": "The source's height in pixels."
+        },
+        "source_width": {
+          "$ref": "#/$defs/U64",
+          "description": "The source's width in pixels."
+        },
+        "thumbnail": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The encoded thumbnail, always PNG, always within [`MAX_PREVIEW_THUMBNAIL_BYTES`]."
+        },
+        "width": {
+          "$ref": "#/$defs/U64",
+          "description": "The thumbnail's width in pixels."
+        }
+      },
+      "required": [
+        "source_format",
+        "source_width",
+        "source_height",
+        "width",
+        "height",
+        "thumbnail"
+      ],
+      "type": "object"
+    },
+    "AttachmentReadGrant": {
+      "additionalProperties": false,
+      "description": "A narrow, expiring read grant over exactly one completed attachment.\n\nThis is how an adapter reaches a staging file when its insertion method needs a readable path.\nIt covers one file, read only, for one purpose, and it weakens nothing else: the agent's sandbox\nis unchanged, and no file is placed inside a repository.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the grant is valid in, and only that one."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the grant expires."
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant's identity."
+        },
+        "host_path": {
+          "description": "The environment-local path the agent may read, valid only while this grant is.\n\nIt is inside the environment's staging area and outside every repository, which is what\nkeeps an upload from becoming a file in the user's working tree.",
+          "type": "string"
+        },
+        "insertion_method": {
+          "$ref": "#/$defs/InsertionMethod",
+          "description": "The insertion method it was issued for."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The attachment it covers."
+        }
+      },
+      "required": [
+        "grant_id",
+        "environment_id",
+        "transfer_id",
+        "insertion_method",
+        "host_path",
+        "expires_at_ms"
+      ],
+      "type": "object"
     },
     "AttachmentSummary": {
       "additionalProperties": false,
@@ -1157,6 +1420,54 @@
       "description": "The exact version of a change set that was tested or reviewed.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "ChunkDescriptor": {
+      "additionalProperties": false,
+      "description": "One chunk's index, exact length and digest.",
+      "properties": {
+        "byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Its exact length."
+        },
+        "digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The SHA-256 digest of exactly those bytes."
+        },
+        "index": {
+          "$ref": "#/$defs/U64",
+          "description": "The chunk's position in the layout."
+        }
+      },
+      "required": [
+        "index",
+        "byte_len",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "ChunkLayout": {
+      "additionalProperties": false,
+      "description": "The chunk layout of one transfer.\n\nBoth directions use the same shape: a fixed chunk size, a count, and the length of the final\nchunk. A zero-length file has no chunks.",
+      "properties": {
+        "chunk_count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many chunks the transfer has."
+        },
+        "chunk_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Bytes per chunk, except the last."
+        },
+        "last_chunk_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Length of the final chunk. Equal to `chunk_len` when the size divides exactly."
+        }
+      },
+      "required": [
+        "chunk_len",
+        "chunk_count",
+        "last_chunk_len"
+      ],
+      "type": "object"
     },
     "ClientBundle": {
       "additionalProperties": false,
@@ -2193,16 +2504,544 @@
         }
       ]
     },
+    "DownloadBeginParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `download.begin`.",
+      "properties": {
+        "device_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The device the concurrency limit is counted against."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns the source."
+        },
+        "resume_transfer_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TransferId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The transfer to resume. Resuming addresses the same snapshot and rechecks read authority; a\nmissing or expired snapshot is refused rather than silently replaced."
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DownloadSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The source, when beginning a new transfer. Ignored when resuming."
+        }
+      },
+      "required": [
+        "environment_id",
+        "resume_transfer_id",
+        "source",
+        "device_id"
+      ],
+      "type": "object"
+    },
+    "DownloadBeginResult": {
+      "additionalProperties": false,
+      "description": "The result of `download.begin`.",
+      "properties": {
+        "byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The size."
+        },
+        "chunks": {
+          "description": "Every chunk's index, length and digest.",
+          "items": {
+            "$ref": "#/$defs/ChunkDescriptor"
+          },
+          "type": "array"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The whole-file digest."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns it."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the snapshot expires."
+        },
+        "immutability": {
+          "$ref": "#/$defs/DownloadImmutability",
+          "description": "How the bytes were made immutable."
+        },
+        "layout": {
+          "$ref": "#/$defs/ChunkLayout",
+          "description": "The chunk layout."
+        },
+        "resumed": {
+          "description": "True when this call resumed an existing snapshot rather than creating one.",
+          "type": "boolean"
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The transfer's opaque identity. A resumed transfer keeps this identity."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "environment_id",
+        "immutability",
+        "byte_len",
+        "content_digest",
+        "layout",
+        "chunks",
+        "expires_at_ms",
+        "resumed"
+      ],
+      "type": "object"
+    },
+    "DownloadChunkParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `download.chunk`.",
+      "properties": {
+        "index": {
+          "$ref": "#/$defs/U64",
+          "description": "The chunk index."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The transfer."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "index"
+      ],
+      "type": "object"
+    },
+    "DownloadChunkResult": {
+      "additionalProperties": false,
+      "description": "The result of `download.chunk`.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The chunk bytes."
+        },
+        "chunk": {
+          "$ref": "#/$defs/ChunkDescriptor",
+          "description": "The chunk's index, exact length and digest."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The transfer."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "chunk",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "DownloadImmutability": {
+      "description": "How a download's bytes were made immutable.",
+      "oneOf": [
+        {
+          "const": "immutable_source",
+          "description": "The source is an already immutable revision and is read in place.",
+          "type": "string"
+        },
+        {
+          "const": "staged_snapshot",
+          "description": "The host staged a bounded copy, because the source could be written while it was read.",
+          "type": "string"
+        }
+      ]
+    },
+    "DownloadPlacement": {
+      "additionalProperties": false,
+      "description": "How a client publishes a verified download to its own destination.\n\nThe host never writes to a client destination. This is the contract the client half performs:\nverify every chunk, the total size and the whole-file digest, write through a temporary file,\nand refuse an existing destination unless the user has taken an explicit overwrite action for\nthat exact destination.",
+      "properties": {
+        "allow_overwrite": {
+          "description": "True only when the user has taken an explicit overwrite action for this destination.\n\nA default value is never true. Without it an existing destination is refused, and the\ntemporary file is removed rather than renamed over anything.",
+          "type": "boolean"
+        },
+        "byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The verified length the client must have received."
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The verified whole-file digest the client must have computed."
+        },
+        "destination_name": {
+          "description": "The name inside the client's chosen destination.",
+          "type": "string"
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The transfer being published."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "destination_name",
+        "byte_len",
+        "content_digest",
+        "allow_overwrite"
+      ],
+      "type": "object"
+    },
+    "DownloadSource": {
+      "description": "Where a download's bytes come from.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A completed attachment in this environment.\n\nA published attachment is already an immutable revision: nothing writes it after its\nverification, so it is served without a copy.",
+          "properties": {
+            "attachment": {
+              "properties": {
+                "transfer_id": {
+                  "$ref": "#/$defs/TransferId",
+                  "description": "The attachment."
+                }
+              },
+              "required": [
+                "transfer_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "attachment"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A file beneath an authorised read scope.\n\nThe source is concurrently writable, so the host stages a bounded immutable snapshot rather\nthan trusting an open handle.",
+          "properties": {
+            "scope": {
+              "properties": {
+                "relative_path": {
+                  "description": "The path beneath it. Absolute paths, traversal segments, separators the host does not\naccept and reserved device names are refused.",
+                  "type": "string"
+                },
+                "scope_id": {
+                  "$ref": "#/$defs/GrantId",
+                  "description": "The scope, which is an opened directory handle the host holds."
+                }
+              },
+              "required": [
+                "scope_id",
+                "relative_path"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "scope"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DraftAttachment": {
+      "additionalProperties": false,
+      "description": "One attachment bound to a draft, and what became of it.",
+      "properties": {
+        "failure_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the insertion failed, when it did."
+        },
+        "handle": {
+          "$ref": "#/$defs/AttachmentHandle",
+          "description": "The completed attachment."
+        },
+        "insertion_method": {
+          "$ref": "#/$defs/InsertionMethod",
+          "description": "How it was offered to the agent."
+        },
+        "read_grant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachmentReadGrant"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The read grant issued for this binding, when its insertion method needed one."
+        },
+        "state": {
+          "$ref": "#/$defs/InsertionState",
+          "description": "What became of the offer."
+        },
+        "upstream_evidence": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The upstream part or native draft binding the adapter reported. Present only for\n[`InsertionState::AcceptedByAgent`], because nothing else establishes acceptance."
+        }
+      },
+      "required": [
+        "handle",
+        "insertion_method",
+        "state",
+        "upstream_evidence",
+        "failure_detail",
+        "read_grant"
+      ],
+      "type": "object"
+    },
+    "DraftCreateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `draft.create`.",
+      "properties": {
+        "application_instance_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApplicationInstanceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The foreground application it targets."
+        },
+        "device_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The device that owns it."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the draft belongs to."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session it targets."
+        },
+        "text": {
+          "description": "Its initial text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "environment_id",
+        "device_id",
+        "session_id",
+        "application_instance_id",
+        "text"
+      ],
+      "type": "object"
+    },
+    "DraftCreateResult": {
+      "additionalProperties": false,
+      "description": "The result of `draft.create`.",
+      "properties": {
+        "draft": {
+          "$ref": "#/$defs/DraftRecord",
+          "description": "The draft."
+        }
+      },
+      "required": [
+        "draft"
+      ],
+      "type": "object"
+    },
     "DraftId": {
       "description": "One durable device-owned draft, independent of an attachment.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "DraftRecord": {
+      "additionalProperties": false,
+      "description": "A durable device-owned draft.\n\nA draft outlives the attachment that displays it: losing a connection removes the association,\nnot the draft. Submission is always a separate action.",
+      "properties": {
+        "application_instance_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApplicationInstanceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The foreground application it targets."
+        },
+        "attachments": {
+          "description": "The attachments bound to it, in binding order.",
+          "items": {
+            "$ref": "#/$defs/DraftAttachment"
+          },
+          "type": "array"
+        },
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was created."
+        },
+        "device_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The device that owns it, when one does."
+        },
+        "draft_id": {
+          "$ref": "#/$defs/DraftId",
+          "description": "The draft's identity."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns it."
+        },
+        "revision": {
+          "$ref": "#/$defs/DraftRevision",
+          "description": "Its current revision. Every update names the revision it expects."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session it targets."
+        },
+        "state": {
+          "$ref": "#/$defs/DraftState",
+          "description": "Its state."
+        },
+        "text": {
+          "description": "The draft text. This is not the native terminal edit buffer.",
+          "type": "string"
+        },
+        "updated_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was last updated."
+        }
+      },
+      "required": [
+        "draft_id",
+        "environment_id",
+        "revision",
+        "device_id",
+        "session_id",
+        "application_instance_id",
+        "state",
+        "text",
+        "attachments",
+        "created_at_ms",
+        "updated_at_ms"
+      ],
+      "type": "object"
+    },
     "DraftRevision": {
       "description": "The exact version of a draft.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "DraftState": {
+      "description": "What state a draft is in.",
+      "oneOf": [
+        {
+          "const": "open",
+          "description": "The draft is bound to its target and can be updated.",
+          "type": "string"
+        },
+        {
+          "const": "conflicted",
+          "description": "The application or binding revision changed. The draft is retained for explicit\nretargeting and is never submitted automatically.",
+          "type": "string"
+        },
+        {
+          "const": "orphaned",
+          "description": "The target is gone. The draft is retained, unbound.",
+          "type": "string"
+        }
+      ]
+    },
+    "DraftUpdateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `draft.update`.",
+      "properties": {
+        "draft_id": {
+          "$ref": "#/$defs/DraftId",
+          "description": "The draft."
+        },
+        "expected_revision": {
+          "$ref": "#/$defs/DraftRevision",
+          "description": "The revision the caller expects. A mismatch is `DRAFT_CONFLICT` and changes nothing."
+        },
+        "text": {
+          "description": "The replacement text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "draft_id",
+        "expected_revision",
+        "text"
+      ],
+      "type": "object"
+    },
+    "DraftUpdateResult": {
+      "additionalProperties": false,
+      "description": "The result of `draft.update`.",
+      "properties": {
+        "draft": {
+          "$ref": "#/$defs/DraftRecord",
+          "description": "The draft after the update."
+        }
+      },
+      "required": [
+        "draft"
+      ],
+      "type": "object"
     },
     "Durability": {
       "description": "Whether a result was recorded durably.",
@@ -4384,6 +5223,46 @@
         "held_prefix_bytes"
       ],
       "type": "object"
+    },
+    "InsertionMethod": {
+      "description": "How an integration puts an attachment in front of its agent.\n\nSection 12 allows exactly three, per operation, declared in advance. None of them is a guess at\na composer's quoting rules.",
+      "oneOf": [
+        {
+          "const": "typed_submission",
+          "description": "A typed submission against the exact upstream binding.",
+          "type": "string"
+        },
+        {
+          "const": "verified_composer_insertion",
+          "description": "Verified insertion into a native composer behind a qualified atomic editor boundary.",
+          "type": "string"
+        },
+        {
+          "const": "manual_terminal_workflow",
+          "description": "The user performs the native operation after an environment-local transfer completes. The\nhost shows the tested syntax; it never injects at a guessed prompt.",
+          "type": "string"
+        }
+      ]
+    },
+    "InsertionState": {
+      "description": "What became of one attachment binding on a draft.",
+      "oneOf": [
+        {
+          "const": "recorded",
+          "description": "The adapter was asked and the binding is recorded. This says nothing about the agent.",
+          "type": "string"
+        },
+        {
+          "const": "accepted_by_agent",
+          "description": "The adapter reported upstream evidence. Only this state means the agent took the file.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The insertion failed. The draft and the completed upload are both retained for a retry.",
+          "type": "string"
+        }
+      ]
     },
     "InstallationId": {
       "description": "One native application installation registered with a push gateway.",
@@ -6793,6 +7672,31 @@
         {
           "const": "invisible",
           "description": "Create without any local terminal attachment.",
+          "type": "string"
+        }
+      ]
+    },
+    "PreviewFormat": {
+      "description": "The image formats a preview decoder accepts.\n\nNothing else is decoded. HTML and SVG are files, not images: rendering either needs a reviewed\nrenderer, which this is not.",
+      "oneOf": [
+        {
+          "const": "png",
+          "description": "Portable Network Graphics.",
+          "type": "string"
+        },
+        {
+          "const": "jpeg",
+          "description": "JPEG.",
+          "type": "string"
+        },
+        {
+          "const": "webp",
+          "description": "WebP.",
+          "type": "string"
+        },
+        {
+          "const": "gif_first_frame",
+          "description": "The first frame of a GIF. Later frames are never decoded.",
           "type": "string"
         }
       ]
@@ -11350,6 +12254,376 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "UploadBeginParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `upload.begin`.",
+      "properties": {
+        "declared_byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The declared size, reserved against the environment budget before anything is written."
+        },
+        "declared_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The declared whole-file digest, verified before anything is published."
+        },
+        "declared_media_type": {
+          "description": "The media type the client believes it is sending.",
+          "type": "string"
+        },
+        "device_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The device the concurrency limit is counted against."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the file will belong to. Uploads bind to an environment, never to a path."
+        },
+        "original_file_name": {
+          "description": "The original filename. Metadata: separators, traversal segments and reserved device names\nnever reach the storage path.",
+          "type": "string"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session the upload is for, when it has one."
+        }
+      },
+      "required": [
+        "environment_id",
+        "session_id",
+        "device_id",
+        "declared_byte_len",
+        "declared_digest",
+        "declared_media_type",
+        "original_file_name"
+      ],
+      "type": "object"
+    },
+    "UploadBeginResult": {
+      "additionalProperties": false,
+      "description": "The result of `upload.begin`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns it."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the unfinished upload expires."
+        },
+        "layout": {
+          "$ref": "#/$defs/ChunkLayout",
+          "description": "The chunk layout the client must follow."
+        },
+        "received_chunks": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The received-chunk bitmap, empty at this point."
+        },
+        "staged_byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Bytes now staged in this environment, this reservation included."
+        },
+        "staged_byte_limit": {
+          "$ref": "#/$defs/U64",
+          "description": "The environment's staged-byte limit."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The upload's identity, which every later chunk and the published handle share."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "environment_id",
+        "layout",
+        "received_chunks",
+        "expires_at_ms",
+        "staged_byte_len",
+        "staged_byte_limit"
+      ],
+      "type": "object"
+    },
+    "UploadCancelParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `upload.cancel`.",
+      "properties": {
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The upload."
+        }
+      },
+      "required": [
+        "transfer_id"
+      ],
+      "type": "object"
+    },
+    "UploadCancelResult": {
+      "additionalProperties": false,
+      "description": "The result of `upload.cancel`.",
+      "properties": {
+        "released_byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Bytes returned to the environment budget."
+        },
+        "state": {
+          "$ref": "#/$defs/UploadState",
+          "description": "Its state after the cancellation."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The upload."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "state",
+        "released_byte_len"
+      ],
+      "type": "object"
+    },
+    "UploadChunkParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `upload.chunk`.\n\nThis rides the attachment-chunk stream, whose frame bound is one 1 MiB chunk plus its metadata.\nA control stream cannot carry it.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The chunk bytes. Their length must equal the descriptor's exactly."
+        },
+        "chunk": {
+          "$ref": "#/$defs/ChunkDescriptor",
+          "description": "The chunk's index, exact length and digest."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The upload."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "chunk",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "UploadChunkResult": {
+      "additionalProperties": false,
+      "description": "The result of `upload.chunk`.",
+      "properties": {
+        "duplicate": {
+          "description": "True when this chunk was already verified with the same digest, so nothing was rewritten.",
+          "type": "boolean"
+        },
+        "index": {
+          "$ref": "#/$defs/U64",
+          "description": "The chunk that was accepted."
+        },
+        "received_byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "How many verified bytes are staged now."
+        },
+        "received_chunks": {
+          "$ref": "#/$defs/Bytes",
+          "description": "Which chunks are verified now."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The upload."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "index",
+        "duplicate",
+        "received_chunks",
+        "received_byte_len"
+      ],
+      "type": "object"
+    },
+    "UploadFinishParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `upload.finish`.\n\nThe declared size and digest are repeated so the host can refuse a client that has changed its\nmind about what it was sending. A changed source needs a new upload identifier.",
+      "properties": {
+        "declared_byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The declared whole-file length, which must match the one `upload.begin` recorded."
+        },
+        "declared_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The declared whole-file digest, which must match the one `upload.begin` recorded."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The upload."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "declared_byte_len",
+        "declared_digest"
+      ],
+      "type": "object"
+    },
+    "UploadFinishResult": {
+      "additionalProperties": false,
+      "description": "The result of `upload.finish`.",
+      "properties": {
+        "already_published": {
+          "description": "True when this call found the attachment already published, which is what a retry after a\nlost reply sees. No second file is ever created.",
+          "type": "boolean"
+        },
+        "handle": {
+          "$ref": "#/$defs/AttachmentHandle",
+          "description": "The published attachment."
+        },
+        "preview_unavailable": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why no preview was produced, when none was. The file itself is unaffected."
+        }
+      },
+      "required": [
+        "handle",
+        "already_published",
+        "preview_unavailable"
+      ],
+      "type": "object"
+    },
+    "UploadState": {
+      "description": "What state an upload is in.",
+      "oneOf": [
+        {
+          "const": "receiving",
+          "description": "Chunks are being accepted.",
+          "type": "string"
+        },
+        {
+          "const": "publishing",
+          "description": "Every chunk is verified and the file is being moved into the completed area. A daemon that\nrestarts here resolves the move from the recorded names rather than starting again.",
+          "type": "string"
+        },
+        {
+          "const": "published",
+          "description": "The whole-file digest and size were verified and the handle exists.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The client cancelled it.",
+          "type": "string"
+        },
+        {
+          "const": "invalidated",
+          "description": "A conflicting duplicate chunk or a failed whole-file verification ended it. The upload\nidentifier is spent; a new one is required.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "It was unfinished for longer than [`UNFINISHED_UPLOAD_LIFETIME`], or the published\nattachment went unused for longer than [`UNUSED_ATTACHMENT_LIFETIME`].",
+          "type": "string"
+        }
+      ]
+    },
+    "UploadStatusParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `upload.status`.",
+      "properties": {
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The upload."
+        }
+      },
+      "required": [
+        "transfer_id"
+      ],
+      "type": "object"
+    },
+    "UploadStatusResult": {
+      "additionalProperties": false,
+      "description": "The result of `upload.status`.\n\nThis is how a lost reply to `upload.finish` is resolved. A published upload answers with its\nhandle, so a client that never saw the reply learns the file exists instead of sending it again.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns it."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it expires."
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachmentHandle"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The published handle, once there is one."
+        },
+        "invalid_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the upload was invalidated, when it was."
+        },
+        "layout": {
+          "$ref": "#/$defs/ChunkLayout",
+          "description": "Its chunk layout."
+        },
+        "received_byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "How many verified bytes are staged."
+        },
+        "received_chunks": {
+          "$ref": "#/$defs/Bytes",
+          "description": "Which chunks are verified."
+        },
+        "state": {
+          "$ref": "#/$defs/UploadState",
+          "description": "Its state."
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId",
+          "description": "The upload."
+        }
+      },
+      "required": [
+        "transfer_id",
+        "environment_id",
+        "state",
+        "layout",
+        "received_chunks",
+        "received_byte_len",
+        "expires_at_ms",
+        "handle",
+        "invalid_reason"
+      ],
+      "type": "object"
+    },
     "Uuid": {
       "description": "A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.",
       "format": "uuid",
@@ -11715,11 +12989,26 @@
     "actor_envelope": {
       "$ref": "#/$defs/ActorEnvelope"
     },
+    "agent_draft_add_attachment_params": {
+      "$ref": "#/$defs/AgentDraftAddAttachmentParams"
+    },
+    "agent_draft_add_attachment_result": {
+      "$ref": "#/$defs/AgentDraftAddAttachmentResult"
+    },
     "archive_descriptor": {
       "$ref": "#/$defs/ArchiveDescriptor"
     },
     "attachment_configure_params": {
       "$ref": "#/$defs/AttachmentConfigureParams"
+    },
+    "attachment_contribution": {
+      "$ref": "#/$defs/AttachmentContribution"
+    },
+    "attachment_handle": {
+      "$ref": "#/$defs/AttachmentHandle"
+    },
+    "attachment_read_grant": {
+      "$ref": "#/$defs/AttachmentReadGrant"
     },
     "attachment_summary": {
       "$ref": "#/$defs/AttachmentSummary"
@@ -11765,6 +13054,36 @@
     },
     "direct_redeem_proof": {
       "$ref": "#/$defs/DirectRedeemProof"
+    },
+    "download_begin_params": {
+      "$ref": "#/$defs/DownloadBeginParams"
+    },
+    "download_begin_result": {
+      "$ref": "#/$defs/DownloadBeginResult"
+    },
+    "download_chunk_params": {
+      "$ref": "#/$defs/DownloadChunkParams"
+    },
+    "download_chunk_result": {
+      "$ref": "#/$defs/DownloadChunkResult"
+    },
+    "download_placement": {
+      "$ref": "#/$defs/DownloadPlacement"
+    },
+    "draft_create_params": {
+      "$ref": "#/$defs/DraftCreateParams"
+    },
+    "draft_create_result": {
+      "$ref": "#/$defs/DraftCreateResult"
+    },
+    "draft_record": {
+      "$ref": "#/$defs/DraftRecord"
+    },
+    "draft_update_params": {
+      "$ref": "#/$defs/DraftUpdateParams"
+    },
+    "draft_update_result": {
+      "$ref": "#/$defs/DraftUpdateResult"
     },
     "envelope_plaintext": {
       "$ref": "#/$defs/EnvelopePlaintext"
@@ -12338,6 +13657,36 @@
     },
     "terminal_resize_params": {
       "$ref": "#/$defs/TerminalResizeParams"
+    },
+    "upload_begin_params": {
+      "$ref": "#/$defs/UploadBeginParams"
+    },
+    "upload_begin_result": {
+      "$ref": "#/$defs/UploadBeginResult"
+    },
+    "upload_cancel_params": {
+      "$ref": "#/$defs/UploadCancelParams"
+    },
+    "upload_cancel_result": {
+      "$ref": "#/$defs/UploadCancelResult"
+    },
+    "upload_chunk_params": {
+      "$ref": "#/$defs/UploadChunkParams"
+    },
+    "upload_chunk_result": {
+      "$ref": "#/$defs/UploadChunkResult"
+    },
+    "upload_finish_params": {
+      "$ref": "#/$defs/UploadFinishParams"
+    },
+    "upload_finish_result": {
+      "$ref": "#/$defs/UploadFinishResult"
+    },
+    "upload_status_params": {
+      "$ref": "#/$defs/UploadStatusParams"
+    },
+    "upload_status_result": {
+      "$ref": "#/$defs/UploadStatusResult"
     },
     "worker_descriptor": {
       "$ref": "#/$defs/WorkerDescriptor"

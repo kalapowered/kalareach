@@ -36,6 +36,14 @@ export type GrantId = string
  */
 export type AuthorityRevision = string
 /**
+ * One KalaReach terminal session.
+ */
+export type SessionId = string
+/**
+ * One foreground application within a terminal session.
+ */
+export type ApplicationInstanceId = string
+/**
  * What an attachment asks to be able to do.
  *
  * A request is not a grant. The host intersects these with the actor's rights, and an attachment
@@ -161,17 +169,9 @@ export type ControlFrame =
  */
 export type AgentBindingRevision = string
 /**
- * One foreground application within a terminal session.
- */
-export type ApplicationInstanceId = string
-/**
  * The session epoch, fixed at 1 in protocol version 1.
  */
 export type SessionEpoch = string
-/**
- * One KalaReach terminal session.
- */
-export type SessionId = string
 /**
  * What the host sends on an authorised control stream outside a response.
  *
@@ -188,6 +188,35 @@ export type ControlEvent =
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
 export type ActionId = string
+/**
+ * One upload or download transfer.
+ */
+export type TransferId = string
+/**
+ * Where a download's bytes come from.
+ */
+export type DownloadSource =
+  | {
+      attachment: {
+        /**
+         * One upload or download transfer.
+         */
+        transfer_id: string
+      }
+    }
+  | {
+      scope: {
+        /**
+         * The path beneath it. Absolute paths, traversal segments, separators the host does not
+         * accept and reserved device names are refused.
+         */
+        relative_path: string
+        /**
+         * One host-issued authority object.
+         */
+        scope_id: string
+      }
+    }
 /**
  * One installed OS, distribution or container environment and OS user.
  */
@@ -499,10 +528,6 @@ export type StreamCursor = string
  */
 export type StreamId = string
 /**
- * One upload or download transfer.
- */
-export type TransferId = string
-/**
  * One automation definition.
  */
 export type WorkflowId = string
@@ -804,8 +829,13 @@ export interface KalaReachProtocol {
   action_read_result?: ActionReadResult
   action_window?: ActionWindow
   actor_envelope?: ActorEnvelope
+  agent_draft_add_attachment_params?: AgentDraftAddAttachmentParams
+  agent_draft_add_attachment_result?: AgentDraftAddAttachmentResult
   archive_descriptor?: ArchiveDescriptor
   attachment_configure_params?: AttachmentConfigureParams
+  attachment_contribution?: AttachmentContribution1
+  attachment_handle?: AttachmentHandle1
+  attachment_read_grant?: AttachmentReadGrant
   attachment_summary?: AttachmentSummary
   attachment_viewport_params?: AttachmentViewportParams
   attachment_viewport_result?: AttachmentViewportResult
@@ -821,6 +851,16 @@ export interface KalaReachProtocol {
   controller_generation_token?: ControllerGenerationToken
   direct_challenge?: DirectChallenge
   direct_redeem_proof?: DirectRedeemProof
+  download_begin_params?: DownloadBeginParams
+  download_begin_result?: DownloadBeginResult
+  download_chunk_params?: DownloadChunkParams
+  download_chunk_result?: DownloadChunkResult
+  download_placement?: DownloadPlacement
+  draft_create_params?: DraftCreateParams
+  draft_create_result?: DraftCreateResult
+  draft_record?: DraftRecord2
+  draft_update_params?: DraftUpdateParams
+  draft_update_result?: DraftUpdateResult
   envelope_plaintext?: EnvelopePlaintext
   environment_list_result?: EnvironmentListResult
   events_snapshot_params?: EventsSnapshotParams
@@ -1015,6 +1055,16 @@ export interface KalaReachProtocol {
   sync_object_record?: SyncObjectRecord
   terminal_geometry_transfer_params?: TerminalGeometryTransferParams
   terminal_resize_params?: TerminalResizeParams
+  upload_begin_params?: UploadBeginParams
+  upload_begin_result?: UploadBeginResult
+  upload_cancel_params?: UploadCancelParams
+  upload_cancel_result?: UploadCancelResult
+  upload_chunk_params?: UploadChunkParams
+  upload_chunk_result?: UploadChunkResult
+  upload_finish_params?: UploadFinishParams
+  upload_finish_result?: UploadFinishResult
+  upload_status_params?: UploadStatusParams
+  upload_status_result?: UploadStatusResult
   worker_descriptor?: WorkerDescriptor
   worker_launch_spec?: WorkerLaunchSpec
   worker_ready?: WorkerReady
@@ -1306,6 +1356,298 @@ export interface ActorEnvelope {
     'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
 }
 /**
+ * Parameters of `agent.draft.add_attachment`.
+ *
+ * This binds a completed handle to a draft and records what the adapter reported. It never
+ * submits: `agent.prompt.submit` is a separate action, and a failed insertion keeps both the
+ * draft and the upload.
+ */
+export interface AgentDraftAddAttachmentParams {
+  contribution: AttachmentContribution
+  /**
+   * The draft.
+   */
+  draft_id: string
+  /**
+   * The revision the caller expects.
+   */
+  expected_revision: string
+  /**
+   * The completed attachment.
+   */
+  transfer_id: string
+}
+/**
+ * The contribution the integration declared for this operation.
+ */
+export interface AttachmentContribution {
+  /**
+   * The media types the installed agent accepts, exactly as declared.
+   */
+  accepted_media_types: string[]
+  /**
+   * The external destination bytes reach, when the operation has one. Null means the bytes stay
+   * in this environment.
+   */
+  external_destination: string | null
+  /**
+   * How the handle reaches the agent.
+   */
+  insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
+  /**
+   * The largest file the selected model accepts, in bytes.
+   */
+  max_byte_len: string
+  /**
+   * How many attachments one draft may carry.
+   */
+  max_count: string
+  /**
+   * True when the selected model advertises a media capability for these types.
+   *
+   * An adapter verifies this before offering an image; a false value means the file transfers
+   * but is not presented as a model image.
+   */
+  model_media_capability: boolean
+  /**
+   * The operation this declaration covers.
+   */
+  operation_id: string
+}
+/**
+ * The result of `agent.draft.add_attachment`.
+ */
+export interface AgentDraftAddAttachmentResult {
+  attachment: DraftAttachment
+  draft: DraftRecord
+}
+/**
+ * The binding this call recorded.
+ */
+export interface DraftAttachment {
+  /**
+   * Why the insertion failed, when it did.
+   */
+  failure_detail: string | null
+  handle: AttachmentHandle
+  /**
+   * How it was offered to the agent.
+   */
+  insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
+  /**
+   * The read grant issued for this binding, when its insertion method needed one.
+   */
+  read_grant: AttachmentReadGrant | null
+  /**
+   * What became of the offer.
+   */
+  state: 'recorded' | 'accepted_by_agent' | 'failed'
+  /**
+   * The upstream part or native draft binding the adapter reported. Present only for
+   * [`InsertionState::AcceptedByAgent`], because nothing else establishes acceptance.
+   */
+  upstream_evidence: string | null
+}
+/**
+ * The completed attachment.
+ */
+export interface AttachmentHandle {
+  /**
+   * The verified length in bytes.
+   */
+  byte_len: string
+  /**
+   * The verified whole-file SHA-256 digest.
+   */
+  content_digest: string
+  /**
+   * The media type the client declared. Declared, not sniffed: it says what the client believes
+   * it sent.
+   */
+  declared_media_type: string
+  /**
+   * The environment that owns the file. A handle never crosses environments.
+   */
+  environment_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The original filename, kept as metadata only.
+   */
+  original_file_name: string
+  /**
+   * True only when the bytes decoded as one of [`PreviewFormat`]'s formats.
+   *
+   * Unsupported media transfers as a file and is never presented as a model image, so an adapter
+   * reads this rather than guessing from the declared media type or the filename.
+   */
+  presented_as_image: boolean
+  /**
+   * The bounded preview, when one could be produced. A failed preview leaves this null and the
+   * file itself is unaffected.
+   */
+  preview: AttachmentPreview | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  published_at_ms: string
+  /**
+   * The session the upload was bound to, when it had one.
+   */
+  session_id: SessionId | null
+  /**
+   * True once a draft binding holding this attachment was submitted.
+   */
+  submitted: boolean
+  /**
+   * The transfer that produced it, which is also this attachment's durable identity.
+   */
+  transfer_id: string
+}
+/**
+ * A bounded thumbnail of a completed attachment.
+ */
+export interface AttachmentPreview {
+  /**
+   * The thumbnail's height in pixels.
+   */
+  height: string
+  /**
+   * The format the source was decoded from.
+   */
+  source_format: 'png' | 'jpeg' | 'webp' | 'gif_first_frame'
+  /**
+   * The source's height in pixels.
+   */
+  source_height: string
+  /**
+   * The source's width in pixels.
+   */
+  source_width: string
+  /**
+   * The encoded thumbnail, always PNG, always within [`MAX_PREVIEW_THUMBNAIL_BYTES`].
+   */
+  thumbnail: string
+  /**
+   * The thumbnail's width in pixels.
+   */
+  width: string
+}
+/**
+ * A narrow, expiring read grant over exactly one completed attachment.
+ *
+ * This is how an adapter reaches a staging file when its insertion method needs a readable path.
+ * It covers one file, read only, for one purpose, and it weakens nothing else: the agent's sandbox
+ * is unchanged, and no file is placed inside a repository.
+ */
+export interface AttachmentReadGrant {
+  /**
+   * The environment the grant is valid in, and only that one.
+   */
+  environment_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * The environment-local path the agent may read, valid only while this grant is.
+   *
+   * It is inside the environment's staging area and outside every repository, which is what
+   * keeps an upload from becoming a file in the user's working tree.
+   */
+  host_path: string
+  /**
+   * The insertion method it was issued for.
+   */
+  insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
+  /**
+   * The attachment it covers.
+   */
+  transfer_id: string
+}
+/**
+ * The draft after the binding.
+ */
+export interface DraftRecord {
+  /**
+   * The foreground application it targets.
+   */
+  application_instance_id: ApplicationInstanceId | null
+  /**
+   * The attachments bound to it, in binding order.
+   */
+  attachments: DraftAttachment1[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The device that owns it, when one does.
+   */
+  device_id: DeviceId | null
+  /**
+   * The draft's identity.
+   */
+  draft_id: string
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  /**
+   * Its current revision. Every update names the revision it expects.
+   */
+  revision: string
+  /**
+   * The session it targets.
+   */
+  session_id: SessionId | null
+  /**
+   * Its state.
+   */
+  state: 'open' | 'conflicted' | 'orphaned'
+  /**
+   * The draft text. This is not the native terminal edit buffer.
+   */
+  text: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  updated_at_ms: string
+}
+/**
+ * One attachment bound to a draft, and what became of it.
+ */
+export interface DraftAttachment1 {
+  /**
+   * Why the insertion failed, when it did.
+   */
+  failure_detail: string | null
+  handle: AttachmentHandle
+  /**
+   * How it was offered to the agent.
+   */
+  insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
+  /**
+   * The read grant issued for this binding, when its insertion method needed one.
+   */
+  read_grant: AttachmentReadGrant | null
+  /**
+   * What became of the offer.
+   */
+  state: 'recorded' | 'accepted_by_agent' | 'failed'
+  /**
+   * The upstream part or native draft binding the adapter reported. Present only for
+   * [`InsertionState::AcceptedByAgent`], because nothing else establishes acceptance.
+   */
+  upstream_evidence: string | null
+}
+/**
  * The public descriptor of one archive.
  *
  * Everything outside it is opaque: the archive identity and encrypted-object references. The
@@ -1417,6 +1759,110 @@ export interface AttachmentConfigureParams {
    * Whether it holds a geometry claim after this call.
    */
   claim_geometry: boolean
+}
+/**
+ * What one integration declares it accepts for one operation.
+ *
+ * Section 11 requires the declaration to exist before anything is offered: accepted media types,
+ * the selected model's limits, counts, the insertion method and any external destination. A
+ * contribution receives completed opaque handles; it never performs the transfer itself.
+ */
+export interface AttachmentContribution1 {
+  /**
+   * The media types the installed agent accepts, exactly as declared.
+   */
+  accepted_media_types: string[]
+  /**
+   * The external destination bytes reach, when the operation has one. Null means the bytes stay
+   * in this environment.
+   */
+  external_destination: string | null
+  /**
+   * How the handle reaches the agent.
+   */
+  insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
+  /**
+   * The largest file the selected model accepts, in bytes.
+   */
+  max_byte_len: string
+  /**
+   * How many attachments one draft may carry.
+   */
+  max_count: string
+  /**
+   * True when the selected model advertises a media capability for these types.
+   *
+   * An adapter verifies this before offering an image; a false value means the file transfers
+   * but is not presented as a model image.
+   */
+  model_media_capability: boolean
+  /**
+   * The operation this declaration covers.
+   */
+  operation_id: string
+}
+/**
+ * A completed, verified attachment.
+ *
+ * This is the opaque handle section 14 requires. It names the environment that owns the bytes, the
+ * transfer that produced them and the digest that was verified before anything was published. It
+ * carries no host path: an adapter that needs a readable location asks for an
+ * [`AttachmentReadGrant`] instead.
+ */
+export interface AttachmentHandle1 {
+  /**
+   * The verified length in bytes.
+   */
+  byte_len: string
+  /**
+   * The verified whole-file SHA-256 digest.
+   */
+  content_digest: string
+  /**
+   * The media type the client declared. Declared, not sniffed: it says what the client believes
+   * it sent.
+   */
+  declared_media_type: string
+  /**
+   * The environment that owns the file. A handle never crosses environments.
+   */
+  environment_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The original filename, kept as metadata only.
+   */
+  original_file_name: string
+  /**
+   * True only when the bytes decoded as one of [`PreviewFormat`]'s formats.
+   *
+   * Unsupported media transfers as a file and is never presented as a model image, so an adapter
+   * reads this rather than guessing from the declared media type or the filename.
+   */
+  presented_as_image: boolean
+  /**
+   * The bounded preview, when one could be produced. A failed preview leaves this null and the
+   * file itself is unaffected.
+   */
+  preview: AttachmentPreview | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  published_at_ms: string
+  /**
+   * The session the upload was bound to, when it had one.
+   */
+  session_id: SessionId | null
+  /**
+   * True once a draft binding holding this attachment was submitted.
+   */
+  submitted: boolean
+  /**
+   * The transfer that produced it, which is also this attachment's durable identity.
+   */
+  transfer_id: string
 }
 /**
  * One attachment of a session.
@@ -2835,6 +3281,381 @@ export interface DevicePublicKeys1 {
    * The iroh transport identity.
    */
   transport: string
+}
+/**
+ * Parameters of `download.begin`.
+ */
+export interface DownloadBeginParams {
+  /**
+   * The device the concurrency limit is counted against.
+   */
+  device_id: DeviceId | null
+  /**
+   * The environment that owns the source.
+   */
+  environment_id: string
+  /**
+   * The transfer to resume. Resuming addresses the same snapshot and rechecks read authority; a
+   * missing or expired snapshot is refused rather than silently replaced.
+   */
+  resume_transfer_id: TransferId | null
+  /**
+   * The source, when beginning a new transfer. Ignored when resuming.
+   */
+  source: DownloadSource | null
+}
+/**
+ * The result of `download.begin`.
+ */
+export interface DownloadBeginResult {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  byte_len: string
+  /**
+   * Every chunk's index, length and digest.
+   */
+  chunks: ChunkDescriptor[]
+  /**
+   * The whole-file digest.
+   */
+  content_digest: string
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * How the bytes were made immutable.
+   */
+  immutability: 'immutable_source' | 'staged_snapshot'
+  layout: ChunkLayout
+  /**
+   * True when this call resumed an existing snapshot rather than creating one.
+   */
+  resumed: boolean
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * One chunk's index, exact length and digest.
+ */
+export interface ChunkDescriptor {
+  /**
+   * Its exact length.
+   */
+  byte_len: string
+  /**
+   * The SHA-256 digest of exactly those bytes.
+   */
+  digest: string
+  /**
+   * The chunk's position in the layout.
+   */
+  index: string
+}
+/**
+ * The chunk layout.
+ */
+export interface ChunkLayout {
+  /**
+   * How many chunks the transfer has.
+   */
+  chunk_count: string
+  /**
+   * Bytes per chunk, except the last.
+   */
+  chunk_len: string
+  /**
+   * Length of the final chunk. Equal to `chunk_len` when the size divides exactly.
+   */
+  last_chunk_len: string
+}
+/**
+ * Parameters of `download.chunk`.
+ */
+export interface DownloadChunkParams {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  index: string
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * The result of `download.chunk`.
+ */
+export interface DownloadChunkResult {
+  /**
+   * The chunk bytes.
+   */
+  bytes: string
+  chunk: ChunkDescriptor1
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * One chunk's index, exact length and digest.
+ */
+export interface ChunkDescriptor1 {
+  /**
+   * Its exact length.
+   */
+  byte_len: string
+  /**
+   * The SHA-256 digest of exactly those bytes.
+   */
+  digest: string
+  /**
+   * The chunk's position in the layout.
+   */
+  index: string
+}
+/**
+ * How a client publishes a verified download to its own destination.
+ *
+ * The host never writes to a client destination. This is the contract the client half performs:
+ * verify every chunk, the total size and the whole-file digest, write through a temporary file,
+ * and refuse an existing destination unless the user has taken an explicit overwrite action for
+ * that exact destination.
+ */
+export interface DownloadPlacement {
+  /**
+   * True only when the user has taken an explicit overwrite action for this destination.
+   *
+   * A default value is never true. Without it an existing destination is refused, and the
+   * temporary file is removed rather than renamed over anything.
+   */
+  allow_overwrite: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  byte_len: string
+  /**
+   * The verified whole-file digest the client must have computed.
+   */
+  content_digest: string
+  /**
+   * The name inside the client's chosen destination.
+   */
+  destination_name: string
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * Parameters of `draft.create`.
+ */
+export interface DraftCreateParams {
+  /**
+   * The foreground application it targets.
+   */
+  application_instance_id: ApplicationInstanceId | null
+  /**
+   * The device that owns it.
+   */
+  device_id: DeviceId | null
+  /**
+   * The environment the draft belongs to.
+   */
+  environment_id: string
+  /**
+   * The session it targets.
+   */
+  session_id: SessionId | null
+  /**
+   * Its initial text.
+   */
+  text: string
+}
+/**
+ * The result of `draft.create`.
+ */
+export interface DraftCreateResult {
+  draft: DraftRecord1
+}
+/**
+ * The draft.
+ */
+export interface DraftRecord1 {
+  /**
+   * The foreground application it targets.
+   */
+  application_instance_id: ApplicationInstanceId | null
+  /**
+   * The attachments bound to it, in binding order.
+   */
+  attachments: DraftAttachment1[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The device that owns it, when one does.
+   */
+  device_id: DeviceId | null
+  /**
+   * The draft's identity.
+   */
+  draft_id: string
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  /**
+   * Its current revision. Every update names the revision it expects.
+   */
+  revision: string
+  /**
+   * The session it targets.
+   */
+  session_id: SessionId | null
+  /**
+   * Its state.
+   */
+  state: 'open' | 'conflicted' | 'orphaned'
+  /**
+   * The draft text. This is not the native terminal edit buffer.
+   */
+  text: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  updated_at_ms: string
+}
+/**
+ * A durable device-owned draft.
+ *
+ * A draft outlives the attachment that displays it: losing a connection removes the association,
+ * not the draft. Submission is always a separate action.
+ */
+export interface DraftRecord2 {
+  /**
+   * The foreground application it targets.
+   */
+  application_instance_id: ApplicationInstanceId | null
+  /**
+   * The attachments bound to it, in binding order.
+   */
+  attachments: DraftAttachment1[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The device that owns it, when one does.
+   */
+  device_id: DeviceId | null
+  /**
+   * The draft's identity.
+   */
+  draft_id: string
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  /**
+   * Its current revision. Every update names the revision it expects.
+   */
+  revision: string
+  /**
+   * The session it targets.
+   */
+  session_id: SessionId | null
+  /**
+   * Its state.
+   */
+  state: 'open' | 'conflicted' | 'orphaned'
+  /**
+   * The draft text. This is not the native terminal edit buffer.
+   */
+  text: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  updated_at_ms: string
+}
+/**
+ * Parameters of `draft.update`.
+ */
+export interface DraftUpdateParams {
+  /**
+   * The draft.
+   */
+  draft_id: string
+  /**
+   * The revision the caller expects. A mismatch is `DRAFT_CONFLICT` and changes nothing.
+   */
+  expected_revision: string
+  /**
+   * The replacement text.
+   */
+  text: string
+}
+/**
+ * The result of `draft.update`.
+ */
+export interface DraftUpdateResult {
+  draft: DraftRecord3
+}
+/**
+ * The draft after the update.
+ */
+export interface DraftRecord3 {
+  /**
+   * The foreground application it targets.
+   */
+  application_instance_id: ApplicationInstanceId | null
+  /**
+   * The attachments bound to it, in binding order.
+   */
+  attachments: DraftAttachment1[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The device that owns it, when one does.
+   */
+  device_id: DeviceId | null
+  /**
+   * The draft's identity.
+   */
+  draft_id: string
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  /**
+   * Its current revision. Every update names the revision it expects.
+   */
+  revision: string
+  /**
+   * The session it targets.
+   */
+  session_id: SessionId | null
+  /**
+   * Its state.
+   */
+  state: 'open' | 'conflicted' | 'orphaned'
+  /**
+   * The draft text. This is not the native terminal edit buffer.
+   */
+  text: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  updated_at_ms: string
 }
 /**
  * The authenticated plaintext of one mailbox envelope.
@@ -7514,6 +8335,332 @@ export interface Dimensions5 {
    * Rows, from 1 to 1,024.
    */
   rows: string
+}
+/**
+ * Parameters of `upload.begin`.
+ */
+export interface UploadBeginParams {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  declared_byte_len: string
+  /**
+   * The declared whole-file digest, verified before anything is published.
+   */
+  declared_digest: string
+  /**
+   * The media type the client believes it is sending.
+   */
+  declared_media_type: string
+  /**
+   * The device the concurrency limit is counted against.
+   */
+  device_id: DeviceId | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The original filename. Metadata: separators, traversal segments and reserved device names
+   * never reach the storage path.
+   */
+  original_file_name: string
+  /**
+   * The session the upload is for, when it has one.
+   */
+  session_id: SessionId | null
+}
+/**
+ * The result of `upload.begin`.
+ */
+export interface UploadBeginResult {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  layout: ChunkLayout1
+  /**
+   * The received-chunk bitmap, empty at this point.
+   */
+  received_chunks: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  staged_byte_len: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  staged_byte_limit: string
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * The chunk layout the client must follow.
+ */
+export interface ChunkLayout1 {
+  /**
+   * How many chunks the transfer has.
+   */
+  chunk_count: string
+  /**
+   * Bytes per chunk, except the last.
+   */
+  chunk_len: string
+  /**
+   * Length of the final chunk. Equal to `chunk_len` when the size divides exactly.
+   */
+  last_chunk_len: string
+}
+/**
+ * Parameters of `upload.cancel`.
+ */
+export interface UploadCancelParams {
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * The result of `upload.cancel`.
+ */
+export interface UploadCancelResult {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  released_byte_len: string
+  /**
+   * Its state after the cancellation.
+   */
+  state: 'receiving' | 'publishing' | 'published' | 'cancelled' | 'invalidated' | 'expired'
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * Parameters of `upload.chunk`.
+ *
+ * This rides the attachment-chunk stream, whose frame bound is one 1 MiB chunk plus its metadata.
+ * A control stream cannot carry it.
+ */
+export interface UploadChunkParams {
+  /**
+   * The chunk bytes. Their length must equal the descriptor's exactly.
+   */
+  bytes: string
+  chunk: ChunkDescriptor2
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * One chunk's index, exact length and digest.
+ */
+export interface ChunkDescriptor2 {
+  /**
+   * Its exact length.
+   */
+  byte_len: string
+  /**
+   * The SHA-256 digest of exactly those bytes.
+   */
+  digest: string
+  /**
+   * The chunk's position in the layout.
+   */
+  index: string
+}
+/**
+ * The result of `upload.chunk`.
+ */
+export interface UploadChunkResult {
+  /**
+   * True when this chunk was already verified with the same digest, so nothing was rewritten.
+   */
+  duplicate: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  index: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  received_byte_len: string
+  /**
+   * Which chunks are verified now.
+   */
+  received_chunks: string
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * Parameters of `upload.finish`.
+ *
+ * The declared size and digest are repeated so the host can refuse a client that has changed its
+ * mind about what it was sending. A changed source needs a new upload identifier.
+ */
+export interface UploadFinishParams {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  declared_byte_len: string
+  /**
+   * The declared whole-file digest, which must match the one `upload.begin` recorded.
+   */
+  declared_digest: string
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * The result of `upload.finish`.
+ */
+export interface UploadFinishResult {
+  /**
+   * True when this call found the attachment already published, which is what a retry after a
+   * lost reply sees. No second file is ever created.
+   */
+  already_published: boolean
+  handle: AttachmentHandle2
+  /**
+   * Why no preview was produced, when none was. The file itself is unaffected.
+   */
+  preview_unavailable: string | null
+}
+/**
+ * The published attachment.
+ */
+export interface AttachmentHandle2 {
+  /**
+   * The verified length in bytes.
+   */
+  byte_len: string
+  /**
+   * The verified whole-file SHA-256 digest.
+   */
+  content_digest: string
+  /**
+   * The media type the client declared. Declared, not sniffed: it says what the client believes
+   * it sent.
+   */
+  declared_media_type: string
+  /**
+   * The environment that owns the file. A handle never crosses environments.
+   */
+  environment_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The original filename, kept as metadata only.
+   */
+  original_file_name: string
+  /**
+   * True only when the bytes decoded as one of [`PreviewFormat`]'s formats.
+   *
+   * Unsupported media transfers as a file and is never presented as a model image, so an adapter
+   * reads this rather than guessing from the declared media type or the filename.
+   */
+  presented_as_image: boolean
+  /**
+   * The bounded preview, when one could be produced. A failed preview leaves this null and the
+   * file itself is unaffected.
+   */
+  preview: AttachmentPreview | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  published_at_ms: string
+  /**
+   * The session the upload was bound to, when it had one.
+   */
+  session_id: SessionId | null
+  /**
+   * True once a draft binding holding this attachment was submitted.
+   */
+  submitted: boolean
+  /**
+   * The transfer that produced it, which is also this attachment's durable identity.
+   */
+  transfer_id: string
+}
+/**
+ * Parameters of `upload.status`.
+ */
+export interface UploadStatusParams {
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * The result of `upload.status`.
+ *
+ * This is how a lost reply to `upload.finish` is resolved. A published upload answers with its
+ * handle, so a client that never saw the reply learns the file exists instead of sending it again.
+ */
+export interface UploadStatusResult {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The published handle, once there is one.
+   */
+  handle: AttachmentHandle1 | null
+  /**
+   * Why the upload was invalidated, when it was.
+   */
+  invalid_reason: string | null
+  layout: ChunkLayout2
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  received_byte_len: string
+  /**
+   * Which chunks are verified.
+   */
+  received_chunks: string
+  /**
+   * Its state.
+   */
+  state: 'receiving' | 'publishing' | 'published' | 'cancelled' | 'invalidated' | 'expired'
+  /**
+   * One upload or download transfer.
+   */
+  transfer_id: string
+}
+/**
+ * Its chunk layout.
+ */
+export interface ChunkLayout2 {
+  /**
+   * How many chunks the transfer has.
+   */
+  chunk_count: string
+  /**
+   * Bytes per chunk, except the last.
+   */
+  chunk_len: string
+  /**
+   * Length of the final chunk. Equal to `chunk_len` when the size divides exactly.
+   */
+  last_chunk_len: string
 }
 /**
  * What the controller publishes so a client can reach a worker without asking the controller.
