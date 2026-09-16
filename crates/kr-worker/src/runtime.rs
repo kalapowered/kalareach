@@ -457,9 +457,10 @@ impl SessionRuntime {
         let (output_sender, mut output_receiver) = mpsc::channel::<ReadEvent>(READ_QUEUE_DEPTH);
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
-        // A process this session owns starts from input it accepted or shows itself in output it
-        // produced, so both of those are what ask the supervision to look. Nothing here is on a
-        // clock that an idle session pays for.
+        // Input this session accepted and output it produced are what ask the supervision to look
+        // at the boundary; neither is proof that a process started, and [`crate::lifecycle`] says
+        // what a session whose application works in silence leaves out. Nothing here is on a clock
+        // that an idle session pays for.
         let activity = crate::lifecycle::Activity::new();
 
         // The read loop runs on its own thread. The terminal answers a read with nothing to read

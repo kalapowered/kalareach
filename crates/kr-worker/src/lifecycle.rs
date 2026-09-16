@@ -70,11 +70,12 @@ pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// delivers a child signal this interval is unused.
 pub const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Whether anything that can have started a process has happened.
+/// Whether the session has done anything that is worth looking at the boundary for.
 ///
-/// A session's own traffic is the event source for the set of processes it owns. A command that
-/// starts a job is input the session accepted, and a job that is running writes something; both
-/// pass through [`crate::runtime`], and both mark this.
+/// A session's own traffic is what asks for an observation: a command that starts a job is input the
+/// session accepted, and a job that is running usually writes something. Both pass through
+/// [`crate::runtime`], and both mark this. Neither is proof that a process started, and the absence
+/// of both is not proof that none did: the module documentation says what that leaves out.
 #[derive(Debug, Default)]
 pub struct Activity {
     happened: AtomicBool,
