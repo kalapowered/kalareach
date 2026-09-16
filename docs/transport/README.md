@@ -474,10 +474,12 @@ one-minute average carries the build that just finished.
 KR-PERF-005 is asserted where the host meets every condition it can be shown against, and recorded
 with the shortfall named where it does not. The reason is in the shape of the figure: it is a
 difference between two percentiles taken on the same host, so noise enters it twice and does not
-cancel. On a host the hypervisor kept taking the processor from, the difference is about contention
-rather than about this application. Where a run cannot assert the target it prints its figure,
-names what was missing and asserts nothing about the number; the evidence for the target is then
-the reference-host run in the release acceptance record.
+cancel. On a host the hypervisor kept taking the processor from, the difference is not evidence
+about this application. It does not follow that contention caused the whole difference, and nothing
+here claims it did: what a shortfall withdraws is the assertion, not the figure. Where a run cannot
+assert the target it prints its figure, names what was missing and asserts nothing about the
+number; the evidence for the target is then the reference-host run in the release acceptance
+record.
 
 KR-PERF-006 is asserted on every run, unoptimised builds included. It has held on every host this
 has run on by three orders of magnitude, which is why it is asserted unconditionally: that is a

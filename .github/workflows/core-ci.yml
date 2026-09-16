@@ -85,8 +85,8 @@ jobs:
       # build too. The harness prints the measurement conditions section 27 states beside each
       # figure and asserts the scheduling target where those conditions hold; a runner that cannot
       # meet them records the figure and names the shortfall instead. The property behind the
-      # figure is asserted on every run, in the test step above. Serially, because the two
-      # measurements would otherwise time each other.
+      # figure is asserted in the test step above, so a run that got that far has it. Serially,
+      # because the two measurements would otherwise time each other.
       - name: Transport scheduling and reconnect
         if: ${{ !cancelled() }}
         run: cargo test --locked --release -p kr-transport --test perf -- --nocapture --test-threads=1

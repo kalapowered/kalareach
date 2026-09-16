@@ -265,9 +265,9 @@ fn drain(stream: &[u8], drain_replies: bool) -> Run {
 /// What the passes sustained together: every byte they drained over every second they took.
 ///
 /// This is the figure the target is asserted against, because KR-PERF-007 is about sustaining a
-/// rate rather than reaching one. A pass that went faster than the others is reported beside it as
-/// what the engine reached when nothing interfered, and it decides nothing: three passes at 3, 3
-/// and 6 MiB/s sustained 3.6 MiB/s and would fail, which is the right answer.
+/// rate rather than reaching one. The fastest pass is reported beside it as the fastest pass
+/// observed, and it decides nothing: three passes at 3, 3 and 6 MiB/s sustained 3.6 MiB/s and
+/// would fail, which is the right answer.
 fn sustained_mib_per_second(runs: &[Run]) -> f64 {
     let bytes: usize = runs.iter().map(|run| run.bytes).sum();
     let seconds: f64 = runs.iter().map(|run| run.elapsed_secs).sum();
