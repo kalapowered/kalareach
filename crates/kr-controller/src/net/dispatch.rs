@@ -294,9 +294,16 @@ impl RemoteOutput {
     }
 
     /// Tells whoever was waiting that this frame has been written.
+    ///
+    /// Only an answer that carries a result counts. A refusal or an unknown outcome is not an
+    /// acceptance, and whatever is waiting for one is left to its own bound rather than told that
+    /// something arrived which the device cannot act on.
     fn delivered(&self, frame: &ControlFrame) {
         let request_id = match frame {
-            ControlFrame::Response(response) => response.request_id,
+            ControlFrame::Response(Response {
+                request_id,
+                outcome: Outcome::Ok(_),
+            }) => *request_id,
             ControlFrame::Receipt(receipt) => receipt.request_id,
             _ => return,
         };
@@ -611,7 +618,15 @@ impl RemoteConnection {
         match self.retained_remotely(mutation, validated).await {
             Ok(Some(answered)) => return answered,
             Ok(None) => {}
-            Err(error) => return failure(mutation.request_id, error),
+            // Storage that cannot say whether this action has been dispatched says nothing about
+            // the action. Section 7 does not let that stop an authorised stop, so a close goes on
+            // and reports whatever durability it then had; anything else is refused.
+            Err(RouteRefusal::Unavailable(error)) => {
+                if entry.method != Method::SessionClose {
+                    return failure(mutation.request_id, error);
+                }
+            }
+            Err(RouteRefusal::Conflict(error)) => return failure(mutation.request_id, error),
         }
         let accepted = match self.check_envelope(mutation, entry) {
             Ok(accepted) => accepted,
@@ -937,25 +952,30 @@ impl RemoteConnection {
         &self,
         mutation: &MutationRequest,
         validated: AuthorityRevision,
-    ) -> std::result::Result<Option<ControlFrame>, ProtocolError> {
+    ) -> std::result::Result<Option<ControlFrame>, RouteRefusal> {
         let actor_id = self.device.principal();
         let Some(routed) = self
             .devices
             .action_route(&actor_id, mutation.action_id)
-            .map_err(|error| error.to_protocol_error())?
+            .map_err(|error| RouteRefusal::Unavailable(error.to_protocol_error()))?
         else {
             return Ok(None);
         };
-        let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
-            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        let digest =
+            kr_protocol::digest::mutation_digest(mutation, &actor_id).map_err(|error| {
+                RouteRefusal::Conflict(ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    error.to_string(),
+                ))
+            })?;
         if routed.payload_digest != Some(digest) {
-            return Err(ProtocolError::new(
+            return Err(RouteRefusal::Conflict(ProtocolError::new(
                 ErrorCode::IdConflict,
                 format!(
                     "action {} was already used with a different request",
                     mutation.action_id
                 ),
-            ));
+            )));
         }
         // An action this host itself owns the receipt of is answered by the daemon or not at all.
         // Asking a worker about it would ask the wrong journal.
@@ -973,9 +993,12 @@ impl RemoteConnection {
         ) else {
             return Ok(None);
         };
-        if self.check_grant(Some(session_id), entry, false).is_err() {
-            return Ok(None);
-        }
+        // A refusal here is the answer, not a reason to go on. This action has already been
+        // dispatched, and forwarding it again would have the worker answer from the receipt this
+        // device may not read: section 23 has present view authority over the subject decide
+        // whether either half of a retained result is returned.
+        self.check_grant(Some(session_id), entry, false)
+            .map_err(RouteRefusal::Conflict)?;
         // A link that cannot be opened is not an answer. The ordinary path decides what this
         // request gets, which for a session whose worker has gone is that session's own refusal
         // rather than a second dispatch.
@@ -989,10 +1012,15 @@ impl RemoteConnection {
             params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
                 action_id: mutation.action_id,
             })
-            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?,
+            .map_err(|error| {
+                RouteRefusal::Conflict(ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    error.to_string(),
+                ))
+            })?,
         };
         let envelope = self.envelope(validated);
-        let authority = self.authority_deadline()?;
+        let authority = self.authority_deadline().map_err(RouteRefusal::Conflict)?;
         let Ok(response) = proxy.forward_read(&request, &envelope, authority).await else {
             // The link failed, not the lookup. The ordinary path decides what happens next.
             return Ok(None);
