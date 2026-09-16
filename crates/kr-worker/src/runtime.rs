@@ -196,11 +196,14 @@ impl SessionRuntime {
         let queued_lease = session.queued_lease_bytes();
         let delivered_paste_open = session.delivered_paste_open();
         let lease_change_queued = session.lease_change_queued();
-        let session = Arc::new(Mutex::new(session));
-        let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<InputBatch>();
         // What the writer compares every batch against. A takeover, a release, a detach or a close
         // moves the session's lease epoch, and this is how that reaches bytes already handed over.
-        let fence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The session owns it, because it publishes the change in the same breath as making it,
+        // which is what lets the bytes that lease left behind be counted once it can no longer be
+        // writing them.
+        let fence = session.input_fence_handle();
+        let session = Arc::new(Mutex::new(session));
+        let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<InputBatch>();
         // Bounded on purpose. Section 9 says a slow *client* must never hold the read loop, and it
         // also says the worker honours the operating system's own backpressure when parsing itself
         // cannot keep up, and never drops parser input. A bounded handoff does both: clients are
@@ -546,20 +549,18 @@ impl SessionRuntime {
         let mut session = self.session();
         let pending = session.take_pending_input();
         // Sent while the session is still held, so two callers cannot interleave their batches:
-        // the order bytes reach the terminal in is the order they were accepted in.
-        self.fence
-            .store(session.input_fence(), std::sync::atomic::Ordering::Release);
+        // the order bytes reach the terminal in is the order they were accepted in. The fence is
+        // already published: the session moves it as it changes the lease, which is earlier than
+        // here and earlier than anything that counts what the lease left behind.
         self.send_input(pending);
     }
 
     /// Writes the batches a caller produced while it was holding the session.
     ///
-    /// The fence moves first, so a batch the caller's own operation invalidated is dropped by the
-    /// writer rather than written.
+    /// The session published the fence as it changed the lease, so a batch the caller's own
+    /// operation invalidated is already one the writer drops rather than writes.
     pub fn flush_locked(&self, session: &mut Session) {
         let pending = session.take_pending_input();
-        self.fence
-            .store(session.input_fence(), std::sync::atomic::Ordering::Release);
         self.send_input(pending);
     }
 
@@ -629,8 +630,8 @@ impl SessionRuntime {
 
     /// Returns the lease epoch the writer is comparing every queued batch against.
     ///
-    /// It is the published half of [`Session::input_fence`]: a lease change that has not reached
-    /// here is a change bytes already handed to the writer do not know about yet.
+    /// It is [`Session::input_fence`] read from the outside: the session publishes it as it changes
+    /// the lease, so it is never behind the lease the session itself holds.
     #[must_use]
     pub fn input_fence(&self) -> u64 {
         self.fence.load(std::sync::atomic::Ordering::Acquire)

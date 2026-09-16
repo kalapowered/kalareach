@@ -138,6 +138,11 @@ pub struct Session {
     /// Whether the application is inside a bracketed paste, as the writer has actually delivered
     /// it. The framer says what the accepted stream means; this says what arrived.
     delivered_paste_open: Arc<std::sync::atomic::AtomicBool>,
+    /// The lease epoch the writer compares every queued batch against.
+    ///
+    /// The session publishes it the moment the lease changes, which is what lets the count of what
+    /// that lease left behind be taken *after* the writer can no longer add to it or write from it.
+    input_fence: Arc<std::sync::atomic::AtomicU64>,
     /// Set while a lease change is queued for the writer and not yet taken.
     ///
     /// One is enough: the writer looks at the fence when it takes a batch, so a second would ask
@@ -209,6 +214,7 @@ impl Session {
             restoration_losses: crate::render::Carried::default(),
             queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             queued_lease_bytes: Arc::new(crate::runtime::LeaseBytes::new()),
+            input_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             delivered_paste_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lease_change_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
@@ -412,6 +418,11 @@ impl Session {
     fn note_lease_holder(&mut self) {
         let epoch = kr_protocol::ids::InputLeaseEpoch::new(self.lease.epoch());
         self.engine.set_lease_holder(self.lease.holder(), epoch);
+        // The fence goes out here, with the change itself. Everything that reads what the lease
+        // that just ended left behind reads it afterwards, so the writer can no longer be adding to
+        // that count or writing from it while it is being counted.
+        self.input_fence
+            .store(self.lease.epoch(), std::sync::atomic::Ordering::Release);
         // The writer is told the lease moved, so a paste the old lease left open at the
         // application is closed even when nothing follows it. One outstanding notice answers every
         // change that happens before the writer takes it, because what the writer then reads is
@@ -556,9 +567,11 @@ impl Session {
         self.lease.release_attachment(attachment_id);
         if held {
             self.framer.close_for_takeover();
-            let _ = self.queued_lease_bytes.take(self.lease.epoch());
         }
         self.note_lease_holder();
+        if held {
+            let _ = self.queued_lease_bytes.take(self.lease.epoch());
+        }
         self.pump_replies();
         self.hub.detached(attachment_id);
         let previous = self.attachments.geometry();
@@ -687,12 +700,12 @@ impl Session {
         // An interrupted paste is closed before the new lease writes, so the application never
         // sees a paste finished under a different actor.
         let framing = self.framer.close_for_takeover();
-        // Everything the previous lease handed over and the writer has not written is discarded by
-        // this takeover: the fence moves with the epoch below, and the writer drops what is left,
-        // including the rest of a batch it is part way through. Taking the counter rather than
-        // reading it is what makes the answer that lease's own: the next takeover starts from zero
-        // and cannot report these bytes a second time.
         let discarded_queue = self.lease.acquire(attachment_id, connection_id);
+        // The fence is published first, so the writer has already stopped writing this lease's
+        // bytes by the time they are counted. Everything it had not written is discarded by this
+        // takeover, and taking the counter rather than reading it is what makes the answer that
+        // lease's own: the next takeover starts from zero and cannot report these bytes again.
+        self.note_lease_holder();
         let mut discarded = self.queued_lease_bytes.take(self.lease.epoch()) as u64;
         discarded += discarded_queue;
         discarded += framing.discarded_prefix.len() as u64;
@@ -706,7 +719,6 @@ impl Session {
         // Nothing is queued for the terminator here. The writer closes a paste the application is
         // actually inside, before anything from the new lease reaches it; queueing a correction
         // under the old lease is what let one be discarded with it.
-        self.note_lease_holder();
         self.pump_replies();
         Ok(InputAcquireResult {
             lease: self.lease.to_wire(),
@@ -728,15 +740,15 @@ impl Session {
         self.lease
             .release(attachment_id, epoch)
             .ok_or(WorkerError::LeaseLost)?;
-        // What this lease handed over and the writer has not written goes with it, and the counter
-        // starts again for whoever takes the lease next.
-        let _ = self.queued_lease_bytes.take(self.lease.epoch());
         // A paste this lease opened is closed as it goes. Leaving it open would put the
         // application into a bracketed paste that nothing was ever going to end, so the next
         // keystroke would arrive inside somebody else's paste. The writer supplies the terminator,
         // because it is the only thing that knows whether the application ever saw the start.
         self.framer.close_for_takeover();
         self.note_lease_holder();
+        // What this lease handed over and the writer has not written goes with it, counted after
+        // the fence above stopped the writer from touching it.
+        let _ = self.queued_lease_bytes.take(self.lease.epoch());
         self.pump_replies();
         Ok(self.lease.to_wire())
     }
@@ -888,6 +900,12 @@ impl Session {
     #[must_use]
     pub fn input_fence(&self) -> u64 {
         self.lease.epoch()
+    }
+
+    /// Returns the published fence the writer compares every queued batch against.
+    #[must_use]
+    pub fn input_fence_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.input_fence)
     }
 
     /// Subscribes an attachment to output.
@@ -1289,8 +1307,8 @@ impl Session {
                     self.lease.release_attachment(holder);
                 }
                 self.framer.close_for_takeover();
-                let _ = self.queued_lease_bytes.take(self.lease.epoch());
                 self.note_lease_holder();
+                let _ = self.queued_lease_bytes.take(self.lease.epoch());
                 CloseAcceptance {
                     state: SessionState::Closing,
                     durability: self.durability(),

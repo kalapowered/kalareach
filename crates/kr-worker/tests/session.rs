@@ -712,3 +712,78 @@ async fn takeover_mid_paste(one_frame: bool) {
     let runtime = std::sync::Arc::clone(&runtime);
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left() {
+    // The receipt says how many of the previous holder's bytes never reached the application. That
+    // answer is only true if the writer had already stopped writing them when it was counted, so
+    // the fence goes out with the lease change itself and the count is taken afterwards. Counting
+    // first would report bytes as discarded that a writer still on the old fence went on to write.
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 120");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let first = AttachmentId::new(kr_ipc::new_uuid());
+    let second = AttachmentId::new(kr_ipc::new_uuid());
+    for id in [first, second] {
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Input);
+        session
+            .attach(&terminal_attachment(session_id), requested, id)
+            .expect("attaches");
+    }
+    session
+        .acquire_input(first, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("takes the lease");
+    let epoch = session.lease().epoch.get();
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+
+    // More than the terminal of an application that never reads will take, so the writer is still
+    // holding some of it when the lease changes.
+    let batch = lines(256 * 1024);
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(first, epoch, 0, &batch, std::time::Instant::now())
+            .expect("writes");
+        runtime.flush_locked(&mut session);
+    }
+    let queued = runtime.session().queued_lease_bytes();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while queued.load() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the writer is holding bytes the application has not read"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let taken = {
+        let mut session = runtime.session();
+        let taken = session
+            .acquire_input(second, ConnectionId::new(kr_ipc::new_uuid()), None)
+            .expect("takes the lease over");
+        // Read before the flush, because the receipt already exists: whatever it reported as
+        // discarded has to be bytes the writer can no longer write, and the fence is what stops it.
+        assert_eq!(
+            runtime.input_fence(),
+            taken.lease.epoch.get(),
+            "the writer was told the lease changed before the bytes it was holding were counted"
+        );
+        assert_eq!(
+            session.queued_lease_bytes().load(),
+            0,
+            "and the count the receipt took belongs to the lease that ended"
+        );
+        runtime.flush_locked(&mut session);
+        taken
+    };
+    assert!(
+        taken.discarded_bytes.get() > 0,
+        "the takeover reports what it did not deliver: {taken:?}"
+    );
+    let runtime = std::sync::Arc::clone(&runtime);
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
