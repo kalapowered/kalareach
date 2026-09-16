@@ -724,13 +724,24 @@ the screen, and gives its charge back once, where it is dropped; the running fig
 `CanonicalGrid::history_bytes` reads, in one read however long the history is. Which rows joined
 and which were given up comes from the two ends of the retained range, so a row that arrives while
 the library drops an older one is still counted, and each row that joined is reached by its own
-index rather than by walking to it. Nothing re-reads a row that has already been charged, because
-nothing changes one: the library compresses a row as it scrolls it off and never touches it again.
-The two operations that do rewrite the retained rows — a resize, which reflows them, and an
-erasure, which discards them — say so, and the account is built again from the rows themselves.
+index rather than by walking to it.
+
+Nothing re-reads a row that has already been charged, and nothing needs to. What a row costs is its
+cells, the text they hold and the allocations they keep, and once the library has compressed a row
+for the scrollback none of those three changes. The library does still touch a retained row: a
+palette change and a buffer switch stamp a sequence number on one, so a client repainting knows
+what moved. A sequence number is not in the charge, so the charge is the same afterwards. What does
+change a charge is a rewrite, and there is one: a resize reflows the retained rows, joining and
+splitting them, and cutting a row to a narrower geometry rewrites it. That says so, and the account
+is built again from the rows themselves. An erasure needs no rebuild, because it changes no row: it
+drops the oldest rows, and their charges come off the front where the account already gives back
+the charges of rows the library drops.
+
 `CanonicalGrid::measure_history_bytes` is the same figure worked out by walking the rows, and a
 test compares the two after every operation of a randomised sequence of prints, resizes, buffer
-switches, erasures and evictions.
+switches, erasures and evictions. The account's own array is measured too, at the room it is
+holding rather than the charges on it, because eviction gives the charges back and not the room
+they sat in.
 
 That is what makes the byte bound affordable. Working the figure out by walking the history made
 every read cost what the whole history cost, so a session printing steadily paid a scan of

@@ -82,6 +82,10 @@ fn build_stream(bytes: usize) -> Vec<u8> {
 /// about what a session pays for the history it keeps. This one only ever adds lines: it fills the
 /// screen, scrolls it, and keeps going, so every row it prints ends up in the historical cache and
 /// the cache reaches its bound and stays there.
+///
+/// It ends where a line ends rather than at `bytes` exactly, so the stream is always whole
+/// sequences and whole scalars. A stream cut in the middle of one is a different amount of work
+/// for the reader that takes it, which is the wrong thing to be measuring.
 fn build_scrolling_stream(bytes: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes + 1024);
     let mut counter = 0u32;
@@ -106,7 +110,6 @@ fn build_scrolling_stream(bytes: usize) -> Vec<u8> {
             _ => out.extend_from_slice(b"\x1b[4munderlined\x1b[24m and plain text after it\r\n"),
         }
     }
-    out.truncate(bytes);
     out
 }
 
@@ -317,26 +320,30 @@ fn sustained_output_stays_inside_the_row_cache_bound() {
 ///
 /// So the figure is carried. This feeds the same bytes to two sessions doing the same work, one
 /// whose history is emptied before every read and one whose history is at its bound and evicting
-/// on every row. Same parsing, same printing, same scrolling; the only difference is how much is
-/// behind the screen. The two therefore take about the same time.
+/// on every row. Same read, same parsing, same printing, same scrolling; the only difference is
+/// how much is behind the screen. The two therefore take about the same time.
 #[test]
 fn a_read_costs_the_same_whatever_the_history_holds() {
-    /// The read size being timed.
+    /// The read being timed.
     ///
     /// Small enough that a read into an emptied history leaves a short one: at this geometry it is
-    /// about seventy rows, against the thousands the bound holds.
-    const UNIT_BYTES: usize = 4 * 1024;
+    /// about seventy rows, against the thousands the bound holds. One whole read, built once and
+    /// fed again and again, so every read of both phases is the same bytes and every one of them
+    /// begins and ends at a parser-ground boundary.
+    const READ_BYTES: usize = 4 * 1024;
     /// Reads per measurement.
     const READS: usize = if cfg!(debug_assertions) { 16 } else { 64 };
     /// Measurements per phase; the fastest is the one with the least noise on it.
     const ROUNDS: usize = if cfg!(debug_assertions) { 2 } else { 5 };
+    /// How many reads the deep phase may take to reach the bound before the test gives up.
+    const FILL_LIMIT: usize = 4_096;
     /// How much further apart the two phases may be before the cost is growing with the history.
     ///
-    /// Walking the history made the deep phase fifty times the shallow one, so this is wide enough
+    /// Walking the history made the deep phase sixty times the shallow one, so this is wide enough
     /// to be quiet on a loaded machine and still far inside what a walk would produce.
     const TOLERANCE: f64 = 4.0;
 
-    let stream = build_scrolling_stream(UNIT_BYTES * READS);
+    let read = build_scrolling_stream(READ_BYTES);
     let session = || {
         Engine::new(EngineConfig {
             size: GridSize::new(120, 40),
@@ -352,14 +359,18 @@ fn a_read_costs_the_same_whatever_the_history_holds() {
     let mut shallow = f64::MAX;
     for _ in 0..ROUNDS {
         let mut elapsed = 0.0;
-        for unit in stream.chunks(UNIT_BYTES) {
+        for _ in 0..READS {
             now_ms += 1;
+            assert!(
+                shallow_engine.at_ground(),
+                "the read has to end where a sequence ends, or the clear would cancel one"
+            );
             shallow_engine.feed(b"\x1b[3J", now_ms);
             shallow_engine
                 .lane_mut()
                 .drain(LaneGate::default(), 8 * 1024, 0);
             let started = Instant::now();
-            shallow_engine.feed(unit, now_ms);
+            shallow_engine.feed(&read, now_ms);
             elapsed += started.elapsed().as_secs_f64();
             shallow_rows = shallow_rows.max(shallow_engine.grid().scrollback_rows());
             shallow_engine
@@ -369,25 +380,37 @@ fn a_read_costs_the_same_whatever_the_history_holds() {
         shallow = shallow.min(elapsed / READS as f64);
     }
 
-    // Filled to the bound first, so every read is evicting behind a history of thousands of rows.
+    // Filled until eviction is running, so every read of the second phase is evicting behind a
+    // history of thousands of rows.
     let mut deep_engine = session();
     let limit = deep_engine.budget().limits().row_cache_bytes;
-    while deep_engine.grid().history_bytes() < limit / 2 {
+    let mut evicted = false;
+    let mut fills = 0usize;
+    while !evicted && fills < FILL_LIMIT {
         now_ms += 1;
-        deep_engine.feed(&stream, now_ms);
+        fills += 1;
+        let outcome = deep_engine.feed(&read, now_ms);
+        evicted |= outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.detail.contains("cache bound"));
         deep_engine
             .lane_mut()
             .drain(LaneGate::default(), 8 * 1024, 0);
     }
+    assert!(
+        evicted,
+        "the deep phase has to be evicting, and {fills} reads did not make it so"
+    );
     let deep_rows = deep_engine.grid().scrollback_rows();
     let deep_bytes = deep_engine.grid().history_bytes();
     let mut deep = f64::MAX;
     for _ in 0..ROUNDS {
         let mut elapsed = 0.0;
-        for unit in stream.chunks(UNIT_BYTES) {
+        for _ in 0..READS {
             now_ms += 1;
             let started = Instant::now();
-            deep_engine.feed(unit, now_ms);
+            deep_engine.feed(&read, now_ms);
             elapsed += started.elapsed().as_secs_f64();
             deep_engine
                 .lane_mut()
@@ -397,7 +420,8 @@ fn a_read_costs_the_same_whatever_the_history_holds() {
     }
 
     println!("KR-PERF-007 read cost against history depth");
-    println!("  read              {UNIT_BYTES} bytes");
+    println!("  read              {} bytes", read.len());
+    println!("  reads to fill     {fills}");
     println!("  shallow history   at most {shallow_rows} rows");
     println!("  shallow read      {:.4} ms", shallow * 1_000.0);
     println!("  deep history      {deep_rows} rows, {deep_bytes} of {limit} bytes");
@@ -409,8 +433,8 @@ fn a_read_costs_the_same_whatever_the_history_holds() {
         "the two phases have to differ in depth: {deep_rows} rows against at most {shallow_rows}"
     );
     assert!(
-        deep_bytes > limit / 2,
-        "the deep phase has to be evicting: {deep_bytes} of {limit} bytes"
+        deep_bytes > limit * 9 / 10,
+        "the deep phase has to sit at its bound: {deep_bytes} of {limit} bytes"
     );
     assert!(
         deep <= shallow * TOLERANCE,

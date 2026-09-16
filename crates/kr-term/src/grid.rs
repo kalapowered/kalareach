@@ -177,11 +177,17 @@ struct RowsBytes {
 /// printing steadily paid a scan of everything it had retained on every read.
 ///
 /// So the figure is carried instead. A row is charged once, where it leaves the screen, and its
-/// charge is given back once, where the row is dropped. Nothing re-reads a row that has already
-/// been charged, because nothing changes one: the library compresses a row as it scrolls it off
-/// and never touches it again. The two operations that do rewrite the retained rows — a resize,
-/// which reflows them, and an erasure, which discards them — say so, and the account is built
-/// again from the rows themselves.
+/// charge is given back once, where the row is dropped.
+///
+/// Nothing re-reads a row that has already been charged, and nothing needs to. What a row costs is
+/// its cells, the text they hold and the allocations they keep, and once the library has
+/// compressed a row for the scrollback none of those three changes. The library does still touch a
+/// retained row — a palette change and a buffer switch stamp a sequence number on one — and a
+/// sequence number is not in the charge. What does change a charge is a rewrite, and a resize is
+/// the one that does it: the reflow joins and splits the retained rows, and normalising a row to a
+/// narrower geometry rewrites it. Both say so through `stale`, and the account is built again from
+/// the rows themselves. An erasure needs no rebuild, because it changes no row: it drops the
+/// oldest, and their charges come off the front like any other row the library drops.
 ///
 /// [`CanonicalGrid::measure_history_bytes`] is the same figure worked out the long way, and the
 /// two agree after every operation.
