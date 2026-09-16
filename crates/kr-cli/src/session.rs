@@ -128,10 +128,6 @@ pub async fn run(
             }
         }
     };
-    // The guard is told whatever was read, including nothing, because being told at all is what
-    // says this attachment is about to begin forwarding and that the keyboard protocols the session
-    // may set are therefore its to clear.
-    guard.learn_keyboard(&probe.keyboard);
     let keyboard = probe.keyboard;
 
     let mut client = crate::resolve::open_worker(descriptor, crate::build_id()).await?;
@@ -172,6 +168,11 @@ pub async fn run(
     )
     .await?;
 
+    // The guard is told whatever was read, including nothing, at the moment forwarding is about to
+    // begin and not before: being told at all is what says the keyboard protocols the session may
+    // set are this attachment's to clear, and an attach that failed on its way here changed
+    // nothing that needs clearing.
+    guard.learn_keyboard(&keyboard);
     let raw_replaced = terminal.enter_raw_mode()?;
 
     let handle = Arc::new(

@@ -31,6 +31,7 @@ struct Hosted {
     temp: kr_ipc::testing::TempHost,
     session_id: SessionId,
     display: DisplayNumber,
+    descriptor: WorkerDescriptor,
     _service: Arc<WorkerService>,
 }
 
@@ -104,28 +105,26 @@ async fn hosted(script: &str) -> Hosted {
     );
     tokio::spawn(Arc::clone(&service).serve(listener));
 
-    kr_ipc::descriptor::publish(
-        &environment,
-        &WorkerDescriptor {
-            session_id,
-            session_epoch: SessionEpoch::V1,
-            environment_id,
-            display_number: display,
-            boot_identity: boot,
-            process_start_identity: process,
-            protocol_version: PROTOCOL_VERSION,
-            endpoint: endpoint.as_text(),
-            worker_public_key: *identity.public_key(),
-            worker_profile: WorkerProfile::HeadlessUser,
-            published_at_ms: TimestampMs::new(0),
-        },
-    )
-    .expect("publishes the descriptor");
+    let descriptor = WorkerDescriptor {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id,
+        display_number: display,
+        boot_identity: boot,
+        process_start_identity: process,
+        protocol_version: PROTOCOL_VERSION,
+        endpoint: endpoint.as_text(),
+        worker_public_key: *identity.public_key(),
+        worker_profile: WorkerProfile::HeadlessUser,
+        published_at_ms: TimestampMs::new(0),
+    };
+    kr_ipc::descriptor::publish(&environment, &descriptor).expect("publishes the descriptor");
 
     Hosted {
         temp,
         session_id,
         display,
+        descriptor,
         _service: service,
     }
 }
@@ -332,6 +331,9 @@ const KEYBOARD_RESTORED: &[u8] = b"\x1b[=5;1u";
 
 /// The `modifyOtherKeys` level this test's terminal reported, as the restoration writes it.
 const MODIFY_OTHER_KEYS_RESTORED: &[u8] = b"\x1b[>4;2m";
+
+/// The first sequence a cleanup that clears the keyboard protocols sends.
+const KEYBOARD_CLEARED: &[u8] = b"\x1b[<65535u";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
@@ -614,6 +616,80 @@ async fn what_was_typed_during_the_handshake_reaches_the_application() {
         output.wait_for(b"kr-typed-early", Duration::from_secs(30)),
         "the bytes typed during the handshake reached the application: {}",
         output.text().escape_debug()
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_alone() {
+    // The outer terminal's own keyboard negotiation is only this attachment's to clear once this
+    // attachment could have changed it, which is once it forwards. An attach that asked the
+    // terminal what it was and then failed on its way to the session changed nothing, so its
+    // cleanup puts the modes back and leaves the protocols the person set up for themselves.
+    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    // A second display whose descriptor names an endpoint nothing is listening on. The command
+    // reaches the terminal, completes the handshake, and then fails to reach the session.
+    let unreachable = DisplayNumber::new(2);
+    let mut descriptor = hosted.descriptor.clone();
+    descriptor.display_number = unreachable;
+    descriptor.endpoint = hosted
+        .temp
+        .environment()
+        .worker_endpoint(unreachable)
+        .expect("an endpoint")
+        .as_text();
+    kr_ipc::descriptor::publish(&hosted.temp.environment(), &descriptor)
+        .expect("publishes the descriptor");
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!(
+                "{} attach {}; printf 'attach-finished-%s\\n' \"$?\"",
+                env!("CARGO_BIN_EXE_kr"),
+                unreachable.get()
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
+
+    assert!(
+        output.wait_for(b"attach-finished-", Duration::from_secs(30)),
+        "the attach ended: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        !output.contains(b"attach-finished-0"),
+        "and it ended as a failure, because nothing was listening: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        output.contains(b"\x1b[?u"),
+        "the handshake did happen, so this terminal's state was read: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        !output.contains(KEYBOARD_CLEARED),
+        "and nothing cleared the keyboard protocols it never changed: {}",
+        output.text().escape_debug()
+    );
+    let after = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
+    assert_eq!(
+        after.local_modes.bits(),
+        before.local_modes.bits(),
+        "while the modes it borrowed for the handshake came back"
     );
     let _ = shell.kill();
     let _ = shell.wait();
