@@ -126,6 +126,7 @@ fn build_scrolling_stream(bytes: usize) -> Vec<u8> {
 }
 
 struct Run {
+    bytes: usize,
     elapsed_secs: f64,
     mib_per_second: f64,
     events: usize,
@@ -133,7 +134,11 @@ struct Run {
     peak_lane_bytes: usize,
     peak_pending_events: usize,
     degraded: bool,
-    session_bytes: u64,
+    /// The most the session budget was holding at any read, not the reading at the end. A bound
+    /// that was passed halfway through and given back is a bound that was passed.
+    peak_session_bytes: u64,
+    /// The most the historical row cache was holding at any read, against its own bound.
+    peak_row_cache_bytes: u64,
 }
 
 /// How many measured passes a rate is taken from, after a warm-up pass.
@@ -146,13 +151,17 @@ struct Run {
 /// machine was doing.
 const PASSES: usize = if cfg!(debug_assertions) { 1 } else { 3 };
 
-/// Drains `stream` once to warm the process, then `PASSES` times, and returns every measured pass.
-fn drain_passes(stream: &[u8], drain_replies: bool) -> Vec<Run> {
-    let _warm = drain(stream, drain_replies);
-    (0..PASSES).map(|_| drain(stream, drain_replies)).collect()
+/// Drains `stream` once to warm the process, then `PASSES` times.
+///
+/// Returns the warm-up pass and the measured passes separately: the rate comes from the measured
+/// ones, and every bound is checked on all of them, the warm-up included.
+fn drain_passes(stream: &[u8], drain_replies: bool) -> (Run, Vec<Run>) {
+    let warm = drain(stream, drain_replies);
+    let measured = (0..PASSES).map(|_| drain(stream, drain_replies)).collect();
+    (warm, measured)
 }
 
-/// The fastest of several passes, which is the one nothing interfered with.
+/// The fastest of several passes, which is what the engine reached when nothing interfered.
 fn fastest(runs: &[Run]) -> &Run {
     runs.iter()
         .max_by(|left, right| {
@@ -176,6 +185,8 @@ fn drain(stream: &[u8], drain_replies: bool) -> Run {
     let mut peak_pending_events = 0usize;
     let mut degraded = false;
     let mut now_ms = 0u64;
+    let mut peak_session_bytes = 0u64;
+    let mut peak_row_cache_bytes = 0u64;
 
     let started = Instant::now();
     for (index, chunk) in stream.chunks(CHUNK_BYTES).enumerate() {
@@ -187,6 +198,8 @@ fn drain(stream: &[u8], drain_replies: bool) -> Run {
         degraded |= outcome.degradation.is_degraded();
         peak_lane_bytes = peak_lane_bytes.max(engine.lane().queued_bytes());
         peak_pending_events = peak_pending_events.max(outcome.events);
+        peak_session_bytes = peak_session_bytes.max(engine.budget().committed());
+        peak_row_cache_bytes = peak_row_cache_bytes.max(engine.budget().usage().rows);
         if drain_replies {
             engine.lane_mut().drain(LaneGate::default(), 8 * 1024, 0);
         }
@@ -201,6 +214,7 @@ fn drain(stream: &[u8], drain_replies: bool) -> Run {
     )]
     let mib = stream.len() as f64 / (1024.0 * 1024.0);
     Run {
+        bytes: stream.len(),
         elapsed_secs,
         mib_per_second: mib / elapsed_secs,
         events,
@@ -208,7 +222,50 @@ fn drain(stream: &[u8], drain_replies: bool) -> Run {
         peak_lane_bytes,
         peak_pending_events,
         degraded,
-        session_bytes: engine.budget().committed(),
+        peak_session_bytes,
+        peak_row_cache_bytes,
+    }
+}
+
+/// What the passes sustained together: every byte they drained over every second they took.
+///
+/// This is the figure the target is asserted against, because KR-PERF-007 is about sustaining a
+/// rate rather than reaching one. A pass that went faster than the others is reported beside it as
+/// what the engine reached when nothing interfered, and it decides nothing: three passes at 3, 3
+/// and 6 MiB/s sustained 3.6 MiB/s and would fail, which is the right answer.
+fn sustained_mib_per_second(runs: &[Run]) -> f64 {
+    let bytes: usize = runs.iter().map(|run| run.bytes).sum();
+    let seconds: f64 = runs.iter().map(|run| run.elapsed_secs).sum();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a few passes of a few megabytes each; f64 represents it exactly"
+    )]
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    mib / seconds.max(f64::MIN_POSITIVE)
+}
+
+/// Asserts every bound the run had to stay inside, whatever the machine was doing.
+fn assert_bounds_held(runs: &[Run]) {
+    let limits = kr_term::budget::BudgetLimits::DEFAULT;
+    for run in runs {
+        assert!(
+            run.peak_lane_bytes <= LaneLimits::DEFAULT.max_queue_bytes,
+            "the response lane grew to {} bytes, past its {} bound",
+            run.peak_lane_bytes,
+            LaneLimits::DEFAULT.max_queue_bytes
+        );
+        assert!(
+            run.peak_session_bytes <= limits.session_bytes,
+            "the session budget reached {} bytes, past its {} bound",
+            run.peak_session_bytes,
+            limits.session_bytes
+        );
+        assert!(
+            run.peak_row_cache_bytes <= limits.row_cache_bytes,
+            "the row cache reached {} bytes, past its {} bound",
+            run.peak_row_cache_bytes,
+            limits.row_cache_bytes
+        );
     }
 }
 
@@ -223,8 +280,9 @@ const TARGET_MIB_PER_SECOND: f64 = 5.0;
 #[test]
 fn drains_five_mebibytes_without_unbounded_queues() {
     let stream = build_stream(STREAM_BYTES);
-    let runs = drain_passes(&stream, true);
-    let run = fastest(&runs);
+    let (warm, runs) = drain_passes(&stream, true);
+    let sustained = sustained_mib_per_second(&runs);
+    let best = fastest(&runs);
 
     println!("KR-PERF-007 kr-term output handling");
     println!(
@@ -235,10 +293,14 @@ fn drains_five_mebibytes_without_unbounded_queues() {
             "release"
         }
     );
-    println!("  host              {} {}", HOST_OS, HOST_ARCH);
+    println!("  host              {HOST_OS} {HOST_ARCH}");
     println!("  processors        {}", processors());
     println!("  stream            {} bytes", stream.len());
     println!("  chunk             {CHUNK_BYTES} bytes");
+    println!(
+        "  warm-up pass      {:.3} s, {:.2} MiB/s, discarded",
+        warm.elapsed_secs, warm.mib_per_second
+    );
     for (pass, run) in runs.iter().enumerate() {
         println!(
             "  pass {pass}            {:.3} s, {:.2} MiB/s",
@@ -246,35 +308,29 @@ fn drains_five_mebibytes_without_unbounded_queues() {
         );
     }
     println!(
-        "  throughput        {:.2} MiB/s, the best pass",
-        run.mib_per_second
+        "  sustained         {sustained:.2} MiB/s over every pass, against a \
+         {TARGET_MIB_PER_SECOND:.1} MiB/s target"
     );
-    println!("  events            {}", run.events);
-    println!("  replies accepted  {}", run.responses);
+    println!("  best pass         {:.2} MiB/s", best.mib_per_second);
+    println!("  events            {}", best.events);
+    println!("  replies accepted  {}", best.responses);
     println!(
         "  peak lane bytes   {} of {}",
-        run.peak_lane_bytes,
+        best.peak_lane_bytes,
         LaneLimits::DEFAULT.max_queue_bytes
     );
-    println!("  peak events/chunk {}", run.peak_pending_events);
-    println!("  session bytes     {}", run.session_bytes);
-    println!("  degraded          {}", run.degraded);
+    println!("  peak events/chunk {}", best.peak_pending_events);
+    println!("  peak session      {} bytes", best.peak_session_bytes);
+    println!("  peak row cache    {} bytes", best.peak_row_cache_bytes);
+    println!("  degraded          {}", best.degraded);
 
     assert!(
-        cfg!(debug_assertions) || run.mib_per_second >= TARGET_MIB_PER_SECOND,
-        "throughput {:.2} MiB/s is below the {TARGET_MIB_PER_SECOND:.1} MiB/s target",
-        run.mib_per_second
+        cfg!(debug_assertions) || sustained >= TARGET_MIB_PER_SECOND,
+        "the passes sustained {sustained:.2} MiB/s, below the {TARGET_MIB_PER_SECOND:.1} MiB/s \
+         target"
     );
-    for run in &runs {
-        assert!(
-            run.peak_lane_bytes <= LaneLimits::DEFAULT.max_queue_bytes,
-            "the response lane grew past its bound"
-        );
-        assert!(
-            run.session_bytes <= kr_term::budget::BudgetLimits::DEFAULT.session_bytes,
-            "the session budget was exceeded"
-        );
-    }
+    assert_bounds_held(&runs);
+    assert_bounds_held(std::slice::from_ref(&warm));
 }
 
 /// The target again, on a stream that scrolls.
@@ -286,13 +342,18 @@ fn drains_five_mebibytes_without_unbounded_queues() {
 #[test]
 fn drains_a_scrolling_stream_at_the_target_rate() {
     let stream = build_scrolling_stream(scrolling_bytes(STREAM_BYTES));
-    let runs = drain_passes(&stream, true);
-    let run = fastest(&runs);
+    let (warm, runs) = drain_passes(&stream, true);
+    let sustained = sustained_mib_per_second(&runs);
+    let best = fastest(&runs);
 
     println!("KR-PERF-007 kr-term scrolling output");
-    println!("  host              {} {}", HOST_OS, HOST_ARCH);
+    println!("  host              {HOST_OS} {HOST_ARCH}");
     println!("  processors        {}", processors());
     println!("  stream            {} bytes", stream.len());
+    println!(
+        "  warm-up pass      {:.3} s, {:.2} MiB/s, discarded",
+        warm.elapsed_secs, warm.mib_per_second
+    );
     for (pass, run) in runs.iter().enumerate() {
         println!(
             "  pass {pass}            {:.3} s, {:.2} MiB/s",
@@ -300,27 +361,25 @@ fn drains_a_scrolling_stream_at_the_target_rate() {
         );
     }
     println!(
-        "  throughput        {:.2} MiB/s, the best pass",
-        run.mib_per_second
+        "  sustained         {sustained:.2} MiB/s over every pass, against a \
+         {TARGET_MIB_PER_SECOND:.1} MiB/s target"
     );
-    println!("  events            {}", run.events);
-    println!("  session bytes     {}", run.session_bytes);
+    println!("  best pass         {:.2} MiB/s", best.mib_per_second);
+    println!("  events            {}", best.events);
+    println!("  peak session      {} bytes", best.peak_session_bytes);
+    println!("  peak row cache    {} bytes", best.peak_row_cache_bytes);
 
     assert!(
-        cfg!(debug_assertions) || run.mib_per_second >= TARGET_MIB_PER_SECOND,
-        "throughput {:.2} MiB/s is below the {TARGET_MIB_PER_SECOND:.1} MiB/s target",
-        run.mib_per_second
+        cfg!(debug_assertions) || sustained >= TARGET_MIB_PER_SECOND,
+        "the passes sustained {sustained:.2} MiB/s, below the {TARGET_MIB_PER_SECOND:.1} MiB/s \
+         target"
     );
-    for run in &runs {
-        assert!(
-            run.peak_lane_bytes <= LaneLimits::DEFAULT.max_queue_bytes,
-            "the response lane grew past its bound"
-        );
-        assert!(
-            run.session_bytes <= kr_term::budget::BudgetLimits::DEFAULT.session_bytes,
-            "the session budget was exceeded"
-        );
-    }
+    assert!(
+        best.peak_row_cache_bytes > 0,
+        "the rows that scrolled off have to reach the cache for this to say anything"
+    );
+    assert_bounds_held(&runs);
+    assert_bounds_held(std::slice::from_ref(&warm));
 }
 
 /// A client that never reads its replies does not make the engine grow.
