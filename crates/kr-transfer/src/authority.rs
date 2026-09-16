@@ -596,45 +596,32 @@ impl AuthorisedDirectory {
     ///
     /// Returns the first rule the name breaks, or the create or open failure.
     pub fn create_subdirectory(&self, name: &RelativeName) -> Result<Self, Escape> {
-        let mut current = Self {
-            environment_id: self.environment_id,
-            directory: self
-                .directory
-                .try_clone()
-                .map_err(|error| Escape::Unopenable {
-                    component: self.display.display().to_string(),
+        // One component, so this directory's own handle is the whole resolution. A creation is the
+        // operation a later refusal cannot undo, so a caller that wants a tree creates each level
+        // against the authority the level above it returned rather than naming a path.
+        single_component(name)?;
+        let component = name.as_str();
+        check_component(component)?;
+        match create_owner_only_directory(&self.directory, component) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(Escape::Unopenable {
+                    component: component.to_owned(),
                     detail: error.to_string(),
-                })?,
-            identity: self.identity,
-            display: self.display.clone(),
-        };
-        // One component at a time, each against the handle of the directory it goes in rather
-        // than against an accumulated path. Nothing above a created component is resolved, so a
-        // component replaced after it was checked cannot decide where the next one is created.
-        for component in name.components() {
-            check_component(component)?;
-            match create_owner_only_directory(&current.directory, component) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(Escape::Unopenable {
-                        component: component.to_owned(),
-                        detail: error.to_string(),
-                    });
-                }
+                });
             }
-            let child = open_directory(&current.directory, component)?;
-            // A directory beneath a boundary inherits the boundary's owner entry on Windows by
-            // design, so what is checked here is the accounts its list names.
-            owner_only(&child, component, Privacy::OwnerOnly)?;
-            // The entry that names the new directory is durable before anything inside it is
-            // created, so a power loss cannot leave a payload in a directory the parent forgot.
-            current.sync()?;
-            let mut display = current.display.clone();
-            display.push(component);
-            current = Self::from_handle(self.environment_id, child, display)?;
         }
-        Ok(current)
+        let child = open_directory(&self.directory, component)?;
+        // A directory beneath a boundary inherits the boundary's owner entry on Windows by design,
+        // so what is checked here is the accounts its list names.
+        owner_only(&child, component, Privacy::OwnerOnly)?;
+        // The entry that names the new directory is durable before anything inside it is created,
+        // so a power loss cannot leave a payload in a directory the parent forgot.
+        self.sync()?;
+        let mut display = self.display.clone();
+        display.push(component);
+        Self::from_handle(self.environment_id, child, display)
     }
 
     /// Opens a descendant for reading, refusing every link on the way.
@@ -1669,15 +1656,34 @@ mod tests {
         let root = tempfile::tempdir().expect("a temporary directory");
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
-        let first = authority
-            .create_subdirectory(&name("a/b"))
-            .expect("creates a tree");
-        let second = authority
-            .create_subdirectory(&name("a/b"))
-            .expect("opens the same tree");
+        // A tree is created one level at a time, each against the authority the level above
+        // returned: a creation names one entry in the directory whose handle is held.
+        let outer = authority
+            .create_subdirectory(&name("a"))
+            .expect("creates the first level");
+        let first = outer
+            .create_subdirectory(&name("b"))
+            .expect("creates the second");
+        let second = outer
+            .create_subdirectory(&name("b"))
+            .expect("opens the same directory");
         assert_eq!(first.identity(), second.identity());
+        // A read may still name a path, and it finds the same object.
         let opened = authority.subdirectory(&name("a/b")).expect("opens it");
         assert_eq!(opened.identity(), first.identity());
+    }
+
+    #[test]
+    fn a_created_directory_names_one_entry() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let authority =
+            AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
+
+        assert!(matches!(
+            authority.create_subdirectory(&name("a/b")),
+            Err(Escape::NotSingleComponent { .. })
+        ));
+        assert!(!root.path().join("a").exists(), "and created nothing");
     }
 
     #[cfg(unix)]
