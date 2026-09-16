@@ -82,6 +82,14 @@ pub const MAX_ORIGINAL_FILE_NAME_LEN: usize = 255;
 /// Maximum length of a declared media type, in bytes.
 pub const MAX_MEDIA_TYPE_LEN: usize = 127;
 
+/// Largest encoded transfer result, in bytes.
+///
+/// A reply travels in one control frame, and a draft's reply carries every attachment bound to it
+/// with its preview. A frame the host cannot send is a mutation whose effect committed and whose
+/// receipt never arrived, so the size of the reply is checked before the effect rather than
+/// discovered after it. The margin below the frame bound is the envelope around the result.
+pub const MAX_TRANSFER_RESULT_BYTES: u64 = 768 * 1024;
+
 /// Maximum length of a declared external destination, in characters.
 ///
 /// It is a disclosure a person reads, so it is bounded like every other string that reaches a

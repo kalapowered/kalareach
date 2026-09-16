@@ -37,13 +37,22 @@ const NEVER_DECODED: &[&str] = &[
     "application/xml",
 ];
 
-/// How many bytes of working memory a decoder is assumed to want per decoded pixel.
+/// How many bytes of working memory a decode is charged per pixel of the image.
 ///
-/// Four for the pixel itself and four for one working buffer beside it. It is a model, not a
-/// measurement: `image` documents its own allocation limit as advisory, and several of its decoders
-/// hold an intermediate buffer the size of the output. Bounding the *estimate* is what makes the
-/// 256 MiB limit something this crate enforces rather than something it hopes for.
-const DECODE_BYTES_PER_PIXEL: u64 = 8;
+/// This is the number that makes the 256 MiB budget something this crate enforces rather than
+/// something it hopes for: `image` documents its own allocation limit as advisory, and its
+/// decoders hold more than the output buffer while they work. Sixteen is the worst case among the
+/// four formats compiled in here:
+///
+/// * a PNG decoded to sixteen-bit RGBA is eight bytes per pixel of output;
+/// * an animated WebP holds the output, the frame it decoded and the canvas it composites onto,
+///   which is three four-byte buffers at once;
+/// * a GIF holds its frame buffer and the image it crops into.
+///
+/// Sixteen covers each of those with room left, so an image whose estimate fits the budget cannot
+/// make the pinned decoders exceed it. The number belongs to the pins in the manifest: it is
+/// re-derived when `image` or one of its codecs moves.
+const DECODE_BYTES_PER_PIXEL: u64 = 16;
 
 /// Why no preview was produced.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -145,6 +154,11 @@ fn decode<S: Read + Seek>(
     // format and the dimensions, and only then does anything ask for a buffer.
     let (format, width, height) = header(source)?;
     check_bounds(width, height)?;
+    if format == ImageFormat::Gif {
+        // The frame is what gets allocated, and it is not always the screen the header reports.
+        let (frame_width, frame_height) = gif_frame_extent(source)?;
+        check_bounds(frame_width, frame_height)?;
+    }
     rewind(source)?;
     let mut reader =
         ImageReader::with_format(BufReader::new(source.take(MAX_PREVIEW_INPUT_BYTES)), format);
@@ -233,6 +247,69 @@ fn encoded_len<S: Seek>(source: &mut S) -> std::result::Result<u64, PreviewRefus
         })?;
     rewind(source)?;
     Ok(len)
+}
+
+/// How far into a GIF this crate looks for the first frame's own extent.
+///
+/// The extent is in the first image descriptor, after the header, any global colour table and any
+/// extension blocks. A file that puts its first frame beyond this is one this crate does not
+/// preview, which is an answer rather than an allocation.
+const GIF_SCAN_BYTES: u64 = 64 * 1024;
+
+/// Returns the extent the first frame of a GIF declares for itself.
+///
+/// The decoder reports a GIF's *logical screen* as the image's dimensions and crops the first
+/// frame into it, so a one-pixel screen with an enormous frame passes every check made on the
+/// reported dimensions and then allocates the frame regardless. The frame's own extent is in its
+/// image descriptor, which is what this reads.
+fn gif_frame_extent<S: Read + Seek>(
+    source: &mut S,
+) -> std::result::Result<(u32, u32), PreviewRefusal> {
+    rewind(source)?;
+    let mut head = Vec::new();
+    source
+        .take(GIF_SCAN_BYTES)
+        .read_to_end(&mut head)
+        .map_err(|error| PreviewRefusal::Unreadable {
+            detail: error.to_string(),
+        })?;
+    let at = |index: usize| head.get(index).copied();
+    let word = |index: usize| match (at(index), at(index + 1)) {
+        (Some(low), Some(high)) => Some(u32::from(low) | (u32::from(high) << 8)),
+        _ => None,
+    };
+    // The header and the logical screen descriptor are thirteen bytes, and the global colour
+    // table, when the packed field says there is one, follows them.
+    let packed = at(10).ok_or(PreviewRefusal::UnsupportedFormat)?;
+    let mut cursor = 13_usize;
+    if packed & 0x80 != 0 {
+        // Two to the power of the size field plus one entries, three bytes each.
+        let entries = 1_usize << ((packed & 0x07) + 1);
+        cursor = cursor.saturating_add(entries.saturating_mul(3));
+    }
+    loop {
+        match at(cursor) {
+            // An image descriptor: two words of position, then two of extent.
+            Some(0x2c) => {
+                let width = word(cursor + 5).ok_or(PreviewRefusal::UnsupportedFormat)?;
+                let height = word(cursor + 7).ok_or(PreviewRefusal::UnsupportedFormat)?;
+                return Ok((width, height));
+            }
+            // An extension: a label, then length-prefixed sub-blocks ending in a zero length.
+            Some(0x21) => {
+                cursor = cursor.saturating_add(2);
+                loop {
+                    let len = at(cursor).ok_or(PreviewRefusal::UnsupportedFormat)?;
+                    cursor = cursor.saturating_add(1 + usize::from(len));
+                    if len == 0 {
+                        break;
+                    }
+                }
+            }
+            // The trailer, or anything this crate does not read.
+            _ => return Err(PreviewRefusal::UnsupportedFormat),
+        }
+    }
 }
 
 /// Reads the format and the dimensions from the header alone.

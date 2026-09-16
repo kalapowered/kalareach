@@ -284,3 +284,41 @@ fn an_image_within_the_pixel_limit_but_above_the_decode_budget_is_refused() {
     assert_eq!(handle.byte_len, U64::new(bytes.len() as u64));
     assert_eq!(handle.content_digest, digest(&bytes));
 }
+
+/// KR-REQ-14.13: a GIF whose first frame is far larger than its logical screen is refused on the
+/// frame, which is the buffer a decoder would actually allocate.
+#[test]
+fn a_gif_frame_larger_than_its_screen_is_refused() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GIF89a");
+    // A one-pixel logical screen, no global colour table.
+    bytes.extend_from_slice(&[0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+    // One image descriptor declaring eight thousand by six thousand: forty-eight million pixels.
+    bytes.push(0x2c);
+    bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    bytes.extend_from_slice(&8000_u16.to_le_bytes());
+    bytes.extend_from_slice(&6000_u16.to_le_bytes());
+    bytes.push(0x00);
+    // The smallest well-formed image data, then the trailer.
+    bytes.extend_from_slice(&[0x02, 0x02, 0x4c, 0x01, 0x00, 0x3b]);
+
+    let refusal =
+        kr_transfer::preview::generate(&mut std::io::Cursor::new(bytes.clone()), "image/gif")
+            .expect_err("the frame is above the pixel limit");
+
+    assert!(
+        matches!(
+            refusal,
+            kr_transfer::preview::PreviewRefusal::TooManyPixels { pixels, .. }
+                if pixels == 48_000_000
+        ),
+        "the refusal names the frame's own pixel count: {refusal}"
+    );
+
+    // And publishing it produces a file with no preview, with the bytes untouched.
+    let harness = Harness::create();
+    let handle = harness.publish(&bytes, "image/gif", "screen.gif");
+    assert!(handle.preview.as_ref().is_none());
+    assert!(!handle.presented_as_image);
+    assert_eq!(handle.content_digest, digest(&bytes));
+}
