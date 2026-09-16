@@ -976,18 +976,21 @@ cargo test -p kr-term --release --test perf -- --nocapture --test-threads=1
 
 Each rate is what three passes sustained together, every byte they drained over every second they
 took, after a warm-up pass that is discarded. Each run records the operating system, the
-architecture and the processors it had, and prints each pass beside the total. A rate is a property
-of the engine, and the first pass through a fresh process is not: it pays for the allocator growing
-its arena and for the first touch of every page the grid and the row cache come to hold, which on
-a Linux runner is most of the difference between failing the target and clearing it. The fastest
-pass is printed too, as what the engine reached when nothing interfered, and it decides nothing:
-three passes at 3, 3 and 6 MiB/s sustained 3.6 MiB/s and fail, which is the right answer for a
-target about sustaining a rate.
+architecture, the processors and the processor's own name, and prints every pass beside the total.
+A rate is a property of the engine, and the first pass through a fresh process is not: it pays for
+the allocator growing its arena and for the first touch of every page the grid and the row cache
+come to hold. The fastest pass observed is printed as well and decides nothing; nothing in the run
+establishes that anything interfered with the others. What the target is asserted against is the
+figure the passes sustained together, because that is what a rate target is about: three passes at
+3, 3 and 6 MiB/s sustained 3.6 MiB/s and fail.
 
-Every bound is checked on every pass, the warm-up included, and at the peak each pass reached
-rather than at the reading it ended on: the response lane's queue, the session budget and the
-historical row cache. A bound that was passed halfway through and given back is a bound that was
-passed.
+Every bound is checked before the rate and on every pass, the warm-up included: the response
+lane's queue, the session budget and the historical row cache, each at the largest reading any pass
+reached rather than the reading it ended on. A bound that was passed halfway through and given back
+is a bound that was passed, and a host too slow for the rate still reports whether anything grew
+without one. Those readings are the engine's own accounting sampled between reads, so they say
+nothing about what a single read held while it was inside one, and nothing about what an allocator
+was holding around it.
 
 It drains a 5 MiB stream of mixed text, colour changes, cursor movement, wide characters,
 hyperlinks, alternate-screen churn and queries, and checks that the response lane, the row cache and

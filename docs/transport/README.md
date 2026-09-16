@@ -444,18 +444,32 @@ them can suppress an assertion.
 A condition counts against the host only when the host can be shown not to meet it. Fewer than
 four processors is a shortfall. A memory figure below 8 GiB is a shortfall. A platform that does
 not report its memory leaves that condition *unverified*, which the run prints and which is not a
-shortfall, because a gap in the harness is not a property of the host.
+shortfall, because a gap in the harness is not a property of the host. So a run that asserts its
+target is a run with no measured shortfall rather than a certified reference-host measurement, and
+it says so in those words.
 
 And no condition rests on something the application under test could have caused, or a regression
 in that application could switch off the check that would catch it. Section 27's idle host is the
 hard one, because no interface reports whether the machine underneath a shared virtual one is
-quiet. What the harness reads is the time the hypervisor took the processor away from the whole
-guest across both phases of the measurement, which is a host fact the measured application cannot
-produce; above one part in a hundred it is a shortfall. Linux accounts for that; where a platform
-does not, the condition is unverified. Beside it the harness records how late a thread of its own
-was woken while the measurement ran, and the load average where the platform reports one. Both are
-evidence for reading a run afterwards and neither suppresses anything: lateness cannot tell a busy
-neighbour from a slow processor, and a one-minute average carries the build that just finished.
+quiet. What the harness reads is the share of the processor time the hypervisor took away from the
+whole guest, which is a host fact the measured application cannot produce. It is read once for the
+idle phase and once for the loaded phase, because one average over both describes neither, and the
+worse of the two decides: above one part in a hundred it is a shortfall. The share is a ratio of
+the same counters, so it depends on neither the kernel's tick rate nor how many processors the
+reading covers. Linux accounts for stolen time; where a platform does not, the condition is
+unverified.
+
+That one part in a hundred is this reference's own exclusion rule, not a figure section 27 states:
+section 27 gives the reference host's processors and memory and says the host is idle, and
+quantifies nothing about how idle. A zero reading is worth less than it looks, too. It means the
+hypervisor reported no loss, which is not the same as an idle host: an environment that keeps no
+such accounting reads zero, and throttling and a neighbour inside the same guest cost time without
+being stolen.
+
+Beside it the harness records how late a thread of its own was woken while the measurement ran, and
+the load average where the platform reports one. Both are evidence for reading a run afterwards and
+neither suppresses anything: lateness cannot tell a busy neighbour from a slow processor, and a
+one-minute average carries the build that just finished.
 
 KR-PERF-005 is asserted where the host meets every condition it can be shown against, and recorded
 with the shortfall named where it does not. The reason is in the shape of the figure: it is a
@@ -466,8 +480,8 @@ names what was missing and asserts nothing about the number; the evidence for th
 the reference-host run in the release acceptance record.
 
 KR-PERF-006 is asserted on every run, unoptimised builds included. It has held on every host this
-has run on by three orders of magnitude, and a reconnect that does take two seconds is a defect
-however busy the host was.
+has run on by three orders of magnitude, which is why it is asserted unconditionally: that is a
+choice about where the line sits rather than a claim that no host could ever miss it.
 
 What both runs assert whatever the host: that the transfer was moving while KR-PERF-005 took its
 loaded measurement, and that the frame arrived whole. Without those a harness could pass by
@@ -484,21 +498,21 @@ of a job that runs until CI kills it, and it decides nothing about the property.
 allows still leaves the control reserve: one more transfer frame is refused, and a keystroke the
 size of the whole reserve is admitted. Exact arithmetic rather than a timing.
 
-**The priority the connection is using.** One stream of every kind is opened, and the priority is
-read back from the connection on both sides of each of them, because the opening side and the
-accepting side install it separately. A stream whose priority never reached the connection answers
-the connection's default of zero and fails there, so this observes the scheduler's decision
-arriving rather than the scheduler making it. Control, which carries the receipts section 23 names
-beside input, is covered along with terminal input and the transfer.
+**The priority the connection is using.** The connection's own control stream, the one the
+handshake opens and the receipts section 23 names travel on, is read back on both sides of it. So
+is one stream of every kind the registry opens, again on both sides, because the opening side and
+the accepting side install it separately, and the handshake installs its own. A stream whose
+priority never reached the connection answers the connection's default of zero and fails there, so
+this observes the scheduler's decision arriving rather than the scheduler making it.
 
 **Progress.** Over a real connection, with a transfer that never ends running through it, every
-keystroke is answered, each echo carries what was sent, the transfer is still writing when the
-keystrokes are done, and a further chunk of it reaches the far end while they run. That is a
-progress check rather than an ordering one: on loopback the receiver keeps up, so the standing
-backlog a keystroke could overtake is small. The transfer is drained rather than left unread,
-because a receiver that stops reading fills the connection's flow-control window, which no stream
-priority reaches past, and that is the case named at the end of the streams section rather than
-this one.
+keystroke is answered and each echo carries what was sent; the transfer is still writing when the
+keystrokes are done; and a further chunk of it reaches the far end after the keystrokes began,
+which is waited for rather than assumed. That is progress on both sides rather than an ordering
+between them: on loopback the receiver keeps up, so the standing backlog a keystroke could overtake
+is small. The transfer is drained rather than left unread, because a receiver that stops reading
+fills the connection's flow-control window, which no stream priority reaches past, and that is the
+case named at the end of the streams section rather than this one.
 
 ## Wiring a host
 
