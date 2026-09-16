@@ -592,18 +592,25 @@ arriving for its screens is never refused, because the room it needs is already 
 
 Every figure in the reservation is fixed. None of them is read out of the machine the build ran
 on, and the reason is that a footprint decides which geometries a session is given: a model built
-on `size_of` would admit a geometry on macOS and refuse it on Linux, and the fixture that records
-the boundary would only be true of the machine that generated it. A row record is the case that
-makes the point. The pinned grid library gives every row a lock for the application data a front
-end may attach to it, a `std::sync::Mutex` costs what each platform decides it costs, and a row
-comes to 144 bytes on macOS against 136 on Linux and Windows.
+on `size_of` would admit a geometry on Linux and refuse the same geometry on macOS, where the
+records are larger, and the fixture that records the boundary would only be true of the machine
+that generated it. A row record is the case that makes the point. The pinned grid library gives
+every row a lock for the application data a front end may attach to it, a `std::sync::Mutex` costs
+what each platform decides it costs, and a row comes to 144 bytes on macOS against 136 on Linux
+and Windows.
 
 So each figure below is the largest that record is on any supported host, and
 `crates/kr-term/src/layout.rs` asserts each one against the type the library really uses. A host
 whose records are smaller reserves the figure anyway, which is the safe direction: the session
 holds room it never needs and the budget stays one number. A host, a toolchain or a library
-revision whose record grew past its figure fails to build, rather than quietly reserving less than
-it allocates.
+revision whose *record* grew past its figure fails to build, rather than quietly reserving less
+than it allocates.
+
+What those assertions establish is the size of each record, and no more. They say nothing about
+the room a vector kept after it was shortened, about what an allocator adds around an allocation,
+or about anything a record reaches through a pointer and this model measures separately: a cell's
+attribute allocation can grow while the cell itself stays the size it was. The limits recorded
+below and in the allocation notes still apply.
 
 One cell of one buffer, in reserved bytes:
 
@@ -967,12 +974,20 @@ tests in that file are timings and they measure each other otherwise:
 cargo test -p kr-term --release --test perf -- --nocapture --test-threads=1
 ```
 
-Each rate is the best of three passes, after a warm-up pass that is discarded, and every run
-records the operating system, the architecture and the processors it had. A rate is a property of
-the engine, and the first pass through a fresh process is not: it pays for the allocator growing
-its arena and for the first touch of every page the grid and the row cache come to hold. Nor is a
-pass the machine interrupted, which is what section 27's idle host is about. Every bound is checked
-on every pass, because a bound holds whatever the machine was doing.
+Each rate is what three passes sustained together, every byte they drained over every second they
+took, after a warm-up pass that is discarded. Each run records the operating system, the
+architecture and the processors it had, and prints each pass beside the total. A rate is a property
+of the engine, and the first pass through a fresh process is not: it pays for the allocator growing
+its arena and for the first touch of every page the grid and the row cache come to hold, which on
+a Linux runner is most of the difference between failing the target and clearing it. The fastest
+pass is printed too, as what the engine reached when nothing interfered, and it decides nothing:
+three passes at 3, 3 and 6 MiB/s sustained 3.6 MiB/s and fail, which is the right answer for a
+target about sustaining a rate.
+
+Every bound is checked on every pass, the warm-up included, and at the peak each pass reached
+rather than at the reading it ended on: the response lane's queue, the session budget and the
+historical row cache. A bound that was passed halfway through and given back is a bound that was
+passed.
 
 It drains a 5 MiB stream of mixed text, colour changes, cursor movement, wide characters,
 hyperlinks, alternate-screen churn and queries, and checks that the response lane, the row cache and

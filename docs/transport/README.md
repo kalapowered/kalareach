@@ -421,7 +421,11 @@ application's own scheduling and handshake are not where the delay comes from.
 | Requirement | What is measured | Target |
 | --- | --- | --- |
 | KR-PERF-005 | What application scheduling adds above the measured path round trip while a transfer runs | under 25 ms p95 |
-| KR-PERF-006 | The transport's share of a reconnect: connecting, the handshake, one stream and a 120x40 screen | under two seconds |
+| KR-PERF-006 | The transport's share of a reconnect: connecting, the handshake, opening one stream and carrying a screen-sized frame | under two seconds |
+
+KR-PERF-006 measures the transport's share and nothing beyond it. A frame the size of a 120x40
+screen arriving is not a screen rendered from it: installing a snapshot belongs to the terminal and
+the client that own its format, and their share of the two seconds is measured where they are.
 
 `crates/kr-transport/tests/perf.rs` is the harness. Run it optimised and serially, because the two
 measurements would otherwise time each other:
@@ -434,52 +438,67 @@ cargo test --release -p kr-transport --test perf -- --nocapture --test-threads=1
 
 Section 27 measures against a reference host: at least four processors and 8 GiB of memory, with
 the operating system and architecture recorded beside the figure, and the host idle apart from the
-measurement. The harness prints every one of those, and measures the one that cannot be looked up.
-"Idle" is not a property a process can read, and a shared virtual machine's own load is invisible
-from inside it, so what the harness records instead is how late the runtime was woken while the
-measurement ran: a task that asks for five milliseconds and is given forty says the host had
-nothing to spare. Each run also prints the load average where the platform reports one, as evidence
-rather than as a condition, because a one-minute average still carries the build that just
-finished.
+measurement. The harness prints every one of those beside every figure. Two rules decide which of
+them can suppress an assertion.
 
-KR-PERF-005 is asserted where every condition held, and recorded with the shortfall named where one
-did not. The reason is in the shape of the figure: it is a difference between two percentiles taken
-on the same host, so noise enters it twice and does not cancel. On a host that cannot give the
-measurement a processor the difference is about contention rather than about this application, and
-asserting the target against such a number would fail runs that say nothing about the product. A
-shared CI runner is one of those hosts. Four processors are the whole of what section 27 asks a
-reference host for, and this harness needs them for its own runtime, because it runs the client,
-the host and the transfer in one process. A run there prints its figure, names what was missing and
-asserts nothing about the number; the evidence for the target is the reference-host run in the
-release record.
+A condition counts against the host only when the host can be shown not to meet it. Fewer than
+four processors is a shortfall. A memory figure below 8 GiB is a shortfall. A platform that does
+not report its memory leaves that condition *unverified*, which the run prints and which is not a
+shortfall, because a gap in the harness is not a property of the host.
 
-KR-PERF-006 is asserted on every optimised run. Two seconds against a handshake and one
-screen-sized frame is three orders of magnitude of room, so no amount of scheduling noise reaches
-it, and a reconnect that does take two seconds is a defect however busy the host was.
+And no condition rests on something the application under test could have caused, or a regression
+in that application could switch off the check that would catch it. Section 27's idle host is the
+hard one, because no interface reports whether the machine underneath a shared virtual one is
+quiet. What the harness reads is the time the hypervisor took the processor away from the whole
+guest across both phases of the measurement, which is a host fact the measured application cannot
+produce; above one part in a hundred it is a shortfall. Linux accounts for that; where a platform
+does not, the condition is unverified. Beside it the harness records how late a thread of its own
+was woken while the measurement ran, and the load average where the platform reports one. Both are
+evidence for reading a run afterwards and neither suppresses anything: lateness cannot tell a busy
+neighbour from a slow processor, and a one-minute average carries the build that just finished.
+
+KR-PERF-005 is asserted where the host meets every condition it can be shown against, and recorded
+with the shortfall named where it does not. The reason is in the shape of the figure: it is a
+difference between two percentiles taken on the same host, so noise enters it twice and does not
+cancel. On a host the hypervisor kept taking the processor from, the difference is about contention
+rather than about this application. Where a run cannot assert the target it prints its figure,
+names what was missing and asserts nothing about the number; the evidence for the target is then
+the reference-host run in the release acceptance record.
+
+KR-PERF-006 is asserted on every run, unoptimised builds included. It has held on every host this
+has run on by three orders of magnitude, and a reconnect that does take two seconds is a defect
+however busy the host was.
 
 What both runs assert whatever the host: that the transfer was moving while KR-PERF-005 took its
-loaded measurement, and that the snapshot arrived whole. Without those a harness could pass by
+loaded measurement, and that the frame arrived whole. Without those a harness could pass by
 measuring an idle connection twice.
 
 ### The property behind the figure
 
 `crates/kr-transport/tests/priority.rs` holds what KR-PERF-005 is about, with nothing timed in it,
-so it is asserted on every run: optimised or not, shared runner or reference host. Two things, one
-for each half of the mechanism above. The one deadline in that file turns a peer that has stopped
-answering into a named failure instead of a job that runs until CI kills it, and it decides nothing
-about the property.
+so it is asserted on every run: optimised or not, shared runner or reference host. Three things.
+The one deadline in that file turns a peer that has stopped answering into a named failure instead
+of a job that runs until CI kills it, and it decides nothing about the property.
 
-At the connection's own default limits, a transfer holding every byte its ceiling allows still
-leaves the control reserve: one more transfer frame is refused, and a keystroke the size of the
-whole reserve is admitted. That is the admission half, and it is exact arithmetic rather than a
-timing.
+**Admission.** At the connection's own default limits, a transfer holding every byte its ceiling
+allows still leaves the control reserve: one more transfer frame is refused, and a keystroke the
+size of the whole reserve is admitted. Exact arithmetic rather than a timing.
 
-Over a real connection, with a transfer that never ends running through it, every keystroke is
-answered and each echo carries the keystroke that was sent, while the transfer keeps taking chunks
-at the far end. Both sides make progress, which a connection whose transfer had taken the link
-could not do. The transfer is drained rather than left unread, because a receiver that stops
-reading fills the connection's flow-control window, which no stream priority reaches past, and that
-is the case named at the end of the streams section rather than this one.
+**The priority the connection is using.** One stream of every kind is opened, and the priority is
+read back from the connection on both sides of each of them, because the opening side and the
+accepting side install it separately. A stream whose priority never reached the connection answers
+the connection's default of zero and fails there, so this observes the scheduler's decision
+arriving rather than the scheduler making it. Control, which carries the receipts section 23 names
+beside input, is covered along with terminal input and the transfer.
+
+**Progress.** Over a real connection, with a transfer that never ends running through it, every
+keystroke is answered, each echo carries what was sent, the transfer is still writing when the
+keystrokes are done, and a further chunk of it reaches the far end while they run. That is a
+progress check rather than an ordering one: on loopback the receiver keeps up, so the standing
+backlog a keystroke could overtake is small. The transfer is drained rather than left unread,
+because a receiver that stops reading fills the connection's flow-control window, which no stream
+priority reaches past, and that is the case named at the end of the streams section rather than
+this one.
 
 ## Wiring a host
 
