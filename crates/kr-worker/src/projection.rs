@@ -38,6 +38,7 @@ use kr_protocol::session::Dimensions;
 use kr_term::budget::GridSize;
 use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
 use kr_term::lane::LaneGate;
+use kr_term::modes::KeyboardEncoding;
 use kr_term::sideeffect::{LeaseHolder, SideEffect, SideEffectKind};
 use kr_term::snapshot::{Viewport, restoration_operations};
 
@@ -238,14 +239,14 @@ impl TerminalEngine {
     /// never put into it sends the plain encoding, and the application reads it as different keys.
     #[must_use]
     pub fn negotiated_keyboard(&self) -> Option<String> {
-        let modes = self.engine.modes();
-        let level = modes.modify_other_keys();
-        match (modes.kitty_flags(), level) {
-            (Some(flags), _) if flags != 0 => {
+        match self.engine.modes().keyboard_encoding() {
+            KeyboardEncoding::Legacy => None,
+            KeyboardEncoding::Kitty(flags) => {
                 Some(format!("the Kitty keyboard protocol with flags {flags}"))
             }
-            (_, level) if level != 0 => Some(format!("modifyOtherKeys level {level}")),
-            _ => None,
+            KeyboardEncoding::ModifyOtherKeys(level) => {
+                Some(format!("modifyOtherKeys level {level}"))
+            }
         }
     }
 

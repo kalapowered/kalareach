@@ -782,9 +782,9 @@ mod tests {
         // taken away.
         let unknown =
             String::from_utf8_lossy(&KeyboardState::EMPTY.cleanup_sequences()).into_owned();
-        assert!(
-            !unknown.contains('u'),
-            "no stack of the terminal's is operated: {unknown:?}"
+        assert_eq!(
+            unknown, "\u{1b}[>4m",
+            "the level goes back to the terminal's own and nothing else is written"
         );
         assert!(
             !unknown.contains("\u{1b}[>4;0m"),

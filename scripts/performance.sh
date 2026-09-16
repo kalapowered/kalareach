@@ -91,6 +91,25 @@ measurement() {
 }
 
 failed=0
+
+# The suite's own regressions, before the measurements. What closes the sessions a run creates is
+# code like any other, and this is the script that owns this suite: `cargo test --workspace` stops
+# at the failing upstream suite before it and nothing else runs it.
+echo
+echo "running the measurement suite's own regressions"
+if ! regressions="$(CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test --release -p kr-worker \
+  --test performance 2>&1)"; then
+  echo "$regressions"
+  echo "FAILED: the measurement suite's own regressions"
+  failed=1
+elif ! grep -qE "^test result: ok\. [1-9]" <<<"$regressions"; then
+  echo "$regressions"
+  echo "FAILED: the measurement suite ran no regression"
+  failed=1
+else
+  grep -E "^test " <<<"$regressions" || true
+fi
+
 measurement attach_to_a_usable_screen || failed=1
 measurement idle_resources_for_twenty_sessions_and_thirty_two_views || failed=1
 

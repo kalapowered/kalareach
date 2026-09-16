@@ -207,6 +207,15 @@ enum Delivery {
 /// inside the boundary too. Nothing waits while the boundary is held, so a lease change never waits
 /// for a terminal, and no write of an ended lease's bytes can begin after that change.
 ///
+/// What makes this a boundary and not a wait is that the write inside it cannot wait: the terminal
+/// is opened in the mode where a write with no room comes straight back, which
+/// [`crate::pty::Pty::answers_rather_than_waits`] reports. A backend where that is false - the
+/// ConPTY pipes on Windows are the one in the repertoire - writes synchronously, so the boundary is
+/// held for as long as that write takes and a lease change waits behind at most one piece. The
+/// answer there is a terminal backend built on overlapped I/O; it is recorded in the handoff rather
+/// than approximated here, because a handle created without `FILE_FLAG_OVERLAPPED` cannot be made
+/// asynchronous afterwards.
+///
 /// A piece is at most [`WRITE_PIECE_BYTES`], so a takeover reaches a writer between pieces instead
 /// of behind a whole batch, and `room` is waited on outside the boundary. A piece never *ends*
 /// inside a paste delimiter: a terminal takes what it has room for, so a short write can stop in
