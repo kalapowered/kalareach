@@ -152,7 +152,7 @@ fn relay_object_authority(
     json: Value,
     id: &str,
     source: &str,
-) -> Result<([u8; 32], Vec<u8>)> {
+) -> Result<(Option<[u8; 32]>, Vec<u8>)> {
     use kr_protocol::relay::{
         RELAY_INSTANCE_DOMAIN, RELAY_LEASE_DOMAIN, RELAY_RECEIPT_DOMAIN, RELAY_REVOKE_DOMAIN,
         RelayConsumptionReceipt, RelayInstanceRegistration, RelayLease, RelayLeaseRevocation,
@@ -165,32 +165,34 @@ fn relay_object_authority(
     match domain {
         RELAY_LEASE_DOMAIN => {
             let object: RelayLease = serde_json::from_value(json).map_err(malformed)?;
-            Ok((*object.issuer_key.as_bytes(), object.signing_input()?))
+            Ok((Some(*object.issuer_key.as_bytes()), object.signing_input()?))
         }
         RELAY_REVOKE_DOMAIN => {
             let object: RelayLeaseRevocation = serde_json::from_value(json).map_err(malformed)?;
-            Ok((*object.issuer_key.as_bytes(), object.signing_input()?))
+            Ok((Some(*object.issuer_key.as_bytes()), object.signing_input()?))
         }
         RELAY_RECEIPT_DOMAIN => {
-            // A receipt names no key: it is verified under the instance the registry holds for the
-            // identity inside it, so the vector's own instance key is the authority here.
+            // A receipt names no key: it is verified under whichever key the registry holds for
+            // the instance inside it, so there is nothing here to compare the signer against. The
+            // absence is the answer rather than a value standing in for one, because a value would
+            // be a value some other object could carry.
             let object: RelayConsumptionReceipt =
                 serde_json::from_value(json).map_err(malformed)?;
-            Ok((RELAY_RECEIPT_AUTHORITY, object.signing_input()?))
+            Ok((None, object.signing_input()?))
         }
         RELAY_INSTANCE_DOMAIN => {
             let object: RelayInstanceRegistration =
                 serde_json::from_value(json).map_err(malformed)?;
-            Ok((*object.instance_key.as_bytes(), object.signing_input()?))
+            Ok((
+                Some(*object.instance_key.as_bytes()),
+                object.signing_input()?,
+            ))
         }
         other => Err(CryptoError::SecretStore {
             message: format!("case {id} in {source} signs under an unknown domain {other}"),
         }),
     }
 }
-
-/// Stands for "whichever instance key the registry holds", which a receipt does not carry.
-const RELAY_RECEIPT_AUTHORITY: [u8; 32] = [0; 32];
 
 /// The relay tier's signatures over the objects in `fixtures/relay/`.
 ///
@@ -266,13 +268,9 @@ fn relay_signatures(repository_root: &Path) -> Result<Value> {
                 RELAY_LEASE_DOMAIN | RELAY_REVOKE_DOMAIN => *admission_public.as_bytes(),
                 _ => *instance.public().as_bytes(),
             };
-            let expected = if named == RELAY_RECEIPT_AUTHORITY {
-                // A receipt names no key, so there is nothing to disagree with.
-                named
-            } else {
-                expected
-            };
-            if named != expected {
+            if let Some(named) = named
+                && named != expected
+            {
                 return Err(CryptoError::SecretStore {
                     message: format!(
                         "case {id} in {source} names a key the vectors do not sign with; \
