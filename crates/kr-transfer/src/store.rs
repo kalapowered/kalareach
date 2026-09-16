@@ -145,6 +145,8 @@ pub struct SnapshotRow {
     pub reserved_byte_len: u64,
     /// Its state.
     pub state: SnapshotState,
+    /// True while a payload this snapshot no longer needs is still on disk.
+    pub cleanup_pending: bool,
     /// Why it failed, when it did.
     pub failure_reason: Option<String>,
     /// The source object's identity when the snapshot was taken.
@@ -160,6 +162,11 @@ pub struct SnapshotRow {
 /// What state a download snapshot is in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotState {
+    /// Its bytes are reserved and its payload is being written.
+    ///
+    /// The row exists before the copy starts, so the reservation is atomic against every other
+    /// admission and an interrupted construction is a row recovery can find.
+    Reserving,
     /// It can serve chunks.
     Open,
     /// The source changed while it was being staged, or its bytes stopped verifying.
@@ -175,6 +182,7 @@ impl SnapshotState {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Reserving => "reserving",
             Self::Open => "open",
             Self::Failed => "failed",
             Self::Expired => "expired",
@@ -184,12 +192,19 @@ impl SnapshotState {
 
     fn parse(text: &str) -> Option<Self> {
         match text {
+            "reserving" => Some(Self::Reserving),
             "open" => Some(Self::Open),
             "failed" => Some(Self::Failed),
             "expired" => Some(Self::Expired),
             "released" => Some(Self::Released),
             _ => None,
         }
+    }
+
+    /// Returns true when this state still holds a payload and a reservation.
+    #[must_use]
+    pub const fn holds_bytes(self) -> bool {
+        matches!(self, Self::Reserving | Self::Open)
     }
 }
 
@@ -258,6 +273,8 @@ pub struct BindingRow {
     pub failure_detail: Option<String>,
     /// The read grant issued for it, when its method needed one.
     pub grant_id: Option<GrantId>,
+    /// Where the operation declared the bytes leave for, when it declared one.
+    pub external_destination: Option<String>,
     /// When it was bound.
     pub bound_at_ms: TimestampMs,
     /// The order it was bound in.
@@ -455,6 +472,7 @@ impl Store {
                      content_digest     BLOB NOT NULL,
                      reserved_byte_len  INTEGER NOT NULL,
                      state              TEXT NOT NULL,
+                     cleanup_pending    INTEGER NOT NULL DEFAULT 0,
                      failure_reason     TEXT,
                      source_device      INTEGER,
                      source_file_id     INTEGER,
@@ -503,6 +521,7 @@ impl Store {
                      upstream_evidence TEXT,
                      failure_detail    TEXT,
                      grant_id          BLOB,
+                     external_destination TEXT,
                      bound_at_ms       INTEGER NOT NULL,
                      ordinal           INTEGER NOT NULL,
                      PRIMARY KEY (draft_id, transfer_id)
@@ -665,8 +684,8 @@ impl Store {
                         .get::<_, Option<i64>>(0)?
                         .zip(row.get::<_, Option<i64>>(1)?)
                         .map(|(device, file_id)| ObjectIdentity {
-                            device: from_i64(device),
-                            file_id: from_i64(file_id),
+                            device: identity_from_sql(device),
+                            file_id: identity_from_sql(file_id),
                         }))
                 },
             )
@@ -687,8 +706,8 @@ impl Store {
                  WHERE environment_id = ?1",
                 params![
                     uuid_sql(self.environment_id.get()),
-                    as_i64(identity.device),
-                    as_i64(identity.file_id),
+                    identity_sql(identity.device),
+                    identity_sql(identity.file_id),
                 ],
             )
             .map_err(TransferError::store)?;
@@ -719,7 +738,8 @@ impl Store {
         let snapshots: i64 = self
             .connection
             .query_row(
-                "SELECT COALESCE(SUM(reserved_byte_len), 0) FROM snapshots WHERE state = 'open'",
+                "SELECT COALESCE(SUM(reserved_byte_len), 0) FROM snapshots
+                 WHERE state IN ('reserving', 'open') OR cleanup_pending = 1",
                 [],
                 |row| row.get(0),
             )
@@ -745,7 +765,8 @@ impl Store {
             params![actor_id.as_str()],
         )?;
         let snapshots = self.count(
-            "SELECT COUNT(*) FROM snapshots WHERE state = 'open' AND actor_id = ?1",
+            "SELECT COUNT(*) FROM snapshots
+             WHERE state IN ('reserving', 'open') AND actor_id = ?1",
             params![actor_id.as_str()],
         )?;
         Ok(uploads.saturating_add(snapshots))
@@ -1057,8 +1078,8 @@ impl Store {
                     content_digest.as_bytes().as_slice(),
                     preview,
                     preview_unavailable,
-                    as_i64(payload_identity.device),
-                    as_i64(payload_identity.file_id),
+                    identity_sql(payload_identity.device),
+                    identity_sql(payload_identity.file_id),
                 ],
             )
             .map_err(TransferError::store)?;
@@ -1081,28 +1102,35 @@ impl Store {
         transfer_id: TransferId,
         published_at_ms: TimestampMs,
         expires_at_ms: TimestampMs,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let transaction = self.begin()?;
-        transaction
+        // Conditional on the row still being the one that was verified. A cancellation that landed
+        // while the file was being moved must not be overwritten by the publish it cancelled.
+        let changed = transaction
             .execute(
                 "UPDATE uploads
                  SET state = ?2, published_at_ms = ?3, expires_at_ms = ?4, cleanup_pending = 0
-                 WHERE transfer_id = ?1",
+                 WHERE transfer_id = ?1 AND state = ?5",
                 params![
                     uuid_sql(transfer_id.get()),
                     UploadState::Published.as_str(),
                     as_i64(published_at_ms.get()),
                     as_i64(expires_at_ms.get()),
+                    UploadState::Publishing.as_str(),
                 ],
             )
             .map_err(TransferError::store)?;
+        if changed == 0 {
+            return Ok(false);
+        }
         record_event(
             &transaction,
             "upload.published",
             &transfer_id.to_string(),
             published_at_ms,
         )?;
-        transaction.commit().map_err(TransferError::store)
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(true)
     }
 
     /// Records that a draft holding this attachment was submitted.
@@ -1110,12 +1138,26 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the write fails.
-    pub fn mark_submitted(&mut self, transfer_id: TransferId, at_ms: TimestampMs) -> Result<()> {
+    pub fn mark_submitted(
+        &mut self,
+        transfer_id: TransferId,
+        at_ms: TimestampMs,
+        session_id: Option<SessionId>,
+    ) -> Result<()> {
         let transaction = self.begin()?;
         transaction
             .execute(
-                "UPDATE uploads SET submitted_at_ms = ?2 WHERE transfer_id = ?1",
-                params![uuid_sql(transfer_id.get()), as_i64(at_ms.get())],
+                // The session is recorded only where the upload had none. An attachment already
+                // bound to a session keeps that one; submission does not move it.
+                "UPDATE uploads
+                 SET submitted_at_ms = ?2,
+                     session_id = COALESCE(session_id, ?3)
+                 WHERE transfer_id = ?1",
+                params![
+                    uuid_sql(transfer_id.get()),
+                    as_i64(at_ms.get()),
+                    session_id.map(|value| uuid_sql(value.get())),
+                ],
             )
             .map_err(TransferError::store)?;
         record_event(
@@ -1170,10 +1212,11 @@ impl Store {
                 "INSERT INTO snapshots
                      (transfer_id, environment_id, actor_id, device_id, scope_id,
                       source_transfer_id, immutability, source_label, stored_name, byte_len,
-                      content_digest, reserved_byte_len, state, failure_reason, source_device,
-                      source_file_id, source_modified_ms, created_at_ms, expires_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15,
-                         ?16, ?17, ?18)",
+                      content_digest, reserved_byte_len, state, cleanup_pending, failure_reason,
+                      source_device, source_file_id, source_modified_ms, created_at_ms,
+                      expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, ?15,
+                         ?16, ?17, ?18, ?19)",
                 params![
                     uuid_sql(row.transfer_id.get()),
                     uuid_sql(row.environment_id.get()),
@@ -1188,8 +1231,11 @@ impl Store {
                     row.content_digest.as_bytes().as_slice(),
                     as_i64(row.reserved_byte_len),
                     row.state.as_str(),
-                    row.source_identity.map(|identity| as_i64(identity.device)),
-                    row.source_identity.map(|identity| as_i64(identity.file_id)),
+                    i64::from(row.cleanup_pending),
+                    row.source_identity
+                        .map(|identity| identity_sql(identity.device)),
+                    row.source_identity
+                        .map(|identity| identity_sql(identity.file_id)),
                     row.source_modified_ms,
                     as_i64(row.created_at_ms.get()),
                     as_i64(row.expires_at_ms.get()),
@@ -1229,8 +1275,9 @@ impl Store {
             .query_row(
                 "SELECT transfer_id, environment_id, actor_id, device_id, scope_id,
                         source_transfer_id, immutability, source_label, stored_name, byte_len,
-                        content_digest, reserved_byte_len, state, failure_reason, source_device,
-                        source_file_id, source_modified_ms, created_at_ms, expires_at_ms
+                        content_digest, reserved_byte_len, state, cleanup_pending, failure_reason,
+                        source_device, source_file_id, source_modified_ms, created_at_ms,
+                        expires_at_ms
                  FROM snapshots WHERE transfer_id = ?1",
                 params![uuid_sql(transfer_id.get())],
                 read_snapshot,
@@ -1296,22 +1343,144 @@ impl Store {
         state: SnapshotState,
         reason: Option<&str>,
         at_ms: TimestampMs,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let transaction = self.begin()?;
-        transaction
+        // Conditional, and the reservation stays. A snapshot's bytes are charged until its payload
+        // is gone, exactly as an upload's are.
+        let changed = transaction
             .execute(
-                "UPDATE snapshots SET state = ?2, failure_reason = ?3, reserved_byte_len = 0
-                 WHERE transfer_id = ?1",
+                "UPDATE snapshots
+                 SET state = ?2, failure_reason = ?3, cleanup_pending = 1
+                 WHERE transfer_id = ?1 AND state IN ('reserving', 'open')",
                 params![uuid_sql(transfer_id.get()), state.as_str(), reason],
             )
             .map_err(TransferError::store)?;
+        if changed == 0 {
+            return Ok(false);
+        }
         record_event(
             &transaction,
             &format!("download.{}", state.as_str()),
             &transfer_id.to_string(),
             at_ms,
         )?;
-        transaction.commit().map_err(TransferError::store)
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(true)
+    }
+
+    /// Moves a snapshot under construction to serving, only while it is still reserving.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn open_snapshot_row(
+        &mut self,
+        transfer_id: TransferId,
+        content_digest: Digest256,
+        chunks: &[ChunkDescriptor],
+        at_ms: TimestampMs,
+    ) -> Result<bool> {
+        let transaction = self.begin()?;
+        let changed = transaction
+            .execute(
+                "UPDATE snapshots SET state = 'open', content_digest = ?2
+                 WHERE transfer_id = ?1 AND state = 'reserving'",
+                params![
+                    uuid_sql(transfer_id.get()),
+                    content_digest.as_bytes().as_slice(),
+                ],
+            )
+            .map_err(TransferError::store)?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        for chunk in chunks {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO snapshot_chunks (transfer_id, idx, byte_len, digest)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        uuid_sql(transfer_id.get()),
+                        as_i64(chunk.index.get()),
+                        as_i64(chunk.byte_len.get()),
+                        chunk.digest.as_bytes().as_slice(),
+                    ],
+                )
+                .map_err(TransferError::store)?;
+        }
+        record_event(
+            &transaction,
+            "download.opened",
+            &transfer_id.to_string(),
+            at_ms,
+        )?;
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(true)
+    }
+
+    /// Records which mechanism produced a snapshot's bytes.
+    ///
+    /// A clone and a byte copy are different guarantees, and the row says which one this snapshot
+    /// has, because a resume answers from the row rather than from the call that created it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn set_snapshot_immutability(
+        &self,
+        transfer_id: TransferId,
+        immutability: DownloadImmutability,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE snapshots SET immutability = ?2 WHERE transfer_id = ?1",
+                params![uuid_sql(transfer_id.get()), immutability.as_str()],
+            )
+            .map_err(TransferError::store)?;
+        Ok(())
+    }
+
+    /// Records that a closed snapshot's payload is gone, which releases its reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn release_snapshot_payload(&self, transfer_id: TransferId) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE snapshots SET reserved_byte_len = 0, cleanup_pending = 0
+                 WHERE transfer_id = ?1",
+                params![uuid_sql(transfer_id.get())],
+            )
+            .map_err(TransferError::store)?;
+        Ok(())
+    }
+
+    /// Returns every snapshot whose payload still has to be removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the read fails.
+    pub fn snapshots_needing_cleanup(&self) -> Result<Vec<SnapshotRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT transfer_id, environment_id, actor_id, device_id, scope_id,
+                        source_transfer_id, immutability, source_label, stored_name, byte_len,
+                        content_digest, reserved_byte_len, state, cleanup_pending, failure_reason,
+                        source_device, source_file_id, source_modified_ms, created_at_ms,
+                        expires_at_ms
+                 FROM snapshots WHERE cleanup_pending = 1 ORDER BY created_at_ms",
+            )
+            .map_err(TransferError::store)?;
+        let rows = statement
+            .query_map([], read_snapshot)
+            .map_err(TransferError::store)?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.push(row.map_err(TransferError::store)??);
+        }
+        Ok(found)
     }
 
     /// Returns every snapshot in one state, oldest first.
@@ -1325,8 +1494,9 @@ impl Store {
             .prepare(
                 "SELECT transfer_id, environment_id, actor_id, device_id, scope_id,
                         source_transfer_id, immutability, source_label, stored_name, byte_len,
-                        content_digest, reserved_byte_len, state, failure_reason, source_device,
-                        source_file_id, source_modified_ms, created_at_ms, expires_at_ms
+                        content_digest, reserved_byte_len, state, cleanup_pending, failure_reason,
+                        source_device, source_file_id, source_modified_ms, created_at_ms,
+                        expires_at_ms
                  FROM snapshots WHERE state = ?1 ORDER BY created_at_ms",
             )
             .map_err(TransferError::store)?;
@@ -1356,8 +1526,8 @@ impl Store {
                     uuid_sql(row.scope_id.get()),
                     uuid_sql(row.environment_id.get()),
                     row.root_path,
-                    as_i64(row.root_identity.device),
-                    as_i64(row.root_identity.file_id),
+                    identity_sql(row.root_identity.device),
+                    identity_sql(row.root_identity.file_id),
                     row.purpose,
                     i64::from(row.revoked),
                 ],
@@ -1384,8 +1554,8 @@ impl Store {
                         environment_id: EnvironmentId::new(uuid_column(row, 1)?),
                         root_path: row.get(2)?,
                         root_identity: ObjectIdentity {
-                            device: from_i64(row.get(3)?),
-                            file_id: from_i64(row.get(4)?),
+                            device: identity_from_sql(row.get(3)?),
+                            file_id: identity_from_sql(row.get(4)?),
                         },
                         purpose: row.get(5)?,
                         revoked: row.get::<_, i64>(6)? != 0,
@@ -1542,6 +1712,7 @@ impl Store {
         &mut self,
         binding: &BindingRow,
         expected: DraftRevision,
+        grant: Option<&GrantRow>,
         action: Option<&RetainedAction>,
     ) -> Result<Option<DraftRevision>> {
         let transaction = self.begin()?;
@@ -1566,8 +1737,8 @@ impl Store {
             .execute(
                 "INSERT OR REPLACE INTO draft_attachments
                      (draft_id, transfer_id, insertion_method, state, upstream_evidence,
-                      failure_detail, grant_id, bound_at_ms, ordinal)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                      failure_detail, grant_id, external_destination, bound_at_ms, ordinal)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     uuid_sql(binding.draft_id.get()),
                     uuid_sql(binding.transfer_id.get()),
@@ -1576,11 +1747,33 @@ impl Store {
                     binding.upstream_evidence,
                     binding.failure_detail,
                     binding.grant_id.map(|value| uuid_sql(value.get())),
+                    binding.external_destination,
                     as_i64(binding.bound_at_ms.get()),
                     binding.ordinal,
                 ],
             )
             .map_err(TransferError::store)?;
+        if let Some(grant) = grant {
+            // The grant exists only if the binding it was issued for does. Committing it first
+            // would leave a readable path behind a binding that never happened.
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO grants
+                         (grant_id, environment_id, transfer_id, insertion_method, host_path,
+                          expires_at_ms, revoked)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        uuid_sql(grant.grant_id.get()),
+                        uuid_sql(grant.environment_id.get()),
+                        uuid_sql(grant.transfer_id.get()),
+                        grant.insertion_method.as_str(),
+                        grant.host_path,
+                        as_i64(grant.expires_at_ms.get()),
+                        i64::from(grant.revoked),
+                    ],
+                )
+                .map_err(TransferError::store)?;
+        }
         record_event(
             &transaction,
             &format!("draft.attachment.{}", binding.state.as_str()),
@@ -1601,7 +1794,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT draft_id, transfer_id, insertion_method, state, upstream_evidence,
-                        failure_detail, grant_id, bound_at_ms, ordinal
+                        failure_detail, grant_id, external_destination, bound_at_ms, ordinal
                  FROM draft_attachments WHERE draft_id = ?1 ORDER BY ordinal",
             )
             .map_err(TransferError::store)?;
@@ -1615,8 +1808,9 @@ impl Store {
                     upstream_evidence: row.get(4)?,
                     failure_detail: row.get(5)?,
                     grant_id: optional_uuid(row, 6)?.map(GrantId::new),
-                    bound_at_ms: timestamp(row.get(7)?),
-                    ordinal: row.get(8)?,
+                    external_destination: row.get(7)?,
+                    bound_at_ms: timestamp(row.get(8)?),
+                    ordinal: row.get(9)?,
                 })
             })
             .map_err(TransferError::store)?;
@@ -1935,8 +2129,8 @@ fn read_upload(row: &rusqlite::Row<'_>) -> RowResult<UploadRow> {
             .get::<_, Option<i64>>(14)?
             .zip(row.get::<_, Option<i64>>(15)?)
             .map(|(device, file_id)| ObjectIdentity {
-                device: from_i64(device),
-                file_id: from_i64(file_id),
+                device: identity_from_sql(device),
+                file_id: identity_from_sql(file_id),
             }),
         cleanup_pending: row.get::<_, i64>(16)? != 0,
         preview: row.get(17)?,
@@ -1965,8 +2159,8 @@ fn read_snapshot(row: &rusqlite::Row<'_>) -> RowResult<SnapshotRow> {
             )));
         }
     };
-    let device: Option<i64> = row.get(14)?;
-    let file_id: Option<i64> = row.get(15)?;
+    let device: Option<i64> = row.get(15)?;
+    let file_id: Option<i64> = row.get(16)?;
     Ok(Ok(SnapshotRow {
         transfer_id: TransferId::new(uuid_column(row, 0)?),
         environment_id: EnvironmentId::new(uuid_column(row, 1)?),
@@ -1988,14 +2182,15 @@ fn read_snapshot(row: &rusqlite::Row<'_>) -> RowResult<SnapshotRow> {
         content_digest: digest_column(row, 10)?,
         reserved_byte_len: from_i64(row.get(11)?),
         state,
-        failure_reason: row.get(13)?,
+        cleanup_pending: row.get::<_, i64>(13)? != 0,
+        failure_reason: row.get(14)?,
         source_identity: device.zip(file_id).map(|(device, file_id)| ObjectIdentity {
-            device: from_i64(device),
-            file_id: from_i64(file_id),
+            device: identity_from_sql(device),
+            file_id: identity_from_sql(file_id),
         }),
-        source_modified_ms: row.get(16)?,
-        created_at_ms: timestamp(row.get(17)?),
-        expires_at_ms: timestamp(row.get(18)?),
+        source_modified_ms: row.get(17)?,
+        created_at_ms: timestamp(row.get(18)?),
+        expires_at_ms: timestamp(row.get(19)?),
     }))
 }
 
@@ -2143,6 +2338,19 @@ const fn as_i64(value: u64) -> i64 {
 
 const fn from_i64(value: i64) -> u64 {
     if value < 0 { 0 } else { value as u64 }
+}
+
+/// Stores a filesystem identity as a signed integer without losing a bit.
+///
+/// A device number or an inode uses the whole `u64` range, so the saturating conversion counts use
+/// for byte lengths would turn a valid identity into `i64::MAX` and make it compare unequal after a
+/// restart. The reinterpretation round-trips exactly.
+const fn identity_sql(value: u64) -> i64 {
+    value as i64
+}
+
+const fn identity_from_sql(value: i64) -> u64 {
+    value as u64
 }
 
 const fn timestamp(value: i64) -> TimestampMs {
@@ -2575,6 +2783,7 @@ mod tests {
             content_digest: Digest256::from_bytes([9; 32]),
             reserved_byte_len: 8,
             state: SnapshotState::Open,
+            cleanup_pending: false,
             failure_reason: None,
             source_identity: Some(ObjectIdentity {
                 device: 3,
@@ -2591,15 +2800,41 @@ mod tests {
         );
         assert_eq!(store.snapshot_chunks(transfer(5)).expect("reads"), chunks);
         assert_eq!(store.staged_byte_len().expect("reads"), 8);
-        store
-            .close_snapshot(
-                transfer(5),
-                SnapshotState::Failed,
-                Some("the source changed while it was staged"),
-                TimestampMs::new(3000),
-            )
-            .expect("writes");
+        assert!(
+            store
+                .close_snapshot(
+                    transfer(5),
+                    SnapshotState::Failed,
+                    Some("the source changed while it was staged"),
+                    TimestampMs::new(3000),
+                )
+                .expect("writes")
+        );
+        // Closing keeps the charge; removing the payload releases it, exactly as an upload does.
+        assert_eq!(store.staged_byte_len().expect("reads"), 8);
+        assert_eq!(
+            store
+                .snapshots_needing_cleanup()
+                .expect("reads")
+                .iter()
+                .map(|row| row.transfer_id)
+                .collect::<Vec<_>>(),
+            vec![transfer(5)]
+        );
+        store.release_snapshot_payload(transfer(5)).expect("writes");
         assert_eq!(store.staged_byte_len().expect("reads"), 0);
+        assert!(store.snapshots_needing_cleanup().expect("reads").is_empty());
+        // A second close finds nothing to change.
+        assert!(
+            !store
+                .close_snapshot(
+                    transfer(5),
+                    SnapshotState::Released,
+                    None,
+                    TimestampMs::new(4000),
+                )
+                .expect("writes")
+        );
         assert_eq!(
             store
                 .snapshot(transfer(5))

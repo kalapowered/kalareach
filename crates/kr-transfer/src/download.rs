@@ -30,11 +30,10 @@ use kr_protocol::transfer::{
 use crate::authority::{AuthorisedDirectory, AuthorisedFile, ObjectPolicy, RelativeName};
 use crate::error::{Result, TransferError};
 use crate::service::{
-    TransferService, digest_of, poisoned, read_at, snapshot_expiry, snapshot_name, unknown,
-    write_at,
+    TransferService, digest_of, read_at, snapshot_expiry, snapshot_name, unknown, write_at,
 };
 use crate::staging::StorageName;
-use crate::store::{ScopeRow, SnapshotRow, SnapshotState};
+use crate::store::{ScopeRow, SnapshotRow, SnapshotState, UploadRow};
 
 /// How much of a source is copied at a time while a snapshot is staged.
 const COPY_BUFFER_LEN: usize = 256 * 1024;
@@ -61,7 +60,6 @@ impl TransferService {
             TransferError::invalid("a download names a source, or the transfer it resumes")
         })?;
         let now = self.clock.now_ms();
-        self.check_transfer_ceiling(actor)?;
         match source {
             DownloadSource::Attachment { transfer_id } => {
                 self.open_attachment_source(actor, params, *transfer_id, now)
@@ -123,20 +121,16 @@ impl TransferService {
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::UnknownTransfer`] when nothing is named, or
-    /// [`TransferError::PermissionDenied`] when another actor opened it.
+    /// Returns [`TransferError::UnknownTransfer`] when this principal has no such transfer. A
+    /// transfer another principal opened is refused by the same answer: a transfer identifier is
+    /// opaque, and which identifiers exist is not something a caller learns by asking.
     pub fn download_release(&self, actor: &ActorId, transfer_id: TransferId) -> Result<()> {
         let now = self.clock.now_ms();
-        let row = self
-            .locked()?
-            .snapshot(transfer_id)?
-            .ok_or_else(|| unknown(transfer_id))?;
-        if &row.actor_id != actor {
-            return Err(TransferError::PermissionDenied {
-                detail: format!("{transfer_id} belongs to another principal"),
-            });
-        }
-        if row.state != SnapshotState::Open {
+        let row = {
+            let store = self.locked()?;
+            snapshot_of(&store, transfer_id, actor)?
+        };
+        if !row.state.holds_bytes() {
             return Ok(());
         }
         self.release_snapshot(&row, SnapshotState::Released, None, now)
@@ -154,15 +148,14 @@ impl TransferService {
         reason: Option<&str>,
         now: TimestampMs,
     ) -> Result<()> {
-        self.locked()?
-            .close_snapshot(row.transfer_id, state, reason, now)?;
-        if row.immutability == DownloadImmutability::StagedSnapshot
-            && let Some(stored) = &row.stored_name
-            && let Ok(name) = snapshot_name(row.transfer_id, stored)
+        if !self
+            .locked()?
+            .close_snapshot(row.transfer_id, state, reason, now)?
         {
-            let _ = self.staging.snapshots().remove(&name);
+            // Something else closed it first. Its payload is that caller's to remove.
+            return Ok(());
         }
-        Ok(())
+        self.discard_snapshot_payload(row)
     }
 
     fn resume_download(
@@ -192,16 +185,11 @@ impl TransferService {
         transfer_id: TransferId,
         now: TimestampMs,
     ) -> Result<SnapshotRow> {
-        let row = self
-            .locked()?
-            .snapshot(transfer_id)?
-            .ok_or_else(|| unknown(transfer_id))?;
+        let row = {
+            let store = self.locked()?;
+            snapshot_of(&store, transfer_id, actor)?
+        };
         self.check_environment(row.environment_id)?;
-        if &row.actor_id != actor {
-            return Err(TransferError::PermissionDenied {
-                detail: format!("{transfer_id} belongs to another principal"),
-            });
-        }
         match row.state {
             SnapshotState::Open => {}
             // A snapshot that is gone is never silently replaced. The client asks for a new one.
@@ -230,21 +218,17 @@ impl TransferService {
                 let source = row.source_transfer_id.ok_or_else(|| {
                     TransferError::store("an immutable-source transfer names no attachment")
                 })?;
-                let upload = self
-                    .locked()?
-                    .upload(source)?
-                    .ok_or_else(|| unknown(source))?;
-                if upload.state != UploadState::Published {
-                    let reason = format!(
-                        "the attachment behind transfer {transfer_id} is {} and no longer serves \
-                         bytes",
-                        upload.state.as_str()
-                    );
+                let upload = {
+                    let store = self.locked()?;
+                    crate::service::upload_of(&store, source, actor)?
+                };
+                if let Err(error) = self.check_source_retention(&upload, now) {
+                    let reason = error.to_string();
                     self.release_snapshot(&row, SnapshotState::Failed, Some(&reason), now)?;
                     return Err(TransferError::PermissionDenied { detail: reason });
                 }
             }
-            DownloadImmutability::StagedSnapshot => {
+            DownloadImmutability::ClonedSnapshot | DownloadImmutability::StagedSnapshot => {
                 if let Some(scope_id) = row.scope_id {
                     self.authorised_scope(scope_id)?;
                 }
@@ -253,23 +237,14 @@ impl TransferService {
         Ok(row)
     }
 
-    fn check_transfer_ceiling(&self, actor: &ActorId) -> Result<()> {
-        let store = self.locked()?;
-        let limits = store.limits()?;
-        let open = store.open_transfers(actor)?;
-        if open >= limits.max_concurrent_transfers {
-            return Err(TransferError::Concurrency {
-                detail: format!(
-                    "this device already holds {open} of {} concurrent transfers; finish or \
-                     release one first",
-                    limits.max_concurrent_transfers
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    /// Serves a published attachment in place, because it is already an immutable revision.
+    /// Serves a published attachment in place.
+    ///
+    /// Its whole-file digest and its per-chunk digests were recorded when it was verified, and the
+    /// object itself is checked against the identity the row recorded, so what is served is the
+    /// revision that was verified or the request fails. That is what makes it an immutable source
+    /// revision for this purpose. It is not a claim that another process under the same
+    /// operating-system user cannot touch the file; such a change makes the affected chunk fail
+    /// integrity instead of being served, and the result says which mechanism produced it.
     fn open_attachment_source(
         &self,
         actor: &ActorId,
@@ -277,20 +252,28 @@ impl TransferService {
         source: TransferId,
         now: TimestampMs,
     ) -> Result<DownloadBeginResult> {
-        let upload = self
-            .locked()?
-            .upload(source)?
-            .ok_or_else(|| unknown(source))?;
+        let upload = {
+            let store = self.locked()?;
+            let limits = store.limits()?;
+            let open = store.open_transfers(actor)?;
+            if open >= limits.max_concurrent_transfers {
+                return Err(TransferError::Concurrency {
+                    detail: format!(
+                        "this device already holds {open} of {} concurrent transfers; finish or \
+                         release one first",
+                        limits.max_concurrent_transfers
+                    ),
+                });
+            }
+            // The same actor-authorised lookup every upload method uses. A transfer identifier is
+            // opaque; it is not a credential, and another principal's attachment is refused
+            // exactly as one that does not exist is.
+            crate::service::upload_of(&store, source, actor)?
+        };
         self.check_environment(upload.environment_id)?;
-        if upload.state != UploadState::Published {
-            return Err(TransferError::WrongState {
-                transfer: source.to_string(),
-                state: upload.state.as_str(),
-                detail: "only a published attachment can be downloaded".to_owned(),
-            });
-        }
-        // Opened through the completed area's own handle and revalidated, so what is served is an
-        // object this host holds rather than a row it trusts.
+        self.check_source_retention(&upload, now)?;
+        // Opened through the completed area's own handle and checked against the identity the row
+        // recorded, so what is served is the object that was verified.
         let mut file = self.open_published(&upload)?;
         let byte_len = file.revalidate()?;
         if byte_len != upload.declared_byte_len {
@@ -330,6 +313,7 @@ impl TransferService {
             // would count one file twice against the environment's budget.
             reserved_byte_len: 0,
             state: SnapshotState::Open,
+            cleanup_pending: false,
             failure_reason: None,
             source_identity: Some(file.identity()),
             source_modified_ms: None,
@@ -350,7 +334,39 @@ impl TransferService {
         })
     }
 
-    /// Stages a bounded immutable copy of a concurrently writable source.
+    /// Refuses an attachment whose own retention has run out.
+    ///
+    /// The sweep is a schedule, not the policy. An attachment past its deadline stops serving the
+    /// moment it is past it, whether or not a sweep has come round.
+    fn check_source_retention(&self, upload: &UploadRow, now: TimestampMs) -> Result<()> {
+        if upload.state != UploadState::Published {
+            return Err(TransferError::WrongState {
+                transfer: upload.transfer_id.to_string(),
+                state: upload.state.as_str(),
+                detail: "only a published attachment can be downloaded".to_owned(),
+            });
+        }
+        if upload.submitted_at_ms.is_none() && upload.expires_at_ms.get() <= now.get() {
+            return Err(TransferError::PermissionDenied {
+                detail: format!(
+                    "attachment {}'s retention has ended, so it serves no more bytes",
+                    upload.transfer_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Stages an immutable snapshot of a concurrently writable source.
+    ///
+    /// The order is what makes the reservation honest. The row exists, in
+    /// [`SnapshotState::Reserving`], with its bytes charged, **before** anything is copied: two
+    /// requests that both passed a quota check and then both copied would otherwise exceed the
+    /// environment's budget together, and an upload admitted during either copy would not see it.
+    ///
+    /// The copy is a filesystem clone where the platform and the filesystem offer one, and a
+    /// bounded byte copy where they do not. Which of the two happened is in the result, because
+    /// only the clone is atomic with respect to the source.
     fn stage_snapshot(
         &self,
         actor: &ActorId,
@@ -364,8 +380,33 @@ impl TransferService {
         let mut source = scope.open_read(&name, ObjectPolicy::ReadableFile)?;
         source.check_environment(self.environment_id)?;
         let before = source_state(&mut source)?;
+        let transfer_id = TransferId::new(kr_ipc::new_uuid());
+        let storage = StorageName::derive(transfer_id, relative_path);
+        let stored = storage.published()?;
+        let reserved = SnapshotRow {
+            transfer_id,
+            environment_id: self.environment_id,
+            actor_id: actor.clone(),
+            device_id: params.device_id.0,
+            scope_id: Some(scope_id),
+            source_transfer_id: None,
+            immutability: DownloadImmutability::StagedSnapshot,
+            source_label: relative_path.to_owned(),
+            stored_name: Some(stored.as_str().to_owned()),
+            byte_len: before.byte_len,
+            // Set when the copy is verified. Until then the row is `reserving` and serves nothing.
+            content_digest: Digest256::from_bytes([0; 32]),
+            reserved_byte_len: before.byte_len,
+            state: SnapshotState::Reserving,
+            cleanup_pending: false,
+            failure_reason: None,
+            source_identity: Some(before.identity),
+            source_modified_ms: before.modified_ms,
+            created_at_ms: now,
+            expires_at_ms: snapshot_expiry(now),
+        };
         {
-            let store = self.locked()?;
+            let mut store = self.locked()?;
             let limits = store.limits()?;
             if before.byte_len > limits.max_file_len {
                 return Err(TransferError::QuotaExceeded {
@@ -385,122 +426,129 @@ impl TransferService {
                     ),
                 });
             }
+            let open = store.open_transfers(actor)?;
+            if open >= limits.max_concurrent_transfers {
+                return Err(TransferError::Concurrency {
+                    detail: format!(
+                        "this device already holds {open} of {} concurrent transfers; finish or \
+                         release one first",
+                        limits.max_concurrent_transfers
+                    ),
+                });
+            }
+            // The reservation and the checks it passed are one transaction.
+            store.insert_snapshot(&reserved, &[])?;
         }
-        let transfer_id = TransferId::new(kr_ipc::new_uuid());
-        let storage = StorageName::derive(transfer_id, relative_path);
-        let stored = storage.published()?;
-        let mut destination = self.staging.snapshots().create_new(&stored)?;
-        let copy = copy_bounded(&mut source, &mut destination, before.byte_len);
-        let copied = match copy {
-            Ok(copied) => copied,
+        match self.fill_snapshot(&reserved, &stored, &mut source, before, now) {
+            Ok(result) => Ok(result),
             Err(error) => {
-                drop(destination);
-                let _ = self.staging.snapshots().remove(&stored);
-                return Err(error);
+                // The reservation goes with the failure, and its payload with it.
+                let closed = self.locked()?.close_snapshot(
+                    transfer_id,
+                    SnapshotState::Failed,
+                    Some(&error.to_string()),
+                    now,
+                )?;
+                if closed {
+                    let _ = self.discard_snapshot_payload(&reserved);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Copies the source into the reserved snapshot and opens it for serving.
+    fn fill_snapshot(
+        &self,
+        reserved: &SnapshotRow,
+        stored: &RelativeName,
+        source: &mut AuthorisedFile,
+        before: SourceState,
+        now: TimestampMs,
+    ) -> Result<DownloadBeginResult> {
+        let (immutability, copied) = match clone_file(source, self.staging.snapshots(), stored) {
+            // A clone is atomic with respect to the source, so nothing a writer does afterwards
+            // can reach it and the before-and-after comparison is a formality.
+            Ok(()) => (DownloadImmutability::ClonedSnapshot, before.byte_len),
+            Err(_) => {
+                let mut destination = self.staging.snapshots().create_new(stored)?;
+                let copied = copy_bounded(source, &mut destination, before.byte_len)?;
+                (DownloadImmutability::StagedSnapshot, copied)
             }
         };
-        // The source is read again through the same handle. A size, an identity or a modification
-        // time that moved means the copy covers two versions, and there is no honest way to serve
-        // it. The failure is recorded so the client learns why rather than seeing a silent retry.
-        let after = source_state(&mut source)?;
-        if after != before || copied != before.byte_len {
-            drop(destination);
-            let _ = self.staging.snapshots().remove(&stored);
-            let reason = format!(
-                "{relative_path} changed while it was being staged, so this snapshot covers no \
-                 single version of it"
-            );
-            let failed = SnapshotRow {
-                transfer_id,
-                environment_id: self.environment_id,
-                actor_id: actor.clone(),
-                device_id: params.device_id.0,
-                scope_id: Some(scope_id),
-                source_transfer_id: None,
-                immutability: DownloadImmutability::StagedSnapshot,
-                source_label: relative_path.to_owned(),
-                stored_name: None,
-                byte_len: before.byte_len,
-                content_digest: Digest256::from_bytes([0; 32]),
-                reserved_byte_len: 0,
-                state: SnapshotState::Failed,
-                failure_reason: Some(reason.clone()),
-                source_identity: Some(before.identity),
-                source_modified_ms: before.modified_ms,
-                created_at_ms: now,
-                expires_at_ms: snapshot_expiry(now),
-            };
-            self.locked()?.insert_snapshot(&failed, &[])?;
-            return Err(TransferError::source_changed(reason));
+        // The name is durable before the record that says it serves bytes.
+        self.staging.snapshots().sync()?;
+        let mut destination = self
+            .staging
+            .snapshots()
+            .open_read(stored, ObjectPolicy::HostOwnedFile)?;
+        if immutability == DownloadImmutability::StagedSnapshot {
+            // The source is read again through the same handle. A size, an identity or a
+            // modification time that moved means the copy may cover two versions, and there is no
+            // honest way to serve it.
+            let after = source_state(source)?;
+            if after != before || copied != before.byte_len {
+                return Err(TransferError::source_changed(format!(
+                    "{} changed while it was being staged, so this snapshot covers no single \
+                     version of it",
+                    reserved.source_label
+                )));
+            }
         }
-        // The copy is verified through its own handle, so a snapshot something else wrote while it
-        // was being staged fails here rather than serving bytes nothing checked.
         let (content_digest, byte_len) = digest_of(&mut destination)?;
         if byte_len != before.byte_len {
-            drop(destination);
-            let _ = self.staging.snapshots().remove(&stored);
             return Err(TransferError::integrity(
                 "the staged snapshot is not the size that was copied into it",
             ));
         }
         let layout = ChunkLayout::for_length(byte_len);
         let chunks = chunk_digests(&mut destination, layout)?;
-        let row = SnapshotRow {
-            transfer_id,
-            environment_id: self.environment_id,
-            actor_id: actor.clone(),
-            device_id: params.device_id.0,
-            scope_id: Some(scope_id),
-            source_transfer_id: None,
-            immutability: DownloadImmutability::StagedSnapshot,
-            source_label: relative_path.to_owned(),
-            stored_name: Some(stored.as_str().to_owned()),
-            byte_len,
-            content_digest,
-            reserved_byte_len: byte_len,
-            state: SnapshotState::Open,
-            failure_reason: None,
-            source_identity: Some(before.identity),
-            source_modified_ms: before.modified_ms,
-            created_at_ms: now,
-            expires_at_ms: snapshot_expiry(now),
-        };
-        if let Err(error) = self.locked()?.insert_snapshot(&row, &chunks) {
-            drop(destination);
-            let _ = self.staging.snapshots().remove(&stored);
-            return Err(error);
+        {
+            let mut store = self.locked()?;
+            if !store.open_snapshot_row(reserved.transfer_id, content_digest, &chunks, now)? {
+                return Err(TransferError::source_changed(
+                    "this snapshot was closed while it was being staged",
+                ));
+            }
+            if immutability != reserved.immutability {
+                store.set_snapshot_immutability(reserved.transfer_id, immutability)?;
+            }
         }
         Ok(DownloadBeginResult {
-            transfer_id,
+            transfer_id: reserved.transfer_id,
             environment_id: self.environment_id,
-            immutability: DownloadImmutability::StagedSnapshot,
+            immutability,
             byte_len: U64::new(byte_len),
             content_digest,
             layout,
             chunks,
-            expires_at_ms: row.expires_at_ms,
+            expires_at_ms: reserved.expires_at_ms,
             resumed: false,
         })
     }
 
-    /// Returns a scope's opened directory, reopening it when this process has not yet.
-    ///
-    /// A reopened scope is checked against the identity its registration recorded, so a rename, a
-    /// case alias or a replacement directory at the same path does not extend the grant.
-    pub(crate) fn authorised_scope(
-        &self,
-        scope_id: GrantId,
-    ) -> Result<std::sync::Arc<AuthorisedDirectory>> {
-        if let Some(directory) = self
-            .scopes
-            .lock()
-            .map_err(|_| poisoned())?
-            .get(&scope_id)
-            .cloned()
+    /// Removes a snapshot's payload and releases its reservation, in that order.
+    pub(crate) fn discard_snapshot_payload(&self, row: &SnapshotRow) -> Result<()> {
+        if row.immutability.is_staged()
+            && let Some(stored) = &row.stored_name
         {
-            directory.revalidate()?;
-            return Ok(directory);
+            let name = snapshot_name(row.transfer_id, stored)?;
+            self.staging.snapshots().remove(&name)?;
+            self.staging.snapshots().sync()?;
         }
+        self.locked()?.release_snapshot_payload(row.transfer_id)
+    }
+
+    /// Returns a scope's opened directory, checked against its record on every use.
+    ///
+    /// Nothing is cached. A revocation is a row, so every use reads that row; a cache would have to
+    /// be kept coherent with it, and a reader that installed an entry between another thread's read
+    /// and its revocation would serve bytes from a scope that no longer exists. An open is
+    /// microseconds, and a revoked scope stops bytes at once.
+    ///
+    /// The reopened directory is checked against the identity its registration recorded, so a
+    /// rename, a case alias or a replacement directory at the same path does not extend the grant.
+    pub(crate) fn authorised_scope(&self, scope_id: GrantId) -> Result<AuthorisedDirectory> {
         let row: ScopeRow =
             self.locked()?
                 .scope(scope_id)?
@@ -518,11 +566,6 @@ impl TransferService {
             std::path::Path::new(&row.root_path),
         )?;
         directory.check_identity(row.root_identity)?;
-        let directory = std::sync::Arc::new(directory);
-        self.scopes
-            .lock()
-            .map_err(|_| poisoned())?
-            .insert(scope_id, std::sync::Arc::clone(&directory));
         Ok(directory)
     }
 
@@ -538,7 +581,7 @@ impl TransferService {
                     .ok_or_else(|| unknown(source))?;
                 self.open_published(&upload)
             }
-            DownloadImmutability::StagedSnapshot => {
+            DownloadImmutability::ClonedSnapshot | DownloadImmutability::StagedSnapshot => {
                 let stored = row.stored_name.as_deref().ok_or_else(|| {
                     TransferError::store("a staged snapshot names no payload file")
                 })?;
@@ -551,6 +594,76 @@ impl TransferService {
                 Ok(file)
             }
         }
+    }
+}
+
+/// Clones a source into a snapshot payload, where the platform and filesystem offer a clone.
+///
+/// A copy-on-write clone is atomic with respect to the source: the snapshot is one revision of it
+/// whatever a writer does next. Apple platforms have `clonefile` on APFS; Linux has the `FICLONE`
+/// ioctl on btrfs and XFS. Everywhere else, and on a filesystem without it, this fails and the
+/// caller falls back to a bounded byte copy whose weaker guarantee the result names.
+#[cfg(target_vendor = "apple")]
+fn clone_file(
+    source: &AuthorisedFile,
+    destination: &AuthorisedDirectory,
+    name: &RelativeName,
+) -> std::io::Result<()> {
+    use std::os::fd::AsFd as _;
+
+    rustix::fs::fclonefileat(
+        source.handle().as_fd(),
+        destination.handle().as_fd(),
+        name.as_str(),
+        rustix::fs::CloneFlags::empty(),
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(target_os = "linux")]
+fn clone_file(
+    source: &AuthorisedFile,
+    destination: &AuthorisedDirectory,
+    name: &RelativeName,
+) -> std::io::Result<()> {
+    use std::os::fd::AsFd as _;
+
+    // The destination has to exist before the ioctl, and it has to be one this host created.
+    let created = destination
+        .create_new(name)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    match rustix::fs::ioctl_ficlone(created.handle().as_fd(), source.handle().as_fd()) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            drop(created);
+            let _ = destination.remove(name);
+            Err(std::io::Error::from(error))
+        }
+    }
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+fn clone_file(
+    _source: &AuthorisedFile,
+    _destination: &AuthorisedDirectory,
+    _name: &RelativeName,
+) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "this platform offers no filesystem clone",
+    ))
+}
+
+/// Returns one snapshot, for the principal that opened it.
+///
+/// Another principal's snapshot is refused exactly as one that does not exist is.
+fn snapshot_of(
+    store: &crate::store::Store,
+    transfer_id: TransferId,
+    actor: &ActorId,
+) -> Result<SnapshotRow> {
+    match store.snapshot(transfer_id)? {
+        Some(row) if &row.actor_id == actor => Ok(row),
+        _ => Err(unknown(transfer_id)),
     }
 }
 
@@ -669,6 +782,8 @@ impl<'destination> DownloadWriter<'destination> {
         placement: &DownloadPlacement,
     ) -> Result<Self> {
         let final_name = RelativeName::parse(&placement.destination_name)?;
+        // Checked here so a client learns early, and decided again at the publish, where the link
+        // that refuses an existing name is the thing that actually enforces it.
         if destination.occupied(&final_name)? && !placement.allow_overwrite {
             return Err(TransferError::PermissionDenied {
                 detail: format!(
@@ -774,6 +889,7 @@ impl<'destination> DownloadWriter<'destination> {
             });
         }
         let file = self.handle()?;
+        let verified = file.identity();
         let (digest, byte_len) = digest_of(file)?;
         if byte_len != self.placement.byte_len.get() {
             return Err(TransferError::integrity(format!(
@@ -786,33 +902,58 @@ impl<'destination> DownloadWriter<'destination> {
                 "this download does not match the whole-file digest the transfer declared",
             ));
         }
-        // Rechecked here, not only at the open: a destination that appeared while the download ran
-        // is still the user's to decide about.
-        let exists = self.destination.occupied(&self.final_name)?;
-        if exists && !self.placement.allow_overwrite {
-            return Err(TransferError::PermissionDenied {
-                detail: format!(
-                    "{} appeared in this destination while the download ran, and overwriting it is \
-                     an action the user takes explicitly",
-                    self.placement.destination_name
-                ),
-            });
-        }
         let temporary = self
             .temporary
-            .take()
+            .clone()
             .ok_or_else(|| TransferError::staging("this download has already been published"))?;
-        // The handle is closed before the rename, because Windows refuses to replace a name a
+        // The handle is closed before the name moves, because Windows refuses to replace a name a
         // handle still holds open.
         self.file = None;
-        if exists {
-            // The explicit overwrite the user asked for. The old name is removed and the verified
-            // file takes its place; between the two there is a moment with no file at that name,
-            // which is the cost of a rename that has to work the same way on every platform.
-            self.destination.remove(&self.final_name)?;
+        if self.placement.allow_overwrite {
+            // The user asked for this destination to be replaced. A rename replaces atomically, so
+            // there is no moment when the name holds nothing.
+            self.destination
+                .rename_into(&temporary, self.destination, &self.final_name)?;
+        } else {
+            // A link is the one portable atomic no-replace publish: it fails when the name is
+            // taken, so a file that appeared while the download ran is never overwritten. There is
+            // no check-then-act window to lose.
+            match self
+                .destination
+                .link_into(&temporary, self.destination, &self.final_name)
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    return Err(match self.destination.occupied(&self.final_name) {
+                        Ok(true) => TransferError::PermissionDenied {
+                            detail: format!(
+                                "{} exists in this destination, and overwriting it is an action \
+                                 the user takes explicitly",
+                                self.placement.destination_name
+                            ),
+                        },
+                        _ => TransferError::from(error),
+                    });
+                }
+            }
+            // The temporary name goes only once the published one holds the file.
+            self.destination.remove(&temporary)?;
         }
-        self.destination
-            .rename_into(&temporary, self.destination, &self.final_name)?;
+        // The name now has to hold the object that was verified. A rename and a link both preserve
+        // it, so anything else means something took the name in between.
+        let published = self
+            .destination
+            .open_read(&self.final_name, ObjectPolicy::ReadableFile)?;
+        if published.identity() != verified {
+            return Err(TransferError::integrity(format!(
+                "{} does not hold the object this download verified",
+                self.placement.destination_name
+            )));
+        }
+        self.destination.sync()?;
+        // Taken only now. Until this point the drop still owns the temporary name, so a failure
+        // anywhere above leaves nothing partial behind.
+        self.temporary = None;
         Ok(())
     }
 
