@@ -210,9 +210,11 @@ enum Delivery {
 /// A piece is at most [`WRITE_PIECE_BYTES`], so a takeover reaches a writer between pieces instead
 /// of behind a whole batch, and `room` is waited on outside the boundary. A piece never *ends*
 /// inside a paste delimiter: a terminal takes what it has room for, so a short write can stop in
-/// the middle of one, and the writer finishes those few bytes before it looks at the fence again.
-/// Half a delimiter is the one thing an abandoned batch cannot leave behind, because the next
-/// actor's first bytes would complete it and their paste would begin inside the previous actor's.
+/// the middle of one, and the writer finishes those few bytes inside the same boundary that began
+/// them. Half a delimiter is the one thing an abandoned batch cannot leave behind, because the next
+/// actor's first bytes would complete it and their paste would begin inside the previous actor's;
+/// and finishing it after the boundary was let go would be worse still, because a takeover in
+/// between would have already reported those bytes as never delivered.
 fn write_batch(
     writer: &mut impl std::io::Write,
     bytes: &[u8],
@@ -239,6 +241,10 @@ fn write_batch(
                 },
             );
         }
+        // One boundary for the fence, the write, the delimiter it may have stopped inside of, and
+        // the accounting for every byte of that. A delimiter finished after the boundary was let go
+        // would be bytes written after a takeover counted them as discarded, which is the one thing
+        // the receipt must never say.
         let attempt = {
             let _boundary = gate.lock().expect("the input boundary is not poisoned");
             if stale() {
@@ -253,6 +259,16 @@ fn write_batch(
             if let Ok(written) = attempt.as_ref() {
                 delivered += written;
                 wrote(*written);
+                // The rest of a delimiter this write stopped inside of goes now, fence or no
+                // fence, and inside this same boundary: its first bytes are already with the
+                // application, and the next actor's input must not be what completes them. It is a
+                // handful of bytes into a terminal that has just taken a piece, so the few
+                // refusals it can meet are waited out here rather than by letting go of what the
+                // count depends on.
+                match finish_delimiter(writer, bytes, transition, room, &mut delivered, wrote) {
+                    Delivery::Complete => {}
+                    ending => return (delivered, ending),
+                }
             }
             attempt
         };
@@ -270,41 +286,6 @@ fn write_batch(
                 continue;
             }
             Err(_) => return (delivered, Delivery::Gone),
-        }
-        // The rest of a delimiter this write stopped inside of goes now, fence or no fence: its
-        // first bytes are already with the application, and the next actor's input must not be
-        // what completes them.
-        while let Some(end) = transition.unfinished(delivered) {
-            let end = end.min(bytes.len());
-            let attempt = {
-                let _boundary = gate.lock().expect("the input boundary is not poisoned");
-                let attempt = writer.write(&bytes[delivered..end]);
-                if let Ok(written) = attempt.as_ref() {
-                    delivered += written;
-                    wrote(*written);
-                }
-                attempt
-            };
-            match attempt {
-                Ok(0) => return (delivered, Delivery::Gone),
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    // A few bytes with nowhere to go yet. The terminal is waited on rather than
-                    // spun on, and this is the one wait the fence does not end: these bytes are
-                    // already half with the application.
-                    if let Some(waiter) = room
-                        && waiter.wait(WRITE_WAIT) == crate::pty::Room::Gone
-                    {
-                        return (delivered, Delivery::Gone);
-                    }
-                }
-                Err(_) => return (delivered, Delivery::Gone),
-            }
         }
     }
     (delivered, Delivery::Complete)
@@ -352,6 +333,67 @@ fn insist(
     let _ = std::io::Write::flush(writer);
     true
 }
+
+/// Finishes a paste delimiter the last write stopped inside of.
+///
+/// Called with the input boundary held, because these bytes and the count of what a lease left
+/// behind have to be one answer: a delimiter completed after the boundary was let go would be bytes
+/// written after a takeover reported them as undelivered.
+///
+/// It is at most a few bytes into a terminal that has just accepted a piece, so the waiting it can
+/// meet is short and is done here rather than by letting go of what the count depends on. A
+/// terminal that will not take even those within [`DELIMITER_LIMIT`] is one this writer cannot
+/// finish anything on.
+fn finish_delimiter(
+    writer: &mut impl std::io::Write,
+    bytes: &[u8],
+    transition: &crate::session::PasteTransition,
+    room: Option<&crate::pty::InputWaiter>,
+    delivered: &mut usize,
+    wrote: &mut impl FnMut(usize),
+) -> Delivery {
+    let deadline = std::time::Instant::now() + DELIMITER_LIMIT;
+    while let Some(end) = transition.unfinished(*delivered) {
+        let end = end.min(bytes.len());
+        match writer.write(&bytes[*delivered..end]) {
+            Ok(0) => return Delivery::Gone,
+            Ok(written) => {
+                *delivered += written;
+                wrote(written);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Delivery::Gone;
+                }
+                match room {
+                    Some(waiter) => {
+                        if waiter.wait(DELIMITER_WAIT) == crate::pty::Room::Gone {
+                            return Delivery::Gone;
+                        }
+                    }
+                    None => std::thread::sleep(DELIMITER_WAIT),
+                }
+            }
+            Err(_) => return Delivery::Gone,
+        }
+    }
+    Delivery::Complete
+}
+
+/// How long the writer keeps offering the rest of a delimiter before it gives the terminal up.
+///
+/// The bytes are a handful and the terminal has just taken a piece, so this is reached only by a
+/// terminal that has stopped taking anything at all. It bounds how long a lease change can wait
+/// behind a half-written delimiter.
+const DELIMITER_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long one of those offers waits for room before it is made again.
+const DELIMITER_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Waits until the terminal will take more, and says whether the batch is still wanted.
 ///
@@ -1033,6 +1075,53 @@ mod tests {
         }
     }
 
+    /// How long the grudging terminal has no room after the piece that stopped inside a delimiter.
+    const REFUSAL_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// A terminal that takes one piece and then has no room for the few bytes that finish the
+    /// delimiter, which is what one whose input queue filled exactly there does.
+    struct Grudging {
+        taken: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        per_write: usize,
+        refuse_until: Option<std::time::Instant>,
+    }
+
+    impl std::io::Write for Grudging {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            match self.refuse_until {
+                Some(until) if std::time::Instant::now() < until => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                Some(_) => {}
+                None => self.refuse_until = Some(std::time::Instant::now() + REFUSAL_WINDOW),
+            }
+            let takes = bytes.len().min(self.per_write);
+            self.taken
+                .lock()
+                .expect("the record of what the application holds is not poisoned")
+                .extend_from_slice(&bytes[..takes]);
+            Ok(takes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A batch that ends with a paste start a write of `WRITE_PIECE_BYTES` stops in the middle of.
+    fn ends_in_a_delimiter() -> (Vec<u8>, PasteTransition) {
+        let ordinary = WRITE_PIECE_BYTES - 2;
+        let mut bytes = vec![b'a'; ordinary];
+        bytes.extend_from_slice(PASTE_START);
+        let end = u32::try_from(ordinary).expect("fits") + Delimiter::LEN;
+        (
+            bytes,
+            PasteTransition {
+                delimiters: vec![Delimiter { end, opens: true }],
+            },
+        )
+    }
+
     /// A paste start that a write of `WRITE_PIECE_BYTES` stops in the middle of.
     fn split_delimiter() -> (Vec<u8>, PasteTransition) {
         let ordinary = WRITE_PIECE_BYTES - 2;
@@ -1088,6 +1177,85 @@ mod tests {
         );
         assert!(
             terminal.taken.ends_with(PASTE_START),
+            "the application holds a whole paste start, not half of one"
+        );
+    }
+
+    #[test]
+    fn the_rest_of_a_delimiter_is_with_the_application_before_a_takeover_can_count_it_lost() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (bytes, transition) = ends_in_a_delimiter();
+        let taken = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut terminal = Grudging {
+            taken: std::sync::Arc::clone(&taken),
+            per_write: WRITE_PIECE_BYTES,
+            refuse_until: None,
+        };
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let released = std::sync::Arc::new(AtomicUsize::new(0));
+        let fence = std::sync::Arc::new(AtomicBool::new(false));
+        let (announce, announced) = std::sync::mpsc::channel();
+
+        // The takeover, doing what `Session::end_lease` does: take the boundary, publish the fence
+        // and count what the ended lease left behind, in one step. It begins the moment the first
+        // piece is with the terminal, which is where the delimiter is half written.
+        let takeover = std::thread::spawn({
+            let gate = std::sync::Arc::clone(&gate);
+            let taken = std::sync::Arc::clone(&taken);
+            let released = std::sync::Arc::clone(&released);
+            let fence = std::sync::Arc::clone(&fence);
+            move || {
+                announced.recv().expect("the writer announces its first piece");
+                let _boundary = gate.lock().expect("the input boundary is not poisoned");
+                let with_the_application =
+                    taken.lock().expect("the record is not poisoned").len();
+                let counted = released.load(Ordering::SeqCst);
+                fence.store(true, Ordering::SeqCst);
+                (with_the_application, counted)
+            }
+        });
+
+        let mut announce = Some(announce);
+        let (delivered, delivery) = write_batch(
+            &mut terminal,
+            &bytes,
+            &transition,
+            None,
+            &gate,
+            &mut || fence.load(Ordering::SeqCst),
+            &mut |count| {
+                released.fetch_add(count, Ordering::SeqCst);
+                if let Some(announce) = announce.take() {
+                    announce.send(()).expect("the takeover is waiting");
+                    // Long enough for the takeover to be waiting on the boundary, so that a writer
+                    // which let go of it between the piece and the rest of the delimiter would
+                    // hand the boundary over with half a delimiter delivered and uncounted.
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+            },
+        );
+        let (with_the_application, counted) =
+            takeover.join().expect("the takeover thread does not panic");
+        let held = taken.lock().expect("the record is not poisoned");
+
+        assert_eq!(
+            delivery,
+            Delivery::Complete,
+            "the terminal takes the whole batch in the end"
+        );
+        assert_eq!(delivered, bytes.len(), "and every byte of it is delivered");
+        assert_eq!(
+            held.len(),
+            with_the_application,
+            "no byte reached the application after the takeover counted what was left"
+        );
+        assert_eq!(
+            counted, with_the_application,
+            "and what the takeover counted already had every byte the application holds"
+        );
+        assert!(
+            held.ends_with(PASTE_START),
             "the application holds a whole paste start, not half of one"
         );
     }
