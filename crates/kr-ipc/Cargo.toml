@@ -37,10 +37,8 @@ kr-ipc = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 # The workspace forbids unsafe code, which a crate that reads the machine's own interrupt-time
-# counter and duplicates its own connection's handle cannot honour. This crate denies it instead and
-# allows it in exactly two modules: `clock::windows`, which owns the counter call, and
-# `endpoint::platform::handle`, which owns duplicating a pipe handle and handing it to the runtime.
-# Nothing else in this crate may relax the rule.
+# counter cannot honour. This crate denies it instead and allows it in exactly one module,
+# `clock::windows`, which owns that single call. Nothing else in this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

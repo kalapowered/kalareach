@@ -7,11 +7,17 @@
 //! Reading and writing are separate halves on purpose. A worker publishes output while a client is
 //! still sending input, and one task owning both directions would serialise them.
 
+#[cfg(windows)]
+use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::task::{Context, Poll};
 
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, StreamKind};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+#[cfg(windows)]
+use tokio::io::AsyncWrite as _;
 use tokio::io::{AsyncReadExt as _, ReadHalf, WriteHalf};
 
 use crate::endpoint::Connection;
@@ -28,8 +34,6 @@ pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWri
     // not know about.
     #[cfg(unix)]
     let descriptor = connection.writability().ok();
-    #[cfg(windows)]
-    let descriptor = writable.pipe();
     let (reader, writer) = tokio::io::split(connection);
     (
         FrameReader {
@@ -47,7 +51,7 @@ pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWri
             pending: Vec::new(),
             sent: 0,
             writable,
-            #[cfg(any(unix, windows))]
+            #[cfg(unix)]
             descriptor,
         },
     )
@@ -74,12 +78,6 @@ pub enum Wrote {
 pub struct Writable(Arc<Readiness>);
 
 impl Writable {
-    /// Returns the pipe this waits on, which is also what the attempt writes through.
-    #[cfg(windows)]
-    fn pipe(&self) -> Option<Arc<crate::endpoint::platform::Writable>> {
-        self.0.0.clone()
-    }
-
     fn of(connection: &Connection) -> Self {
         Self(Arc::new(Readiness::of(connection)))
     }
@@ -130,25 +128,24 @@ impl Readiness {
 
 #[cfg(windows)]
 #[derive(Debug)]
-struct Readiness(Option<Arc<crate::endpoint::platform::Writable>>);
+struct Readiness;
 
 #[cfg(windows)]
 impl Readiness {
-    fn of(connection: &Connection) -> Self {
-        // A handle of this connection's own, so waiting on it borrows nothing the writer holds. A
-        // connection this cannot be taken for is one whose writes fail anyway, and the wait below
-        // then yields rather than pretending to be readiness.
-        Self(connection.writability().ok().map(Arc::new))
+    const fn of(_connection: &Connection) -> Self {
+        Self
     }
 
+    /// Waits a moment and lets the caller try again.
+    ///
+    /// There is no readiness of this connection's own to wait on that the writer can hold while the
+    /// reader holds the other half: a pipe object is one object, and a second one over the same
+    /// pipe would take bytes the reader needs. So a writer that was refused comes back shortly
+    /// rather than spinning. The attempt itself is the same on both platforms, and it is the
+    /// attempt that never waits.
     async fn ready(&self) -> Result<()> {
-        let Some(pipe) = self.0.as_ref() else {
-            tokio::task::yield_now().await;
-            return Ok(());
-        };
-        pipe.ready()
-            .await
-            .map_err(|error| IpcError::socket("wait for the connection", error))
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        Ok(())
     }
 }
 
@@ -245,10 +242,14 @@ impl FrameReader {
 #[derive(Debug)]
 pub struct FrameWriter {
     /// The connection's write half, which keeps this end of it open for as long as the writer
-    /// lives. The bytes go through [`FrameWriter::descriptor`] instead: this connection's own
-    /// descriptor or handle, because the socket's own answer is what the boundary this writer sits
-    /// inside needs rather than a runtime's record of what it last saw.
-    #[expect(dead_code, reason = "it owns the half rather than writing through it")]
+    /// lives, and on Windows is what the attempt writes through. On a platform with descriptors the
+    /// bytes go through [`FrameWriter::descriptor`] instead, because the socket's own answer is
+    /// what the boundary this writer sits inside needs rather than a runtime's record of what it
+    /// last saw.
+    #[cfg_attr(
+        unix,
+        expect(dead_code, reason = "it owns the half rather than writing through it")
+    )]
     half: WriteHalf<Connection>,
     codec: FrameCodec,
     pending: Vec<u8>,
@@ -257,9 +258,6 @@ pub struct FrameWriter {
     /// This connection's own descriptor, which is what the attempt writes through.
     #[cfg(unix)]
     descriptor: Option<std::os::fd::OwnedFd>,
-    /// This connection's own overlapped handle on the pipe, which the attempt writes through.
-    #[cfg(windows)]
-    descriptor: Option<Arc<crate::endpoint::platform::Writable>>,
 }
 
 impl FrameWriter {
@@ -368,23 +366,23 @@ impl FrameWriter {
 
     /// Writes what it can and stops at the first byte the pipe will not take.
     ///
-    /// An overlapped write on this connection's own handle, which is the pipe's own answer now
-    /// rather than a runtime's record of what it last saw. Waiting for a different answer is
-    /// [`Writable::ready`]'s job, somewhere this writer is not held.
+    /// The attempt is made on the connection's own write half, with a waker nothing wakes: what
+    /// this reports is the pipe's answer now, and waiting for a different answer is
+    /// [`Writable::ready`]'s job. It is *this* object rather than a duplicate of the handle on
+    /// purpose. A duplicate adopted by the runtime would be a second pipe object over one pipe, and
+    /// registering one starts a read of its own: the bytes it took would be bytes
+    /// [`FrameReader`] never sees. One object reads, writes and reports readiness, or the stream
+    /// loses frames.
     #[cfg(windows)]
     fn attempt(&mut self) -> Result<Wrote> {
-        let Some(descriptor) = self.descriptor.as_ref() else {
-            return Err(IpcError::PeerClosed);
-        };
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
         while self.sent < self.pending.len() {
-            match descriptor.try_write(&self.pending[self.sent..]) {
-                Ok(0) => return Err(IpcError::PeerClosed),
-                Ok(written) => self.sent += written,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(Wrote::Blocked);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error)
+            match Pin::new(&mut self.half).poll_write(&mut context, &self.pending[self.sent..]) {
+                Poll::Pending => return Ok(Wrote::Blocked),
+                Poll::Ready(Ok(0)) => return Err(IpcError::PeerClosed),
+                Poll::Ready(Ok(written)) => self.sent += written,
+                Poll::Ready(Err(error))
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
@@ -392,9 +390,16 @@ impl FrameWriter {
                 {
                     return Err(IpcError::PeerClosed);
                 }
-                Err(error) => return Err(IpcError::socket("write", error)),
+                Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(Wrote::Blocked);
+                }
+                Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Poll::Ready(Err(error)) => return Err(IpcError::socket("write", error)),
             }
         }
+        // A flush the pipe defers changes nothing here: the bytes are with the operating system,
+        // which is what delivery means on a local connection.
+        let _ = Pin::new(&mut self.half).poll_flush(&mut context);
         Ok(Wrote::Complete)
     }
 
