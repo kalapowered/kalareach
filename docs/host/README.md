@@ -336,6 +336,34 @@ the effect happened. De-duplication records are kept for 30 days.
 Raw input is not in this table. Section 9 makes it a separate ordered stream keyed by connection,
 lease epoch and sequence, with nothing replayed on reconnection.
 
+## What an idle session wakes for
+
+A session with nothing happening in it should cost nothing, and twenty of them are measured
+together. KR-PERF-003 puts the whole host under one per cent of one processor core, averaged over
+five minutes: twenty idle sessions, thirty-two attached views, the allocated grids with their
+caches, and the daemon. A host that asked the kernel ten times a second, for every session, whether
+anything had happened yet would spend most of that allowance on the questions alone.
+
+So every wait in a worker is on something that happens rather than on a clock.
+
+| What is watched | What wakes the host | What is left on a clock |
+| --- | --- | --- |
+| the application's output | the terminal's own descriptor, which reports output and a hangup alike | a one-minute safety net, for a platform that reports neither |
+| room for the application's input | the same descriptor | nothing; a write with no room waits on it |
+| the root shell's exit | the child signal the kernel sends the worker | a thirty-second sweep, in case a signal is lost. Windows reports a process ending on its handle rather than by a signal, so there a hundred-millisecond check is the whole answer |
+| the processes the session owns | input the session accepted and output it produced, because a new process comes from one or the other | the same sweep, for a process that started from neither |
+| the login a desktop-bound session is tied to | nothing this host can subscribe to | the same sweep |
+| a held paste prefix | its own deadline, which exists only while a prefix is held | nothing |
+| an attached view | the frames its connection carries | one keepalive per connection every ten seconds, which section 23 requires of a local connection |
+
+The sweep is a window rather than a guarantee, and it is worth saying what that costs. A process
+that starts and ends between two observations of the ownership boundary is not in the closure
+record's list of what was stopped. The record never claims every application was discovered, and the
+coverage flag says which boundary produced it. The session's own traffic is what keeps that
+window narrow when it matters: a session that is running something is observed within a second of
+the input or the output that started the process, and the window is only as wide as the sweep while
+nothing at all is happening.
+
 ## Closure
 
 `session.close` is a state, not a request to exit.
