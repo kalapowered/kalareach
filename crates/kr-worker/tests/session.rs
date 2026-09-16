@@ -1222,8 +1222,11 @@ async fn a_root_shell_that_exits_is_noticed_without_waiting_for_a_sweep() {
         Some(7),
         "the shell's own status"
     );
+    // Well inside the sweep, not merely inside it. The closure sequence itself accounts for most
+    // of this: the grace period ends as soon as nothing the session owns is still running, and the
+    // output drain is two seconds.
     assert!(
-        taken < kr_worker::lifecycle::IDLE_SWEEP_INTERVAL,
+        taken < kr_worker::lifecycle::IDLE_SWEEP_INTERVAL / 2,
         "the exit reached the host before the sweep could have found it: {taken:?}"
     );
 }
@@ -1235,9 +1238,14 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
     // had already seen it - and what makes the host look is the session's own traffic, since a
     // process starts from input it accepted or shows itself in output it produced.
     let host = kr_ipc::testing::TempHost::create();
-    let config = configuration(&host, "sleep 4 & printf 'kr-working\\n'; exec cat");
+    // The job prints nothing itself; what makes the host look is the shell's own line, written
+    // while the job is running. The shell then waits for it, which is what a shell does with its
+    // jobs: a job nobody collected the status of is a process this host would still find in the
+    // kernel's table at closure, and this test is about the record rather than about that.
+    let config = configuration(&host, "sleep 4 & printf 'kr-working\\n'; wait; exec cat");
     let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
-    // Long enough for the job to have been observed while it ran, and to have ended afterwards.
+    // Long enough for the job to have been observed while it ran, and to have ended and been
+    // collected afterwards.
     tokio::time::sleep(Duration::from_secs(6)).await;
     assert_eq!(
         runtime.state(),
