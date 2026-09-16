@@ -26,6 +26,13 @@ serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
+[target.'cfg(windows)'.dependencies]
+# The terminal is this host's own pseudo-console, because the pipe modes its boundaries need cannot
+# be set on a pipe after it exists. `windows-sys` is what creates it; `anyhow` is only what the
+# terminal library's traits report a failure as.
+anyhow.workspace = true
+windows-sys.workspace = true
+
 [dev-dependencies]
 kr-cbor.workspace = true
 # The host tests start a real control daemon beside a real worker. The dependency is only in

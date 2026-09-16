@@ -13,7 +13,9 @@ use std::io::{Read, Write};
 
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::session::Dimensions;
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+#[cfg(unix)]
+use portable_pty::native_pty_system;
+use portable_pty::{CommandBuilder, MasterPty, PtySize};
 
 use crate::error::{Result, WorkerError};
 
@@ -54,6 +56,12 @@ impl ShellExit {
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     slave: Option<Box<dyn portable_pty::SlavePty + Send>>,
+    /// The event a started read of this terminal's output is signalled on.
+    ///
+    /// Windows has no readiness to ask a pipe about: what says there is output is the read the
+    /// reader already started, and this is how the waiter beside it waits for that read.
+    #[cfg(windows)]
+    output_event: std::os::windows::io::OwnedHandle,
     dimensions: Dimensions,
 }
 
@@ -74,6 +82,7 @@ impl Pty {
     ///
     /// Returns a dimension failure when the geometry violates a constraint, and
     /// [`WorkerError::Pty`] when the terminal cannot be created.
+    #[cfg(unix)]
     pub fn open(dimensions: Dimensions) -> Result<Self> {
         dimensions.validate()?;
         let pair = native_pty_system()
@@ -88,6 +97,33 @@ impl Pty {
         Ok(Self {
             master: pair.master,
             slave: Some(pair.slave),
+            dimensions,
+        })
+    }
+
+    /// Creates the pseudo-console at a validated geometry.
+    ///
+    /// The pipes are this host's own rather than the terminal library's, because the modes they
+    /// need are the ones the boundaries need and a pipe cannot be changed into them afterwards:
+    /// what this host writes into answers rather than waits, and what it reads from is overlapped,
+    /// so the reader waits on its own read rather than asking again on a timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a dimension failure when the geometry violates a constraint, and
+    /// [`WorkerError::Pty`] when the console cannot be created.
+    #[cfg(windows)]
+    pub fn open(dimensions: Dimensions) -> Result<Self> {
+        dimensions.validate()?;
+        let (master, slave) = crate::conpty::open(pty_size(dimensions))
+            .map_err(|error| WorkerError::pty("create the pseudo-terminal", error))?;
+        let output_event = master
+            .output_event()
+            .map_err(|error| WorkerError::pty("create the pseudo-terminal", error))?;
+        Ok(Self {
+            master: Box::new(master),
+            slave: Some(Box::new(slave)),
+            output_event,
             dimensions,
         })
     }
@@ -169,23 +205,24 @@ impl Pty {
         InputWaiter::of(self.master.as_ref())
     }
 
-    /// Returns whether this terminal answers a read or a write rather than waiting inside it.
-    ///
-    /// Where it does, a reader takes everything the terminal has in one batch; where it does not, a
-    /// second read would wait for output that has not happened yet, so what was read goes on its
-    /// way first.
-    #[must_use]
-    pub const fn answers_rather_than_waits(&self) -> bool {
-        cfg!(unix)
-    }
-
     /// Returns a handle that can be waited on until the application has written something.
     ///
     /// The terminal answers a read with nothing to read rather than waiting inside it, so the read
     /// loop waits here instead.
     #[must_use]
+    #[cfg(unix)]
     pub fn output_waiter(&self) -> Option<OutputWaiter> {
         OutputWaiter::of(self.master.as_ref())
+    }
+
+    /// Returns a handle that can be waited on until the application has written something.
+    ///
+    /// It waits on the read the reader has already started, because a pipe has no readiness of its
+    /// own to ask about.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn output_waiter(&self) -> Option<OutputWaiter> {
+        self.output_event.try_clone().ok().map(OutputWaiter::over)
     }
 
     /// Returns the process group the terminal currently has in the foreground.
@@ -779,45 +816,32 @@ fn answer_rather_than_wait(master: &dyn MasterPty) {
     }
 }
 
-/// A terminal on a platform with no descriptor to set the mode on.
-#[cfg(not(unix))]
-const fn answer_rather_than_wait(_master: &dyn MasterPty) {}
+/// Waiting for the terminal's output, which on Windows is waiting for the read that was started.
+#[cfg(windows)]
+pub use crate::conpty::OutputWaiter;
 
-/// A waiter on a platform where the terminal has no descriptor to wait on.
-#[cfg(not(unix))]
-#[derive(Debug)]
-pub struct OutputWaiter {}
-
-#[cfg(not(unix))]
-impl OutputWaiter {
-    /// Builds a waiter for a terminal, or `None` when it has no descriptor to wait on.
-    const fn of(_master: &dyn MasterPty) -> Option<Self> {
-        None
-    }
-
-    /// Waits until the terminal has output to read, or until `timeout` passes.
-    #[must_use]
-    pub const fn wait(&self, _timeout: std::time::Duration) -> Room {
-        Room::Gone
-    }
-}
-
-/// A waiter on a platform where the terminal has no descriptor to wait on.
-#[cfg(not(unix))]
+/// A waiter for room in a terminal whose writes answer rather than wait.
+///
+/// A pipe has nothing to wait on for room: what knows whether there is any is the write itself, and
+/// in this mode it answers. So this waits a little and says to ask again, which is what turns a
+/// writer that would spin into one that comes back shortly. A terminal that has gone is reported by
+/// the write rather than here, because the write is the thing that finds out.
+#[cfg(windows)]
 #[derive(Debug)]
 pub struct InputWaiter {}
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 impl InputWaiter {
-    /// Builds a waiter for a terminal, or `None` when it has no descriptor to wait on.
+    /// Builds the waiter. Every terminal on this platform has one.
     const fn of(_master: &dyn MasterPty) -> Option<Self> {
-        None
+        Some(Self {})
     }
 
-    /// Waits until the terminal will take more input, or until `timeout` passes.
+    /// Waits `timeout` and says the writer may ask the terminal again.
     #[must_use]
-    pub const fn wait(&self, _timeout: std::time::Duration) -> Room {
-        Room::Gone
+    pub fn wait(&self, timeout: std::time::Duration) -> Room {
+        std::thread::sleep(timeout);
+        Room::Ready
     }
 }
 

@@ -208,15 +208,10 @@ impl Drop for TerminalEnded {
     }
 }
 
-/// The terminal a batch is written into, and what it will do to a writer.
-///
-/// `answers` is whether a write comes straight back rather than waiting for the application to
-/// read, and `room` is what such a terminal is waited on with. The two travel together because they
-/// are one property of one backend.
+/// The terminal a batch is written into, and what it is waited on with.
 struct Terminal<'a, W: std::io::Write> {
     writer: &'a mut W,
     room: Option<&'a crate::pty::InputWaiter>,
-    answers: bool,
 }
 
 /// Hands one batch to the terminal a piece at a time, and says how far it got.
@@ -228,19 +223,9 @@ struct Terminal<'a, W: std::io::Write> {
 /// inside the boundary too. Nothing waits while the boundary is held, so a lease change never waits
 /// for a terminal, and no write of an ended lease's bytes can begin after that change.
 ///
-/// One rule holds on every platform: **what is committed inside the boundary is delivered outside
-/// it, and nothing waits inside it.**
-///
-/// Where the terminal answers rather than waits, the write itself happens inside the boundary,
-/// because it cannot wait there: it takes what it has room for and says so, and what it took is
-/// what is released. Where it waits - a backend whose write blocks until the application reads,
-/// which is what `answers` being false means - the piece is committed *before* it is written: the
-/// fence is read, the piece is released from the budget and from the lease's share, the boundary is
-/// let go, and only then does the write happen. A takeover taking that boundary next therefore sees
-/// a count that already excludes those bytes and never reports as undelivered what this writer is
-/// about to deliver, and it does not wait behind an application that has stopped reading. What that
-/// costs is the other direction, and it is bounded: a terminal that dies inside such a write leaves
-/// at most one piece counted as delivered that was not.
+/// What makes this a boundary and not a wait is that the write inside it cannot wait. Every terminal
+/// this host opens answers rather than waits - that is what [`crate::conpty`] exists for on Windows
+/// - so a write takes what there is room for and says so, and what it took is what is released.
 ///
 /// A piece is at most [`WRITE_PIECE_BYTES`], so a takeover reaches a writer between pieces instead
 /// of behind a whole batch, and `room` is waited on outside the boundary. A piece never *ends*
@@ -261,12 +246,8 @@ fn write_batch(
     stale: &mut impl FnMut() -> bool,
     wrote: &mut impl FnMut(usize),
 ) -> (usize, Delivery) {
-    let Terminal {
-        writer,
-        room,
-        answers,
-    } = terminal;
-    let (room, answers) = (*room, *answers);
+    let Terminal { writer, room } = terminal;
+    let room = *room;
     let mut delivered = 0_usize;
     while delivered < bytes.len() {
         // The rest of a delimiter the last piece stopped inside of, already counted as delivered
@@ -301,38 +282,28 @@ fn write_batch(
                 .unfinished(offered)
                 .unwrap_or(offered)
                 .min(bytes.len());
-            if !answers {
-                // A write that waits cannot be made under this boundary. The piece is committed
-                // instead, and written below.
-                owed = Some(delivered..offered);
-                wrote(offered - delivered);
-                delivered = offered;
-                Ok(offered)
-            } else {
-                let attempt = writer.write(&bytes[delivered..offered]);
-                if let Ok(written) = attempt.as_ref() {
-                    delivered += written;
-                    wrote(*written);
-                    // A write that stopped inside a delimiter commits the rest of it here, fence or
-                    // no fence: its first bytes are already with the application, and the next
-                    // actor's input must not be what completes them. Counting them now, on this
-                    // boundary, is what makes the count a takeover takes on the same boundary true
-                    // of them.
-                    if let Some(end) = transition.unfinished(delivered) {
-                        let end = end.min(bytes.len());
-                        owed = Some(delivered..end);
-                        wrote(end - delivered);
-                        delivered = end;
-                    }
+            let attempt = writer.write(&bytes[delivered..offered]);
+            if let Ok(written) = attempt.as_ref() {
+                delivered += written;
+                wrote(*written);
+                // A write that stopped inside a delimiter commits the rest of it here, fence or no
+                // fence: its first bytes are already with the application, and the next actor's
+                // input must not be what completes them. Counting them now, on this boundary, is
+                // what makes the count a takeover takes on the same boundary true of them.
+                if let Some(end) = transition.unfinished(delivered) {
+                    let end = end.min(bytes.len());
+                    owed = Some(delivered..end);
+                    wrote(end - delivered);
+                    delivered = end;
                 }
-                attempt
             }
+            attempt
         };
         // Outside the boundary, because nothing here is still deciding anything: these bytes are
         // counted, they are this writer's to deliver, and a terminal that will not take them is one
         // that has gone rather than one that is slow.
         if let Some(owed) = owed
-            && !deliver(writer, &bytes[owed], room, answers, gate)
+            && !insist(writer, &bytes[owed], room, gate)
         {
             return (delivered, Delivery::Gone);
         }
@@ -353,28 +324,6 @@ fn write_batch(
         }
     }
     (delivered, Delivery::Complete)
-}
-
-/// Writes bytes the boundary has already counted as delivered, whichever kind of terminal this is.
-///
-/// No fence applies to them: they are counted, and a paste terminator is the one thing that can end
-/// a paste nothing else is going to end. What differs is only how the waiting is done.
-fn deliver(
-    writer: &mut impl std::io::Write,
-    bytes: &[u8],
-    room: Option<&crate::pty::InputWaiter>,
-    answers: bool,
-    gate: &std::sync::Mutex<()>,
-) -> bool {
-    if answers {
-        return insist(writer, bytes, room, gate);
-    }
-    // A terminal that waits is waited on here, outside the boundary and without holding it: the
-    // bytes are already counted, so nothing a takeover reads depends on when this returns. The
-    // write ends when the application reads, or when the terminal goes and the write fails.
-    let sent = writer.write_all(bytes).is_ok();
-    let _ = std::io::Write::flush(writer);
-    sent
 }
 
 /// Writes a few bytes the application must have into a terminal that answers rather than waits.
@@ -480,10 +429,6 @@ impl SessionRuntime {
         // waiting in the session, because the session hands its queue over on every flush.
         let input_waiter = session.input_waiter();
         let output_waiter = session.output_waiter();
-        // Whether this terminal answers a read or a write rather than waiting inside it. It decides
-        // how the reader batches and how the writer keeps its boundary; both are the same question.
-        let answers = session.terminal_answers_rather_than_waits();
-        let batches_reads = answers;
         // The boundary the writer and the lease share. What is inside it is the fence, one write
         // that refuses to wait, and the accounting for what that write sent; the waiting for the
         // terminal is outside it. A lease change takes the same boundary, so a write cannot begin
@@ -537,10 +482,7 @@ impl SessionRuntime {
                         // an application printing steadily hands the engine and every subscriber a
                         // few large deliveries rather than thousands of small ones.
                         filled += read;
-                        // Only where the terminal answers rather than waits. Where a second read
-                        // would wait for output that has not happened, what was read goes on its
-                        // way now rather than being held for company.
-                        if batches_reads && filled < buffer.len() {
+                        if filled < buffer.len() {
                             continue;
                         }
                         if output_sender
@@ -624,11 +566,10 @@ impl SessionRuntime {
                 if fence != last_fence {
                     last_fence = fence;
                     if writer_paste_open.swap(false, Ordering::AcqRel)
-                        && !deliver(
+                        && !insist(
                             &mut writer,
                             crate::input::PASTE_END,
                             input_waiter.as_ref(),
-                            answers,
                             &writer_gate,
                         )
                     {
@@ -663,7 +604,6 @@ impl SessionRuntime {
                     &mut Terminal {
                         writer: &mut writer,
                         room: input_waiter.as_ref(),
-                        answers,
                     },
                     bytes,
                     &transition,
@@ -1201,7 +1141,6 @@ mod tests {
             &mut Terminal {
                 writer: &mut terminal,
                 room: None,
-                answers: true,
             },
             &bytes,
             &transition,
@@ -1275,7 +1214,6 @@ mod tests {
             &mut Terminal {
                 writer: &mut terminal,
                 room: None,
-                answers: true,
             },
             &bytes,
             &transition,
@@ -1336,7 +1274,6 @@ mod tests {
             &mut Terminal {
                 writer: &mut terminal,
                 room: None,
-                answers: true,
             },
             &bytes,
             &transition,
@@ -1359,101 +1296,6 @@ mod tests {
         );
     }
 
-    /// A terminal whose write waits for the application, which is what a synchronous pipe does.
-    struct Waits {
-        taken: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-        entered: std::sync::mpsc::Sender<()>,
-        go: std::sync::mpsc::Receiver<()>,
-    }
-
-    impl std::io::Write for Waits {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            let _ = self.entered.send(());
-            self.go
-                .recv()
-                .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
-            self.taken
-                .lock()
-                .expect("the record is not poisoned")
-                .extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn a_terminal_that_waits_is_written_to_outside_the_boundary() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        // A backend whose write waits until the application reads - the ConPTY pipes on Windows are
-        // the one in the repertoire - cannot be asked how much it will take. The piece is therefore
-        // counted before it is written and the boundary is let go first, so a lease change never
-        // waits behind an application that has stopped reading.
-        let bytes = vec![b'a'; WRITE_PIECE_BYTES * 2];
-        let taken = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (entered, has_entered) = std::sync::mpsc::channel();
-        let (go, may_go) = std::sync::mpsc::channel();
-        let mut terminal = Waits {
-            taken: std::sync::Arc::clone(&taken),
-            entered,
-            go: may_go,
-        };
-        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
-        let released = std::sync::Arc::new(AtomicUsize::new(0));
-
-        let writing = std::thread::spawn({
-            let gate = std::sync::Arc::clone(&gate);
-            let released = std::sync::Arc::clone(&released);
-            let bytes = bytes.clone();
-            move || {
-                write_batch(
-                    &mut Terminal {
-                        writer: &mut terminal,
-                        room: None,
-                        answers: false,
-                    },
-                    &bytes,
-                    &PasteTransition::default(),
-                    &gate,
-                    &mut || false,
-                    &mut |count| {
-                        released.fetch_add(count, Ordering::SeqCst);
-                    },
-                )
-            }
-        });
-
-        // The terminal is inside its write and is not coming back until this test lets it.
-        has_entered
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the terminal is inside a write");
-        assert!(
-            gate.try_lock().is_ok(),
-            "the boundary a lease change takes is free while the terminal is being written to"
-        );
-        assert_eq!(
-            released.load(Ordering::SeqCst),
-            WRITE_PIECE_BYTES,
-            "and the piece being written is already counted as delivered"
-        );
-
-        // Let it through, and let the rest of the batch follow.
-        for _ in 0..2 {
-            let _ = go.send(());
-        }
-        let (delivered, delivery) = writing.join().expect("the writer does not panic");
-        assert_eq!(delivery, Delivery::Complete);
-        assert_eq!(delivered, bytes.len());
-        assert_eq!(
-            taken.lock().expect("the record is not poisoned").len(),
-            bytes.len(),
-            "and every byte reached the application"
-        );
-    }
-
     #[test]
     fn what_the_terminal_took_is_what_is_released_not_what_was_offered() {
         let bytes = vec![b'a'; WRITE_PIECE_BYTES * 3];
@@ -1466,7 +1308,6 @@ mod tests {
             &mut Terminal {
                 writer: &mut terminal,
                 room: None,
-                answers: true,
             },
             &bytes,
             &PasteTransition::default(),
@@ -1492,7 +1333,6 @@ mod tests {
             &mut Terminal {
                 writer: &mut terminal,
                 room: None,
-                answers: true,
             },
             b"kr",
             &PasteTransition::default(),

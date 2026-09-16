@@ -3094,6 +3094,7 @@ dependencies = [
 name = "kr-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "kr-cbor",
  "kr-controller",
@@ -3108,6 +3109,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

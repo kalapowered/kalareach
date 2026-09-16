@@ -23,6 +23,7 @@
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
 pub mod attachments;
+pub mod conpty;
 pub mod environment;
 pub mod error;
 pub mod history;
