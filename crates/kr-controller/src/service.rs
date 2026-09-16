@@ -560,6 +560,9 @@ impl Controller {
             revision
         };
         self.leases.revoke(revision);
+        // The registrations are gone; the connections that held them are told. A frame already
+        // waiting for its peer is stopped by its connection closing, not by the next check.
+        self.fence_network_connections().await;
         self.announce_authority_revision().await
     }
 

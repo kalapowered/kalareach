@@ -178,6 +178,100 @@ impl FrameWriter {
         outcome
     }
 
+    /// Writes one message while `admits` holds, and says whether it went.
+    ///
+    /// `admits` is evaluated in the same poll as every attempt to hand bytes to the stream, so no
+    /// byte of this frame reaches the stream without it having held at that moment. That is what
+    /// makes an authority check a delivery barrier rather than a check before a wait: a frame
+    /// queued behind a peer that has stopped reading is abandoned where it waits, however long it
+    /// waits there.
+    ///
+    /// An abandoned frame leaves the stream in pieces when part of it had already gone, so the
+    /// stream is reset and carries nothing more. That is the right end for a stream whose
+    /// authority went: the peer sees the stream gone rather than a frame it can complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns a framing error when the message exceeds this stream kind's bound, and a stream
+    /// error when the write fails or the peer has stopped reading.
+    pub async fn write_message_while<T: Serialize + ?Sized>(
+        &mut self,
+        message: &T,
+        admits: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<bool> {
+        let payload = kr_cbor::to_canonical_vec_within(
+            message,
+            &kr_cbor::Limits::DEFAULT.with_max_message_len(self.max_payload),
+        )
+        .map_err(FrameError::Cbor)?;
+        if payload.is_empty() {
+            return Err(FrameError::EmptyPayload.into());
+        }
+        let length = u32::try_from(payload.len()).map_err(|_| FrameError::PayloadTooLarge {
+            len: payload.len(),
+            limit: self.max_payload,
+        })?;
+        self.write_framed_while(&length.to_be_bytes(), &payload, admits)
+            .await
+    }
+
+    /// Writes one frame in attempts, each of which `admits` has to admit.
+    async fn write_framed_while(
+        &mut self,
+        prefix: &[u8],
+        payload: &[u8],
+        admits: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<bool> {
+        if self.interrupted {
+            self.reset();
+            return Err(TransportError::Stream(
+                "a cancelled write left this stream incomplete".to_owned(),
+            ));
+        }
+        self.interrupted = true;
+        let mut sent = true;
+        for part in [prefix, payload] {
+            let mut written = 0;
+            while written < part.len() {
+                let stream = &mut self.stream;
+                let attempt = std::future::poll_fn(|context| {
+                    // In the same poll as the attempt. A poll that hands bytes to the stream is a
+                    // poll in which this held; a wake that arrives after the authority went
+                    // returns here and abandons the frame instead.
+                    if !admits() {
+                        return std::task::Poll::Ready(None);
+                    }
+                    std::pin::Pin::new(&mut *stream)
+                        .poll_write(context, &part[written..])
+                        .map(Some)
+                })
+                .await;
+                match attempt {
+                    None => {
+                        sent = false;
+                        break;
+                    }
+                    Some(Ok(0)) => {
+                        return Err(TransportError::Stream(
+                            "the peer accepted none of this frame".to_owned(),
+                        ));
+                    }
+                    Some(Ok(accepted)) => written += accepted,
+                    Some(Err(error)) => return Err(TransportError::Stream(error.to_string())),
+                }
+            }
+            if !sent {
+                break;
+            }
+        }
+        if sent {
+            self.interrupted = false;
+        } else {
+            self.reset();
+        }
+        Ok(sent)
+    }
+
     /// Finishes the stream, telling the peer no more frames follow.
     ///
     /// # Errors

@@ -87,6 +87,14 @@ pub struct RemoteOutput {
     /// Whose turn it is to write. Exactly one frame is in flight at a time.
     turn: tokio::sync::Mutex<()>,
     withdrawn: AtomicBool,
+    /// Who is waiting to hear that one answer reached the device, by the request it answers.
+    ///
+    /// A close is the reason this exists: the worker holds the session's termination until the
+    /// acceptance has been delivered, and whatever released that hold has to know the device
+    /// actually has the acceptance. A waiter whose connection goes learns it from the sender being
+    /// dropped with the connection.
+    delivery:
+        std::sync::Mutex<std::collections::BTreeMap<RequestId, tokio::sync::oneshot::Sender<()>>>,
     sender: ControlSender,
     connection: iroh::endpoint::Connection,
     /// The authority this connection writes under, read inside the turn.
@@ -187,6 +195,7 @@ impl RemoteOutput {
         Self {
             turn: tokio::sync::Mutex::new(()),
             withdrawn: AtomicBool::new(false),
+            delivery: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             sender: session.control.sender(),
             connection: session.connection.clone(),
             authority,
@@ -212,15 +221,23 @@ impl RemoteOutput {
         if self.has_withdrawn() {
             return false;
         }
+        if !self.fence() {
+            self.withdraw();
+            return false;
+        }
+        let fence = || self.fence();
         let written = tokio::select! {
-            written = self.sender.send_when(frame, || self.admits()) => written,
+            written = self.sender.send_while(frame, &fence) => written,
             () = self.authority_lost() => {
                 self.withdraw();
                 return false;
             }
         };
         match written {
-            Ok(true) => true,
+            Ok(true) => {
+                self.delivered(frame);
+                true
+            }
             // Refused at the boundary: the authority this connection writes under has gone, so the
             // connection goes with it rather than waiting to be asked for something else.
             Ok(false) => {
@@ -231,13 +248,43 @@ impl RemoteOutput {
         }
     }
 
-    /// Returns whether a frame may be written on this connection now.
+    /// Says who wants to hear that the answer to `request_id` reached the device.
     ///
-    /// Read inside the stream's writer, so it decides at the write rather than before the wait
-    /// for it. The latch is what a device revocation sets; the registration covers an authority
-    /// revision the daemon advanced for another reason, and the grant covers its own expiry.
-    async fn admits(&self) -> bool {
-        !self.has_withdrawn() && self.authority.stands().await
+    /// The sender goes with this connection, so a waiter whose device disconnected is told at once
+    /// rather than left waiting for a frame nothing is going to write.
+    pub fn on_delivery(&self, request_id: RequestId, tell: tokio::sync::oneshot::Sender<()>) {
+        self.delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request_id, tell);
+    }
+
+    /// Tells whoever was waiting that this frame has been written.
+    fn delivered(&self, frame: &ControlFrame) {
+        let request_id = match frame {
+            ControlFrame::Response(response) => response.request_id,
+            ControlFrame::Receipt(receipt) => receipt.request_id,
+            _ => return,
+        };
+        let waiting = self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&request_id);
+        if let Some(waiting) = waiting {
+            let _ = waiting.send(());
+        }
+    }
+
+    /// Returns whether a byte of a frame may go on this connection at this instant.
+    ///
+    /// Synchronous on purpose: it is evaluated inside the poll that hands bytes to the stream, so
+    /// no byte is accepted without it having just held. The latch is what a device revocation sets
+    /// and what a withdrawn registration sets through [`Self::withdraw`]; the grant covers its own
+    /// expiry. The registration itself is read by the checks that can wait, which is every request
+    /// and the watch below.
+    fn fence(&self) -> bool {
+        !self.has_withdrawn() && self.authority.has_time_left()
     }
 
     /// Resolves once this connection stops being one this host may write to.

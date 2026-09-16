@@ -289,32 +289,33 @@ impl ControlSender {
         outcome
     }
 
-    /// Sends one control frame if `admits` still holds at the write itself.
+    /// Sends one control frame for as long as `admits` holds, and says whether it went.
     ///
-    /// The stream's writer is taken first and `admits` decides after that, so a frame that waited
-    /// behind the keepalive or a window renewal is not written under authority that went while it
-    /// waited. Returns `Ok(false)` when `admits` refused, in which case nothing was written.
+    /// The writer is taken first, and then `admits` decides at every attempt to hand bytes to the
+    /// stream: a frame that waited behind the keepalive, behind a window renewal or behind a peer
+    /// that stopped reading is never written under authority that went while it waited. `admits`
+    /// is evaluated inside a poll, so it must not block and must not wait on this stream.
     ///
-    /// `admits` runs while the writer is held, so it must not wait on anything that waits on this
-    /// stream.
+    /// Returns `Ok(false)` when it refused. Nothing more can be written on the stream after that:
+    /// a frame abandoned part way through leaves it in pieces, and it is reset.
     ///
     /// # Errors
     ///
     /// As [`ControlChannel::send`].
-    pub async fn send_when<F, A>(&self, frame: &ControlFrame, admits: F) -> Result<bool>
-    where
-        F: FnOnce() -> A,
-        A: Future<Output = bool>,
-    {
+    pub async fn send_while(
+        &self,
+        frame: &ControlFrame,
+        admits: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<bool> {
         let mut writer = self.writer.lock().await;
-        if !admits().await {
+        if !admits() {
             return Ok(false);
         }
-        let outcome = writer.write_message(frame).await;
+        let outcome = writer.write_message_while(frame, admits).await;
         if outcome.is_err() {
             self.lost.declare();
         }
-        outcome.map(|()| true)
+        outcome
     }
 }
 

@@ -587,6 +587,35 @@ impl NetworkHost {
         controller.announce_authority_revision().await
     }
 
+    /// Fences every live connection whose registration has gone.
+    ///
+    /// A registration is what a remote connection writes under, and a revocation that withdraws
+    /// one has to reach the connection itself: a frame already waiting for its peer is stopped by
+    /// the connection closing rather than by the next check, and the closing is what makes the
+    /// authority check a delivery barrier. A device revocation withdraws its own device's
+    /// connections directly; this is for a revocation that withdrew registrations without naming
+    /// the devices holding them.
+    async fn fence_withdrawn(&self) {
+        let live: Vec<Arc<RemoteConnection>> = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(Arc::clone)
+            .collect();
+        for remote in live {
+            if remote.is_authorised().await {
+                continue;
+            }
+            remote.output().withdraw();
+            // Releasing the worker link waits for a socket, so it belongs to a task rather than
+            // to the caller of a revocation.
+            tokio::spawn(async move {
+                remote.release().await;
+            });
+        }
+    }
+
     /// Withdraws every live connection of one device.
     ///
     /// Withdrawing the registration stops the next request; this stops the writes and releases
@@ -845,6 +874,16 @@ impl Controller {
         // every worker would make one paused session everybody's wait.
         let _ = self.acknowledge_worker_revision(session_id).await;
         Ok(proxy)
+    }
+
+    /// Fences every network connection whose registration a revocation has withdrawn.
+    ///
+    /// Called where registrations are withdrawn without the devices holding them being named.
+    /// A host with no network has none to fence.
+    pub(crate) async fn fence_network_connections(&self) {
+        if let Some(network) = self.network.get() {
+            network.host.fence_withdrawn().await;
+        }
     }
 
     /// Closes one session over a link opened for the close, and settles what it answered.
