@@ -216,11 +216,12 @@ struct HistoryAccount {
     stale: bool,
 }
 
-/// The fewest charges an array of them ever allocates room for.
+/// The fewest charges the reservation for the account is written against.
 ///
-/// An array that has to grow does not start at one. This is what the standard library's smallest
-/// non-empty allocation holds for an eight-byte element, and it is what the reservation has to
-/// cover for a session whose scrollback is a row or two.
+/// The array is asked for one charge a row, and an allocator gives at least what it is asked for
+/// rather than exactly it, so a request for a charge or two can come back with more. This is the
+/// smallest non-empty allocation the standard library takes for an eight-byte element, which is as
+/// much as such a request can be rounded up to.
 const HISTORY_ACCOUNT_MINIMUM_CHARGES: usize = 4;
 
 impl HistoryAccount {
@@ -1756,10 +1757,10 @@ pub const HISTORY_CHARGE_BYTES: u64 = 2 * HISTORY_CHARGE_SLOT_BYTES;
 
 /// The least the account of what the retained rows cost is reserved at.
 ///
-/// Its array never allocates fewer charges than the standard library's smallest allocation holds,
-/// so a session whose scrollback is a row or two is holding that much whatever its geometry says,
-/// and it is reserved at twice that like everything else here. Without it the reservation would be
-/// under the truth at the smallest geometries.
+/// A session whose scrollback is a row or two asks for a charge or two and can be given the
+/// smallest allocation there is, so the reservation carries that floor, at twice it like
+/// everything else here. Without it the reservation would be under the truth at the smallest
+/// geometries.
 pub const HISTORY_ACCOUNT_MINIMUM_BYTES: u64 =
     (2 * HISTORY_ACCOUNT_MINIMUM_CHARGES * size_of::<u64>()) as u64;
 

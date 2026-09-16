@@ -162,9 +162,10 @@ pub const fn cell_content_bytes(cell_bytes: u64) -> u64 {
 
 /// What the account of what the retained rows cost can be holding, at `scrollback_rows` of history.
 ///
-/// One charge a row, in an array that grows by doubling and gives the room back when the charges
-/// on it go, so it holds at most twice the rows the scrollback keeps. Never less than the smallest
-/// allocation there is, which is what a session of one or two retained rows is still holding.
+/// One charge for every row the scrollback may keep. The array is brought to that room and left
+/// there, whether or not the charges are on it, so this is what the session holds for it from the
+/// moment it is admitted. It is reserved at twice that, and never below a floor, because an array
+/// allocates at least the room it is asked for rather than exactly it.
 #[must_use]
 pub const fn history_account_bytes(scrollback_rows: usize) -> u64 {
     let charges = (scrollback_rows as u64).saturating_mul(HISTORY_CHARGE_BYTES);
