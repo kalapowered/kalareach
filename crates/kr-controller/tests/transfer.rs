@@ -1049,3 +1049,258 @@ async fn each_endpoint_carries_only_the_methods_its_frame_bound_is_for() {
         .expect("a bitmap for this layout");
     assert_eq!(bitmap.missing(), vec![0]);
 }
+
+/// KR-REQ-14.12, KR-REQ-24.09: a daemon killed outright mid-upload leaves a transfer its
+/// replacement resumes from the verified chunk bitmap, with every byte counted exactly once.
+///
+/// This one runs the daemon as a real process and ends it with `SIGKILL`: no unwinding, no
+/// destructors, no flush of anything the journal had not already committed. The binary is copied to
+/// the internal disk and every directory it touches is there too, so nothing it opens is on the
+/// removable volume this tree lives on.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
+    let host = kr_ipc::testing::TempHost::create();
+    let environment = host.environment();
+    let environment_id = host.environment_id();
+    let program = host.root().join("kr-controller");
+    std::fs::copy(env!("CARGO_BIN_EXE_kr-controller"), &program).expect("copies the daemon");
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let chunk_address = chunk_endpoint(&environment).expect("an addressable chunk endpoint");
+    let bytes = pattern(UPLOAD_CHUNK_LEN + 4096);
+    let declared = bytes.len() as u64;
+
+    let first = start_daemon(&program, &host);
+    wait_for_daemon(&endpoint).await;
+    let transfer_id: TransferId;
+    {
+        let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects to the daemon this test started");
+        let mut chunks = ChunkChannel::connect(&chunk_address, build())
+            .await
+            .expect("connects to its attachment endpoint");
+        let begun: UploadBeginResult = typed(
+            &control
+                .mutate(
+                    Method::UploadBegin,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(environment_id),
+                    &UploadBeginParams {
+                        environment_id,
+                        session_id: Nullable::null(),
+                        device_id: Nullable::null(),
+                        declared_byte_len: U64::new(declared),
+                        declared_digest: digest(&bytes),
+                        declared_media_type: "application/octet-stream".to_owned(),
+                        original_file_name: "notes.bin".to_owned(),
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("upload.begin succeeds"),
+        );
+        transfer_id = begun.transfer_id;
+        assert_eq!(begun.layout.chunk_count, U64::new(2));
+        let (chunk, payload) = chunk_of(&bytes, 0);
+        chunks
+            .send_chunk(
+                &ActionTarget::environment(environment_id),
+                transfer_id,
+                chunk,
+                payload,
+            )
+            .await
+            .expect("the first chunk is accepted");
+    }
+
+    // The daemon dies where it stands.
+    kill_daemon(first);
+
+    let second = start_daemon(&program, &host);
+    wait_for_daemon(&endpoint).await;
+    let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the replacement");
+    let mut chunks = ChunkChannel::connect(&chunk_address, build())
+        .await
+        .expect("connects to the replacement's attachment endpoint");
+
+    let status: UploadStatusResult = typed(
+        &control
+            .request(Method::UploadStatus, &UploadStatusParams { transfer_id })
+            .await
+            .expect("the call reaches the replacement")
+            .expect("upload.status succeeds"),
+    );
+    assert_eq!(status.state, UploadState::Receiving);
+    assert_eq!(
+        status.received_byte_len,
+        U64::new(UPLOAD_CHUNK_LEN as u64),
+        "the chunk that arrived is counted once, and the one that did not is not counted"
+    );
+    let bitmap = ChunkBitmap::decode(&status.received_chunks, status.layout.chunk_count.get())
+        .expect("a bitmap for this layout");
+    assert_eq!(bitmap.missing(), vec![1]);
+
+    for index in bitmap.missing() {
+        let (chunk, payload) = chunk_of(&bytes, index);
+        let accepted = chunks
+            .send_chunk(
+                &ActionTarget::environment(environment_id),
+                transfer_id,
+                chunk,
+                payload,
+            )
+            .await
+            .expect("the remaining chunk is accepted");
+        assert!(
+            !accepted.duplicate,
+            "the chunk that never arrived is not a duplicate"
+        );
+    }
+
+    let finished: UploadFinishResult = typed(
+        &control
+            .mutate(
+                Method::UploadFinish,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &UploadFinishParams {
+                    transfer_id,
+                    declared_byte_len: U64::new(declared),
+                    declared_digest: digest(&bytes),
+                },
+            )
+            .await
+            .expect("the call reaches the replacement")
+            .expect("upload.finish succeeds"),
+    );
+    assert!(!finished.already_published);
+    assert_eq!(finished.handle.transfer_id, transfer_id);
+    assert_eq!(finished.handle.content_digest, digest(&bytes));
+    assert_eq!(finished.handle.byte_len, U64::new(declared));
+
+    // Nothing was double-counted: a second reservation reports the environment's staged total, and
+    // it is this attachment's bytes plus the new reservation, once each.
+    let next: UploadBeginResult = typed(
+        &control
+            .mutate(
+                Method::UploadBegin,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &UploadBeginParams {
+                    environment_id,
+                    session_id: Nullable::null(),
+                    device_id: Nullable::null(),
+                    declared_byte_len: U64::new(1),
+                    declared_digest: digest(&[0]),
+                    declared_media_type: "application/octet-stream".to_owned(),
+                    original_file_name: "one.bin".to_owned(),
+                },
+            )
+            .await
+            .expect("the call reaches the replacement")
+            .expect("upload.begin succeeds"),
+    );
+    assert_eq!(next.staged_byte_len, U64::new(declared + 1));
+
+    // And the published attachment serves exactly the bytes that were uploaded.
+    let download: DownloadBeginResult = typed(
+        &control
+            .request(
+                Method::DownloadBegin,
+                &DownloadBeginParams {
+                    environment_id,
+                    resume_transfer_id: Nullable::null(),
+                    source: Nullable::some(DownloadSource::Attachment {
+                        transfer_id: finished.handle.transfer_id,
+                    }),
+                    device_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the replacement")
+            .expect("download.begin succeeds"),
+    );
+    assert_eq!(download.byte_len, U64::new(declared));
+    assert_eq!(download.content_digest, digest(&bytes));
+
+    drop(control);
+    drop(chunks);
+    kill_daemon(second);
+    forget_environment_secrets(environment_id);
+}
+
+/// Starts the copied daemon on this test's own directories, with no worker program.
+#[cfg(unix)]
+fn start_daemon(
+    program: &std::path::Path,
+    host: &kr_ipc::testing::TempHost,
+) -> std::process::Child {
+    let logs = host.root().join("daemon.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&logs)
+        .expect("opens the daemon's log");
+    std::process::Command::new(program)
+        .arg("--runtime-dir")
+        .arg(host.root().join("r"))
+        .arg("--state-dir")
+        .arg(host.root().join("s"))
+        // This test creates no sessions, and a worker that cannot be found is refused rather than
+        // started.
+        .arg("--worker")
+        .arg(host.root().join("no-such-worker"))
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().expect("duplicates the log"))
+        .stderr(log)
+        .spawn()
+        .expect("starts the daemon")
+}
+
+/// Waits for a daemon to answer on its control endpoint.
+#[cfg(unix)]
+async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon did not answer on {} within thirty seconds",
+            endpoint.as_text()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Ends a daemon this test started, without giving it a chance to tidy up.
+#[cfg(unix)]
+fn kill_daemon(mut child: std::process::Child) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a process id"))
+        .expect("a process identifier");
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL).expect("kills the daemon");
+    child.wait().expect("reaps the daemon");
+}
+
+/// Removes the secrets this environment's daemon created, so a test leaves none behind.
+#[cfg(unix)]
+fn forget_environment_secrets(environment_id: EnvironmentId) {
+    for purpose in kr_protocol::pairing::KeyPurpose::ALL.map(|purpose| purpose.as_str()) {
+        let _ = std::process::Command::new("security")
+            .arg("delete-generic-password")
+            .arg("-s")
+            .arg("KalaReach")
+            .arg("-a")
+            .arg(format!("{environment_id}/device-key/{purpose}"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
