@@ -68,8 +68,10 @@ pub const RELAY_QUEUED_BYTES: usize = kr_protocol::limits::MAX_SEND_QUEUE_BYTES;
 /// been written or dropped. A charge released before the write would let the producer refill the
 /// budget while the write was still waiting, which is the memory the bound exists to cap.
 ///
-/// What is carried is the frame the connection will send, encoded once here rather than again at
-/// the other end, so what is charged is what is actually held.
+/// What is carried is the frame the connection will send, measured here against the connection's
+/// queue so that what is charged is what the connection will hold. The transport encodes it again
+/// when it writes it, which is one encoding of one frame at a time rather than a second copy held
+/// alongside this one.
 #[derive(Debug)]
 pub struct Relayed {
     frame: ControlFrame,
@@ -372,20 +374,27 @@ impl WorkerProxy {
                 return (
                     Err(kr_ipc::IpcError::UnexpectedMessage("this link has ended")),
                     false,
+                    false,
                 );
             };
             let written = writer.write_message(frame).await;
             let interrupted = writer.is_mid_frame();
-            if interrupted || written.is_err() {
-                // A frame that stopped part way through leaves the stream in pieces and the writer
-                // refuses to continue one, so the half goes here rather than being handed to the
-                // next caller.
+            // A frame that stopped part way through leaves the stream in pieces, and the writer
+            // refuses to continue one. A frame that could not be encoded at all left the stream
+            // untouched, so the writer is still usable and the failure is this call's alone.
+            let unusable = interrupted || (written.is_err() && writer.is_mid_frame());
+            if unusable {
                 held.take();
             }
-            (written, interrupted)
+            (written, interrupted, unusable)
         };
         let sent = match tokio::time::timeout(CALL_TIMEOUT, exchange).await {
-            Ok((written, interrupted)) => {
+            Ok((written, interrupted, unusable)) => {
+                if unusable && !interrupted {
+                    // The half is gone, so this link cannot carry anything else. Ending it is what
+                    // the worker reads as the connection going, which detaches what it held.
+                    self.close();
+                }
                 if interrupted {
                     self.close();
                     return Err(ControllerError::Uncertain {
