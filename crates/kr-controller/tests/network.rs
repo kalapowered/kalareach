@@ -148,16 +148,20 @@ impl Host {
     fn end_stray_workers(&self) -> Vec<String> {
         let Ok(registry) = Registry::open(self.paths().registry_database(), self.environment_id)
         else {
-            return Vec::new();
+            // The records cannot be read, so what this host started cannot be established. The
+            // tree stays: it is the only thing that could still be found by hand.
+            return vec!["this host's records could not be read".to_owned()];
         };
         let mut started: Vec<(kr_protocol::identity::ProcessStartIdentity, String)> = Vec::new();
-        if let Ok(workers) = registry.workers() {
-            started.extend(workers.into_iter().map(|worker| {
+        let mut unreadable = Vec::new();
+        match registry.workers() {
+            Ok(workers) => started.extend(workers.into_iter().map(|worker| {
                 (
                     worker.process_identity,
                     format!("session {}", worker.session_id),
                 )
-            }));
+            })),
+            Err(error) => unreadable.push(format!("the worker records could not be read: {error}")),
         }
         // Every phase in which something may be running. `Reserved` has nothing started yet, and
         // `Failed` and `Closed` are the phases that say the process is gone.
@@ -167,71 +171,94 @@ impl Host {
             LaunchPhase::Live,
             LaunchPhase::Fenced,
         ] {
-            let Ok(reservations) = registry.reservations_in(phase) else {
-                continue;
-            };
-            started.extend(reservations.into_iter().filter_map(|reservation| {
-                reservation.launcher_identity.map(|identity| {
-                    (
-                        identity,
-                        format!("the launch for session {}", reservation.session_id),
-                    )
-                })
-            }));
+            match registry.reservations_in(phase) {
+                Ok(reservations) => {
+                    started.extend(reservations.into_iter().filter_map(|reservation| {
+                        reservation.launcher_identity.map(|identity| {
+                            (
+                                identity,
+                                format!("the launch for session {}", reservation.session_id),
+                            )
+                        })
+                    }))
+                }
+                Err(error) => unreadable.push(format!(
+                    "the {phase:?} launch records could not be read: {error}"
+                )),
+            }
         }
         started.sort_by_key(|(identity, _)| identity.pid.get());
         started.dedup_by_key(|(identity, _)| identity.pid.get());
 
-        let mut signalled = Vec::new();
+        // Every identity this host started is followed until the kernel says it has ended, whether
+        // the request to stop reached it or not. A signal that failed, and a query the operating
+        // system refused, both establish nothing: treating either as death is what would remove a
+        // tree from under a live worker.
+        let mut signalled = unreadable;
+        let mut following = Vec::new();
         for (identity, what) in started {
-            if !matches!(
+            if matches!(
                 kr_ipc::identity::process_state(&identity),
-                kr_ipc::identity::ProcessState::Running
+                kr_ipc::identity::ProcessState::Ended
             ) {
                 continue;
             }
-            let Ok(raw) = i32::try_from(identity.pid.get()) else {
-                continue;
-            };
-            let Some(pid) = rustix::process::Pid::from_raw(raw) else {
-                continue;
-            };
             eprintln!("ending a worker this test started and did not close: {what}");
-            if rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok() {
-                signalled.push((identity, pid, what));
-            }
+            Self::signal(&identity, rustix::process::Signal::TERM);
+            following.push((identity, what));
         }
-        // Nothing is released until the kernel says each signalled process has ended. "Not
-        // running" is not that answer: a query the operating system refused establishes neither
-        // outcome, and treating it as death is what would remove a tree from under a live worker.
+        // Nothing is released until the kernel says every one of them has ended.
         let deadline = std::time::Instant::now() + STRAY_PATIENCE;
         let insist_at = deadline - STRAY_PATIENCE / 2;
         let mut insisted = false;
-        while !signalled.is_empty() {
-            signalled.retain(|(identity, _, _)| {
+        while !following.is_empty() {
+            following.retain(|(identity, _)| {
                 !matches!(
                     kr_ipc::identity::process_state(identity),
                     kr_ipc::identity::ProcessState::Ended
                 )
             });
             let now = std::time::Instant::now();
-            if signalled.is_empty() || now >= deadline {
+            if following.is_empty() || now >= deadline {
                 break;
             }
             // A worker that will not stop for the request is stopped outright. Leaving it running
-            // while its tree is removed is worse than ending it abruptly.
+            // while its tree is removed is worse than ending it abruptly. The identity is checked
+            // again first, inside `signal`: by now the identifier may belong to somebody else.
             if !insisted && now >= insist_at {
-                for (_, pid, _) in &signalled {
-                    let _ = rustix::process::kill_process(*pid, rustix::process::Signal::KILL);
+                for (identity, _) in &following {
+                    Self::signal(identity, rustix::process::Signal::KILL);
                 }
                 insisted = true;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        signalled.extend(following.into_iter().map(|(_, what)| what));
         signalled
-            .into_iter()
-            .map(|(_, _, what)| what)
-            .collect::<Vec<_>>()
+    }
+
+    /// Signals one process, and only while the kernel agrees it is the one that identity names.
+    ///
+    /// A process identifier is reused. Checking the start identity immediately before the signal
+    /// is what keeps this from ending somebody else's process, and it is checked again before an
+    /// escalation for the same reason.
+    fn signal(
+        identity: &kr_protocol::identity::ProcessStartIdentity,
+        signal: rustix::process::Signal,
+    ) {
+        if !matches!(
+            kr_ipc::identity::process_state(identity),
+            kr_ipc::identity::ProcessState::Running
+        ) {
+            return;
+        }
+        let Ok(raw) = i32::try_from(identity.pid.get()) else {
+            return;
+        };
+        let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+            return;
+        };
+        let _ = rustix::process::kill_process(pid, signal);
     }
 
     /// Starts the daemon and puts it on the network with the endpoint configuration given.
@@ -357,13 +384,16 @@ impl Drop for Host {
         }
         // Not established as ended. The tree is kept, and where it is is printed, because the
         // alternative is removing the directories a live worker is reading.
-        let kept = self.temp.take().map(std::mem::forget);
-        debug_assert!(kept.is_some(), "the tree was held until here");
+        let kept = self.temp.take().map(|temp| {
+            let root = temp.root().to_path_buf();
+            std::mem::forget(temp);
+            root
+        });
         for what in unresolved {
-            eprintln!(
-                "could not establish that a worker this test started has ended: {what}; \
-                 its host tree has been kept"
-            );
+            eprintln!("could not establish that a worker this test started has ended: {what}");
+        }
+        if let Some(root) = kept {
+            eprintln!("the host tree has been kept at {}", root.display());
         }
     }
 }
