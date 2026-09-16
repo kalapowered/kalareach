@@ -190,9 +190,18 @@ pub struct StolenTime {
 
 /// The processor line's counters at one moment, in whatever ticks the kernel counts in.
 #[derive(Debug, Clone, Copy)]
-struct StolenSample {
+pub struct StolenSample {
     stolen: u64,
     total: u64,
+}
+
+impl StolenSample {
+    /// Builds a reading from the two counters, which is how a test drives the boundary rules
+    /// without a `/proc/stat` that can be made to fail on demand.
+    #[must_use]
+    pub const fn new(stolen: u64, total: u64) -> Self {
+        Self { stolen, total }
+    }
 }
 
 impl StolenTime {
@@ -215,8 +224,17 @@ impl StolenTime {
     /// rolling that span into the next one, where time from the phase before it would be reported
     /// as the phase after it. A later span recovers on the next successful pair.
     pub fn take(&mut self) -> Option<f64> {
-        let last = stolen_sample();
-        let first = self.started.replace(last?);
+        self.advance(stolen_sample())
+    }
+
+    /// The boundary rules, over a reading a caller supplies.
+    ///
+    /// Separate from [`StolenTime::take`] so the rules can be driven through a reading that failed
+    /// without a `/proc/stat` that fails on demand. The store happens before anything can return:
+    /// a reading that failed has to become the boundary, or the span it ended is rolled into the
+    /// next one and time from the phase before is reported as the phase after.
+    pub fn advance(&mut self, last: Option<StolenSample>) -> Option<f64> {
+        let first = std::mem::replace(&mut self.started, last);
         let first = first?;
         let last = last?;
         let stolen = last.stolen.checked_sub(first.stolen)?;

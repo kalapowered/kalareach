@@ -29,10 +29,10 @@
 //! KR-PERF-005 is asserted where the host meets every condition it can be shown against, and
 //! recorded with the shortfall named where it does not. Its figure is a difference of two
 //! percentiles on the same host, so noise enters it twice and does not cancel: on a host the
-//! hypervisor kept taking the processor from, the difference is not evidence about this
-//! application. What it is not is proof of the reverse: a run with no measured shortfall is a run
-//! with no measured shortfall, not a certified reference-host measurement, and positive stolen
-//! time does not establish that contention caused the whole difference either. Lateness alone
+//! hypervisor kept taking the processor from, the figure alone cannot separate what the application
+//! added from what the host took. What it is not is proof of the reverse: a run with no measured
+//! shortfall is a run with no measured shortfall, not a certified reference-host measurement, and
+//! positive stolen time does not establish that contention caused the whole difference either. Lateness alone
 //! never suppresses anything, because the application under test can cause lateness and a
 //! regression must not be able to switch off the check that would catch it. `tests/priority.rs`
 //! holds the property behind the figure, with nothing timed in it, and that one is asserted
@@ -64,7 +64,7 @@ use kr_transport::handshake::{self, Admitted, PairedDirectory};
 use kr_transport::scheduler::{SendLimits, StreamBudget};
 use kr_transport::streams::StreamRegistry;
 use std::sync::Arc;
-use support::conditions::{Host, MAX_STOLEN_SHARE, SchedulingProbe, StolenTime};
+use support::conditions::{Host, MAX_STOLEN_SHARE, SchedulingProbe, StolenSample, StolenTime};
 use support::{OneDevice, Side, direct_addr, epochs, ledger, paired_pair, windows};
 
 /// One input round trip, and the payload it carried.
@@ -333,11 +333,8 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
 
     // Whatever the host, the measurement has to have measured something: a transfer that never
     // started, or one that stopped part way, leaves some or all of the loaded phase idle and the
-    // figure would be a second idle measurement.
-    assert!(
-        during > 0,
-        "the transfer moved nothing while the round trips ran, so they were not measured under one"
-    );
+    // figure would be a second idle measurement. The transfer that ended is reported first,
+    // because it is the one that says why.
     if !transfer_ran_throughout {
         // It only ends by failing: nothing else leaves that loop. Awaiting it names the write.
         match bulk.await {
@@ -348,6 +345,10 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
             Ok(Ok(())) => unreachable!("the transfer's loop has no successful exit"),
         }
     }
+    assert!(
+        during > 0,
+        "the transfer moved nothing while the round trips ran, so they were not measured under one"
+    );
 
     let shortfalls = host.shortfalls(stolen_share);
     if shortfalls.is_empty() {
@@ -397,6 +398,41 @@ async fn round_trips(
         assert_eq!(bytes_of(&echoed), INPUT_PAYLOAD);
     }
     measurements
+}
+
+/// The boundary rules of the stolen-share reading, over readings that are supplied rather than
+/// read, including one that failed.
+///
+/// A reading that fails has to become the boundary of the next span. Otherwise the span after it
+/// is measured from the boundary before it, and time from one phase is reported as another's,
+/// which is how a share confined to the transfer's warm-up could suppress the loaded phase's
+/// target. Both spans touching the failed reading answer nothing, and the span after them
+/// recovers. No host can be made to fail a `/proc/stat` read on demand, so the rules are driven
+/// through [`StolenTime::advance`].
+#[test]
+fn a_reading_that_failed_leaves_its_spans_unverified_and_the_next_recovers() {
+    let mut stolen = StolenTime::start();
+    // A first reading establishes a boundary and answers nothing: there is no span yet.
+    assert_eq!(stolen.advance(Some(StolenSample::new(0, 1_000))), None);
+    // One span, a tenth of it taken.
+    assert_eq!(
+        stolen.advance(Some(StolenSample::new(100, 2_000))),
+        Some(0.1)
+    );
+    // A reading that failed. The span it ended answers nothing.
+    assert_eq!(stolen.advance(None), None);
+    // And so does the span after it, because that span has no boundary to start from.
+    assert_eq!(stolen.advance(Some(StolenSample::new(900, 5_000))), None);
+    // The next span recovers, and it is measured from the reading that succeeded rather than from
+    // the one before the failure: 100 of 1,000 rather than 900 of 4,000.
+    assert_eq!(
+        stolen.advance(Some(StolenSample::new(1_000, 6_000))),
+        Some(0.1)
+    );
+    // A counter that went backwards is a discontinuity, not a negative share.
+    assert_eq!(stolen.advance(Some(StolenSample::new(0, 0))), None);
+    // And the boundary moved to it, so the span after the discontinuity is measured from there.
+    assert_eq!(stolen.advance(Some(StolenSample::new(10, 100))), Some(0.1));
 }
 
 /// KR-PERF-006.
