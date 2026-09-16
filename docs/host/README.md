@@ -180,6 +180,83 @@ A sequence the profile does not name is consumed rather than forwarded, and the 
 the input lease has no destination, so it becomes a durable host event in the worker's own journal
 rather than being shown to whoever happens to be watching.
 
+## Who may type
+
+A session has one input lease with an epoch. `input.acquire` takes it immediately: the epoch
+advances, the previous holder's undelivered bytes are dropped, and nothing waits for that holder to
+agree. What has already reached the application cannot be recalled, so the count of discarded bytes
+is the honest limit of what a takeover undoes. A write at any other epoch, or from any other
+attachment, is `LEASE_LOST`, and it never takes the lease as a side effect: acquiring is something a
+controller asks for.
+
+Whether it may hold the lease is a comparison rather than a label. The canonical grid knows which
+keyboard encoding the application has negotiated — the ordinary one, `modifyOtherKeys` at a level,
+or the Kitty protocol with a set of flags — and the host compares that against what the controller
+can produce. A controller that cannot produce it is refused with `INPUT_INCOMPATIBLE` and keeps
+everything else it had: it goes on watching, and its typed actions are unaffected.
+
+| Controller | What it offers |
+| --- | --- |
+| A semantic attachment | whichever protocol is in force, because it builds each key from the logical key and its modifiers through the shared encoder |
+| A terminal that declared what it is | what that terminal is known to implement, from `kr_worker::input::KEYBOARD_PROTOCOLS` |
+| A terminal outside that table, but declared | the ordinary encoding, which every terminal sends |
+| A terminal that declared nothing, which is what `--no-probe` chooses | nothing, in either direction: a terminal nobody was allowed to ask about is as likely to have been left in an enhanced protocol by whatever ran before it |
+
+The table rests on the same fact `QUALIFIED_TERMINALS` rests on, and carries the same limit: each
+row is what that terminal's own documentation says it implements, and a `TERM` name is the client's
+claim about which terminal it is rather than a measurement of it. So the rows are conservative. A
+protocol a terminal implements only under a setting, or only by passing it through to something
+else, is not claimed, because a controller that advertised one and then sent another is exactly what
+section 8 refuses to allow.
+
+The comparison is made again whenever the application changes the negotiation, which it can do at
+any moment and without telling anybody. Parsing the output is what tells the host, so an application
+that turns an enhanced protocol on takes the keys from a terminal that cannot send it, and one that
+turns it off leaves the ordinary encoding, which any declared terminal can send, so that terminal
+can acquire again. The release is the ordinary one — the epoch advances, the fence goes out, a paste
+the lease had open is closed — and the holder learns on its next write.
+
+Three things that look like input are not: a focus event, a passive scrollback read and an attached
+window that is doing nothing all leave the lease exactly where it was. So does the host's own reply
+to a question the application asked, which travels on the same path to the terminal and is not a
+lease event.
+
+What reaches the terminal is not a record of what was typed. `input.write` is an ordered stream
+rather than an admitted action, so no receipt, intent or result is written for a keystroke and
+nothing replays one. Nor is delivery proof of effect: bytes written into a pseudo-terminal whose
+application is not reading have reached the terminal and done nothing at all.
+
+## Who owns the size
+
+Size ownership is separate from input ownership, and both are separate from observing the session.
+The first eligible geometry claim owns rows and columns; eligibility needs a terminal attachment, a
+registered claim and the geometry right together, so reporting a viewport confers none of it and a
+conversation view — which is semantic, and cannot claim — never competes for it.
+
+| What happens | What it does to the size |
+| --- | --- |
+| A second terminal attaches | nothing: an existing owner keeps it |
+| An attachment reports its viewport | nothing; it decides only how that attachment is shown the session |
+| The owner resizes at the current epoch | moves the pseudo-terminal and the canonical grid together |
+| The owner detaches or withdraws its claim | the oldest remaining eligible claim succeeds and supplies its own dimensions |
+| No eligible claim remains | the last geometry is retained, and the next eligible claimant takes it |
+| `terminal.geometry.transfer` at the expected epoch | moves it deliberately, and every attachment learns at once |
+| An input takeover | nothing |
+
+Every ownership change advances the geometry epoch, and a change that did not happen does not: a
+resize the kernel or the session's budget refused leaves the epoch where it was, so a refusal cannot
+invalidate every client's next request. A succession is the exception that proves the rule — the
+owner did give up its claim, whatever the kernel then said about the successor's size, so the size
+goes back unowned rather than to an attachment that has left or has withdrawn.
+
+Dimensions are validated before anything is allocated, against all three of section 8's constraints
+at once: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, with checked multiplication
+so a product that would overflow is a refusal rather than a wrap. The independent maxima are not
+valid together. A session created without a terminal starts at 120x40. A history page carries at
+most 1,000 rows and 1 MiB. A semantic snapshot carries at most 16 MiB across its parts, sixteen
+levels of depth and twenty thousand nodes; a part that stops short says which limit stopped it and
+where a reader continues, so a truncation can never be mistaken for a whole tree.
+
 ## Action windows and the dispatch lease
 
 Both are the transport's own components (`kr_transport::window`, `kr_transport::lease`), used

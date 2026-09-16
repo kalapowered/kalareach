@@ -62,6 +62,29 @@ Nothing is decoded into text and re-encoded, nothing is normalised and no status
 When an application turns mouse reporting on, the outer terminal produces those events and they are
 forwarded; when it turns it off, the terminal's scrollback behaves normally again.
 
+### What the command does to a keystroke
+
+Nothing. It is worth saying as a list, because each item is something a terminal client is often
+built to do and this one must not:
+
+| What the person does | What the command sends |
+| --- | --- |
+| Presses a key, any key | the bytes their terminal produced, unchanged |
+| Presses Return | the byte their terminal produced, whichever it is; no line ending is rewritten |
+| Pastes text | the bytes the terminal sent, delimiters and all, so the application sees one paste |
+| Types a character the command cannot decode | the bytes; nothing is replaced with a substitution character |
+| Types a combining mark | two scalars, because that is what arrived; nothing is composed |
+| Turns the wheel | the mouse report their terminal produced, never an arrow key |
+| Clicks or drags | the mouse report, in whichever protocol the application enabled |
+| Moves the window's focus | a focus event, and only while this attachment holds the input lease |
+
+A terminal that may not type is told so once, on standard error, and goes on watching. That is what
+happens under `--no-probe`: the host checks that a controller can supply the encoding the
+application has negotiated, and a terminal nobody was allowed to ask about cannot be shown to. It is
+also what happens when an application turns on a keyboard protocol this terminal does not implement
+while the attachment is running; the next keystroke is refused and the command says which of the two
+it got.
+
 What the host sends is not always every byte the application wrote. The session's canonical grid
 answers the application's queries itself and routes a bell, a clipboard write or a notification to
 the one attachment holding the input lease, so two attached terminals can never both answer a
