@@ -728,7 +728,11 @@ walked rows would report them as free.
 What is refused before it is allocated: a geometry that cannot fit, and hyperlinks. A link's cost is
 reserved before it is applied, against the hyperlink envelope, and one that will not fit is refused;
 refusing one ends the link that was open, because the text that belonged to the refused link must
-not end up inside the previous one. A link with parameters and no target is refused the same way:
+not end up inside the previous one. What is reserved for a link is at or above what the object turns
+out to hold, and a row that is dropped gives nothing back until the objects on it are measured
+again, so the reserved figure drifts above the truth while a session prints. A refusal on that
+figure would refuse a link the session has room for, so the objects are measured before anything is
+refused, and only then: a link is admitted on a reservation and refused only on a measurement. A link with parameters and no target is refused the same way:
 that is a close, and keeping its parameters would let an application hold a session's worth of
 identifiers in links nothing can follow. A cell that reaches its content bound drops the marks past
 it. The alert channel holds a bounded number of alerts, each cut to a bounded length.
@@ -759,12 +763,19 @@ is built again from the rows themselves. An erasure needs no rebuild, because it
 drops the oldest rows, and their charges come off the front where the account already gives back
 the charges of rows the library drops.
 
-Other things do read a retained row. The periodic measurement of what the session's screens and
-hyperlinks hold walks every row of both buffers wherever it sits, and it runs inside a read; so does
-a snapshot of the history, when one is asked for. Neither is proportional to the reads: the
-measurement runs every sixty-fourth read, or when the rows have grown by a page, or when something
-asked for it. What the account removes is the walk a *single row leaving the screen* used to cost,
-which is the one that grew with the history and happened thousands of times a read.
+One thing does read every retained row: what the hyperlink objects cost. An object is shared, so it
+has to be found wherever it sits and counted once, and a row that is not showing can be the only
+place one sits. That measurement is not proportional to the reads. It runs every sixty-fourth read,
+when a link would otherwise be refused, and when something asked for it; between two of them every
+link is reserved for where it arrives, so the figure the envelope is checked against is at or above
+the truth. A snapshot of the history reads retained rows too, when one is asked for.
+
+Nothing else on the read path reads a retained row. What the session's screens hold is read from the
+rows that are showing; what their records cost is read from how many rows there are, which the
+library already knows; and what the retained rows hold is carried. So the whole of that measurement
+costs what a screen costs, whatever the history behind it, and it is taken on every read rather
+than on a schedule. What the account removes is the walk a *single row leaving the screen* used to
+cost, which is the one that grew with the history and happened thousands of times a read.
 
 `CanonicalGrid::measure_history_bytes` is the same figure worked out by walking the rows, and a
 test compares the two after every operation of a randomised sequence of prints, resizes, buffer
@@ -998,31 +1009,53 @@ it measured it on rather than only the failure. A run that cannot write it fails
 carrying on with nothing kept. The command above sets nothing, so a local run prints its record and
 keeps no file; continuous integration sets it and retains the directory.
 
+### What a read costs
+
+A read is one lexical pass over its bytes, one policy decision and one grid mutation for each event
+that pass produced, and one measurement of resident state. Each of those is proportional to the
+bytes of the read or to the screen. None of them is proportional to the history behind the screen,
+to how many links the session has opened, or to how long it has been printing:
+
+* the lexical pass appends a run of printable bytes in one step rather than a byte at a time, and
+  keeps the buffer it collects a sequence in between sequences, so collecting a sequence costs no
+  allocation;
+* the actions an event adapts to are handed to the grid library rather than copied to it, and a
+  parameter list is split into the shape the class table is written in without growing as it goes;
+* a printed cell is read back where it sits, rather than by asking the library for its row's cells.
+  Asking rewrites the row into a vector of cells and leaves it that way until something compacts it
+  again, which for a session printing into a screen is every row twice over: into cells where the
+  run is placed, and back into clustered text where the row scrolls off. The read-back also happens
+  only where a combining mark can still join the cell, which for a run cut at every cell boundary is
+  the cell the run ends on rather than each cell in it;
+* what the screens hold is read from the rows that are showing, what their records cost from how
+  many rows there are, and what the retained rows hold is carried;
+* what the hyperlink objects cost is the one figure that has to be found wherever the objects sit,
+  because an object is shared and a row that is not showing can be the only place one sits. That is
+  read every sixty-fourth read, before a link would otherwise be refused, and when something asked.
+
 ### What the target measures on real hosts
 
-The 5 MiB/s target is met on some hosts and not on others. The figures below are what this engine
-measured on the hosts it has run on, in September 2026, each one the rate three passes sustained
-after a discarded warm-up. The stream that scrolls is the harder of the two, because every row it
-prints joins the historical cache and the cache is enforced on the way.
+The figures below are what this engine measured on the hosts it has run on, in September 2026, each
+one the rate three passes sustained after a discarded warm-up. The plain stream is the harder of the
+two on every host measured here: most of what it asks for is the screen cleared, and clearing a
+screen writes every cell of forty rows.
 
 | Host | Plain stream | Stream that scrolls | Where it was measured |
 | --- | --- | --- | --- |
-| Apple M4 Pro, 12 processors | 11.1 to 11.4 MiB/s | 7.3 to 7.6 MiB/s | local runs of this revision |
-| Intel Xeon 6973P-C, 4 processors | 8.5 MiB/s | 5.7 MiB/s | `core-ci` run 35127815035 |
-| Intel Xeon Platinum 8573C, 4 processors | 6.9 MiB/s | 4.8 MiB/s | `core-ci` run 35125837021 |
-| AMD EPYC 7763 64-Core, 4 processors | 5.2 to 5.4 MiB/s | 3.7 to 3.8 MiB/s | `core-ci` runs 35118939233, 35120519784, 35123616447, 35130325631 and 35133681704 |
+| Apple M4 Pro, 12 processors | 12.0 to 12.4 MiB/s | 16.1 to 17.0 MiB/s | local runs of this revision |
+| AMD EPYC 7763 64-Core, 4 processors | 5.7 MiB/s | 8.0 MiB/s | `core-ci` run 35150987281 |
+| AMD EPYC 9V74 80-Core, 4 processors | 5.7 MiB/s | 8.1 MiB/s | `core-ci` run 35152906656 |
+| Intel Xeon Platinum 8573C, 4 processors | 7.5 MiB/s | 7.2 MiB/s | `core-ci` run 35148943978 |
 
 Each row is one host's sampled runs and not a fixed property of that processor. The runs named are
 `core-ci` runs of this revision's terminal engine, and each of them retains the figures, the
 processor and the verdict it measured, so a row can be read back to the run it came from.
 
-Section 27 asks a
-reference host for at least four CPU cores and 8 GiB, so four processors is the floor a host has to
-meet the target on, and two of the four-processor hosts above are under it on the stream that
-scrolls. A faster host clearing the target does not settle that: the figure is asserted on every
-optimised run, so a host that does not reach it says so, and the run keeps the number and the
-processor. Further optimisation of the engine's output path is tracked separately, and the 5 MiB/s
-target is not moving.
+Section 27 asks a reference host for at least four CPU cores and 8 GiB, so four processors is the
+floor a host has to meet the target on, and every four-processor host above meets it on both
+streams. A faster host clearing the target does not settle a slower one: the figure is asserted on
+every optimised run, so a host that does not reach it says so, and the run keeps the number and the
+processor.
 
 It drains a 5 MiB stream of mixed text, colour changes, cursor movement, wide characters,
 hyperlinks, alternate-screen churn and queries, and checks that the response lane, the row cache and
