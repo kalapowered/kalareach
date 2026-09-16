@@ -238,7 +238,7 @@ export type ChangeSetVersion = string
  */
 export type ClockEpoch = string
 /**
- * The group a notification replaces others in on the device. 128 opaque bits revealing no project or session name.
+ * The group a notification replaces others in on the device. 128 bits a host derives from its own secret.
  */
 export type CollapseId = string
 /**
@@ -2551,9 +2551,15 @@ export interface PushDeliveryCredential {
  * One notification, as a host hands it to the gateway.
  *
  * The host writes the underlying event first and then sends this, so a notification that is never
- * delivered has already been recorded somewhere the person can find it. Nothing here is plaintext
- * that describes the work: the identifier is opaque, the collapse label names no project, the
- * alert comes from a closed vocabulary, and the preview is sealed to the device.
+ * delivered has already been recorded somewhere the person can find it.
+ *
+ * Nothing here is a field for plaintext that describes the work. The alert comes from a closed
+ * vocabulary, the two identifiers are 128-bit values rather than text, and the preview is a sealed
+ * envelope whose shape [`PushDeliveryRequest::preview_is_well_formed`] checks. Those are the
+ * checks a gateway can make. What they do not do is inspect a producer: a host that put meaning
+ * into its own identifiers, or sealed the wrong thing, has disclosed it to the provider and to the
+ * gateway. Keeping the identifiers meaningless and the preview correctly sealed is the producer's
+ * obligation, and section 16 places it there.
  *
  * Larger detail does not belong here. Section 16 bounds the preview plaintext to
  * [`MAX_PREVIEW_PLAINTEXT_BYTES`] and the complete provider payload to
