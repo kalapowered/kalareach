@@ -104,8 +104,13 @@ check_no_survivors() {
 echo "building the release profile"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release --workspace
 
-measurement() {
-  local name="$1"
+# Runs one measurement out of a named target.
+#
+# The target matters: the resource and attach measurements live beside the suite that closes the
+# sessions they create, and the two input measurements live in their own target, because what they
+# measure is one keystroke's path rather than a whole host's footprint.
+measurement_in() {
+  local target_flag="$1" target="$2" name="$3"
   echo
   echo "running $name"
   # The load at each edge of the measurement, so a figure can be read against what else the machine
@@ -114,7 +119,7 @@ measurement() {
   local output
   # The measurement prints its own conditions. `--nocapture` is what lets them reach this log.
   if ! output="$(CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test --release -p kr-worker \
-    --test performance -- --ignored --exact --nocapture "$name" 2>&1)"; then
+    "$target_flag" "$target" -- --ignored --exact --nocapture "$name" 2>&1)"; then
     echo "$output"
     echo "  load average leaving this measurement: $(load_average)"
     echo "FAILED: $name did not meet its bound"
@@ -130,6 +135,14 @@ measurement() {
     echo "FAILED: $name did not run"
     return 1
   fi
+}
+
+measurement() {
+  measurement_in --test performance "$1"
+}
+
+input_measurement() {
+  measurement_in --bench input_latency "$1"
 }
 
 failed=0
@@ -152,7 +165,26 @@ else
   grep -E "^test " <<<"$regressions" || true
 fi
 
+# The input measurements' own regressions, for the same reason: the percentile helper and the root
+# programs each measurement needs are code, and nothing else runs them.
+echo
+echo "running the input measurements' own regressions"
+if ! regressions="$(CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test --release -p kr-worker \
+  --bench input_latency 2>&1)"; then
+  echo "$regressions"
+  echo "FAILED: the input measurements' own regressions"
+  failed=1
+elif ! grep -qE "^test result: ok\. [1-9]" <<<"$regressions"; then
+  echo "$regressions"
+  echo "FAILED: the input measurements ran no regression"
+  failed=1
+else
+  grep -E "^test " <<<"$regressions" || true
+fi
+
 measurement attach_to_a_usable_screen || failed=1
+input_measurement added_input_forwarding_latency || failed=1
+input_measurement paste_prefix_recogniser_deadline || failed=1
 measurement idle_resources_for_twenty_sessions_and_thirty_two_views || failed=1
 
 echo
