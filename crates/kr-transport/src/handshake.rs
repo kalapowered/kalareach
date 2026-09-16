@@ -675,6 +675,120 @@ pub async fn connect(
     })
 }
 
+/// The candidate's side of an unpaired connection.
+///
+/// It negotiated framing and a protocol version like any other connection and stopped one line
+/// short of a proof exchange, because this device has no paired record on that host yet. What it
+/// can reach is the bounded pre-authorisation pairing surface, through [`Self::call`], and nothing
+/// else: the host refuses every other method at this ingress.
+#[derive(Debug)]
+pub struct CandidateConnection {
+    /// The connection identity the host allocated.
+    pub connection_id: ConnectionId,
+    /// The selection the host answered with.
+    pub selection: HostSelection,
+    control_writer: FrameWriter,
+    control_reader: FrameReader,
+    next_request: u64,
+}
+
+impl CandidateConnection {
+    /// Calls one method on the pre-authorisation pairing surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal, a framing failure, or a stream failure. A refusal is the host's
+    /// own protocol error: a candidate that asked for something this surface does not serve is
+    /// told so rather than disconnected.
+    pub async fn call<P, R>(&mut self, method: kr_protocol::method::Method, params: &P) -> Result<R>
+    where
+        P: serde::Serialize + ?Sized,
+        R: serde::de::DeserializeOwned + serde::Serialize,
+    {
+        self.next_request += 1;
+        let request_id = kr_protocol::ids::RequestId::new(self.next_request);
+        let request = kr_protocol::envelope::Request {
+            request_id,
+            method: method.into(),
+            method_version: method.entry().version,
+            params: kr_protocol::envelope::ParamsValue::from_typed(params)?,
+        };
+        self.control_writer.write_message(&request).await?;
+        let response: kr_protocol::envelope::Response = self
+            .control_reader
+            .read_message_within(crate::preauth::MAX_PREAUTH_FRAME_LEN)
+            .await?
+            .ok_or_else(|| {
+                TransportError::handshake(
+                    ErrorCode::ResourceUnavailable,
+                    "the host answered nothing",
+                )
+            })?;
+        if response.request_id != request_id {
+            return Err(TransportError::handshake(
+                ErrorCode::InvalidArgument,
+                "the host answered another request",
+            ));
+        }
+        match response.outcome {
+            kr_protocol::envelope::Outcome::Ok(value) => Ok(value.to_typed()?),
+            kr_protocol::envelope::Outcome::Error(error) => Err(TransportError::Handshake(error)),
+        }
+    }
+}
+
+/// Opens the pre-authorisation surface of a host this device is not paired with yet.
+///
+/// The exchange is the first half of the ordinary one: the offer, and the host's selection. There
+/// is no proof, because there is no paired record to prove against; that is the whole point of the
+/// surface this returns.
+///
+/// # Errors
+///
+/// Returns the host's refusal when no offered version is supported, or a stream failure. A host
+/// that answers with an acceptance is refused here: a connection with no paired record must not be
+/// treated as authorised however the host replied.
+pub async fn connect_unpaired(
+    connection: &Connection,
+    identity: &LocalIdentity,
+) -> Result<CandidateConnection> {
+    let (send, recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| TransportError::Stream(error.to_string()))?;
+    let mut writer = FrameWriter::new(send, StreamKind::Control);
+    let mut reader = FrameReader::new(recv, StreamKind::Control);
+    writer.set_priority(crate::scheduler::priority_of(StreamKind::Control));
+
+    let offer = ClientOffer {
+        offered_versions: identity.supported_versions.clone(),
+        build_id: identity.build_id.clone(),
+        device_id: identity.device_id,
+        device_key_revision: identity.device_key_revision,
+        capabilities: identity.capabilities.clone(),
+        max_receive: identity.max_receive,
+        client_nonce: fresh_nonce()?,
+    };
+    writer.write_message(&offer).await?;
+    let reply: HelloReply = reader
+        .read_message_within(MAX_OFFER_LEN)
+        .await?
+        .ok_or_else(|| {
+            TransportError::handshake(ErrorCode::ResourceUnavailable, "the host sent no reply")
+        })?;
+    let selection = match reply {
+        HelloReply::Selected(selection) => *selection,
+        HelloReply::Refused(error) => return Err(TransportError::Handshake(error)),
+    };
+    Ok(CandidateConnection {
+        connection_id: selection.connection_id,
+        selection,
+        control_writer: writer,
+        control_reader: reader,
+        next_request: 0,
+    })
+}
+
 /// Returns the peer's endpoint identity as iroh authenticated it.
 fn remote_endpoint_key(connection: &Connection) -> Result<EndpointKey> {
     Ok(EndpointKey::from_bytes(*connection.remote_id().as_bytes()))

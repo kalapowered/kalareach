@@ -22,7 +22,11 @@ use iroh::{EndpointAddr, PublicKey, RelayMap, RelayUrl};
 use kr_protocol::pairing::{MAX_NETWORK_HINTS, NetworkConfig, NetworkHint};
 use kr_protocol::scalars::EndpointKey;
 use kr_protocol::scalars::Nullable;
-use url::Url;
+/// The URL type every selected service is named by.
+///
+/// Re-exported so a host that builds this configuration does not have to take a dependency on the
+/// URL library to name the services it selected.
+pub use url::Url;
 
 use crate::error::{Result, TransportError};
 
