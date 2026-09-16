@@ -551,8 +551,6 @@ struct TailCell {
     /// Once it has, every later mark is dropped too. Keeping some of a group and none of the next
     /// would make the answer depend on how many marks arrived in each read.
     full: bool,
-    /// The scalars that were printed into the cell.
-    text: String,
     /// What the cell holds, which a designated character set can make different from the scalars.
     stored: String,
     /// Cells it occupies.
@@ -633,8 +631,12 @@ impl CanonicalGrid {
     /// An event the library does not recognise is not applied either. A half-understood sequence is
     /// worse than a consumed one: the canonical grid would do something the physical terminal on
     /// the other side would not, or the other way round.
+    ///
+    /// The actions this applied are handed to the library rather than copied to it, so the record
+    /// it returns says what the adaptation decided and carries no actions. Copying them would put
+    /// a second list of every event's actions on the path every byte of output takes.
     pub fn apply(&mut self, event: &Event) -> Adapted {
-        let adapted = adapt(
+        let mut adapted = adapt(
             event,
             AdaptContext {
                 rows: self.size.rows,
@@ -656,7 +658,8 @@ impl CanonicalGrid {
         // read: the library flushes its own print buffer for the same reason.
         self.tail = None;
         if !adapted.actions.is_empty() {
-            self.terminal.perform_actions(adapted.actions.clone());
+            self.terminal
+                .perform_actions(core::mem::take(&mut adapted.actions));
         }
         self.sync_history();
         adapted
@@ -692,8 +695,7 @@ impl CanonicalGrid {
                 .perform_actions(vec![Action::PrintString(head.to_owned())]);
         }
         let before = self.print_origin();
-        self.terminal
-            .perform_actions(vec![Action::PrintString(last.to_owned())]);
+        self.print_text(last);
         self.tail = self.locate(last, before);
     }
 
@@ -704,24 +706,42 @@ impl CanonicalGrid {
     /// joins the library performs: a list can be incomplete, and the library's list is longer than
     /// emoji.
     fn print_cells(&mut self, text: &str) {
-        let starts: Vec<usize> = text
-            .char_indices()
-            .filter(|(_, scalar)| !crate::unicode::is_zero_width(*scalar))
-            .map(|(index, _)| index)
-            .collect();
-        let Some(first) = starts.first().copied() else {
+        // One pass, carrying the cell that has been opened and not yet drawn. A cell is a scalar
+        // with a width of its own and the zero-width scalars after it, so a cell is complete
+        // exactly where the next scalar with a width of its own begins.
+        let mut cell: Option<(usize, usize)> = None;
+        for (index, scalar) in text.char_indices() {
+            if crate::unicode::is_zero_width(scalar) {
+                continue;
+            }
+            if let Some((start, base)) = cell {
+                self.print_cell(&text[start..base], &text[base..index]);
+            } else if index > 0 {
+                // Whatever came before the first cell of this run has no width of its own, so it
+                // belongs to the cell the run before it ended on.
+                self.rejoin(&text[..index]);
+            }
+            cell = Some((index, index + scalar.len_utf8()));
+        }
+        match cell {
+            Some((start, base)) => self.print_cell(&text[start..base], &text[base..]),
             // Nothing here has a width of its own, so all of it belongs to the cell before.
-            self.rejoin(text);
-            return;
+            None => self.rejoin(text),
+        }
+    }
+
+    /// Draws one run of text, as one scalar where it is one scalar.
+    ///
+    /// A single scalar goes as itself rather than as a string, which the library reads the same way
+    /// and which costs no allocation. Every cell a session prints comes through here, so that is
+    /// one allocation a cell.
+    fn print_text(&mut self, text: &str) {
+        let mut scalars = text.chars();
+        let action = match (scalars.next(), scalars.next()) {
+            (Some(scalar), None) => Action::Print(scalar),
+            _ => Action::PrintString(text.to_owned()),
         };
-        if first > 0 {
-            self.rejoin(&text[..first]);
-        }
-        for (position, start) in starts.iter().copied().enumerate() {
-            let end = starts.get(position + 1).copied().unwrap_or(text.len());
-            let base = start + text[start..end].chars().next().map_or(0, char::len_utf8);
-            self.print_cell(&text[start..base], &text[base..end]);
-        }
+        self.terminal.perform_actions(vec![action]);
     }
 
     /// Draws one cell: the scalar that has a width, then the marks that belong to it.
@@ -732,8 +752,7 @@ impl CanonicalGrid {
     /// so doing it the same way here is what makes the two answers identical.
     fn print_cell(&mut self, base: &str, marks: &str) {
         let before = self.print_origin();
-        self.terminal
-            .perform_actions(vec![Action::PrintString(base.to_owned())]);
+        self.print_text(base);
         self.tail = self.locate(base, before);
         if !marks.is_empty() {
             self.rejoin(marks);
@@ -795,7 +814,6 @@ impl CanonicalGrid {
         let stored = self.cell_text(col, row)?;
         Some(TailCell {
             full: false,
-            text: cell.to_owned(),
             stored,
             width,
             col,
@@ -882,7 +900,6 @@ impl CanonicalGrid {
             .unwrap_or_else(|| text.clone());
         self.tail = Some(TailCell {
             full,
-            text: tail.text,
             stored,
             width: tail.width,
             col: tail.col,
