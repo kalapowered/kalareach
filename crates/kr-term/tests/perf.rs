@@ -727,13 +727,16 @@ fn a_read_reads_as_many_rows_as_the_geometry_has() {
     };
     let mut now_ms = 0u64;
 
-    // Emptied before every read, so the history behind each one is nothing.
+    // Emptied at the start of every read, so the history behind each one is nothing. The clear
+    // travels with the read rather than in a read of its own, so both sessions take the same number
+    // of reads and the figures below compare like with like.
+    let mut cleared = b"\x1b[3J".to_vec();
+    cleared.extend_from_slice(&read);
     let mut shallow = session();
     let mut shallow_rows = 0usize;
     for _ in 0..READS {
         now_ms += 1;
-        shallow.feed(b"\x1b[3J", now_ms);
-        shallow.feed(&read, now_ms);
+        shallow.feed(&cleared, now_ms);
         shallow_rows = shallow_rows.max(shallow.grid().scrollback_rows());
     }
     let shallow_read = shallow.grid().rows_read();
