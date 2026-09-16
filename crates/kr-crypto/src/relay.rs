@@ -44,6 +44,9 @@ use crate::store::{check_owner_only, sync_directory, write_owner_only};
 /// The file the relay instance key is kept in, inside the directory the caller names.
 const INSTANCE_KEY_FILE: &str = "instance.key";
 
+/// The file a service admission key is kept in, inside the directory the caller names.
+const ADMISSION_KEY_FILE: &str = "admission.key";
+
 /// Bytes in the seed a relay instance key is derived from.
 pub const RELAY_SEED_LEN: usize = 32;
 
@@ -315,8 +318,10 @@ fn read_seed(path: &Path, _owner: u32) -> Result<Option<Secret<RELAY_SEED_LEN>>>
 /// got there first keeps its key, and this one reads that instead.
 #[cfg(unix)]
 fn publish_seed(directory: &Path, path: &Path, seed: &[u8]) -> Result<()> {
+    // A staging name, unique to this process and this moment. Both keys kept here stage the same
+    // thing, which is a seed.
     let staging = directory.join(format!(
-        ".{}.{}.instance-key",
+        ".{}.{}.seed",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -443,6 +448,52 @@ impl ServiceAdmissionKeyPair {
     /// The keypair underneath, for the vector generator's transcript-level signing.
     pub(crate) const fn inner(&self) -> &crate::keys::AuthorisationKeyPair {
         &self.0
+    }
+
+    /// Opens an admission key in `directory`, generating and writing it on the first run.
+    ///
+    /// The managed service keeps its admission key as a Worker secret and never uses this. What
+    /// does is an issuing tool that has to hold the same key twice: the end-to-end test that
+    /// installs a lease on a deployed relay signs with a key the relay pins, so that key has to
+    /// survive between runs or the relay would have to be reconfigured for every one.
+    ///
+    /// The file is handled exactly as [`RelayInstanceKeyPair::open`] handles the instance key,
+    /// including what the caller owes about the directory's ancestors. Read that first: the rules
+    /// are the same because the consequence is the same, and a key that authorises spending is not
+    /// a smaller secret than a key that records it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::SecretStore`] when the directory or the file cannot be used safely,
+    /// [`CryptoError::StoredSecretLength`] when what is there is not a seed, and a library error
+    /// when libsodium fails.
+    pub fn open(directory: &Path) -> Result<Self> {
+        let owner = open_private_directory(directory)?;
+        let path = directory.join(ADMISSION_KEY_FILE);
+
+        match read_seed(&path, owner)? {
+            Some(seed) => Self::from_seed(seed),
+            None => {
+                let seed = Secret::<RELAY_SEED_LEN>::random()?;
+                publish_seed(directory, &path, seed.expose())?;
+                // Read back rather than trusted: whatever is on disk is what every later run will
+                // sign with, and a key that differed from this process's would be discovered by a
+                // relay refusing a lease it should have accepted.
+                match read_seed(&path, owner)? {
+                    Some(written) => Self::from_seed(written),
+                    None => Err(CryptoError::SecretStore {
+                        message: format!("{} was not written", path.display()),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Derives the keypair from its seed.
+    fn from_seed(seed: Secret<RELAY_SEED_LEN>) -> Result<Self> {
+        Ok(Self(crate::keys::AuthorisationKeyPair::from_seed(
+            crate::keys::AuthorisationSeed::from_stored_bytes(seed.expose())?,
+        )?))
     }
 
     /// The public half, which a relay pins.
