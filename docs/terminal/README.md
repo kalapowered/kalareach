@@ -737,17 +737,22 @@ is built again from the rows themselves. An erasure needs no rebuild, because it
 drops the oldest rows, and their charges come off the front where the account already gives back
 the charges of rows the library drops.
 
-Other things do read a retained row, at their own pace and for their own reasons: the periodic
-measurement of the session's hyperlinks walks every row of both buffers, wherever it sits, and so
-does a snapshot of the history. Neither is on the path a read takes, which is the one the account
-exists to keep cheap.
+Other things do read a retained row. The periodic measurement of what the session's screens and
+hyperlinks hold walks every row of both buffers wherever it sits, and it runs inside a read; so does
+a snapshot of the history, when one is asked for. Neither is proportional to the reads: the
+measurement runs every sixty-fourth read, or when the rows have grown by a page, or when something
+asked for it. What the account removes is the walk a *single row leaving the screen* used to cost,
+which is the one that grew with the history and happened thousands of times a read.
 
 `CanonicalGrid::measure_history_bytes` is the same figure worked out by walking the rows, and a
 test compares the two after every operation of a randomised sequence of prints, resizes, buffer
 switches, erasures and evictions. The account's own array is measured too, at the room it is
-holding rather than the charges on it, and it gives that room back when the rows go: eviction
-returns a great many charges at once, an erasure returns every one of them, and an array that
-kept the room it once needed would keep it for the rest of the session.
+holding rather than the charges on it. That room is one charge for every row the scrollback may
+keep, which is what the geometry reserved for, and the array is brought to it and left there: a row
+arriving never allocates, and a row leaving never gives back room the next row would ask for again.
+Sizing the room to the charges on it instead would put a pair of reallocations, each copying the
+whole history, on the arrival of a single row whenever the rows arriving cost a little more than
+the rows they replace.
 
 That is what makes the byte bound affordable. Working the figure out by walking the history made
 every read cost what the whole history cost, so a session printing steadily paid a scan of

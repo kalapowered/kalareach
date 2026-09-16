@@ -189,10 +189,13 @@ struct RowsBytes {
 /// again from the rows themselves. An erasure needs no rebuild, because it changes no row: it
 /// drops the oldest, and their charges come off the front like any other row the library drops.
 ///
-/// Other things do read a retained row, at their own pace and for their own reasons: the periodic
-/// measurement of the session's hyperlinks walks every row of both buffers, wherever it sits, and
-/// so does a snapshot of the history. Neither is on the path a read takes, which is the one this
-/// account exists to keep cheap.
+/// Other things do read a retained row. The periodic measurement of what the session's screens and
+/// hyperlinks hold walks every row of both buffers wherever it sits, and it runs inside a read; so
+/// does a snapshot of the history, when one is asked for. Neither is proportional to the reads: the
+/// measurement runs every sixty-fourth read, or when the rows have grown by a page, or when
+/// something asked for it. What this account removes is the walk a *single row leaving the screen*
+/// used to cost, which is the one that grew with the history and happened thousands of times a
+/// read.
 ///
 /// [`CanonicalGrid::measure_history_bytes`] is the same figure worked out the long way, and the
 /// two agree after every operation.
@@ -213,29 +216,36 @@ struct HistoryAccount {
     stale: bool,
 }
 
-/// The fewest charges the account's array ever allocates room for.
+/// The fewest charges an array of them ever allocates room for.
 ///
-/// An array that grows by doubling does not start at one. This is what the standard library's
-/// smallest non-empty allocation holds for an eight-byte element, and it is what the reservation
-/// has to cover for a session whose scrollback is a row or two.
+/// An array that has to grow does not start at one. This is what the standard library's smallest
+/// non-empty allocation holds for an eight-byte element, and it is what the reservation has to
+/// cover for a session whose scrollback is a row or two.
 const HISTORY_ACCOUNT_MINIMUM_CHARGES: usize = 4;
 
 impl HistoryAccount {
-    /// Gives back the room the array is holding for charges that have gone.
+    /// Keeps the array's room at one charge for every row the scrollback may hold.
     ///
-    /// The array grows by doubling, so it holds at most twice the charges on it, and the
-    /// reservation is made for exactly that. Rows do not only arrive, though: eviction gives a
-    /// great many back at once, an erasure gives every one of them back, and a reflow can leave
-    /// the account holding rows the geometry never reserved for. Without this the array would keep
-    /// the room it once needed for the rest of the session.
+    /// Which is what the geometry reserved for it. The array is brought to that room and stays
+    /// there, so a row arriving never allocates and a row leaving never gives back room the next
+    /// row would ask for again. Sizing the room to the charges on it instead would put a pair of
+    /// reallocations, each copying the whole history, on the arrival of a single row whenever the
+    /// rows arriving cost a little more than the rows they replace.
     ///
-    /// It shrinks only when the room is more than twice what is on it, and never below the
-    /// smallest allocation there is, so a row arriving after one of these does not allocate again:
-    /// what it grows to is what the test here allows.
-    fn give_back_the_room(&mut self) {
-        let wanted = self.charges.len().max(HISTORY_ACCOUNT_MINIMUM_CHARGES);
-        if self.charges.capacity() > 2 * wanted {
-            self.charges.shrink_to(wanted);
+    /// Eviction lowers how many rows the library keeps, not how many the session was admitted for,
+    /// so the room stays where it is through one.
+    ///
+    /// There is one way past that room: a reflow can leave the buffer that is not showing holding
+    /// more rows than its geometry reserved for. Those rows are excess and so are their charges,
+    /// and the room goes back to the reserved figure here as soon as the rows do.
+    fn hold_room_for(&mut self, rows: usize) {
+        if self.charges.len() > rows {
+            return;
+        }
+        if self.charges.capacity() < rows {
+            self.charges.reserve_exact(rows - self.charges.len());
+        } else if self.charges.capacity() > rows {
+            self.charges.shrink_to(rows);
         }
     }
 }
@@ -1457,10 +1467,10 @@ impl CanonicalGrid {
             content,
             cell_slots: rows.cell_slots,
             // The retained rows' account is an array of row slots like the screens' own, and it
-            // keeps the room it grew to: eviction gives the charges back but not the room they sat
-            // in, so what is measured is the capacity rather than the entries.
+            // holds its room whether or not the charges are on it, so what is measured is the room
+            // rather than the charges.
             row_records: rows.records.saturating_add(
-                (self.history.charges.capacity() as u64).saturating_mul(size_of::<u64>() as u64),
+                (self.history.charges.capacity() as u64).saturating_mul(HISTORY_CHARGE_SLOT_BYTES),
             ),
             links,
         }
@@ -1553,13 +1563,11 @@ impl CanonicalGrid {
         // and was given up between two of these calls, and a row that was never charged gives
         // nothing back.
         let dropped = usize::try_from(start.saturating_sub(self.history.start)).unwrap_or(0);
-        if dropped > 0 {
-            for _ in 0..dropped.min(self.history.charges.len()) {
-                let charge = self.history.charges.pop_front().unwrap_or(0);
-                self.history.total = self.history.total.saturating_sub(charge);
-            }
-            self.history.give_back_the_room();
+        for _ in 0..dropped.min(self.history.charges.len()) {
+            let charge = self.history.charges.pop_front().unwrap_or(0);
+            self.history.total = self.history.total.saturating_sub(charge);
         }
+        self.history.hold_room_for(self.config.scrollback_rows);
         // What is left is what the rows that have just arrived cost, and they are the newest rows
         // of the history. Each is read once, here, and never again, and each is reached by its own
         // index rather than by walking to it, so a read that scrolled one row reads one row.
@@ -1594,8 +1602,9 @@ impl CanonicalGrid {
     /// The one walk of the retained rows there is. It happens where the rows changed rather than
     /// moved: a resize reflows them, and an erasure discards them.
     fn rebuild_history(&mut self, start: i64, end: i64) {
-        let mut charges =
-            VecDeque::with_capacity(usize::try_from(end.saturating_sub(start)).unwrap_or_default());
+        let rows = usize::try_from(end.saturating_sub(start)).unwrap_or_default();
+        // The room the geometry reserved, or the rows there are if a reflow left more of them.
+        let mut charges = VecDeque::with_capacity(rows.max(self.config.scrollback_rows));
         let mut total = 0u64;
         self.walk_history(|charge| {
             total = total.saturating_add(charge);
@@ -1733,13 +1742,17 @@ pub fn link_table_entry_bytes(target: &String) -> u64 {
     STRING_HANDLE_BYTES + target.capacity() as u64 + LINK_TABLE_ENTRY_BYTES
 }
 
-/// What one retained row costs in the account of what the retained rows cost.
+/// What one charge takes in the array the retained rows' account keeps.
+pub const HISTORY_CHARGE_SLOT_BYTES: u64 = size_of::<u64>() as u64;
+
+/// What one retained row is reserved at in the account of what the retained rows cost.
 ///
-/// One charge a row, in one array, and the array grows by doubling, so it can be holding room for
-/// twice the rows it has. A retained row is a slot here as well as a slot in its screen's own
-/// array, and the account keeps the room it grew to after eviction gives rows back, so this is
-/// reserved for every row the scrollback may hold and measured at the room it is holding.
-pub const HISTORY_CHARGE_BYTES: u64 = 2 * size_of::<u64>() as u64;
+/// One charge a row, at twice what a charge takes. A retained row is a slot here as well as a slot
+/// in its screen's own array, the account holds that room for every row the scrollback may keep
+/// whether or not the rows are there, and an array allocates at least the room it is asked for
+/// rather than exactly it, so the reservation carries the same doubling every other array in this
+/// model carries.
+pub const HISTORY_CHARGE_BYTES: u64 = 2 * HISTORY_CHARGE_SLOT_BYTES;
 
 /// The least the account of what the retained rows cost is reserved at.
 ///

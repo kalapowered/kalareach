@@ -2611,43 +2611,59 @@ fn a_restored_keyboard_stack_is_bounded_and_qualified() {
 
 /// The account of what the retained rows cost is resident state, and it is measured.
 ///
-/// It is one charge a retained row, in an array of its own beside the rows. The geometry reserves
-/// for it, the measurement reads the room it is holding rather than the charges on it, and it
-/// gives that room back when the rows go.
+/// It is one charge a retained row, in an array of its own beside the rows. The array holds room
+/// for every row the scrollback may keep, whether or not the rows are there, so that a row
+/// arriving never allocates and a row leaving never gives back room the next row would ask for
+/// again. The geometry reserves for that room and the measurement reads it.
 #[test]
 fn the_retained_rows_account_is_reserved_and_measured() {
-    let mut engine = Engine::new(EngineConfig {
-        size: GridSize::new(40, 8),
-        ..EngineConfig::DEFAULT
-    })
-    .expect("engine");
-    let empty = engine.grid().buffer_bytes().row_records;
+    fn engine_holding(scrollback_rows: usize) -> Engine {
+        Engine::new(EngineConfig {
+            size: GridSize::new(40, 8),
+            grid: kr_term::grid::GridConfig {
+                scrollback_rows,
+                ..kr_term::grid::GridConfig::DEFAULT
+            },
+            ..EngineConfig::DEFAULT
+        })
+        .expect("engine")
+    }
 
+    // Two sessions of the same geometry holding the same rows, one keeping more scrollback than
+    // the other. The rows are identical, so what separates the two measurements is the account.
+    let small = engine_holding(100);
+    let large = engine_holding(3_500);
+    assert_eq!(
+        large.grid().buffer_bytes().row_records - small.grid().buffer_bytes().row_records,
+        3_400 * kr_term::grid::HISTORY_CHARGE_SLOT_BYTES,
+        "the account holds one charge for every row its scrollback may keep"
+    );
+
+    // Filling it and emptying it again changes the rows, not the room.
+    let mut engine = engine_holding(3_500);
+    let before = engine.grid().buffer_bytes().row_records;
     let mut input = String::new();
     for index in 0..600u32 {
         input.push_str(&format!("row {index} with some content\r\n"));
     }
     engine.feed(input.as_bytes(), 0);
     engine.quiesce(0);
-    let filled = engine.grid().buffer_bytes().row_records;
     assert!(
-        filled >= empty + 600 * kr_term::grid::HISTORY_CHARGE_BYTES / 2,
-        "the charges of six hundred retained rows are in the measurement: {filled} against {empty}"
+        engine.grid().history_bytes() > 0,
+        "six hundred rows are retained"
     );
     assert_eq!(
         engine.budget().excess(),
         0,
-        "and the geometry reserved room for them"
+        "and the geometry reserved room for their charges"
     );
-
-    // The scrollback goes, and so does the room its charges sat in.
     engine.feed(b"\x1b[3J", 0);
     engine.quiesce(0);
     assert_eq!(engine.grid().history_bytes(), 0, "the rows are gone");
-    assert!(
-        engine.grid().buffer_bytes().row_records
-            <= empty + kr_term::grid::HISTORY_ACCOUNT_MINIMUM_BYTES,
-        "and the account is holding no more than its smallest allocation"
+    assert_eq!(
+        engine.grid().buffer_bytes().row_records,
+        before,
+        "and the account is holding exactly the room it started with"
     );
     assert_eq!(engine.budget().excess(), 0);
 }
@@ -2671,9 +2687,78 @@ fn a_session_of_one_retained_row_is_reserved_for_what_its_account_allocates() {
     engine.feed(b"a\r\nb\r\nc\r\n", 0);
     engine.quiesce(0);
     assert_eq!(engine.grid().scrollback_rows(), 1, "one row is retained");
+    assert!(
+        engine.grid().buffer_bytes().row_records <= engine.budget().reserved().row_arrays,
+        "the arrays the smallest geometry there is holds fit what it reserved for them: {} \
+         measured against {} reserved",
+        engine.grid().buffer_bytes().row_records,
+        engine.budget().reserved().row_arrays
+    );
     assert_eq!(
         engine.budget().excess(),
         0,
         "and the smallest geometry there is reserved for what its account allocates"
     );
+}
+
+/// Rows that cost more than the rows they replace do not make the account reallocate.
+///
+/// Eviction gives charges back and printing takes room again, over and over, and an array sized to
+/// the charges on it would shrink and grow on the arrival of a single row, copying the whole
+/// history twice each time. The room is the scrollback's, not the charges', so it does not move.
+#[test]
+fn a_stream_of_costlier_rows_leaves_the_accounts_room_where_it_is() {
+    const SCROLLBACK_ROWS: usize = 3_500;
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(40, 8),
+        grid: kr_term::grid::GridConfig {
+            scrollback_rows: SCROLLBACK_ROWS,
+            ..kr_term::grid::GridConfig::DEFAULT
+        },
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+
+    // What the account is holding, separated from the row records beside it: the rows of the
+    // primary screen and its history, and the alternate buffer's own screen.
+    let account = |engine: &Engine| {
+        let lines =
+            2 * u64::from(engine.grid().size().rows) + engine.grid().scrollback_rows() as u64;
+        engine.grid().buffer_bytes().row_records - lines * kr_term::grid::ROW_SLOT_BYTES
+    };
+    let room = account(&engine);
+    assert_eq!(
+        room,
+        SCROLLBACK_ROWS as u64 * kr_term::grid::HISTORY_CHARGE_SLOT_BYTES,
+        "the account starts with room for every row the scrollback may keep"
+    );
+
+    // Rows that cost a little more each time, so eviction gives charges back on nearly every row
+    // that arrives and the length of the account keeps falling.
+    let mut evicted = false;
+    for step in 0..120u32 {
+        let width = 4 + (step % 36) as usize;
+        let mut input = String::from("\x1b[38;2;10;20;30;48;5;9m");
+        for _ in 0..40 {
+            for _ in 0..width {
+                input.push('\u{754c}');
+            }
+            input.push_str("\r\n");
+        }
+        input.push_str("\x1b[0m");
+        engine.feed(input.as_bytes(), u64::from(step));
+        evicted |= engine.grid().history_bytes() > BudgetLimits::DEFAULT.row_cache_bytes * 9 / 10;
+        assert_eq!(
+            account(&engine),
+            room,
+            "step {step} moved the room the account holds"
+        );
+    }
+    engine.quiesce(0);
+    assert!(
+        evicted,
+        "the run has to reach the cache bound to give charges back"
+    );
+    assert_eq!(account(&engine), room);
+    assert_eq!(engine.budget().excess(), 0);
 }
