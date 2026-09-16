@@ -14,12 +14,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use kr_client::services::relay::{
+    ManagedRelayLeaseService, RelayLeaseIssueBody, RelayLeaseRevokeBody,
+};
 use kr_client::services::{
     LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseAnswer, RelayLeaseService,
     ServiceHttp, ServiceHttpAnswer, ServiceSigner,
-};
-use kr_client::services::relay::{
-    ManagedRelayLeaseService, RelayLeaseIssueBody, RelayLeaseRevokeBody,
 };
 use kr_client::{ClientError, Result};
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -36,7 +36,8 @@ use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 /// `workers/api/test/relay/vectors.json` in the website repository, where the service rebuilds
 /// these bytes from the JSON it received.
 const LEASE_REQUEST_HEX: &str = "8278186b722d72656c61792d6c656173652d726571756573742f31a86570617965726c696e7374616c6c6174696f6e686c656173655f6964f669646972656374696f6e6d6269646972656374696f6e616c6c627974655f6365696c696e671a00400000706475726174696f6e5f7365636f6e647319012c71726567696f6e5f707265666572656e63656a65752d63656e7472616c73736f757263655f656e64706f696e745f6b657958200101010101010101010101010101010101010101010101010101010101010101781864657374696e6174696f6e5f656e64706f696e745f6b657958200202020202020202020202020202020202020202020202020202020202020202";
-const LEASE_REQUEST_SHA256: &str = "881c444baf4654ce066f19140796089b116d3b87a41ce36e0da2528b66a69e4d";
+const LEASE_REQUEST_SHA256: &str =
+    "881c444baf4654ce066f19140796089b116d3b87a41ce36e0da2528b66a69e4d";
 
 /// The canonical bytes an installation's credential covers, for [`fixed_payload`].
 const CREDENTIAL_HEX: &str = "82746b722d736572766963652d726571756573742f31a5656e6f6e636558203c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c666d6574686f647172656c61792e6c656173652e69737375656b626f64795f64696765737458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6c7369676e65645f61745f6d731b000001a3185c50006e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f";
@@ -46,7 +47,8 @@ const CREDENTIAL_HOST_HEX: &str = "8278196b722d736572766963652d726571756573742f3
 
 /// The same, for the revocation `RelayLeaseRevokeBody` builds.
 const LEASE_REVOKE_HEX: &str = "82776b722d72656c61792d6c656173652d7265766f6b652f31a266726561736f6e6866696e6973686564686c656173655f69645011111111111111111111111111111111";
-const LEASE_REVOKE_SHA256: &str = "cb78aa32039121f529ecfe4468e34203864841d37fb56c04bf3748ebe7044524";
+const LEASE_REVOKE_SHA256: &str =
+    "cb78aa32039121f529ecfe4468e34203864841d37fb56c04bf3748ebe7044524";
 
 /// A service that records what it was sent and answers with what it was told to.
 #[derive(Debug)]
@@ -126,8 +128,9 @@ impl ServiceSigner for Installation {
     fn sign(&self, message: &[u8]) -> Result<Signature64> {
         // The transcript type refuses bytes that are not a domain-tagged array, so a signer cannot
         // be handed arbitrary bytes to sign under a domain it holds a key for.
-        let transcript = SigningTranscript::from_canonical_bytes(self.kind.domain(), message.to_vec())
-            .expect("a domain-tagged transcript");
+        let transcript =
+            SigningTranscript::from_canonical_bytes(self.kind.domain(), message.to_vec())
+                .expect("a domain-tagged transcript");
         Ok(sign(&self.pair, &transcript).expect("a signature"))
     }
 }
@@ -342,7 +345,10 @@ async fn an_exhausted_allowance_is_an_answer_with_the_grace_left() {
     };
     assert!(refusal.allowance.exhausted);
     assert_eq!(refusal.alternatives.len(), 2);
-    assert_eq!(refusal.warnings.first().map(|warning| warning.threshold), Some(80));
+    assert_eq!(
+        refusal.warnings.first().map(|warning| warning.threshold),
+        Some(80)
+    );
 
     // Section 17 requires the remaining interval to be visible before the relay closes, and this is
     // the request that is refused: the interval comes back with the refusal.
@@ -498,13 +504,11 @@ fn payload_signature(sent: &serde_json::Value) -> Signature64 {
 /// The bytes the credential covered, rebuilt from what was sent.
 fn covered_bytes(sent: &serde_json::Value) -> Vec<u8> {
     let payload = &sent["signature"]["payload"];
-    let digest = kr_protocol::scalars::from_base64url(
-        payload["body_digest"].as_str().expect("a digest"),
-    )
-    .expect("base64url");
-    let nonce =
-        kr_protocol::scalars::from_base64url(payload["nonce"].as_str().expect("a nonce"))
+    let digest =
+        kr_protocol::scalars::from_base64url(payload["body_digest"].as_str().expect("a digest"))
             .expect("base64url");
+    let nonce = kr_protocol::scalars::from_base64url(payload["nonce"].as_str().expect("a nonce"))
+        .expect("base64url");
 
     let rebuilt = kr_client::services::relay::RelayRequestPayload {
         body_digest: kr_protocol::scalars::Digest256::from_bytes(

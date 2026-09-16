@@ -49,8 +49,8 @@ use kr_protocol::scalars::{
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use serde::{Deserialize, Serialize};
 
-use super::{LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseService};
 use super::ServiceFuture;
+use super::{LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseService};
 use crate::error::{ClientError, Result};
 
 /// The domain a lease request's body digest covers.
@@ -544,7 +544,12 @@ impl RelayLeaseService for ManagedRelayLeaseService {
             let body = RelayLeaseIssueBody::of(request);
             let signing_input = body.signing_input()?;
             let data = self
-                .call(RELAY_LEASE_PATH, RELAY_LEASE_ISSUE_METHOD, body, signing_input)
+                .call(
+                    RELAY_LEASE_PATH,
+                    RELAY_LEASE_ISSUE_METHOD,
+                    body,
+                    signing_input,
+                )
                 .await?;
             let answer: TaggedAnswer = serde_json::from_value(data)
                 .map_err(|error| malformed(format!("a lease answer: {error}")))?;
@@ -617,7 +622,9 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 /// The protocol code one service error code means.
 fn code_of(code: &str) -> ErrorCode {
     match code {
-        "UNAUTHENTICATED" | "FORBIDDEN" | "REAUTHENTICATION_REQUIRED" => ErrorCode::PermissionDenied,
+        "UNAUTHENTICATED" | "FORBIDDEN" | "REAUTHENTICATION_REQUIRED" => {
+            ErrorCode::PermissionDenied
+        }
         "RATE_LIMITED" => ErrorCode::RateLimited,
         "QUOTA_EXHAUSTED" => ErrorCode::QuotaExceeded,
         "NOT_CONFIGURED" => ErrorCode::HostNotConfigured,
@@ -635,7 +642,9 @@ fn malformed(message: String) -> ClientError {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// A fresh nonce from the operating system's generator.
