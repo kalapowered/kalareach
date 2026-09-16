@@ -677,7 +677,7 @@ impl AttachmentTable {
 /// many columns and, with them, too many cells. One violation is reported as the dimension failure
 /// it is; several are reported together, because telling somebody about the first and leaving them
 /// to discover the rest one refusal at a time is not telling them.
-fn admit(dimensions: Dimensions) -> Result<()> {
+pub(crate) fn admit(dimensions: Dimensions) -> Result<()> {
     let violations = dimensions.violations();
     match violations.len() {
         0 => Ok(()),

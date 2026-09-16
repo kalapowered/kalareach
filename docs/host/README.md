@@ -229,8 +229,9 @@ The comparison is made again whenever the application changes the negotiation, w
 any moment and without telling anybody. Parsing the output is what tells the host, so an application
 that turns an enhanced protocol on takes the keys from a terminal that cannot send it, and one that
 turns it off leaves the ordinary encoding, which any declared terminal can send, so that terminal
-can acquire again. The release is the ordinary one — the epoch advances, the fence goes out, a paste
-the lease had open is closed — and the holder learns on its next write, which is `LEASE_LOST`.
+is eligible again and can ask for the keys. Nothing gives them back by itself. The release is the
+ordinary one — the epoch advances, the fence goes out, a paste the lease had open is closed — and
+the holder learns on its next write, which is `LEASE_LOST`.
 
 Such a release has no answer of its own to report in, and neither does a detach, so what it
 interrupted is carried instead: the bytes that were accepted and never arrived, and whether a paste

@@ -94,6 +94,20 @@ pub struct CloseAcceptance {
     pub initiated: bool,
 }
 
+/// What ending a lease established, read on the boundary the writer shares.
+///
+/// Both answers have to be taken there and taken together: the bytes the ending lease handed over
+/// and the writer has not written, and whether the writer was holding a paste of that lease's open.
+/// Reading either one outside the boundary, or after the fence, reads an answer about a different
+/// moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LeaseEnded {
+    /// Bytes that lease had queued and the writer had not written.
+    left: u64,
+    /// The lease whose delivered paste was open, as one more than its epoch; zero for none.
+    paste_open_for: u64,
+}
+
 /// What a lease the host ended by itself left behind, waiting to be reported.
 ///
 /// Section 8 requires an interrupted paste and the input that never arrived to be reported. A
@@ -200,6 +214,10 @@ impl Session {
     /// Returns an error when the terminal cannot be created. A journal that cannot be opened is
     /// recorded rather than fatal: an authorised stop must still work without one.
     pub fn open(config: SessionConfig) -> Result<Self> {
+        // The creation geometry is admitted here rather than only inside the terminal, so a
+        // request that breaks more than one of section 8's three constraints is told about all of
+        // them at once instead of one refusal at a time.
+        crate::attachments::admit(config.dimensions)?;
         let pty = Pty::open(config.dimensions)?;
         let engine = crate::projection::TerminalEngine::new(config.dimensions)?;
         let history = match config.spool_directory.as_ref() {
@@ -400,13 +418,23 @@ impl Session {
     /// this returns, no write of that lease's bytes can begin, and none was part way through while
     /// the count was taken. That is what makes the number a receipt can quote exact rather than an
     /// estimate of what a writer might still be doing.
-    fn end_lease(&mut self) -> u64 {
+    fn end_lease(&mut self) -> LeaseEnded {
         let gate = Arc::clone(&self.input_gate);
         let boundary = gate.lock().expect("the input boundary is not poisoned");
+        // Read before the fence goes out. The writer clears this latch when it sees the fence
+        // change, so a read afterwards can find the zero the writer wrote for this very change and
+        // report that no paste was interrupted when one was. Before the fence, no writer can have
+        // seen it, and a latch an *earlier* change left set was reported by that change.
+        let paste_open_for = self
+            .delivered_paste_open
+            .load(std::sync::atomic::Ordering::Acquire);
         self.note_lease_holder();
         let left = self.queued_lease_bytes.take(self.lease.epoch()) as u64;
         drop(boundary);
-        left
+        LeaseEnded {
+            left,
+            paste_open_for,
+        }
     }
 
     /// Returns the boundary the writer and a lease change share.
@@ -678,7 +706,7 @@ impl Session {
         let discarded_queue = self.lease.release_attachment(attachment_id);
         if held {
             let framing = self.framer.close_for_takeover();
-            let left = self.end_lease();
+            let ended = self.end_lease();
             // The source of this input has gone, which is the loss section 8 asks to be reported.
             // The attachment that is leaving has no answer left to read it in, so it is carried to
             // whoever takes the keys next.
@@ -686,10 +714,10 @@ impl Session {
                 .interrupted
                 .bytes
                 .saturating_add(discarded_queue)
-                .saturating_add(left)
+                .saturating_add(ended.left)
                 .saturating_add(framing.discarded_prefix.len() as u64);
-            self.interrupted.closed_open_paste |=
-                framing.terminator.is_some() || self.delivered_paste_is_ours(ending_epoch);
+            self.interrupted.closed_open_paste |= framing.terminator.is_some()
+                || Self::delivered_paste_was_ours(&ended, ending_epoch);
         } else {
             self.note_lease_holder();
         }
@@ -899,14 +927,15 @@ impl Session {
         // being written while it was counted. Taking the counter rather than reading it is what
         // makes the answer that lease's own: the next takeover starts from zero and cannot report
         // these bytes again.
-        let mut discarded = self.end_lease();
+        let ended = self.end_lease();
+        let mut discarded = ended.left;
         discarded += discarded_queue;
         discarded += framing.discarded_prefix.len() as u64;
         // A paste is reported as closed when one was open in the stream this lease accepted, or
         // when one is open at the application: the writer keeps the second, because a terminator
         // the framer accepted may have been queued behind a writer that never wrote it.
         let mut closed_open_paste =
-            framing.terminator.is_some() || self.delivered_paste_is_ours(ending_epoch);
+            framing.terminator.is_some() || Self::delivered_paste_was_ours(&ended, ending_epoch);
         // Plus whatever a lease the host ended by itself left behind. It had no answer of its own
         // to be reported in, so it is reported here, once, and then it is nobody's any more.
         let carried = std::mem::take(&mut self.interrupted);
@@ -948,15 +977,15 @@ impl Session {
         // lease state, which has nowhere to say it, so it is carried to whoever takes the keys next
         // rather than dropped: an actor that let go of the keys still interrupted whatever it had
         // not delivered.
-        let left = self.end_lease();
+        let ended = self.end_lease();
         self.interrupted.bytes = self
             .interrupted
             .bytes
             .saturating_add(discarded_queue)
-            .saturating_add(left)
+            .saturating_add(ended.left)
             .saturating_add(framing.discarded_prefix.len() as u64);
         self.interrupted.closed_open_paste |=
-            framing.terminator.is_some() || self.delivered_paste_is_ours(ending_epoch);
+            framing.terminator.is_some() || Self::delivered_paste_was_ours(&ended, ending_epoch);
         self.pump_replies();
         Ok(self.lease.to_wire())
     }
@@ -1269,34 +1298,33 @@ impl Session {
         let ending_epoch = self.lease.epoch();
         let discarded_queue = self.lease.release_attachment(holder);
         let framing = self.framer.close_for_takeover();
-        let left = self.end_lease();
+        let ended = self.end_lease();
         // What this lease lost is carried rather than dropped. Nobody asked for the release, so
         // there is no answer to put it in; the next acquire reports it with its own.
         self.interrupted.bytes = self
             .interrupted
             .bytes
             .saturating_add(discarded_queue)
-            .saturating_add(left)
+            .saturating_add(ended.left)
             .saturating_add(framing.discarded_prefix.len() as u64);
         self.interrupted.closed_open_paste |=
-            framing.terminator.is_some() || self.delivered_paste_is_ours(ending_epoch);
+            framing.terminator.is_some() || Self::delivered_paste_was_ours(&ended, ending_epoch);
         self.pump_replies();
         true
     }
 
-    /// Returns whether a paste the writer is still holding open belongs to the lease just ending.
+    /// Returns whether a paste the writer was holding open belongs to the lease just ending.
     ///
-    /// The writer keeps this latch because a terminator the framer accepted may have been queued
+    /// The writer keeps that latch because a terminator the framer accepted may have been queued
     /// behind a writer that never wrote it, and it clears the latch when it writes the correction.
-    /// Between a lease change and the writer acting on it the latch is still set, so something has
-    /// to say whose paste it is or a second lease change in that window would report the same
-    /// closure again. What says it is the latch itself: it names the lease that wrote into the
-    /// paste, as one more than that lease's epoch, and zero for no paste at all.
-    fn delivered_paste_is_ours(&self, ending_epoch: u64) -> bool {
-        let open_for = self
-            .delivered_paste_open
-            .load(std::sync::atomic::Ordering::Acquire);
-        open_for != 0 && open_for == ending_epoch.saturating_add(1)
+    /// Two things follow. The value has to say *whose* paste it is, or a second lease change in the
+    /// writer's window would report the same closure again; so it names the lease that wrote into
+    /// the paste, as one more than that lease's epoch, and zero for no paste at all. And it has to
+    /// be read before the fence goes out, or the writer's own answer to this change would be read
+    /// as an answer about the lease before it; so the reading happens inside
+    /// [`Session::end_lease`], on the boundary, and travels here.
+    const fn delivered_paste_was_ours(ended: &LeaseEnded, ending_epoch: u64) -> bool {
+        ended.paste_open_for != 0 && ended.paste_open_for == ending_epoch.saturating_add(1)
     }
 
     /// Returns what a lease the host ended by itself left behind and nobody has been told about.
@@ -1624,7 +1652,7 @@ impl Session {
                     self.lease.release_attachment(holder);
                 }
                 self.framer.close_for_takeover();
-                let _ = self.end_lease();
+                let _ = self.end_lease().left;
                 CloseAcceptance {
                     state: SessionState::Closing,
                     durability: self.durability(),
