@@ -35,6 +35,7 @@
 //! | [`frame`] | Stream headers and the length-delimited frame codec |
 //! | [`hello`] | Version negotiation and the `kr-connect/1` proof transcript |
 //! | [`pairing`] | Pairing contexts, bundles, transcripts, QR payloads and owner confirmation |
+//! | [`preauth`] | What an unpaired connection may send on the bounded pairing surface |
 //! | [`mailbox`] | Stored mailbox envelopes and their size buckets |
 //! | [`service`] | The credential every managed-service method authenticates with |
 //! | [`push`] | Push registration, sender authorisation and delivery |
@@ -107,6 +108,7 @@ pub mod local;
 pub mod mailbox;
 pub mod method;
 pub mod pairing;
+pub mod preauth;
 pub mod push;
 pub mod receipt;
 pub mod recovery;

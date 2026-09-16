@@ -7247,6 +7247,91 @@
       ],
       "type": "object"
     },
+    "PairRedeemParams": {
+      "description": "The parameters of `pair.redeem`.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Ask the host for a fresh single-use challenge for this invitation.",
+          "properties": {
+            "challenge": {
+              "properties": {
+                "invitation_id": {
+                  "$ref": "#/$defs/InvitationId",
+                  "description": "The invitation the candidate scanned."
+                }
+              },
+              "required": [
+                "invitation_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "challenge"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Answer that challenge with the direct route's proof.",
+          "properties": {
+            "direct": {
+              "$ref": "#/$defs/DirectRedeemProof"
+            }
+          },
+          "required": [
+            "direct"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PairRedeemResult": {
+      "description": "The result of `pair.redeem`.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The challenge to answer. It is single use and expires with the invitation.",
+          "properties": {
+            "challenge": {
+              "$ref": "#/$defs/DirectChallenge"
+            }
+          },
+          "required": [
+            "challenge"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The candidate now holds the invitation, and both devices show this value.\n\nHolding it is not being paired. The owner still has to approve the value both devices\ndisplay, and the candidate learns that it happened through `pair.status`.",
+          "properties": {
+            "locked": {
+              "properties": {
+                "attempt_id": {
+                  "$ref": "#/$defs/AttemptId",
+                  "description": "The attempt the host locked to this candidate."
+                },
+                "verification_value": {
+                  "description": "The eight hexadecimal characters both devices display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "attempt_id",
+                "verification_value"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "locked"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "PairStatus": {
       "description": "What `pair.status` reports.\n\nIt never reveals secret material, and the host returns it only to the candidate's authenticated\nendpoint or to the issuing owner.",
       "oneOf": [
@@ -7393,6 +7478,34 @@
           "type": "object"
         }
       ]
+    },
+    "PairStatusParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `pair.status`.\n\nThe invitation is named; the candidate is not, and cannot be. The host answers about the\nattempt the *authenticated endpoint* of this connection is party to, so a caller cannot ask\nabout another candidate's attempt by naming it.",
+      "properties": {
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation the candidate is party to."
+        }
+      },
+      "required": [
+        "invitation_id"
+      ],
+      "type": "object"
+    },
+    "PairStatusResult": {
+      "additionalProperties": false,
+      "description": "The result of `pair.status`.",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/PairStatus",
+          "description": "What the invitation is doing."
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
     },
     "PairingConsumedReason": {
       "description": "Why an invitation was consumed without issuing a grant.",
@@ -13508,8 +13621,20 @@
     "pair_finish_request": {
       "$ref": "#/$defs/PairFinishRequest"
     },
+    "pair_redeem_params": {
+      "$ref": "#/$defs/PairRedeemParams"
+    },
+    "pair_redeem_result": {
+      "$ref": "#/$defs/PairRedeemResult"
+    },
     "pair_status": {
       "$ref": "#/$defs/PairStatus"
+    },
+    "pair_status_params": {
+      "$ref": "#/$defs/PairStatusParams"
+    },
+    "pair_status_result": {
+      "$ref": "#/$defs/PairStatusResult"
     },
     "policy_authority": {
       "$ref": "#/$defs/PolicyAuthority"

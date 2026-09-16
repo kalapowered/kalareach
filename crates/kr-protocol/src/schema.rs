@@ -44,6 +44,7 @@ use crate::pairing::{
     OwnerConfirmationProof, OwnerConfirmationRequest, PairFinishRequest, PairStatus, ProposedGrant,
     RevocationAcknowledgement, RevocationRequest, SignedClientBundle, SignedHostBundle,
 };
+use crate::preauth::{PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult};
 use crate::push::{
     PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest, PushInstallationBinding,
     PushRegistrationAnswer, PushRegistrationChallenge, PushRequest, PushSenderRecord,
@@ -179,7 +180,11 @@ pub fn protocol_schema() -> Value {
         "owner_confirmation_proof" => OwnerConfirmationProof,
         "owner_confirmation_request" => OwnerConfirmationRequest,
         "pair_finish_request" => PairFinishRequest,
+        "pair_redeem_params" => PairRedeemParams,
+        "pair_redeem_result" => PairRedeemResult,
         "pair_status" => PairStatus,
+        "pair_status_params" => PairStatusParams,
+        "pair_status_result" => PairStatusResult,
         "proposed_grant" => ProposedGrant,
         "protocol_error" => ProtocolError,
         "push_delivery_ack" => PushDeliveryAck,

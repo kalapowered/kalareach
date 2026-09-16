@@ -582,6 +582,40 @@ export type ResourceSelectorKind =
  */
 export type ClientVersion = string
 /**
+ * The parameters of `pair.redeem`.
+ */
+export type PairRedeemParams =
+  | {
+      challenge: {
+        /**
+         * The invitation the candidate scanned.
+         */
+        invitation_id: string
+      }
+    }
+  | {
+      direct: DirectRedeemProof
+    }
+/**
+ * The result of `pair.redeem`.
+ */
+export type PairRedeemResult =
+  | {
+      challenge: DirectChallenge
+    }
+  | {
+      locked: {
+        /**
+         * The attempt the host locked to this candidate.
+         */
+        attempt_id: string
+        /**
+         * The eight hexadecimal characters both devices display.
+         */
+        verification_value: string
+      }
+    }
+/**
  * What `pair.status` reports.
  *
  * It never reveals secret material, and the host returns it only to the candidate's authenticated
@@ -986,7 +1020,11 @@ export interface KalaReachProtocol {
   owner_confirmation_proof?: OwnerConfirmationProof
   owner_confirmation_request?: OwnerConfirmationRequest1
   pair_finish_request?: PairFinishRequest
+  pair_redeem_params?: PairRedeemParams
+  pair_redeem_result?: PairRedeemResult
   pair_status?: PairStatus
+  pair_status_params?: PairStatusParams
+  pair_status_result?: PairStatusResult
   policy_authority?: PolicyAuthority
   proposed_grant?: ProposedGrant
   protocol_error?: ProtocolError
@@ -5266,6 +5304,88 @@ export interface PairFinishRequest {
    * The transcript both devices confirmed.
    */
   transcript: string
+}
+/**
+ * The parameters of `pair.status`.
+ *
+ * The invitation is named; the candidate is not, and cannot be. The host answers about the
+ * attempt the *authenticated endpoint* of this connection is party to, so a caller cannot ask
+ * about another candidate's attempt by naming it.
+ */
+export interface PairStatusParams {
+  /**
+   * The invitation the candidate is party to.
+   */
+  invitation_id: string
+}
+/**
+ * The result of `pair.status`.
+ */
+export interface PairStatusResult {
+  /**
+   * What the invitation is doing.
+   */
+  status:
+    | {
+        open: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+          /**
+           * Remaining failed-confirmation allowance on the host.
+           */
+          remaining_confirmations: number
+        }
+      }
+    | {
+        locked: {
+          /**
+           * The candidate that holds it.
+           */
+          attempt_id: string
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+    | {
+        awaiting_approval: {
+          /**
+           * The candidate's attempt.
+           */
+          attempt_id: string
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+          /**
+           * The verification value shown on both devices.
+           */
+          verification_value: string
+        }
+      }
+    | {
+        committed: {
+          /**
+           * One paired device.
+           */
+          device_id: string
+          /**
+           * One host-issued authority object.
+           */
+          grant_id: string
+        }
+      }
+    | {
+        consumed: {
+          /**
+           * Why it was consumed.
+           */
+          reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
+        }
+      }
 }
 /**
  * An organisation's policy-signing authority as it is published.
