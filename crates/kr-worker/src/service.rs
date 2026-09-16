@@ -1166,7 +1166,7 @@ impl WorkerService {
             Method::HistoryPage => self.history_page(state, &request.params),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params),
             Method::ActionRead => self.action_read(&caller.actor_id, &request.params),
-            Method::InputWrite => self.input_write(state, &request.params),
+            Method::InputWrite => self.input_write(state, &request.params, caller),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
                 method.as_str()
@@ -2079,6 +2079,7 @@ impl WorkerService {
         &self,
         state: &mut ConnectionState,
         params: &ParamsValue,
+        caller: &Caller,
     ) -> Result<ParamsValue> {
         let params: InputWriteParams = parse(params)?;
         Self::check_attachment(state, params.attachment_id)?;
@@ -2092,6 +2093,10 @@ impl WorkerService {
         }
         let accepted = {
             let mut session = self.runtime.session();
+            // Inside the session's own boundary, where the lease and the fence are: a forwarded
+            // batch can wait here while the controller installs a newer authority revision, and
+            // what the boundary decides is what actually reaches the application.
+            self.check_validated_revision(caller)?;
             Self::check_session(&session, params.session_id)?;
             Self::check_capability(&session, params.attachment_id, AttachmentCapability::Input)?;
             let accepted = session.write_input(
