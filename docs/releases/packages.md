@@ -33,9 +33,13 @@ A release is one commit's output. Tag that commit and push the tag:
 
 ```bash
 commit=$(git rev-parse HEAD)
-git tag "packages/v0.2.0+${commit:0:12}" "$commit"
-git push origin "packages/v0.2.0+${commit:0:12}"
+version=$(node -p "require('./packages/protocol/package.json').version")
+git tag "packages/v${version}+${commit:0:12}" "$commit"
+git push origin "packages/v${version}+${commit:0:12}"
 ```
+
+The version comes out of the package rather than being typed, so a bump cannot leave this naming
+the version before it.
 
 `.github/workflows/package-release.yml` runs on a tag matching `packages/v*`. It packs the archives
 with `scripts/release-packages.sh`, refuses to go on if that tag already has a release or a draft,
