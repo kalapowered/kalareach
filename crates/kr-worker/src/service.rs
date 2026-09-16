@@ -602,6 +602,7 @@ impl WorkerService {
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
             self.runtime.flush_locked(&mut session);
+            self.forget_remote_attachment(attachment_id);
         }
         // A window that outlived its connection could first-admit a request through a connection
         // that no longer exists, so the connection's windows go when it does, and so does its
@@ -995,6 +996,18 @@ impl WorkerService {
         })
     }
 
+    /// Forgets an attachment that has gone, so the set holds only attachments that exist.
+    ///
+    /// Every way an attachment ends comes through here: its own detach, its connection going, and
+    /// a withdrawal taking it back. A set that only grew would keep one entry per remote
+    /// attachment for as long as this worker ran.
+    fn forget_remote_attachment(&self, attachment_id: AttachmentId) {
+        self.remote_attachments
+            .lock()
+            .expect("the remote attachment set is not poisoned")
+            .remove(&attachment_id);
+    }
+
     /// Takes the input lease away from a forwarded caller, with whatever it had not delivered.
     ///
     /// Section 10's input fence is what a revocation needs here. Input the worker accepted can sit
@@ -1107,6 +1120,7 @@ impl WorkerService {
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
             self.runtime.flush_locked(&mut session);
+            self.forget_remote_attachment(attachment_id);
         }
     }
 
@@ -2246,10 +2260,7 @@ impl WorkerService {
                 self.runtime.flush_locked(session);
                 let result = outcome?;
                 state.remove_attachment(params.attachment_id);
-                self.remote_attachments
-                    .lock()
-                    .expect("the remote attachment set is not poisoned")
-                    .remove(&params.attachment_id);
+                self.forget_remote_attachment(params.attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::SessionClose => {
