@@ -321,6 +321,7 @@ export function mailboxSizeBucket (length: number): number {
 
 /** Why a sealed record is not one this contract admits. */
 export type StructureRefusal =
+  | { readonly reason: 'unknown_payload_type'; readonly declared: string }
   | { readonly reason: 'undeclared_bucket'; readonly bucket: bigint }
   | { readonly reason: 'ciphertext_length'; readonly length: bigint; readonly expected: bigint }
   | { readonly reason: 'too_large'; readonly bucket: bigint; readonly limit: number }
@@ -331,15 +332,24 @@ export type StructureRefusal =
 /**
  * Everything about a sealed mailbox item a service can check without a key, or null.
  *
- * Four rules: the declared bucket is a length the padding rules produce, the ciphertext is exactly
- * that bucket plus the seal's overhead, the item expires inside the day section 9 gives it and not
- * in the past, and a payload that carries authority names no coalescing thread.
+ * Five rules: the payload kind is one of the closed set, the declared bucket is a length the
+ * padding rules produce, the ciphertext is exactly that bucket plus the seal's overhead, the item
+ * expires inside the day section 9 gives it and not in the past, and a payload that carries
+ * authority names no coalescing thread.
+ *
+ * The first is what keeps an action out of a mailbox. Section 9 queues no keystroke, no shell
+ * command, no approval decision and no closure, and the way that holds is that the kinds are a
+ * closed set with no member any of them could arrive under: a kind outside it is refused here
+ * rather than stored under a name nobody reads.
  */
 export function checkSealedEnvelope (
   envelope: SealedEnvelope,
   nowMs: number
 ): StructureRefusal | null {
   const routing = envelope.routing
+  if (!(MAILBOX_PAYLOAD_TYPES as readonly string[]).includes(routing.payload_type)) {
+    return { reason: 'unknown_payload_type', declared: String(routing.payload_type) }
+  }
   const bucket = jsonToU64(routing.size_bucket_bytes)
   if (granularityForBucket(bucket) === null) {
     return { reason: 'undeclared_bucket', bucket }

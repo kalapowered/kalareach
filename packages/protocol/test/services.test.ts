@@ -171,6 +171,19 @@ describe('the mailbox', () => {
     expect(checkSealedEnvelope(sealed, expires)?.reason).toBe('already_expired')
   })
 
+  it('refuses a payload kind that is not one of the closed set', () => {
+    const created = Number(plaintext.created_at_ms)
+    // There is no kind an action could arrive under: a keystroke, a command, an approval decision
+    // and a closure are all refused by the same rule.
+    for (const kind of ['keystroke', 'shell_command', 'approval_decision', 'session_closure']) {
+      const declared: SealedEnvelope = {
+        ...sealed,
+        routing: { ...sealed.routing, payload_type: kind as never }
+      }
+      expect(checkSealedEnvelope(declared, created)?.reason).toBe('unknown_payload_type')
+    }
+  })
+
   it('refuses a payload that carries authority and asks to be coalesced', () => {
     const created = Number(plaintext.created_at_ms)
     const authority: SealedEnvelope = {
