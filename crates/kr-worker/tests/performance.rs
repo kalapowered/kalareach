@@ -424,6 +424,33 @@ fn total<T: std::iter::Sum>(
         .sum()
 }
 
+/// Returns the one-, five- and fifteen-minute load averages, or says why it could not read them.
+///
+/// A resource figure is about a machine under conditions. The script around this measurement
+/// records the load either side of the whole command, setup and cleanup included; this reads it at
+/// the two edges of the processor window itself, which is the interval the figure is an average
+/// over.
+fn load_average() -> Result<String, String> {
+    if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
+        return Ok(text
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" "));
+    }
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .map_err(|error| format!("read the load average: {error}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim().trim_matches(|c| c == '{' || c == '}');
+    let reading: Vec<&str> = text.split_whitespace().take(3).collect();
+    if reading.len() < 3 {
+        return Err("the host reports its load average".to_owned());
+    }
+    Ok(reading.join(" "))
+}
+
 /// What the idle measurement established.
 struct Idle {
     cores: f64,
@@ -511,9 +538,11 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     let daemon = std::process::id();
 
     let started = Instant::now();
+    let entering = load_average()?;
     let before = each(&workers, daemon, processor_seconds)?;
     tokio::time::sleep(IDLE_WINDOW).await;
     let after = each(&workers, daemon, processor_seconds)?;
+    let leaving = load_average()?;
     let elapsed = started.elapsed().as_secs_f64();
     // Per process, because a total that missed its bound does not say what spent the time. A
     // reading that went backwards is an identifier that is no longer the process it was, and a
@@ -564,6 +593,7 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
         grid.rows.get()
     );
     println!("  processor: {cores:.5} of one core averaged over {elapsed:.0} seconds");
+    println!("  load average at the edges of that window: {entering} entering, {leaving} leaving");
     println!(
         "  processor time: {used:.3} s in all over {elapsed:.1} s: {in_hosts:.3} s across {hosts} \
          session hosts, {in_roots:.3} s across {roots} root shells, and {in_daemon:.3} s in \
