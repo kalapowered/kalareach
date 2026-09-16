@@ -82,6 +82,12 @@ pub const MAX_ORIGINAL_FILE_NAME_LEN: usize = 255;
 /// Maximum length of a declared media type, in bytes.
 pub const MAX_MEDIA_TYPE_LEN: usize = 127;
 
+/// Maximum length of the upstream evidence or failure detail an adapter reports, in characters.
+///
+/// Each is text a client shows and the draft keeps, and a draft's reply carries one of them per
+/// binding, so each is bounded rather than left to the adapter's generosity.
+pub const MAX_INSERTION_DETAIL_LEN: usize = 4096;
+
 /// Largest encoded transfer result, in bytes.
 ///
 /// A reply travels in one control frame, and a draft's reply carries every attachment bound to it

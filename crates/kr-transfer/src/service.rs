@@ -205,6 +205,8 @@ pub struct TransferService {
     /// journal's lock and never after, which is what keeps the two from deadlocking.
     pub(crate) payloads: Mutex<()>,
     pub(crate) clock: Arc<dyn Clock>,
+    /// Set to stage every snapshot by copying its bytes, even where the filesystem clones.
+    pub(crate) copy_snapshots: std::sync::atomic::AtomicBool,
 }
 
 impl TransferService {
@@ -242,7 +244,20 @@ impl TransferService {
             staging,
             payloads: Mutex::new(()),
             clock,
+            copy_snapshots: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Stages every snapshot by copying its bytes, even where the filesystem offers a clone.
+    ///
+    /// The two ways of taking a snapshot make different promises, and the weaker one has to be
+    /// reachable on a machine whose filesystem offers the stronger one: a qualification run that
+    /// only ever clones never exercises what a copy has to prove about its source. Setting this
+    /// asks for the copy. It changes nothing else, because a copy is what a filesystem without a
+    /// clone does anyway.
+    pub fn copy_snapshots(&self, on: bool) {
+        self.copy_snapshots
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns the environment this service owns.
@@ -693,13 +708,19 @@ impl TransferService {
             };
             drop(file);
             let payloads = self.payloads.lock().map_err(|_| poisoned())?;
-            self.locked()?.close_upload(
+            // Conditional on the state this call read before it spent time verifying the file. A
+            // cancellation that landed in between has already closed this transfer and removed
+            // its payload, and that terminal state is not this failure's to overwrite.
+            let moved = self.locked()?.close_upload_from(
                 row.transfer_id,
+                row.state,
                 UploadState::Invalidated,
                 Some(&reason),
                 now,
             )?;
-            self.discard_payloads(&row)?;
+            if moved {
+                self.discard_payloads(&row)?;
+            }
             drop(payloads);
             return Err(TransferError::integrity(reason));
         }
@@ -1052,6 +1073,7 @@ impl TransferService {
         let result = DraftCreateResult {
             draft: self.draft_record(&row, &[])?,
         };
+        check_result_size(&result, "this draft")?;
         let retained = match action {
             Some(action) => Some(action.retained(
                 kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
@@ -1220,6 +1242,13 @@ impl TransferService {
         } else {
             None
         };
+        // An attachment with no session of its own becomes the draft's when it is bound, in the
+        // same transaction as the binding.
+        let session_for_attachment = upload
+            .session_id
+            .is_none()
+            .then_some(row.session_id)
+            .flatten();
         let ordinal = existing
             .iter()
             .map(|binding| binding.ordinal)
@@ -1290,13 +1319,7 @@ impl TransferService {
             params.expected_revision,
             grant.as_ref(),
             retained.as_ref(),
-            // An attachment with no session of its own takes the draft's, so its retention follows
-            // the session that holds it from this moment rather than from its submission.
-            upload
-                .session_id
-                .is_none()
-                .then_some(row.session_id)
-                .flatten(),
+            session_for_attachment,
         )? {
             Some(_) => Ok(result),
             None => {
@@ -1338,6 +1361,7 @@ impl TransferService {
             .ok_or_else(|| {
                 TransferError::invalid(format!("{transfer_id} is not bound to this draft"))
             })?;
+        check_insertion_detail(outcome)?;
         let binding = match outcome {
             InsertionOutcome::AcceptedByAgent { upstream_evidence } => {
                 if upstream_evidence.trim().is_empty() {
@@ -1662,10 +1686,11 @@ impl TransferService {
             let _ = self.discard_payloads(&row);
             sweep.expired_attachments += 1;
         }
-        let mut snapshots = self.locked()?.snapshots_in(SnapshotState::Open)?;
-        // A reserving row past its expiry is one whose staging never finished. A newer one may
-        // belong to a call still running in this process, which is why only the expiry decides.
-        snapshots.extend(self.locked()?.snapshots_in(SnapshotState::Reserving)?);
+        // Open rows only. A reserving row belongs to a call that is still staging: closing it
+        // would release a reservation whose file is about to exist, and nothing would be charged
+        // for those bytes. An abandoned reservation is resolved at the next start, by recovery,
+        // where nothing is in flight.
+        let snapshots = self.locked()?.snapshots_in(SnapshotState::Open)?;
         for candidate in snapshots {
             let Some(row) = self.locked()?.snapshot(candidate.transfer_id)? else {
                 continue;
@@ -2121,6 +2146,24 @@ fn check_original_name(name: &str) -> Result<()> {
 }
 
 /// Refuses a handle the declared contribution does not admit.
+/// Refuses an insertion outcome whose text a draft could not carry.
+///
+/// A draft's reply holds one of these per binding. Bounding each one is what keeps the reply
+/// bounded, and the bound is on the text rather than on how many bindings a draft may have.
+fn check_insertion_detail(outcome: &InsertionOutcome) -> Result<()> {
+    let text = match outcome {
+        InsertionOutcome::AcceptedByAgent { upstream_evidence } => upstream_evidence,
+        InsertionOutcome::Failed { detail } => detail,
+    };
+    if text.chars().count() > kr_protocol::transfer::MAX_INSERTION_DETAIL_LEN {
+        return Err(TransferError::invalid(format!(
+            "an insertion outcome carries at most {} characters",
+            kr_protocol::transfer::MAX_INSERTION_DETAIL_LEN
+        )));
+    }
+    Ok(())
+}
+
 /// Refuses a result too large to travel in the frame that carries it.
 ///
 /// Every mutation that returns a draft can grow the reply: one more attachment, one more preview,
