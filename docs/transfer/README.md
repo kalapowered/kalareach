@@ -53,6 +53,7 @@ them; nothing in the protocol depends on the defaults.
 | unfinished upload | 24 hours | `UNFINISHED_UPLOAD_LIFETIME` |
 | unused attachment | 7 days | `UNUSED_ATTACHMENT_LIFETIME` |
 | download snapshot | 24 hours | `DOWNLOAD_SNAPSHOT_LIFETIME` |
+| one reply | 768 KiB encoded | `MAX_TRANSFER_RESULT_BYTES`, checked before a mutation commits |
 
 A submitted attachment follows its session's retention instead of the seven-day window, which is why
 submission is recorded rather than inferred from age. The host tells the service which sessions its
@@ -196,8 +197,15 @@ whose object is in neither place is invalidated, because a handle whose file is 
 handle, and a storage failure is reported instead of being read as an absence.
 
 The directory that names a payload is flushed before the record that depends on it commits: after a
-`create`, and after the rename that publishes. Without that a power loss could leave SQLite saying
-`published` while the rename was still only in the page cache. A retried `upload.finish` resolves a
+`create`, after the rename that publishes, and after each directory of the staging tree is created.
+Without that a power loss could leave SQLite saying `published` while the rename was still only in
+the page cache. The flush opens a descriptor of its own for the directory, because the handle this
+service holds may be a reference to the directory rather than a file description, which is what
+Linux gives for an ordinary directory open and refuses to flush.
+
+On Windows there is no directory flush to make: the platform refuses one on a directory handle, and
+a rename inside one volume is its own ordered metadata operation. So the ordering above is a Unix
+guarantee, and what it leaves open on Windows is what the Windows qualification pass records. A retried `upload.finish` resolves a
 `publishing` row the same way, so a caller does not have to wait for the next start to learn what
 happened.
 
@@ -327,13 +335,23 @@ is compared before it is served, and every chunk's digest is compared against th
 off the disk. A tampered attachment is refused rather than delivered. For a source this service
 never verified, detection is not enough and it stages its own copy.
 
-A component replaced with a symbolic link between the prefix pass and the open of the object
-beneath it can be traversed. The destination is still beneath the authorised directory, because
-every open carries the boundary, so this is a link followed inside the tree and never an escape.
+Handle-based resolution removes the race between checking a path and using it, because there is no
+path to re-resolve: the boundary is a descriptor. What it does not remove is what happens *inside*
+one resolution of a multi-component name. A component replaced with a symbolic link between the
+prefix pass and the open of the object beneath it can be traversed; the destination is still beneath
+the authorised directory, because every open carries that boundary, so it is a link followed inside
+the tree rather than an escape.
 
-On Linux each accumulated path is resolved in one syscall, so there is no window inside a
-resolution. On the other platforms the resolution is component-wise beneath the start directory,
-and `cap-std`'s own documentation is the authority on what that leaves open.
+Every operation that *changes* what a directory holds takes a single component, so nothing above it
+is resolved at all: a create, a write, a removal, a rename and a link each name one entry in the
+directory whose handle is held. That is deliberate, and it is the reason the case above is about
+reads. A creation is the operation a later refusal cannot undo, so it never depends on a prefix
+that could have moved between being checked and being resolved.
+
+Where `openat2` with `RESOLVE_BENEATH` is available, Linux resolves an accumulated path in one
+syscall and there is no window inside it. `cap-std` falls back to its own component-wise resolution
+where that syscall is unavailable or returns `EAGAIN`, which is the same shape as the other Unix
+platforms. `cap-std`'s own documentation is the authority on what that leaves open.
 
 ## Verified downloads
 
@@ -376,9 +394,15 @@ evidence, not proof: a writer that rewrote the same number of bytes and restored
 time would pass it. What the comparison rules out is every change that leaves a trace, and what the
 chunk digests then rule out is a snapshot changed after it was taken.
 
-Either way the staged file is read back through its own handle and its digests computed from what
-is actually on disk, so a snapshot never serves bytes nothing checked, and never serves chunks that
-came from two versions of a file.
+That is why the metadata comparison is not the end of it. The copy's digest is compared with a
+second read of the source: equal digests mean the copy is byte-for-byte a state the source actually
+held, whatever its modification time says, and a difference is `SOURCE_CHANGED`. A rewrite that put
+the original bytes back between the two reads is the one case both checks pass, and there the copy
+is the original revision anyway.
+
+Either way the staged file is read back through its own handle and its digests computed from what is
+actually on disk, so a snapshot never serves bytes nothing checked, and the chunks it serves come
+from one revision of the file or the transfer is refused.
 
 Resuming names the transfer. The same snapshot answers with the same identity, size, digest, chunk
 layout and expiry. A snapshot that has expired, failed or been released is refused rather than
@@ -415,6 +439,12 @@ unsupported media transfers as a file without being offered as a model image.
 A draft is durable and device-owned, with its own revision. Every update and every binding names the
 revision it expects, and a mismatch is `DRAFT_CONFLICT` that changes nothing. Losing a connection
 removes an attachment's association, not the draft.
+
+A draft's reply carries the draft: its text, every attachment bound to it and every preview. That
+reply has to fit the frame that carries it, so its encoded size is checked *before* the mutation
+commits and the refusal is `QUOTA_EXCEEDED` with what to remove. Checking afterwards would leave a
+caller with a committed effect and no receipt, which is the one outcome an action identifier exists
+to avoid.
 
 `agent.draft.add_attachment` binds a completed handle to a draft and records that the adapter was
 asked. The binding starts at `recorded`, which says exactly that and no more. It reaches
@@ -457,13 +487,23 @@ Section 14 fixes four numbers and a format list: 40 megapixels of input, 256 MiB
 is pinned at 0.25.10 with only those four decoders compiled in.
 
 Two of those numbers need this crate's own enforcement rather than the library's. `image` documents
-its allocation limit as advisory, and several of its decoders hold an intermediate buffer the size
-of the output, so the limit is set on the decoder *and* the decode is refused in advance on an
-estimate: the declared pixels charged at eight bytes each, four for the pixel and four for one
-working buffer beside it. An image inside the pixel limit whose estimate is above the budget
-publishes as a file. The encoded input is bounded too, at 48 MiB, because both reader passes are
-taken over the same handle and a small image with a large trailing payload would otherwise spend the
-budget in the pass that was supposed to read a header.
+its allocation limit as advisory, and its decoders hold more than the output while they work, so the
+limit is set on the decoder *and* the decode is refused in advance on a charge this crate makes: the
+declared pixels at sixteen bytes each. Sixteen is the worst case among the four formats compiled in
+here, a PNG decoded to sixteen-bit RGBA and an animated WebP holding its output, its frame and its
+canvas at once, so an image whose charge fits the budget cannot make these decoders exceed it. The
+charge belongs to the pins in the manifest and is re-derived when they move. An image inside the
+pixel limit whose charge is above the budget publishes as a file: in practice the budget is the
+binding limit, at sixteen megapixels rather than forty.
+
+The dimensions that are charged are the ones that get allocated, which is not always the ones a
+header reports. A GIF's logical screen can be one pixel while its first frame is eight thousand by
+six thousand, and the decoder crops the frame into the screen, so the frame's own extent is read
+from the image descriptor and charged instead.
+
+The encoded input is bounded too, at 48 MiB, because both reader passes are taken over the same
+handle and a small image with a large trailing payload would otherwise spend the budget in the pass
+that was supposed to read a header.
 
 The third is a bound the specification does not state and a result cannot do without: a reply travels
 in one frame, and a draft's reply carries one preview per bound attachment. So an encoded thumbnail
@@ -495,7 +535,7 @@ untouched. Nothing invents a placeholder image to stand in for it.
 | `QUOTA_EXCEEDED` | a per-file or per-environment byte limit |
 | `RESOURCE_UNAVAILABLE` | the device's concurrency ceiling, or a transfer in a state that admits no more |
 | `DRAFT_CONFLICT` | the draft's revision is not the one the caller expected |
-| `PERMISSION_DENIED` | a name that leaves an authorised directory, a revoked scope or grant, or another principal's transfer |
+| `PERMISSION_DENIED` | a name that leaves an authorised directory, or a revoked scope or grant |
 | `ENVIRONMENT_UNAVAILABLE` | the request names an environment this service does not own |
 | `ID_CONFLICT` | one action identifier used for two different payloads |
 | `INVALID_ARGUMENT` | a malformed request, or an identifier that names nothing this caller owns |
