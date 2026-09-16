@@ -288,6 +288,34 @@ impl ControlSender {
         }
         outcome
     }
+
+    /// Sends one control frame if `admits` still holds at the write itself.
+    ///
+    /// The stream's writer is taken first and `admits` decides after that, so a frame that waited
+    /// behind the keepalive or a window renewal is not written under authority that went while it
+    /// waited. Returns `Ok(false)` when `admits` refused, in which case nothing was written.
+    ///
+    /// `admits` runs while the writer is held, so it must not wait on anything that waits on this
+    /// stream.
+    ///
+    /// # Errors
+    ///
+    /// As [`ControlChannel::send`].
+    pub async fn send_when<F, A>(&self, frame: &ControlFrame, admits: F) -> Result<bool>
+    where
+        F: FnOnce() -> A,
+        A: Future<Output = bool>,
+    {
+        let mut writer = self.writer.lock().await;
+        if !admits().await {
+            return Ok(false);
+        }
+        let outcome = writer.write_message(frame).await;
+        if outcome.is_err() {
+            self.lost.declare();
+        }
+        outcome.map(|()| true)
+    }
 }
 
 /// One authorised connection, handed to the host.

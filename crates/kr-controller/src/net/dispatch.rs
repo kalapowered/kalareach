@@ -178,28 +178,49 @@ impl RemoteOutput {
 
     /// Sends one frame, and returns whether it was sent.
     ///
-    /// The latch and the registration are both read after the turn is taken, so a frame is never
-    /// begun on a connection whose authority has been withdrawn — by a device revocation, which
-    /// sets the latch, or by an authority revision, which withdraws the registration.
+    /// The authority is read at the write itself, inside the stream's writer, and again for as
+    /// long as the write waits:
     ///
-    /// A write can then wait: for the control stream's own writer, which the keepalive and the
-    /// window renewal share, and for the peer to make room. The authority is watched for as long
-    /// as that lasts, because a check that only ran before the wait would let a frame be delivered
-    /// under authority that went while it was queued. A frame abandoned that way leaves the stream
-    /// in pieces, which is exactly right for a connection being fenced: the connection is closed
-    /// with it.
+    /// * The turn keeps this connection's frames in order, one at a time.
+    /// * The writer is shared with the keepalive and the window renewal, so a frame can wait for
+    ///   it. The latch and the registration are read after it has been taken, which is the moment
+    ///   the bytes would go: a frame that waited there is never written under authority that went
+    ///   while it waited.
+    /// * A write that has begun can still wait for the peer to make room. That wait is watched,
+    ///   and an authority that goes closes the connection, which is what stops the bytes reaching
+    ///   a peer no longer authorised to receive them. The abandoned frame leaves the stream in
+    ///   pieces, which is exactly right for a connection being fenced.
     pub async fn send(&self, frame: &ControlFrame) -> bool {
         let _turn = self.turn.lock().await;
-        if self.has_withdrawn() || !self.authority.stands().await {
+        if self.has_withdrawn() {
             return false;
         }
-        tokio::select! {
-            written = self.sender.send(frame) => written.is_ok(),
+        let written = tokio::select! {
+            written = self.sender.send_when(frame, || self.admits()) => written,
             () = self.authority_lost() => {
+                self.withdraw();
+                return false;
+            }
+        };
+        match written {
+            Ok(true) => true,
+            // Refused at the boundary: the authority this connection writes under has gone, so the
+            // connection goes with it rather than waiting to be asked for something else.
+            Ok(false) => {
                 self.withdraw();
                 false
             }
+            Err(_) => false,
         }
+    }
+
+    /// Returns whether a frame may be written on this connection now.
+    ///
+    /// Read inside the stream's writer, so it decides at the write rather than before the wait
+    /// for it. The latch is what a device revocation sets; the registration covers an authority
+    /// revision the daemon advanced for another reason, and the grant covers its own expiry.
+    async fn admits(&self) -> bool {
+        !self.has_withdrawn() && self.authority.stands().await
     }
 
     /// Resolves once this connection stops being one this host may write to.
@@ -390,12 +411,14 @@ impl RemoteConnection {
             );
         }
         // Before the read, not only after it. A registration withdrawn before this request arrived
-        // must stop it, and a read that is refused must not have reached the subject first.
-        if let Err(error) = self.authorised().await {
-            return failure(request.request_id, error);
-        }
+        // must stop it, and a read that is refused must not have reached the subject first. The
+        // revision comes from the same critical section, so a request can never be stamped with a
+        // revision the registration was not still standing at.
+        let validated = match self.admitted_at().await {
+            Ok(validated) => validated,
+            Err(error) => return failure(request.request_id, error),
+        };
         let named = session_of(&request.params, entry).ok();
-        let validated = self.validation_revision().await;
         // A read never claims geometry: the condition on `terminal.geometry` is about a request
         // that claims or adds a claim, and only a mutation does either.
         if let Err(error) = self.check_grant(named, entry, false) {
@@ -451,17 +474,18 @@ impl RemoteConnection {
         // The registration first, before a retained result is looked up and before any effect is
         // considered. A revoked device gets no further dispatch, and it does not get its own
         // retained results back either: section 9 has the host check current authority before it
-        // returns a retained receipt.
-        if let Err(error) = self.authorised().await {
-            return failure(mutation.request_id, error);
-        }
+        // returns a retained receipt. The revision it is stamped with comes from the same critical
+        // section as that check.
+        let validated = match self.admitted_at().await {
+            Ok(validated) => validated,
+            Err(error) => return failure(mutation.request_id, error),
+        };
         // A retained action is answered before anything about a first admission is considered.
         // Applying the freshness window to a retry would refuse a caller its own completed result
         // because the window it was admitted under has since been replaced. Its authority is
         // checked above, and the grant below, because an authority that has gone does not entitle
         // a caller to a result it once produced.
         let actor_id = self.device.principal();
-        let validated = self.validation_revision().await;
         if let Err(error) = self.check_grant(
             mutation.target.session_id.as_ref().copied(),
             entry,
@@ -763,16 +787,24 @@ impl RemoteConnection {
             .envelope(Some((self.device.grant.grant_id, validated)))
     }
 
-    /// Returns the authority revision this request's checks are made at.
+    /// Returns the authority revision this request is admitted at, or a refusal.
     ///
-    /// Read once per request, before the grant is checked, and carried into the envelope. Reading
-    /// it twice would let a request claim it was validated at a revision later than the one its
-    /// grant was actually checked against.
-    async fn validation_revision(&self) -> AuthorityRevision {
-        self.controller
+    /// The registration and the revision are read in one critical section, taking the registry
+    /// lock and then the connection table — the order a revocation takes. So a request is never
+    /// stamped with a revision that was installed *by* the revocation that withdrew its
+    /// registration: either the registration is still there and the revision is the one it stands
+    /// under, or the request is refused.
+    async fn admitted_at(&self) -> std::result::Result<AuthorityRevision, ProtocolError> {
+        let registry = self.controller.registry.lock().await;
+        let revision = registry
             .authority_revision()
+            .map_err(|error| error.to_protocol_error())?;
+        self.controller
+            .authorised(self.connection_id)
             .await
-            .unwrap_or(self.device.grant.authority_revision)
+            .map_err(|error| error.to_protocol_error())?;
+        drop(registry);
+        Ok(revision)
     }
 
     /// Resolves one method against the registry at this connection's ingress.
