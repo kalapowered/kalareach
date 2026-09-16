@@ -5,6 +5,13 @@
 //! budget, and PNG, JPEG, WebP and the **first** frame of a GIF. HTML and SVG stay files; rendering
 //! either one needs a reviewed renderer, and this is not one.
 //!
+//! WebP is on that list and is withheld here, which is a decision rather than an omission. The
+//! pinned lossless decoder takes its Huffman group count from a sixteen-bit metadata field and
+//! allocates a table set per group, so a file of a few kilobytes can ask for hundreds of megabytes
+//! that no bound on pixels can catch. The decoder is not compiled in, the bytes are recognised
+//! from their signature, and the attachment publishes with no preview and a reason. The preview
+//! returns when the pin bounds that allocation.
+//!
 //! Three properties matter more than the decode itself.
 //!
 //! * The format comes from the bytes, not from the client. A declared media type is a claim and a
@@ -64,9 +71,15 @@ pub enum PreviewRefusal {
         /// The declared media type.
         media_type: String,
     },
-    /// The bytes are not one of the four formats this decoder handles.
-    #[error("the bytes are not PNG, JPEG, WebP or GIF")]
+    /// The bytes are not one of the formats this decoder handles.
+    #[error("the bytes are not PNG, JPEG or GIF")]
     UnsupportedFormat,
+    /// The bytes are a format whose decoder this host withholds.
+    #[error("no preview for this format: {reason}")]
+    FormatWithheld {
+        /// Why the format is not decoded here.
+        reason: &'static str,
+    },
     /// The encoded image is larger than a preview decoder reads.
     #[error("{len} encoded bytes is above the {MAX_PREVIEW_INPUT_BYTES}-byte input limit")]
     InputTooLarge {
@@ -180,7 +193,6 @@ fn decode<S: Read + Seek>(
         source_format: match format {
             ImageFormat::Png => PreviewFormat::Png,
             ImageFormat::Jpeg => PreviewFormat::Jpeg,
-            ImageFormat::WebP => PreviewFormat::Webp,
             _ => PreviewFormat::GifFirstFrame,
         },
         source_width: U64::new(u64::from(image.width())),
@@ -247,6 +259,26 @@ fn encoded_len<S: Seek>(source: &mut S) -> std::result::Result<u64, PreviewRefus
         })?;
     rewind(source)?;
     Ok(len)
+}
+
+/// Why a WebP is not decoded here.
+const WEBP_WITHHELD: &str = "this host does not decode WebP: the pinned decoder allocates from its own metadata, which no \
+     bound on pixels can limit";
+
+/// Returns true when these bytes are a WebP.
+///
+/// Twelve bytes decide it: the RIFF container's tag, its length, and the form type. Nothing is
+/// decoded and nothing is allocated beyond the twelve bytes.
+fn webp_signature<S: Read + Seek>(source: &mut S) -> std::result::Result<bool, PreviewRefusal> {
+    rewind(source)?;
+    let mut head = [0_u8; 12];
+    let read = source
+        .take(12)
+        .read(&mut head)
+        .map_err(|error| PreviewRefusal::Unreadable {
+            detail: error.to_string(),
+        })?;
+    Ok(read == 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP")
 }
 
 /// How far into a GIF this crate looks for the first frame's own extent.
@@ -323,9 +355,15 @@ fn header<S: Read + Seek>(
             detail: error.to_string(),
         })?;
     let format = match reader.format() {
-        Some(
-            format @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif),
-        ) => format,
+        Some(format @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif)) => format,
+        // The decoder is not compiled in, so `image` cannot name this format. The signature is
+        // read here instead, so the refusal says which format it was rather than lumping a WebP in
+        // with everything this host does not recognise.
+        _ if webp_signature(source)? => {
+            return Err(PreviewRefusal::FormatWithheld {
+                reason: WEBP_WITHHELD,
+            });
+        }
         _ => return Err(PreviewRefusal::UnsupportedFormat),
     };
     reader.limits(limits());
@@ -384,12 +422,11 @@ mod tests {
     }
 
     #[test]
-    fn each_of_the_four_formats_decodes_to_a_bounded_thumbnail() {
+    fn each_decoded_format_produces_a_bounded_thumbnail() {
         for (format, expected) in [
             (ImageFormat::Png, PreviewFormat::Png),
             (ImageFormat::Jpeg, PreviewFormat::Jpeg),
             (ImageFormat::Gif, PreviewFormat::GifFirstFrame),
-            (ImageFormat::WebP, PreviewFormat::Webp),
         ] {
             let bytes = encoded(800, 600, format);
             let mut source = Cursor::new(bytes);

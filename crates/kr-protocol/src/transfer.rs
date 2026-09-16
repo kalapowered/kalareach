@@ -394,6 +394,10 @@ pub enum PreviewFormat {
     /// JPEG.
     Jpeg,
     /// WebP.
+    ///
+    /// No host produces this yet: the pinned decoder allocates from its own metadata, so WebP
+    /// previews are withheld and a WebP publishes without one. The variant stays because the
+    /// format is in the specification's list and a preview taken by a later host is this.
     Webp,
     /// The first frame of a GIF. Later frames are never decoded.
     GifFirstFrame,

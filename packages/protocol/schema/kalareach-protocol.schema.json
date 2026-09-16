@@ -7708,7 +7708,7 @@
         },
         {
           "const": "webp",
-          "description": "WebP.",
+          "description": "WebP.\n\nNo host produces this yet: the pinned decoder allocates from its own metadata, so WebP\npreviews are withheld and a WebP publishes without one. The variant stays because the\nformat is in the specification's list and a preview taken by a later host is this.",
           "type": "string"
         },
         {

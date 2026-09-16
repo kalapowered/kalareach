@@ -27,12 +27,11 @@ fn encoded(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
 
 /// KR-REQ-14.13: the four decoded formats produce a bounded thumbnail on the published handle.
 #[test]
-fn the_four_supported_formats_publish_with_a_bounded_preview() {
+fn the_decoded_formats_publish_with_a_bounded_preview() {
     let harness = Harness::create();
     for (format, media_type, expected) in [
         (image::ImageFormat::Png, "image/png", PreviewFormat::Png),
         (image::ImageFormat::Jpeg, "image/jpeg", PreviewFormat::Jpeg),
-        (image::ImageFormat::WebP, "image/webp", PreviewFormat::Webp),
         (
             image::ImageFormat::Gif,
             "image/gif",
@@ -321,4 +320,67 @@ fn a_gif_frame_larger_than_its_screen_is_refused() {
     assert!(handle.preview.as_ref().is_none());
     assert!(!handle.presented_as_image);
     assert_eq!(handle.content_digest, digest(&bytes));
+}
+
+/// KR-REQ-14.13: a WebP publishes without a preview, and says so, rather than reaching a decoder
+/// whose allocation this host cannot bound.
+///
+/// The bytes below are a lossless WebP whose metadata would ask the pinned decoder for sixty-five
+/// thousand Huffman groups — tables of hundreds of megabytes from a file of a few dozen bytes. No
+/// decoder runs: the format is not compiled in, and the refusal comes from the twelve-byte
+/// container signature.
+#[test]
+fn a_webp_publishes_without_a_preview_and_says_why() {
+    let harness = Harness::create();
+    // A RIFF container with a `VP8L` chunk: the signature byte, a small canvas, and a metadata
+    // prefix that sets the "has more than one Huffman group" bit with a large group count.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"VP8L");
+    let lossless = [
+        0x2f, 0xff, 0xff, 0xff, 0xff, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff,
+    ];
+    payload.extend_from_slice(&(lossless.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&lossless);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&((payload.len() + 4) as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WEBP");
+    bytes.extend_from_slice(&payload);
+
+    let refusal =
+        kr_transfer::preview::generate(&mut std::io::Cursor::new(bytes.clone()), "image/webp")
+            .expect_err("this host does not decode WebP");
+
+    assert!(
+        matches!(
+            refusal,
+            kr_transfer::preview::PreviewRefusal::FormatWithheld { .. }
+        ),
+        "the refusal names the format rather than the bytes: {refusal}"
+    );
+    assert!(
+        refusal
+            .to_string()
+            .starts_with("no preview for this format"),
+        "and says so in the words a client shows: {refusal}"
+    );
+
+    // The transfer itself succeeds: a file with no preview is still an attachment.
+    let handle = harness.publish(&bytes, "image/webp", "shot.webp");
+    assert!(handle.preview.as_ref().is_none());
+    assert!(!handle.presented_as_image);
+    assert_eq!(handle.byte_len, U64::new(bytes.len() as u64));
+    assert_eq!(handle.content_digest, digest(&bytes));
+    let staged = std::fs::read_dir(harness.service.staging().complete().display_path())
+        .expect("reads the completed area")
+        .next()
+        .expect("one published payload")
+        .expect("a directory entry")
+        .path();
+    assert_eq!(
+        std::fs::read(&staged).expect("reads the payload"),
+        bytes,
+        "the file is exactly what was uploaded"
+    );
 }
