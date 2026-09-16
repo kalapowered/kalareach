@@ -40,11 +40,15 @@ impl ClientState {
     ///
     /// The session's connection identity and input lane are deliberately not taken: the next
     /// connection gets its own, and an acknowledgement position belongs to the connection that
-    /// produced it.
+    /// produced it. Event sequences belong to the connection as well, and go the same way: what is
+    /// carried is how far each stream's *content* had been applied, which is what the next
+    /// subscription asks the host to resume from.
     pub async fn from_session(session: &Session, interruption: Option<InputInterruption>) -> Self {
         let (receipts, submitted) = session.outcomes().await;
+        let mut cursors = session.cursors().await;
+        cursors.reconnected();
         Self {
-            cursors: session.cursors().await,
+            cursors,
             receipts,
             submitted,
             interruption,

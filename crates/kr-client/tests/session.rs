@@ -22,11 +22,12 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
-    BootEpoch, BuildId, ClockEpoch, DeviceId, DeviceKeyRevision, EnvironmentId, EventSequence,
-    EventType, StreamId,
+    AttachmentId, BootEpoch, BuildId, ClockEpoch, DeviceId, DeviceKeyRevision, EnvironmentId,
+    EventSequence, EventType, SessionId, StreamId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::receipt::{Receipt, ReceiptState};
+use kr_protocol::recovery::EventStream;
 use kr_protocol::scalars::{Digest256, DurationMs, EndpointKey, Nullable, TimestampMs, U64, Uuid};
 use kr_transport::clock::{ContinuousClock, ManualClock};
 use kr_transport::config::EndpointConfig;
@@ -290,7 +291,7 @@ async fn one_connection_carries_one_session() {
 }
 
 #[tokio::test]
-async fn a_read_returns_a_typed_result_and_a_mutation_returns_a_receipt() {
+async fn a_read_returns_a_typed_result_and_a_mutation_returns_what_settled_it() {
     let host = side(1, true).await;
     let client = side(2, false).await;
     let script = Arc::new(HostScript::default());
@@ -303,7 +304,7 @@ async fn a_read_returns_a_typed_result_and_a_mutation_returns_a_receipt() {
         .expect("a listing");
     assert_eq!(listing, SessionList { count: 2 });
 
-    let receipt = session
+    let settled = session
         .mutate(
             Method::SessionCreate,
             ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
@@ -313,7 +314,8 @@ async fn a_read_returns_a_typed_result_and_a_mutation_returns_a_receipt() {
             DurationMs::new(120_000),
         )
         .await
-        .expect("a receipt");
+        .expect("a settlement");
+    let receipt = settled.receipt().expect("this host answers with a receipt");
     assert_eq!(receipt.state, ReceiptState::Accepted);
 
     // The action identifier is the client's own, is a version 4 UUID, and the mutation carried the
@@ -429,23 +431,36 @@ async fn a_reconnect_subscribes_from_its_cursor_before_installing_a_snapshot() {
     // it folded them into its state, a reconnect has to ask for them again.
     deliver(&pushes, &session, &stream_id, &[1, 2]).await;
     assert_eq!(
-        session.cursors().await.position(&stream_id),
+        session.cursors().await.applied_cursor(&stream_id),
         None,
         "a received event establishes no position on its own"
     );
     session.applied(&stream_id, EventSequence::new(2)).await;
+    session.applied_content(&stream_id, U64::new(4_096)).await;
 
     let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
+    // The sequences belonged to the connection that produced them and are gone; the content
+    // position is what the next subscription resumes from.
+    assert_eq!(carried.cursors.received(&stream_id), None);
     assert_eq!(
-        carried.cursors.position(&stream_id),
-        Some(EventSequence::new(2))
+        carried.cursors.applied_cursor(&stream_id),
+        Some(U64::new(4_096))
     );
     let mut second = Restoration::start(stream_id.clone(), &carried.cursors);
     assert_eq!(
         second.step(),
-        RestorationStep::SubscribeFrom(EventSequence::new(2)),
+        RestorationStep::SubscribeFrom(U64::new(4_096)),
         "a reconnect subscribes from the cursor"
     );
+    // And the request it builds names exactly that cursor, in the protocol's own parameter type.
+    let params = second
+        .subscribe_params(
+            SessionId::new(Uuid::from_bytes([7; 16])),
+            AttachmentId::new(Uuid::from_bytes([8; 16])),
+            &[EventStream::Output],
+        )
+        .expect("the stream is waiting to subscribe");
+    assert_eq!(params.from_cursor, Nullable::some(U64::new(4_096)));
     assert!(
         second.installed().is_err(),
         "a snapshot cannot be installed before the subscription"
@@ -671,7 +686,7 @@ async fn a_cancelled_mutation_returns_its_place_in_the_outstanding_bound() {
     }
 
     // The connection still admits a mutation, which it could not if the bound had leaked.
-    let receipt = tokio::time::timeout(
+    let settled = tokio::time::timeout(
         Duration::from_secs(5),
         session.mutate(
             Method::SessionCreate,
@@ -684,8 +699,14 @@ async fn a_cancelled_mutation_returns_its_place_in_the_outstanding_bound() {
     )
     .await
     .expect("the mutation was answered")
-    .expect("a receipt");
-    assert_eq!(receipt.state, ReceiptState::Accepted);
+    .expect("a settlement");
+    assert_eq!(
+        settled
+            .receipt()
+            .expect("this host answers with a receipt")
+            .state,
+        ReceiptState::Accepted
+    );
 
     session.close();
     serving.abort();
@@ -699,7 +720,7 @@ async fn an_unsettled_submission_carries_the_intent_it_was_made_for() {
     let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
     let session = connect(&client, &host).await;
 
-    let receipt = session
+    let settled = session
         .mutate(
             Method::SessionCreate,
             ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
@@ -709,7 +730,8 @@ async fn an_unsettled_submission_carries_the_intent_it_was_made_for() {
             DurationMs::new(120_000),
         )
         .await
-        .expect("a receipt");
+        .expect("a settlement");
+    let receipt = settled.receipt().expect("this host answers with a receipt");
 
     // The receipt was `accepted`, which is not terminal, so the action is still unsettled and the
     // record says which operation it was rather than only which identifier.

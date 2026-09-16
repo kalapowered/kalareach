@@ -43,4 +43,4 @@ pub mod transport;
 pub mod viewport;
 
 pub use error::{ClientError, Result};
-pub use session::Session;
+pub use session::{Session, Settled};

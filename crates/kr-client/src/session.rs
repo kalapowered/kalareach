@@ -52,6 +52,68 @@ enum Answer {
     Receipt(Box<Receipt>),
 }
 
+/// How the host settled one mutation.
+///
+/// Section 23 gives a mutation two kinds of answer and they mean different things. A response
+/// correlates the request and carries the method's own result, which is what a caller needs to go
+/// on with: the attachment a `session.attach` allocated, the lease a `input.acquire` took. A
+/// receipt carries the action's durable execution state, which is what a caller asks about when it
+/// does not know whether its action happened. A host sends whichever it has; this names which
+/// arrived rather than making a caller guess.
+#[derive(Clone, Debug)]
+pub enum Settled {
+    /// The host answered with the method's own result.
+    Result(ParamsValue),
+    /// The host answered with a receipt for the action.
+    Receipt(Box<Receipt>),
+}
+
+impl Settled {
+    /// Returns the receipt, when the host answered with one.
+    #[must_use]
+    pub fn receipt(&self) -> Option<&Receipt> {
+        match self {
+            Self::Receipt(receipt) => Some(receipt),
+            Self::Result(_) => None,
+        }
+    }
+
+    /// Returns the method's result, when the host answered with one.
+    #[must_use]
+    pub const fn result(&self) -> Option<&ParamsValue> {
+        match self {
+            Self::Result(value) => Some(value),
+            Self::Receipt(_) => None,
+        }
+    }
+
+    /// Parses the method's result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Cbor`] when the result is not this type, and
+    /// [`ClientError::Host`] when the host answered with a receipt instead of a result: an action
+    /// whose receipt is all the host had has produced no result to parse.
+    pub fn to_typed<R>(&self) -> Result<R>
+    where
+        R: DeserializeOwned + Serialize,
+    {
+        match self {
+            Self::Result(value) => Ok(value.to_typed()?),
+            Self::Receipt(receipt) => {
+                Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::OutcomeUnknown,
+                    format!(
+                        "action {} is {} and has no result yet",
+                        receipt.action_id,
+                        receipt.state.as_str()
+                    ),
+                )))
+            }
+        }
+    }
+}
+
 /// Whom this connection owes an answer, and whether it can still give one.
 ///
 /// The map and the ended flag are one thing under one synchronous lock. With two, a request could
@@ -190,13 +252,26 @@ impl Session {
     /// Returns [`ClientError::ConnectionEnded`] when another session already reads this
     /// connection. Two sessions on one control stream would divide its frames between them.
     pub fn start(transport: Arc<dyn ControlTransport>) -> Result<Self> {
+        Self::resume(transport, StreamCursors::new())
+    }
+
+    /// Starts a session that carries what a previous connection had reached.
+    ///
+    /// This is the client half of section 8's restoration: the cursors come from
+    /// [`crate::reconnect::ClientState`], which kept each stream's content position and dropped the
+    /// previous connection's event sequences.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::start`].
+    pub fn resume(transport: Arc<dyn ControlTransport>, cursors: StreamCursors) -> Result<Self> {
         transport.claim_receiver()?;
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let limits = transport.limits();
         let state = Arc::new(SessionState {
             waiters: std::sync::Mutex::new(Waiters::default()),
             action_window: Mutex::new(transport.initial_action_window()),
-            cursors: Mutex::new(StreamCursors::new()),
+            cursors: Mutex::new(cursors),
             outcomes: Mutex::new(Outcomes::default()),
             events,
             outstanding: AtomicU64::new(0),
@@ -335,7 +410,7 @@ impl Session {
         }
     }
 
-    /// Submits a mutation and waits for its first receipt.
+    /// Submits a mutation and waits for the host to settle it.
     ///
     /// The identifier is generated here and recorded before the request is sent. A retry is a new
     /// request with the same identifier, which the host de-duplicates; a new intent is a new
@@ -355,7 +430,7 @@ impl Session {
         expected: &E,
         params: &P,
         requested_ttl: DurationMs,
-    ) -> Result<Receipt>
+    ) -> Result<Settled>
     where
         P: Serialize + ?Sized,
         E: Serialize + ?Sized,
@@ -437,7 +512,7 @@ impl Session {
         }
 
         match waiter.wait().await {
-            Ok(Answer::Receipt(receipt)) => Ok(*receipt),
+            Ok(Answer::Receipt(receipt)) => Ok(Settled::Receipt(receipt)),
             Ok(Answer::Response(response)) => {
                 // A correlated answer is definite, whichever way it went: the host reached a
                 // decision about this action, so it is no longer an unknown outcome.
@@ -449,16 +524,115 @@ impl Session {
                     .remove(&action_id);
                 match response.outcome {
                     Outcome::Error(error) => Err(ClientError::from(error)),
-                    Outcome::Ok(_) => {
-                        Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
-                            kr_protocol::error::ErrorCode::InvalidArgument,
-                            "a mutation was answered without a receipt",
-                        )))
-                    }
+                    Outcome::Ok(value) => Ok(Settled::Result(value)),
                 }
             }
             Err(_) => Err(ClientError::SubmissionUncertain { action_id }),
         }
+    }
+
+    /// Subscribes to a session's event streams from the cursor the parameters name.
+    ///
+    /// Section 8 fixes the order: subscribe from a cursor *before* installing the snapshot, so the
+    /// host can return the state at that cursor and queue everything after it. The parameters come
+    /// from [`crate::cursors::Restoration::subscribe_params`], which is what keeps the cursor this
+    /// asks for the one the client actually holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal, including [`ClientError::ResyncRequired`] when the client's
+    /// position is no longer usable.
+    pub async fn subscribe_events(
+        &self,
+        params: &kr_protocol::recovery::EventsSubscribeParams,
+    ) -> Result<kr_protocol::recovery::EventsSubscribeResult> {
+        self.read(Method::EventsSubscribe, params).await
+    }
+
+    /// Takes a session's snapshot and the cursor it was taken at.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal.
+    pub async fn events_snapshot(
+        &self,
+        params: &kr_protocol::recovery::EventsSnapshotParams,
+    ) -> Result<kr_protocol::recovery::EventsSnapshotResult> {
+        self.read(Method::EventsSnapshot, params).await
+    }
+
+    /// Reads one page of a session's retained output history.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal.
+    pub async fn history_page(
+        &self,
+        params: &kr_protocol::recovery::HistoryPageParams,
+    ) -> Result<kr_protocol::recovery::HistoryPageResult> {
+        self.read(Method::HistoryPage, params).await
+    }
+
+    /// Writes one ordered batch of raw input under the lease this attachment holds.
+    ///
+    /// Raw input is the one write that is not a mutation. Section 9 makes it a separate ordered
+    /// stream keyed by connection, lease epoch and sequence, with no durable de-duplication and
+    /// nothing replayed on reconnection, so it carries no action identifier and receives no
+    /// receipt: it is ordered by its own sequence and acknowledged by what the host forwarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal, including the lease refusal when this attachment no longer
+    /// holds input.
+    pub async fn write_input(
+        &self,
+        params: &kr_protocol::input::InputWriteParams,
+    ) -> Result<kr_protocol::input::InputWriteResult> {
+        let entry = Method::InputWrite.entry();
+        debug_assert_eq!(
+            entry.idempotency,
+            kr_protocol::authority::IdempotencyBehaviour::OrderedStream
+        );
+        let request_id = self.next_request_id();
+        let waiter = self.register(request_id)?;
+        let request = Request {
+            request_id,
+            method: Method::InputWrite.into(),
+            method_version: entry.version,
+            params: ParamsValue::from_typed(params)?,
+        };
+        self.transport.send(&ControlFrame::Request(request)).await?;
+        match waiter.wait().await? {
+            Answer::Response(response) => match response.outcome {
+                Outcome::Ok(value) => Ok(value.to_typed()?),
+                Outcome::Error(error) => Err(ClientError::from(error)),
+            },
+            Answer::Receipt(_) => Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::InvalidArgument,
+                "raw input is an ordered stream and receives no receipt",
+            ))),
+        }
+    }
+
+    /// Records that a consumer applied a stream's content up to `cursor`.
+    ///
+    /// This is the position the next subscription resumes from, so only a consumer that has folded
+    /// the content into its state moves it.
+    pub async fn applied_content(&self, stream_id: &StreamId, cursor: kr_protocol::scalars::U64) {
+        self.state
+            .cursors
+            .lock()
+            .await
+            .applied_content(stream_id, cursor);
+    }
+
+    /// Forgets every per-connection sequence and keeps every content position.
+    ///
+    /// A client that carries its cursors onto a new connection calls this: the host numbers a
+    /// fresh subscription's events from its own beginning, so the previous connection's sequences
+    /// would make the first event of the new one read as a duplicate.
+    pub async fn reconnected(&self) {
+        self.state.cursors.lock().await.reconnected();
     }
 
     /// Ends the session and the connection, waking every waiting call.

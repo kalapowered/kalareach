@@ -13,8 +13,10 @@
 use std::collections::BTreeMap;
 
 use kr_protocol::envelope::Notification;
-use kr_protocol::ids::{ActionId, EventSequence, StreamId};
+use kr_protocol::ids::{ActionId, AttachmentId, EventSequence, SessionId, StreamId};
 use kr_protocol::receipt::{Receipt, ReceiptState};
+use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
+use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 
 /// What a client has received and what it has actually applied, per subscribed stream.
 ///
@@ -22,10 +24,19 @@ use kr_protocol::receipt::{Receipt, ReceiptState};
 /// *received* when it arrives on the connection; it is *applied* when whatever consumes the stream
 /// has folded it into its state. A reconnect subscribes from the applied position, because an event
 /// that was received and never applied has to arrive again.
+///
+/// There are two positions here, and keeping them apart is the whole point. An event *sequence*
+/// orders one stream on one connection: the host starts a fresh subscription at its first event, so
+/// a sequence means nothing on the next connection and is what gap detection works from here. A
+/// *content cursor* is the host's own durable position in what the session produced, so it is what
+/// survives a disconnect and what [`EventsSubscribeParams::from_cursor`] names. A reconnect
+/// therefore resumes from the content cursor and starts its sequences again from nothing.
 #[derive(Clone, Debug, Default)]
 pub struct StreamCursors {
     received: BTreeMap<StreamId, EventSequence>,
     applied: BTreeMap<StreamId, EventSequence>,
+    /// The host's durable position in each stream's content, as far as a consumer has applied it.
+    applied_cursor: BTreeMap<StreamId, U64>,
     /// Streams whose partial state is no longer usable. They need a snapshot before anything else.
     needs_snapshot: std::collections::BTreeSet<StreamId>,
     /// The contiguous run of events that arrived on a stream while it was waiting for a snapshot.
@@ -64,6 +75,49 @@ impl StreamCursors {
     #[must_use]
     pub fn needs_snapshot(&self, stream_id: &StreamId) -> bool {
         self.needs_snapshot.contains(stream_id)
+    }
+
+    /// Returns the host's content position a consumer has applied on `stream_id`.
+    ///
+    /// This is what a subscription resumes from, and it is the only position that means anything
+    /// after a disconnect. `None` means nothing usable is held and the subscription starts wherever
+    /// the host is now.
+    #[must_use]
+    pub fn applied_cursor(&self, stream_id: &StreamId) -> Option<U64> {
+        if self.needs_snapshot.contains(stream_id) {
+            return None;
+        }
+        self.applied_cursor.get(stream_id).copied()
+    }
+
+    /// Records that a consumer applied this stream's content up to `cursor`.
+    ///
+    /// The cursor only moves forwards. An event that was delivered and never folded into a
+    /// consumer's state leaves the cursor where it was, so the next subscription asks for it again.
+    pub fn applied_content(&mut self, stream_id: &StreamId, cursor: U64) {
+        if self.needs_snapshot.contains(stream_id) {
+            return;
+        }
+        let current = self
+            .applied_cursor
+            .get(stream_id)
+            .map_or(0, |position| position.get());
+        if cursor.get() > current {
+            self.applied_cursor.insert(stream_id.clone(), cursor);
+        }
+    }
+
+    /// Forgets every per-connection sequence and keeps every content position.
+    ///
+    /// A reconnect is exactly this transition. The host numbers a fresh subscription's events from
+    /// its own beginning, so carrying the old connection's sequences across would make the first
+    /// event of the new subscription read as a duplicate and the client would drop it. What does
+    /// carry across is where each stream's content had been applied to, which is what the new
+    /// subscription asks to resume from.
+    pub fn reconnected(&mut self) {
+        self.received.clear();
+        self.applied.clear();
+        self.since_discard.clear();
     }
 
     /// Records one delivered event, returning whether it was the next one.
@@ -179,10 +233,14 @@ impl StreamCursors {
 
     /// Discards a stream's state and marks it as needing a snapshot.
     ///
-    /// This is what a resynchronisation requirement means, and what a gap does.
+    /// This is what a resynchronisation requirement means, and what a gap does. The content
+    /// position goes with the rest: a stream that owes a snapshot has no position to resume from,
+    /// and asking to resume from one would ask for history the host has already said it cannot
+    /// replay.
     pub fn discard(&mut self, stream_id: &StreamId) {
         self.received.remove(stream_id);
         self.applied.remove(stream_id);
+        self.applied_cursor.remove(stream_id);
         self.since_discard.remove(stream_id);
         self.needs_snapshot.insert(stream_id.clone());
     }
@@ -191,6 +249,7 @@ impl StreamCursors {
     pub fn discard_all(&mut self) {
         self.received.clear();
         self.applied.clear();
+        self.applied_cursor.clear();
         self.since_discard.clear();
         self.needs_snapshot.clear();
     }
@@ -229,9 +288,10 @@ pub enum Delivery {
 /// The steps of restoring one stream, in the only order that is correct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestorationStep {
-    /// Subscribe from this cursor. Nothing has been installed yet.
-    SubscribeFrom(EventSequence),
-    /// Subscribe from the beginning, because this client has no position on the stream.
+    /// Subscribe from this content cursor. Nothing has been installed yet.
+    SubscribeFrom(U64),
+    /// Subscribe from wherever the host is now, because this client holds no position on the
+    /// stream.
     SubscribeFromStart,
     /// Install the snapshot the subscription returned, then apply the queued updates.
     InstallSnapshot,
@@ -258,8 +318,8 @@ impl Restoration {
     /// Starts a restoration from whatever this client already has.
     #[must_use]
     pub fn start(stream_id: StreamId, cursors: &StreamCursors) -> Self {
-        let step = match cursors.position(&stream_id) {
-            Some(position) => RestorationStep::SubscribeFrom(position),
+        let step = match cursors.applied_cursor(&stream_id) {
+            Some(cursor) => RestorationStep::SubscribeFrom(cursor),
             None => RestorationStep::SubscribeFromStart,
         };
         Self { stream_id, step }
@@ -275,6 +335,35 @@ impl Restoration {
     #[must_use]
     pub const fn step(&self) -> RestorationStep {
         self.step
+    }
+
+    /// Returns the parameters of the `events.subscribe` this restoration is waiting to send.
+    ///
+    /// The cursor is this restoration's own, so the request cannot be built from a position the
+    /// client no longer holds: a stream that owes a snapshot subscribes from wherever the host is
+    /// now, and one that holds a position asks the host to resume from exactly it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutOfOrder`] when the stream is not waiting to subscribe. Subscribing again after
+    /// the subscription succeeded would restart the stream and lose whatever came in between.
+    pub fn subscribe_params(
+        &self,
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        streams: &[EventStream],
+    ) -> std::result::Result<EventsSubscribeParams, OutOfOrder> {
+        let from_cursor = match self.step {
+            RestorationStep::SubscribeFrom(cursor) => Nullable::some(cursor),
+            RestorationStep::SubscribeFromStart => Nullable::null(),
+            step => return Err(OutOfOrder { step }),
+        };
+        Ok(EventsSubscribeParams {
+            session_id,
+            attachment_id,
+            streams: streams.iter().copied().collect::<CanonicalSet<_>>(),
+            from_cursor,
+        })
     }
 
     /// Records that the subscription succeeded.
@@ -463,10 +552,12 @@ mod tests {
         cursors.accept(&event(&stream_id, 7));
         cursors.applied(&stream_id, EventSequence::new(7));
 
+        cursors.applied_content(&stream_id, U64::new(2_048));
+
         let mut restoration = Restoration::start(stream_id.clone(), &cursors);
         assert_eq!(
             restoration.step(),
-            RestorationStep::SubscribeFrom(EventSequence::new(7))
+            RestorationStep::SubscribeFrom(U64::new(2_048))
         );
         // A snapshot cannot be installed before the subscription: that order loses every event in
         // between, so the type refuses it rather than leaving it to a comment.
@@ -560,6 +651,88 @@ mod tests {
         assert_eq!(cursors.position(&stream_id), None);
         assert!(cursors.needs_snapshot(&stream_id));
         assert!(cursors.is_empty());
+    }
+
+    #[test]
+    fn a_reconnect_keeps_the_content_position_and_starts_the_sequences_again() {
+        let mut cursors = StreamCursors::new();
+        let stream_id = stream("session.output");
+        cursors.accept(&event(&stream_id, 1));
+        cursors.accept(&event(&stream_id, 2));
+        cursors.applied(&stream_id, EventSequence::new(2));
+        cursors.applied_content(&stream_id, U64::new(4_096));
+
+        cursors.reconnected();
+
+        // The host numbers the next subscription's events from its own beginning, and that first
+        // event is not a duplicate of anything.
+        assert_eq!(cursors.received(&stream_id), None);
+        assert_eq!(cursors.accept(&event(&stream_id, 1)), Delivery::Received);
+        // What the content had reached is what the new subscription resumes from.
+        assert_eq!(cursors.applied_cursor(&stream_id), Some(U64::new(4_096)));
+        assert_eq!(
+            Restoration::start(stream_id.clone(), &cursors).step(),
+            RestorationStep::SubscribeFrom(U64::new(4_096))
+        );
+    }
+
+    #[test]
+    fn a_content_position_only_moves_forwards_and_never_over_a_hole() {
+        let mut cursors = StreamCursors::new();
+        let stream_id = stream("session.output");
+        cursors.applied_content(&stream_id, U64::new(100));
+        cursors.applied_content(&stream_id, U64::new(40));
+        assert_eq!(cursors.applied_cursor(&stream_id), Some(U64::new(100)));
+
+        // A stream that owes a snapshot holds no position, and nothing can give it one until the
+        // snapshot says where it is.
+        cursors.discard(&stream_id);
+        cursors.applied_content(&stream_id, U64::new(200));
+        assert_eq!(cursors.applied_cursor(&stream_id), None);
+        cursors.installed_snapshot(&stream_id, EventSequence::new(0));
+        cursors.applied_content(&stream_id, U64::new(200));
+        assert_eq!(cursors.applied_cursor(&stream_id), Some(U64::new(200)));
+    }
+
+    #[test]
+    fn a_subscription_asks_for_the_position_the_restoration_holds() {
+        let mut cursors = StreamCursors::new();
+        let stream_id = stream("session.output");
+        cursors.applied_content(&stream_id, U64::new(512));
+        let session_id = SessionId::new(Uuid::from_bytes([3; 16]));
+        let attachment_id = AttachmentId::new(Uuid::from_bytes([4; 16]));
+
+        let mut restoration = Restoration::start(stream_id.clone(), &cursors);
+        let params = restoration
+            .subscribe_params(session_id, attachment_id, &[EventStream::Output])
+            .expect("the stream is waiting to subscribe");
+        assert_eq!(params.from_cursor, Nullable::some(U64::new(512)));
+        assert_eq!(params.session_id, session_id);
+        assert_eq!(params.attachment_id, attachment_id);
+
+        // And once it has subscribed it cannot build another subscription: that would restart the
+        // stream and lose whatever arrived in between.
+        restoration
+            .subscribed()
+            .expect("the subscription succeeded");
+        assert!(
+            restoration
+                .subscribe_params(session_id, attachment_id, &[EventStream::Output])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_client_with_no_position_subscribes_from_wherever_the_host_is() {
+        let cursors = StreamCursors::new();
+        let params = Restoration::start(stream("session.output"), &cursors)
+            .subscribe_params(
+                SessionId::new(Uuid::from_bytes([3; 16])),
+                AttachmentId::new(Uuid::from_bytes([4; 16])),
+                &[EventStream::Output],
+            )
+            .expect("the stream is waiting to subscribe");
+        assert_eq!(params.from_cursor, Nullable::null());
     }
 
     fn receipt(action: u8, revision: u64, state: ReceiptState) -> Receipt {
