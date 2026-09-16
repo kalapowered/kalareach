@@ -66,9 +66,25 @@ const EVERY_PHASE: &[LaunchPhase] = &[
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
 /// The transfer service, as the daemon holds it.
+///
+/// The module owns the tasks that serve the attachment-chunk endpoint and run the expiry sweep, and
+/// ends them when it is dropped. The daemon owns the module, so its endpoint is released at the
+/// same moment its singleton lock is: a listener that outlived the daemon would keep an address
+/// bound that nothing is serving, and the next daemon would find it occupied.
 #[derive(Debug)]
 pub struct TransferModule {
     service: Arc<TransferService>,
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for TransferModule {
+    fn drop(&mut self) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+    }
 }
 
 impl TransferModule {
@@ -93,6 +109,7 @@ impl TransferModule {
             })?;
         Ok(Self {
             service: Arc::new(service),
+            tasks: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -421,21 +438,34 @@ pub fn serve(controller: &Arc<Controller>) -> Result<()> {
     })?;
     let listener = Listener::bind(&endpoint)?;
     let chunks = Arc::downgrade(controller);
-    tokio::spawn(async move {
-        serve_chunks(chunks, listener).await;
-    });
     let sweeps = Arc::downgrade(controller);
-    tokio::spawn(async move {
-        sweep_forever(sweeps).await;
-    });
+    let started = vec![
+        tokio::spawn(async move {
+            serve_chunks(chunks, listener).await;
+        }),
+        tokio::spawn(async move {
+            sweep_forever(sweeps).await;
+        }),
+    ];
+    let mut tasks = controller.transfer().tasks.lock().map_err(|_| {
+        ControllerError::NotConfigured(
+            "the transfer service's task list was left poisoned by an earlier failure".to_owned(),
+        )
+    })?;
+    for task in started {
+        tasks.push(task);
+    }
     Ok(())
 }
 
 /// Accepts attachment-chunk connections until the daemon goes.
+///
+/// An accept that fails ends the loop, as it does on the control endpoint: a listener that cannot
+/// accept has nothing left to serve, and spinning on it would hide that.
 async fn serve_chunks(controller: Weak<Controller>, listener: Listener) {
     loop {
         let Ok((connection, peer)) = listener.accept().await else {
-            continue;
+            return;
         };
         let Some(controller) = controller.upgrade() else {
             return;
