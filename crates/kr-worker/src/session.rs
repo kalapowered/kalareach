@@ -676,6 +676,9 @@ impl Session {
             && self.state.is_running()
             && let Err(error) = self.resize_canonical(change.state.dimensions)
         {
+            // A withdrawn claim stays withdrawn, because the attachment asked for that, but the
+            // geometry it would have handed on is not moved when the kernel refuses the size, and
+            // the size does not go back to an attachment that no longer claims it.
             self.attachments.restore_geometry(&previous);
             return Err(error);
         }

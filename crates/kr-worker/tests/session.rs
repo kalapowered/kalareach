@@ -1002,6 +1002,85 @@ async fn a_succession_the_budget_refuses_leaves_the_size_unowned_rather_than_wit
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_claim_the_budget_refuses_leaves_the_size_unowned_rather_than_with_who_withdrew()
+ {
+    // The attachment that owned the size withdraws its claim, and the one next in line asks for a
+    // geometry this session cannot afford. The withdrawal happened: the attachment asked for it and
+    // the claim is gone. So the size cannot go back to it either, for the same reason a departed
+    // owner does not get it back - an attachment that holds no claim is not an owner, and a session
+    // naming one has nowhere for its next eligible claim to go, and nothing stops the one that
+    // withdrew from resizing the session it gave up.
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 120");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+
+    let owner = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Geometry);
+    session
+        .attach(&terminal_attachment(session_id), requested.clone(), owner)
+        .expect("attaches the owner");
+
+    // The one next in line, at a size whose two screen buffers do not fit the session's budget.
+    let waiting = AttachmentId::new(kr_ipc::new_uuid());
+    let mut params = terminal_attachment(session_id);
+    params.claim_geometry = true;
+    params.dimensions = Nullable::some(Dimensions::new(2_048, 128));
+    session
+        .attach(&params, requested, waiting)
+        .expect("attaches the one next in line");
+
+    let before = session.geometry();
+    let refused = session
+        .configure(owner, false)
+        .expect_err("the succession the withdrawal produced is refused");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "and it is refused for what it would cost: {refused}"
+    );
+
+    let after = session.geometry();
+    assert_eq!(
+        after.dimensions, before.dimensions,
+        "the terminal the application is looking at did not move"
+    );
+    assert!(
+        session
+            .attachments()
+            .iter()
+            .any(|attachment| attachment.attachment_id == owner && !attachment.claim_geometry),
+        "the claim the attachment withdrew is withdrawn"
+    );
+    assert!(
+        after.owner.0.is_none(),
+        "and the size is not left with the attachment that withdrew its claim: {:?}",
+        after.owner
+    );
+    assert!(
+        after.epoch.get() > before.epoch.get(),
+        "the ownership that changed advanced the epoch, so a client holding the state from before \
+         the claim went cannot transfer the size against it: {} then {}",
+        before.epoch.get(),
+        after.epoch.get()
+    );
+    let refused = session
+        .resize(owner, Dimensions::new(100, 30), after.epoch.get())
+        .expect_err("what withdrew its claim cannot resize the session it gave up");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::GeometryNotOwner,
+        "and it is refused as not the owner: {refused}"
+    );
+
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn input_for_a_terminal_that_has_gone_is_refused_rather_than_acknowledged() {
     // The writer sets this latch on its way out, and it goes out for one reason: a terminal that
     // will take nothing more. An acknowledgement after that would say bytes reached an application

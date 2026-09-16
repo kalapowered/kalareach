@@ -223,17 +223,19 @@ impl AttachmentTable {
     /// advance an epoch. Putting the epoch back is what stops a refused resize from invalidating
     /// every client's next request.
     ///
-    /// An ownership change that *did* happen is the exception. A refused succession still leaves
-    /// the attachment that owned the size gone, and an owner that has left is not an owner: the
-    /// size goes back unowned, which is a state the succession can act on, rather than naming an
-    /// attachment nothing can reach. That is an ownership change, and the wire contract says every
-    /// ownership change advances the epoch - otherwise a client holding the state from before the
-    /// owner left could still transfer the size against it.
+    /// An ownership change that *did* happen is the exception. A succession runs because the owner
+    /// gave up the claim it owned by - it detached, or it withdrew that claim - and that part
+    /// happened whatever the kernel then said about the successor's size. An attachment holding no
+    /// eligible claim is not an owner, so the size goes back unowned, which is a state the next
+    /// eligible claim can act on, rather than to one that has left and cannot be reached or to one
+    /// that would then still be resizing a session it gave up. That is an ownership change, and the
+    /// wire contract says every ownership change advances the epoch - otherwise a client holding
+    /// the state from before the claim went could still transfer the size against it.
     pub fn restore_geometry(&mut self, previous: &GeometryState) {
-        let owner = previous
-            .owner
-            .0
-            .filter(|owner| self.by_id.contains_key(owner));
+        let owner = previous.owner.0.filter(|owner| {
+            self.get(*owner)
+                .is_some_and(|attachment| attachment.is_eligible())
+        });
         self.epoch = if owner == previous.owner.0 {
             previous.epoch.get()
         } else {
