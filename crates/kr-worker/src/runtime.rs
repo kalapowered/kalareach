@@ -403,6 +403,7 @@ impl SessionRuntime {
         // waiting in the session, because the session hands its queue over on every flush.
         let input_waiter = session.input_waiter();
         let output_waiter = session.output_waiter();
+        let batches_reads = session.terminal_answers_rather_than_waits();
         // The boundary the writer and the lease share. What is inside it is the fence, one write
         // that refuses to wait, and the accounting for what that write sent; the waiting for the
         // terminal is outside it. A lease change takes the same boundary, so a write cannot begin
@@ -453,7 +454,10 @@ impl SessionRuntime {
                         // an application printing steadily hands the engine and every subscriber a
                         // few large deliveries rather than thousands of small ones.
                         filled += read;
-                        if filled < buffer.len() {
+                        // Only where the terminal answers rather than waits. Where a second read
+                        // would wait for output that has not happened, what was read goes on its
+                        // way now rather than being held for company.
+                        if batches_reads && filled < buffer.len() {
                             continue;
                         }
                         if output_sender

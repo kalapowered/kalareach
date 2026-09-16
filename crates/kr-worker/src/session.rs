@@ -359,6 +359,12 @@ impl Session {
         self.pty.input_waiter()
     }
 
+    /// Returns whether the terminal answers a read or a write rather than waiting inside it.
+    #[must_use]
+    pub const fn terminal_answers_rather_than_waits(&self) -> bool {
+        self.pty.answers_rather_than_waits()
+    }
+
     /// Returns the handle the read loop waits on when the application has written nothing.
     #[must_use]
     pub fn output_waiter(&self) -> Option<crate::pty::OutputWaiter> {

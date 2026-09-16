@@ -169,6 +169,16 @@ impl Pty {
         InputWaiter::of(self.master.as_ref())
     }
 
+    /// Returns whether this terminal answers a read or a write rather than waiting inside it.
+    ///
+    /// Where it does, a reader takes everything the terminal has in one batch; where it does not, a
+    /// second read would wait for output that has not happened yet, so what was read goes on its
+    /// way first.
+    #[must_use]
+    pub const fn answers_rather_than_waits(&self) -> bool {
+        cfg!(unix)
+    }
+
     /// Returns a handle that can be waited on until the application has written something.
     ///
     /// The terminal answers a read with nothing to read rather than waiting inside it, so the read
