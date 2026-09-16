@@ -130,6 +130,14 @@ pub struct EndpointConfig {
     pub direct_addresses: Vec<SocketAddr>,
     /// The address this endpoint binds to. `None` binds to an unspecified address and a free port.
     pub bind_addr: Option<SocketAddr>,
+    /// Whether this endpoint may use direct IP paths at all.
+    ///
+    /// `false` is the ordinary case: an endpoint tries direct paths and falls back to the relay.
+    /// `true` removes the IP transports altogether, so every packet goes through the selected
+    /// relay. A deployment selects it where a direct path is not available or not wanted, and it
+    /// is how the relay path is exercised on its own: two endpoints that can reach each other
+    /// directly will, whatever addresses they were given.
+    pub relay_only: bool,
     /// Extra trust anchors for the relay's HTTPS certificate, as DER-encoded certificates.
     ///
     /// The relay path is ordinary HTTPS, so by default it is verified against the public trust
@@ -226,6 +234,7 @@ impl EndpointConfig {
             },
             direct_addresses,
             bind_addr: None,
+            relay_only: false,
             relay_ca_roots: Vec::new(),
         })
     }
@@ -354,6 +363,7 @@ mod tests {
             },
             direct_addresses: vec!["192.0.2.1:41234".parse().expect("an address")],
             bind_addr: None,
+            relay_only: false,
             relay_ca_roots: Vec::new(),
         }
     }

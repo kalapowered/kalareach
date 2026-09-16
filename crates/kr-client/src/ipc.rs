@@ -64,9 +64,14 @@ pub struct IpcTransport {
     /// about, the way a QUIC connection has an application error code. So closing sets the flag
     /// and takes whichever half is not in use, and a call that is in flight releases its own half
     /// when it sees the flag.
+    /// Whose turn it is to write. Frames do not interleave on one stream, and a caller that has
+    /// to wait for another's frame is waiting rather than being told the connection ended.
+    turn: Mutex<()>,
     writer: Mutex<Option<FrameWriter>>,
     reader: Mutex<Option<FrameReader>>,
     closed: AtomicBool,
+    /// Notified when this connection is closed, so an active read or write stops waiting.
+    ending: tokio::sync::Notify,
     /// Set once a session has claimed the receive side.
     claimed: AtomicBool,
 }
@@ -93,9 +98,11 @@ impl IpcTransport {
                 boot_identity: acknowledgement.boot_identity,
                 peer: acknowledgement.peer,
             },
+            turn: Mutex::new(()),
             writer: Mutex::new(Some(writer)),
             reader: Mutex::new(Some(reader)),
             closed: AtomicBool::new(false),
+            ending: tokio::sync::Notify::new(),
             claimed: AtomicBool::new(false),
         })
     }
@@ -132,20 +139,30 @@ impl ControlTransport for IpcTransport {
 
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
         Box::pin(async move {
+            // One frame at a time. A second caller waits for the first's turn rather than finding
+            // an empty slot and reporting a connection that is perfectly alive as ended.
+            let _turn = self.turn.lock().await;
             if self.has_closed() {
                 return Err(ClientError::ConnectionEnded);
             }
-            // The write half is taken out for the duration of the write and put back afterwards,
-            // for the same reason the read half is: a caller that drops this future part way
-            // through drops the half with it, so a cancelled write cannot leave the socket open on
-            // a transport nobody is using. It cannot be resumed either, and the frame writer
-            // refuses to continue a stream an interrupted write left in pieces.
+            // The write half is taken out for the duration of the write, for the same reason the
+            // read half is: a caller that drops this future part way through drops the half with
+            // it, so a cancelled write closes the socket rather than leaving it on a transport
+            // nobody is using. It cannot be resumed either — the frame writer refuses to continue
+            // a stream an interrupted write left in pieces.
             let Some(mut writer) = self.writer.lock().await.take() else {
                 return Err(ClientError::ConnectionEnded);
             };
-            let outcome = writer.write_message(frame).await;
+            let closing = self.ending.notified();
+            let outcome = tokio::select! {
+                outcome = writer.write_message(frame) => outcome,
+                // Closing while this was waiting for the socket. The half is dropped with this
+                // future, which is what ends the connection rather than waiting for a peer that
+                // may never read again.
+                () = closing => return Err(ClientError::ConnectionEnded),
+            };
             // A write that failed has ended this connection, and so has a close that arrived while
-            // this one was waiting for the socket. Either way the half goes rather than going back.
+            // this one was in progress. Either way the half goes rather than going back.
             if outcome.is_ok() {
                 let mut held = self.writer.lock().await;
                 if !self.has_closed() {
@@ -177,10 +194,14 @@ impl ControlTransport for IpcTransport {
             let Some(mut reader) = self.reader.lock().await.take() else {
                 return Err(ClientError::ConnectionEnded);
             };
+            let closing = self.ending.notified();
             // A local frame reader reports the end of the stream as a failure rather than as an
             // absent message, because every local exchange has a next frame until the peer goes
             // away. To a session the two are one thing: the connection ended.
-            let frame = reader.read_message::<ControlFrame>().await;
+            let frame = tokio::select! {
+                frame = reader.read_message::<ControlFrame>() => frame,
+                () = closing => return Ok(None),
+            };
             match frame {
                 Ok(frame) => {
                     // The slot is taken before the flag is read again, so a close that lands while
@@ -205,15 +226,16 @@ impl ControlTransport for IpcTransport {
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
-        // Whichever half nothing is using is released here. A call that is in flight holds the
-        // other one: a read holds it inside its own future, so cancelling that future drops it,
-        // and a write releases it when it sees the flag. The socket closes once both are gone.
+        // Whichever half nothing is using is released here, and whatever is in flight is told to
+        // stop: a read or a write that is waiting for the socket abandons it and drops the half it
+        // is holding. The socket closes once both are gone.
         if let Ok(mut held) = self.writer.try_lock() {
             held.take();
         }
         if let Ok(mut held) = self.reader.try_lock() {
             held.take();
         }
+        self.ending.notify_waiters();
     }
 }
 

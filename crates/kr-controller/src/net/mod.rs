@@ -256,6 +256,13 @@ impl Network {
     }
 }
 
+/// When one device's grant runs out, and whether it has been found to have run out.
+#[derive(Clone, Copy, Debug)]
+pub struct GrantDeadline {
+    /// The moment on the continuous clock, absent for a grant that does not expire.
+    pub deadline: Option<ContinuousInstant>,
+}
+
 /// What the transport calls back into.
 pub struct NetworkHost {
     /// The daemon this host belongs to.
@@ -267,6 +274,15 @@ pub struct NetworkHost {
     devices: Arc<DeviceDirectory>,
     pairing: Option<Arc<PairingHost>>,
     endpoint: kr_transport::config::EndpointConfig,
+    /// The clock every deadline this host decides is measured on.
+    clock: Arc<dyn kr_transport::clock::ContinuousClock>,
+    /// When each device's grant runs out, on the continuous clock.
+    ///
+    /// Anchored the first time a device connects and shared by every connection it makes
+    /// afterwards, so a wall clock stepped backwards between two connections cannot give the same
+    /// grant a longer life the second time. A device whose grant is found to have run out is
+    /// recorded as expired, which is what makes the decision survive a restart as well.
+    grant_deadlines: std::sync::Mutex<std::collections::BTreeMap<DeviceId, GrantDeadline>>,
     /// Every authorised connection this host is serving.
     ///
     /// A revocation needs them: withdrawing a registration stops the next request, and a device
@@ -364,6 +380,38 @@ impl NetworkHost {
         Ok(record)
     }
 
+    /// Returns when this device's grant runs out, anchoring it the first time it is asked.
+    ///
+    /// One anchor per device, shared by every connection it makes, so the answer does not depend
+    /// on what the wall clock said at each connection. A grant already past its expiry is recorded
+    /// as expired, and that record is what a later run reads.
+    fn grant_deadline(&self, record: &DeviceRecord) -> Option<ContinuousInstant> {
+        let mut held = self
+            .grant_deadlines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(anchored) = held.get(&record.device_id) {
+            return anchored.deadline;
+        }
+        let kr_protocol::grant::GrantExpiry::At { expires_at_ms } = record.grant.expiry else {
+            held.insert(record.device_id, GrantDeadline { deadline: None });
+            return None;
+        };
+        let now = kr_ipc::now_ms();
+        let remaining = expires_at_ms.get().saturating_sub(now.get());
+        if remaining == 0 {
+            // Already run out. Recording it is what stops a wall clock stepped backwards from
+            // making the same grant look current on the next connection, or after a restart.
+            let _ = self.devices.record_expiry(record.device_id, now);
+        }
+        let deadline = self
+            .clock
+            .now()
+            .checked_add(std::time::Duration::from_millis(remaining));
+        held.insert(record.device_id, GrantDeadline { deadline });
+        deadline
+    }
+
     /// Serves one authorised connection until it ends.
     async fn serve_connection(self: Arc<Self>, mut session: AuthorisedSession) {
         let connection_id = session.connection_id;
@@ -381,11 +429,16 @@ impl NetworkHost {
             return;
         };
         let (notifications, relayed) = tokio::sync::mpsc::channel(RELAY_DEPTH);
+        // Section 9 makes the accepted deadline the earliest of the window's expiry, receipt time
+        // plus the requested lifetime and any applicable authority deadline. A grant that runs out
+        // is exactly such a deadline, and it is this host's one anchor for that device.
+        let grant_deadline = self.grant_deadline(&device);
         let remote = Arc::new(RemoteConnection::new(
             Arc::clone(&controller),
             device,
             &session,
             notifications,
+            grant_deadline,
         ));
         self.live
             .lock()
@@ -509,11 +562,11 @@ async fn relay_loop(
             // next one from the cursor it holds.
             () = remote.link_lost() => return,
         };
-        // The registration and the grant are read inside the write boundary itself, so a
-        // revocation that lands while this frame is waiting for the peer stops it there. The item
-        // holds its charge against the connection's queue until it is written or dropped.
-        let frame = kr_protocol::envelope::ControlFrame::Notification(item.notification().clone());
-        if !remote.output().send(&frame).await {
+        // The registration and the grant are read inside the write boundary itself, and watched
+        // for as long as the write waits, so a revocation that lands while this frame is queued
+        // stops it there. The item holds its charge against the connection's queue until it has
+        // been written or dropped.
+        if !remote.output().send(item.frame()).await {
             return;
         }
         drop(item);
@@ -604,11 +657,18 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
             Arc::clone(&devices),
         ))
     });
+    // The daemon's own clock, not a second one. Deadlines from the transport's action windows are
+    // compared with deadlines the daemon decided, and a continuous instant is anchored privately:
+    // two clocks would make those comparisons meaningless rather than merely imprecise.
+    let clock: Arc<dyn kr_transport::clock::ContinuousClock> =
+        Arc::clone(&controller.clock) as Arc<_>;
     let host = Arc::new(NetworkHost {
         controller: Arc::downgrade(controller),
         devices,
         pairing,
         endpoint: setup.settings.endpoint.clone(),
+        clock: Arc::clone(&clock),
+        grant_deadlines: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         live: std::sync::Mutex::new(std::collections::BTreeMap::new()),
     });
     let mut config = ListenerConfig::new(
@@ -621,11 +681,6 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     );
     config.send_limits = setup.settings.send_limits;
     config.preauth_limits = setup.settings.preauth_limits;
-    // The daemon's own clock, not a second one. Deadlines from the transport's action windows are
-    // compared with deadlines the daemon decided, and a continuous instant is anchored privately:
-    // two clocks would make those comparisons meaningless rather than merely imprecise.
-    let clock: Arc<dyn kr_transport::clock::ContinuousClock> =
-        Arc::clone(&controller.clock) as Arc<_>;
     let listener = kr_transport::listener::register_with_clock(
         config,
         identity,
@@ -728,7 +783,11 @@ impl Controller {
         // not be a bound at all.
         let exchange = async {
             let mut held = self.worker_client(&worker).await?;
-            let client = held.as_mut().expect("the connection is open");
+            // The connection is taken out of the shared slot for the exchange and put back only
+            // when it finished. A cancelled exchange — this one running out of time — would
+            // otherwise leave a connection in the slot with an acknowledgement still on the wire,
+            // and the next caller would read somebody else's answer as its own.
+            let mut client = held.take().expect("the connection is open");
             let answered = client
                 .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
                     environment_id: self.paths().environment_id(),
@@ -736,11 +795,11 @@ impl Controller {
                 })
                 .await;
             match answered {
-                Ok(ack) => Ok(Some(ack)),
-                Err(error) => {
-                    *held = None;
-                    Err(ControllerError::from(error))
+                Ok(ack) => {
+                    *held = Some(client);
+                    Ok(Some(ack))
                 }
+                Err(error) => Err(ControllerError::from(error)),
             }
         };
         let answered = match tokio::time::timeout(ACKNOWLEDGEMENT_TIMEOUT, exchange).await {

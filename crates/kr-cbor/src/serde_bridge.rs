@@ -111,10 +111,11 @@ where
 
 /// Serialises a value to canonical bytes and checks it against `limits` first.
 ///
-/// Nothing the size of the encoding is allocated for a message that will be refused: the length is
-/// counted through a counting writer, and only a message inside the bound is written into a buffer
-/// of exactly that length. So an oversized message costs the value tree the caller already built
-/// and nothing further.
+/// The buffer the encoding would fill is not allocated for a message that will be refused: the
+/// length is counted through a counting writer, and only a message inside the bound is written
+/// into a buffer of exactly that length. What an oversized message still costs is the validated
+/// value tree and the encoder's own conversion of it, which are the same allocations writing the
+/// bytes would have made.
 ///
 /// # Errors
 ///

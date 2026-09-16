@@ -35,9 +35,10 @@ pub fn encode_into(value: &CanonicalValue, out: &mut Vec<u8>) {
 /// Returns how many bytes the canonical encoding of `value` occupies, without producing them.
 ///
 /// The bytes are written to a counter rather than to a buffer, so asking how long a message would
-/// be costs no memory proportional to its length. The count comes from the same encoder that
-/// writes the bytes, so it is the length the encoding actually has rather than an arithmetic
-/// estimate of it.
+/// be costs no buffer the size of the answer. The count comes from the same encoder that writes
+/// the bytes, so it is the length the encoding actually has rather than an arithmetic estimate of
+/// it; what it does cost is the encoder's own conversion of the value, which is the same
+/// conversion writing the bytes would make.
 #[must_use]
 pub fn encoded_len(value: &CanonicalValue) -> usize {
     let mut counter = ByteCounter::default();
@@ -48,10 +49,11 @@ pub fn encoded_len(value: &CanonicalValue) -> usize {
 
 /// Encodes `value` only if its canonical encoding is at most `limit` bytes.
 ///
-/// The length is counted first, so a message above the bound is refused before anything the size
-/// of its encoding is allocated. A message inside the bound is then written into a buffer of
+/// The length is counted first, so a message above the bound is refused before the buffer its
+/// encoding would fill is allocated. A message inside the bound is then written into a buffer of
 /// exactly that length, which is also what a caller that holds the result while a write is blocked
-/// is charged for.
+/// is charged for. The value the caller passed, and the encoder's own conversion of it, are there
+/// either way.
 ///
 /// # Errors
 ///

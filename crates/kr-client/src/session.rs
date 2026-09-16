@@ -514,14 +514,9 @@ impl Session {
         match waiter.wait().await {
             Ok(Answer::Receipt(receipt)) => Ok(Settled::Receipt(receipt)),
             Ok(Answer::Response(response)) => {
-                // A correlated answer is definite, whichever way it went: the host reached a
-                // decision about this action, so it is no longer an unknown outcome.
-                self.state
-                    .outcomes
-                    .lock()
-                    .await
-                    .submitted
-                    .remove(&action_id);
+                // Whether this action is settled was decided where the answer was routed, and it
+                // is not decided twice: an answer that says the outcome is unknown leaves the
+                // action on the unresolved list, and section 9 forbids forgetting one.
                 match response.outcome {
                     Outcome::Error(error) => Err(ClientError::from(error)),
                     Outcome::Ok(value) => Ok(Settled::Result(value)),

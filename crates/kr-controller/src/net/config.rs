@@ -18,6 +18,7 @@
 //! | `KR_NETWORK_PKARR_RESOLVER` | The Pkarr server this host resolves peers from |
 //! | `KR_NETWORK_DNS_ORIGIN` | The DNS origin this host resolves peers from |
 //! | `KR_NETWORK_RELAY_CA` | DER certificate files, comma separated, trusted for a relay's HTTPS |
+//! | `KR_NETWORK_RELAY_ONLY` | `1` sends every packet through the relay and uses no direct path |
 //! | `KR_NETWORK_LOCAL_DISCOVERY` | `1` selects local network discovery |
 //! | `KR_NETWORK_MAINLINE` | `1` selects the public Mainline DHT |
 
@@ -76,6 +77,7 @@ impl NetworkSettings {
         settings.endpoint.discovery.pkarr_publisher_url = url("KR_NETWORK_PKARR_PUBLISHER")?;
         settings.endpoint.discovery.pkarr_resolver_url = url("KR_NETWORK_PKARR_RESOLVER")?;
         settings.endpoint.discovery.dns_origin = value("KR_NETWORK_DNS_ORIGIN");
+        settings.endpoint.relay_only = flag("KR_NETWORK_RELAY_ONLY");
         settings.endpoint.discovery.local_discovery = flag("KR_NETWORK_LOCAL_DISCOVERY");
         settings.endpoint.discovery.mainline_dht = flag("KR_NETWORK_MAINLINE");
         if let Some(paths) = value("KR_NETWORK_RELAY_CA") {

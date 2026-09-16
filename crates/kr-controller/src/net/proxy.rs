@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use kr_ipc::client::LocalClient;
 use kr_protocol::actor::ActorEnvelope;
 use kr_protocol::envelope::{
-    ControlEvent, ControlFrame, MutationRequest, Notification, ParamsValue, Request, Response,
+    ControlEvent, ControlFrame, MutationRequest, ParamsValue, Request, Response,
 };
 use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::local::{
@@ -53,32 +53,35 @@ pub const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15)
 /// behind ends its connection; the alternative is holding the worker's own delivery task.
 pub const RELAY_DEPTH: usize = 256;
 
-/// How many queued *bytes* the relay holds for one remote connection.
+/// How many queued *bytes* the relay holds for one remote connection by default.
 ///
 /// A count of notifications is not a bound on memory: one output notification can carry a large
 /// batch, so 256 of them would be far more than section 9's 8 MiB send queue per peer. This is
-/// that bound, charged before a notification is queued and released once it has been written or
-/// discarded.
+/// that bound, charged before a frame is queued and released once it has been written or
+/// discarded. A connection that negotiated a smaller send queue is held to what it negotiated.
 pub const RELAY_QUEUED_BYTES: usize = kr_protocol::limits::MAX_SEND_QUEUE_BYTES;
 
-/// One notification on its way to a remote connection, holding its charge until it is delivered.
+/// One frame on its way to a remote connection, holding its charge until it is delivered.
 ///
 /// The charge is released by the destructor and by nothing else, so it is released exactly once
-/// and it covers the notification's whole life: from the moment the proxy reads it to the moment
-/// it has been written or dropped. A charge released before the write would let the producer refill
-/// the budget while the write was still waiting, which is the memory the bound exists to cap.
+/// and it covers the frame's whole life: from the moment the proxy reads it to the moment it has
+/// been written or dropped. A charge released before the write would let the producer refill the
+/// budget while the write was still waiting, which is the memory the bound exists to cap.
+///
+/// What is carried is the frame the connection will send, encoded once here rather than again at
+/// the other end, so what is charged is what is actually held.
 #[derive(Debug)]
 pub struct Relayed {
-    notification: Notification,
+    frame: ControlFrame,
     charged: usize,
     budget: Arc<RelayBudget>,
 }
 
 impl Relayed {
-    /// Returns the notification this carries.
+    /// Returns the frame this carries.
     #[must_use]
-    pub const fn notification(&self) -> &Notification {
-        &self.notification
+    pub const fn frame(&self) -> &ControlFrame {
+        &self.frame
     }
 }
 
@@ -138,7 +141,12 @@ pub struct WorkerProxy {
     /// is not a connection that can go on being served: section 8 has the device reconnect and
     /// restore its state from the cursor it holds.
     lost: Arc<tokio::sync::Notify>,
-    writer: Mutex<kr_ipc::framed::FrameWriter>,
+    /// The write half, released as soon as nothing is using it.
+    ///
+    /// A link that has ended closes its socket, which is what the worker reads as the connection
+    /// going: that is how the attachment this link held is detached. A closed link that kept its
+    /// writer would keep the attachment as well.
+    writer: Mutex<Option<kr_ipc::framed::FrameWriter>>,
     /// Shared with the reader task, because a response and the request that is waiting for it are
     /// one fact. Two maps would let a response arrive for a request that was never recorded.
     waiters: Arc<std::sync::Mutex<Waiters>>,
@@ -237,7 +245,7 @@ impl WorkerProxy {
         Ok(Arc::new(Self {
             session_id: worker.descriptor.session_id,
             lost,
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Some(writer)),
             waiters,
             reader,
             next_request: AtomicU64::new(1),
@@ -329,6 +337,12 @@ impl WorkerProxy {
             waiters.pending.clear();
         }
         self.reader.abort();
+        // The write half goes with it. A call that is in flight holds it and releases it when it
+        // finds the link ended; the reader's abort drops its own half. Once both are gone the
+        // socket closes, which is what detaches whatever this link held at the worker.
+        if let Ok(mut held) = self.writer.try_lock() {
+            held.take();
+        }
         self.lost.notify_waiters();
     }
 
@@ -353,10 +367,21 @@ impl WorkerProxy {
         // worker is still waiting for. Whether the frame reached the worker is then unknown, which
         // is what the caller is told.
         let exchange = async {
-            let mut writer = self.writer.lock().await;
+            let mut held = self.writer.lock().await;
+            let Some(writer) = held.as_mut() else {
+                return (
+                    Err(kr_ipc::IpcError::UnexpectedMessage("this link has ended")),
+                    false,
+                );
+            };
             let written = writer.write_message(frame).await;
             let interrupted = writer.is_mid_frame();
-            drop(writer);
+            if interrupted || written.is_err() {
+                // A frame that stopped part way through leaves the stream in pieces and the writer
+                // refuses to continue one, so the half goes here rather than being handed to the
+                // next caller.
+                held.take();
+            }
             (written, interrupted)
         };
         let sent = match tokio::time::timeout(CALL_TIMEOUT, exchange).await {
@@ -464,14 +489,20 @@ async fn read_loop(
             // from the cursor it holds. Holding the worker's delivery task instead would make one
             // slow device everybody's problem.
             ControlFrame::Notification(notification) => {
-                let charged = kr_cbor::to_canonical_value(&notification)
-                    .map(|value| kr_cbor::encoded_len(&value))
+                let frame = ControlFrame::Notification(notification);
+                // The complete frame, its length prefix included, because that is what the
+                // connection holds while the write is waiting.
+                let charged = kr_cbor::to_canonical_value(&frame)
+                    .map(|value| {
+                        kr_cbor::encoded_len(&value)
+                            .saturating_add(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN)
+                    })
                     .unwrap_or(usize::MAX);
                 if !budget.charge(charged) {
                     break;
                 }
                 let relayed = Relayed {
-                    notification,
+                    frame,
                     charged,
                     budget: Arc::clone(&budget),
                 };

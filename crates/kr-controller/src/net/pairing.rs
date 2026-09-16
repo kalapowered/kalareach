@@ -188,8 +188,10 @@ impl InvitationStore for SharedInvitations {
             Some(current) if current == expected => {
                 // The device record first, and durably: a candidate told `committed` that then
                 // found no record of itself would have been told a pairing succeeded that cannot
-                // authorise anything. A store that cannot write it leaves the invitation exactly
-                // as it was, so the owner's approval can be presented again.
+                // authorise anything. A store that cannot write it leaves the invitation
+                // unwritten, and the confirmation that failed has spent the owner's approval and
+                // fenced the invitation: the owner issues another rather than presenting the same
+                // one again.
                 let record = device_record(commitment)
                     .map_err(|reason| kr_pairing::PairingError::Store { reason })?;
                 self.devices
@@ -510,24 +512,53 @@ impl PairingHost {
         }
     }
 
+    /// Answers a candidate about a pairing this host has already committed.
+    ///
+    /// It reads the durable device record rather than an invitation, which is what makes the
+    /// answer survive a restart: a candidate whose redemption succeeded and whose answer was lost
+    /// can still learn which device it became.
+    fn committed_status(
+        &self,
+        peer: &ConnectionPeer,
+    ) -> std::result::Result<PairStatusResult, ProtocolError> {
+        let record = self
+            .devices
+            .record_for_endpoint(peer.endpoint_id())
+            .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this host is not offering that invitation",
+                )
+            })?;
+        Ok(PairStatusResult {
+            status: PairStatus::Committed {
+                device_id: record.device_id,
+                grant_id: record.grant.grant_id,
+            },
+        })
+    }
+
     fn candidate_status(
         &self,
         peer: &ConnectionPeer,
         params: &PairStatusParams,
     ) -> std::result::Result<PairStatusResult, ProtocolError> {
         let mut open = self.open.lock().unwrap_or_else(|held| held.into_inner());
-        let invitation = open.as_mut().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this host is not offering an invitation",
-            )
-        })?;
-        if params.invitation_id != invitation.invitation_id() {
-            return Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "that invitation is not the one this host is offering",
-            ));
+        let matching = open
+            .as_ref()
+            .is_some_and(|invitation| invitation.invitation_id() == params.invitation_id);
+        if !matching {
+            // No invitation object for this candidate to ask about, which is the ordinary state
+            // after a restart: section 10 cancels every unfinished invitation when a host starts,
+            // and a committed one leaves a device record behind. The record is keyed by the
+            // endpoint identity this connection was authenticated as, so this answers the caller
+            // about itself and about nothing else.
+            return self.committed_status(peer);
         }
+        let invitation = open
+            .as_mut()
+            .expect("the invitation is the one asked about");
         let status = invitation
             .status(DirectStatusViewer::Candidate {
                 // The host generated the attempt identity, so a candidate whose redemption answer
@@ -589,6 +620,7 @@ fn device_record(commitment: &PairingCommitment) -> std::result::Result<DeviceRe
         grant: commitment.grant.clone(),
         paired_at_ms: commitment.committed_at_ms,
         revoked_at_ms: None,
+        expired_at_ms: None,
     })
 }
 

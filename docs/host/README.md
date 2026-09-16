@@ -315,7 +315,8 @@ suspend-aware continuous clock (`kr_transport::clock`).
 The daemon joins the network once, at the end of its startup, when its environment selects one.
 `KR_NETWORK` turns it on and the variables in `crates/kr-controller/src/net/config.rs` select the
 relay map, the Pkarr publisher, the Pkarr resolver and the DNS origin, each on its own and none
-inherited. `KR_NETWORK_OWNER_KEY` names the enrolled owner signer; without one the host accepts no
+inherited. `KR_NETWORK_RELAY_ONLY` removes the direct paths altogether, for a deployment where one
+is not available or not wanted. `KR_NETWORK_OWNER_KEY` names the enrolled owner signer; without one the host accepts no
 pairing, because there is nobody who could authorise a confirmation. A daemon that selects no
 network serves its local endpoint alone, which is a supported deployment rather than a degraded
 one.

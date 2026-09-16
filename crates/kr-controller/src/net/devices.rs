@@ -50,13 +50,18 @@ pub struct DeviceRecord {
     pub paired_at_ms: TimestampMs,
     /// When the host revoked it, in UTC milliseconds, while it still holds a grant.
     pub revoked_at_ms: Option<TimestampMs>,
+    /// When the host first found its grant to have run out, in UTC milliseconds.
+    ///
+    /// Recorded so the decision survives a restart and a wall clock stepped backwards. A grant
+    /// that has once run out never comes back.
+    pub expired_at_ms: Option<TimestampMs>,
 }
 
 impl DeviceRecord {
     /// Returns true when this device may still open an authorised connection.
     #[must_use]
     pub const fn is_paired(&self) -> bool {
-        self.revoked_at_ms.is_none()
+        self.revoked_at_ms.is_none() && self.expired_at_ms.is_none()
     }
 
     /// Returns the paired record the connection handshake checks a proof against.
@@ -145,7 +150,8 @@ impl DeviceDirectory {
                      grant_id BLOB NOT NULL,
                      grant BLOB NOT NULL,
                      paired_at_ms INTEGER NOT NULL,
-                     revoked_at_ms INTEGER
+                     revoked_at_ms INTEGER,
+                     expired_at_ms INTEGER
                  );
                  CREATE INDEX IF NOT EXISTS network_devices_endpoint
                      ON network_devices (endpoint_id);",
@@ -180,8 +186,9 @@ impl DeviceDirectory {
                 .execute(
                     "INSERT INTO network_devices (
                          device_id, endpoint_id, device_key_revision, authorisation_key,
-                         device_name, platform, grant_id, grant, paired_at_ms, revoked_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                         device_name, platform, grant_id, grant, paired_at_ms, revoked_at_ms,
+                         expired_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)",
                     params![
                         record.device_id.get().as_bytes().as_slice(),
                         record.endpoint_id.as_bytes().as_slice(),
@@ -209,7 +216,8 @@ impl DeviceDirectory {
             connection
                 .query_row(
                     "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
-                            device_name, platform, grant, paired_at_ms, revoked_at_ms
+                            device_name, platform, grant, paired_at_ms, revoked_at_ms,
+                            expired_at_ms
                      FROM network_devices WHERE endpoint_id = ?1",
                     params![bytes],
                     |row| Ok(read_record(row)),
@@ -230,7 +238,8 @@ impl DeviceDirectory {
             connection
                 .query_row(
                     "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
-                            device_name, platform, grant, paired_at_ms, revoked_at_ms
+                            device_name, platform, grant, paired_at_ms, revoked_at_ms,
+                            expired_at_ms
                      FROM network_devices WHERE device_id = ?1",
                     params![bytes],
                     |row| Ok(read_record(row)),
@@ -249,7 +258,7 @@ impl DeviceDirectory {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
-                        device_name, platform, grant, paired_at_ms, revoked_at_ms
+                        device_name, platform, grant, paired_at_ms, revoked_at_ms, expired_at_ms
                  FROM network_devices ORDER BY paired_at_ms, device_id",
             )?;
             let rows = statement
@@ -259,6 +268,27 @@ impl DeviceDirectory {
         })?
         .into_iter()
         .collect()
+    }
+
+    /// Records that one device's grant has run out.
+    ///
+    /// It is written so the decision survives a restart. An absolute expiry is read against the
+    /// wall clock, and a wall clock can be stepped backwards; a grant that has once been found to
+    /// have run out never comes back, whatever the clock says afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn record_expiry(&self, device_id: DeviceId, now_ms: TimestampMs) -> Result<()> {
+        let bytes = device_id.get().as_bytes().to_vec();
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE network_devices SET expired_at_ms = ?2
+                 WHERE device_id = ?1 AND expired_at_ms IS NULL",
+                params![bytes, i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
+            )
+        })?;
+        Ok(())
     }
 
     /// Marks one device as revoked, and reports whether this call was the one that did it.
@@ -309,6 +339,7 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
     let grant: Vec<u8> = row.get(6).map_err(ControllerError::registry)?;
     let paired_at_ms: i64 = row.get(7).map_err(ControllerError::registry)?;
     let revoked_at_ms: Option<i64> = row.get(8).map_err(ControllerError::registry)?;
+    let expired_at_ms: Option<i64> = row.get(9).map_err(ControllerError::registry)?;
     Ok(DeviceRecord {
         device_id: DeviceId::new(uuid(&device_id)?),
         endpoint_id: EndpointKey::from_bytes(key(&endpoint_id)?),
@@ -323,6 +354,8 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
             .map_err(|error| ControllerError::registry(error.to_string()))?,
         paired_at_ms: TimestampMs::new(u64::try_from(paired_at_ms).unwrap_or_default()),
         revoked_at_ms: revoked_at_ms
+            .map(|at| TimestampMs::new(u64::try_from(at).unwrap_or_default())),
+        expired_at_ms: expired_at_ms
             .map(|at| TimestampMs::new(u64::try_from(at).unwrap_or_default())),
     })
 }
@@ -397,6 +430,7 @@ mod tests {
             },
             paired_at_ms: TimestampMs::new(1_764_003_600_000),
             revoked_at_ms: None,
+            expired_at_ms: None,
         }
     }
 

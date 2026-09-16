@@ -22,6 +22,7 @@ use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::ipc::IpcTransport;
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
+use kr_controller::registry::Registry;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::{self, Network, NetworkSetup};
 use kr_controller::service::{Controller, ControllerSetup};
@@ -103,10 +104,10 @@ impl Host {
         std::fs::copy(&worker_build, &worker).expect("copies the worker");
         // A launched worker inherits this process's working directory, and this process starts in
         // the build tree, which may be on a removable volume: a process a service manager started
-        // that reaches one asks the person at the machine for permission. Moving this process into
-        // the host tree moves every worker it launches with it. Every test in this binary wants
-        // the same thing, so which of them set it last does not matter.
-        std::env::set_current_dir(temp.root()).expect("moves into the host tree");
+        // that reaches one asks the person at the machine for permission. This moves the process
+        // once, to a directory on the internal disk that outlives every test in this binary, so
+        // no test can leave another launching a worker from a directory it has just removed.
+        move_to_internal_disk();
         Some(Self {
             temp,
             worker,
@@ -116,6 +117,42 @@ impl Host {
 
     fn paths(&self) -> kr_ipc::paths::EnvironmentPaths {
         self.temp.environment()
+    }
+
+    /// Ends every worker this host started that is still running.
+    ///
+    /// A worker is deliberately not a child of whatever created it, so a test that panicked before
+    /// it could close its session would leave one running until the machine was restarted. The
+    /// registry holds the process identity of each worker this host started, and a process is
+    /// signalled only when the kernel agrees it is still the process that identity names: a reused
+    /// identifier is never signalled.
+    fn end_stray_workers(&self) {
+        let Ok(registry) = Registry::open(self.paths().registry_database(), self.environment_id)
+        else {
+            return;
+        };
+        let Ok(workers) = registry.workers() else {
+            return;
+        };
+        for worker in workers {
+            if !matches!(
+                kr_ipc::identity::process_state(&worker.process_identity),
+                kr_ipc::identity::ProcessState::Running
+            ) {
+                continue;
+            }
+            let Ok(pid) = i32::try_from(worker.process_identity.pid.get()) else {
+                continue;
+            };
+            let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+                continue;
+            };
+            eprintln!(
+                "ending a worker this test started and did not close: session {}",
+                worker.session_id
+            );
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
     }
 
     /// Starts the daemon and puts it on the network with the endpoint configuration given.
@@ -184,6 +221,25 @@ impl Host {
     }
 }
 
+/// Moves this process out of the build tree, once, for every test in this binary.
+///
+/// The directory a launched worker inherits has to be on the internal disk, and it has to still
+/// exist: a per-test temporary root would be removed by whichever test finished first. The
+/// platform's own temporary directory is both.
+fn move_to_internal_disk() {
+    static MOVED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    MOVED.get_or_init(|| {
+        let internal = std::env::temp_dir();
+        std::env::set_current_dir(&internal).unwrap_or_else(|error| {
+            panic!(
+                "this suite launches processes and must not leave them a directory on a removable \
+                 volume; moving to {} failed: {error}",
+                internal.display()
+            )
+        });
+    });
+}
+
 /// Returns the worker binary beside this test's own.
 ///
 /// # Panics
@@ -209,6 +265,15 @@ fn worker_program() -> Option<PathBuf> {
         worker.display()
     );
     Some(worker)
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        // The successful paths close their sessions and wait for the record. This is the failing
+        // path: unwinding cannot await, so what it can do is end the processes this host started
+        // before its tree goes.
+        self.end_stray_workers();
+    }
 }
 
 struct RunningDaemon {
@@ -688,11 +753,11 @@ async fn observe(
         }
         let event: OutputEvent = notification.payload.to_typed().expect("an output event");
         seen.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+        // The event's own cursor, never a position derived from how many bytes it carried: a
+        // restoration's chunks are a rendering of the screen at one position rather than a run of
+        // source output, so adding their lengths would claim a position the session never reached.
         session
-            .applied_content(
-                &output_stream(),
-                U64::new(event.cursor.get() + event.bytes.len() as u64),
-            )
+            .applied_content(&output_stream(), event.cursor)
             .await;
         session
             .applied(&output_stream(), notification.sequence)
@@ -859,6 +924,55 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     // The control stream is lost. What the client carries across is the content position, not the
     // previous connection's event sequences.
     let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
+    session.close();
+    drop(session);
+
+    // While the device is away, the session goes on producing: a local caller reads the retained
+    // history on the worker's own endpoint and finds what was typed but never waited for. That is
+    // what makes the restoration on the next connection worth checking — the content exists, and
+    // the device has not seen it.
+    let mut on_worker = LocalClient::connect(
+        &kr_ipc::paths::Endpoint::from_path(
+            created
+                .endpoint
+                .as_ref()
+                .cloned()
+                .expect("a live session names its worker"),
+        )
+        .expect("a worker endpoint"),
+        LocalClientKind::Cli,
+        build(),
+    )
+    .await
+    .expect("the local client reaches the worker");
+    let produced = tokio::time::Instant::now() + PATIENCE;
+    let mut retained = String::new();
+    while tokio::time::Instant::now() < produced {
+        let page: kr_protocol::recovery::HistoryPageResult = on_worker
+            .request(
+                Method::HistoryPage,
+                &kr_protocol::recovery::HistoryPageParams {
+                    session_id,
+                    from_cursor: U64::ZERO,
+                    max_bytes: U64::new(256 * 1024),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the page is served")
+            .to_typed()
+            .expect("decodes");
+        retained.push_str(&String::from_utf8_lossy(page.bytes.as_slice()));
+        if retained.contains("while-it-away") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        retained.contains("while-it-away"),
+        "the session produced it while the device was away: {retained:?}"
+    );
+
     let resumed_from = carried
         .cursors
         .applied_cursor(&output_stream())
@@ -869,8 +983,6 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         None,
         "the previous connection's event sequences do not travel"
     );
-    session.close();
-    drop(session);
 
     // A reconnect resumes the cursors it carried, and the subscription it opens is asked to start
     // from exactly them.
@@ -903,6 +1015,7 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         restored.contains("while-it-away"),
         "the restoration carries what happened while the device was away: {restored:?}"
     );
+    drop(on_worker);
 
     session.close();
     close_session(&mut local, &host, session_id).await;
@@ -1210,6 +1323,18 @@ impl LocalRelay {
         }
     }
 
+    /// The same selection, with no direct path at all.
+    ///
+    /// Two loopback endpoints reach each other directly whatever addresses they were given, so an
+    /// endpoint that must use the relay has to have nothing else: this removes its IP transports.
+    /// It is what makes stopping the relay the end of the path rather than a detail.
+    fn relay_only_config(&self) -> EndpointConfig {
+        EndpointConfig {
+            relay_only: true,
+            ..self.config()
+        }
+    }
+
     /// Takes the relay away, which is what a lease that ran out of reserved bytes does to a path.
     async fn shut_down(&mut self) {
         if let Some(server) = self.server.take() {
@@ -1229,7 +1354,10 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
     };
     let mut relay = LocalRelay::spawn().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let daemon = host.start(relay.config(), &owner).await;
+    // Neither endpoint has a direct path: two loopback endpoints reach each other directly
+    // whatever addresses they were given, so the relay is the only path only if there is no other
+    // transport on either side.
+    let daemon = host.start(relay.relay_only_config(), &owner).await;
     let mut local = host.client().await;
     let created = create(&mut local, &host).await;
     let session_id = created.session.session_id;
@@ -1275,9 +1403,9 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
         .to_typed()
         .expect("an attachment");
 
-    // The device knows the relay and nothing else about where the host is, so the relay is how it
-    // reaches it. The pairing and the attachment then run over that path.
-    let device = Device::create(&relay.config()).await;
+    // The device has no direct path at all: every packet it sends goes through the relay. The
+    // pairing and the attachment therefore run over that path and nothing else.
+    let device = Device::create(&relay.relay_only_config()).await;
     let record = pair(&daemon, &device, &owner).await;
     let mut addr = EndpointAddr::new(
         iroh::PublicKey::from_bytes(daemon.network.endpoint_id().as_bytes())
@@ -1305,12 +1433,13 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
     .await;
     assert!(seen.contains(MARKER), "the relay carried the session");
 
-    // The device's path goes: the relay it reached the host through is stopped, and its endpoint
-    // is closed. Two loopback endpoints hole-punch a direct path whatever they were told about, so
-    // stopping the relay alone would not prove the remote path had ended; closing the endpoint is
-    // the simulation section 17's quota disconnect gets here, and what it establishes is the half
-    // that matters: the remote path ending takes neither the worker nor the local attachment with
-    // it.
+    // The relay path goes. Neither endpoint has any other transport, so the relay *is* the path:
+    // the server is stopped and the device's endpoint closed, which is the closing of the relay
+    // path that section 17's quota disconnect is simulated by. What a real quota disconnect adds
+    // is *when* the device notices — section 23's thirty-second inactivity threshold rather than
+    // an immediate local close — and that is a property of the transport rather than of what this
+    // checks, which is the other half: the remote path ending takes neither the worker nor the
+    // local attachment with it.
     relay.shut_down().await;
     device.endpoint.close().await;
     drop(session);

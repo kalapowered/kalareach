@@ -53,6 +53,7 @@ used:
 | `discovery.mainline_dht` | The public Mainline DHT. Disabled unless selected. |
 | `discovery.publisher` | The republish rules below. |
 | `direct_addresses` | Address hints for the peer this configuration describes. |
+| `relay_only` | Removes the IP transports, so every packet goes through the selected relay. |
 | `relay_ca_roots` | Extra trust anchors for a relay whose certificate comes from a private authority. |
 | `bind_addr` | The local socket. |
 
@@ -241,13 +242,14 @@ retries. A message is encoded under the smaller of its stream kind's frame bound
 frame its class could ever be admitted with, so a frame this connection could never queue is refused
 as too large before it costs a write.
 
-What is not charged is the encoder's own working memory. An oversized message no longer costs a
-buffer the size of its encoding: the canonical encoder counts the encoding's length through a
-counting writer and refuses the message before writing a byte of it, so what a refusal costs is the
-value tree the caller already had. A message inside the bound is written into a buffer of exactly
-its own length, which is what the charge then covers. The rest of that working memory is allocated
-and released inside one synchronous encode with nothing awaited in it, so it cannot accumulate
-across blocked writes.
+What is not charged is the encoder's own working memory. An oversized message no longer costs the
+buffer its encoding would fill: the canonical encoder counts the encoding's length through a
+counting writer and refuses the message before writing a byte of it. What a refusal still costs is
+the validated value tree and the encoder's conversion of it, which are the same allocations writing
+the bytes would have made. A message inside the bound is written into a buffer of exactly its own
+length, which is what the charge then covers. The rest of that working memory is allocated and
+released inside one synchronous encode with nothing awaited in it, so it cannot accumulate across
+blocked writes.
 
 An empty frame is refused before the write, because a zero length is what the peer's decoder reads
 as a malformed frame. A caller's mistake stays a local error rather than becoming stream damage.

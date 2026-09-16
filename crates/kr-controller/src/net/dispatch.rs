@@ -64,6 +64,19 @@ use crate::service::Controller;
 /// The QUIC application error code a withdrawn connection is closed with.
 pub const WITHDRAWN: u32 = 4;
 
+/// How long a caller waits for an effect the daemon owns before it is told the outcome is unknown.
+///
+/// The effect runs on a task that outlives the connection, so this bounds what the *caller* waits
+/// for rather than the work: a device holding a request slot for a session that has stopped
+/// answering is told, and the effect goes on to whatever end it reaches.
+pub const EFFECT_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How often a waiting write asks whether the authority behind it still stands.
+///
+/// It bounds how long a frame can sit waiting for a peer after the authority that admitted it went
+/// away. Nothing polls while nothing is waiting.
+pub const AUTHORITY_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// One connection's write boundary, and the latch a withdrawal sets.
 ///
 /// Deciding what to send and sending it are one step, and a withdrawal is the other side of the
@@ -137,12 +150,40 @@ impl RemoteOutput {
     /// The latch and the registration are both read after the turn is taken, so a frame is never
     /// begun on a connection whose authority has been withdrawn — by a device revocation, which
     /// sets the latch, or by an authority revision, which withdraws the registration.
+    ///
+    /// A write can then wait: for the control stream's own writer, which the keepalive and the
+    /// window renewal share, and for the peer to make room. The authority is watched for as long
+    /// as that lasts, because a check that only ran before the wait would let a frame be delivered
+    /// under authority that went while it was queued. A frame abandoned that way leaves the stream
+    /// in pieces, which is exactly right for a connection being fenced: the connection is closed
+    /// with it.
     pub async fn send(&self, frame: &ControlFrame) -> bool {
         let _turn = self.turn.lock().await;
         if self.has_withdrawn() || !self.authority.stands().await {
             return false;
         }
-        self.sender.send(frame).await.is_ok()
+        tokio::select! {
+            written = self.sender.send(frame) => written.is_ok(),
+            () = self.authority_lost() => {
+                self.withdraw();
+                false
+            }
+        }
+    }
+
+    /// Resolves once this connection stops being one this host may write to.
+    ///
+    /// It polls, because the daemon's own revocation path withdraws a registration without
+    /// knowing which network connections hold it, and a grant runs out on a clock rather than on
+    /// an event. The interval only matters while a write is waiting, which is the only time
+    /// anything is watching.
+    async fn authority_lost(&self) {
+        loop {
+            tokio::time::sleep(AUTHORITY_POLL).await;
+            if self.has_withdrawn() || !self.authority.stands().await {
+                return;
+            }
+        }
     }
 
     /// Withdraws this connection. No write begins after this returns.
@@ -202,9 +243,10 @@ impl RemoteConnection {
         device: DeviceRecord,
         session: &AuthorisedSession,
         notifications: tokio::sync::mpsc::Sender<Relayed>,
+        grant_deadline: Option<kr_transport::clock::ContinuousInstant>,
     ) -> Self {
         let authority = Arc::new(Authorisation {
-            grant_deadline: grant_deadline(&controller, &device),
+            grant_deadline,
             controller: Arc::clone(&controller),
             connection_id: session.connection_id,
             expired: AtomicBool::new(false),
@@ -218,7 +260,13 @@ impl RemoteConnection {
             authority,
             proxy: tokio::sync::Mutex::new(None),
             notifications,
-            budget: Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
+            // What this connection said it could receive, never more than the protocol's own
+            // bound: a peer that offered a smaller send queue is held to what it offered.
+            budget: Arc::new(RelayBudget::new(
+                usize::try_from(session.selection.limits.max_send_queue_bytes.get())
+                    .unwrap_or(RELAY_QUEUED_BYTES)
+                    .min(RELAY_QUEUED_BYTES),
+            )),
             lost: Arc::new(tokio::sync::Notify::new()),
             windows: Arc::clone(&session.windows),
         }
@@ -416,7 +464,7 @@ impl RemoteConnection {
                         .session_create(&actor_id, &mutation, accepted)
                         .await
                 });
-                settled(request_id, effect.await)
+                settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
             }
             Method::SessionClose => {
                 // A close is dispatched to the worker, so it needs a lease, and a lease is renewed
@@ -438,7 +486,7 @@ impl RemoteConnection {
                         .session_close(&mutation, &envelope, accepted)
                         .await
                 });
-                settled(request_id, effect.await)
+                settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
             }
             // Everything else belongs to the worker that owns the session.
             _ => self.proxied_mutation(mutation, accepted, validated).await,
@@ -926,31 +974,6 @@ impl RemoteConnection {
     }
 }
 
-/// Returns when one device's grant runs out, on the continuous clock.
-///
-/// Section 9 makes the accepted deadline the earliest of the window's expiry, receipt time plus the
-/// requested lifetime and any applicable authority deadline. A grant that runs out in ten seconds
-/// is exactly such a deadline, and without it an action admitted a moment before the expiry could
-/// dispatch a minute after it.
-///
-/// It is anchored once, from what the wall clock says is left at admission, because the continuous
-/// clock is the one every deadline this host decides is measured on and the only one a step cannot
-/// move. A grant with no expiry has no deadline, and the window and the requested lifetime still
-/// bound the action.
-fn grant_deadline(
-    controller: &Arc<Controller>,
-    device: &DeviceRecord,
-) -> Option<kr_transport::clock::ContinuousInstant> {
-    let kr_protocol::grant::GrantExpiry::At { expires_at_ms } = device.grant.expiry else {
-        return None;
-    };
-    let remaining = expires_at_ms.get().saturating_sub(kr_ipc::now_ms().get());
-    controller
-        .clock
-        .now()
-        .checked_add(std::time::Duration::from_millis(remaining))
-}
-
 /// Returns whether one request claims or adds a geometry claim.
 ///
 /// The condition on `terminal.geometry` is "when the request claims or adds a geometry claim", so
@@ -1002,20 +1025,26 @@ fn session_of(
 }
 
 /// Returns what one spawned effect settled as.
-fn settled(
-    request_id: RequestId,
-    outcome: std::result::Result<Result<ParamsValue>, tokio::task::JoinError>,
-) -> ControlFrame {
+///
+/// The task owns the effect and outlives this connection, so a wait that ran out says the outcome
+/// is unknown rather than that the action failed: the effect is still running, and section 9
+/// forbids reporting an action that may have happened as refused.
+type Effect = std::result::Result<
+    std::result::Result<Result<ParamsValue>, tokio::task::JoinError>,
+    tokio::time::error::Elapsed,
+>;
+
+fn settled(request_id: RequestId, outcome: Effect) -> ControlFrame {
     match outcome {
-        Ok(Ok(value)) => ControlFrame::Response(Response {
+        Ok(Ok(Ok(value))) => ControlFrame::Response(Response {
             request_id,
             outcome: Outcome::Ok(value),
         }),
-        Ok(Err(error)) => ControlFrame::Response(Response {
+        Ok(Ok(Err(error))) => ControlFrame::Response(Response {
             request_id,
             outcome: Outcome::Error(error.to_protocol_error()),
         }),
-        Err(_) => failure(request_id, outcome_unknown()),
+        Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
     }
 }
 
