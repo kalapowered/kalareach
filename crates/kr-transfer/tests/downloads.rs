@@ -1302,7 +1302,10 @@ fn a_source_rewritten_while_snapshots_are_taken_never_yields_a_mixture() {
     std::thread::scope(|threads| {
         let writer = threads.spawn(|| {
             let mut turn = 0_usize;
-            while !stop.load(Ordering::Relaxed) {
+            // Bounded as well as flagged: an assertion that fails below unwinds without setting
+            // the flag, and a producer that waited only for the flag would keep this scope
+            // waiting for it for ever.
+            while turn < 2_000 && !stop.load(Ordering::Relaxed) {
                 let bytes: &[u8] = if turn.is_multiple_of(2) {
                     &second
                 } else {
@@ -1387,5 +1390,144 @@ fn a_source_rewritten_while_snapshots_are_taken_never_yields_a_mixture() {
             .expect("reads the snapshot area")
             .count(),
         0
+    );
+}
+
+/// KR-REQ-14.16: a snapshot whose construction was interrupted is resolved by the next recovery
+/// pass rather than holding its bytes and its transfer slot for ever.
+#[test]
+fn an_interrupted_snapshot_reservation_is_resolved_by_recovery() {
+    let harness = Harness::create();
+    let bytes = pattern(4096);
+    // A reservation with a payload beneath it and no caller behind it: the shape a daemon that
+    // died between the reservation and the copy leaves.
+    let transfer_id = TransferId::new(Uuid::from_bytes([31; 16]));
+    let stored = format!("{}.bin", "1f".repeat(16));
+    let area = harness
+        .service
+        .staging()
+        .snapshots()
+        .display_path()
+        .join(&stored);
+    std::fs::write(&area, &bytes).expect("writes the payload the reservation names");
+    {
+        let mut store = kr_transfer::Store::open(
+            kr_transfer::StagingArea::store_path(&harness.host.environment()),
+            harness.environment_id(),
+        )
+        .expect("opens the journal");
+        store
+            .insert_snapshot(
+                &kr_transfer::store::SnapshotRow {
+                    transfer_id,
+                    environment_id: harness.environment_id(),
+                    actor_id: harness.actor.clone(),
+                    device_id: None,
+                    scope_id: None,
+                    source_transfer_id: None,
+                    immutability: DownloadImmutability::StagedSnapshot,
+                    source_label: "a source that never finished copying".to_owned(),
+                    stored_name: Some(stored.clone()),
+                    byte_len: bytes.len() as u64,
+                    content_digest: digest(&[]),
+                    reserved_byte_len: bytes.len() as u64,
+                    state: kr_transfer::store::SnapshotState::Reserving,
+                    cleanup_pending: false,
+                    failure_reason: None,
+                    source_identity: None,
+                    source_modified_ms: None,
+                    created_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS),
+                    expires_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+                },
+                &[],
+            )
+            .expect("records the reservation");
+    }
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        bytes.len() as u64,
+        "the reservation charges the environment while it stands"
+    );
+
+    let recovery = harness.service.recover().expect("recovers");
+
+    assert_eq!(recovery.interrupted_snapshots, 1);
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        0,
+        "and the charge goes with it"
+    );
+    assert!(!area.exists(), "the payload it named is removed");
+}
+
+/// KR-REQ-14.16: a temporary file replaced between its verification and its publication is not
+/// published, and the destination is left as it was.
+#[test]
+fn a_replaced_temporary_file_is_never_published() {
+    let harness = Harness::create();
+    let bytes = pattern(4096);
+    let handle = harness.publish(&bytes, "application/octet-stream", "notes.bin");
+    let begun = harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Attachment {
+                    transfer_id: handle.transfer_id,
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect("opens the source");
+    let destination = source_tree();
+    let authority = AuthorisedDirectory::open_root(harness.environment_id(), destination.path())
+        .expect("opens the destination");
+    let placement = DownloadPlacement {
+        transfer_id: begun.transfer_id,
+        destination_name: "notes.bin".to_owned(),
+        byte_len: begun.byte_len,
+        content_digest: begun.content_digest,
+        allow_overwrite: false,
+    };
+    let mut writer = DownloadWriter::open(&authority, &placement).expect("opens the writer");
+    for index in 0..begun.layout.chunk_count.get() {
+        let chunk = harness
+            .service
+            .download_chunk(
+                &harness.actor,
+                &DownloadChunkParams {
+                    transfer_id: begun.transfer_id,
+                    index: U64::new(index),
+                },
+            )
+            .expect("reads a chunk");
+        writer
+            .write_chunk(&chunk.chunk, chunk.bytes.as_slice())
+            .expect("every chunk verifies");
+    }
+
+    // Something takes the temporary name. The writer still holds the object it verified, so a
+    // publication by name would otherwise name this file in the destination.
+    let temporary = std::fs::read_dir(destination.path())
+        .expect("reads the destination")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "part")
+        })
+        .expect("the writer has a temporary file");
+    let decoy = destination.path().join("decoy");
+    std::fs::write(&decoy, b"not the bytes this download verified").expect("writes the decoy");
+    std::fs::rename(&decoy, &temporary).expect("takes the temporary name");
+
+    let refusal = writer.publish().expect_err("the name no longer holds it");
+
+    assert_eq!(refusal.code(), ErrorCode::AttachmentIntegrity);
+    assert!(
+        !destination.path().join("notes.bin").exists(),
+        "nothing was published"
     );
 }

@@ -98,6 +98,8 @@ pub struct Recovery {
     pub completed_publications: usize,
     /// Publications whose payload could not be found and are now invalidated.
     pub unresolved_publications: usize,
+    /// Snapshots whose construction an earlier daemon never finished, now failed and released.
+    pub interrupted_snapshots: usize,
     /// Payloads of closed uploads that were still on disk and have now been removed.
     pub removed_payloads: usize,
     /// Payloads that still could not be removed. Their bytes stay charged and the next pass
@@ -354,26 +356,34 @@ impl TransferService {
                 ),
             });
         }
+        // These two refusals are the ones a first attempt at this same action could have caused:
+        // it holds the transfer slot, and it charged the bytes. So they are answered from the
+        // record when there is one, rather than telling a retry that its own reservation is in
+        // the way.
         let open = store.open_transfers(actor)?;
         if open >= limits.max_concurrent_transfers {
-            return Err(TransferError::Concurrency {
+            let refusal = TransferError::Concurrency {
                 detail: format!(
                     "this device already holds {open} of {} concurrent transfers; finish or cancel \
                      one first",
                     limits.max_concurrent_transfers
                 ),
-            });
+            };
+            drop(store);
+            return self.refuse_unless_performed(action, refusal);
         }
         let staged = store.staged_byte_len()?;
         let after = staged.saturating_add(declared);
         if after > limits.max_staged_len {
-            return Err(TransferError::QuotaExceeded {
+            let refusal = TransferError::QuotaExceeded {
                 detail: format!(
                     "this environment has {staged} of {} staged bytes, and {declared} more would \
                      exceed it",
                     limits.max_staged_len
                 ),
-            });
+            };
+            drop(store);
+            return self.refuse_unless_performed(action, refusal);
         }
         // The payload file exists before the row does, so a row can never name a file that was
         // refused, and the exclusive create is what proves the name was unused.
@@ -682,6 +692,7 @@ impl TransferService {
                 )
             };
             drop(file);
+            let payloads = self.payloads.lock().map_err(|_| poisoned())?;
             self.locked()?.close_upload(
                 row.transfer_id,
                 UploadState::Invalidated,
@@ -689,6 +700,7 @@ impl TransferService {
                 now,
             )?;
             self.discard_payloads(&row)?;
+            drop(payloads);
             return Err(TransferError::integrity(reason));
         }
         let (preview, preview_unavailable) =
@@ -702,6 +714,9 @@ impl TransferService {
             }
             None => None,
         };
+        // Taken before the journal's lock, and held over both commits, so a cancellation, a
+        // sweep or a recovery cannot act on this payload between them.
+        let payloads = self.payloads.lock().map_err(|_| poisoned())?;
         let mut store = self.locked()?;
         // Rechecked under the lock: a cancellation could have landed while the file was read.
         let row = upload_of(&store, params.transfer_id, actor)?;
@@ -719,9 +734,6 @@ impl TransferService {
                 detail: "it cannot be finished".to_owned(),
             });
         }
-        // Taken before the journal's lock and held over the move, so a cancellation or a sweep
-        // cannot act on the same payload between the two commits.
-        let payloads = self.payloads.lock().map_err(|_| poisoned())?;
         // The intent is durable before the file moves, and it carries the identity of the object
         // that was verified, so an interrupted publish is resolved from the record rather than
         // guessed at.
@@ -820,8 +832,12 @@ impl TransferService {
                 .complete_publish(row.transfer_id, now, expires_at_ms)?;
             return Ok(());
         }
-        self.locked()?.close_upload(
+        // Only a row that is still publishing. A cancellation that closed this transfer and
+        // removed its payload is the other explanation for finding neither name, and it is not an
+        // integrity failure to be overwritten with one.
+        self.locked()?.close_upload_from(
             row.transfer_id,
+            UploadState::Publishing,
             UploadState::Invalidated,
             Some("the verified payload is not in the staging area, so no handle can name it"),
             now,
@@ -907,6 +923,9 @@ impl TransferService {
         params: &UploadCancelParams,
     ) -> Result<UploadCancelResult> {
         let now = self.clock.now_ms();
+        // Before the journal's lock, and held across the removal: a cancellation and a publish
+        // are the two things that move the same payload, and this is what keeps them apart.
+        let payloads = self.payloads.lock().map_err(|_| poisoned())?;
         let mut store = self.locked()?;
         let row = upload_of(&store, params.transfer_id, actor)?;
         match row.state {
@@ -934,6 +953,7 @@ impl TransferService {
         // Both names, because a cancellation can arrive on an upload whose publish had already
         // moved the file. The reservation is released only once the payload is gone.
         self.discard_payloads(&row)?;
+        drop(payloads);
         Ok(UploadCancelResult {
             transfer_id: row.transfer_id,
             state: UploadState::Cancelled,
@@ -1064,13 +1084,17 @@ impl TransferService {
         let row = draft_of(&store, params.draft_id, actor)?;
         self.check_environment(row.environment_id)?;
         if row.revision != params.expected_revision {
-            return Err(TransferError::DraftConflict {
+            // The revision this update expects can be one its own first attempt moved past, so
+            // the record answers before the conflict does.
+            let refusal = TransferError::DraftConflict {
                 detail: format!(
                     "this draft is at revision {} and the update expects {}",
                     row.revision.get(),
                     params.expected_revision.get()
                 ),
-            });
+            };
+            drop(store);
+            return self.refuse_unless_performed(action, refusal);
         }
         // The result is built before the transaction, because the transaction commits it beside
         // the state it changes.
@@ -1085,6 +1109,7 @@ impl TransferService {
         let result = DraftUpdateResult {
             draft: self.compose_draft(&updated, &bindings, &handles)?,
         };
+        check_result_size(&result, "this draft")?;
         let retained = match action {
             Some(action) => Some(action.retained(
                 kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
@@ -1175,13 +1200,17 @@ impl TransferService {
             )));
         }
         if row.revision != params.expected_revision {
-            return Err(TransferError::DraftConflict {
+            // As for an update: a binding's own first attempt is one explanation for the revision
+            // having moved, and one action answers once.
+            let refusal = TransferError::DraftConflict {
                 detail: format!(
                     "this draft is at revision {} and the binding expects {}",
                     row.revision.get(),
                     params.expected_revision.get()
                 ),
-            });
+            };
+            drop(store);
+            return self.refuse_unless_performed(action, refusal);
         }
         // A method that needs the agent to open the file gets a narrow read grant over that one
         // file, inside the staging area and outside every repository. A typed submission needs no
@@ -1248,6 +1277,7 @@ impl TransferService {
             .cloned()
             .ok_or_else(|| TransferError::store("the binding that was written is not readable"))?;
         let result = AgentDraftAddAttachmentResult { draft, attachment };
+        check_result_size(&result, "this draft with the attachment bound to it")?;
         let retained = match action {
             Some(action) => Some(action.retained(
                 kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
@@ -1260,6 +1290,13 @@ impl TransferService {
             params.expected_revision,
             grant.as_ref(),
             retained.as_ref(),
+            // An attachment with no session of its own takes the draft's, so its retention follows
+            // the session that holds it from this moment rather than from its submission.
+            upload
+                .session_id
+                .is_none()
+                .then_some(row.session_id)
+                .flatten(),
         )? {
             Some(_) => Ok(result),
             None => {
@@ -1325,7 +1362,9 @@ impl TransferService {
             },
         };
         store
-            .bind_attachment(&binding, row.revision, None, None)?
+            // The insertion outcome changes the binding's state and nothing about which session
+            // owns the attachment.
+            .bind_attachment(&binding, row.revision, None, None, None)?
             .ok_or_else(|| TransferError::store("the draft's revision moved during this record"))?;
         let bindings = store.bindings(draft_id)?;
         let handles = self.handles_of(&store, &bindings)?;
@@ -1376,7 +1415,11 @@ impl TransferService {
         let bindings = store.bindings(draft_id)?;
         let handles = self.handles_of(&store, &bindings)?;
         drop(store);
-        self.compose_draft(&row, &bindings, &handles)
+        let record = self.compose_draft(&row, &bindings, &handles)?;
+        // The same budget a mutation is held to. A record too large to send is refused with the
+        // reason rather than turned into a frame the connection cannot carry.
+        check_result_size(&record, "this draft")?;
+        Ok(record)
     }
 
     /// Returns one narrow read grant, refusing a revoked or expired one.
@@ -1440,6 +1483,22 @@ impl TransferService {
                 Some(UploadState::Published) => recovery.completed_publications += 1,
                 _ => recovery.unresolved_publications += 1,
             }
+        }
+        // A snapshot whose construction was interrupted is a reservation with no caller behind
+        // it: nothing will ever open it, and its bytes and its transfer slot stay charged until
+        // something closes it. Nothing is being staged yet at this point, so every reserving row
+        // found here is one an earlier daemon left.
+        let reserving = self
+            .locked()?
+            .snapshots_in(crate::store::SnapshotState::Reserving)?;
+        for row in reserving {
+            self.release_snapshot_held(
+                &row,
+                crate::store::SnapshotState::Failed,
+                Some("this snapshot was still being staged when its daemon ended"),
+                now,
+            )?;
+            recovery.interrupted_snapshots += 1;
         }
         let (removed, unremovable) = self.retry_cleanup()?;
         recovery.removed_payloads = removed;
@@ -1603,15 +1662,19 @@ impl TransferService {
             let _ = self.discard_payloads(&row);
             sweep.expired_attachments += 1;
         }
-        let snapshots = self.locked()?.snapshots_in(SnapshotState::Open)?;
+        let mut snapshots = self.locked()?.snapshots_in(SnapshotState::Open)?;
+        // A reserving row past its expiry is one whose staging never finished. A newer one may
+        // belong to a call still running in this process, which is why only the expiry decides.
+        snapshots.extend(self.locked()?.snapshots_in(SnapshotState::Reserving)?);
         for candidate in snapshots {
             let Some(row) = self.locked()?.snapshot(candidate.transfer_id)? else {
                 continue;
             };
-            if row.state != SnapshotState::Open || row.expires_at_ms.get() > now.get() {
+            if !row.state.holds_bytes() || row.expires_at_ms.get() > now.get() {
                 continue;
             }
-            self.release_snapshot(
+            // The payload lock is already held here, so the release must not take it again.
+            self.release_snapshot_held(
                 &row,
                 SnapshotState::Expired,
                 Some("this snapshot outlived its expiry"),
@@ -1710,6 +1773,29 @@ impl TransferService {
     /// Reached when a transaction carrying an action found it already recorded, which means
     /// another attempt at the same action committed first. That attempt's result is the answer
     /// this one owes its caller.
+    /// Answers a refusal from the retained record when this action has already been performed.
+    ///
+    /// A precondition a request fails can be one its own first attempt created: the reservation it
+    /// charged against the environment, or the revision it moved. Two concurrent copies of one
+    /// action must not answer differently, so where a refusal could have that explanation the
+    /// record is consulted before the refusal is returned. An identifier carrying a different
+    /// payload is still a reused identifier.
+    fn refuse_unless_performed<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        action: Option<&Action>,
+        refusal: TransferError,
+    ) -> Result<T> {
+        if action.is_none() {
+            return Err(refusal);
+        }
+        match self.retained_result(action) {
+            Ok(result) => Ok(result),
+            // A reused identifier is what it is whatever this request would have failed for.
+            Err(conflict @ TransferError::IdConflict { .. }) => Err(conflict),
+            Err(_) => Err(refusal),
+        }
+    }
+
     fn retained_result<T: serde::de::DeserializeOwned + serde::Serialize>(
         &self,
         action: Option<&Action>,
@@ -2035,6 +2121,26 @@ fn check_original_name(name: &str) -> Result<()> {
 }
 
 /// Refuses a handle the declared contribution does not admit.
+/// Refuses a result too large to travel in the frame that carries it.
+///
+/// Every mutation that returns a draft can grow the reply: one more attachment, one more preview,
+/// a longer text. A reply the host cannot send would leave the caller with a committed effect and
+/// no receipt, so the encoded size is checked before the commit and the refusal changes nothing.
+fn check_result_size<T: serde::Serialize>(result: &T, what: &str) -> Result<u64> {
+    let encoded = kr_cbor::to_canonical_vec(result).map_err(TransferError::store)?;
+    let len = encoded.len() as u64;
+    if len > kr_protocol::transfer::MAX_TRANSFER_RESULT_BYTES {
+        return Err(TransferError::QuotaExceeded {
+            detail: format!(
+                "{what} encodes to {len} bytes and a reply carries at most {}; remove an \
+                 attachment or shorten the text",
+                kr_protocol::transfer::MAX_TRANSFER_RESULT_BYTES
+            ),
+        });
+    }
+    Ok(len)
+}
+
 fn check_contribution(
     contribution: &kr_protocol::transfer::AttachmentContribution,
     handle: &AttachmentHandle,

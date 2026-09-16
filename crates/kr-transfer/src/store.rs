@@ -821,9 +821,10 @@ impl Store {
                     row.stored_name,
                     row.state.as_str(),
                     as_i64(row.reserved_byte_len),
-                    row.payload_identity.map(|identity| as_i64(identity.device)),
                     row.payload_identity
-                        .map(|identity| as_i64(identity.file_id)),
+                        .map(|identity| identity_sql(identity.device)),
+                    row.payload_identity
+                        .map(|identity| identity_sql(identity.file_id)),
                     as_i64(row.created_at_ms.get()),
                     as_i64(row.expires_at_ms.get()),
                 ],
@@ -1714,10 +1715,27 @@ impl Store {
         expected: DraftRevision,
         grant: Option<&GrantRow>,
         action: Option<&RetainedAction>,
+        session_id: Option<SessionId>,
     ) -> Result<Option<DraftRevision>> {
         let transaction = self.begin()?;
         if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
             return Ok(None);
+        }
+        // An attachment uploaded without a session becomes that session's when it is bound to a
+        // draft for one, in the same transaction as the binding. Recorded here rather than at
+        // submission, so a second draft for another session finds the session already set and is
+        // refused instead of quietly sharing the attachment.
+        if let Some(session_id) = session_id {
+            transaction
+                .execute(
+                    "UPDATE uploads SET session_id = ?2
+                     WHERE transfer_id = ?1 AND session_id IS NULL",
+                    params![
+                        uuid_sql(binding.transfer_id.get()),
+                        uuid_sql(session_id.get()),
+                    ],
+                )
+                .map_err(TransferError::store)?;
         }
         let changed = transaction
             .execute(
@@ -2398,6 +2416,28 @@ mod tests {
             published_at_ms: None,
             submitted_at_ms: None,
         }
+    }
+
+    #[test]
+    fn a_filesystem_identity_survives_the_whole_range_of_the_journal() {
+        let mut store = Store::in_memory(environment()).expect("opens");
+        // A device number and a file identifier are unsigned and use the whole range. SQLite
+        // stores signed integers, so the conversion has to be a reinterpretation rather than a
+        // clamp: an identifier with its high bit set must come back as itself.
+        let extreme = crate::authority::ObjectIdentity {
+            device: u64::MAX,
+            file_id: u64::MAX - 1,
+        };
+        let mut row = upload(9, 64);
+        row.payload_identity = Some(extreme);
+        store.insert_upload(&row, None).expect("records the upload");
+
+        let read = store
+            .upload(transfer(9))
+            .expect("reads it back")
+            .expect("the row exists");
+
+        assert_eq!(read.payload_identity, Some(extreme));
     }
 
     #[test]

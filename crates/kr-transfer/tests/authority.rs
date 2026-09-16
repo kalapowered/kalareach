@@ -503,7 +503,13 @@ fn a_component_swapped_under_running_lookups_never_resolves_outside() {
         let swapper = threads.spawn(|| {
             let real = inside.join("src");
             let parked = inside.join(".parked");
-            while !stop.load(Ordering::Relaxed) {
+            // Bounded as well as flagged. An assertion that fails in the lookups below unwinds
+            // without setting the flag, and a producer that waited only for the flag would then
+            // keep this scope waiting for it for ever.
+            for _ in 0..4_000 {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 // The real directory is parked and a link to the tree outside takes its name.
                 std::fs::rename(&real, &parked).expect("parks the real directory");
                 std::os::unix::fs::symlink(&outside, &real).expect("links to the outside tree");

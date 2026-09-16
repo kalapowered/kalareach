@@ -148,6 +148,30 @@ impl TransferService {
         reason: Option<&str>,
         now: TimestampMs,
     ) -> Result<()> {
+        // Before the journal's lock, and held across the removal, which is the order every path
+        // that needs both locks uses. A caller that already holds it uses
+        // [`Self::release_snapshot_held`] instead; this mutex is not reentrant.
+        let payloads = self
+            .payloads
+            .lock()
+            .map_err(|_| crate::service::poisoned())?;
+        let outcome = self.release_snapshot_held(row, state, reason, now);
+        drop(payloads);
+        outcome
+    }
+
+    /// Closes a snapshot and removes whatever it staged, with the payload lock already held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the row cannot be written.
+    pub(crate) fn release_snapshot_held(
+        &self,
+        row: &SnapshotRow,
+        state: SnapshotState,
+        reason: Option<&str>,
+        now: TimestampMs,
+    ) -> Result<()> {
         if !self
             .locked()?
             .close_snapshot(row.transfer_id, state, reason, now)?
@@ -304,6 +328,8 @@ impl TransferService {
             device_id: params.device_id.0,
             scope_id: None,
             source_transfer_id: Some(source),
+            // The fields below are the same whatever the admission decides; the row is built here
+            // so the check and the insert can be one transaction.
             immutability: DownloadImmutability::ImmutableSource,
             source_label: format!("attachment {source}"),
             stored_name: None,
@@ -320,7 +346,24 @@ impl TransferService {
             created_at_ms: now,
             expires_at_ms: snapshot_expiry(now),
         };
-        self.locked()?.insert_snapshot(&row, &chunks)?;
+        {
+            // The ceiling is checked again here, in the same transaction as the row that occupies
+            // a slot. Checked only at the start, two concurrent downloads could each see the last
+            // slot free and both take it.
+            let mut store = self.locked()?;
+            let limits = store.limits()?;
+            let open = store.open_transfers(actor)?;
+            if open >= limits.max_concurrent_transfers {
+                return Err(TransferError::Concurrency {
+                    detail: format!(
+                        "this device already holds {open} of {} concurrent transfers; finish or \
+                         release one first",
+                        limits.max_concurrent_transfers
+                    ),
+                });
+            }
+            store.insert_snapshot(&row, &chunks)?;
+        }
         Ok(DownloadBeginResult {
             transfer_id,
             environment_id: self.environment_id,
@@ -482,10 +525,37 @@ impl TransferService {
             .staging
             .snapshots()
             .open_read(stored, ObjectPolicy::HostOwnedFile)?;
+        // The payload's own length, before anything reads all of it. A source that grew between
+        // the reservation and the clone would otherwise be hashed in full and only then compared
+        // with the bytes the environment reserved for it.
+        let staged_len = destination.revalidate()?;
+        if staged_len != before.byte_len {
+            return Err(TransferError::source_changed(format!(
+                "{} was {} bytes when this snapshot was reserved and the snapshot is {staged_len}",
+                reserved.source_label, before.byte_len
+            )));
+        }
+        // A clone copies the source's mode bits, so an executable source would otherwise produce
+        // an executable payload. The payload policy is this host's, not the source's.
+        normalise_payload(&destination)?;
+        // The copy path flushed its own writes; a clone never went through this host's handle, so
+        // its data is flushed here, before the record that says the snapshot serves bytes.
+        destination
+            .handle()
+            .sync_data()
+            .map_err(TransferError::staging)?;
+        let (content_digest, byte_len) = digest_of(&mut destination)?;
+        if byte_len != before.byte_len {
+            return Err(TransferError::integrity(
+                "the staged snapshot is not the size that was copied into it",
+            ));
+        }
         if immutability == DownloadImmutability::StagedSnapshot {
-            // The source is read again through the same handle. A size, an identity or a
-            // modification time that moved means the copy may cover two versions, and there is no
-            // honest way to serve it.
+            // A byte copy is not atomic, so what it produced has to be shown to be one revision
+            // of the source rather than assumed to be.
+            //
+            // The cheap evidence first: an identity, a size or a modification time that moved
+            // means the copy may cover two versions.
             let after = source_state(source)?;
             if after != before || copied != before.byte_len {
                 return Err(TransferError::source_changed(format!(
@@ -494,12 +564,18 @@ impl TransferService {
                     reserved.source_label
                 )));
             }
-        }
-        let (content_digest, byte_len) = digest_of(&mut destination)?;
-        if byte_len != before.byte_len {
-            return Err(TransferError::integrity(
-                "the staged snapshot is not the size that was copied into it",
-            ));
+            // Then the evidence that does not depend on metadata at all. A writer that rewrote the
+            // same number of bytes and restored the modification time passes the comparison above,
+            // so the source is read again and its digest compared with the copy's: equal digests
+            // mean the copy is byte-for-byte a state the source actually held.
+            let (source_digest, source_len) = digest_of(source)?;
+            if source_len != byte_len || source_digest != content_digest {
+                return Err(TransferError::source_changed(format!(
+                    "{} does not match the copy taken of it, so this snapshot covers no single \
+                     version of it",
+                    reserved.source_label
+                )));
+            }
         }
         let layout = ChunkLayout::for_length(byte_len);
         let chunks = chunk_digests(&mut destination, layout)?;
@@ -651,6 +727,29 @@ fn clone_file(
     Err(std::io::Error::other(
         "this platform offers no filesystem clone",
     ))
+}
+
+/// Applies this host's payload permissions to a staged snapshot.
+///
+/// A copy-on-write clone carries the source's mode bits across, so a clone of a world-readable or
+/// executable file would be a payload with those permissions. Every other payload this service
+/// creates is owner-only and never executable, and a snapshot is no different.
+#[cfg(unix)]
+fn normalise_payload(file: &AuthorisedFile) -> Result<()> {
+    use std::os::fd::AsFd as _;
+
+    rustix::fs::fchmod(
+        file.handle().as_fd(),
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .map_err(|error| TransferError::staging(std::io::Error::from(error)))
+}
+
+/// Windows has no mode bits, and a clone there is a byte copy into a file this host created, which
+/// already carries the staging area's inherited owner-only entry.
+#[cfg(not(unix))]
+fn normalise_payload(_file: &AuthorisedFile) -> Result<()> {
+    Ok(())
 }
 
 /// Returns one snapshot, for the principal that opened it.
@@ -906,12 +1005,30 @@ impl<'destination> DownloadWriter<'destination> {
             .temporary
             .clone()
             .ok_or_else(|| TransferError::staging("this download has already been published"))?;
-        // The handle is closed before the name moves, because Windows refuses to replace a name a
-        // handle still holds open.
-        self.file = None;
+        // Everything above read the open handle, which keeps its object whatever happens to the
+        // name. What publishes is the *name*, so the name has to be shown to still hold the
+        // object that was verified before it is published: something that took the temporary name
+        // in between would otherwise be what the destination ends up holding.
+        let staged = self
+            .destination
+            .open_read(&temporary, ObjectPolicy::ReadableFile)?;
+        if staged.identity() != verified {
+            return Err(TransferError::integrity(format!(
+                "{} no longer holds the object this download verified",
+                temporary.as_str()
+            )));
+        }
+        drop(staged);
         if self.placement.allow_overwrite {
             // The user asked for this destination to be replaced. A rename replaces atomically, so
-            // there is no moment when the name holds nothing.
+            // there is no moment when the name holds nothing. The handle is closed first, because
+            // Windows refuses to replace a name a handle still holds open.
+            //
+            // This is the one publish that cannot be undone: between the check above and the
+            // rename there is no read, but there is also nothing to restore if the name were
+            // swapped in that instant, because the file it replaced is the one the user asked to
+            // replace.
+            self.file = None;
             self.destination
                 .rename_into(&temporary, self.destination, &self.final_name)?;
         } else {
@@ -936,7 +1053,23 @@ impl<'destination> DownloadWriter<'destination> {
                     });
                 }
             }
+            // The link this call created has to name the verified object. If it does not, the name
+            // did not exist before this call, so removing it leaves the destination exactly as it
+            // was rather than holding something nobody asked for.
+            let published = self
+                .destination
+                .open_read(&self.final_name, ObjectPolicy::ReadableFile)?;
+            if published.identity() != verified {
+                drop(published);
+                let _ = self.destination.remove(&self.final_name);
+                return Err(TransferError::integrity(format!(
+                    "{} does not hold the object this download verified, so it was not published",
+                    self.placement.destination_name
+                )));
+            }
+            drop(published);
             // The temporary name goes only once the published one holds the file.
+            self.file = None;
             self.destination.remove(&temporary)?;
         }
         // The name now has to hold the object that was verified. A rename and a link both preserve

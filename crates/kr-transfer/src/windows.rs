@@ -222,12 +222,14 @@ fn evaluate(
     for text in TRUSTED_ACCOUNTS {
         trusted.push(OwnedSid::parse(text)?);
     }
-    let permitted = |sid: PSID| {
-        equal(sid, accounts.user())
-            || equal(sid, accounts.owner())
-            || trusted.iter().any(|account| equal(sid, account.as_psid()))
-    };
-    if !permitted(owner) {
+    // Two different rules, so they are two different predicates. The owner has to be an account
+    // this process could have created the directory as: its own user, or the owner new objects of
+    // this process receive. The machine's own accounts are trusted to *hold* the directory, which
+    // nothing can prevent, but a directory owned by one of them is not one this host created.
+    let is_owner = |sid: PSID| equal(sid, accounts.user()) || equal(sid, accounts.owner());
+    let permitted =
+        |sid: PSID| is_owner(sid) || trusted.iter().any(|account| equal(sid, account.as_psid()));
+    if !is_owner(owner) {
         return Err(Refusal::Policy(format!(
             "{what} belongs to {}, and this host runs as another account",
             describe(owner)

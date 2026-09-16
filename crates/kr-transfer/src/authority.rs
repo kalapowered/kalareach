@@ -596,33 +596,45 @@ impl AuthorisedDirectory {
     ///
     /// Returns the first rule the name breaks, or the create or open failure.
     pub fn create_subdirectory(&self, name: &RelativeName) -> Result<Self, Escape> {
-        let components = name.components();
-        let mut prefix = String::new();
-        let mut display = self.display.clone();
-        for component in &components {
+        let mut current = Self {
+            environment_id: self.environment_id,
+            directory: self
+                .directory
+                .try_clone()
+                .map_err(|error| Escape::Unopenable {
+                    component: self.display.display().to_string(),
+                    detail: error.to_string(),
+                })?,
+            identity: self.identity,
+            display: self.display.clone(),
+        };
+        // One component at a time, each against the handle of the directory it goes in rather
+        // than against an accumulated path. Nothing above a created component is resolved, so a
+        // component replaced after it was checked cannot decide where the next one is created.
+        for component in name.components() {
             check_component(component)?;
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(component);
-            match create_owner_only_directory(&self.directory, &prefix) {
+            match create_owner_only_directory(&current.directory, component) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(Escape::Unopenable {
-                        component: prefix.clone(),
+                        component: component.to_owned(),
                         detail: error.to_string(),
                     });
                 }
             }
-            let child = open_directory(&self.directory, &prefix)?;
+            let child = open_directory(&current.directory, component)?;
             // A directory beneath a boundary inherits the boundary's owner entry on Windows by
             // design, so what is checked here is the accounts its list names.
-            owner_only(&child, &prefix, Privacy::OwnerOnly)?;
+            owner_only(&child, component, Privacy::OwnerOnly)?;
+            // The entry that names the new directory is durable before anything inside it is
+            // created, so a power loss cannot leave a payload in a directory the parent forgot.
+            current.sync()?;
+            let mut display = current.display.clone();
             display.push(component);
+            current = Self::from_handle(self.environment_id, child, display)?;
         }
-        let directory = open_directory(&self.directory, name.as_str())?;
-        Self::from_handle(self.environment_id, directory, display)
+        Ok(current)
     }
 
     /// Opens a descendant for reading, refusing every link on the way.
@@ -654,7 +666,10 @@ impl AuthorisedDirectory {
     ///
     /// Returns the first rule the name breaks, or the create failure.
     pub fn create_new(&self, name: &RelativeName) -> Result<AuthorisedFile, Escape> {
-        self.check_prefixes(name, name.components().len() - 1)?;
+        // One component, so this directory's own handle is the whole resolution. A creation is the
+        // one operation a later refusal cannot undo, so it never depends on a prefix that could
+        // have been replaced between being checked and being resolved.
+        single_component(name)?;
         let mut options = OpenOptions::new();
         options
             .read(true)
@@ -680,7 +695,8 @@ impl AuthorisedDirectory {
     ///
     /// Returns the first rule the name or the object breaks.
     pub fn open_write(&self, name: &RelativeName) -> Result<AuthorisedFile, Escape> {
-        self.check_prefixes(name, name.components().len() - 1)?;
+        // One component, for the same reason a creation is: what is written cannot be unwritten.
+        single_component(name)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).follow(FollowSymlinks::No);
         no_wait(&mut options);
@@ -821,7 +837,8 @@ impl AuthorisedDirectory {
     /// Returns the first rule the name breaks, or the removal failure. A name that is already
     /// absent succeeds.
     pub fn remove(&self, name: &RelativeName) -> Result<(), Escape> {
-        self.check_prefixes(name, name.components().len() - 1)?;
+        // One component, as for every other operation that changes what a directory holds.
+        single_component(name)?;
         match self.directory.remove_file_or_symlink(name.as_str()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1224,10 +1241,17 @@ fn rustix_uid() -> u32 {
 fn sync_directory(directory: &Dir) -> std::io::Result<()> {
     use std::os::fd::AsFd as _;
 
-    // The descriptor is duplicated so the flush owns what it closes; `fsync` on a directory
-    // descriptor is what makes the names inside it durable.
-    let descriptor = directory.as_fd().try_clone_to_owned()?;
-    std::fs::File::from(descriptor).sync_all()
+    // A duplicate of this handle is not enough. `cap-std` opens a directory with `O_PATH` where
+    // the platform has it, which is a reference to the directory rather than a file description,
+    // and Linux refuses to flush one. So the flush opens a descriptor of its own for the same
+    // directory, relative to the handle and never by path, and flushes that.
+    let flushable = rustix::fs::openat(
+        directory.as_fd(),
+        ".",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    rustix::fs::fsync(&flushable).map_err(std::io::Error::from)
 }
 
 /// Windows refuses a flush on a directory handle, and a rename inside one volume is the platform's

@@ -1703,3 +1703,135 @@ fn a_replaced_payload_is_never_served_to_a_download() {
         "the refusal names the change rather than serving the bytes: {refusal}"
     );
 }
+
+/// KR-REQ-14.11, KR-REQ-23.41: an attachment uploaded without a session takes the session of the
+/// draft it is bound to, and a draft for another session cannot then take it.
+#[test]
+fn an_attachment_bound_to_a_session_draft_becomes_that_sessions() {
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let handle = harness.publish(&bytes, "application/octet-stream", "notes.bin");
+    assert_eq!(
+        handle.session_id,
+        Nullable::null(),
+        "it was uploaded without one"
+    );
+    let first = SessionId::new(Uuid::from_bytes([21; 16]));
+    let second = SessionId::new(Uuid::from_bytes([22; 16]));
+    let draft = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &kr_protocol::transfer::DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(first),
+                application_instance_id: Nullable::null(),
+                text: "for the first session".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the first draft")
+        .draft;
+
+    harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &kr_protocol::transfer::AgentDraftAddAttachmentParams {
+                draft_id: draft.draft_id,
+                transfer_id: handle.transfer_id,
+                expected_revision: draft.revision,
+                contribution: contribution(&handle),
+            },
+            None,
+        )
+        .expect("binds the attachment to the first session's draft");
+
+    // The attachment now belongs to that session, which is what its retention will follow.
+    assert_eq!(
+        harness
+            .service
+            .attachment_handle(&harness.actor, handle.transfer_id)
+            .expect("reads the handle")
+            .session_id,
+        Nullable::some(first)
+    );
+
+    // A draft for another session cannot take it.
+    let elsewhere = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &kr_protocol::transfer::DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(second),
+                application_instance_id: Nullable::null(),
+                text: "for the second session".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the second draft")
+        .draft;
+    let refusal = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &kr_protocol::transfer::AgentDraftAddAttachmentParams {
+                draft_id: elsewhere.draft_id,
+                transfer_id: handle.transfer_id,
+                expected_revision: elsewhere.revision,
+                contribution: contribution(&handle),
+            },
+            None,
+        )
+        .expect_err("the attachment is already another session's");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+}
+
+/// KR-REQ-23.41: a draft whose reply would not fit the frame that carries it is refused, and the
+/// draft is left as it was.
+#[test]
+fn a_draft_too_large_to_send_is_refused_before_it_is_written() {
+    let harness = Harness::create();
+    let draft = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &kr_protocol::transfer::DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::null(),
+                application_instance_id: Nullable::null(),
+                text: "short enough".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+
+    let refusal = harness
+        .service
+        .draft_update(
+            &harness.actor,
+            &kr_protocol::transfer::DraftUpdateParams {
+                draft_id: draft.draft_id,
+                expected_revision: draft.revision,
+                text: "x".repeat(
+                    usize::try_from(kr_protocol::transfer::MAX_TRANSFER_RESULT_BYTES).unwrap_or(0)
+                        + 1,
+                ),
+            },
+            None,
+        )
+        .expect_err("a reply that large cannot be sent");
+
+    assert_eq!(refusal.code(), ErrorCode::QuotaExceeded);
+    let unchanged = harness
+        .service
+        .draft(&harness.actor, draft.draft_id)
+        .expect("reads the draft");
+    assert_eq!(unchanged.revision, draft.revision);
+    assert_eq!(unchanged.text, "short enough");
+}
