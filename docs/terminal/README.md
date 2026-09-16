@@ -1005,21 +1005,24 @@ measured on the hosts it has run on, in September 2026, each one the rate three 
 after a discarded warm-up. The stream that scrolls is the harder of the two, because every row it
 prints joins the historical cache and the cache is enforced on the way.
 
-| Host | Plain stream | Stream that scrolls |
-| --- | --- | --- |
-| Apple M4 Pro, 12 processors | 11.4 MiB/s | 7.5 MiB/s |
-| Intel Xeon 6973P-C, 4 processors | 8.5 MiB/s | 5.7 MiB/s |
-| Intel Xeon Platinum 8573C, 4 processors | 6.9 MiB/s | 4.8 MiB/s |
-| AMD EPYC 7763 64-Core, 4 processors | 5.2 to 5.4 MiB/s | 3.7 to 3.8 MiB/s |
+| Host | Plain stream | Stream that scrolls | Where it was measured |
+| --- | --- | --- | --- |
+| Apple M4 Pro, 12 processors | 11.1 to 11.4 MiB/s | 7.3 to 7.6 MiB/s | local runs of this revision |
+| Intel Xeon 6973P-C, 4 processors | 8.5 MiB/s | 5.7 MiB/s | `core-ci` run 35127815035 |
+| Intel Xeon Platinum 8573C, 4 processors | 6.9 MiB/s | 4.8 MiB/s | `core-ci` run 35125837021 |
+| AMD EPYC 7763 64-Core, 4 processors | 5.2 to 5.4 MiB/s | 3.7 to 3.8 MiB/s | `core-ci` runs 35118939233, 35120519784, 35123616447, 35130325631 and 35133681704 |
 
-Each row is one host's sampled runs and not a fixed property of that processor. Section 27 asks a
+Each row is one host's sampled runs and not a fixed property of that processor. The runs named are
+`core-ci` runs of this revision's terminal engine, and each of them retains the figures, the
+processor and the verdict it measured, so a row can be read back to the run it came from.
+
+Section 27 asks a
 reference host for at least four CPU cores and 8 GiB, so four processors is the floor a host has to
 meet the target on, and two of the four-processor hosts above are under it on the stream that
 scrolls. A faster host clearing the target does not settle that: the figure is asserted on every
 optimised run, so a host that does not reach it says so, and the run keeps the number and the
 processor. Further optimisation of the engine's output path is tracked separately, and the 5 MiB/s
 target is not moving.
-
 
 It drains a 5 MiB stream of mixed text, colour changes, cursor movement, wide characters,
 hyperlinks, alternate-screen churn and queries, and checks that the response lane, the row cache and
