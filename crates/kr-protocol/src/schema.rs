@@ -56,6 +56,7 @@ use crate::project::{
     WorkspaceReadParams, WorkspaceReadResult, WorkspaceRemoveParams, WorkspaceRemoveResult,
     WorkspaceSummary,
 };
+use crate::projection::{ProjectionDelta, ProjectionReset, ProjectionRowPage, ProjectionSnapshot};
 use crate::push::{
     PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest, PushInstallationBinding,
     PushRegistrationAnswer, PushRegistrationChallenge, PushRequest, PushSenderRecord,
@@ -209,6 +210,10 @@ pub fn protocol_schema() -> Value {
         "pair_status" => PairStatus,
         "pair_status_params" => PairStatusParams,
         "pair_status_result" => PairStatusResult,
+        "projection_delta" => ProjectionDelta,
+        "projection_reset" => ProjectionReset,
+        "projection_row_page" => ProjectionRowPage,
+        "projection_snapshot" => ProjectionSnapshot,
         "proposed_grant" => ProposedGrant,
         "protocol_error" => ProtocolError,
         "push_delivery_ack" => PushDeliveryAck,

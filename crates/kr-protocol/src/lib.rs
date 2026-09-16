@@ -113,6 +113,7 @@ pub mod method;
 pub mod pairing;
 pub mod preauth;
 pub mod project;
+pub mod projection;
 pub mod push;
 pub mod question;
 pub mod receipt;

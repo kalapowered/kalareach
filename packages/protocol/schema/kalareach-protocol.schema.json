@@ -440,16 +440,6 @@
         }
       ]
     },
-    "AdoptionFlow": {
-      "description": "The one adoption flow this host supports for a destination that already exists.\n\nSection 14 rejects a nonempty or existing destination *unless the user explicitly chooses an\nindependently supported adoption flow*, and forbids merging a clone into one. So there is\nexactly one member: adopting a checkout that is already a Git repository, which reads what is\nthere and writes nothing into the working tree. A second member would have to be a merge, and\nthat is the thing the paragraph forbids.",
-      "oneOf": [
-        {
-          "const": "existing_checkout",
-          "description": "Register an existing Git working tree as a repository, changing nothing inside it.\n\nThe host reads the repository's own configuration under the restricted profile, records its\nfilesystem identity and its current reference, and adds a row. It does not fetch, does not\ncheck anything out, does not touch the index and does not write into the working tree.",
-          "type": "string"
-        }
-      ]
-    },
     "AgentBindingRevision": {
       "description": "Changes when the active upstream execution owner or selected thread changes.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -1801,22 +1791,231 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
-    "ChangeKind": {
-      "description": "What the working tree holds for one path.\n\nA copy is not the only way to carry an inclusion: a deletion is carried by removing the path\nfrom the new workspace, and a path this host cannot read is carried by neither.",
+    "CellBlink": {
+      "description": "Whether and how a run of cells blinks.",
       "oneOf": [
         {
-          "const": "present",
-          "description": "The content differs from the base, or the path is new.",
+          "const": "none",
+          "description": "Not blinking.",
           "type": "string"
         },
         {
-          "const": "deleted",
-          "description": "The path is gone from the working tree and the base still has it.",
+          "const": "slow",
+          "description": "The slow rate.",
           "type": "string"
         },
         {
-          "const": "unmerged",
-          "description": "The path has an unresolved merge.",
+          "const": "rapid",
+          "description": "The rapid rate.",
+          "type": "string"
+        }
+      ]
+    },
+    "CellColour": {
+      "description": "One cell colour.",
+      "oneOf": [
+        {
+          "const": "default",
+          "description": "The session's own default, which a client resolves against the palette it was given.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A palette index.",
+          "properties": {
+            "indexed": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "indexed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A direct colour.",
+          "properties": {
+            "direct": {
+              "$ref": "#/$defs/Rgb"
+            }
+          },
+          "required": [
+            "direct"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CellRendition": {
+      "additionalProperties": false,
+      "description": "The graphic rendition of a run of cells.",
+      "properties": {
+        "background": {
+          "$ref": "#/$defs/CellColour",
+          "description": "The cell colour."
+        },
+        "blink": {
+          "$ref": "#/$defs/CellBlink",
+          "description": "The blink rate."
+        },
+        "bold": {
+          "description": "Bold.",
+          "type": "boolean"
+        },
+        "faint": {
+          "description": "Faint.",
+          "type": "boolean"
+        },
+        "foreground": {
+          "$ref": "#/$defs/CellColour",
+          "description": "The text colour."
+        },
+        "invisible": {
+          "description": "Invisible.",
+          "type": "boolean"
+        },
+        "italic": {
+          "description": "Italic.",
+          "type": "boolean"
+        },
+        "overline": {
+          "description": "Overlined.",
+          "type": "boolean"
+        },
+        "reverse": {
+          "description": "Reverse video.",
+          "type": "boolean"
+        },
+        "strikethrough": {
+          "description": "Struck through.",
+          "type": "boolean"
+        },
+        "underline": {
+          "$ref": "#/$defs/CellUnderline",
+          "description": "The underline style."
+        },
+        "underline_colour": {
+          "$ref": "#/$defs/CellColour",
+          "description": "The underline colour, where it differs from the text."
+        },
+        "vertical_align": {
+          "$ref": "#/$defs/CellVerticalAlign",
+          "description": "The position against the baseline."
+        }
+      },
+      "required": [
+        "foreground",
+        "background",
+        "underline_colour",
+        "underline",
+        "blink",
+        "vertical_align",
+        "bold",
+        "faint",
+        "italic",
+        "reverse",
+        "invisible",
+        "strikethrough",
+        "overline"
+      ],
+      "type": "object"
+    },
+    "CellRun": {
+      "additionalProperties": false,
+      "description": "One run of cells that share a rendition and a hyperlink.",
+      "properties": {
+        "cells": {
+          "$ref": "#/$defs/U64",
+          "description": "How many cells the run occupies, counting a wide cell as two.\n\nA client draws from `column` and advances by this, so a destination whose own width model\ndisagrees with the session's is corrected at the next run rather than shifting everything\nafter it."
+        },
+        "column": {
+          "$ref": "#/$defs/U64",
+          "description": "The canonical column of the first cell, zero-based."
+        },
+        "hyperlink": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The hyperlink this run is inside, as inert metadata."
+        },
+        "rendition": {
+          "$ref": "#/$defs/CellRendition",
+          "description": "The rendition."
+        },
+        "text": {
+          "description": "The text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "cells",
+        "text",
+        "rendition",
+        "hyperlink"
+      ],
+      "type": "object"
+    },
+    "CellUnderline": {
+      "description": "How a run of cells is underlined.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "Not underlined.",
+          "type": "string"
+        },
+        {
+          "const": "single",
+          "description": "One line.",
+          "type": "string"
+        },
+        {
+          "const": "double",
+          "description": "Two lines.",
+          "type": "string"
+        },
+        {
+          "const": "curly",
+          "description": "A curly line.",
+          "type": "string"
+        },
+        {
+          "const": "dotted",
+          "description": "A dotted line.",
+          "type": "string"
+        },
+        {
+          "const": "dashed",
+          "description": "A dashed line.",
+          "type": "string"
+        }
+      ]
+    },
+    "CellVerticalAlign": {
+      "description": "Where a run of cells sits against the baseline.",
+      "oneOf": [
+        {
+          "const": "baseline",
+          "description": "On the baseline.",
+          "type": "string"
+        },
+        {
+          "const": "superscript",
+          "description": "Raised.",
+          "type": "string"
+        },
+        {
+          "const": "subscript",
+          "description": "Lowered.",
           "type": "string"
         }
       ]
@@ -1967,6 +2166,49 @@
       "description": "The exact version of a change set that was tested or reviewed.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "CharsetDesignations": {
+      "additionalProperties": false,
+      "description": "The character sets a saved cursor carries.",
+      "properties": {
+        "g0": {
+          "description": "The set designated as G0.",
+          "type": "string"
+        },
+        "g1": {
+          "description": "The set designated as G1.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "g0",
+        "g1"
+      ],
+      "type": "object"
+    },
+    "CharsetState": {
+      "additionalProperties": false,
+      "description": "The designated character sets and the locking shift.",
+      "properties": {
+        "g0": {
+          "description": "The set designated as G0.",
+          "type": "string"
+        },
+        "g1": {
+          "description": "The set designated as G1.",
+          "type": "string"
+        },
+        "shift_out": {
+          "description": "Whether the shift-out set is selected.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "g0",
+        "g1",
+        "shift_out"
+      ],
+      "type": "object"
     },
     "ChunkDescriptor": {
       "additionalProperties": false,
@@ -2396,26 +2638,6 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
-    },
-    "ContentClass": {
-      "description": "What one path's content is, as far as this host read it.\n\nThe test for binary is Git's own: a null byte in the first eight thousand bytes of content as it\nis stored. [`Self::Unknown`] is the honest third answer, for a path this host did not read\nbecause the preview's scan bound was reached, or could not read at all. An unknown path is\ntreated as binary by an exclusion, because excluding what might be binary is the direction that\nhonours the request.",
-      "oneOf": [
-        {
-          "const": "text",
-          "description": "Read, and no null byte in the first eight thousand bytes.",
-          "type": "string"
-        },
-        {
-          "const": "binary",
-          "description": "Read, and a null byte in the first eight thousand bytes.",
-          "type": "string"
-        },
-        {
-          "const": "unknown",
-          "description": "Not read, so neither.",
-          "type": "string"
-        }
-      ]
     },
     "ControlEvent": {
       "description": "What the host sends on an authorised control stream outside a response.\n\nThe control stream carries ordinary [`Notification`] events once the connection is authorised.\nThese two messages are the connection's own, not an application event: the freshness resource\nand the transport's liveness belong to the connection rather than to any session.",
@@ -2854,55 +3076,6 @@
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
-    },
-    "DestinationRequest": {
-      "additionalProperties": false,
-      "description": "Where a repository operation puts what it creates.\n\nA parent the caller already holds authority over, and one single-component name inside it. The\nparent is named by a path the host resolves **once**, with its own ambient authority, into a\ndirectory handle; everything after that is relative to the handle. A multi-component name is\nrefused, because the operation that creates the entry must not depend on a prefix resolved\nafter the check.",
-      "properties": {
-        "environment_id": {
-          "$ref": "#/$defs/EnvironmentId",
-          "description": "The environment the repository will belong to."
-        },
-        "name": {
-          "description": "The single name inside it. No separators, no traversal segment, no reserved device name.",
-          "type": "string"
-        },
-        "parent_path": {
-          "description": "The parent directory, as an absolute host path the caller chose.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "environment_id",
-        "parent_path",
-        "name"
-      ],
-      "type": "object"
-    },
-    "DestinationState": {
-      "description": "What a destination looked like before an operation was allowed to use it.",
-      "oneOf": [
-        {
-          "const": "absent",
-          "description": "Nothing exists at the name.",
-          "type": "string"
-        },
-        {
-          "const": "empty_directory",
-          "description": "A directory exists at the name and holds nothing.",
-          "type": "string"
-        },
-        {
-          "const": "non_empty_directory",
-          "description": "A directory exists at the name and holds entries.",
-          "type": "string"
-        },
-        {
-          "const": "occupied",
-          "description": "A file, a link or something else exists at the name.",
-          "type": "string"
-        }
-      ]
     },
     "DeviceId": {
       "description": "One paired device.",
@@ -4970,25 +5143,6 @@
         }
       ]
     },
-    "FilesystemIdentity": {
-      "additionalProperties": false,
-      "description": "A repository's stable environment-local identity, as a client may show it.\n\nThe two numbers are the device and the object number of the Git directory: the inode on Unix\nand the file index on Windows. They are metadata a client can display and compare; they are\nnever an authority, because authority is the opened handle the host holds.",
-      "properties": {
-        "device": {
-          "$ref": "#/$defs/U64",
-          "description": "The device or volume the object lives on."
-        },
-        "file_id": {
-          "$ref": "#/$defs/U64",
-          "description": "The object's number within that device or volume."
-        }
-      },
-      "required": [
-        "device",
-        "file_id"
-      ],
-      "type": "object"
-    },
     "ForwardedMutation": {
       "additionalProperties": false,
       "description": "A mutation the host admitted for a caller, passed to the component that owns its subject.\n\nThe control daemon owns admission: it authenticates the caller, stamps the freshness window,\nchecks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding\ncarries the caller's mutation to the worker **unchanged**, because the mutation is what the\npayload digest covers and what the caller will retry with: rewriting any of it would give the\nworker a different action from the one the caller asked for.\n\nWhat travels beside it is what the worker cannot establish for itself: which principal the host\nverified, and the deadline the host accepted. The worker performs the action under both.",
@@ -5685,6 +5839,56 @@
       ],
       "type": "object"
     },
+    "HyperlinkChange": {
+      "additionalProperties": false,
+      "description": "The hyperlink the next character printed belongs to, once it has changed.\n\nA null target is an open link that closed. Without the distinction a client could not tell a\nlink that closed from one that was never mentioned.",
+      "properties": {
+        "uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The target, or null when no link is open."
+        }
+      },
+      "required": [
+        "uri"
+      ],
+      "type": "object"
+    },
+    "HyperlinkRange": {
+      "additionalProperties": false,
+      "description": "A hyperlink over a range of cells.\n\nIt is inert metadata. A reconnection restores it so a later click still works; nothing here\nactivates anything, and a scheme that would launch an external application needs the client's\nown policy before anything happens.",
+      "properties": {
+        "end_column": {
+          "$ref": "#/$defs/U64",
+          "description": "One past the last column."
+        },
+        "row": {
+          "$ref": "#/$defs/U64",
+          "description": "The stable row identifier."
+        },
+        "start_column": {
+          "$ref": "#/$defs/U64",
+          "description": "The first column, zero-based."
+        },
+        "uri": {
+          "description": "The target.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "row",
+        "start_column",
+        "end_column",
+        "uri"
+      ],
+      "type": "object"
+    },
     "IdempotencyBehaviour": {
       "description": "How a repeated request is resolved.",
       "oneOf": [
@@ -5727,182 +5931,6 @@
           "type": "string"
         }
       ]
-    },
-    "InclusionChoice": {
-      "description": "What a workspace does with the user's uncommitted work.\n\nEvery member is a decision the user made, and none of them removes anything from the user's own\ntree: an exclusion means the new workspace starts without that file, never that the file is\ncleaned, stashed or discarded where it is.",
-      "oneOf": [
-        {
-          "const": "include",
-          "description": "The workspace starts with this class of file copied in.",
-          "type": "string"
-        },
-        {
-          "const": "exclude",
-          "description": "The workspace starts without it. The original stays where it is, untouched.",
-          "type": "string"
-        }
-      ]
-    },
-    "InclusionClass": {
-      "description": "Which class of the working tree one previewed entry belongs to.\n\nThe first four say where a path came from and a path has exactly one of them.\n[`Self::BinaryFile`] is the exception: it cuts across the others, so it appears in the counts\nand in [`PreviewEntry::binary`] rather than as a path's own class.",
-      "oneOf": [
-        {
-          "const": "dirty_file",
-          "description": "A tracked file with uncommitted modifications.",
-          "type": "string"
-        },
-        {
-          "const": "untracked_file",
-          "description": "A file Git neither tracks nor ignores.",
-          "type": "string"
-        },
-        {
-          "const": "submodule",
-          "description": "A submodule working tree.",
-          "type": "string"
-        },
-        {
-          "const": "binary_file",
-          "description": "A file whose content Git reports as binary.",
-          "type": "string"
-        },
-        {
-          "const": "generated_artefact",
-          "description": "A file an ignore rule covers.",
-          "type": "string"
-        }
-      ]
-    },
-    "InclusionPolicy": {
-      "additionalProperties": false,
-      "description": "The inclusion policy of an isolated workspace, one decision per class.\n\nSection 14 names the five classes explicitly, so they are five fields rather than a list of\npatterns: a user answering five questions can see what they answered, and a policy that is a\npattern language cannot be previewed honestly.",
-      "properties": {
-        "binary_files": {
-          "$ref": "#/$defs/InclusionChoice",
-          "description": "Files whose content Git reports as binary."
-        },
-        "dirty_files": {
-          "$ref": "#/$defs/InclusionChoice",
-          "description": "Tracked files with uncommitted modifications."
-        },
-        "generated_artefacts": {
-          "$ref": "#/$defs/InclusionChoice",
-          "description": "Files an ignore rule covers, which is what a build usually produces."
-        },
-        "submodules": {
-          "$ref": "#/$defs/InclusionChoice",
-          "description": "Submodule working trees."
-        },
-        "untracked_files": {
-          "$ref": "#/$defs/InclusionChoice",
-          "description": "Files Git does not track and does not ignore."
-        }
-      },
-      "required": [
-        "dirty_files",
-        "untracked_files",
-        "submodules",
-        "binary_files",
-        "generated_artefacts"
-      ],
-      "type": "object"
-    },
-    "InclusionPreview": {
-      "additionalProperties": false,
-      "description": "What a reviewer would see, before the workspace exists.\n\nSection 14 requires the create interface to preview what will be included. This is that\npreview as data: exact counts per class, a bounded sample of paths, and the base the\nmaterialisation would start from. It is a read, so it creates nothing and changes nothing.",
-      "properties": {
-        "base_change_set_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ChangeSetId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The change-set version an isolated workspace would materialise, when it names one."
-        },
-        "base_reference": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The reference that revision was named by, when it was named by one."
-        },
-        "base_revision": {
-          "description": "The revision an isolated workspace would start from, as the repository resolved it.",
-          "type": "string"
-        },
-        "counts": {
-          "description": "One row per class, with exact counts.",
-          "items": {
-            "$ref": "#/$defs/PreviewCount"
-          },
-          "type": "array"
-        },
-        "counts_complete": {
-          "description": "True when every count above is the whole of its class.\n\nFalse when a bound was reached: an ignored directory deeper or larger than the walk\ncovers, or a directory this host could not list. Then each count is a lower bound and the\nlimitations say which bound was reached.",
-          "type": "boolean"
-        },
-        "entries": {
-          "description": "A bounded sample of the paths, grouped by class in [`InclusionClass::EVERY`] order.",
-          "items": {
-            "$ref": "#/$defs/PreviewEntry"
-          },
-          "type": "array"
-        },
-        "kind": {
-          "$ref": "#/$defs/WorkspaceKind",
-          "description": "The kind of workspace it was taken for."
-        },
-        "limitations": {
-          "description": "What this preview cannot promise, in the host's own words.\n\nA shared workspace is not a sandbox; a worktree shares repository metadata; a working tree\ncan change between the preview and the creation. A client shows this rather than deciding\nfor the user.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "omitted_entries": {
-          "$ref": "#/$defs/U64",
-          "description": "How many paths the sample left out. The counts still cover them."
-        },
-        "policy": {
-          "$ref": "#/$defs/InclusionPolicy",
-          "description": "The policy it was taken under."
-        },
-        "project_repository_id": {
-          "$ref": "#/$defs/ProjectRepositoryId",
-          "description": "The repository the preview was taken on."
-        },
-        "taken_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When it was taken."
-        },
-        "unknown_content": {
-          "$ref": "#/$defs/U64",
-          "description": "How many paths this host could not classify as text or binary.\n\nReading every path's first bytes costs an open each, and a working tree with a build\ndirectory in it holds hundreds of thousands. Above [`MAX_BINARY_SCAN_ENTRIES`] the host\nstops reading and says how many it did not read rather than calling them text."
-        }
-      },
-      "required": [
-        "project_repository_id",
-        "kind",
-        "policy",
-        "base_revision",
-        "base_reference",
-        "base_change_set_id",
-        "counts",
-        "entries",
-        "omitted_entries",
-        "unknown_content",
-        "counts_complete",
-        "limitations",
-        "taken_at_ms"
-      ],
-      "type": "object"
     },
     "InputAcquireParams": {
       "additionalProperties": false,
@@ -6245,21 +6273,6 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
-    "IsolationMechanism": {
-      "description": "How an isolated workspace is separated from the user's own tree.",
-      "oneOf": [
-        {
-          "const": "git_worktree",
-          "description": "A Git worktree: separate working files, shared repository metadata, same account.\n\nNot a security sandbox. A process in this workspace can read and write the repository's\nobjects and references, which are the same ones the user's own tree uses.",
-          "type": "string"
-        },
-        {
-          "const": "independent_clone",
-          "description": "An independent clone: its own object store and its own references.\n\nUsed where shared metadata is not acceptable. It costs the objects it copies.",
-          "type": "string"
-        }
-      ]
-    },
     "KeyId": {
       "contentEncoding": "base64url",
       "description": "A 32-byte key identifier: the SHA-256 of the domain-separated encoding of a key purpose and public key.",
@@ -6363,6 +6376,35 @@
           "type": "string"
         }
       ]
+    },
+    "KittyKeyboardState": {
+      "additionalProperties": false,
+      "description": "One buffer's Kitty keyboard negotiation.",
+      "properties": {
+        "flags": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The flags in force, when the protocol is in use."
+        },
+        "stack": {
+          "description": "The flag stack, oldest first.",
+          "items": {
+            "$ref": "#/$defs/U64"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "flags",
+        "stack"
+      ],
+      "type": "object"
     },
     "LaunchCommand": {
       "description": "What a launch installs in the editor.\n\nAn argument vector is the safe form: the integration quotes it for its own shell. A quoted\ncommand is already the exact text to run, and neither form is assembled by interpolation.",
@@ -6637,6 +6679,35 @@
       "required": [
         "object",
         "filename"
+      ],
+      "type": "object"
+    },
+    "MarginState": {
+      "additionalProperties": false,
+      "description": "The scroll region.",
+      "properties": {
+        "bottom": {
+          "$ref": "#/$defs/U64",
+          "description": "The bottom row, zero-based and inclusive."
+        },
+        "left": {
+          "$ref": "#/$defs/U64",
+          "description": "The left column, zero-based and inclusive."
+        },
+        "right": {
+          "$ref": "#/$defs/U64",
+          "description": "The right column, zero-based and inclusive."
+        },
+        "top": {
+          "$ref": "#/$defs/U64",
+          "description": "The top row, zero-based and inclusive."
+        }
+      },
+      "required": [
+        "top",
+        "bottom",
+        "left",
+        "right"
       ],
       "type": "object"
     },
@@ -7843,142 +7914,6 @@
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },
-    "OperationRecord": {
-      "additionalProperties": false,
-      "description": "One repository operation, as a read or a cancellation returns it.",
-      "properties": {
-        "action_id": {
-          "$ref": "#/$defs/ActionId",
-          "description": "The action that started it. This is the create token a reconciliation is decided against."
-        },
-        "destination_state": {
-          "$ref": "#/$defs/DestinationState",
-          "description": "The destination's state when the operation was admitted."
-        },
-        "detail": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Why it ended, when it ended for a reason."
-        },
-        "ended_at_ms": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimestampMs"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "When it ended, once it has."
-        },
-        "environment_id": {
-          "$ref": "#/$defs/EnvironmentId",
-          "description": "The environment that owns it."
-        },
-        "method": {
-          "description": "Which method started it.",
-          "type": "string"
-        },
-        "project_repository_id": {
-          "$ref": "#/$defs/ProjectRepositoryId",
-          "description": "The repository it creates, allocated when the operation begins."
-        },
-        "remote": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RemoteSpecification"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The remote it reaches, when it reaches one."
-        },
-        "removed_staging_paths": {
-          "description": "The staging paths this host removed.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "retained_staging_paths": {
-          "description": "The staging paths that still exist, for a person to find.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "started_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When it started."
-        },
-        "state": {
-          "$ref": "#/$defs/OperationState",
-          "description": "What state it is in."
-        }
-      },
-      "required": [
-        "action_id",
-        "environment_id",
-        "project_repository_id",
-        "method",
-        "state",
-        "remote",
-        "destination_state",
-        "retained_staging_paths",
-        "removed_staging_paths",
-        "detail",
-        "started_at_ms",
-        "ended_at_ms"
-      ],
-      "type": "object"
-    },
-    "OperationState": {
-      "description": "What state one repository operation is in.",
-      "oneOf": [
-        {
-          "const": "staging",
-          "description": "It is staging content and has published nothing.",
-          "type": "string"
-        },
-        {
-          "const": "publishing",
-          "description": "Staging finished, and the publication into the destination is under way.\n\nA daemon that dies here resolves the publication from the create token rather than starting\nanother clone: whichever name holds the staged object decides what happened.",
-          "type": "string"
-        },
-        {
-          "const": "completed",
-          "description": "It completed and the repository exists.",
-          "type": "string"
-        },
-        {
-          "const": "cancelled",
-          "description": "The caller cancelled it. The result says which staging paths were removed and which stayed.",
-          "type": "string"
-        },
-        {
-          "const": "failed",
-          "description": "It failed. The reason is recorded and the staged content is cleaned up.",
-          "type": "string"
-        },
-        {
-          "const": "expired",
-          "description": "It ran past [`OPERATION_DEADLINE`].",
-          "type": "string"
-        },
-        {
-          "const": "unknown",
-          "description": "It was interrupted and this host cannot say whether its publication landed.\n\nReconciliation resolves it against the create token; until it does, a repeat of the same\naction is answered with this rather than performed again.",
-          "type": "string"
-        }
-      ]
-    },
     "OrganisationId": {
       "description": "One organisation whose signed policy a host has opted into.",
       "format": "uuid",
@@ -8635,6 +8570,115 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "PaletteOverride": {
+      "additionalProperties": false,
+      "description": "One indexed colour that differs from the profile default.",
+      "properties": {
+        "colour": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The colour."
+        },
+        "index": {
+          "description": "The palette index.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "index",
+        "colour"
+      ],
+      "type": "object"
+    },
+    "PaletteProvenance": {
+      "description": "Where the session's palette came from.\n\nProvenance travels with the palette because succession must not change it. A second attachment\nwith different colours is shown the session's palette, not its own, and the source says which\none that is.",
+      "oneOf": [
+        {
+          "const": "profile_default",
+          "description": "The profile's own default palette.",
+          "type": "string"
+        },
+        {
+          "const": "client_preference",
+          "description": "A client's stated foreground and background, shared during the bounded probe.",
+          "type": "string"
+        },
+        {
+          "const": "light_preset",
+          "description": "The light preset, selected for a no-probe or invisible creation.",
+          "type": "string"
+        },
+        {
+          "const": "dark_preset",
+          "description": "The dark preset, selected for a no-probe or invisible creation.",
+          "type": "string"
+        },
+        {
+          "const": "explicit_change",
+          "description": "An authorised, explicit palette change made after creation.",
+          "type": "string"
+        }
+      ]
+    },
+    "PaletteState": {
+      "additionalProperties": false,
+      "description": "The session's canonical palette and where it came from.",
+      "properties": {
+        "background": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The default background."
+        },
+        "cursor": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The cursor colour."
+        },
+        "foreground": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The default foreground."
+        },
+        "overrides": {
+          "description": "The indexed colours that differ from the profile default.",
+          "items": {
+            "$ref": "#/$defs/PaletteOverride"
+          },
+          "type": "array"
+        },
+        "pointer_background": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The pointer background."
+        },
+        "pointer_foreground": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The pointer foreground."
+        },
+        "selection_background": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The selection background."
+        },
+        "selection_foreground": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The selection foreground."
+        },
+        "source": {
+          "$ref": "#/$defs/PaletteProvenance",
+          "description": "Where this palette came from."
+        }
+      },
+      "required": [
+        "source",
+        "foreground",
+        "background",
+        "cursor",
+        "pointer_foreground",
+        "pointer_background",
+        "selection_background",
+        "selection_foreground",
+        "overrides"
+      ],
+      "type": "object"
+    },
     "ParamsValue": {
       "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.",
       "tsType": "unknown"
@@ -8939,81 +8983,6 @@
         }
       ]
     },
-    "PreviewCount": {
-      "additionalProperties": false,
-      "description": "One class's counts in a preview.",
-      "properties": {
-        "byte_len": {
-          "$ref": "#/$defs/U64",
-          "description": "Their total size in bytes, as far as the host could read it."
-        },
-        "class": {
-          "$ref": "#/$defs/InclusionClass",
-          "description": "The class."
-        },
-        "included": {
-          "$ref": "#/$defs/U64",
-          "description": "How many of them the policy in force would copy in."
-        },
-        "total": {
-          "$ref": "#/$defs/U64",
-          "description": "How many paths in the working tree belong to it."
-        }
-      },
-      "required": [
-        "class",
-        "total",
-        "included",
-        "byte_len"
-      ],
-      "type": "object"
-    },
-    "PreviewEntry": {
-      "additionalProperties": false,
-      "description": "One path an inclusion preview names.",
-      "properties": {
-        "byte_len": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/U64"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Its size in bytes, when the host could read one."
-        },
-        "change": {
-          "$ref": "#/$defs/ChangeKind",
-          "description": "What change the working tree holds for it."
-        },
-        "class": {
-          "$ref": "#/$defs/InclusionClass",
-          "description": "Which class it belongs to: where in the working tree it came from."
-        },
-        "content": {
-          "$ref": "#/$defs/ContentClass",
-          "description": "What its content is.\n\nThis cuts across the other classes rather than replacing them: a dirty file may be binary,\nand a policy that includes dirty files and excludes binaries leaves this one out."
-        },
-        "included": {
-          "description": "Whether the policy in force would copy it into the new workspace.",
-          "type": "boolean"
-        },
-        "path": {
-          "description": "The path, relative to the repository's top level.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "path",
-        "class",
-        "change",
-        "content",
-        "byte_len",
-        "included"
-      ],
-      "type": "object"
-    },
     "PreviewFormat": {
       "description": "The image formats a preview decoder accepts.\n\nNothing else is decoded. HTML and SVG are files, not images: rendering either needs a reviewed\nrenderer, which this is not.",
       "oneOf": [
@@ -9083,101 +9052,544 @@
         }
       ]
     },
-    "ProjectAdoptParams": {
+    "ProjectRepositoryId": {
+      "description": "One environment-bound source repository.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "ProjectedBuffer": {
+      "description": "Which screen buffer something belongs to.",
+      "oneOf": [
+        {
+          "const": "primary",
+          "description": "The primary buffer, which has the scrollback.",
+          "type": "string"
+        },
+        {
+          "const": "alternate",
+          "description": "The alternate buffer, which has none.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProjectedCursor": {
       "additionalProperties": false,
-      "description": "Parameters of `project.adopt`.",
+      "description": "The cursor, as a projection carries it.",
       "properties": {
-        "destination": {
-          "$ref": "#/$defs/DestinationRequest",
-          "description": "The checkout to adopt, named the same way a destination is."
+        "column": {
+          "$ref": "#/$defs/U64",
+          "description": "The canonical column, zero-based."
         },
-        "flow": {
-          "$ref": "#/$defs/AdoptionFlow",
-          "description": "The flow the user explicitly chose.\n\nThere is no default. A destination that already exists is refused unless this names a flow,\nwhich is what section 14 requires."
+        "pending_wrap": {
+          "description": "Whether the next printable character wraps before it is placed.\n\nThe same coordinates mean different things with and without it, so a renderer that left it\nout would put the next character in the wrong cell.",
+          "type": "boolean"
         },
-        "label": {
-          "description": "The label the user gave it.",
+        "row": {
+          "$ref": "#/$defs/U64",
+          "description": "The row within the visible page, zero-based."
+        },
+        "style": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor-style number."
+        },
+        "visible": {
+          "description": "Whether the cursor is shown.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "column",
+        "row",
+        "visible",
+        "style",
+        "pending_wrap"
+      ],
+      "type": "object"
+    },
+    "ProjectedKeyboard": {
+      "additionalProperties": false,
+      "description": "The keyboard negotiation an input encoder has to reproduce.\n\nEach buffer has its own stack, so a full-screen application's negotiation cannot leak into the\nshell's when it exits. A client that knew only the active one would send the wrong encoding the\nmoment the application quit.",
+      "properties": {
+        "alternate": {
+          "$ref": "#/$defs/KittyKeyboardState",
+          "description": "The alternate buffer's negotiation."
+        },
+        "modify_other_keys": {
+          "$ref": "#/$defs/U64",
+          "description": "The `modifyOtherKeys` level."
+        },
+        "primary": {
+          "$ref": "#/$defs/KittyKeyboardState",
+          "description": "The primary buffer's negotiation."
+        }
+      },
+      "required": [
+        "modify_other_keys",
+        "primary",
+        "alternate"
+      ],
+      "type": "object"
+    },
+    "ProjectedMode": {
+      "additionalProperties": false,
+      "description": "One tracked mode and its value.",
+      "properties": {
+        "enabled": {
+          "description": "Whether it is set.",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/ProjectedModeKind",
+          "description": "Which spelling."
+        },
+        "mode": {
+          "$ref": "#/$defs/U64",
+          "description": "The mode number."
+        }
+      },
+      "required": [
+        "kind",
+        "mode",
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "ProjectedModeKind": {
+      "description": "Which spelling a tracked mode has.",
+      "oneOf": [
+        {
+          "const": "ansi",
+          "description": "An ANSI mode, set with `CSI h` and reset with `CSI l`.",
+          "type": "string"
+        },
+        {
+          "const": "dec",
+          "description": "A DEC private mode, set with `CSI ? h` and reset with `CSI ? l`.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProjectedRow": {
+      "additionalProperties": false,
+      "description": "One row of the canonical grid.",
+      "properties": {
+        "row": {
+          "$ref": "#/$defs/U64",
+          "description": "The stable identifier, which survives scrollback eviction and names the same row in every\nlater update."
+        },
+        "runs": {
+          "description": "The runs, left to right.",
+          "items": {
+            "$ref": "#/$defs/CellRun"
+          },
+          "type": "array"
+        },
+        "soft_wrapped": {
+          "description": "Whether the row ends in a soft wrap rather than a hard line break.\n\nA selection that copies two soft-wrapped rows copies one logical line, which is why the\nmarker travels with the row instead of being inferred from its length.",
+          "type": "boolean"
+        },
+        "truncated": {
+          "description": "Whether runs were dropped to keep the row inside a page's byte bound.\n\nThe degradation is explicit: a client shows what it was given and knows it is not all of\nthe row, rather than drawing a short row as though the application had written one.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "soft_wrapped",
+        "truncated",
+        "runs"
+      ],
+      "type": "object"
+    },
+    "ProjectedTitle": {
+      "additionalProperties": false,
+      "description": "The current titles.",
+      "properties": {
+        "icon": {
+          "description": "The icon title.",
+          "type": "string"
+        },
+        "window": {
+          "description": "The window title.",
           "type": "string"
         }
       },
       "required": [
-        "destination",
-        "label",
-        "flow"
+        "icon",
+        "window"
       ],
       "type": "object"
     },
-    "ProjectAdoptResult": {
+    "ProjectedViewport": {
       "additionalProperties": false,
-      "description": "Result of `project.adopt`.",
+      "description": "The part of the canonical grid one client is showing.",
       "properties": {
-        "operation": {
-          "$ref": "#/$defs/OperationRecord",
-          "description": "The operation that registered it."
+        "columns": {
+          "$ref": "#/$defs/U64",
+          "description": "How many columns are shown."
         },
-        "project": {
-          "$ref": "#/$defs/ProjectSummary",
-          "description": "The repository that is now known here."
+        "left_column": {
+          "$ref": "#/$defs/U64",
+          "description": "The first canonical column shown, for a display narrower than the grid."
+        },
+        "rows": {
+          "$ref": "#/$defs/U64",
+          "description": "How many rows are shown."
+        },
+        "top_row": {
+          "$ref": "#/$defs/U64",
+          "description": "The stable identifier of the first row shown."
         }
       },
       "required": [
-        "project",
-        "operation"
+        "top_row",
+        "rows",
+        "left_column",
+        "columns"
       ],
       "type": "object"
     },
-    "ProjectCloneParams": {
+    "ProjectionDelta": {
       "additionalProperties": false,
-      "description": "Parameters of `project.clone`.",
+      "description": "A bounded update against a known base.\n\nThis is what a projected attachment receives per batch of output: the rows that changed and the\nstate that changed with them, never the whole screen.",
       "properties": {
-        "destination": {
-          "$ref": "#/$defs/DestinationRequest",
-          "description": "Where the clone goes."
+        "base_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor this update continues from. A client holding another one asks for a snapshot."
         },
-        "label": {
-          "description": "The label the user gave it.",
+        "buffer": {
+          "$ref": "#/$defs/ProjectedBuffer",
+          "description": "Which buffer the rows belong to."
+        },
+        "charsets": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CharsetState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The designated character sets, when they changed."
+        },
+        "cursor": {
+          "$ref": "#/$defs/ProjectedCursor",
+          "description": "The cursor after the update."
+        },
+        "dimensions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Dimensions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The canonical dimensions, when they changed."
+        },
+        "evicted": {
+          "description": "Whether rows below `oldest_retained_row` have been evicted.",
+          "type": "boolean"
+        },
+        "hyperlink": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HyperlinkChange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The open hyperlink, when it changed."
+        },
+        "hyperlinks": {
+          "description": "The hyperlink ranges of the rows carried here.",
+          "items": {
+            "$ref": "#/$defs/HyperlinkRange"
+          },
+          "type": "array"
+        },
+        "keyboard": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectedKeyboard"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The keyboard negotiation, when it changed."
+        },
+        "margins": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MarginState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The scroll region, when it changed."
+        },
+        "modes": {
+          "description": "The modes that changed since the base.",
+          "items": {
+            "$ref": "#/$defs/ProjectedMode"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor after it."
+        },
+        "oldest_retained_row": {
+          "$ref": "#/$defs/U64",
+          "description": "The oldest row still retained anywhere."
+        },
+        "palette": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaletteState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The palette, when an authorised explicit change moved it."
+        },
+        "projection_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation it belongs to."
+        },
+        "rendition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CellRendition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The pen, when it changed."
+        },
+        "rows": {
+          "description": "The rows that changed, by stable identifier. A row not named here is unchanged.",
+          "items": {
+            "$ref": "#/$defs/ProjectedRow"
+          },
+          "type": "array"
+        },
+        "saved_cursors": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/SavedCursorState"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The saved cursors, when one was saved or restored."
+        },
+        "tab_stops": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/U64"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The tab stops, when they changed."
+        },
+        "title": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectedTitle"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The titles, when they changed."
+        },
+        "title_stack": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/SavedTitleEntry"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The virtual title stack, when the titles changed."
+        },
+        "viewport": {
+          "$ref": "#/$defs/ProjectedViewport",
+          "description": "The window this client is showing, which a scroll moves without changing any row."
+        }
+      },
+      "required": [
+        "base_cursor",
+        "next_cursor",
+        "projection_generation",
+        "buffer",
+        "viewport",
+        "rows",
+        "cursor",
+        "modes",
+        "margins",
+        "rendition",
+        "tab_stops",
+        "charsets",
+        "hyperlinks",
+        "hyperlink",
+        "title",
+        "title_stack",
+        "keyboard",
+        "palette",
+        "dimensions",
+        "saved_cursors",
+        "oldest_retained_row",
+        "evicted"
+      ],
+      "type": "object"
+    },
+    "ProjectionReset": {
+      "additionalProperties": false,
+      "description": "Discard whatever is being shown; a snapshot follows.",
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor the reset happened at."
+        },
+        "projection_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation the client is now on."
+        },
+        "reason": {
+          "$ref": "#/$defs/ProjectionResetReason",
+          "description": "Why."
+        }
+      },
+      "required": [
+        "projection_generation",
+        "cursor",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "ProjectionResetReason": {
+      "description": "Why a projection was reset.",
+      "oneOf": [
+        {
+          "const": "attached",
+          "description": "The attachment has just joined, or has just been moved into projected mode.",
           "type": "string"
         },
-        "remote": {
-          "$ref": "#/$defs/RemoteSpecification",
-          "description": "The remote to clone, its validated transport, its provider and its credential broker."
+        {
+          "const": "buffer_switch",
+          "description": "The screen buffer changed, which replaces the grid rather than changing it.",
+          "type": "string"
+        },
+        {
+          "const": "geometry",
+          "description": "The canonical geometry changed, which reflows every row.",
+          "type": "string"
+        },
+        {
+          "const": "replay_gap",
+          "description": "The client's base cursor is outside the bounded replay window.",
+          "type": "string"
+        },
+        {
+          "const": "history_evicted",
+          "description": "Retained rows the client was holding have been evicted.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProjectionRowPage": {
+      "additionalProperties": false,
+      "description": "One page of rows belonging to one buffer of one snapshot.",
+      "properties": {
+        "buffer": {
+          "$ref": "#/$defs/ProjectedBuffer",
+          "description": "Which buffer they belong to."
+        },
+        "evicted": {
+          "description": "Whether rows below `oldest_retained_row` have been evicted.",
+          "type": "boolean"
+        },
+        "more": {
+          "description": "Whether more pages of this snapshot follow.\n\nA client that has not seen a page with this clear does not yet hold the whole screen, and\nsection 8 forbids mixing live output with an incomplete repaint.",
+          "type": "boolean"
+        },
+        "oldest_retained_row": {
+          "$ref": "#/$defs/U64",
+          "description": "The oldest row still retained anywhere."
+        },
+        "output_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor of the snapshot these rows complete."
+        },
+        "projection_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation these rows belong to."
+        },
+        "rows": {
+          "description": "The rows, in stable-identifier order.",
+          "items": {
+            "$ref": "#/$defs/ProjectedRow"
+          },
+          "type": "array"
         }
       },
       "required": [
-        "destination",
-        "label",
-        "remote"
+        "projection_generation",
+        "output_cursor",
+        "buffer",
+        "rows",
+        "oldest_retained_row",
+        "evicted",
+        "more"
       ],
       "type": "object"
     },
-    "ProjectCloneResult": {
+    "ProjectionSnapshot": {
       "additionalProperties": false,
-      "description": "Result of `project.clone`.",
+      "description": "Everything a screen is, apart from its rows.\n\nThe rows follow in [`ProjectionRowPage`]s, because a canonical grid of 2,048 columns by 1,024\nrows in two buffers is not one message. A client installs the state here, paints the pages as\nthey arrive, and applies deltas from `output_cursor` once the last page has landed.",
       "properties": {
-        "operation": {
-          "$ref": "#/$defs/OperationRecord",
-          "description": "The operation that created it."
+        "active_buffer": {
+          "$ref": "#/$defs/ProjectedBuffer",
+          "description": "Which buffer is active."
         },
-        "project": {
-          "$ref": "#/$defs/ProjectSummary",
-          "description": "The repository that now exists."
-        }
-      },
-      "required": [
-        "project",
-        "operation"
-      ],
-      "type": "object"
-    },
-    "ProjectInitParams": {
-      "additionalProperties": false,
-      "description": "Parameters of `project.init`.",
-      "properties": {
-        "destination": {
-          "$ref": "#/$defs/DestinationRequest",
-          "description": "Where the repository goes."
+        "charsets": {
+          "$ref": "#/$defs/CharsetState",
+          "description": "The designated character sets."
         },
-        "initial_branch": {
+        "cursor": {
+          "$ref": "#/$defs/ProjectedCursor",
+          "description": "The cursor."
+        },
+        "dimensions": {
+          "$ref": "#/$defs/Dimensions",
+          "description": "The canonical dimensions."
+        },
+        "evicted": {
+          "description": "Whether rows below `oldest_retained_row` have been evicted.",
+          "type": "boolean"
+        },
+        "hyperlink": {
           "anyOf": [
             {
               "type": "string"
@@ -9186,260 +9598,98 @@
               "type": "null"
             }
           ],
-          "description": "The name of the initial branch, when the user chose one."
+          "description": "The hyperlink the next character printed belongs to."
         },
-        "label": {
-          "description": "The label the user gave it.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "destination",
-        "label",
-        "initial_branch"
-      ],
-      "type": "object"
-    },
-    "ProjectInitResult": {
-      "additionalProperties": false,
-      "description": "Result of `project.init`.",
-      "properties": {
-        "operation": {
-          "$ref": "#/$defs/OperationRecord",
-          "description": "The operation that created it."
+        "keyboard": {
+          "$ref": "#/$defs/ProjectedKeyboard",
+          "description": "The keyboard negotiation an input encoder has to reproduce."
         },
-        "project": {
-          "$ref": "#/$defs/ProjectSummary",
-          "description": "The repository that now exists."
-        }
-      },
-      "required": [
-        "project",
-        "operation"
-      ],
-      "type": "object"
-    },
-    "ProjectListParams": {
-      "additionalProperties": false,
-      "description": "Parameters of `project.list`.",
-      "properties": {
-        "environment_id": {
-          "$ref": "#/$defs/EnvironmentId",
-          "description": "The environment to list."
-        }
-      },
-      "required": [
-        "environment_id"
-      ],
-      "type": "object"
-    },
-    "ProjectListResult": {
-      "additionalProperties": false,
-      "description": "Result of `project.list`.",
-      "properties": {
-        "projects": {
-          "description": "The repositories, oldest first.",
+        "keypad_application": {
+          "description": "Whether the keypad is in application mode.",
+          "type": "boolean"
+        },
+        "margins": {
+          "$ref": "#/$defs/MarginState",
+          "description": "The scroll region."
+        },
+        "modes": {
+          "description": "Every tracked mode.",
           "items": {
-            "$ref": "#/$defs/ProjectSummary"
+            "$ref": "#/$defs/ProjectedMode"
           },
           "type": "array"
-        }
-      },
-      "required": [
-        "projects"
-      ],
-      "type": "object"
-    },
-    "ProjectOperationCancelParams": {
-      "additionalProperties": false,
-      "description": "Parameters of `project.operation.cancel`.",
-      "properties": {
-        "operation_action_id": {
-          "$ref": "#/$defs/ActionId",
-          "description": "The action that started the operation to cancel."
-        }
-      },
-      "required": [
-        "operation_action_id"
-      ],
-      "type": "object"
-    },
-    "ProjectOperationCancelResult": {
-      "additionalProperties": false,
-      "description": "Result of `project.operation.cancel`.",
-      "properties": {
-        "operation": {
-          "$ref": "#/$defs/OperationRecord",
-          "description": "The operation, with its retained and removed staging paths."
         },
-        "stopped_processes": {
+        "oldest_retained_row": {
           "$ref": "#/$defs/U64",
-          "description": "How many subprocesses this host owned and stopped."
-        }
-      },
-      "required": [
-        "operation",
-        "stopped_processes"
-      ],
-      "type": "object"
-    },
-    "ProjectOrigin": {
-      "description": "How a repository came to be known to this host.",
-      "oneOf": [
-        {
-          "const": "initialised",
-          "description": "`project.init` created it empty.",
-          "type": "string"
+          "description": "The oldest row still retained anywhere."
         },
-        {
-          "const": "cloned",
-          "description": "`project.clone` cloned it from a remote.",
-          "type": "string"
+        "output_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The monotonic output cursor this snapshot describes. Updates resume from here."
         },
-        {
-          "const": "adopted",
-          "description": "`project.adopt` registered an existing checkout.",
-          "type": "string"
-        }
-      ]
-    },
-    "ProjectReadParams": {
-      "additionalProperties": false,
-      "description": "Parameters of `project.read`.",
-      "properties": {
-        "project_repository_id": {
-          "$ref": "#/$defs/ProjectRepositoryId",
-          "description": "The repository to read."
-        }
-      },
-      "required": [
-        "project_repository_id"
-      ],
-      "type": "object"
-    },
-    "ProjectReadResult": {
-      "additionalProperties": false,
-      "description": "Result of `project.read`.",
-      "properties": {
-        "operation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/OperationRecord"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The operation that created it, when this host still has the record."
+        "palette": {
+          "$ref": "#/$defs/PaletteState",
+          "description": "The canonical palette and its provenance."
         },
-        "project": {
-          "$ref": "#/$defs/ProjectSummary",
-          "description": "The repository."
+        "projection_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation this screen belongs to. Every later update names it."
         },
-        "workspaces": {
-          "description": "Its workspaces.",
+        "rendition": {
+          "$ref": "#/$defs/CellRendition",
+          "description": "The pen the next character would be drawn with."
+        },
+        "saved_cursors": {
+          "description": "The cursor each buffer has saved.",
           "items": {
-            "$ref": "#/$defs/WorkspaceSummary"
+            "$ref": "#/$defs/SavedCursorState"
           },
           "type": "array"
+        },
+        "tab_stops": {
+          "description": "The columns carrying a tab stop.",
+          "items": {
+            "$ref": "#/$defs/U64"
+          },
+          "type": "array"
+        },
+        "title": {
+          "$ref": "#/$defs/ProjectedTitle",
+          "description": "The current titles."
+        },
+        "title_stack": {
+          "description": "The virtual title stack, oldest first.",
+          "items": {
+            "$ref": "#/$defs/SavedTitleEntry"
+          },
+          "type": "array"
+        },
+        "viewport": {
+          "$ref": "#/$defs/ProjectedViewport",
+          "description": "The window this client is showing."
         }
       },
       "required": [
-        "project",
-        "workspaces",
-        "operation"
-      ],
-      "type": "object"
-    },
-    "ProjectRepositoryId": {
-      "description": "One environment-bound source repository.",
-      "format": "uuid",
-      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-      "type": "string"
-    },
-    "ProjectState": {
-      "description": "What state one repository record is in.",
-      "oneOf": [
-        {
-          "const": "ready",
-          "description": "The repository exists and its identity matched the last time it was opened.",
-          "type": "string"
-        },
-        {
-          "const": "creating",
-          "description": "The operation that would have created it is still running.",
-          "type": "string"
-        },
-        {
-          "const": "detached",
-          "description": "The object the record names is gone, or a different object now holds its path.\n\nThe record is kept rather than deleted: a repository whose disk was unmounted comes back,\nand a record that named an object which has been replaced is evidence rather than rubbish.\nNothing is served from it until its identity matches again.",
-          "type": "string"
-        }
-      ]
-    },
-    "ProjectSummary": {
-      "additionalProperties": false,
-      "description": "One repository, as a scoped read returns it.",
-      "properties": {
-        "created_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the record was written."
-        },
-        "display_path": {
-          "description": "The path it was created or adopted at, for a person to read.\n\nDiagnostics only. Re-resolving it would let a rename hand a grant to an unrelated tree,\nwhich is why every operation uses the recorded identity and an opened handle instead.",
-          "type": "string"
-        },
-        "environment_id": {
-          "$ref": "#/$defs/EnvironmentId",
-          "description": "The environment that owns it."
-        },
-        "filesystem_identity": {
-          "$ref": "#/$defs/FilesystemIdentity",
-          "description": "The stable filesystem identity of its Git directory."
-        },
-        "label": {
-          "description": "The label the user gave it.",
-          "type": "string"
-        },
-        "origin": {
-          "$ref": "#/$defs/ProjectOrigin",
-          "description": "How it came to be known here."
-        },
-        "project_repository_id": {
-          "$ref": "#/$defs/ProjectRepositoryId",
-          "description": "Its environment-local identity."
-        },
-        "remote": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RemoteSpecification"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The remote it was cloned from, when it has one."
-        },
-        "state": {
-          "$ref": "#/$defs/ProjectState",
-          "description": "What state the record is in."
-        },
-        "workspace_count": {
-          "$ref": "#/$defs/U64",
-          "description": "How many workspaces are selected on it."
-        }
-      },
-      "required": [
-        "project_repository_id",
-        "environment_id",
-        "label",
-        "origin",
-        "state",
-        "filesystem_identity",
-        "display_path",
-        "remote",
-        "created_at_ms",
-        "workspace_count"
+        "projection_generation",
+        "output_cursor",
+        "active_buffer",
+        "dimensions",
+        "viewport",
+        "cursor",
+        "saved_cursors",
+        "margins",
+        "rendition",
+        "tab_stops",
+        "charsets",
+        "modes",
+        "keypad_application",
+        "keyboard",
+        "title",
+        "title_stack",
+        "hyperlink",
+        "palette",
+        "oldest_retained_row",
+        "evicted"
       ],
       "type": "object"
     },
@@ -12184,60 +12434,6 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
-    "RemoteSpecification": {
-      "additionalProperties": false,
-      "description": "A remote a repository operation reaches, and who authenticates it.\n\nThe URL is here; a credential is not, and there is no field one could travel in. What the host\nrecords and what a diagnostic shows is this object, so a credential cannot leak through either.",
-      "properties": {
-        "credential_broker": {
-          "description": "The approved credential broker that authenticates it, when the transport needs one.\n\nEmpty for a transport that needs no credential. A named broker is one the host has, and a\nname it does not have is refused before anything is executed.",
-          "type": "string"
-        },
-        "provider": {
-          "description": "The provider that serves it, as the host resolved it from the host name.",
-          "type": "string"
-        },
-        "remote_name": {
-          "description": "The remote's name inside the repository, conventionally `origin`.",
-          "type": "string"
-        },
-        "transport": {
-          "$ref": "#/$defs/RemoteTransport",
-          "description": "The validated transport."
-        },
-        "url": {
-          "description": "The URL, with no user information and no credential.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "remote_name",
-        "transport",
-        "url",
-        "provider",
-        "credential_broker"
-      ],
-      "type": "object"
-    },
-    "RemoteTransport": {
-      "description": "The transports a repository operation may use.\n\nAn allowlist, because the question is not which transports Git can be talked into using (a list\nnobody can close: `ext::`, `file://` to a submodule helper, a remote helper on the path) but\nwhich ones this host validated. Everything else is refused with the reason, which is what\nsection 14 means by validating the transport before executing it.",
-      "oneOf": [
-        {
-          "const": "https",
-          "description": "`https://`. The credential broker supplies the authentication.",
-          "type": "string"
-        },
-        {
-          "const": "ssh",
-          "description": "`ssh://`, or the `user@host:path` form. The broker supplies the key.",
-          "type": "string"
-        },
-        {
-          "const": "local_path",
-          "description": "A local path on this host, used for a clone between two directories of the same machine.\n\nThe path is an authorised source handle rather than a URL, so a `file://` URL that Git\nwould hand to a helper never appears.",
-          "type": "string"
-        }
-      ]
-    },
     "RepositoryGeneration": {
       "description": "The catalogue generation a plugin package was resolved against.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -12556,72 +12752,6 @@
       ],
       "type": "object"
     },
-    "RetainedItem": {
-      "additionalProperties": false,
-      "description": "One thing a workspace holds that its removal would have to account for.",
-      "properties": {
-        "change_set_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ChangeSetId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The change set it belongs to, when it belongs to one."
-        },
-        "detail": {
-          "description": "What it is, in the host's own words.",
-          "type": "string"
-        },
-        "kind": {
-          "$ref": "#/$defs/RetainedKind",
-          "description": "What kind of thing it is."
-        }
-      },
-      "required": [
-        "kind",
-        "detail",
-        "change_set_id"
-      ],
-      "type": "object"
-    },
-    "RetainedKind": {
-      "description": "What kind of retained thing a workspace holds.",
-      "oneOf": [
-        {
-          "const": "dirty_content",
-          "description": "Uncommitted work in the workspace's own tree.",
-          "type": "string"
-        },
-        {
-          "const": "pinned_change_set",
-          "description": "A change-set version something has pinned.",
-          "type": "string"
-        },
-        {
-          "const": "review_evidence",
-          "description": "Evidence of a review that bound to a version of this workspace.",
-          "type": "string"
-        }
-      ]
-    },
-    "RetentionPolicy": {
-      "description": "What a workspace removal does with what it holds.",
-      "oneOf": [
-        {
-          "const": "keep_everything",
-          "description": "Keep everything. The workspace is removed only when it holds nothing.\n\nThe one a client offers first, because it is the only one that cannot lose work. What the\nworkspace holds is measured rather than assumed: its own uncommitted work as well as the\npins and the review evidence recorded against it. When it holds something, nothing is\nremoved and the result lists what.",
-          "type": "string"
-        },
-        {
-          "const": "remove_retained",
-          "description": "Remove everything, including what is held.\n\nSection 14 keeps dirty content, pinned change sets and review evidence until the user\napproves their removal, so this policy *is* the approval: it follows a\n[`Self::KeepEverything`] request that listed what is held, and the result lists what went.\n\nThere is deliberately no third policy that removes the working files while keeping the\ndirty content in them. Keeping content means capturing it, and capturing an immutable\nversion of a workspace is the change-set service's; a policy that claimed to keep what it\nhad just deleted would be a lie.",
-          "type": "string"
-        }
-      ]
-    },
     "RetryCategory": {
       "description": "How a client may react to an error.\n\nOnly idempotent reads, transfer chunks and requests whose receipt proves no dispatch may retry\nautomatically.",
       "oneOf": [
@@ -12902,6 +13032,39 @@
           "type": "object"
         }
       ]
+    },
+    "Rgb": {
+      "additionalProperties": false,
+      "description": "A direct colour.",
+      "properties": {
+        "blue": {
+          "description": "Blue.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "green": {
+          "description": "Green.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "red": {
+          "description": "Red.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "red",
+        "green",
+        "blue"
+      ],
+      "type": "object"
     },
     "RightCondition": {
       "description": "When a required authority applies.",
@@ -13226,6 +13389,100 @@
         "detached_attachment",
         "state",
         "discarded_input_bytes"
+      ],
+      "type": "object"
+    },
+    "SavedCursorState": {
+      "additionalProperties": false,
+      "description": "A cursor an application saved, with the pen it saved alongside it.",
+      "properties": {
+        "buffer": {
+          "$ref": "#/$defs/ProjectedBuffer",
+          "description": "Which buffer saved it."
+        },
+        "charsets": {
+          "$ref": "#/$defs/CharsetDesignations",
+          "description": "The character sets designated when it was saved."
+        },
+        "column": {
+          "$ref": "#/$defs/U64",
+          "description": "The column, zero-based."
+        },
+        "hyperlink": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The hyperlink that was open when it was saved."
+        },
+        "origin_mode": {
+          "description": "Whether origin mode was set when it was saved.",
+          "type": "boolean"
+        },
+        "pending_wrap": {
+          "description": "Whether the saved cursor had a pending wrap.",
+          "type": "boolean"
+        },
+        "rendition": {
+          "$ref": "#/$defs/CellRendition",
+          "description": "The rendition saved with it."
+        },
+        "row": {
+          "$ref": "#/$defs/U64",
+          "description": "The row, zero-based."
+        },
+        "style": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor-style number saved with it."
+        }
+      },
+      "required": [
+        "buffer",
+        "column",
+        "row",
+        "pending_wrap",
+        "rendition",
+        "charsets",
+        "origin_mode",
+        "style",
+        "hyperlink"
+      ],
+      "type": "object"
+    },
+    "SavedTitleEntry": {
+      "additionalProperties": false,
+      "description": "One entry of the virtual title stack.\n\nA push saves only the titles it names, so each field is either a title that was saved or\nnothing at all. The two are different: a pop leaves the current title alone where nothing was\nsaved for it, and a client that flattened the distinction would show the wrong title after one.",
+      "properties": {
+        "icon": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The icon title, when this entry saved one."
+        },
+        "window": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The window title, when this entry saved one."
+        }
+      },
+      "required": [
+        "icon",
+        "window"
       ],
       "type": "object"
     },
@@ -15430,415 +15687,11 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
-    "WorkspaceCreateParams": {
-      "additionalProperties": false,
-      "description": "Parameters of `workspace.preview`, which is a read `workspace.create` shares its shape with.\n\nThis is not a method of its own: `workspace.create` carries the same fields and the daemon\nanswers the preview from the create parameters when `preview_only` is set. One shape is a\nconvenience rather than a binding: a preview and a creation are two independent requests, and\na creation returns the preview it was created under, which is what a client shows.",
-      "properties": {
-        "base_change_set_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ChangeSetId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The change-set version an isolated workspace materialises, when it names one."
-        },
-        "base_revision": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The revision an isolated workspace starts from, when it names one directly."
-        },
-        "destination": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/DestinationRequest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Where an isolated workspace's working tree goes.\n\nA shared workspace names none: it is the repository's own tree."
-        },
-        "isolation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/IsolationMechanism"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "How an isolated workspace is separated. Ignored for a shared one."
-        },
-        "kind": {
-          "$ref": "#/$defs/WorkspaceKind",
-          "description": "Which kind it is. Explicit, with no default."
-        },
-        "label": {
-          "description": "The label the user gave it.",
-          "type": "string"
-        },
-        "policy": {
-          "$ref": "#/$defs/InclusionPolicy",
-          "description": "The inclusion policy, one decision per class."
-        },
-        "preview_only": {
-          "description": "Return the preview and create nothing.\n\nThe create interface previews first, and the preview is this method with nothing written.\nIt is still a mutation in the registry, because the parameters are the same object and a\ncaller that may not create a workspace has no business measuring one.",
-          "type": "boolean"
-        },
-        "project_repository_id": {
-          "$ref": "#/$defs/ProjectRepositoryId",
-          "description": "The repository to make a working copy of."
-        }
-      },
-      "required": [
-        "project_repository_id",
-        "label",
-        "kind",
-        "isolation",
-        "policy",
-        "base_revision",
-        "base_change_set_id",
-        "destination",
-        "preview_only"
-      ],
-      "type": "object"
-    },
-    "WorkspaceCreateResult": {
-      "additionalProperties": false,
-      "description": "Result of `workspace.create`.",
-      "properties": {
-        "preview": {
-          "$ref": "#/$defs/InclusionPreview",
-          "description": "What a reviewer would see, always."
-        },
-        "unapplied": {
-          "description": "The paths the policy included that this host could not carry into the workspace.\n\nA symbolic link, a device, a submodule's own working tree, and a path whose destination\nthis host could not replace. The workspace exists and is usable; what it does not hold is\nnamed here rather than left for a reviewer to notice.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "workspace": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/WorkspaceSummary"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The workspace, or nothing when this was a preview."
-        }
-      },
-      "required": [
-        "workspace",
-        "preview",
-        "unapplied"
-      ],
-      "type": "object"
-    },
     "WorkspaceId": {
       "description": "One selected working copy and its policy.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
-    },
-    "WorkspaceKind": {
-      "description": "Which kind of working copy a workspace is.\n\nThere is no default. Section 14 requires the choice to be explicit, because the two have\ndifferent concurrency and different guarantees, and a host that picked one would be choosing\nfor the user.",
-      "oneOf": [
-        {
-          "const": "shared_existing",
-          "description": "The user's own working tree, used where it is.\n\nDirty and untracked files stay exactly as they are. Concurrency is the limit of the tree\nitself: one working tree, one index, and every session bound to this workspace sees the\nother's edits. An apply to it is best-effort conflict detection rather than\ncompare-and-swap.",
-          "type": "string"
-        },
-        {
-          "const": "isolated",
-          "description": "A separate working tree materialised from a named base.\n\nThe base is a revision or a change-set version, and what of the user's uncommitted work\ncomes with it is the explicit inclusion policy. A Git worktree implements the isolation of\nworking *files*; it shares repository metadata and runs under the same account, so it is not\na security sandbox. Where that matters the host uses an independent clone.",
-          "type": "string"
-        }
-      ]
-    },
-    "WorkspaceListParams": {
-      "additionalProperties": false,
-      "description": "Parameters of `workspace.list`.",
-      "properties": {
-        "environment_id": {
-          "$ref": "#/$defs/EnvironmentId",
-          "description": "The environment to list."
-        },
-        "project_repository_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ProjectRepositoryId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "One repository to list, or none for every repository in the environment."
-        }
-      },
-      "required": [
-        "environment_id",
-        "project_repository_id"
-      ],
-      "type": "object"
-    },
-    "WorkspaceListResult": {
-      "additionalProperties": false,
-      "description": "Result of `workspace.list`.",
-      "properties": {
-        "workspaces": {
-          "description": "The workspaces, oldest first.",
-          "items": {
-            "$ref": "#/$defs/WorkspaceSummary"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "workspaces"
-      ],
-      "type": "object"
-    },
-    "WorkspaceReadParams": {
-      "additionalProperties": false,
-      "description": "Parameters of `workspace.read`.",
-      "properties": {
-        "workspace_id": {
-          "$ref": "#/$defs/WorkspaceId",
-          "description": "The workspace to read."
-        }
-      },
-      "required": [
-        "workspace_id"
-      ],
-      "type": "object"
-    },
-    "WorkspaceReadResult": {
-      "additionalProperties": false,
-      "description": "Result of `workspace.read`.",
-      "properties": {
-        "workspace": {
-          "$ref": "#/$defs/WorkspaceSummary",
-          "description": "The workspace."
-        }
-      },
-      "required": [
-        "workspace"
-      ],
-      "type": "object"
-    },
-    "WorkspaceRemoveParams": {
-      "additionalProperties": false,
-      "description": "Parameters of `workspace.remove`.",
-      "properties": {
-        "retention": {
-          "$ref": "#/$defs/RetentionPolicy",
-          "description": "What the removal does with what the workspace holds."
-        },
-        "workspace_id": {
-          "$ref": "#/$defs/WorkspaceId",
-          "description": "The workspace to remove."
-        }
-      },
-      "required": [
-        "workspace_id",
-        "retention"
-      ],
-      "type": "object"
-    },
-    "WorkspaceRemoveResult": {
-      "additionalProperties": false,
-      "description": "Result of `workspace.remove`.",
-      "properties": {
-        "retained": {
-          "description": "What is still held, and is waiting for the user's approval.",
-          "items": {
-            "$ref": "#/$defs/RetainedItem"
-          },
-          "type": "array"
-        },
-        "working_files_removed": {
-          "description": "True when this workspace's own working files are gone.\n\nRead from the filesystem rather than from what the removal did: the tree is not there any\nmore, whether this call removed it, an earlier one did, or the user did. A removal never\ntouches a *shared* workspace's tree, because that tree is the user's own, so this is\nordinarily false for one; it says false whenever the host could not establish that the\ndirectory is absent.",
-          "type": "boolean"
-        },
-        "workspace": {
-          "$ref": "#/$defs/WorkspaceSummary",
-          "description": "The workspace, in the state the removal left it."
-        }
-      },
-      "required": [
-        "workspace",
-        "working_files_removed",
-        "retained"
-      ],
-      "type": "object"
-    },
-    "WorkspaceState": {
-      "description": "What state one workspace is in.",
-      "oneOf": [
-        {
-          "const": "ready",
-          "description": "It exists and can be used.",
-          "type": "string"
-        },
-        {
-          "const": "materialising",
-          "description": "Its materialisation is still running.",
-          "type": "string"
-        },
-        {
-          "const": "removal_pending",
-          "description": "The user asked for it to be removed and something it holds is retained.\n\nA workspace reaches this state rather than disappearing when it still holds dirty content,\na pinned change set or review evidence. What is retained is listed, and the removal\nfinishes when the user approves it.",
-          "type": "string"
-        },
-        {
-          "const": "removed",
-          "description": "It is gone. The record stays so a later read says what happened rather than nothing.",
-          "type": "string"
-        }
-      ]
-    },
-    "WorkspaceSummary": {
-      "additionalProperties": false,
-      "description": "One workspace, as a scoped read returns it.",
-      "properties": {
-        "base_change_set_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ChangeSetId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The change-set version it materialised, when it named one."
-        },
-        "base_revision": {
-          "description": "The revision it started from.",
-          "type": "string"
-        },
-        "bound_runs": {
-          "description": "The automation runs bound to it that are still live.\n\nSection 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace\nbetween two sessions or after its last one ended, so it is recorded separately and refuses\na removal in the same way.",
-          "items": {
-            "$ref": "#/$defs/WorkflowRunId"
-          },
-          "type": "array"
-        },
-        "bound_sessions": {
-          "description": "The sessions bound to it that are still live.\n\nA removal is refused while this is not empty, whatever retention policy it carries.",
-          "items": {
-            "$ref": "#/$defs/SessionId"
-          },
-          "type": "array"
-        },
-        "created_at_ms": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When it was created."
-        },
-        "detail": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Why it is in the state it is in, when it ended up there for a reason."
-        },
-        "display_path": {
-          "description": "The path it was created at, for a person to read.",
-          "type": "string"
-        },
-        "environment_id": {
-          "$ref": "#/$defs/EnvironmentId",
-          "description": "The environment that owns it."
-        },
-        "filesystem_identity": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FilesystemIdentity"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The stable filesystem identity of its working tree, once this host has one.\n\nAbsent while the workspace is being materialised, and absent afterwards only when the\nmaterialisation did not get as far as creating the tree. An absent identity is what refuses\na removal: this host does not delete a directory it cannot prove it created."
-        },
-        "isolation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/IsolationMechanism"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "How an isolated workspace is separated, when it is one."
-        },
-        "kind": {
-          "$ref": "#/$defs/WorkspaceKind",
-          "description": "Which kind it is."
-        },
-        "label": {
-          "description": "The label the user gave it.",
-          "type": "string"
-        },
-        "policy": {
-          "$ref": "#/$defs/InclusionPolicy",
-          "description": "The inclusion policy it was created under."
-        },
-        "project_repository_id": {
-          "$ref": "#/$defs/ProjectRepositoryId",
-          "description": "The repository it is a working copy of."
-        },
-        "retained": {
-          "description": "What it holds that a removal would have to account for.",
-          "items": {
-            "$ref": "#/$defs/RetainedItem"
-          },
-          "type": "array"
-        },
-        "state": {
-          "$ref": "#/$defs/WorkspaceState",
-          "description": "What state it is in."
-        },
-        "workspace_id": {
-          "$ref": "#/$defs/WorkspaceId",
-          "description": "Its identity."
-        }
-      },
-      "required": [
-        "workspace_id",
-        "project_repository_id",
-        "environment_id",
-        "label",
-        "kind",
-        "isolation",
-        "policy",
-        "state",
-        "base_revision",
-        "base_change_set_id",
-        "filesystem_identity",
-        "display_path",
-        "detail",
-        "bound_sessions",
-        "bound_runs",
-        "retained",
-        "created_at_ms"
-      ],
-      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -16303,9 +16156,6 @@
       },
       "type": "object"
     },
-    "inclusion_preview": {
-      "$ref": "#/$defs/InclusionPreview"
-    },
     "input_acquire_params": {
       "$ref": "#/$defs/InputAcquireParams"
     },
@@ -16351,9 +16201,6 @@
     "notification": {
       "$ref": "#/$defs/Notification"
     },
-    "operation_record": {
-      "$ref": "#/$defs/OperationRecord"
-    },
     "organisation_policy": {
       "$ref": "#/$defs/OrganisationPolicy"
     },
@@ -16387,47 +16234,17 @@
     "policy_authority": {
       "$ref": "#/$defs/PolicyAuthority"
     },
-    "preview_entry": {
-      "$ref": "#/$defs/PreviewEntry"
+    "projection_delta": {
+      "$ref": "#/$defs/ProjectionDelta"
     },
-    "project_adopt_params": {
-      "$ref": "#/$defs/ProjectAdoptParams"
+    "projection_reset": {
+      "$ref": "#/$defs/ProjectionReset"
     },
-    "project_adopt_result": {
-      "$ref": "#/$defs/ProjectAdoptResult"
+    "projection_row_page": {
+      "$ref": "#/$defs/ProjectionRowPage"
     },
-    "project_clone_params": {
-      "$ref": "#/$defs/ProjectCloneParams"
-    },
-    "project_clone_result": {
-      "$ref": "#/$defs/ProjectCloneResult"
-    },
-    "project_init_params": {
-      "$ref": "#/$defs/ProjectInitParams"
-    },
-    "project_init_result": {
-      "$ref": "#/$defs/ProjectInitResult"
-    },
-    "project_list_params": {
-      "$ref": "#/$defs/ProjectListParams"
-    },
-    "project_list_result": {
-      "$ref": "#/$defs/ProjectListResult"
-    },
-    "project_operation_cancel_params": {
-      "$ref": "#/$defs/ProjectOperationCancelParams"
-    },
-    "project_operation_cancel_result": {
-      "$ref": "#/$defs/ProjectOperationCancelResult"
-    },
-    "project_read_params": {
-      "$ref": "#/$defs/ProjectReadParams"
-    },
-    "project_read_result": {
-      "$ref": "#/$defs/ProjectReadResult"
-    },
-    "project_summary": {
-      "$ref": "#/$defs/ProjectSummary"
+    "projection_snapshot": {
+      "$ref": "#/$defs/ProjectionSnapshot"
     },
     "proposed_grant": {
       "$ref": "#/$defs/ProposedGrant"
@@ -16722,33 +16539,6 @@
     },
     "worker_verify_proof": {
       "$ref": "#/$defs/WorkerVerifyProof"
-    },
-    "workspace_create_params": {
-      "$ref": "#/$defs/WorkspaceCreateParams"
-    },
-    "workspace_create_result": {
-      "$ref": "#/$defs/WorkspaceCreateResult"
-    },
-    "workspace_list_params": {
-      "$ref": "#/$defs/WorkspaceListParams"
-    },
-    "workspace_list_result": {
-      "$ref": "#/$defs/WorkspaceListResult"
-    },
-    "workspace_read_params": {
-      "$ref": "#/$defs/WorkspaceReadParams"
-    },
-    "workspace_read_result": {
-      "$ref": "#/$defs/WorkspaceReadResult"
-    },
-    "workspace_remove_params": {
-      "$ref": "#/$defs/WorkspaceRemoveParams"
-    },
-    "workspace_remove_result": {
-      "$ref": "#/$defs/WorkspaceRemoveResult"
-    },
-    "workspace_summary": {
-      "$ref": "#/$defs/WorkspaceSummary"
     }
   },
   "title": "KalaReach protocol",
