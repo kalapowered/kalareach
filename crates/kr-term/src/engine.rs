@@ -757,24 +757,30 @@ impl Engine {
         // noticed at the next measurement. One read can carry a session's worth of links.
         let parameters = parts[1].iter().filter(|byte| **byte == b':').count() + 1;
         let resident = crate::grid::link_cost(&uri, parameters);
-        if !self.links_would_fit(resident) {
+        // What the table will cost for this entry, worked out the way the measurement works it
+        // out, so admission and measurement cannot disagree about the same entry. The first target
+        // pays for the node it opens, which the measurement charges once the set is not empty.
+        let known = self.links.contains(&uri);
+        let cost = if known {
+            0
+        } else {
+            crate::grid::link_table_entry_bytes(&uri)
+                + if self.links.is_empty() {
+                    crate::grid::LINK_TABLE_NODE_BYTES
+                } else {
+                    0
+                }
+        };
+        self.read_links_if_the_charge_would_not_fit(resident.saturating_add(cost));
+        if !self.budget.links_fit(resident) {
             self.budget.record_truncation();
             return Some("the session has no room left for another hyperlink");
         }
         self.budget.add_links(resident);
-        if self.links.contains(&uri) {
+        if known {
             return None;
         }
-        // What the table will cost for this entry, worked out the way the measurement works it
-        // out, so admission and measurement cannot disagree about the same entry. The first target
-        // pays for the node it opens, which the measurement charges once the set is not empty.
-        let cost = crate::grid::link_table_entry_bytes(&uri)
-            + if self.links.is_empty() {
-                crate::grid::LINK_TABLE_NODE_BYTES
-            } else {
-                0
-            };
-        if self.links.len() >= self.budget.limits().unique_links || !self.links_would_fit(cost) {
+        if self.links.len() >= self.budget.limits().unique_links || !self.budget.links_fit(cost) {
             // The link is refused after all, so what was reserved for it is given back rather than
             // left to be corrected at the next measurement.
             self.budget.release_links(resident);
@@ -786,7 +792,7 @@ impl Engine {
         None
     }
 
-    /// Whether another `bytes` of hyperlink state fits the envelope, measuring first if it does not.
+    /// Reads what the hyperlink state holds when `bytes` more of it would not fit the envelope.
     ///
     /// Every hyperlink is charged what it will cost where it arrives, because one read can carry a
     /// session's worth of them and a bound that is only checked afterwards is not a bound. What is
@@ -794,12 +800,15 @@ impl Engine {
     /// nothing back until the objects on it are measured again, so the charged figure drifts above
     /// the truth while a session prints. A refusal on that figure would refuse a link the session
     /// has room for, so the truth is read before anything is refused, and only then.
-    fn links_would_fit(&mut self, bytes: u64) -> bool {
-        if self.budget.links_fit(bytes) {
-            return true;
+    ///
+    /// It is read here, before anything is charged, and `bytes` is the whole of what this link will
+    /// cost: the object and the table entry together. A measurement replaces the account with what
+    /// the grid is holding, and the object this link is being admitted for is not on a row yet, so
+    /// a measurement taken between two charges would erase the first of them.
+    fn read_links_if_the_charge_would_not_fit(&mut self, bytes: u64) {
+        if !self.budget.links_fit(bytes) {
+            self.measure_links();
         }
-        self.measure_links();
-        self.budget.links_fit(bytes)
     }
 
     /// Notices that the buffers have swapped, and settles the one that has come back.
