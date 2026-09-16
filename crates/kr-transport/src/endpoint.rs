@@ -83,18 +83,15 @@ async fn bind(
     if accept {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
-    if config.relay_only {
-        // Every packet through the selected relay, because there is no other transport left. An
-        // endpoint with no relay selected and no IP transport could reach nothing at all, so that
-        // combination is a configuration error rather than a silent no-op.
-        if config.relays_disabled() {
-            return Err(TransportError::Configuration {
-                what: "relay_only".to_owned(),
-                kind: "endpoint transports",
-                reason: "an endpoint with no relay and no direct path can reach nothing".to_owned(),
-            });
-        }
-        builder = builder.clear_ip_transports();
+    // An endpoint with no relay selected and no IP transport could reach nothing at all, so that
+    // combination is a configuration error rather than a silent no-op. It is checked here, before
+    // anything is bound.
+    if config.relay_only && config.relays_disabled() {
+        return Err(TransportError::Configuration {
+            what: "relay_only".to_owned(),
+            kind: "endpoint transports",
+            reason: "an endpoint with no relay and no direct path can reach nothing".to_owned(),
+        });
     }
     if !config.relay_ca_roots.is_empty() {
         let roots = config
@@ -113,6 +110,12 @@ async fn bind(
                 kind: "bind address",
                 reason: error.to_string(),
             })?;
+    }
+    if config.relay_only {
+        // Last, after every bind-address operation: naming a bind address adds an IP transport, so
+        // clearing them earlier would leave one behind and the endpoint would still have a direct
+        // path. Every packet then goes through the selected relay, because there is nothing else.
+        builder = builder.clear_ip_transports();
     }
     builder
         .bind()
