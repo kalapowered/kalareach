@@ -36,6 +36,8 @@
 //! | [`hello`] | Version negotiation and the `kr-connect/1` proof transcript |
 //! | [`pairing`] | Pairing contexts, bundles, transcripts, QR payloads and owner confirmation |
 //! | [`mailbox`] | Stored mailbox envelopes and their size buckets |
+//! | [`service`] | The credential every managed-service method authenticates with |
+//! | [`push`] | Push registration, sender authorisation and delivery |
 //! | [`archive`] | Backup key wraps, manifests, descriptors and recovery material |
 //! | [`account`] | Membership leases and the organisation policy-signing authority chain |
 //! | [`digest`] | The mutation payload digest |
@@ -49,6 +51,7 @@
 //! | [`hostinfo`] | Host and environment reads, and read-only diagnostics |
 //! | [`worker`] | Worker descriptors, the startup rendezvous, the verify challenge and the generation token |
 //! | [`schema`] | Deterministic JSON Schema and method-table generation |
+//! | [`vectors`] | The cross-language vectors under `fixtures/service` and `fixtures/push` |
 //!
 //! # What this crate does not do
 //!
@@ -102,11 +105,14 @@ pub mod local;
 pub mod mailbox;
 pub mod method;
 pub mod pairing;
+pub mod push;
 pub mod receipt;
 pub mod recovery;
 pub mod relay;
 pub mod rights;
 pub mod scalars;
 pub mod schema;
+pub mod service;
 pub mod session;
+pub mod vectors;
 pub mod worker;

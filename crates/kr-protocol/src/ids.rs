@@ -395,6 +395,41 @@ uuid_id!(
     OrganisationId,
     "One organisation whose signed policy a host has opted into."
 );
+uuid_id!(
+    /// One notification, as the host that produced it names it. 128 random bits.
+    ///
+    /// The gateway deduplicates by this value and never reads it. It travels to a provider in the
+    /// clear, so the producer generates it at random rather than deriving it from anything about
+    /// the work. Being 128 bits rather than text leaves no room for a name that reads as one; it
+    /// does not stop a producer encoding something into the bits, which is the producer's own rule
+    /// to keep.
+    NotificationId,
+    "One notification, named by the host that produced it. 128 random bits, opaque to the gateway and the provider."
+);
+uuid_id!(
+    /// The group a notification replaces others in on the device.
+    ///
+    /// A host derives it from its own secret and whatever it wants to group by, so two notifications
+    /// about one thing collapse into one and the value tells a provider nothing about what that
+    /// thing is. Like the notification identifier it reaches the provider in the clear, and like it
+    /// the producer is the one that keeps it meaningless.
+    CollapseId,
+    "The group a notification replaces others in on the device. 128 bits a host derives from its own secret."
+);
+uuid_id!(
+    /// One attempt to bind a push token to an installation. 128 random bits.
+    ///
+    /// It names the attempt, not the token: a challenge answered for one attempt says nothing
+    /// about another, so a pending registration cannot be completed with the answer to an earlier
+    /// one.
+    PushRegistrationId,
+    "One attempt to bind a push token to an installation. 128 random bits."
+);
+uuid_id!(
+    /// One installation's authorisation of one paired host to send it notifications.
+    PushSenderRecordId,
+    "One installation's authorisation of one paired host to send it notifications."
+);
 
 counter_id!(
     /// The session epoch. Fixed at 1 in version 1 of the protocol.
@@ -463,6 +498,14 @@ counter_id!(
     /// chain from the revision it pinned to the revision signing now.
     PolicyKeyRevision,
     "The revision of an organisation's policy-signing key, advanced on every rotation."
+);
+counter_id!(
+    /// The revision of one push sender record. Only the gateway advances it.
+    ///
+    /// Every renewal advances it, so a captured renewal cannot be replayed to reinstate a
+    /// credential that a later renewal or a revocation has already replaced.
+    PushSenderRevision,
+    "The revision of one push sender record, advanced by the gateway on every renewal."
 );
 
 counter_id!(

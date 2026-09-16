@@ -91,11 +91,26 @@ for text association, which the input encoders cannot produce, so it is `X` rath
 application believes it got. A colon sublist belongs to ordinary SGR and nowhere else, so
 `CSI > 4 : 99 m` is not a level.
 
-What is qualified is a mode, and a mode is forwarded live. A direct terminal that did not see the
-negotiation would keep sending the old encoding, which is exactly the mismatch the negotiation
-exists to prevent. The profile still tracks it, and still keeps it away from the canonical grid,
-which has nothing to do with key encodings. Each screen buffer keeps its own Kitty stack, so a
-full-screen application's negotiation cannot leak into the shell's when it exits.
+The flags in force are a mode, and a mode is forwarded live: `CSI = flags ; mode u` goes to a
+direct terminal unchanged, because a terminal that did not see the negotiation would keep sending
+the old encoding, which is exactly the mismatch the negotiation exists to prevent. The profile
+still tracks it, and still keeps it away from the canonical grid, which has nothing to do with key
+encodings.
+
+**The Kitty keyboard stack is virtualised, like the title stack.** `CSI > flags u` and
+`CSI < count u` stop at the engine. The stack a direct attachment's terminal holds belongs to
+whatever was running when the attachment arrived: an application inside the session that emits
+`CSI < 65535 u` would empty it, and a program that had pushed an entry before would then pop into a
+state that is not its own. So the session keeps a stack of its own, sixteen entries deep, one for
+each screen buffer, and a push or a pop leaves the attachment projecting. The restoration that
+projection produces installs the resulting flags as an absolute state, so a direct attachment
+receives only flag settings and never a push or a pop, and the flags it needs still arrive. A push
+or a pop the profile does not qualify is `X`: it changed nothing, so it needs no projection either.
+
+Each screen buffer keeps its own flags and its own stack, so a full-screen application's
+negotiation cannot leak into the shell's when it exits, and both travel in a snapshot. A
+restoration puts back no more than a session could have built: every entry is masked to the
+qualified flags and the stack is cut to its depth, into an array of exactly the entries kept.
 
 **DECSCA is not classified as display.** Nothing in the profile implements selective erase, so the
 attribute is `X` and DA1 does not claim `6`. Advertising a capability and then dropping it is worse
@@ -260,7 +275,8 @@ count of such sequences is zero for the supported corpus.
 
 Three kinds of sequence never reach the library, because the profile owns them outright:
 
-- the virtualised title stack (`CSI 22 t` and `CSI 23 t`),
+- the virtualised title stack (`CSI 22 t` and `CSI 23 t`) and the virtualised Kitty keyboard stack
+  (`CSI > flags u` and `CSI < count u`),
 - OSC 633, which the library does not model, and
 - DEC modes 66, 67, 1007 and 1034, which change what a keyboard or mouse encoder produces and
   nothing about the screen.
@@ -484,9 +500,9 @@ carried because a projection and a person find them useful.
 A snapshot is presentation state. It is not a serialised process and not a durable parser
 checkpoint. It carries the projection generation, the active buffer, the canonical dimensions, the
 viewport, the cursor, the margins, the current rendition, the tab stops, the character sets, every
-tracked mode, the keypad mode, the keyboard protocol an input encoder has to reproduce, the titles
-and the virtual title stack, the hyperlink ranges, the whole palette with its source, and paged rows
-with stable identifiers and wrap markers.
+tracked mode, the keypad mode, the keyboard protocol an input encoder has to reproduce with each
+buffer's virtual Kitty stack, the titles and the virtual title stack, the hyperlink ranges, the
+whole palette with its source, and paged rows with stable identifiers and wrap markers.
 
 It also carries the pending wrap, the saved cursor of each buffer with the rendition and character
 sets that were saved with it, and the rows of the buffer that is not showing. A saved cursor is
@@ -589,22 +605,23 @@ The rest of the reservation:
 | Part | Bytes | Why |
 | --- | --- | --- |
 | Row arrays | 288 a row | The array slot of every row of both buffers, the primary buffer's 3,500 scrollback slots included, at twice the rows they hold |
+| The retained rows' account | 16 a retained row | One charge a retained row, in an array beside the rows, at twice the rows it holds. It keeps the room it grew to after eviction gives rows back |
 | Row storage | 136 a screen row | What a row allocates for itself before anything is on it: eighty bytes of room for its text, and a header each for the cell offsets and the wide-cell bits. A retained row's own storage is the row cache's to carry |
 | Hyperlink envelope | 17,137,960 | 4,096 targets of 2,048 bytes, at twice what they hold, with the table slots and the first node. One envelope holds every link object the grid keeps, on a screen or on a retained row, so a row scrolling off moves no charge |
 | Titles and the virtual stack | 50,208 | Ten entries of two 1,024-byte titles, at twice what they hold, the current pair, and the copy of each title the grid keeps |
 | Alert channel | 1,073,152 | 256 alerts of two 1,024-byte strings, at twice what the list holds |
 
-So an 80 by 24 session reserves 20,764,232 bytes of its 67,108,864, and the default invisible
-120 by 40 reserves 22,989,640. A full-width 2,048 by 24 terminal is admitted; so is every grid at
+So an 80 by 24 session reserves 20,820,232 bytes of its 67,108,864, and the default invisible
+120 by 40 reserves 23,045,640. A full-width 2,048 by 24 terminal is admitted; so is every grid at
 that height, because 2,048 columns is the widest section 8 allows. The largest grid the dimensions
-allow, 2,048 by 128, would need 220,704,456 bytes, so it is refused before anything is allocated
+allow, 2,048 by 128, would need 220,760,456 bytes, so it is refused before anything is allocated
 for it.
 
 There is no single boundary in cells, because a row costs something of its own: the largest cell
-count any shape is admitted at is 2,008 by 31, or 62,248 cells, and 60 by 1,020 is refused at
-61,200. The boundary by height is what a client cares about, and
-`fixtures/terminal/admission.json` records it: 1,556 columns are admitted at 40 rows and 1,557 are
-not; 485 at 128 rows and 486 are not; 249 by 249 is the largest square and 250 by 250 is refused;
+count any shape is admitted at is 1,943 by 32, or 62,176 cells, and 61 by 1,002 is refused at
+61,122. The boundary by height is what a client cares about, and
+`fixtures/terminal/admission.json` records it: 1,554 columns are admitted at 40 rows and 1,555 are
+not; 484 at 128 rows and 485 are not; 248 by 248 is the largest square and 249 by 249 is refused;
 59 columns are admitted at the full 1,024 rows.
 
 The historical row cache is not in that figure. Section 8 gives it its own 8 MiB bound beside the
@@ -697,11 +714,59 @@ it. The alert channel holds a bounded number of alerts, each cut to a bounded le
 Nothing else is refused. Text, titles and the rows that scroll off all draw on room the geometry
 already reserved, so an admitted session can fill its screens, set a title as often as it likes and
 push its stack to the bound without meeting a refusal. Rows that scroll off the screen are charged
-to the historical cache where they join it, counted by where the history ends rather than by how
-many rows it holds, so a row that arrives while the library drops an older one is still counted, and
-the cache is brought back under its bound there rather than at the next measurement: two rows can
-carry more than the whole of it. A resize moves rows between a screen and the history, and the two
-are charged to different bounds, so both are measured again at the resize.
+to the historical cache where they join it, and the cache is brought back under its bound there
+rather than at the next measurement: two rows can carry more than the whole of it. A resize moves
+rows between a screen and the history, and the two are charged to different bounds, so both are
+measured again at the resize.
+
+**What the retained rows cost is carried, not measured.** A row is charged once, where it leaves
+the screen, and gives its charge back once, where it is dropped; the running figure is what
+`CanonicalGrid::history_bytes` reads, in one read however long the history is. Which rows joined
+and which were given up comes from the two ends of the retained range, so a row that arrives while
+the library drops an older one is still counted, and each row that joined is reached by its own
+index rather than by walking to it.
+
+Nothing on that path reads a row that has already been charged, and nothing needs to. What a row
+costs is its cells, the text they hold and the allocations they keep, and once the library has
+compressed a row for the scrollback none of those three changes. The library does still touch a retained row: a
+palette change and a buffer switch stamp a sequence number on one, so a client repainting knows
+what moved. A sequence number is not in the charge, so the charge is the same afterwards. What does
+change a charge is a rewrite, and there is one: a resize reflows the retained rows, joining and
+splitting them, and cutting a row to a narrower geometry rewrites it. That says so, and the account
+is built again from the rows themselves. An erasure needs no rebuild, because it changes no row: it
+drops the oldest rows, and their charges come off the front where the account already gives back
+the charges of rows the library drops.
+
+Other things do read a retained row. The periodic measurement of what the session's screens and
+hyperlinks hold walks every row of both buffers wherever it sits, and it runs inside a read; so does
+a snapshot of the history, when one is asked for. Neither is proportional to the reads: the
+measurement runs every sixty-fourth read, or when the rows have grown by a page, or when something
+asked for it. What the account removes is the walk a *single row leaving the screen* used to cost,
+which is the one that grew with the history and happened thousands of times a read.
+
+`CanonicalGrid::measure_history_bytes` is the same figure worked out by walking the rows, and a
+test compares the two after every operation of a randomised sequence of prints, resizes, buffer
+switches, erasures and evictions. The account's own array is measured too, at the room it is
+holding rather than the charges on it. That room is one charge for every row the scrollback may
+keep, which is what the geometry reserved for, and the array is brought to it and left there: a row
+arriving never allocates, and a row leaving never gives back room the next row would ask for again.
+Sizing the room to the charges on it instead would put a pair of reallocations, each copying the
+whole history, on the arrival of a single row whenever the rows arriving cost a little more than
+the rows they replace.
+
+That is what makes the byte bound affordable. Working the figure out by walking the history made
+every read cost what the whole history cost, so a session printing steadily paid a scan of
+everything it had retained on every read: on one machine 0.10 MiB/s of scrolling output against
+the 5 MiB/s of KR-PERF-007, and a read behind 1,841 retained rows costing sixty-two times a read
+behind ninety. `cargo test -p kr-term --release --test perf` asserts both ends of that: the rate on
+a stream that scrolls, and that a read behind a full cache costs what a read behind an empty one
+costs.
+
+Eviction reads the same figures. The rows to give up are chosen by what each one costs, oldest
+first, until what is left costs no more than the bound, so one pass lands under it rather than
+converging towards it, and no cell is read to decide. A row count worked out from the average cost
+of a row would land on the wrong side of the bound whenever the rows are not all the same size,
+which is the usual case.
 
 Where a reservation and a measurement look at the same thing, the reservation is the larger. Both
 work a link's parameter table out through the same rounding, from the separators the parameter field
@@ -885,3 +950,10 @@ cargo test -p kr-term --release --test perf -- --nocapture
 It drains a 5 MiB stream of mixed text, colour changes, cursor movement, wide characters,
 hyperlinks, alternate-screen churn and queries, and checks that the response lane, the row cache and
 the session budget all stayed inside their bounds while it did.
+
+It drains a second 5 MiB stream that scrolls. The first one clears its screen as often as it prints,
+so rows rarely leave it and the historical cache stays empty; an application printing into a session
+scrolls, every row it prints joins the cache, and the cache is enforced on the way. That is the load
+a host actually carries, and it has to hold the target too. Beside it is a benchmark that feeds the
+same bytes to two sessions, one whose history is emptied before every read and one whose history is
+at its bound and evicting on every row, and asserts that the two reads cost about the same.

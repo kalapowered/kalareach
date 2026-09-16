@@ -381,13 +381,25 @@ impl ModeState {
     }
 
     /// Restores the keyboard negotiation state from a snapshot.
+    ///
+    /// Every entry goes through the same bound an entry from the session does. A snapshot is state
+    /// this session once held, but it arrives from outside, and a restoration that took it at its
+    /// word could put back flags the profile does not advertise or a stack deeper than one a
+    /// session can build.
     pub fn restore_keyboard(&mut self, modify_other_keys: u8, buffers: [(Option<u8>, Vec<u8>); 2]) {
         self.modify_other_keys = modify_other_keys.min(2);
         for (slot, (flags, stack)) in buffers.into_iter().enumerate() {
             let state = &mut self.kitty[slot];
             state.flags = flags.map(|flags| flags & KITTY_QUALIFIED_FLAGS);
-            state.stack = stack;
-            state.stack.truncate(KITTY_STACK_DEPTH);
+            // Into an array of exactly the entries kept, not the one that arrived: a vector
+            // carries the room it was built with, and a snapshot could have been built with a
+            // great deal of it.
+            state.stack = stack
+                .into_iter()
+                .take(KITTY_STACK_DEPTH)
+                .map(|entry| entry & KITTY_QUALIFIED_FLAGS)
+                .collect();
+            state.stack.shrink_to_fit();
         }
     }
 

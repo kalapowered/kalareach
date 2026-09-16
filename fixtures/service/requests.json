@@ -1,0 +1,228 @@
+{
+  "cases": [
+    {
+      "cbor_hex": "82746b722d736572766963652d726571756573742f31a5656e6f6e636558204141414141414141414141414141414141414141414141414141414141414141666d6574686f64781a707573682e696e7374616c6c6174696f6e2e72656769737465726b626f64795f64696765737458205751c268f50dc0beac6f258bee1be74f2a4d869faf6f3c5a77aad393f90d64596c7369676e65645f61745f6d731b0000019b76daa8006e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f",
+      "description": "A native installation registering a push token, signed by its device authorisation key.",
+      "domain": "kr-service-request/1",
+      "id": "installation_request",
+      "json": {
+        "payload": {
+          "body_digest": "V1HCaPUNwL6sbyWL7hvnTypNhp-vbzxad6rTk_kNZFk",
+          "gateway_origin": "https://reach.kala.to",
+          "method": "push.installation.register",
+          "nonce": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE",
+          "signed_at_ms": "1767225600000"
+        },
+        "public_key": "ERERERERERERERERERERERERERERERERERERERERERE",
+        "signature": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWg",
+        "signer": "installation"
+      },
+      "sha256": "269bc1b473b493d677dd61400d6dae853ffafb97555728b67484eab74371cdf4",
+      "value": {
+        "array": [
+          {
+            "text": "kr-service-request/1"
+          },
+          {
+            "map": [
+              [
+                "nonce",
+                {
+                  "bytes": "4141414141414141414141414141414141414141414141414141414141414141"
+                }
+              ],
+              [
+                "method",
+                {
+                  "text": "push.installation.register"
+                }
+              ],
+              [
+                "body_digest",
+                {
+                  "bytes": "5751c268f50dc0beac6f258bee1be74f2a4d869faf6f3c5a77aad393f90d6459"
+                }
+              ],
+              [
+                "signed_at_ms",
+                {
+                  "int": "1767225600000"
+                }
+              ],
+              [
+                "gateway_origin",
+                {
+                  "text": "https://reach.kala.to"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "8278196b722d736572766963652d726571756573742f312f686f7374a5656e6f6e636558204242424242424242424242424242424242424242424242424242424242424242666d6574686f6471707573682e73656e6465722e72656e65776b626f64795f646967657374582031ba443f0bdc54f10c4ca7172851deaee65d321c340bf357e7bed1df6827632d6c7369676e65645f61745f6d731b0000019b76daa8006e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f",
+      "description": "A paired host renewing its delivery credential, signed by its host signing key.",
+      "domain": "kr-service-request/1/host",
+      "id": "host_request",
+      "json": {
+        "payload": {
+          "body_digest": "MbpEPwvcVPEMTKcXKFHeruZdMhw0C_NX577R32gnYy0",
+          "gateway_origin": "https://reach.kala.to",
+          "method": "push.sender.renew",
+          "nonce": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI",
+          "signed_at_ms": "1767225600000"
+        },
+        "public_key": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "signature": "W1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbWw",
+        "signer": "host"
+      },
+      "sha256": "4ff5c80611a848d2d27c7277802c6acafe2220313dfed4af29a1da0e38410490",
+      "value": {
+        "array": [
+          {
+            "text": "kr-service-request/1/host"
+          },
+          {
+            "map": [
+              [
+                "nonce",
+                {
+                  "bytes": "4242424242424242424242424242424242424242424242424242424242424242"
+                }
+              ],
+              [
+                "method",
+                {
+                  "text": "push.sender.renew"
+                }
+              ],
+              [
+                "body_digest",
+                {
+                  "bytes": "31ba443f0bdc54f10c4ca7172851deaee65d321c340bf357e7bed1df6827632d"
+                }
+              ],
+              [
+                "signed_at_ms",
+                {
+                  "int": "1767225600000"
+                }
+              ],
+              [
+                "gateway_origin",
+                {
+                  "text": "https://reach.kala.to"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "8278196b722d736572766963652d726571756573742f312f686f7374a5656e6f6e636558204141414141414141414141414141414141414141414141414141414141414141666d6574686f64781a707573682e696e7374616c6c6174696f6e2e72656769737465726b626f64795f64696765737458205751c268f50dc0beac6f258bee1be74f2a4d869faf6f3c5a77aad393f90d64596c7369676e65645f61745f6d731b0000019b76daa8006e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f",
+      "description": "The installation payload above, encoded under the host domain. The bytes differ, so an installation's signature can never be presented as a host's.",
+      "domain": "kr-service-request/1/host",
+      "id": "same_payload_other_domain",
+      "sha256": "4967ff904472b8a9f42c1dc4a2e784dbf63e7472290264b37e13652416a22d13",
+      "value": {
+        "array": [
+          {
+            "text": "kr-service-request/1/host"
+          },
+          {
+            "map": [
+              [
+                "nonce",
+                {
+                  "bytes": "4141414141414141414141414141414141414141414141414141414141414141"
+                }
+              ],
+              [
+                "method",
+                {
+                  "text": "push.installation.register"
+                }
+              ],
+              [
+                "body_digest",
+                {
+                  "bytes": "5751c268f50dc0beac6f258bee1be74f2a4d869faf6f3c5a77aad393f90d6459"
+                }
+              ],
+              [
+                "signed_at_ms",
+                {
+                  "int": "1767225600000"
+                }
+              ],
+              [
+                "gateway_origin",
+                {
+                  "text": "https://reach.kala.to"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "description": "The installation credential every managed-service method authenticates with: the exact bytes each signature covers.",
+  "freshness_ms": "300000",
+  "installation_identity": {
+    "derivation": "The first sixteen bytes of the SHA-256 of the device authorisation public key, written in hyphenated form.",
+    "installation_id": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+    "public_key": "ERERERERERERERERERERERERERERERERERERERERERE"
+  },
+  "name": "requests",
+  "note": "Values use the same description grammar as fixtures/cbor. cbor_hex is the canonical KR-CBOR-1 encoding of CBOR([domain, payload]), the bytes a signature or a digest covers; sha256 is its digest. json is the managed HTTP representation of the whole record, signature included. The signatures and secrets in json are fixed test bytes, not verifiable material: signature vectors need a signing implementation and live with the cryptography fixtures.",
+  "origins": {
+    "accepted": [
+      "https://reach.kala.to",
+      "https://reach.kala.to:8443",
+      "https://ns1.reach.kala.to",
+      "https://192.0.2.10",
+      "https://[2001:db8::1]",
+      "https://[2001:db8::1]:8443",
+      "http://localhost",
+      "http://localhost:8787",
+      "http://127.0.0.1:8787",
+      "http://[::1]:8787"
+    ],
+    "description": "Every origin a gateway accepts, and every spelling it refuses. One address has one spelling, because two spellings of one service are two signing inputs for one request.",
+    "refused": [
+      "https://reach.kala.to/",
+      "https://reach.kala.to/api",
+      "https://reach.kala.to?x=1",
+      "https://reach.kala.to#x",
+      "https://REACH.kala.to",
+      "https://user@reach.kala.to",
+      "https://reach.kala.to:443",
+      "https://reach.kala.to:08443",
+      "https://reach.kala.to:0",
+      "https://reach.kala.to:99999",
+      "https://reach.kala.to:http",
+      "https://reach.kala.to.",
+      "https://reach..kala.to",
+      "https://-reach.kala.to",
+      "https://reach.kala.to-",
+      "https://192.0.2.001",
+      "https://0xc0000201",
+      "https://2001:db8::1",
+      "https://[2001:0db8::1]",
+      "https://[0:0:0:0:0:0:0:1]",
+      "https://[::ffff:192.0.2.1]",
+      "https://[::1]junk",
+      "https://[2001:db8::1",
+      "https://[:::]",
+      "https://",
+      "http://reach.kala.to",
+      "http://[2001:db8::1]",
+      "http://localhost:80",
+      "reach.kala.to",
+      "ftp://reach.kala.to"
+    ]
+  }
+}

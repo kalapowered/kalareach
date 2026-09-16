@@ -18,6 +18,18 @@ use kr_term::sideeffect::{
     SideEffectDestination, SideEffectKind, SideEffectPolicy, SideEffectRefusal,
 };
 
+/// The keyboard state a snapshot of `engine` carries.
+fn keyboard(engine: &mut Engine) -> kr_term::snapshot::KeyboardSnapshot {
+    let size = engine.grid().size();
+    let viewport = kr_term::snapshot::Viewport {
+        top_row: 0,
+        rows: size.rows,
+        left_col: 0,
+        cols: size.cols,
+    };
+    engine.snapshot(viewport, 0).0.keyboard
+}
+
 fn attachment() -> AttachmentId {
     AttachmentId::new(Uuid::from_bytes([7; 16]))
 }
@@ -583,9 +595,13 @@ fn plain_engine() -> Engine {
     Engine::new(EngineConfig::default()).expect("engine")
 }
 
-/// A mode is forwarded live, including the keyboard negotiation a direct terminal has to follow.
+/// A mode is forwarded live, including the keyboard flags a direct terminal has to follow.
+///
+/// The flags in force, that is. The push and the pop that put them there are the session's own
+/// business; `an_application_that_works_the_keyboard_stack_takes_nothing_of_the_terminals_own`
+/// covers those.
 #[test]
-fn keyboard_negotiation_is_forwarded_like_any_other_mode() {
+fn the_keyboard_flags_in_force_are_forwarded_like_any_other_mode() {
     let mut engine = plain_engine();
     let outcome = engine.feed(b"\x1b[>4;2m\x1b[=3u", 0);
     assert_eq!(
@@ -726,4 +742,101 @@ fn an_embedded_control_is_performed_where_it_appears() {
     assert!(outcome.forward.is_empty());
     assert_eq!(outcome.side_effects.len(), 9, "every bell rang");
     assert_eq!(engine.grid().cursor(), (5, 0), "and the movement happened");
+}
+
+/// An application's Kitty keyboard stack operations never reach a direct attachment's terminal.
+///
+/// The stack that terminal holds belongs to whatever was running when the attachment arrived. A
+/// push would bury an entry it had saved and a pop would take one, so the session keeps a stack of
+/// its own and the attachment projects instead. What the terminal needs — the flags in force — is
+/// installed as a state by the restoration that projection produces.
+#[test]
+fn an_application_that_works_the_keyboard_stack_takes_nothing_of_the_terminals_own() {
+    let mut engine = leased_engine();
+
+    // A push. The bytes stop here and the attachment projects.
+    let outcome = engine.feed(b"\x1b[>5u", 0);
+    assert!(
+        outcome.forward.is_empty(),
+        "a push must not reach a terminal that has a stack of its own"
+    );
+    assert!(outcome.projection_required_at.is_some());
+    assert_eq!(keyboard(&mut engine).primary.flags, Some(5));
+    assert_eq!(keyboard(&mut engine).primary.stack, vec![0]);
+
+    // Another push, then a pop: the flags go back to what the first push installed, and neither
+    // sequence travels.
+    let outcome = engine.feed(b"\x1b[>3u", 0);
+    assert!(outcome.forward.is_empty());
+    assert_eq!(keyboard(&mut engine).primary.flags, Some(3));
+    let outcome = engine.feed(b"\x1b[<1u", 0);
+    assert!(
+        outcome.forward.is_empty(),
+        "a pop must not reach a terminal that has a stack of its own"
+    );
+    assert!(outcome.projection_required_at.is_some());
+    let snapshot = keyboard(&mut engine);
+    assert_eq!(
+        (snapshot.primary.flags, snapshot.primary.stack),
+        (Some(5), vec![0]),
+        "the pop put back what the session had, through the session's own stack"
+    );
+
+    // A pop deeper than the session ever pushed empties the session's stack and nothing else.
+    let outcome = engine.feed(b"\x1b[<65535u", 0);
+    assert!(
+        outcome.forward.is_empty(),
+        "a pop past the session's own stack must not reach the terminal's"
+    );
+    let snapshot = keyboard(&mut engine);
+    assert_eq!(snapshot.primary.flags, None);
+    assert!(snapshot.primary.stack.is_empty());
+
+    // And the flags a direct terminal needs still arrive, because an absolute setting is not a
+    // stack operation and is forwarded live.
+    let outcome = engine.feed(b"\x1b[=5;1u", 0);
+    assert_eq!(
+        outcome.forward.len(),
+        1,
+        "the flags in force still reach a direct terminal"
+    );
+    assert_eq!(keyboard(&mut engine).primary.flags, Some(5));
+
+    // A push the profile does not qualify changed nothing, so it needs no projection either.
+    let outcome = engine.feed(b"\x1b[>16u", 0);
+    assert!(
+        outcome.forward.is_empty(),
+        "an unqualified flag is consumed"
+    );
+    assert!(
+        outcome.projection_required_at.is_none(),
+        "and it changed nothing, so nothing has to repaint"
+    );
+}
+
+/// Each buffer's keyboard stack is its own, and neither reaches a terminal.
+#[test]
+fn the_alternate_buffers_keyboard_stack_is_not_the_shells() {
+    let mut engine = leased_engine();
+    engine.feed(b"\x1b[>1u", 0);
+    engine.feed(b"\x1b[?1049h", 0);
+    let outcome = engine.feed(b"\x1b[>9u", 0);
+    assert!(outcome.forward.is_empty());
+
+    let snapshot = keyboard(&mut engine);
+    assert_eq!(snapshot.primary.flags, Some(1));
+    assert_eq!(snapshot.alternate.flags, Some(9));
+    assert_eq!(snapshot.alternate.stack, vec![0]);
+
+    // A full-screen application emptying its own stack on the way out takes nothing of the
+    // shell's, and nothing of the terminal's either.
+    let outcome = engine.feed(b"\x1b[<65535u", 0);
+    assert!(outcome.forward.is_empty());
+    engine.feed(b"\x1b[?1049l", 0);
+    let snapshot = keyboard(&mut engine);
+    assert_eq!(
+        snapshot.primary.flags,
+        Some(1),
+        "what the shell negotiated is still what the shell negotiated"
+    );
 }

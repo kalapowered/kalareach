@@ -688,11 +688,25 @@ enum StopsHere {
 /// alongside other modes still stops here, so the attachment projects rather than falling out of
 /// step over the modes that did apply.
 ///
-/// Keyboard negotiation is deliberately not here. It is a mode, and a mode is forwarded live: a
-/// direct terminal that did not see the negotiation would keep sending the old encoding, which is
-/// exactly the mismatch the negotiation exists to prevent. The profile still tracks it and still
-/// keeps it away from the canonical grid, which has nothing to do with key encodings.
-fn stops_here(kind: &EventKind) -> StopsHere {
+/// The Kitty keyboard stack is the title stack one level deeper, and it stops here for the same
+/// reason. The stack a direct attachment's terminal holds belongs to whatever was running when the
+/// attachment arrived: an application inside the session that emits `CSI < 65535 u` would empty
+/// it, and a program that had pushed an entry before would then pop into a state that is not its
+/// own. Nothing outside the engine can prevent that, because the worker is handed byte spans the
+/// engine says a terminal may take, and finding the sequence inside them would mean parsing the
+/// stream a second time with a second model of the same state.
+///
+/// The flags in force are a different matter and are not here. A direct terminal that did not see
+/// the negotiation would keep sending the old encoding, which is exactly the mismatch the
+/// negotiation exists to prevent, so `CSI = flags ; mode u` is forwarded live; and a push or a pop
+/// leaves the attachment projecting, which installs the resulting flags as a state. The session's
+/// stack stays the session's, the terminal's stays the terminal's, and the flags a direct
+/// attachment needs still arrive.
+///
+/// `class` is what the row the sequence belongs to says about it. A push or a pop the profile does
+/// not qualify changed nothing, so it needs no projection: it is consumed like any other
+/// extension.
+fn stops_here(kind: &EventKind, class: SequenceClass) -> StopsHere {
     // A colour request that both asks and changes is answered here, so its bytes stop here too.
     // The change went into the canonical palette and a physical terminal never saw it, which it
     // has to be told about rather than left to drift.
@@ -728,6 +742,9 @@ fn stops_here(kind: &EventKind) -> StopsHere {
     let csi = CsiView::with_truncation(params, *final_byte, *truncated);
     match csi.final_byte {
         b't' if matches!(csi.first_or(0), 22 | 23) => StopsHere::Withhold,
+        b'u' if matches!(csi.private, Some(b'>' | b'<')) && class == SequenceClass::Mode => {
+            StopsHere::Projection
+        }
         b'h' | b'l'
             if csi.private == Some(b'?')
                 && csi.numbers.contains(&Some(i64::from(MODE_WIN32_INPUT))) =>
@@ -755,7 +772,7 @@ pub fn disposition(
 ) -> DirectDisposition {
     // What the profile handles itself is decided first, because a sequence can be answered here and
     // still have changed the canonical screen on the way.
-    match stops_here(kind) {
+    match stops_here(kind, class) {
         StopsHere::Withhold => return DirectDisposition::Withhold,
         StopsHere::Projection => return DirectDisposition::RequireProjection,
         StopsHere::No => {}

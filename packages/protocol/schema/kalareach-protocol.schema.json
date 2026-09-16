@@ -1198,6 +1198,12 @@
       ],
       "type": "object"
     },
+    "CollapseId": {
+      "description": "The group a notification replaces others in on the device. 128 bits a host derives from its own secret.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
     "CollectionLocator": {
       "additionalProperties": false,
       "description": "One collection a recovery bundle can find.",
@@ -2834,6 +2840,12 @@
           "type": "string"
         }
       ]
+    },
+    "GatewayOrigin": {
+      "description": "The origin a service request is bound to: scheme, host and optional port, with no path, query, fragment or trailing slash.",
+      "maxLength": 128,
+      "minLength": 1,
+      "type": "string"
     },
     "GenerationAccepted": {
       "additionalProperties": false,
@@ -5185,6 +5197,12 @@
       ],
       "type": "object"
     },
+    "NotificationId": {
+      "description": "One notification, named by the host that produced it. 128 random bits, opaque to the gateway and the provider.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
     "NotificationPreviewKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte X25519 notification-preview public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
@@ -6029,6 +6047,1053 @@
       ],
       "type": "object"
     },
+    "PushAlert": {
+      "description": "The generic alert a device shows before anything is decrypted.\n\nSection 16 requires the plaintext alert to be generic, and this is how: a sender chooses from a\nclosed vocabulary and the text comes from here. A delivery request has no field for text a\nsender supplies, so command text and approval arguments cannot reach a lock screen by mistake or\nby a bug in a host. What reaches it is one of six sentences, each of which names no session,\nproject, host or command.",
+      "oneOf": [
+        {
+          "const": "session_needs_attention",
+          "description": "Something in a session wants a person.",
+          "type": "string"
+        },
+        {
+          "const": "approval_waiting",
+          "description": "An agent is waiting for an approval decision.",
+          "type": "string"
+        },
+        {
+          "const": "question_waiting",
+          "description": "An agent asked a question and is waiting for the answer.",
+          "type": "string"
+        },
+        {
+          "const": "work_complete",
+          "description": "A turn finished and is waiting to be reviewed.",
+          "type": "string"
+        },
+        {
+          "const": "host_unreachable",
+          "description": "The host stopped answering.",
+          "type": "string"
+        },
+        {
+          "const": "attention_update",
+          "description": "Notifications were suppressed and collapsed into this one.",
+          "type": "string"
+        }
+      ]
+    },
+    "PushDeliveryAck": {
+      "additionalProperties": false,
+      "description": "The gateway's answer to one delivery request.",
+      "properties": {
+        "decided_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the gateway decided, in UTC milliseconds."
+        },
+        "notification_id": {
+          "$ref": "#/$defs/NotificationId",
+          "description": "The notification this answers."
+        },
+        "state": {
+          "$ref": "#/$defs/PushDeliveryState",
+          "description": "What became of it."
+        },
+        "suppression": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PushSuppression"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What was suppressed, when anything was."
+        }
+      },
+      "required": [
+        "decided_at_ms",
+        "notification_id",
+        "state",
+        "suppression"
+      ],
+      "type": "object"
+    },
+    "PushDeliveryCredential": {
+      "additionalProperties": false,
+      "description": "The bearer a host presents to deliver, and what it is bound to.\n\nAt issue it goes to the installation, which passes it to the host through the paired encrypted\nchannel: the installation is the one authorising, so the first credential travels the way the\nauthorisation does. At renewal it goes straight to the host, in the answer to the renewal the\nhost itself proved, which is what makes renewal work while the phone is asleep or unreachable.\n\nIt grants delivery to one destination and nothing else: it is not a session, it reads nothing,\nand it cannot be presented to any other method.\n\nThe gateway stores [`PushDeliveryCredential::secret_digest`], never the secret. A copy of the\ndatabase is therefore not a set of working credentials.",
+      "properties": {
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it stops working, at most [`DELIVERY_CREDENTIAL_LIFETIME_MS`] after issue."
+        },
+        "gateway_origin": {
+          "$ref": "#/$defs/GatewayOrigin",
+          "description": "The gateway that issued it."
+        },
+        "installation_id": {
+          "$ref": "#/$defs/InstallationId",
+          "description": "The destination installation."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was issued or last renewed, in UTC milliseconds."
+        },
+        "revision": {
+          "$ref": "#/$defs/PushSenderRevision",
+          "description": "The revision of the record it was issued against."
+        },
+        "secret": {
+          "$ref": "#/$defs/SecretBytes32",
+          "description": "The bearer itself. It reaches a log or a debug rendering as a redaction."
+        },
+        "sender_record_id": {
+          "$ref": "#/$defs/PushSenderRecordId",
+          "description": "The authorisation it delivers under."
+        }
+      },
+      "required": [
+        "expires_at_ms",
+        "gateway_origin",
+        "installation_id",
+        "issued_at_ms",
+        "revision",
+        "secret",
+        "sender_record_id"
+      ],
+      "type": "object"
+    },
+    "PushDeliveryRequest": {
+      "additionalProperties": false,
+      "description": "One notification, as a host hands it to the gateway.\n\nThe host writes the underlying event first and then sends this, so a notification that is never\ndelivered has already been recorded somewhere the person can find it.\n\nNothing here is a field for plaintext that describes the work. The alert comes from a closed\nvocabulary, the two identifiers are 128-bit values rather than text, and the preview is a sealed\nenvelope whose shape [`PushDeliveryRequest::preview_is_well_formed`] checks. Those are the\nchecks a gateway can make. What they do not do is inspect a producer: a host that put meaning\ninto its own identifiers, or sealed the wrong thing, has disclosed it to the provider and to the\ngateway. Keeping the identifiers meaningless and the preview correctly sealed is the producer's\nobligation, and section 16 places it there.\n\nLarger detail does not belong here. Section 16 bounds the preview plaintext to\n[`MAX_PREVIEW_PLAINTEXT_BYTES`] and the complete provider payload to\n[`MAX_PROVIDER_PAYLOAD_BYTES`], and says to move the excess into a referenced encrypted object\nrather than trusting an expansion ratio.",
+      "properties": {
+        "collapse_id": {
+          "$ref": "#/$defs/CollapseId",
+          "description": "The group this replaces others in on the device."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the notification stops being worth delivering, in UTC milliseconds.\n\nRetries stop here. A notification whose moment has passed is not redelivered later."
+        },
+        "hints": {
+          "$ref": "#/$defs/PushPlatformHints",
+          "description": "What to ask each platform for."
+        },
+        "notification_id": {
+          "$ref": "#/$defs/NotificationId",
+          "description": "The notification's identity. The gateway deduplicates by it and never reads it."
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SealedEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The sealed preview, or null when the destination has previews disabled.\n\nIt is a [`SealedEnvelope`], not opaque bytes, so the gateway can check the shape of what it\nis forwarding without holding a key that opens it: that the envelope expires when the\nnotification does, and that its ciphertext is a padded plaintext of a notification-sized\nbucket rather than an arbitrary payload. [`PushDeliveryRequest::preview_is_well_formed`] is\nthat check."
+        },
+        "sender_record_id": {
+          "$ref": "#/$defs/PushSenderRecordId",
+          "description": "The authorisation this is delivered under."
+        }
+      },
+      "required": [
+        "collapse_id",
+        "expires_at_ms",
+        "hints",
+        "notification_id",
+        "preview",
+        "sender_record_id"
+      ],
+      "type": "object"
+    },
+    "PushDeliveryState": {
+      "description": "What became of one delivery request.\n\n`Queued` means the provider accepted it for delivery. It does not mean displayed, read or\nexecuted, and nothing in KalaReach treats it as though it did: in-app review state comes from\nhost events and client acknowledgements. Every other state says something other than acceptance\nhappened, which is a fact the host needs rather than one to smooth over.",
+      "oneOf": [
+        {
+          "const": "queued",
+          "description": "The provider accepted it for delivery.",
+          "type": "string"
+        },
+        {
+          "const": "retrying",
+          "description": "The gateway holds it and is retrying a transient provider failure until it expires.\n\nIt is the honest answer to \"did the provider take it\", and the answer is not yet. Section 16\nretries transient failures with exponential backoff and jitter and stops at expiry, so this\nstate settles on its own rather than becoming something a host has to poll for. It ends as\n`queued` when the provider takes it, as `collapsed` when the destination is over its policy\nby the time it is tried again, as `token_disabled` or `refused` when the provider rejects\nthe token or the message, as `revoked` when the authorisation ends first, as `abandoned`\nwhen the gateway stops trying, and as `expired` when the notification's moment passes.\n\nThe same request presented again while the gateway is still holding it is answered\n`retrying`, with what it was told the first time. One presented after the gateway has\ndecided is answered `duplicate`.",
+          "type": "string"
+        },
+        {
+          "const": "collapsed",
+          "description": "The destination is over its rate policy; this collapsed into an attention update.",
+          "type": "string"
+        },
+        {
+          "const": "duplicate",
+          "description": "This notification identifier was already handled. The earlier outcome stands.",
+          "type": "string"
+        },
+        {
+          "const": "token_disabled",
+          "description": "The destination token was rejected by the provider and is disabled.\n\nNothing more is sent to it until a native registration proves receipt again.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "The provider refused the notification itself, and a retry cannot change that.\n\nIt is the honest answer to a payload the provider will not take: too large, or malformed.\nThe host fixes what it sent rather than sending it again.",
+          "type": "string"
+        },
+        {
+          "const": "revoked",
+          "description": "The authorisation this was sent under ended before the provider accepted it.\n\nA revocation reaches work that is already queued, and a notification that was waiting when\nit arrived is not an exception to it. The host needs a new authorisation from the device.",
+          "type": "string"
+        },
+        {
+          "const": "abandoned",
+          "description": "The gateway stopped trying before the notification's own expiry.\n\nA provider that refused for long enough, or a destination with more waiting than a gateway\nholds for one installation. It is separate from `expired` because the notification's moment\nhad not passed: the host may still have something to say about it.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "The notification expired before the provider accepted it.",
+          "type": "string"
+        }
+      ]
+    },
+    "PushInstallationBinding": {
+      "additionalProperties": false,
+      "description": "The canonical active binding of one provider token to one installation.\n\nThere is exactly one of these per token digest. That is what stops an installation from\nregistering the same token under a second identity to start its rate history again: a second\nidentity for one token is not an additional binding, it is a replacement, and a replacement has\nto pass its own challenge. The rate history stays with the digest through that replacement, so\nthe alias gains nothing.\n\nThe token itself is not here. The gateway keeps it where it keeps its own secrets, because it\nneeds the token to deliver; what travels in a record is the digest.",
+      "properties": {
+        "bound_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the answered challenge bound it, in UTC milliseconds."
+        },
+        "gateway_origin": {
+          "$ref": "#/$defs/GatewayOrigin",
+          "description": "The gateway holding it."
+        },
+        "installation_id": {
+          "$ref": "#/$defs/InstallationId",
+          "description": "The installation the token delivers to."
+        },
+        "installation_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The public key that installation authenticates with."
+        },
+        "platform": {
+          "$ref": "#/$defs/PushPlatform",
+          "description": "The platform the token belongs to."
+        },
+        "registration_id": {
+          "$ref": "#/$defs/PushRegistrationId",
+          "description": "The attempt whose answer established it."
+        },
+        "state": {
+          "$ref": "#/$defs/PushTokenState",
+          "description": "Whether the provider still delivers to the token."
+        },
+        "token_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The token, as the gateway records it."
+        }
+      },
+      "required": [
+        "bound_at_ms",
+        "gateway_origin",
+        "installation_id",
+        "installation_key",
+        "platform",
+        "registration_id",
+        "state",
+        "token_digest"
+      ],
+      "type": "object"
+    },
+    "PushPlatform": {
+      "description": "A push platform, as the gateway builds a payload for it.\n\nBoth go through FCM HTTP v1. The distinction is the payload: an iOS message carries the APNs\nalert, `mutable-content`, expiry and collapse headers the notification extension needs, and\nFirebase forwards it through APNs with KalaReach's registered key and app topic.",
+      "oneOf": [
+        {
+          "const": "android",
+          "description": "Android, through FCM directly.",
+          "type": "string"
+        },
+        {
+          "const": "ios",
+          "description": "iOS, through FCM to APNs.",
+          "type": "string"
+        }
+      ]
+    },
+    "PushPlatformHints": {
+      "additionalProperties": false,
+      "description": "What the gateway asks each platform for, beyond the payload itself.",
+      "properties": {
+        "alert": {
+          "$ref": "#/$defs/PushAlert",
+          "description": "Which generic alert to show."
+        },
+        "urgency": {
+          "$ref": "#/$defs/PushUrgency",
+          "description": "How urgently to deliver."
+        }
+      },
+      "required": [
+        "alert",
+        "urgency"
+      ],
+      "type": "object"
+    },
+    "PushRatePolicy": {
+      "additionalProperties": false,
+      "description": "What a destination may receive, and how excess collapses.\n\nFree push has its own budget and is never charged against a voice balance (section 17). The\npolicy is fixed when an authorisation is issued and a renewal cannot change it, so a host\ncannot widen its own allowance by renewing.",
+      "properties": {
+        "burst": {
+          "$ref": "#/$defs/U64",
+          "description": "How many notifications may arrive in a burst."
+        },
+        "collapse_window_ms": {
+          "$ref": "#/$defs/DurationMs",
+          "description": "How often excess collapses into one attention update."
+        },
+        "sustained_per_hour": {
+          "$ref": "#/$defs/U64",
+          "description": "How many may arrive in one hour."
+        }
+      },
+      "required": [
+        "burst",
+        "sustained_per_hour",
+        "collapse_window_ms"
+      ],
+      "type": "object"
+    },
+    "PushRegistrationAnswer": {
+      "additionalProperties": false,
+      "description": "The receiver's answer to a challenge, signed by the proposed installation key.\n\nThe receiver answers only for its own locally pending registration and its own public key. It\ndoes not sign a challenge that names an attempt it did not start, or an installation identifier\nthat is not the one its key derives, so a challenge aimed at a token in the hope of a reply gets\nnone.",
+      "properties": {
+        "installation_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The public half of the key that answered. Its SHA-256 names the installation."
+        },
+        "payload": {
+          "$ref": "#/$defs/PushRegistrationAnswerPayload",
+          "description": "What the receiver states."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The signature over [`PushRegistrationAnswerPayload::signing_input`]."
+        }
+      },
+      "required": [
+        "payload",
+        "installation_key",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "PushRegistrationAnswerPayload": {
+      "additionalProperties": false,
+      "description": "What a registration answer states, and exactly what its signature covers.\n\nEvery field of the challenge is repeated here and covered by the signature, so an answer is a\nstatement about one attempt, one token and one gateway. Dropping any of them would let an answer\ncollected in one context be presented in another: without the token digest an answer would\nactivate a token nobody proved receipt of; without the origin it would answer a different\ndeployment's challenge; without the registration identifier it would complete whichever attempt\nhappened to be pending.",
+      "properties": {
+        "challenge": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The value that arrived through the provider."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The expiry the challenge carried."
+        },
+        "gateway_origin": {
+          "$ref": "#/$defs/GatewayOrigin",
+          "description": "The gateway that issued the challenge."
+        },
+        "installation_id": {
+          "$ref": "#/$defs/InstallationId",
+          "description": "The installation the answering key names."
+        },
+        "platform": {
+          "$ref": "#/$defs/PushPlatform",
+          "description": "The platform the token belongs to."
+        },
+        "registration_id": {
+          "$ref": "#/$defs/PushRegistrationId",
+          "description": "The attempt being answered."
+        },
+        "token_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The token the challenge was sent to."
+        }
+      },
+      "required": [
+        "challenge",
+        "expires_at_ms",
+        "gateway_origin",
+        "installation_id",
+        "platform",
+        "registration_id",
+        "token_digest"
+      ],
+      "type": "object"
+    },
+    "PushRegistrationChallenge": {
+      "additionalProperties": false,
+      "description": "The challenge the gateway sends through the provider to a proposed token.\n\nIt goes to the token, not to the caller. That is the whole point: an authenticated HTTP request\nproves the caller holds an installation key, and nothing more. Sending a random value to the\ntoken and requiring it back signed proves that the installation which holds the key is also the\none the provider delivers that token to. Until that returns, the registration stays pending and\nno sender credential is issued.\n\nThe challenge is single use. An answer consumes it, and a second answer, whether the same one\nreplayed or another arriving at the same moment, finds nothing pending to answer.",
+      "properties": {
+        "challenge": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The single-use random value the receiver returns."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it stops being answerable, at most [`REGISTRATION_CHALLENGE_LIFETIME_MS`] after issue."
+        },
+        "gateway_origin": {
+          "$ref": "#/$defs/GatewayOrigin",
+          "description": "The gateway that issued it."
+        },
+        "installation_id": {
+          "$ref": "#/$defs/InstallationId",
+          "description": "The installation the pending registration is for."
+        },
+        "platform": {
+          "$ref": "#/$defs/PushPlatform",
+          "description": "The platform the token belongs to."
+        },
+        "registration_id": {
+          "$ref": "#/$defs/PushRegistrationId",
+          "description": "This attempt, so an answer cannot complete a different one."
+        },
+        "token_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The token the challenge was sent to."
+        }
+      },
+      "required": [
+        "challenge",
+        "expires_at_ms",
+        "gateway_origin",
+        "installation_id",
+        "platform",
+        "registration_id",
+        "token_digest"
+      ],
+      "type": "object"
+    },
+    "PushRegistrationId": {
+      "description": "One attempt to bind a push token to an installation. 128 random bits.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "PushRegistrationProposal": {
+      "additionalProperties": false,
+      "description": "What a caller sends to begin a registration.\n\nIt proposes a token. It establishes nothing: the gateway records the attempt, sends a challenge\nthrough the provider to that token, and waits. A caller that never receives the challenge has\nonly ever had a pending registration.",
+      "properties": {
+        "installation_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The public key the installation will authenticate with. Its SHA-256 names the installation."
+        },
+        "platform": {
+          "$ref": "#/$defs/PushPlatform",
+          "description": "The platform whose payload the gateway should build for this token.\n\nIt is a claim, not a proof: receiving the challenge says the token reaches this device and\nnothing about the label beside it. The gateway records it as delivery metadata and never\nindexes by it."
+        },
+        "registration_id": {
+          "$ref": "#/$defs/PushRegistrationId",
+          "description": "This attempt. A retry carrying the same value is the same attempt."
+        },
+        "registration_token": {
+          "$ref": "#/$defs/RegistrationToken",
+          "description": "The provider token being proposed."
+        }
+      },
+      "required": [
+        "installation_key",
+        "platform",
+        "registration_id",
+        "registration_token"
+      ],
+      "type": "object"
+    },
+    "PushRegistrationRequest": {
+      "description": "What a caller sends for `push.installation.register`.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Propose a token and ask for the challenge to be sent to it.",
+          "properties": {
+            "propose": {
+              "additionalProperties": false,
+              "properties": {
+                "proposal": {
+                  "$ref": "#/$defs/PushRegistrationProposal",
+                  "description": "The token and the identity proposed for it."
+                }
+              },
+              "required": [
+                "proposal"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "propose"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Present the challenge, signed, and activate the binding.",
+          "properties": {
+            "answer": {
+              "additionalProperties": false,
+              "properties": {
+                "answer": {
+                  "$ref": "#/$defs/PushRegistrationAnswer",
+                  "description": "The receiver's answer."
+                }
+              },
+              "required": [
+                "answer"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PushRequest": {
+      "description": "Every body a signed push method carries.\n\nOne type, so there is one rule for what a service-request signature covers: the signature's\n`body_digest` is [`PushRequest::digest`], and the method it names is [`PushRequest::method`]. A\nbody built for one method therefore cannot be presented under another, because the signature\ncovers both the body and the method and a verifier checks that they agree.\n\nDelivery is not here. It carries the bearer credential the host was issued rather than a\nsignature, so it has no body digest to cover.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "`push.installation.register`.",
+          "properties": {
+            "installation_register": {
+              "additionalProperties": false,
+              "properties": {
+                "request": {
+                  "$ref": "#/$defs/PushRegistrationRequest",
+                  "description": "The proposal or the answer."
+                }
+              },
+              "required": [
+                "request"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "installation_register"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`push.sender.issue`.",
+          "properties": {
+            "sender_issue": {
+              "additionalProperties": false,
+              "properties": {
+                "request": {
+                  "$ref": "#/$defs/PushSenderIssueRequest",
+                  "description": "The host being authorised."
+                }
+              },
+              "required": [
+                "request"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "sender_issue"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`push.sender.renew`.",
+          "properties": {
+            "sender_renew": {
+              "additionalProperties": false,
+              "properties": {
+                "request": {
+                  "$ref": "#/$defs/PushSenderRenewRequest",
+                  "description": "The nonce request or the proof."
+                }
+              },
+              "required": [
+                "request"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "sender_renew"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`push.sender.revoke`.",
+          "properties": {
+            "sender_revoke": {
+              "additionalProperties": false,
+              "properties": {
+                "request": {
+                  "$ref": "#/$defs/PushSenderRevokeRequest",
+                  "description": "The nonce request or the statement."
+                }
+              },
+              "required": [
+                "request"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "sender_revoke"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PushRevocationReason": {
+      "description": "Why a sender authorisation ended.",
+      "oneOf": [
+        {
+          "const": "unpaired",
+          "description": "The device and the host were unpaired.",
+          "type": "string"
+        },
+        {
+          "const": "host_key_replaced",
+          "description": "The host replaced its signing key, which needs a new authorisation from the installation.",
+          "type": "string"
+        },
+        {
+          "const": "installation_key_replaced",
+          "description": "The installation replaced its own key, which revokes every authorisation it had given.",
+          "type": "string"
+        }
+      ]
+    },
+    "PushSenderBinding": {
+      "additionalProperties": false,
+      "description": "What one sender authorisation fixes for its lifetime.\n\nA renewal proves the host is still there; it is not an opportunity to change what was\nauthorised. Every field a renewal must not touch is here and nowhere else, so\n[`PushSenderRecord::renewal_preserves_binding`] is a comparison of one digest rather than a list\nof fields somebody has to remember to extend.",
+      "properties": {
+        "gateway_origin": {
+          "$ref": "#/$defs/GatewayOrigin",
+          "description": "The gateway holding the authorisation."
+        },
+        "host_endpoint_key": {
+          "$ref": "#/$defs/EndpointKey",
+          "description": "The host's iroh endpoint identity, so the installation knows which peer it authorised."
+        },
+        "host_signing_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The host's Ed25519 signing key. Renewal and revocation are proven with it."
+        },
+        "installation_id": {
+          "$ref": "#/$defs/InstallationId",
+          "description": "The destination installation."
+        },
+        "rate_policy": {
+          "$ref": "#/$defs/PushRatePolicy",
+          "description": "What that destination may receive."
+        },
+        "sender_record_id": {
+          "$ref": "#/$defs/PushSenderRecordId",
+          "description": "This authorisation."
+        }
+      },
+      "required": [
+        "gateway_origin",
+        "host_endpoint_key",
+        "host_signing_key",
+        "installation_id",
+        "rate_policy",
+        "sender_record_id"
+      ],
+      "type": "object"
+    },
+    "PushSenderIssueRequest": {
+      "additionalProperties": false,
+      "description": "What an installation sends for `push.sender.issue`.\n\nIt names one paired host by both of its keys and asks for a credential scoped to that host and\nthis installation. The gateway sets the rate policy; a caller cannot ask for a wider one.",
+      "properties": {
+        "host_endpoint_key": {
+          "$ref": "#/$defs/EndpointKey",
+          "description": "The host's iroh endpoint identity."
+        },
+        "host_signing_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The host's Ed25519 signing key, which will prove its renewals and its revocation."
+        },
+        "sender_record_id": {
+          "$ref": "#/$defs/PushSenderRecordId",
+          "description": "The authorisation being created. A retry carrying the same value is the same authorisation."
+        }
+      },
+      "required": [
+        "host_endpoint_key",
+        "host_signing_key",
+        "sender_record_id"
+      ],
+      "type": "object"
+    },
+    "PushSenderNonceRequest": {
+      "additionalProperties": false,
+      "description": "What a host sends to ask for the nonce its proof will answer.",
+      "properties": {
+        "sender_record_id": {
+          "$ref": "#/$defs/PushSenderRecordId",
+          "description": "The authorisation the host is about to renew or revoke."
+        }
+      },
+      "required": [
+        "sender_record_id"
+      ],
+      "type": "object"
+    },
+    "PushSenderRecord": {
+      "additionalProperties": false,
+      "description": "One installation's authorisation of one host, as the gateway holds it.\n\nThe authorisation and the credential have different lifetimes on purpose. The authorisation is\nthe installation's decision and lasts until the installation revokes it. The credential is a\nbearer token that a host keeps on disk, so it expires in thirty days and is renewed by proving\npossession of the key the installation named. An offline host that comes back after its\ncredential expired still renews, because what it proves has not lapsed.",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/PushSenderBinding",
+          "description": "What the installation authorised, and what a renewal may not change."
+        },
+        "credential_expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the current credential stops working."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the installation authorised the host, in UTC milliseconds."
+        },
+        "revision": {
+          "$ref": "#/$defs/PushSenderRevision",
+          "description": "The gateway's revision, advanced on every renewal."
+        },
+        "state": {
+          "$ref": "#/$defs/PushSenderState",
+          "description": "Whether the authorisation still stands."
+        }
+      },
+      "required": [
+        "binding",
+        "credential_expires_at_ms",
+        "issued_at_ms",
+        "revision",
+        "state"
+      ],
+      "type": "object"
+    },
+    "PushSenderRecordId": {
+      "description": "One installation's authorisation of one paired host to send it notifications.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "PushSenderRenewRequest": {
+      "description": "What a host sends for `push.sender.renew`.\n\nTwo steps, because the proof answers a nonce the gateway chose. The first asks for the nonce and\nthe second returns it signed, so a captured renewal answers a question that has already been\nasked and closed.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Ask for a fresh nonce to renew against.",
+          "properties": {
+            "begin": {
+              "additionalProperties": false,
+              "properties": {
+                "request": {
+                  "$ref": "#/$defs/PushSenderNonceRequest",
+                  "description": "The authorisation being renewed."
+                }
+              },
+              "required": [
+                "request"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "begin"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Present the renewal proof and take the new credential.",
+          "properties": {
+            "complete": {
+              "additionalProperties": false,
+              "properties": {
+                "renewal": {
+                  "$ref": "#/$defs/PushSenderRenewal",
+                  "description": "The host's proof."
+                }
+              },
+              "required": [
+                "renewal"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "complete"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PushSenderRenewal": {
+      "additionalProperties": false,
+      "description": "A host's proof that it still holds the key the installation authorised.",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/PushSenderRenewalPayload",
+          "description": "What the host states."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The host signing key's signature over [`PushSenderRenewalPayload::signing_input`]."
+        }
+      },
+      "required": [
+        "payload",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "PushSenderRenewalPayload": {
+      "additionalProperties": false,
+      "description": "What a renewal proof states, and exactly what its signature covers.\n\nThe nonce is the gateway's, handed out for this renewal and accepted once. Without it a captured\nrenewal would be usable for as long as the host key lived; with it, a renewal is a reply to a\nquestion the gateway asked a moment ago.",
+      "properties": {
+        "gateway_nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The single-use value the gateway handed out for this renewal."
+        },
+        "gateway_origin": {
+          "$ref": "#/$defs/GatewayOrigin",
+          "description": "The gateway that issued the nonce."
+        },
+        "requested_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the host signed, in UTC milliseconds."
+        },
+        "sender_record_id": {
+          "$ref": "#/$defs/PushSenderRecordId",
+          "description": "The authorisation being renewed."
+        }
+      },
+      "required": [
+        "gateway_origin",
+        "gateway_nonce",
+        "requested_at_ms",
+        "sender_record_id"
+      ],
+      "type": "object"
+    },
+    "PushSenderRevision": {
+      "description": "The revision of one push sender record, advanced by the gateway on every renewal.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "PushSenderRevocation": {
+      "additionalProperties": false,
+      "description": "A host's statement that an authorisation is finished.",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/PushSenderRevocationPayload",
+          "description": "What the host states."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The host signing key's signature over [`PushSenderRevocationPayload::signing_input`]."
+        }
+      },
+      "required": [
+        "payload",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "PushSenderRevocationPayload": {
+      "additionalProperties": false,
+      "description": "What a revocation states, and exactly what its signature covers.",
+      "properties": {
+        "gateway_nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "The single-use value the gateway handed out for this revocation."
+        },
+        "gateway_origin": {
+          "$ref": "#/$defs/GatewayOrigin",
+          "description": "The gateway that issued the nonce."
+        },
+        "reason": {
+          "$ref": "#/$defs/PushRevocationReason",
+          "description": "Why the authorisation is ending."
+        },
+        "requested_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the host signed, in UTC milliseconds."
+        },
+        "sender_record_id": {
+          "$ref": "#/$defs/PushSenderRecordId",
+          "description": "The authorisation being revoked."
+        }
+      },
+      "required": [
+        "gateway_origin",
+        "gateway_nonce",
+        "reason",
+        "requested_at_ms",
+        "sender_record_id"
+      ],
+      "type": "object"
+    },
+    "PushSenderRevokeRequest": {
+      "description": "What a host sends for `push.sender.revoke`.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Ask for a fresh nonce to revoke against.",
+          "properties": {
+            "begin": {
+              "additionalProperties": false,
+              "properties": {
+                "request": {
+                  "$ref": "#/$defs/PushSenderNonceRequest",
+                  "description": "The authorisation being revoked."
+                }
+              },
+              "required": [
+                "request"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "begin"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Present the revocation and end the authorisation.",
+          "properties": {
+            "complete": {
+              "additionalProperties": false,
+              "properties": {
+                "revocation": {
+                  "$ref": "#/$defs/PushSenderRevocation",
+                  "description": "The host's statement."
+                }
+              },
+              "required": [
+                "revocation"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "complete"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PushSenderState": {
+      "description": "Whether a sender authorisation still stands.",
+      "oneOf": [
+        {
+          "const": "active",
+          "description": "The installation's authorisation stands. The credential may be renewed.",
+          "type": "string"
+        },
+        {
+          "const": "revoked",
+          "description": "It was revoked, by unpairing or by the installation key being replaced.\n\nA revoked record never becomes active again. A host that needs to send after this needs a\nnew authorisation from the installation, which is a decision made on the device.",
+          "type": "string"
+        }
+      ]
+    },
+    "PushSuppression": {
+      "additionalProperties": false,
+      "description": "What the gateway suppressed, so the host can record it.\n\nThe host retains every request it made and reports suppression locally, which is what keeps a\nsuppressed notification from becoming a lost decision: the pending work is still on the host and\nstill visible there.",
+      "properties": {
+        "collapsed_into": {
+          "$ref": "#/$defs/NotificationId",
+          "description": "The attention update this collapsed into."
+        },
+        "next_update_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the next attention update may be sent, in UTC milliseconds."
+        },
+        "reason": {
+          "$ref": "#/$defs/PushSuppressionReason",
+          "description": "Which allowance was spent."
+        },
+        "suppressed_count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many notifications have collapsed into the current update, including this one."
+        }
+      },
+      "required": [
+        "collapsed_into",
+        "next_update_at_ms",
+        "reason",
+        "suppressed_count"
+      ],
+      "type": "object"
+    },
+    "PushSuppressionReason": {
+      "description": "Why a notification was suppressed, when it was.",
+      "oneOf": [
+        {
+          "const": "burst",
+          "description": "The burst allowance was spent.",
+          "type": "string"
+        },
+        {
+          "const": "sustained",
+          "description": "The hourly allowance was spent.",
+          "type": "string"
+        }
+      ]
+    },
+    "PushTokenState": {
+      "description": "Whether a bound token is still usable.",
+      "oneOf": [
+        {
+          "const": "active",
+          "description": "The provider delivers to it.",
+          "type": "string"
+        },
+        {
+          "const": "disabled",
+          "description": "The provider rejected it as unregistered or invalid.\n\nNothing is sent to a disabled token. Only a fresh native registration, which proves receipt\nagain, puts a token back in service; a host cannot re-enable one by asking.",
+          "type": "string"
+        }
+      ]
+    },
+    "PushUrgency": {
+      "description": "How urgently a provider is asked to deliver.",
+      "oneOf": [
+        {
+          "const": "attention",
+          "description": "Deliver now: a person is waiting. FCM `high`, APNs priority 10.",
+          "type": "string"
+        },
+        {
+          "const": "deferred",
+          "description": "Deliver when convenient. FCM `normal`, APNs priority 5.",
+          "type": "string"
+        }
+      ]
+    },
     "QuestionId": {
       "description": "One agent-to-user question.",
       "format": "uuid",
@@ -6304,6 +7369,12 @@
         "bundle_locator"
       ],
       "type": "object"
+    },
+    "RegistrationToken": {
+      "description": "A provider registration token, printable ASCII without spaces. It reaches the gateway once and is never carried in a record that leaves it.",
+      "maxLength": 1024,
+      "minLength": 1,
+      "type": "string"
     },
     "RejectionReason": {
       "description": "Why an action was rejected before dispatch.",
@@ -7611,6 +8682,84 @@
       "description": "A 32-byte Ed25519 service admission public key, which signs relay leases. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
+    },
+    "ServiceRequestPayload": {
+      "additionalProperties": false,
+      "description": "What a service-request signature covers, and exactly what it covers.",
+      "properties": {
+        "body_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The SHA-256 of the canonical request body."
+        },
+        "gateway_origin": {
+          "$ref": "#/$defs/GatewayOrigin",
+          "description": "The origin the request was addressed to."
+        },
+        "method": {
+          "$ref": "#/$defs/Method",
+          "description": "The method being called."
+        },
+        "nonce": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "A fresh 32-byte nonce, from the caller's random generator."
+        },
+        "signed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the caller signed, in UTC milliseconds."
+        }
+      },
+      "required": [
+        "body_digest",
+        "gateway_origin",
+        "method",
+        "nonce",
+        "signed_at_ms"
+      ],
+      "type": "object"
+    },
+    "ServiceRequestSignature": {
+      "additionalProperties": false,
+      "description": "One signed service request.\n\nIt authenticates a request; it authorises nothing by itself. What the caller may do with the\nmethod it names is the service's decision, made from the installation record and the records\nthat method reads.",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/ServiceRequestPayload",
+          "description": "What was signed."
+        },
+        "public_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The Ed25519 public key of that signer."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The signature over [`ServiceRequestPayload::signing_input`]."
+        },
+        "signer": {
+          "$ref": "#/$defs/ServiceRequestSigner",
+          "description": "Which key signed it, and therefore which domain the signature is checked under."
+        }
+      },
+      "required": [
+        "payload",
+        "signer",
+        "public_key",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "ServiceRequestSigner": {
+      "description": "Which key signed a service request, and therefore which domain it is checked under.",
+      "oneOf": [
+        {
+          "const": "installation",
+          "description": "A native installation, signing with its device authorisation key.",
+          "type": "string"
+        },
+        {
+          "const": "host",
+          "description": "A paired host, signing with its host signing key.",
+          "type": "string"
+        }
+      ]
     },
     "SessionAttachParams": {
       "additionalProperties": false,
@@ -9150,6 +10299,9 @@
         "clock_epoch": {
           "$ref": "#/$defs/ClockEpoch"
         },
+        "collapse_id": {
+          "$ref": "#/$defs/CollapseId"
+        },
         "confirmation_id": {
           "$ref": "#/$defs/ConfirmationId"
         },
@@ -9210,6 +10362,9 @@
         "machine_id": {
           "$ref": "#/$defs/MachineId"
         },
+        "notification_id": {
+          "$ref": "#/$defs/NotificationId"
+        },
         "organisation_id": {
           "$ref": "#/$defs/OrganisationId"
         },
@@ -9227,6 +10382,15 @@
         },
         "project_repository_id": {
           "$ref": "#/$defs/ProjectRepositoryId"
+        },
+        "push_registration_id": {
+          "$ref": "#/$defs/PushRegistrationId"
+        },
+        "push_sender_record_id": {
+          "$ref": "#/$defs/PushSenderRecordId"
+        },
+        "push_sender_revision": {
+          "$ref": "#/$defs/PushSenderRevision"
         },
         "question_id": {
           "$ref": "#/$defs/QuestionId"
@@ -9378,6 +10542,36 @@
     "protocol_error": {
       "$ref": "#/$defs/ProtocolError"
     },
+    "push_delivery_ack": {
+      "$ref": "#/$defs/PushDeliveryAck"
+    },
+    "push_delivery_credential": {
+      "$ref": "#/$defs/PushDeliveryCredential"
+    },
+    "push_delivery_request": {
+      "$ref": "#/$defs/PushDeliveryRequest"
+    },
+    "push_installation_binding": {
+      "$ref": "#/$defs/PushInstallationBinding"
+    },
+    "push_registration_answer": {
+      "$ref": "#/$defs/PushRegistrationAnswer"
+    },
+    "push_registration_challenge": {
+      "$ref": "#/$defs/PushRegistrationChallenge"
+    },
+    "push_request": {
+      "$ref": "#/$defs/PushRequest"
+    },
+    "push_sender_record": {
+      "$ref": "#/$defs/PushSenderRecord"
+    },
+    "push_sender_renewal": {
+      "$ref": "#/$defs/PushSenderRenewal"
+    },
+    "push_sender_revocation": {
+      "$ref": "#/$defs/PushSenderRevocation"
+    },
     "receipt": {
       "$ref": "#/$defs/Receipt"
     },
@@ -9419,6 +10613,9 @@
     },
     "sealed_envelope": {
       "$ref": "#/$defs/SealedEnvelope"
+    },
+    "service_request_signature": {
+      "$ref": "#/$defs/ServiceRequestSignature"
     },
     "session_attach_params": {
       "$ref": "#/$defs/SessionAttachParams"

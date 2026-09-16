@@ -1,23 +1,50 @@
-//! Writes the generated JSON Schema and method table for the TypeScript package.
+//! Writes the generated JSON Schema, the method table and the cross-language vectors.
+//!
+//! Two output roots, because the two are consumed differently: the schema and the method table
+//! feed the TypeScript build, and the vectors are conformance material both languages read.
 //!
 //! ```text
-//! kr-protocol-gen              write the files
-//! kr-protocol-gen --check      fail when the committed files differ
-//! kr-protocol-gen --out-dir P  write to P instead of packages/protocol/schema
+//! kr-protocol-gen                   write the files
+//! kr-protocol-gen --check           fail when the committed files differ
+//! kr-protocol-gen --out-dir P       write the schema to P instead of packages/protocol/schema
+//! kr-protocol-gen --fixtures-dir P  write the vectors to P instead of fixtures
 //! ```
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use kr_protocol::schema::generated_files;
+use kr_protocol::vectors::{PUSH_FILE_NAME, SERVICE_REQUESTS_FILE_NAME};
 
 fn default_out_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/protocol/schema")
 }
 
+fn default_fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
+}
+
+/// Every generated vector file, with the directory it belongs in under the fixtures root.
+fn vector_files() -> Vec<(PathBuf, String)> {
+    kr_protocol::vectors::generated_files()
+        .into_iter()
+        .map(|(name, contents)| {
+            let area = if name == SERVICE_REQUESTS_FILE_NAME {
+                "service"
+            } else if name == PUSH_FILE_NAME {
+                "push"
+            } else {
+                unreachable!("every vector file names its area")
+            };
+            (PathBuf::from(area).join(name), contents)
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
     let mut check = false;
     let mut out_dir = default_out_dir();
+    let mut fixtures_dir = default_fixtures_dir();
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -29,8 +56,15 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--fixtures-dir" => match arguments.next() {
+                Some(value) => fixtures_dir = PathBuf::from(value),
+                None => {
+                    eprintln!("--fixtures-dir needs a path");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--help" | "-h" => {
-                println!("kr-protocol-gen [--check] [--out-dir <path>]");
+                println!("kr-protocol-gen [--check] [--out-dir <path>] [--fixtures-dir <path>]");
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -40,18 +74,28 @@ fn main() -> ExitCode {
         }
     }
 
+    let files: Vec<(PathBuf, String)> = generated_files()
+        .into_iter()
+        .map(|(name, contents)| (out_dir.join(name), contents))
+        .chain(
+            vector_files()
+                .into_iter()
+                .map(|(relative, contents)| (fixtures_dir.join(relative), contents)),
+        )
+        .collect();
+
     if check {
-        run_check(&out_dir)
+        run_check(&files)
     } else {
-        run_write(&out_dir)
+        run_write(&files)
     }
 }
 
-fn run_check(out_dir: &Path) -> ExitCode {
+fn run_check(files: &[(PathBuf, String)]) -> ExitCode {
     let mut differences = 0usize;
-    for (name, expected) in generated_files() {
-        let path = out_dir.join(name);
-        match std::fs::read_to_string(&path) {
+    for (path, expected) in files {
+        let expected = expected.as_str();
+        match std::fs::read_to_string(path) {
             Ok(actual) if actual == expected => {}
             Ok(actual) => {
                 differences += 1;
@@ -61,7 +105,7 @@ fn run_check(out_dir: &Path) -> ExitCode {
                     actual.len(),
                     expected.len()
                 );
-                report_first_difference(&actual, &expected);
+                report_first_difference(&actual, expected);
             }
             Err(error) => {
                 differences += 1;
@@ -93,14 +137,15 @@ fn report_first_difference(actual: &str, expected: &str) {
     );
 }
 
-fn run_write(out_dir: &Path) -> ExitCode {
-    if let Err(error) = std::fs::create_dir_all(out_dir) {
-        eprintln!("{}: {error}", out_dir.display());
-        return ExitCode::FAILURE;
-    }
-    for (name, contents) in generated_files() {
-        let path = out_dir.join(name);
-        if let Err(error) = std::fs::write(&path, contents) {
+fn run_write(files: &[(PathBuf, String)]) -> ExitCode {
+    for (path, contents) in files {
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("{}: {error}", parent.display());
+            return ExitCode::FAILURE;
+        }
+        if let Err(error) = std::fs::write(path, contents) {
             eprintln!("{}: {error}", path.display());
             return ExitCode::FAILURE;
         }

@@ -1804,7 +1804,8 @@ fn a_cell_with_its_text_on_the_heap_is_charged_for_the_header() {
 }
 
 /// The array a screen keeps its rows in is reserved with the scrollback slots it can grow to, so
-/// an empty row and the slot it sits in are not free.
+/// an empty row and the slot it sits in are not free. Beside it is the array of what each retained
+/// row costs, which is a slot a retained row of its own.
 #[test]
 fn the_row_arrays_are_reserved_with_their_scrollback() {
     let budget = SessionBudget::new();
@@ -1812,9 +1813,10 @@ fn the_row_arrays_are_reserved_with_their_scrollback() {
     let footprint = budget.footprint(GridSize::new(80, 24), grid.scrollback_rows, 64);
     assert_eq!(
         footprint.row_arrays,
-        (24 + grid.scrollback_rows as u64 + 24) * kr_term::grid::ROW_SLOT_BYTES,
-        "the primary buffer's array holds the screen and the scrollback; the alternate keeps no \
-         history"
+        (24 + grid.scrollback_rows as u64 + 24) * kr_term::grid::ROW_SLOT_BYTES
+            + kr_term::budget::history_account_bytes(grid.scrollback_rows),
+        "the primary buffer's array holds the screen and the scrollback and the alternate keeps no \
+         history; the retained rows' account holds one charge a retained row"
     );
     assert!(
         footprint.cell_content >= 48 * kr_term::grid::ROW_STORAGE_BYTES,
@@ -2366,4 +2368,397 @@ fn rows_a_reflow_builds_behind_the_alternate_buffer_are_reported() {
         0,
         "the rows past what the geometry keeps were dropped when the buffer came back"
     );
+}
+
+/// A deterministic source of randomness for the sequence below.
+///
+/// A property this test proves has to be provable again from the same numbers, so the sequence is
+/// generated rather than recorded and the generator is fixed.
+struct Numbers(u64);
+
+impl Numbers {
+    fn next(&mut self) -> u64 {
+        // xorshift64*, which is short enough to read and good enough to pick operations with.
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
+
+/// What the retained rows cost is carried, and it is exact.
+///
+/// The figure is charged as rows leave the screen and given back as rows are dropped, so nothing
+/// walks the history to find it. This runs the two apart: a random sequence of prints, resizes,
+/// buffer switches, erasures and evictions, with the carried figure compared against a walk of the
+/// rows after every one of them.
+#[test]
+fn the_carried_history_figure_matches_a_walk_of_the_rows() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(40, 8),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let mut numbers = Numbers(0x5eed_1234_9abc_def1);
+    let mut operations = 0usize;
+    let mut resizes = 0usize;
+    let mut erasures = 0usize;
+    let mut deepest = 0usize;
+    let mut dearest = 0u64;
+
+    for step in 0..700u32 {
+        let before = engine.grid().scrollback_rows();
+        match numbers.below(64) {
+            // Plain text, sometimes with a line ending and sometimes without, so a row is
+            // sometimes finished and sometimes left open across the next operation.
+            0..=27 => {
+                let lines = numbers.below(6);
+                let mut input = String::new();
+                for _ in 0..=lines {
+                    let width = numbers.below(60);
+                    for _ in 0..width {
+                        input.push('x');
+                    }
+                    if numbers.below(4) != 0 {
+                        input.push_str("\r\n");
+                    }
+                }
+                engine.feed(input.as_bytes(), u64::from(step));
+            }
+            // Rows that cost far more than a plain one: colour, wide characters and a hyperlink,
+            // so the rows in the history are not all the same size.
+            28..=39 => {
+                let mut input = String::from("\x1b[38;2;10;20;30;48;5;9m");
+                if numbers.below(2) == 0 {
+                    input.push_str("\x1b]8;;https://example.invalid/a\x1b\\");
+                }
+                for _ in 0..=numbers.below(40) {
+                    input.push('\u{754c}');
+                }
+                input.push_str("\x1b]8;;\x1b\\\x1b[0m\r\n");
+                engine.feed(input.as_bytes(), u64::from(step));
+            }
+            // A burst that costs more than the whole cache, which evicts.
+            40..=41 => {
+                let mut input = String::from("\x1b[38;2;10;20;30;48;5;9m");
+                for _ in 0..1_200 {
+                    for _ in 0..20 {
+                        input.push('\u{754c}');
+                    }
+                    input.push_str("\r\n");
+                }
+                input.push_str("\x1b[0m");
+                engine.feed(input.as_bytes(), u64::from(step));
+            }
+            // A resize, which reflows every retained row and moves rows between the screen and the
+            // history in both directions. A geometry the budget refuses leaves the grid alone, and
+            // the account has to match after that too.
+            42..=51 => {
+                let rows = 2 + u32::try_from(numbers.below(20)).unwrap_or(0);
+                let cols = 8 + u32::try_from(numbers.below(80)).unwrap_or(0);
+                if engine
+                    .resize(GridSize::new(cols, rows), u64::from(step))
+                    .is_ok()
+                {
+                    resizes += 1;
+                }
+            }
+            // Into the alternate buffer and back, where the primary buffer's history is out of
+            // reach and a resize still moves rows into it.
+            52..=55 => {
+                engine.feed(b"\x1b[?1049h", u64::from(step));
+            }
+            56..=59 => {
+                engine.feed(b"\x1b[?1049l", u64::from(step));
+            }
+            // The two erasures: the scrollback on its own, and a full reset.
+            60..=61 => {
+                if numbers.below(2) == 0 {
+                    engine.feed(b"\x1b[3J", u64::from(step));
+                } else {
+                    engine.feed(b"\x1bc", u64::from(step));
+                }
+                erasures += 1;
+            }
+            // Nothing at all, which still has to leave the account matching.
+            _ => {}
+        }
+        if numbers.below(3) == 0 {
+            engine.quiesce(u64::from(step));
+        }
+        operations += 1;
+        deepest = deepest.max(engine.grid().scrollback_rows());
+        dearest = dearest.max(engine.grid().history_bytes());
+        let carried = engine.grid().history_bytes();
+        let walked = engine.grid().measure_history_bytes();
+        assert_eq!(
+            carried,
+            walked,
+            "step {step} left the carried figure at {carried} and a walk of the rows at {walked}; \
+             the history held {before} rows before it and {} after",
+            engine.grid().scrollback_rows()
+        );
+        assert!(
+            engine.grid().history_bytes() <= BudgetLimits::DEFAULT.row_cache_bytes
+                || engine.grid().alternate_active(),
+            "step {step} left the cache over its bound"
+        );
+    }
+
+    assert!(operations >= 700);
+    assert!(resizes > 60, "the sequence has to resize: {resizes}");
+    assert!(erasures > 8, "the sequence has to erase: {erasures}");
+    assert!(
+        deepest > 500,
+        "the history has to get deep enough for a walk of it to be the wrong answer: {deepest}"
+    );
+    assert!(
+        dearest > BudgetLimits::DEFAULT.row_cache_bytes * 9 / 10,
+        "the cache has to reach its bound for eviction to be exercised: {dearest}"
+    );
+}
+
+/// A restoration carries the keyboard stack as it carries the title stack.
+///
+/// The stack is the session's, not the terminal's, so nothing outside the session can be asked
+/// what is on it. A reconnecting client is handed the flags in force as a state, and the entries
+/// behind them travel with the snapshot so that an application's next pop lands where it would
+/// have landed had nothing been disconnected.
+#[test]
+fn a_restoration_reproduces_the_keyboard_stack() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(40, 8),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // The shell negotiates, then a full-screen application negotiates its own on the other buffer.
+    engine.feed(b"\x1b[>4;2m\x1b[>1u\x1b[>5u", 0);
+    engine.feed(b"\x1b[?1049h\x1b[>9u\x1b[>3u", 0);
+    engine.quiesce(0);
+
+    let (snapshot, _) = engine.snapshot(viewport(&engine), 0);
+    assert_eq!(snapshot.keyboard.modify_other_keys, 2);
+    assert_eq!(snapshot.keyboard.primary.flags, Some(5));
+    assert_eq!(snapshot.keyboard.primary.stack, vec![0, 1]);
+    assert_eq!(snapshot.keyboard.alternate.flags, Some(3));
+    assert_eq!(snapshot.keyboard.alternate.stack, vec![0, 9]);
+
+    let installed = restoration_operations(&snapshot)
+        .into_iter()
+        .find_map(|op| match op {
+            RestoreOp::SetKeyboard { keyboard } => Some(keyboard),
+            _ => None,
+        })
+        .expect("the restoration installs the keyboard state");
+    assert_eq!(
+        installed, snapshot.keyboard,
+        "the whole of it, both buffers and both stacks"
+    );
+
+    // And a session built from it holds what the first one held.
+    let mut restored = kr_term::modes::ModeState::new();
+    restored.restore_keyboard(
+        snapshot.keyboard.modify_other_keys,
+        [
+            (
+                snapshot.keyboard.primary.flags,
+                snapshot.keyboard.primary.stack.clone(),
+            ),
+            (
+                snapshot.keyboard.alternate.flags,
+                snapshot.keyboard.alternate.stack.clone(),
+            ),
+        ],
+    );
+    assert_eq!(restored.kitty_buffer(false), (Some(5), vec![0, 1]));
+    assert_eq!(restored.kitty_buffer(true), (Some(3), vec![0, 9]));
+}
+
+/// A restoration puts back no more than a session could have built.
+///
+/// A snapshot is state a session once held, but it arrives from outside. Flags the profile does
+/// not advertise and a stack deeper than a session can push are both refused here rather than
+/// carried into the encoder the attachment has to satisfy.
+#[test]
+fn a_restored_keyboard_stack_is_bounded_and_qualified() {
+    let mut modes = kr_term::modes::ModeState::new();
+    let deep: Vec<u8> = (0..64).map(|index| 0xffu8.wrapping_sub(index)).collect();
+    modes.restore_keyboard(9, [(Some(0xff), deep), (None, Vec::new())]);
+
+    let (flags, stack) = modes.kitty_buffer(false);
+    assert_eq!(
+        flags,
+        Some(kr_term::modes::KITTY_QUALIFIED_FLAGS),
+        "only the flags the profile advertises survive"
+    );
+    assert_eq!(
+        stack.len(),
+        16,
+        "the stack is no deeper than one a push builds"
+    );
+    assert!(
+        stack
+            .iter()
+            .all(|entry| entry & !kr_term::modes::KITTY_QUALIFIED_FLAGS == 0),
+        "and every entry on it is qualified too"
+    );
+    assert_eq!(stack.capacity(), stack.len(), "with no room kept beyond it");
+}
+
+/// The account of what the retained rows cost is resident state, and it is measured.
+///
+/// It is one charge a retained row, in an array of its own beside the rows. The array holds room
+/// for every row the scrollback may keep, whether or not the rows are there, so that a row
+/// arriving never allocates and a row leaving never gives back room the next row would ask for
+/// again. The geometry reserves for that room and the measurement reads it.
+#[test]
+fn the_retained_rows_account_is_reserved_and_measured() {
+    fn engine_holding(scrollback_rows: usize) -> Engine {
+        Engine::new(EngineConfig {
+            size: GridSize::new(40, 8),
+            grid: kr_term::grid::GridConfig {
+                scrollback_rows,
+                ..kr_term::grid::GridConfig::DEFAULT
+            },
+            ..EngineConfig::DEFAULT
+        })
+        .expect("engine")
+    }
+
+    // Two sessions of the same geometry holding the same rows, one keeping more scrollback than
+    // the other. The rows are identical, so what separates the two measurements is the account.
+    let small = engine_holding(100);
+    let large = engine_holding(3_500);
+    assert_eq!(
+        large.grid().buffer_bytes().row_records - small.grid().buffer_bytes().row_records,
+        3_400 * kr_term::grid::HISTORY_CHARGE_SLOT_BYTES,
+        "the account holds one charge for every row its scrollback may keep"
+    );
+
+    // Filling it and emptying it again changes the rows, not the room.
+    let mut engine = engine_holding(3_500);
+    let before = engine.grid().buffer_bytes().row_records;
+    let mut input = String::new();
+    for index in 0..600u32 {
+        input.push_str(&format!("row {index} with some content\r\n"));
+    }
+    engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+    assert!(
+        engine.grid().history_bytes() > 0,
+        "six hundred rows are retained"
+    );
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "and the geometry reserved room for their charges"
+    );
+    engine.feed(b"\x1b[3J", 0);
+    engine.quiesce(0);
+    assert_eq!(engine.grid().history_bytes(), 0, "the rows are gone");
+    assert_eq!(
+        engine.grid().buffer_bytes().row_records,
+        before,
+        "and the account is holding exactly the room it started with"
+    );
+    assert_eq!(engine.budget().excess(), 0);
+}
+
+/// The reservation covers the account's smallest allocation, which no geometry is below.
+///
+/// An array that grows by doubling does not start at one entry. A session whose scrollback is a
+/// single row still holds the smallest allocation there is, and a reservation worked out from the
+/// row count alone would be under it.
+#[test]
+fn a_session_of_one_retained_row_is_reserved_for_what_its_account_allocates() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(1, 1),
+        grid: kr_term::grid::GridConfig {
+            scrollback_rows: 1,
+            ..kr_term::grid::GridConfig::DEFAULT
+        },
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    engine.feed(b"a\r\nb\r\nc\r\n", 0);
+    engine.quiesce(0);
+    assert_eq!(engine.grid().scrollback_rows(), 1, "one row is retained");
+    assert!(
+        engine.grid().buffer_bytes().row_records <= engine.budget().reserved().row_arrays,
+        "the arrays the smallest geometry there is holds fit what it reserved for them: {} \
+         measured against {} reserved",
+        engine.grid().buffer_bytes().row_records,
+        engine.budget().reserved().row_arrays
+    );
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "and the smallest geometry there is reserved for what its account allocates"
+    );
+}
+
+/// Rows that cost more than the rows they replace do not make the account reallocate.
+///
+/// Eviction gives charges back and printing takes room again, over and over, and an array sized to
+/// the charges on it would shrink and grow on the arrival of a single row, copying the whole
+/// history twice each time. The room is the scrollback's, not the charges', so it does not move.
+#[test]
+fn a_stream_of_costlier_rows_leaves_the_accounts_room_where_it_is() {
+    const SCROLLBACK_ROWS: usize = 3_500;
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(40, 8),
+        grid: kr_term::grid::GridConfig {
+            scrollback_rows: SCROLLBACK_ROWS,
+            ..kr_term::grid::GridConfig::DEFAULT
+        },
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+
+    // What the account is holding, separated from the row records beside it: the rows of the
+    // primary screen and its history, and the alternate buffer's own screen.
+    let account = |engine: &Engine| {
+        let lines =
+            2 * u64::from(engine.grid().size().rows) + engine.grid().scrollback_rows() as u64;
+        engine.grid().buffer_bytes().row_records - lines * kr_term::grid::ROW_SLOT_BYTES
+    };
+    let room = account(&engine);
+    assert_eq!(
+        room,
+        SCROLLBACK_ROWS as u64 * kr_term::grid::HISTORY_CHARGE_SLOT_BYTES,
+        "the account starts with room for every row the scrollback may keep"
+    );
+
+    // Rows that cost a little more each time, so eviction gives charges back on nearly every row
+    // that arrives and the length of the account keeps falling.
+    let mut evicted = false;
+    for step in 0..120u32 {
+        let width = 4 + (step % 36) as usize;
+        let mut input = String::from("\x1b[38;2;10;20;30;48;5;9m");
+        for _ in 0..40 {
+            for _ in 0..width {
+                input.push('\u{754c}');
+            }
+            input.push_str("\r\n");
+        }
+        input.push_str("\x1b[0m");
+        engine.feed(input.as_bytes(), u64::from(step));
+        evicted |= engine.grid().history_bytes() > BudgetLimits::DEFAULT.row_cache_bytes * 9 / 10;
+        assert_eq!(
+            account(&engine),
+            room,
+            "step {step} moved the room the account holds"
+        );
+    }
+    engine.quiesce(0);
+    assert!(
+        evicted,
+        "the run has to reach the cache bound to give charges back"
+    );
+    assert_eq!(account(&engine), room);
+    assert_eq!(engine.budget().excess(), 0);
 }
