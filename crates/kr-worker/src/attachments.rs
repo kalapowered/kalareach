@@ -323,8 +323,18 @@ impl AttachmentTable {
             }
             (_, None) => None,
         };
+        // Join order is what decides succession, so an ordinal that wrapped would put a new
+        // attachment in front of older claims - or land on an occupied entry. The counter is
+        // refused before it is spent rather than allowed to come round.
         let ordinal = self.next_ordinal;
-        self.next_ordinal += 1;
+        self.next_ordinal =
+            self.next_ordinal
+                .checked_add(1)
+                .ok_or_else(|| WorkerError::ResourceUnavailable {
+                    detail: "this session has exhausted its join order and can admit no more \
+                         attachments"
+                        .to_owned(),
+                })?;
         let attachment = Attachment {
             id,
             ordinal,

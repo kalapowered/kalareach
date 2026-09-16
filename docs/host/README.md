@@ -267,10 +267,16 @@ goes back unowned rather than to an attachment that has left or has withdrawn.
 Dimensions are validated before anything is allocated, against all three of section 8's constraints
 at once: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, with checked multiplication
 so a product that would overflow is a refusal rather than a wrap. The independent maxima are not
-valid together. A session created without a terminal starts at 120x40. A history page carries at
-most 1,000 rows and 1 MiB. A semantic snapshot carries at most 16 MiB across its parts, sixteen
-levels of depth and twenty thousand nodes; a part that stops short says which limit stopped it and
-where a reader continues, so a truncation can never be mistaken for a whole tree.
+valid together. A refusal names the limit it violated and changes nothing about the grid the session
+is running at, its epoch included. A session created without a terminal starts at 120x40. A history
+page carries at most 1,000 rows and 1 MiB.
+
+Semantic snapshots have their bounds and nothing yet to spend them: `kr_protocol::semantic` holds
+section 8's three limits (16 MiB across the parts, sixteen levels of depth, twenty thousand nodes),
+the budget a producer spends as it walks a tree, and the continuation a refused node produces, so a
+part that stops short says which limit stopped it and where a reader asks for the rest. The producer
+that walks the tree is the semantic-snapshot task's, and until it exists these bounds are what that
+task has to spend rather than a bound anything is under.
 
 ## Action windows and the dispatch lease
 

@@ -170,9 +170,17 @@ impl SemanticBudget {
     /// node that was refused.
     #[must_use]
     pub const fn continuation(&self, limit: SemanticLimit, from_node: u64) -> SemanticContinuation {
+        // The limit this budget is actually spending, which is the specification's except where a
+        // caller asked for less. Reporting the constant would tell a reader it had 16 MiB left when
+        // its own request was what stopped it.
+        let limit_value = match limit {
+            SemanticLimit::Bytes => self.max_bytes,
+            SemanticLimit::Depth => self.max_depth,
+            SemanticLimit::Nodes => self.max_nodes,
+        };
         SemanticContinuation {
             limit,
-            limit_value: U64::new(limit.value()),
+            limit_value: U64::new(limit_value),
             from_node: U64::new(from_node),
             nodes: U64::new(self.nodes),
             bytes: U64::new(self.bytes),
@@ -253,6 +261,14 @@ mod tests {
     fn a_caller_can_ask_for_less_than_the_limit_but_never_for_more() {
         let mut budget = SemanticBudget::with_max_bytes(512);
         assert_eq!(budget.admit(1, 513), Err(SemanticLimit::Bytes));
+        assert_eq!(
+            budget
+                .continuation(SemanticLimit::Bytes, 0)
+                .limit_value
+                .get(),
+            512,
+            "the continuation reports the budget that stopped it, not the one it could have had"
+        );
         let mut generous = SemanticBudget::with_max_bytes(u64::MAX);
         assert_eq!(
             generous.admit(1, MAX_SEMANTIC_SNAPSHOT_BYTES + 1),

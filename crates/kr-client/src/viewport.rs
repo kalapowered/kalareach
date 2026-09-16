@@ -173,13 +173,13 @@ impl Viewport {
         let before = (self.origin_column, self.origin_row);
         if column < self.origin_column {
             self.origin_column = column;
-        } else if column >= self.origin_column + self.columns {
-            self.origin_column = column + 1 - self.columns;
+        } else if column >= self.origin_column.saturating_add(self.columns) {
+            self.origin_column = column.saturating_add(1).saturating_sub(self.columns);
         }
         if row < self.origin_row {
             self.origin_row = row;
-        } else if row >= self.origin_row + self.rows {
-            self.origin_row = row + 1 - self.rows;
+        } else if row >= self.origin_row.saturating_add(self.rows) {
+            self.origin_row = row.saturating_add(1).saturating_sub(self.rows);
         }
         self.clamp();
         before.0 != self.origin_column || before.1 != self.origin_row
@@ -196,8 +196,13 @@ impl Viewport {
     }
 }
 
+/// Moves `value` by `delta`, saturating at both ends of a cell coordinate.
+///
+/// The arithmetic is done in the wider type and saturated rather than added, because a pan by
+/// `i64::MAX` from a large origin overflows a signed addition and a wrapped origin is a window
+/// somewhere else entirely.
 const fn shift(value: u32, delta: i64) -> u32 {
-    let moved = value as i64 + delta;
+    let moved = (value as i64).saturating_add(delta);
     if moved < 0 {
         0
     } else if moved > u32::MAX as i64 {
@@ -228,37 +233,127 @@ pub enum PointerOutcome {
     Nothing,
 }
 
+/// One batch the host delivered.
+///
+/// The two are not interchangeable and a client that added them up the same way would invent
+/// cursors. A span of the raw stream advances the output cursor by its length. A rendering of the
+/// canonical screen is *state at* one cursor, however many frames it takes, so it moves the cursor
+/// to that cursor and not past it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// A span of the raw output stream, starting at this cursor.
+    Bytes {
+        /// Where the span starts.
+        cursor: u64,
+        /// The bytes.
+        bytes: Vec<u8>,
+    },
+    /// A rendering of the canonical screen as it stood at this cursor.
+    Screen {
+        /// The cursor the screen describes.
+        cursor: u64,
+        /// The bytes that draw it.
+        bytes: Vec<u8>,
+    },
+}
+
+impl Delivery {
+    /// Returns the cursor this delivery leaves the client at.
+    #[must_use]
+    pub fn ends_at(&self) -> u64 {
+        match self {
+            Self::Bytes { cursor, bytes } => cursor.saturating_add(bytes.len() as u64),
+            Self::Screen { cursor, .. } => *cursor,
+        }
+    }
+
+    /// Returns the cursor this delivery begins at.
+    #[must_use]
+    pub const fn starts_at(&self) -> u64 {
+        match self {
+            Self::Bytes { cursor, .. } | Self::Screen { cursor, .. } => *cursor,
+        }
+    }
+
+    /// Returns the bytes to draw.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
+}
+
+/// How much output a display holds while a repaint is being installed.
+///
+/// The host bounds its own send queue and resynchronises a subscriber that fills it. A client that
+/// drained that queue into an unbounded vector would have removed the protection rather than
+/// respected it, so this is the client's own share of the same rule: past it the held state is
+/// worthless and the display asks for a fresh snapshot instead.
+pub const MAX_HELD_BYTES: usize = 4 * 1024 * 1024;
+
 /// One client's display of a session.
 ///
-/// It owns the viewport, the pan mode and the one piece of state a presentation change needs: what
-/// is waiting to be applied while a repaint is being installed.
+/// It owns the viewport, the pan mode, the presentation the host selected, and the one piece of
+/// state a presentation change needs: what is waiting to be applied while a repaint is installed.
 #[derive(Clone, Debug)]
 pub struct Display {
     viewport: Viewport,
     mode: PanMode,
-    /// The cursor the installed state describes. Everything after it has been applied.
+    /// What the host says this client is being served.
+    ///
+    /// The host decides it, not the client: equal size is necessary and not sufficient, because a
+    /// stream the engine cannot carry, or a screen a restoration could not carry, projects a
+    /// terminal of exactly the right size. So this is what the host said rather than what the
+    /// dimensions imply.
+    presentation: Presentation,
+    /// The cursor the installed state describes. Everything before it has been applied.
     cursor: u64,
+    /// Whether the state on screen is unusable and only a snapshot can replace it.
+    needs_snapshot: bool,
     switching: Option<Switch>,
+    /// Counts the switches this display has begun, so a snapshot for an older one is refused.
+    switch_generation: u64,
 }
 
 /// A presentation change in progress.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Switch {
-    /// What the client will be when the snapshot is installed.
+    /// Which switch this is, so a snapshot that arrives for an earlier one is refused.
+    generation: u64,
+    /// What the host says the client will be once the snapshot is installed.
     into: Presentation,
     /// Live output that arrived while the snapshot was being fetched, in arrival order.
-    held: Vec<(u64, Vec<u8>)>,
+    held: Vec<Delivery>,
+    /// How many bytes those deliveries hold.
+    held_bytes: usize,
+    /// Whether any of the repaint reached the screen before the switch was abandoned.
+    partial: bool,
 }
 
 impl Display {
     /// Builds a display of `canonical` in a window of `window`, at output cursor `cursor`.
+    ///
+    /// `presentation` is what the host said it is serving this client.
     #[must_use]
-    pub const fn new(canonical: (u32, u32), window: (u32, u32), cursor: u64) -> Self {
+    pub const fn new(
+        canonical: (u32, u32),
+        window: (u32, u32),
+        cursor: u64,
+        presentation: Presentation,
+    ) -> Self {
         Self {
             viewport: Viewport::new(canonical, window),
             mode: PanMode::Follow,
+            presentation,
             cursor,
+            needs_snapshot: false,
             switching: None,
+            switch_generation: 0,
         }
     }
 
@@ -280,10 +375,16 @@ impl Display {
         self.cursor
     }
 
-    /// Returns how the client is currently being shown the session.
+    /// Returns how the host says this client is being shown the session.
     #[must_use]
     pub const fn presentation(&self) -> Presentation {
-        self.viewport.presentation()
+        self.presentation
+    }
+
+    /// Returns true when the state on screen cannot be used and only a snapshot can replace it.
+    #[must_use]
+    pub const fn needs_snapshot(&self) -> bool {
+        self.needs_snapshot
     }
 
     /// Enters or leaves view mode.
@@ -292,6 +393,42 @@ impl Display {
     /// the person left it until the next thing it has to reveal.
     pub const fn set_mode(&mut self, mode: PanMode) {
         self.mode = mode;
+    }
+
+    /// Moves the window, and returns whether it moved.
+    ///
+    /// Only view mode pans. In follow mode the window belongs to the session, so a pan request is
+    /// refused rather than quietly applied: a client that panned while following would fight the
+    /// application's own cursor.
+    pub const fn pan(&mut self, columns: i64, rows: i64) -> bool {
+        if matches!(self.mode, PanMode::Follow) {
+            return false;
+        }
+        self.viewport.pan(columns, rows)
+    }
+
+    /// Moves the window the least it can to keep a canonical cell visible.
+    ///
+    /// This is what follow mode does with the application's cursor. In view mode the person is
+    /// looking somewhere of their own choosing and the window stays where they left it.
+    pub const fn reveal(&mut self, column: u32, row: u32) -> bool {
+        if matches!(self.mode, PanMode::View) {
+            return false;
+        }
+        self.viewport.reveal(column, row)
+    }
+
+    /// Records that this client's own window changed size.
+    ///
+    /// The presentation is the host's to decide, so this does not change it. What it changes is
+    /// which part of the grid the window looks at.
+    pub const fn window_resized(&mut self, window: (u32, u32)) {
+        self.viewport.window_resized(window);
+    }
+
+    /// Records that the session's canonical grid changed size.
+    pub const fn canonical_resized(&mut self, canonical: (u32, u32)) {
+        self.viewport.canonical_resized(canonical);
     }
 
     /// Records that this client took the input lease.
@@ -327,10 +464,23 @@ impl Display {
     /// one cursor and is about to be given state that describes another, and drawing live output
     /// over a repaint that is not finished is the mixed display section 8 forbids. Output that
     /// arrives meanwhile is handed to [`Display::hold`] and applied afterwards.
+    ///
+    /// Beginning a second switch supersedes the first. The snapshot the first one asked for is then
+    /// refused by [`Display::install`], because installing it would replace the state of a
+    /// presentation this client has already left.
     pub fn begin_switch(&mut self, into: Presentation) -> u64 {
+        self.switch_generation = self.switch_generation.saturating_add(1);
+        let held = self
+            .switching
+            .take()
+            .map_or_else(Vec::new, |switch| switch.held);
+        let held_bytes = held.iter().map(Delivery::len).sum();
         self.switching = Some(Switch {
+            generation: self.switch_generation,
             into,
-            held: Vec::new(),
+            held,
+            held_bytes,
+            partial: false,
         });
         self.cursor
     }
@@ -341,20 +491,31 @@ impl Display {
         self.switching.is_some()
     }
 
-    /// Takes one batch of live output.
+    /// Takes one delivery from the host.
     ///
     /// While the display is painting it is held; otherwise it is applied at once and the cursor
-    /// moves past it. The return value is what the client draws now, which is nothing at all
-    /// during a repaint.
-    pub fn hold(&mut self, cursor: u64, bytes: Vec<u8>) -> Option<Vec<u8>> {
+    /// moves to where it ends. The return value is what the client draws now, which is nothing at
+    /// all during a repaint.
+    ///
+    /// Past [`MAX_HELD_BYTES`] the held state is abandoned and the display asks for a snapshot,
+    /// which is the same answer the host gives a subscriber that fills its queue.
+    pub fn hold(&mut self, delivery: Delivery) -> Option<Vec<u8>> {
         match self.switching.as_mut() {
             Some(switch) => {
-                switch.held.push((cursor, bytes));
+                switch.held_bytes = switch.held_bytes.saturating_add(delivery.len());
+                if switch.held_bytes > MAX_HELD_BYTES {
+                    switch.held.clear();
+                    switch.held_bytes = 0;
+                    switch.partial = true;
+                    self.needs_snapshot = true;
+                    return None;
+                }
+                switch.held.push(delivery);
                 None
             }
             None => {
-                self.cursor = cursor + bytes.len() as u64;
-                Some(bytes)
+                self.cursor = delivery.ends_at();
+                Some(delivery.bytes().to_vec())
             }
         }
     }
@@ -362,47 +523,88 @@ impl Display {
     /// Installs the snapshot the switch was waiting for, and returns what to draw after it.
     ///
     /// `at` is the cursor the snapshot describes, which is the one [`Display::begin_switch`]
-    /// returned. Held output from before that cursor is discarded, because the snapshot already
-    /// contains it; everything from it onwards is replayed in order, so the client resumes exactly
-    /// where the installed state ends.
+    /// returned or a later one. Held output the snapshot already contains is discarded; everything
+    /// from that cursor onwards is replayed in order, so the client resumes exactly where the
+    /// installed state ends.
+    ///
+    /// `generation` is the value `begin_switch` returned alongside its cursor, obtained from
+    /// [`Display::switch_generation`]. A snapshot for an earlier switch is refused.
     ///
     /// # Errors
     ///
-    /// Returns [`NotSwitching`] when no presentation change is in progress, because applying a
-    /// snapshot nobody asked for would replace live state with older state.
-    pub fn install(&mut self, at: u64, window: (u32, u32)) -> Result<Vec<Vec<u8>>, NotSwitching> {
+    /// Returns [`NotSwitching`] when no presentation change is in progress, or when this snapshot
+    /// belongs to one this display has already left. Applying either would replace live state with
+    /// state for a presentation the client no longer has.
+    pub fn install(
+        &mut self,
+        generation: u64,
+        at: u64,
+        window: (u32, u32),
+    ) -> Result<Vec<Vec<u8>>, NotSwitching> {
         let switch = self.switching.take().ok_or(NotSwitching)?;
+        if switch.generation != generation {
+            // Put it back: the switch this snapshot is too late for is still the one in progress.
+            self.switching = Some(switch);
+            return Err(NotSwitching);
+        }
         self.viewport.window_resized(window);
-        let _ = switch.into;
+        self.presentation = switch.into;
         self.cursor = at;
+        self.needs_snapshot = false;
         let mut resumed = Vec::new();
-        for (cursor, bytes) in switch.held {
-            let end = cursor + bytes.len() as u64;
-            if end <= at {
-                // The snapshot was taken after these bytes, so it already describes them.
+        for delivery in switch.held {
+            if delivery.ends_at() <= at {
+                // The snapshot was taken after this, so it already describes it.
                 continue;
             }
-            let skip = usize::try_from(at.saturating_sub(cursor))
-                .unwrap_or(bytes.len())
-                .min(bytes.len());
-            self.cursor = end;
-            resumed.push(bytes[skip..].to_vec());
+            match delivery {
+                Delivery::Screen { cursor, bytes } => {
+                    // A repaint of a screen the snapshot already replaced is worthless; one taken
+                    // after it replaces the snapshot's own picture.
+                    if cursor >= at {
+                        self.cursor = cursor;
+                        resumed.push(bytes);
+                    }
+                }
+                Delivery::Bytes { cursor, bytes } => {
+                    let skip = usize::try_from(at.saturating_sub(cursor))
+                        .unwrap_or(bytes.len())
+                        .min(bytes.len());
+                    self.cursor = cursor.saturating_add(bytes.len() as u64);
+                    resumed.push(bytes[skip..].to_vec());
+                }
+            }
         }
         Ok(resumed)
     }
 
-    /// Abandons a switch, keeping whatever was held so nothing is lost.
+    /// Returns the generation of the switch in progress, for [`Display::install`].
+    #[must_use]
+    pub const fn switch_generation(&self) -> u64 {
+        self.switch_generation
+    }
+
+    /// Abandons a switch.
     ///
     /// A switch that cannot be completed - the snapshot never arrived, the connection went - has to
-    /// leave the display drawing again rather than painting for ever.
-    pub fn abandon_switch(&mut self) -> Vec<Vec<u8>> {
+    /// leave the display drawing again rather than painting for ever. What it does **not** do is
+    /// resume as though nothing happened when part of the repaint already reached the screen: that
+    /// state describes neither cursor, so the display says it needs a snapshot and draws nothing
+    /// until it has one.
+    ///
+    /// Returns the held output to draw, which is empty when a snapshot is needed instead.
+    pub fn abandon_switch(&mut self, repaint_reached_the_screen: bool) -> Vec<Vec<u8>> {
         let Some(switch) = self.switching.take() else {
             return Vec::new();
         };
+        if switch.partial || repaint_reached_the_screen {
+            self.needs_snapshot = true;
+            return Vec::new();
+        }
         let mut resumed = Vec::new();
-        for (cursor, bytes) in switch.held {
-            self.cursor = cursor + bytes.len() as u64;
-            resumed.push(bytes);
+        for delivery in switch.held {
+            self.cursor = delivery.ends_at();
+            resumed.push(delivery.bytes().to_vec());
         }
         resumed
     }
@@ -489,13 +691,17 @@ mod tests {
     /// KR-REQ-08.76: pan controls apply only in view mode, so the wheel stays the application's.
     #[test]
     fn the_wheel_belongs_to_the_application_until_the_person_enters_view_mode() {
-        let mut display = Display::new((80, 24), (40, 12), 0);
+        let mut display = Display::new((80, 24), (40, 12), 0, Presentation::Viewport);
         assert_eq!(display.mode(), PanMode::Follow);
         assert_eq!(
             display.pointer(3, 4, Some(-3)),
             PointerOutcome::Application { column: 3, row: 4 },
             "in follow mode a wheel event is the application's, which is what makes scrollback \
              work inside a full-screen program"
+        );
+        assert!(
+            !display.pan(0, -3),
+            "and a pan request in follow mode is refused rather than quietly applied"
         );
         display.set_mode(PanMode::View);
         assert_eq!(
@@ -505,9 +711,12 @@ mod tests {
                 rows: -3
             }
         );
+        // Which the client applies through the display, to the viewport the mapping uses.
+        assert!(display.pan(0, 5));
+        assert_eq!(display.viewport().origin(), (0, 5));
         assert_eq!(
             display.pointer(3, 4, None),
-            PointerOutcome::Application { column: 3, row: 4 },
+            PointerOutcome::Application { column: 3, row: 9 },
             "and a click still reaches the application, at the cell it was mapped to"
         );
         assert_eq!(
@@ -515,25 +724,50 @@ mod tests {
             PointerOutcome::Nothing,
             "outside the window, nothing"
         );
+        assert!(
+            !display.reveal(0, 0),
+            "in view mode the window stays where the person left it"
+        );
         display.set_mode(PanMode::Follow);
         assert_eq!(
             display.pointer(3, 4, Some(1)),
-            PointerOutcome::Application { column: 3, row: 4 },
+            PointerOutcome::Application { column: 3, row: 9 },
             "leaving view mode gives the wheel back"
         );
+        assert!(display.reveal(0, 0), "and the window follows again");
+        assert_eq!(display.viewport().origin(), (0, 0));
     }
 
     /// KR-REQ-08.76: taking the keyboard does not move the size.
     #[test]
     fn taking_the_keyboard_leaves_the_window_and_the_grid_exactly_as_they_were() {
-        let mut display = Display::new((80, 24), (40, 12), 0);
-        display.viewport.pan(10, 3);
+        let mut display = Display::new((80, 24), (40, 12), 0, Presentation::Viewport);
+        display.set_mode(PanMode::View);
+        display.pan(10, 3);
         let before = display.viewport();
         let after = display.took_the_keyboard();
         assert_eq!(after, before, "the two ownerships are separate");
         assert_eq!(display.viewport().canonical(), (80, 24));
         assert_eq!(display.viewport().window(), (40, 12));
         assert_eq!(display.viewport().origin(), (10, 3));
+        assert_eq!(display.presentation(), Presentation::Viewport);
+    }
+
+    /// KR-REQ-08.75: the presentation is the host's answer, not the dimensions' implication.
+    #[test]
+    fn an_equal_sized_window_is_still_a_projection_when_the_host_says_so() {
+        // The host projects a terminal of exactly the right size whenever the stream is not
+        // carryable or the screen it was drawn could not carry the state the application will
+        // address. A client that worked it out from its own dimensions would draw the wrong thing.
+        let projected = Display::new((80, 24), (80, 24), 0, Presentation::Viewport);
+        assert_eq!(projected.presentation(), Presentation::Viewport);
+        assert_eq!(
+            projected.viewport().presentation(),
+            Presentation::Direct,
+            "the size alone would have said otherwise"
+        );
+        let direct = Display::new((80, 24), (80, 24), 0, Presentation::Direct);
+        assert_eq!(direct.presentation(), Presentation::Direct);
     }
 
     /// KR-REQ-08.76: the window follows the application's cursor by the least it can.
@@ -549,24 +783,46 @@ mod tests {
         );
         assert!(viewport.reveal(0, 0));
         assert_eq!(viewport.origin(), (0, 0));
+        // And a target at the far end of the coordinate space clamps rather than wrapping.
+        let mut wide = Viewport::new((u32::MAX, u32::MAX), (40, 12));
+        assert!(wide.reveal(u32::MAX, u32::MAX));
+        assert_eq!(
+            wide.origin(),
+            (u32::MAX - 40, u32::MAX - 12),
+            "which is as far as the window can be panned, and the last cell is inside it"
+        );
+        assert_eq!(wide.map(39, 11), Some((u32::MAX - 1, u32::MAX - 1)));
+    }
+
+    /// KR-REQ-08.76: a pan argument at the end of its range clamps rather than wrapping.
+    #[test]
+    fn an_extreme_pan_clamps_rather_than_wrapping_round() {
+        let mut viewport = Viewport::new((u32::MAX, u32::MAX), (40, 12));
+        assert!(viewport.pan(i64::MAX, i64::MAX));
+        assert_eq!(viewport.origin(), (u32::MAX - 40, u32::MAX - 12));
+        assert!(viewport.pan(i64::MIN, i64::MIN));
+        assert_eq!(viewport.origin(), (0, 0));
     }
 
     /// KR-REQ-08.77: a presentation change installs a snapshot at a cursor and mixes nothing.
     #[test]
     fn a_presentation_change_holds_live_output_until_the_repaint_is_installed() {
-        let mut display = Display::new((80, 24), (80, 24), 100);
-        assert_eq!(display.presentation(), Presentation::Direct);
+        let mut display = Display::new((80, 24), (80, 24), 100, Presentation::Direct);
         assert!(!display.is_painting());
         // Live output is drawn at once while nothing is being installed.
         assert_eq!(
-            display.hold(100, b"abc".to_vec()),
+            display.hold(Delivery::Bytes {
+                cursor: 100,
+                bytes: b"abc".to_vec()
+            }),
             Some(b"abc".to_vec()),
-            "an ordinary batch is drawn as it arrives"
+            "an ordinary span is drawn as it arrives"
         );
         assert_eq!(display.cursor(), 103);
 
-        // The window changed size, so this client is about to become a viewport.
+        // The window changed size, so the host is about to serve this client a viewport.
         let at = display.begin_switch(Presentation::Viewport);
+        let generation = display.switch_generation();
         assert_eq!(
             at, 103,
             "the snapshot is taken at the cursor it has reached"
@@ -574,25 +830,71 @@ mod tests {
         assert!(display.is_painting());
         // Everything that arrives now waits. Drawing it over an unfinished repaint is exactly the
         // mixed display the row forbids.
-        assert_eq!(display.hold(103, b"de".to_vec()), None);
-        assert_eq!(display.hold(105, b"fg".to_vec()), None);
+        assert_eq!(
+            display.hold(Delivery::Bytes {
+                cursor: 103,
+                bytes: b"de".to_vec()
+            }),
+            None
+        );
+        assert_eq!(
+            display.hold(Delivery::Bytes {
+                cursor: 105,
+                bytes: b"fg".to_vec()
+            }),
+            None
+        );
 
-        // The snapshot describes cursor 105, so the first held batch is already in it and the
+        // The snapshot describes cursor 105, so the first held span is already in it and the
         // second continues from it.
-        let resumed = display.install(105, (40, 12)).expect("installs");
+        let resumed = display
+            .install(generation, 105, (40, 12))
+            .expect("installs");
         assert_eq!(resumed, vec![b"fg".to_vec()]);
         assert!(!display.is_painting());
         assert_eq!(display.cursor(), 107);
         assert_eq!(display.presentation(), Presentation::Viewport);
+        assert_eq!(display.viewport().window(), (40, 12));
     }
 
-    /// KR-REQ-08.77: a snapshot taken part way through a held batch resumes inside it.
+    /// KR-REQ-08.77: a repaint is state at one cursor, and does not advance it by its length.
+    #[test]
+    fn a_screen_is_state_at_a_cursor_rather_than_a_span_of_the_stream() {
+        let mut display = Display::new((80, 24), (40, 12), 0, Presentation::Viewport);
+        // A clipped repaint is thousands of bytes of cursor addressing describing the screen at
+        // cursor 40. A client that added its length to the cursor would then ask for output from
+        // somewhere the stream never reached.
+        let repaint = vec![b'x'; 2_048];
+        assert_eq!(
+            display.hold(Delivery::Screen {
+                cursor: 40,
+                bytes: repaint.clone()
+            }),
+            Some(repaint)
+        );
+        assert_eq!(display.cursor(), 40);
+        // A span, by contrast, moves it along by what it carried.
+        display.hold(Delivery::Bytes {
+            cursor: 40,
+            bytes: b"abcd".to_vec(),
+        });
+        assert_eq!(display.cursor(), 44);
+    }
+
+    /// KR-REQ-08.77: a snapshot taken part way through a held span resumes inside it.
     #[test]
     fn a_snapshot_inside_a_held_batch_resumes_from_where_it_ends() {
-        let mut display = Display::new((80, 24), (80, 24), 0);
+        let mut display = Display::new((80, 24), (80, 24), 0, Presentation::Direct);
         display.begin_switch(Presentation::Viewport);
-        assert_eq!(display.hold(0, b"abcdef".to_vec()), None);
-        let resumed = display.install(3, (40, 12)).expect("installs");
+        let generation = display.switch_generation();
+        assert_eq!(
+            display.hold(Delivery::Bytes {
+                cursor: 0,
+                bytes: b"abcdef".to_vec()
+            }),
+            None
+        );
+        let resumed = display.install(generation, 3, (40, 12)).expect("installs");
         assert_eq!(
             resumed,
             vec![b"def".to_vec()],
@@ -601,26 +903,96 @@ mod tests {
         assert_eq!(display.cursor(), 6);
     }
 
-    /// KR-REQ-08.77: a snapshot nobody asked for is refused rather than replacing live state.
+    /// KR-REQ-08.77: a snapshot nobody asked for, or one for a switch already left, is refused.
     #[test]
-    fn a_snapshot_with_no_switch_in_progress_is_refused() {
-        let mut display = Display::new((80, 24), (80, 24), 50);
-        assert_eq!(display.install(10, (80, 24)), Err(NotSwitching));
+    fn a_snapshot_for_no_switch_or_an_older_one_is_refused() {
+        let mut display = Display::new((80, 24), (80, 24), 50, Presentation::Direct);
+        assert_eq!(display.install(0, 10, (80, 24)), Err(NotSwitching));
         assert_eq!(display.cursor(), 50, "and the live state is untouched");
+
+        // Two switches in a row: the person resized twice before the first snapshot arrived.
+        display.begin_switch(Presentation::Viewport);
+        let first = display.switch_generation();
+        display.begin_switch(Presentation::Viewport);
+        let second = display.switch_generation();
+        assert_ne!(first, second);
+        assert_eq!(
+            display.install(first, 60, (40, 12)),
+            Err(NotSwitching),
+            "the snapshot for the switch this display has already left is refused"
+        );
+        assert!(
+            display.is_painting(),
+            "and the switch in progress is still waiting for its own"
+        );
+        display
+            .install(second, 60, (20, 6))
+            .expect("the current switch's snapshot installs");
+        assert_eq!(display.viewport().window(), (20, 6));
     }
 
-    /// KR-REQ-08.77: a switch that cannot finish leaves the display drawing rather than painting.
+    /// KR-REQ-08.77: a switch abandoned after part of the repaint drew asks for a snapshot.
     #[test]
-    fn an_abandoned_switch_gives_back_what_it_was_holding() {
-        let mut display = Display::new((80, 24), (80, 24), 0);
+    fn an_abandoned_switch_gives_back_what_it_held_or_asks_for_a_snapshot() {
+        let mut display = Display::new((80, 24), (80, 24), 0, Presentation::Direct);
         display.begin_switch(Presentation::Viewport);
-        display.hold(0, b"ab".to_vec());
-        display.hold(2, b"cd".to_vec());
-        let resumed = display.abandon_switch();
+        display.hold(Delivery::Bytes {
+            cursor: 0,
+            bytes: b"ab".to_vec(),
+        });
+        display.hold(Delivery::Bytes {
+            cursor: 2,
+            bytes: b"cd".to_vec(),
+        });
+        // Nothing of the repaint reached the screen, so what was held is still continuous with what
+        // is on it.
+        let resumed = display.abandon_switch(false);
         assert_eq!(resumed, vec![b"ab".to_vec(), b"cd".to_vec()]);
         assert!(!display.is_painting());
+        assert!(!display.needs_snapshot());
         assert_eq!(display.cursor(), 4);
-        assert!(display.abandon_switch().is_empty());
+        assert!(display.abandon_switch(false).is_empty());
+
+        // Part of the repaint did reach the screen: that state describes neither cursor, so the
+        // held output is not drawn over it and the display says what it needs.
+        display.begin_switch(Presentation::Viewport);
+        display.hold(Delivery::Bytes {
+            cursor: 4,
+            bytes: b"ef".to_vec(),
+        });
+        assert!(display.abandon_switch(true).is_empty());
+        assert!(display.needs_snapshot());
+        assert!(!display.is_painting());
+    }
+
+    /// KR-REQ-08.77: held output is bounded, and past it a snapshot replaces the state.
+    #[test]
+    fn held_output_is_bounded_rather_than_drained_into_the_client() {
+        let mut display = Display::new((80, 24), (80, 24), 0, Presentation::Direct);
+        display.begin_switch(Presentation::Viewport);
+        let generation = display.switch_generation();
+        let mut cursor = 0_u64;
+        let batch = vec![b'x'; 1024 * 1024];
+        for _ in 0..5 {
+            display.hold(Delivery::Bytes {
+                cursor,
+                bytes: batch.clone(),
+            });
+            cursor += batch.len() as u64;
+        }
+        assert!(
+            display.needs_snapshot(),
+            "the client bounds its own share of what the host bounds"
+        );
+        let resumed = display
+            .install(generation, cursor, (40, 12))
+            .expect("installs");
+        assert!(
+            resumed.is_empty(),
+            "and what it was holding went, because the snapshot replaces it"
+        );
+        assert!(!display.needs_snapshot());
+        assert_eq!(display.cursor(), cursor);
     }
 
     /// KR-REQ-08.76: the window follows the canonical grid when the session is resized.

@@ -401,15 +401,20 @@ async fn all_three_dimension_limits_apply_at_once_and_a_refusal_changes_nothing(
         valid.validate().expect("within every bound");
     }
     // And the pair of them is not: the independent maxima need not be valid together.
-    for refused in [
-        Dimensions::new(MAX_COLUMNS + 1, 1),
-        Dimensions::new(1, MAX_ROWS + 1),
-        Dimensions::new(0, 24),
-        Dimensions::new(80, 0),
-        Dimensions::new(MAX_COLUMNS, MAX_ROWS),
-        // The product overflows a 64-bit multiplication, which is why it is checked rather than
-        // computed and compared.
-        Dimensions::new(u64::MAX, u64::MAX),
+    // Each refusal names the limit it violated, exactly. The host reports the first constraint a
+    // request breaks rather than an enumeration of all of them, which is why each case here breaks
+    // one.
+    for (refused, limit) in [
+        (Dimensions::new(MAX_COLUMNS + 1, 1), "2048"),
+        (Dimensions::new(1, MAX_ROWS + 1), "1024"),
+        (Dimensions::new(0, 24), "2048"),
+        (Dimensions::new(80, 0), "1024"),
+        (Dimensions::new(u64::MAX, u64::MAX), "2048"),
+        // Inside both independent maxima and outside the cell count, which is the case the "all
+        // three at once" rule exists for: 2,048 columns are valid and 1,024 rows are valid, and
+        // 2,097,152 cells are not.
+        (Dimensions::new(MAX_COLUMNS, MAX_ROWS), "262144"),
+        (Dimensions::new(1_024, 512), "262144"),
     ] {
         let error = session
             .resize(owner, refused, epoch)
@@ -417,10 +422,8 @@ async fn all_three_dimension_limits_apply_at_once_and_a_refusal_changes_nothing(
         let reported = error.to_protocol_error();
         assert_eq!(reported.code, ErrorCode::InvalidArgument, "{refused:?}");
         assert!(
-            reported.message.contains("2048")
-                || reported.message.contains("1024")
-                || reported.message.contains("262144"),
-            "the refusal names the violated limit: {}",
+            reported.message.contains(limit),
+            "the refusal names the limit it violated ({limit}): {}",
             reported.message
         );
         assert_eq!(
@@ -430,8 +433,16 @@ async fn all_three_dimension_limits_apply_at_once_and_a_refusal_changes_nothing(
         );
         assert_eq!(session.geometry().epoch.get(), epoch);
     }
+    // The multiplication is checked rather than computed and compared. Nothing inside the two
+    // independent maxima can overflow it - their product is 2,097,152 - so the check is what stops
+    // a request outside them from wrapping into a small cell count on its way to the comparison.
     assert_eq!(MAX_COLUMNS.checked_mul(MAX_ROWS), Some(2_097_152));
     const { assert!(MAX_COLUMNS * MAX_ROWS > MAX_CELLS) };
+    assert_eq!(
+        u64::MAX.checked_mul(u64::MAX),
+        None,
+        "and an unchecked multiplication of a request like that would have wrapped"
+    );
 
     let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
     runtime.close(ClosureReason::CloseRequested).1.release();
@@ -459,19 +470,36 @@ async fn the_invisible_default_and_every_page_bound_are_what_section_eight_state
     assert_eq!(kr_protocol::semantic::MAX_SEMANTIC_TREE_NODES, 20_000);
 
     let host = kr_ipc::testing::TempHost::create();
-    // A session created with no size starts at the invisible default.
-    let config = configuration(&host, "sleep 120", INVISIBLE_DEFAULT_DIMENSIONS);
+    // A session created with no size of its own is created at this one: it is what
+    // `kr-worker`'s own argument handling and the daemon's create both fall back to, and this is
+    // the size such a session then runs at.
+    let mut config = configuration(&host, "sleep 120", INVISIBLE_DEFAULT_DIMENSIONS);
+    config.resident_bytes = 8 * 1024 * 1024;
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
     assert_eq!(session.geometry().dimensions, INVISIBLE_DEFAULT_DIMENSIONS);
 
-    // A page never exceeds its bound, however much is asked for.
+    // Three megabytes of retained output, so the page bound is exercised against a history that
+    // has more than a page in it rather than against an empty one.
+    let line = vec![b'x'; 4_096];
+    for _ in 0..768 {
+        session.ingest_output(&line);
+    }
     let page = session
         .history_page(0, u64::MAX)
         .expect("reads what is retained");
+    let carried = page.bytes.as_slice().len() as u64;
     assert!(
-        page.bytes.as_slice().len() as u64 <= kr_protocol::recovery::MAX_HISTORY_PAGE_BYTES,
-        "a page is bounded even when more is asked for"
+        carried <= kr_protocol::recovery::MAX_HISTORY_PAGE_BYTES,
+        "a page is bounded even when more is asked for: {carried}"
+    );
+    assert!(
+        carried > 0 && page.next_cursor.get() > 0,
+        "and it carried a page rather than nothing, so the bound is what stopped it"
+    );
+    assert!(
+        page.next_cursor.get() < 768 * 4_096,
+        "with more to come after it"
     );
 
     let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
@@ -669,24 +697,41 @@ async fn a_keyboard_takeover_leaves_the_size_exactly_where_it_was() {
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-08.75: a terminal of the session's size shares the stream; another size is clipped.
+///
+/// Two canonical rows are written, each with its own marker at the left and another beyond the
+/// narrow window's right edge. A clipped window shows the left of each row and neither of the far
+/// markers - not on its own row, and not anywhere else, which is what distinguishes clipping from
+/// reflowing the row onto the next one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_not_reflowed() {
-    // A line wider than the narrow terminal, written once. What each attachment is shown of it is
-    // the whole question: the same bytes, or a rendering of the grid clipped to its own window.
-    let wide = "wrapme-".repeat(9);
+    // Column 1 holds a near marker, column 60 a far one, on each of two rows. The session is 80
+    // columns wide, so neither row wraps.
+    let row = |near: &str, far: &str| format!("{near}{:width$}{far}", "", width = 59 - near.len());
+    let first = row("kr-near-one", "kr-far-one");
+    let second = row("kr-near-two", "kr-far-two");
     let wired = wired(
-        &format!("stty raw -echo; printf '{wide}'; printf 'kr-ready.'; sleep 120"),
+        &format!(
+            "stty raw -echo; printf 'kr-ready.'; read -r ignored; \
+             printf '\\033[1;1H{first}\\033[2;1H{second}\\033[3;1Hkr-drawn.'; sleep 120"
+        ),
         CANONICAL,
     )
     .await;
     let mut same = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
+    let mut also_same = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
     let mut narrow = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
+    retained_within(&wired.runtime, b"kr-ready.", Duration::from_secs(10)).await;
 
+    // Everybody joins before anything is drawn, so what each one receives is live output rather
+    // than the screen it was restored with.
     let same_attachment = attach_over(&mut same, &wired, CANONICAL, false).await;
+    let also_same_attachment = attach_over(&mut also_same, &wired, CANONICAL, false).await;
     let narrow_attachment = attach_over(&mut narrow, &wired, Dimensions::new(40, 24), false).await;
     assert_eq!(
         presentation_of(&wired, same_attachment),
@@ -694,41 +739,259 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
         "the same size, a qualified profile and a carryable stream together"
     );
     assert_eq!(
+        presentation_of(&wired, also_same_attachment),
+        Some(TerminalPresentationMode::Direct),
+        "and a second terminal of that size shares the same answer"
+    );
+    assert_eq!(
         presentation_of(&wired, narrow_attachment),
         Some(TerminalPresentationMode::Viewport),
         "and any other size is a clipped viewport of the canonical grid"
     );
-
     subscribe_over(&mut same, &wired, same_attachment).await;
+    subscribe_over(&mut also_same, &wired, also_same_attachment).await;
     subscribe_over(&mut narrow, &wired, narrow_attachment).await;
+    // Whatever the restoration sent each of them, before the application draws.
+    collect(&mut same, Duration::from_millis(500)).await;
+    collect(&mut also_same, Duration::from_millis(500)).await;
+    collect(&mut narrow, Duration::from_millis(500)).await;
+
+    // Now the application draws.
+    {
+        let mut session = wired.runtime.session();
+        let attachment = attach_over_locally(&mut session, &wired);
+        let lease = session
+            .acquire_input(
+                attachment,
+                kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+                None,
+            )
+            .expect("the keys");
+        session
+            .write_input(
+                attachment,
+                lease.lease.epoch.get(),
+                0,
+                b"go\n",
+                std::time::Instant::now(),
+            )
+            .expect("lets the application proceed");
+    }
+    wired.runtime.flush_input();
+    retained_within(&wired.runtime, b"kr-drawn.", Duration::from_secs(10)).await;
+
     let direct = collect(&mut same, Duration::from_secs(3)).await;
+    let also_direct = collect(&mut also_same, Duration::from_secs(3)).await;
     let clipped = collect(&mut narrow, Duration::from_secs(3)).await;
 
-    // The narrow terminal is shown the left of each canonical row. Nothing is rewrapped for it, so
-    // the part of the row beyond its window is simply not there.
+    // Equal size means the same filtered live byte stream, to both of them.
     assert!(
-        contains(&clipped, b"wrapme-wrapme-"),
-        "the left of the row is drawn: {}",
-        String::from_utf8_lossy(&clipped)
-    );
-    // The row is nine repetitions wide on a grid eighty columns across, so it occupies one
-    // canonical row and nothing wrapped. A forty-column window shows the left forty columns of it,
-    // which holds five whole repetitions and part of a sixth. What the row does *not* do is appear
-    // again on a following row: clipping drops what is outside the window, and reflowing would have
-    // moved it.
-    assert!(
-        count(&clipped, b"wrapme-") <= 5,
-        "the window shows the left of the row and no more: {} repetitions",
-        count(&clipped, b"wrapme-")
+        contains(&direct, b"kr-far-one") && contains(&direct, b"kr-far-two"),
+        "the equal-sized terminal receives the session's own bytes: {}",
+        String::from_utf8_lossy(&direct).escape_debug()
     );
     assert_eq!(
-        count(&direct, b"wrapme-"),
-        9,
-        "while the equal-sized terminal receives the session's own bytes, all of them"
+        direct, also_direct,
+        "and two of them receive the same bytes, which is what sharing the stream means"
     );
 
+    // The clipped window shows the left of each row and nothing beyond its own right edge. A row
+    // that had been reflowed would have put the far marker on a following row, where it would
+    // still be somewhere in this repaint.
+    assert!(
+        contains(&clipped, b"kr-near-one") && contains(&clipped, b"kr-near-two"),
+        "each row's left-hand side is drawn: {}",
+        String::from_utf8_lossy(&clipped).escape_debug()
+    );
+    for far in [&b"kr-far-one"[..], &b"kr-far-two"[..]] {
+        assert_eq!(
+            count(&clipped, far),
+            0,
+            "what is outside the window is dropped rather than moved: {} appears in {}",
+            String::from_utf8_lossy(far),
+            String::from_utf8_lossy(&clipped).escape_debug()
+        );
+    }
+    // And the canonical grid did not change for either of them.
+    assert_eq!(wired.runtime.session().geometry().dimensions, CANONICAL);
+
     drop(same);
+    drop(also_same);
     drop(narrow);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// Attaches directly on the session, for the one case that needs to type into it.
+fn attach_over_locally(session: &mut Session, wired: &Wired) -> AttachmentId {
+    let mut params = terminal(wired.session_id, CANONICAL, false);
+    params.requested.insert(AttachmentCapability::Input);
+    let id = AttachmentId::new(kr_ipc::new_uuid());
+    session
+        .attach(&params, params.requested.clone(), id)
+        .expect("attaches");
+    id
+}
+
+/// KR-REQ-08.74: a transfer between two terminals of one size still tells everybody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_that_moves_no_dimension_still_notifies_every_attachment() {
+    let wired = wired("sleep 120", CANONICAL).await;
+    let mut desk = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut phone = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    // A third window that asks for nothing, so what it is told came from the transfer rather than
+    // from a call of its own. The phone's own notification is not asserted: this client library
+    // discards a notification that arrives while one of its own calls is outstanding, and the phone
+    // is the connection making the call.
+    let mut watching = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let desk_attachment = attach_over(&mut desk, &wired, CANONICAL, true).await;
+    // The same size as the desk, so the transfer changes the owner and the epoch and no dimension.
+    let phone_attachment = attach_over(&mut phone, &wired, CANONICAL, true).await;
+    let watching_attachment =
+        attach_over(&mut watching, &wired, Dimensions::new(48, 16), false).await;
+    subscribe_over(&mut desk, &wired, desk_attachment).await;
+    subscribe_over(&mut phone, &wired, phone_attachment).await;
+    subscribe_over(&mut watching, &wired, watching_attachment).await;
+
+    let epoch = wired.runtime.session().geometry().epoch;
+    let transferred: GeometryResult = phone
+        .mutate(
+            Method::TerminalGeometryTransfer,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &TerminalGeometryTransferParams {
+                attachment_id: phone_attachment,
+                expected_geometry_epoch: epoch,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("transfers")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(transferred.geometry.owner.as_ref(), Some(&phone_attachment));
+    assert_eq!(transferred.geometry.dimensions, CANONICAL, "nothing moved");
+    assert_eq!(
+        transferred.geometry.epoch.get(),
+        epoch.get() + 1,
+        "and the epoch did"
+    );
+    // Both are told their view is no longer continuous, in the same locked step that moved the
+    // ownership. The snapshot each then asks for carries the committed owner and epoch.
+    assert!(
+        resynchronised(&mut desk, Duration::from_secs(10)).await,
+        "the desk is told it no longer owns the size"
+    );
+    assert!(
+        resynchronised(&mut watching, Duration::from_secs(10)).await,
+        "and so is a window that owns nothing and asked for nothing"
+    );
+    let snapshot: kr_protocol::recovery::EventsSnapshotResult = desk
+        .request(
+            Method::EventsSnapshot,
+            &kr_protocol::recovery::EventsSnapshotParams {
+                session_id: wired.session_id,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("snapshots")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        snapshot.geometry.owner.as_ref(),
+        Some(&phone_attachment),
+        "which the snapshot then states"
+    );
+    assert_eq!(snapshot.geometry.epoch.get(), epoch.get() + 1);
+
+    drop(desk);
+    drop(phone);
+    drop(watching);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// KR-REQ-08.77: a window that changes presentation is told at once, not on the next byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_that_changed_presentation_is_told_while_the_application_is_idle() {
+    // The application writes its marker and then nothing at all, so anything the client is told
+    // about afterwards came from the size change rather than from output.
+    let wired = wired("stty raw -echo; printf 'kr-ready.'; sleep 120", CANONICAL).await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let attachment = attach_over(&mut client, &wired, CANONICAL, false).await;
+    subscribe_over(&mut client, &wired, attachment).await;
+    retained_within(&wired.runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    collect(&mut client, Duration::from_millis(500)).await;
+    assert_eq!(
+        presentation_of(&wired, attachment),
+        Some(TerminalPresentationMode::Direct)
+    );
+
+    // The person drags the window narrower. It is now a viewport onto a session it used to share
+    // the stream with, and the screen it holds was drawn for the other size.
+    let reported: AttachmentViewportResult = client
+        .mutate(
+            Method::AttachmentViewport,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &AttachmentViewportParams {
+                attachment_id: attachment,
+                dimensions: Dimensions::new(40, 12),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("reports")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(reported.presentation, TerminalPresentationMode::Viewport);
+    assert_eq!(
+        reported.geometry.dimensions, CANONICAL,
+        "and the canonical geometry did not move"
+    );
+    assert!(
+        resynchronised(&mut client, Duration::from_secs(10)).await,
+        "it is told at once that what it holds is no longer continuous"
+    );
+
+    // And back again, with the application still writing nothing.
+    let reported: AttachmentViewportResult = client
+        .mutate(
+            Method::AttachmentViewport,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &AttachmentViewportParams {
+                attachment_id: attachment,
+                dimensions: CANONICAL,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("reports")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(reported.presentation, TerminalPresentationMode::Direct);
+    assert!(
+        resynchronised(&mut client, Duration::from_secs(10)).await,
+        "and told again on the way back"
+    );
+
+    drop(client);
     wired
         .runtime
         .close(ClosureReason::CloseRequested)
@@ -938,7 +1201,9 @@ async fn the_attachment_methods_answer_with_the_geometry_and_the_epoch_they_prod
 #[tokio::test(flavor = "multi_thread")]
 async fn a_claim_the_session_budget_cannot_admit_is_refused_at_attach_and_owns_nothing() {
     let host = kr_ipc::testing::TempHost::create();
-    // A budget that admits the starting grid and nothing much larger.
+    // The bound that refuses this geometry is the engine's own state budget, which is what both
+    // screen buffers of a grid have to fit inside. `resident_bytes` below bounds the retained
+    // output rather than the grids, and is set small only to keep this session cheap.
     let mut config = configuration(&host, "sleep 120", Dimensions::new(80, 24));
     config.resident_bytes = 512 * 1024;
     let session_id = config.session_id;

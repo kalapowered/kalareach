@@ -469,21 +469,39 @@ impl Session {
     /// They are one size. A terminal whose kernel size and canonical grid disagreed would place
     /// its cursor by one and wrap by the other, so neither is moved without the other.
     fn resize_canonical(&mut self, dimensions: Dimensions) -> Result<()> {
-        // The grid decides first, because it is the one that can refuse: a size whose two screen
-        // buffers do not fit this session's budget is refused before anything is allocated for it,
-        // and the terminal the application is looking at must not have moved in the meantime.
-        self.engine.resize(dimensions, kr_ipc::now_ms().get())?;
+        // The kernel moves first, and the reason is which failure can be undone. A grid that
+        // resized has reflowed: rows moved between the screen and the history, and putting the
+        // size back would not put those rows back, so a kernel refusal after a successful grid
+        // resize would leave the two permanently disagreeing about one size. The kernel's own size
+        // is two numbers it stores, so a refusal from the grid can be answered by putting them
+        // back, and the only cost is that the application is told the window changed twice.
+        //
+        // The grid still refuses before it allocates: a size whose two screen buffers do not fit
+        // this session's budget is refused with the grid unchanged.
+        let previous = self.pty.dimensions();
         self.pty.resize(dimensions)?;
+        if let Err(error) = self.engine.resize(dimensions, kr_ipc::now_ms().get()) {
+            // Back to the size the grid still has. A second window-change notification is visible
+            // to the application; a kernel and a grid that disagree for the rest of the session
+            // are not, until something draws in the wrong place.
+            let _ = self.pty.resize(previous);
+            return Err(error);
+        }
         // A resize advances the engine's projection: every client's screen is at the old size and
         // nothing continues from it. They are told, here, rather than on the next byte the
         // application happens to write, which for an idle session may be never.
+        self.require_resync_of_every_subscriber();
+        Ok(())
+    }
+
+    /// Tells every subscriber that its view of this session is no longer continuous.
+    fn require_resync_of_every_subscriber(&mut self) {
         let next = self.history.next_cursor();
         let oldest = self.history.oldest_retained_cursor();
         for attachment_id in self.hub.subscribers() {
             self.hub
                 .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
         }
-        Ok(())
     }
 
     /// Tells the canonical grid where a side effect currently goes.
@@ -692,7 +710,38 @@ impl Session {
         attachment_id: AttachmentId,
         dimensions: Dimensions,
     ) -> Result<TerminalPresentationMode> {
-        self.attachments.viewport(attachment_id, dimensions)
+        let before = self.presentation_of_attachment(attachment_id);
+        let presentation = self.attachments.viewport(attachment_id, dimensions)?;
+        // A window that changed size is looking at a different part of the grid, and one that
+        // changed presentation is being served a different thing altogether. Either way what it
+        // holds is no longer continuous with what it is about to be sent, so it is told now rather
+        // than on the next byte the application happens to write - which for an idle session may
+        // be never, and the person would sit looking at a screen drawn for another size.
+        // A presentation that changed needs a fresh screen, and so does a viewport that stayed a
+        // viewport: what it is drawn is clipped to its own window, and the window moved.
+        let no_longer_continuous =
+            before != Some(presentation) || presentation == TerminalPresentationMode::Viewport;
+        if no_longer_continuous {
+            let next = self.history.next_cursor();
+            let oldest = self.history.oldest_retained_cursor();
+            self.hub
+                .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
+        }
+        Ok(presentation)
+    }
+
+    /// Returns how one attachment is currently being shown the session, without changing anything.
+    fn presentation_of_attachment(
+        &mut self,
+        attachment_id: AttachmentId,
+    ) -> Option<TerminalPresentationMode> {
+        self.attachments
+            .set_carryable(self.engine.direct_is_carryable());
+        self.attachments
+            .summaries()
+            .into_iter()
+            .find(|summary| summary.attachment_id == attachment_id)
+            .and_then(|summary| summary.presentation.0)
     }
 
     /// Adds or withdraws a geometry claim.
@@ -757,13 +806,20 @@ impl Session {
         self.require_running()?;
         let previous = self.attachments.geometry();
         let change = self.attachments.transfer(attachment_id, expected_epoch)?;
-        if change.resize_required
-            && let Err(error) = self.resize_canonical(change.state.dimensions)
-        {
-            // The transfer is undone, owner and epoch together: a half-completed handover would
-            // leave the session with an owner whose size it never took.
-            self.attachments.restore_geometry(&previous);
-            return Err(error);
+        if change.resize_required {
+            if let Err(error) = self.resize_canonical(change.state.dimensions) {
+                // The transfer is undone, owner and epoch together: a half-completed handover would
+                // leave the session with an owner whose size it never took.
+                self.attachments.restore_geometry(&previous);
+                return Err(error);
+            }
+        } else {
+            // The size did not move, so nothing above resynchronised anybody - and every
+            // attachment's picture of who owns the size and at which epoch has still changed.
+            // Section 8 requires them to be told atomically, so they are told here, inside the same
+            // locked step that moved the ownership, and the snapshot each one then asks for carries
+            // the committed owner and epoch.
+            self.require_resync_of_every_subscriber();
         }
         Ok(change.state)
     }
