@@ -505,6 +505,7 @@ impl Session {
         self.restoration_losses.clipped_rows += carried.clipped_rows;
         self.restoration_losses.soft_wraps += carried.soft_wraps;
         self.restoration_losses.other_keyboard |= carried.other_keyboard;
+        self.restoration_losses.keyboard_stack += carried.keyboard_stack;
         self.restoration_losses.pending_wrap |= carried.pending_wrap;
     }
 

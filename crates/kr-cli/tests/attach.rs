@@ -772,10 +772,17 @@ async fn an_attachment_that_asked_nothing_still_gives_the_keyboard_state_back() 
         "and the guard gave the terminal its keyboard state back: {}",
         output.text().escape_debug()
     );
+    // And what follows the pop sets nothing: the session's own restoration installs the flags it
+    // holds while the attachment runs, but the cleanup has nothing to put back that anybody read.
+    let seen = output.text();
+    let after_the_pop = seen
+        .rfind("\u{1b}[<1u")
+        .map_or("", |at| &seen[at..])
+        .to_owned();
     assert!(
-        !output.contains(b"\x1b[="),
-        "without setting it to anything nobody ever read: {}",
-        output.text().escape_debug()
+        !after_the_pop.contains("\u{1b}[="),
+        "the cleanup set no keyboard state nobody ever read: {}",
+        after_the_pop.escape_debug()
     );
     // One push, one pop, whichever process was alive for each. The guard owns both, because a
     // stack operation cannot be repeated or skipped without leaving the terminal in a state

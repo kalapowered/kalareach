@@ -379,12 +379,14 @@ impl Writer {
         // take that away or bury it. A stack the session holds is therefore counted as something
         // this restoration did not carry, which is what keeps such an attachment projected rather
         // than handed the stream with a stack it would pop into somebody else's state.
-        if let Some(flags) = kitty.flags {
-            let mut set = b"=".to_vec();
-            set.extend_from_slice(flags.to_string().as_bytes());
-            set.extend_from_slice(b";1u");
-            self.csi(&set);
-        }
+        // The flags are always installed, including none of them. A terminal reached by a
+        // restoration is not a terminal that started empty: what an earlier application negotiated
+        // there stays in force until something says otherwise, and a session whose own flags are
+        // none would otherwise leave the application reading an encoding it never asked for.
+        let mut set = b"=".to_vec();
+        set.extend_from_slice(kitty.flags.unwrap_or(0).to_string().as_bytes());
+        set.extend_from_slice(b";1u");
+        self.csi(&set);
         self.carried.keyboard_stack += kitty.stack.len();
     }
 
@@ -1447,5 +1449,30 @@ mod tests {
             "so the terminal is not handed the stream with a stack it would pop into \
              somebody else's state"
         );
+    }
+
+    #[test]
+    fn a_session_that_negotiated_no_keyboard_flags_installs_none_rather_than_nothing() {
+        // A terminal a restoration reaches is not a terminal that started empty: whatever an
+        // earlier application negotiated there is still in force. A session holding no flags has
+        // to say so, or the application reads an encoding it never asked for.
+        let rendered = render(
+            &[RestoreOp::SetKeyboard {
+                keyboard: KeyboardSnapshot {
+                    modify_other_keys: 0,
+                    primary: KittyKeyboard {
+                        flags: None,
+                        stack: Vec::new(),
+                    },
+                    alternate: KittyKeyboard {
+                        flags: None,
+                        stack: Vec::new(),
+                    },
+                },
+            }],
+            viewport(24, 80),
+        );
+        assert_eq!(rendered.bytes, b"\x1b[>4;0m\x1b[=0;1u".to_vec());
+        assert_eq!(rendered.carried.keyboard_stack, 0);
     }
 }
