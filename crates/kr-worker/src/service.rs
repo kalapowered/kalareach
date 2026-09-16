@@ -156,6 +156,13 @@ pub struct WorkerService {
     /// mutation; it does not cover a read or a subscription already running on a connection that
     /// was authorised a moment before its authority was withdrawn. This is what covers those.
     admitted: Mutex<std::collections::BTreeMap<ConnectionId, Registration>>,
+    /// The attachments a forwarded caller made, whose authority is a grant rather than this user.
+    ///
+    /// An authority revision fences what those attachments were admitted to do, and an attachment
+    /// identifier is the only thing the input lease records about who holds it. A local
+    /// attachment is not in here, because its authority is the operating-system identity the
+    /// socket authenticated and no revision replaces that.
+    remote_attachments: Mutex<std::collections::BTreeSet<AttachmentId>>,
     build_id: kr_protocol::ids::BuildId,
 }
 
@@ -222,6 +229,7 @@ impl WorkerService {
             dispatch: Mutex::new(()),
             connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             admitted: Mutex::new(std::collections::BTreeMap::new()),
+            remote_attachments: Mutex::new(std::collections::BTreeSet::new()),
             build_id: binding.build_id,
         })
     }
@@ -947,40 +955,75 @@ impl WorkerService {
                 revision: held.unwrap_or(notice.revision),
             });
         }
-        let fenced = {
-            let mut session = self.runtime.session();
-            match session.journal_mut() {
-                Some(journal) => journal.revoke_undispatched(
-                    Some(ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        format!(
-                            "the authority this action was admitted under was revoked at revision \
-                             {}",
-                            notice.revision
-                        ),
-                    )),
-                    kr_ipc::now_ms(),
-                ),
-                // Without a journal there is no admitted intent to fence, because no ordinary
-                // mutation is admitted at all.
-                None => Ok(0),
-            }
+        // The session is held from here until the revision is installed. The two fences below and
+        // the installation are one step: input that got past the fence and into the queue while
+        // the revision was going in would otherwise still be written to the application after the
+        // revocation had been called complete.
+        let mut session = self.runtime.session();
+        let fenced = match session.journal_mut() {
+            Some(journal) => journal.revoke_undispatched(
+                Some(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    format!(
+                        "the authority this action was admitted under was revoked at revision {}",
+                        notice.revision
+                    ),
+                )),
+                kr_ipc::now_ms(),
+            ),
+            // Without a journal there is no admitted intent to fence, because no ordinary
+            // mutation is admitted at all.
+            None => Ok(0),
         };
         if let Err(error) = fenced {
             // The acknowledgement is what the controller waits on before it calls a revocation
             // complete. Reporting success while the fence did not run would answer it wrongly.
             return failure(RequestId::new(0), &error.to_protocol_error());
         }
+        self.fence_remote_input(&mut session);
+        let session_id = session.id();
         let mut authority = self
             .authority
             .lock()
             .expect("the authority lock is not poisoned");
         authority.acknowledged_revision = Some(notice.revision);
         drop(authority);
+        drop(session);
         ControlFrame::AuthorityRevisionAck(kr_protocol::worker::AuthorityRevisionAck {
-            session_id: self.runtime.session().id(),
+            session_id,
             revision: notice.revision,
         })
+    }
+
+    /// Takes the input lease away from a forwarded caller, with whatever it had not delivered.
+    ///
+    /// Section 10's input fence is what a revocation needs here. Input the worker accepted can sit
+    /// in the lease's queue while the application is not taking bytes, so an acknowledgement that
+    /// only fenced *admitted intents* would let keystrokes admitted under the replaced authority
+    /// reach the application afterwards. Releasing the lease discards them on the same boundary
+    /// the writer takes, which is the step a takeover already uses.
+    ///
+    /// Which device the revision was about is not something this worker is told, so every
+    /// forwarded lease is fenced. The device acquires the lease again on its next request, under
+    /// the revision now in force; a local lease is untouched, because no revision replaces the
+    /// operating-system identity behind it.
+    fn fence_remote_input(&self, session: &mut Session) {
+        let lease = session.lease();
+        let Some(holder) = lease.holder.0 else {
+            return;
+        };
+        let remote = self
+            .remote_attachments
+            .lock()
+            .expect("the remote attachment set is not poisoned")
+            .contains(&holder);
+        if !remote {
+            return;
+        }
+        let _ = session.release_input(holder, lease.epoch.get());
+        // The fence moved, so what the writer holds has to be published with it rather than left
+        // for the next caller to flush.
+        self.runtime.flush_locked(session);
     }
 
     /// Registers one admitted connection, and returns how it learns that it has been withdrawn.
@@ -2149,6 +2192,10 @@ impl WorkerService {
                 let result = session.attach(&params, granted, attachment_id)?;
                 if caller.is_remote() {
                     session.narrow_content(attachment_id, crate::render::Scope::LiveScreen);
+                    self.remote_attachments
+                        .lock()
+                        .expect("the remote attachment set is not poisoned")
+                        .insert(attachment_id);
                 }
                 state.add_attachment(attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
@@ -2173,6 +2220,10 @@ impl WorkerService {
                 self.runtime.flush_locked(session);
                 let result = outcome?;
                 state.remove_attachment(params.attachment_id);
+                self.remote_attachments
+                    .lock()
+                    .expect("the remote attachment set is not poisoned")
+                    .remove(&params.attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::SessionClose => {
