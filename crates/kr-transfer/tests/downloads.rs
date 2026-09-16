@@ -808,6 +808,7 @@ fn an_upload_stays_outside_repositories_and_is_reached_through_a_narrow_grant() 
                 application_instance_id: Nullable::null(),
                 text: "look".to_owned(),
             },
+            None,
         )
         .expect("creates the draft")
         .draft;
@@ -830,6 +831,7 @@ fn an_upload_stays_outside_repositories_and_is_reached_through_a_narrow_grant() 
                     model_media_capability: false,
                 },
             },
+            None,
         )
         .expect("binds the attachment");
     let grant = bound
@@ -867,6 +869,7 @@ fn an_upload_stays_outside_repositories_and_is_reached_through_a_narrow_grant() 
                     model_media_capability: false,
                 },
             },
+            None,
         )
         .expect("binds the second attachment");
     assert!(

@@ -49,7 +49,7 @@ them; nothing in the protocol depends on the defaults.
 | chunk size | 1 MiB | `kr_protocol::limits::UPLOAD_CHUNK_LEN`, fixed by the wire contract |
 | one file | 2 GiB | `max_file_len`, per environment |
 | staged bytes | 8 GiB | `max_staged_len`, per environment |
-| concurrent transfers | 2 | `max_concurrent_transfers`, per device |
+| concurrent transfers | 2 | `max_concurrent_transfers`, per authenticated principal |
 | unfinished upload | 24 hours | `UNFINISHED_UPLOAD_LIFETIME` |
 | unused attachment | 7 days | `UNUSED_ATTACHMENT_LIFETIME` |
 | download snapshot | 24 hours | `DOWNLOAD_SNAPSHOT_LIFETIME` |
@@ -65,6 +65,17 @@ charges nothing, because those bytes are already counted against the attachment 
 
 A byte quota is `QUOTA_EXCEEDED`, which nothing retries into. The concurrency ceiling is
 `RESOURCE_UNAVAILABLE`, because it clears when one of the caller's own transfers finishes.
+
+The ceiling counts per authenticated principal, which is what identifies a device to this host: a
+paired device's actor is that device, and a local caller's actor is the operating-system user. The
+`device_id` a request carries is recorded as metadata and confers nothing, because a caller that
+could change it per request would give itself another allowance.
+
+Bytes stay charged until the payload they name is actually gone. Closing an upload's row marks it
+for cleanup and keeps its reservation; removing the file releases it. A removal that fails, or a
+daemon that dies between the two, leaves the row marked and the bytes charged, and the next
+recovery pass retries it. That is why a staged total can include a cancelled upload for a moment,
+and why it can never omit a file that still exists.
 
 ## Which stream a chunk travels on
 
@@ -112,14 +123,22 @@ completed area.
 
 Payload files are created exclusively, without following links, mode 0600, and never with an
 executable bit. The storage name comes from the transfer identifier in hexadecimal, plus at most a
-validated extension taken from the original filename: ASCII alphanumeric, sixteen bytes or fewer, and
-not one of the extensions Windows would execute. Everything else about the client's name is
-metadata. Separators, traversal segments, reserved device names and stream separators never reach
-the storage path.
+validated extension taken from the original filename.
+
+The extension rule is an allowlist, not a denylist. Section 14 permits a validated extension to be
+retained for an agent that requires one, and the allowed set is the media, document, audio, video
+and archive types an attachment is; the list is `PERMITTED_EXTENSIONS` in `staging.rs`. Anything
+outside it keeps the bare identifier with no extension at all, which executes nothing on any
+platform. Asking instead which extensions Windows can execute would be a list nobody can close.
+
+Everything else about the client's name is metadata. Separators, traversal segments, reserved
+device names and stream separators never reach the storage path.
 
 The random directory name is not a secret and nothing depends on it staying unknown. It is there so
 two installations, or an installation and a restored backup, never collide on a payload name, and so
-a path guessed from a transfer identifier alone names nothing.
+a path guessed from a transfer identifier alone names nothing. What makes a staging area *this*
+environment's is the object rather than the name: its stable filesystem identity is recorded the
+first time it is opened, and a directory replaced at the same name afterwards is refused.
 
 ## The journal, and what makes a transfer resumable
 
@@ -128,7 +147,7 @@ migrations. Every state change commits together with the outbox row that announc
 
 | Table | What it holds |
 | --- | --- |
-| `uploads` | one row per upload: the declaration, the reservation, the state, the verified digest and the preview |
+| `uploads` | one row per upload: the declaration, the reservation, the state, the verified digest, the payload's filesystem identity, whether a payload still has to be removed, and the preview |
 | `chunks` | the per-chunk journal: index, exact length, digest and when it was written |
 | `snapshots`, `snapshot_chunks` | download snapshots, their chunk layout and the source facts they were taken against |
 | `scopes` | registered read scopes, with the stable filesystem identity each one was recorded for |
@@ -144,16 +163,33 @@ the environment's budget. A chunk row is written after its bytes are on disk and
 row with no bytes behind it would let a later verification trust a hole; bytes with no row are simply
 sent again, which costs one chunk.
 
-Publication is two commits with a recoverable state between them. The row moves to `publishing`
-naming both the incomplete and the published name, then the file is renamed, then the row moves to
-`published`. A daemon that dies in the middle finds the `publishing` row at startup and resolves it
-from whichever name exists: the published name means the rename landed and only the row was behind,
-and the incomplete name means it did not and the verified bytes are still there to move. A row with
-neither is invalidated, because a handle whose file is gone is not a handle. Nothing here needs a
-separate directory flush, since the record answers either way.
+Publication is two commits with a recoverable state between them, and the identity of the verified
+object is what ties them together. The row moves to `publishing` carrying the device and inode (or
+volume serial and file index) of the file the verification was made against, then the file is
+renamed, then the row moves to `published`.
+
+A daemon that dies in the middle finds the `publishing` row and resolves it by asking which name
+holds *that exact object*: the published name means the rename landed and only the row was behind,
+and the incomplete name means it did not and the verified bytes are still there to move. A file of
+the same length that took either name in between is not that object, so it is not published. A row
+whose object is in neither place is invalidated, because a handle whose file is gone is not a
+handle, and a storage failure is reported instead of being read as an absence.
+
+The directory that names a payload is flushed before the record that depends on it commits: after a
+`create`, and after the rename that publishes. Without that a power loss could leave SQLite saying
+`published` while the rename was still only in the page cache. A retried `upload.finish` resolves a
+`publishing` row the same way, so a caller does not have to wait for the next start to learn what
+happened.
+
+Recovery at startup does two jobs, both idempotent. It resolves every interrupted publication as
+above, and it removes every payload whose upload is closed but whose bytes are still on disk,
+releasing those bytes only once the file is gone.
 
 That is what makes the ownership contract true rather than merely stated. A worker's death
 invalidates an insertion; it does not change the identity of a file this service already verified.
+
+Every state change commits an outbox row with it, including the submission that moves an attachment
+onto its session's retention. Consumers keep their own cursor in `cursors`.
 
 ## Integrity
 
@@ -193,14 +229,20 @@ descendant opened relative to it, one component at a time.
 The no-escape policy, qualified:
 
 - A name is relative in this crate's accepted form. No root, no drive prefix, no `..`, no `.`, no
-  empty component, no NUL or other control byte, no separator other than `/`, no trailing dot or
-  space on a component, no alternate-data-stream colon, and no Windows reserved device name with or
-  without an extension. The same rules apply on every platform, so a name one host accepts is a name
-  every host accepts.
-- Resolution opens each intermediate component with the no-follow open. A component that is a
-  symbolic link or a reparse point fails the lookup instead of redirecting it, whether it points
-  inside the tree or out of it. Replacing a component with a link during the walk fails the same
-  way, because the open that would have crossed it is the one that refuses.
+  empty component, no NUL or other control byte, no separator other than `/`, none of the
+  characters Windows refuses in a filename (`< > " | ? *`), no trailing dot or space on a
+  component, no alternate-data-stream colon, and no Windows reserved device name. The device-name
+  comparison drops everything from the first dot, trims surrounding space and folds the superscript
+  digits Windows folds, so `NUL .txt` and `COM¹` are refused too. The same rules apply on every
+  platform, so a name one host accepts is a name every host accepts.
+- **Every** open is made against the authorised directory's own handle with the accumulated path,
+  never against the previous component's handle. That is what keeps the boundary the platform
+  enforces the authorised directory rather than whatever the walk last reached: a directory moved
+  out of the tree between two components makes the next open fail, because the accumulated path no
+  longer resolves beneath the root.
+- Each prefix is opened with the no-follow open before the object itself is. A component that is a
+  symbolic link or a reparse point at the moment it is resolved fails the lookup instead of
+  redirecting it, whether it points inside the tree or out of it.
 - After the open, the object's stable filesystem identity, device and inode on Unix or volume serial
   and file index on Windows, is read back through the handle and checked against the policy the
   caller asked for. A payload file this host created must have exactly one name; a file the host only
@@ -214,8 +256,14 @@ The no-escape policy, qualified:
   by another, which is how a Windows path and a WSL path stay separate rather than aliasing.
 
 `cap-std` 4.0.3 owns the three platform implementations: `openat2` with `RESOLVE_BENEATH` on Linux,
-component-wise `openat` with `O_NOFOLLOW` on other Unix systems, and relative `NtCreateFile` opens
-with reparse-point rejection on Windows. This crate is the policy, not the syscalls.
+which resolves a whole accumulated path in one syscall, component-wise `openat` with `O_NOFOLLOW`
+beneath the same start directory on other Unix systems, and relative `NtCreateFile` opens on
+Windows. This crate is the policy, not the syscalls.
+
+One thing the delegation does not cover. `cap-std`'s Windows no-follow test recognises
+name-surrogate reparse tags, which covers junctions and symbolic links and not every reparse point,
+so this crate reads `FILE_ATTRIBUTE_REPARSE_POINT` from each opened handle itself and refuses any
+tag.
 
 An open is non-blocking on Unix, so a name replaced with a named pipe cannot hold the service open
 waiting for a writer. The handle's own metadata then decides whether it is a regular file.
@@ -228,11 +276,22 @@ rather than counted as passed.
 
 ### What this does not promise
 
+Three residuals, stated rather than implied.
+
 Handle-based resolution removes path-resolution races. It does not make an authorised file private
 from another process running as the same operating-system user: such a process can open and write a
-file this host has authorised, and nothing in this crate prevents it. Where immutability is the
-requirement, as it is for a download, the host stages its own copy and verifies it instead of
-trusting an open handle.
+file this host has authorised, before or after it is published, and nothing in this crate prevents
+it. What the host does instead is verify: `upload.finish` reads the whole staged file back and
+refuses to publish bytes that do not match the declaration, and a download stages its own copy
+rather than trusting an open handle.
+
+A component replaced with a symbolic link between the prefix pass and the open of the object
+beneath it can be traversed. The destination is still beneath the authorised directory, because
+every open carries the boundary, so this is a link followed inside the tree and never an escape.
+
+On Linux each accumulated path is resolved in one syscall, so there is no window inside a
+resolution. On the other platforms the resolution is component-wise beneath the start directory,
+and `cap-std`'s own documentation is the authority on what that leaves open.
 
 ## Verified downloads
 
@@ -291,6 +350,10 @@ asked. The binding starts at `recorded`, which says exactly that and no more. It
 nothing else sets it. A failure records `failed` with its reason and keeps both the draft and the
 published attachment, so a retry has something to retry with.
 
+The attachment and the draft must belong to the same principal, and to the same session where both
+name one. An attachment bound to one session would otherwise be retained against that session while
+a draft for another held it.
+
 A contribution declares what one operation accepts before anything is offered: the media types, the
 selected model's size limit, how many attachments a draft may carry, the insertion method and any
 external destination. The host checks the handle against that declaration. An operation that claims
@@ -341,11 +404,18 @@ untouched. Nothing invents a placeholder image to stand in for it.
 | `PERMISSION_DENIED` | a name that leaves an authorised directory, a revoked scope or grant, or another principal's transfer |
 | `ENVIRONMENT_UNAVAILABLE` | the request names an environment this service does not own |
 | `ID_CONFLICT` | one action identifier used for two different payloads |
-| `INVALID_ARGUMENT` | a malformed request, or an identifier that names nothing |
-| `STORAGE_UNAVAILABLE` | the journal or the staging area could not be used |
+| `INVALID_ARGUMENT` | a malformed request, or an identifier that names nothing this caller owns |
+| `STORAGE_UNAVAILABLE` | the journal or the staging area could not be used, including a name the storage would not answer about |
 
-An identifier that names nothing is `INVALID_ARGUMENT` rather than a code of its own, so a caller
-never learns from the error whether something with that identifier exists.
+An identifier that names nothing is `INVALID_ARGUMENT` rather than a code of its own, and an
+identifier that names another principal's transfer or draft gets the same refusal with the same
+message. A caller therefore never learns from the error whether something with that identifier
+exists.
+
+A name refused by the authority and a name the storage would not answer about are different
+answers. A traversal segment, a link, the wrong kind of object, a changed identity and a name that
+is absent are all `PERMISSION_DENIED`. A full disk or a read failure is `STORAGE_UNAVAILABLE`,
+because the caller should wait rather than change its request.
 
 ## What a caller builds on
 

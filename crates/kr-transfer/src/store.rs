@@ -92,6 +92,16 @@ pub struct UploadRow {
     pub reserved_byte_len: u64,
     /// The verified whole-file digest, once verification has happened.
     pub content_digest: Option<Digest256>,
+    /// The stable identity of the payload file the verification was made against.
+    ///
+    /// A rename preserves it, so the object in the completed area has to be the object that was
+    /// verified. A replacement of equal length does not.
+    pub payload_identity: Option<ObjectIdentity>,
+    /// True while a payload this upload no longer needs is still on disk.
+    ///
+    /// The bytes stay charged against the environment until the file is gone, and recovery retries
+    /// the removal, so a failed delete cannot leave an uncharged file nothing looks at again.
+    pub cleanup_pending: bool,
     /// The encoded preview, once one has been produced.
     pub preview: Option<Vec<u8>>,
     /// Why no preview was produced, when none was.
@@ -273,6 +283,36 @@ pub struct GrantRow {
     pub revoked: bool,
 }
 
+/// One action's identity, its payload and the result it produced.
+///
+/// A mutation whose idempotency is the action identifier commits this row in the same transaction
+/// as the state it changed. That is what makes a repeat answerable: a daemon that dies between the
+/// two would otherwise leave a mutation nothing could recognise as already performed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedAction {
+    /// The actor that performed it.
+    pub actor_id: ActorId,
+    /// The action identifier.
+    pub action_id: Uuid,
+    /// The method.
+    pub method: String,
+    /// The digest of the payload it was performed with.
+    pub payload_digest: Digest256,
+    /// The canonically encoded result.
+    pub result: Vec<u8>,
+    /// When it was recorded.
+    pub recorded_at_ms: TimestampMs,
+}
+
+/// What a transaction that carried an action found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// The action was recorded and the state it changed was committed with it.
+    Committed,
+    /// This actor had already performed this action. Nothing was changed.
+    AlreadyPerformed,
+}
+
 /// A retained mutation result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionRecord {
@@ -356,11 +396,13 @@ impl Store {
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
                  CREATE TABLE IF NOT EXISTS environment (
-                     environment_id BLOB PRIMARY KEY,
-                     staging_name   TEXT NOT NULL,
-                     max_file_len   INTEGER NOT NULL,
-                     max_staged_len INTEGER NOT NULL,
-                     max_concurrent INTEGER NOT NULL
+                     environment_id  BLOB PRIMARY KEY,
+                     staging_name    TEXT NOT NULL,
+                     staging_device  INTEGER,
+                     staging_file_id INTEGER,
+                     max_file_len    INTEGER NOT NULL,
+                     max_staged_len  INTEGER NOT NULL,
+                     max_concurrent  INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS uploads (
                      transfer_id         BLOB PRIMARY KEY,
@@ -377,6 +419,9 @@ impl Store {
                      invalid_reason      TEXT,
                      reserved_byte_len   INTEGER NOT NULL,
                      content_digest      BLOB,
+                     payload_device      INTEGER,
+                     payload_file_id     INTEGER,
+                     cleanup_pending     INTEGER NOT NULL DEFAULT 0,
                      preview             BLOB,
                      preview_unavailable TEXT,
                      created_at_ms       INTEGER NOT NULL,
@@ -384,6 +429,8 @@ impl Store {
                      published_at_ms     INTEGER,
                      submitted_at_ms     INTEGER
                  );
+                 CREATE INDEX IF NOT EXISTS uploads_needing_cleanup
+                     ON uploads (cleanup_pending);
                  CREATE INDEX IF NOT EXISTS uploads_by_state ON uploads (state, expires_at_ms);
                  CREATE TABLE IF NOT EXISTS chunks (
                      transfer_id BLOB NOT NULL
@@ -603,6 +650,51 @@ impl Store {
         Ok(())
     }
 
+    /// Returns the identity recorded for this environment's staging directory, if one is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the row cannot be read.
+    pub fn staging_identity(&self) -> Result<Option<ObjectIdentity>> {
+        self.connection
+            .query_row(
+                "SELECT staging_device, staging_file_id FROM environment WHERE environment_id = ?1",
+                params![uuid_sql(self.environment_id.get())],
+                |row| {
+                    Ok(row
+                        .get::<_, Option<i64>>(0)?
+                        .zip(row.get::<_, Option<i64>>(1)?)
+                        .map(|(device, file_id)| ObjectIdentity {
+                            device: from_i64(device),
+                            file_id: from_i64(file_id),
+                        }))
+                },
+            )
+            .optional()
+            .map_err(TransferError::store)
+            .map(Option::flatten)
+    }
+
+    /// Records the identity of this environment's staging directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the row cannot be written.
+    pub fn set_staging_identity(&self, identity: ObjectIdentity) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE environment SET staging_device = ?2, staging_file_id = ?3
+                 WHERE environment_id = ?1",
+                params![
+                    uuid_sql(self.environment_id.get()),
+                    as_i64(identity.device),
+                    as_i64(identity.file_id),
+                ],
+            )
+            .map_err(TransferError::store)?;
+        Ok(())
+    }
+
     /// Returns how many bytes this environment has staged.
     ///
     /// Receiving uploads, published attachments that still exist and open snapshots share one
@@ -615,8 +707,11 @@ impl Store {
         let uploads: i64 = self
             .connection
             .query_row(
+                // The charge follows the file, not the state: a closed upload whose payload is
+                // still on disk is still spending this environment's bytes.
                 "SELECT COALESCE(SUM(reserved_byte_len), 0) FROM uploads
-                 WHERE state IN ('receiving', 'publishing', 'published')",
+                 WHERE state IN ('receiving', 'publishing', 'published')
+                    OR cleanup_pending = 1",
                 [],
                 |row| row.get(0),
             )
@@ -632,38 +727,27 @@ impl Store {
         Ok(from_i64(uploads).saturating_add(from_i64(snapshots)))
     }
 
-    /// Returns how many transfers a device holds open.
+    /// Returns how many transfers one principal holds open.
+    ///
+    /// Section 14 counts the ceiling per device, and the authenticated principal is what identifies
+    /// a device to this host: a paired device's actor is that device, and a local caller's actor is
+    /// the operating-system user. The `device_id` a request carries is a label the host records and
+    /// takes no authority from, because a caller could otherwise send a new one per request and
+    /// give itself another allowance.
     ///
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the counts cannot be read.
-    pub fn open_transfers(&self, device_id: Option<DeviceId>, actor_id: &ActorId) -> Result<u64> {
-        // A device identity is what section 14 counts against, and a local caller has none: the
-        // authenticated operating-system actor stands in for it, so the ceiling still applies.
-        let (uploads, snapshots) = match device_id {
-            Some(device) => (
-                self.count(
-                    "SELECT COUNT(*) FROM uploads WHERE state = 'receiving' AND device_id = ?1",
-                    params![uuid_sql(device.get())],
-                )?,
-                self.count(
-                    "SELECT COUNT(*) FROM snapshots WHERE state = 'open' AND device_id = ?1",
-                    params![uuid_sql(device.get())],
-                )?,
-            ),
-            None => (
-                self.count(
-                    "SELECT COUNT(*) FROM uploads
-                     WHERE state = 'receiving' AND device_id IS NULL AND actor_id = ?1",
-                    params![actor_id.as_str()],
-                )?,
-                self.count(
-                    "SELECT COUNT(*) FROM snapshots
-                     WHERE state = 'open' AND device_id IS NULL AND actor_id = ?1",
-                    params![actor_id.as_str()],
-                )?,
-            ),
-        };
+    pub fn open_transfers(&self, actor_id: &ActorId) -> Result<u64> {
+        let uploads = self.count(
+            "SELECT COUNT(*) FROM uploads
+             WHERE state IN ('receiving', 'publishing') AND actor_id = ?1",
+            params![actor_id.as_str()],
+        )?;
+        let snapshots = self.count(
+            "SELECT COUNT(*) FROM snapshots WHERE state = 'open' AND actor_id = ?1",
+            params![actor_id.as_str()],
+        )?;
         Ok(uploads.saturating_add(snapshots))
     }
 
@@ -675,23 +759,34 @@ impl Store {
         Ok(from_i64(count))
     }
 
-    /// Records a new upload and the event that announces it, in one transaction.
+    /// Records a new upload, its action and the event that announces it, in one transaction.
+    ///
+    /// Returns [`ActionOutcome::AlreadyPerformed`] when this actor had already performed this
+    /// action, in which case nothing was written.
     ///
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the write fails.
-    pub fn insert_upload(&mut self, row: &UploadRow) -> Result<()> {
+    pub fn insert_upload(
+        &mut self,
+        row: &UploadRow,
+        action: Option<&RetainedAction>,
+    ) -> Result<ActionOutcome> {
         let transaction = self.begin()?;
+        if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
+            return Ok(ActionOutcome::AlreadyPerformed);
+        }
         transaction
             .execute(
                 "INSERT INTO uploads
                      (transfer_id, environment_id, session_id, device_id, actor_id,
                       declared_byte_len, declared_digest, declared_media_type, original_file_name,
                       stored_name, state, invalid_reason, reserved_byte_len, content_digest,
-                      preview, preview_unavailable, created_at_ms, expires_at_ms, published_at_ms,
+                      payload_device, payload_file_id, cleanup_pending, preview,
+                      preview_unavailable, created_at_ms, expires_at_ms, published_at_ms,
                       submitted_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, NULL, NULL,
-                         NULL, ?13, ?14, NULL, NULL)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, NULL, ?13, ?14,
+                         1, NULL, NULL, ?15, ?16, NULL, NULL)",
                 params![
                     uuid_sql(row.transfer_id.get()),
                     uuid_sql(row.environment_id.get()),
@@ -705,6 +800,9 @@ impl Store {
                     row.stored_name,
                     row.state.as_str(),
                     as_i64(row.reserved_byte_len),
+                    row.payload_identity.map(|identity| as_i64(identity.device)),
+                    row.payload_identity
+                        .map(|identity| as_i64(identity.file_id)),
                     as_i64(row.created_at_ms.get()),
                     as_i64(row.expires_at_ms.get()),
                 ],
@@ -716,7 +814,8 @@ impl Store {
             &row.transfer_id.to_string(),
             row.created_at_ms,
         )?;
-        transaction.commit().map_err(TransferError::store)
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(ActionOutcome::Committed)
     }
 
     /// Returns one upload.
@@ -730,8 +829,9 @@ impl Store {
                 "SELECT transfer_id, environment_id, session_id, device_id, actor_id,
                         declared_byte_len, declared_digest, declared_media_type,
                         original_file_name, stored_name, state, invalid_reason, reserved_byte_len,
-                        content_digest, preview, preview_unavailable, created_at_ms, expires_at_ms,
-                        published_at_ms, submitted_at_ms
+                        content_digest, payload_device, payload_file_id, cleanup_pending, preview,
+                        preview_unavailable, created_at_ms, expires_at_ms, published_at_ms,
+                        submitted_at_ms
                  FROM uploads WHERE transfer_id = ?1",
                 params![uuid_sql(transfer_id.get())],
                 read_upload,
@@ -805,7 +905,11 @@ impl Store {
         Ok(chunks)
     }
 
-    /// Moves an upload to a terminal state, releasing its reservation, and announces it.
+    /// Moves an upload to a terminal state and announces it.
+    ///
+    /// The reservation is **not** released here. Its bytes stay charged against the environment
+    /// until the payload is actually gone, which [`Self::release_payload`] records; a daemon that
+    /// died between the two would otherwise leave a file no sweep looks at again.
     ///
     /// # Errors
     ///
@@ -820,7 +924,8 @@ impl Store {
         let transaction = self.begin()?;
         transaction
             .execute(
-                "UPDATE uploads SET state = ?2, invalid_reason = ?3, reserved_byte_len = 0
+                "UPDATE uploads
+                 SET state = ?2, invalid_reason = ?3, cleanup_pending = 1
                  WHERE transfer_id = ?1",
                 params![uuid_sql(transfer_id.get()), state.as_str(), reason],
             )
@@ -834,6 +939,97 @@ impl Store {
         transaction.commit().map_err(TransferError::store)
     }
 
+    /// Moves an upload out of `from` to a terminal state, only while it is still in `from`.
+    ///
+    /// Returns false when the row had already moved, which is what a sweep needs: its list of
+    /// candidates was read before the lock it now holds, and a finish or a cancellation may have
+    /// landed in between.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn close_upload_from(
+        &mut self,
+        transfer_id: TransferId,
+        from: UploadState,
+        state: UploadState,
+        reason: Option<&str>,
+        at_ms: TimestampMs,
+    ) -> Result<bool> {
+        let transaction = self.begin()?;
+        let changed = transaction
+            .execute(
+                "UPDATE uploads
+                 SET state = ?3, invalid_reason = ?4, cleanup_pending = 1
+                 WHERE transfer_id = ?1 AND state = ?2",
+                params![
+                    uuid_sql(transfer_id.get()),
+                    from.as_str(),
+                    state.as_str(),
+                    reason,
+                ],
+            )
+            .map_err(TransferError::store)?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        record_event(
+            &transaction,
+            &format!("upload.{}", state.as_str()),
+            &transfer_id.to_string(),
+            at_ms,
+        )?;
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(true)
+    }
+
+    /// Records that a closed upload's payload is gone, which releases its reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn release_payload(&self, transfer_id: TransferId) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE uploads SET reserved_byte_len = 0, cleanup_pending = 0
+                 WHERE transfer_id = ?1",
+                params![uuid_sql(transfer_id.get())],
+            )
+            .map_err(TransferError::store)?;
+        Ok(())
+    }
+
+    /// Returns every upload whose payload still has to be removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the read fails.
+    pub fn uploads_needing_cleanup(&self) -> Result<Vec<UploadRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT transfer_id, environment_id, session_id, device_id, actor_id,
+                        declared_byte_len, declared_digest, declared_media_type,
+                        original_file_name, stored_name, state, invalid_reason, reserved_byte_len,
+                        content_digest, payload_device, payload_file_id, cleanup_pending, preview,
+                        preview_unavailable, created_at_ms, expires_at_ms, published_at_ms,
+                        submitted_at_ms
+                 FROM uploads
+                 WHERE cleanup_pending = 1
+                   AND state IN ('cancelled', 'invalidated', 'expired')
+                 ORDER BY created_at_ms",
+            )
+            .map_err(TransferError::store)?;
+        let rows = statement
+            .query_map([], read_upload)
+            .map_err(TransferError::store)?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.push(row.map_err(TransferError::store)??);
+        }
+        Ok(found)
+    }
+
     /// Records the intent to publish, before the payload file is moved.
     ///
     /// # Errors
@@ -843,6 +1039,7 @@ impl Store {
         &mut self,
         transfer_id: TransferId,
         content_digest: Digest256,
+        payload_identity: ObjectIdentity,
         preview: Option<&[u8]>,
         preview_unavailable: Option<&str>,
         at_ms: TimestampMs,
@@ -851,7 +1048,8 @@ impl Store {
         transaction
             .execute(
                 "UPDATE uploads
-                 SET state = ?2, content_digest = ?3, preview = ?4, preview_unavailable = ?5
+                 SET state = ?2, content_digest = ?3, preview = ?4, preview_unavailable = ?5,
+                     payload_device = ?6, payload_file_id = ?7
                  WHERE transfer_id = ?1",
                 params![
                     uuid_sql(transfer_id.get()),
@@ -859,6 +1057,8 @@ impl Store {
                     content_digest.as_bytes().as_slice(),
                     preview,
                     preview_unavailable,
+                    as_i64(payload_identity.device),
+                    as_i64(payload_identity.file_id),
                 ],
             )
             .map_err(TransferError::store)?;
@@ -886,7 +1086,7 @@ impl Store {
         transaction
             .execute(
                 "UPDATE uploads
-                 SET state = ?2, published_at_ms = ?3, expires_at_ms = ?4
+                 SET state = ?2, published_at_ms = ?3, expires_at_ms = ?4, cleanup_pending = 0
                  WHERE transfer_id = ?1",
                 params![
                     uuid_sql(transfer_id.get()),
@@ -910,14 +1110,21 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the write fails.
-    pub fn mark_submitted(&self, transfer_id: TransferId, at_ms: TimestampMs) -> Result<()> {
-        self.connection
+    pub fn mark_submitted(&mut self, transfer_id: TransferId, at_ms: TimestampMs) -> Result<()> {
+        let transaction = self.begin()?;
+        transaction
             .execute(
                 "UPDATE uploads SET submitted_at_ms = ?2 WHERE transfer_id = ?1",
                 params![uuid_sql(transfer_id.get()), as_i64(at_ms.get())],
             )
             .map_err(TransferError::store)?;
-        Ok(())
+        record_event(
+            &transaction,
+            "upload.submitted",
+            &transfer_id.to_string(),
+            at_ms,
+        )?;
+        transaction.commit().map_err(TransferError::store)
     }
 
     /// Returns every upload in one of the given states, oldest first.
@@ -934,8 +1141,9 @@ impl Store {
                     "SELECT transfer_id, environment_id, session_id, device_id, actor_id,
                             declared_byte_len, declared_digest, declared_media_type,
                             original_file_name, stored_name, state, invalid_reason,
-                            reserved_byte_len, content_digest, preview, preview_unavailable,
-                            created_at_ms, expires_at_ms, published_at_ms, submitted_at_ms
+                            reserved_byte_len, content_digest, payload_device, payload_file_id,
+                            cleanup_pending, preview, preview_unavailable, created_at_ms,
+                            expires_at_ms, published_at_ms, submitted_at_ms
                      FROM uploads WHERE state = ?1 ORDER BY created_at_ms",
                 )
                 .map_err(TransferError::store)?;
@@ -1208,8 +1416,15 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the write fails.
-    pub fn insert_draft(&mut self, row: &DraftRow) -> Result<()> {
+    pub fn insert_draft(
+        &mut self,
+        row: &DraftRow,
+        action: Option<&RetainedAction>,
+    ) -> Result<ActionOutcome> {
         let transaction = self.begin()?;
+        if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
+            return Ok(ActionOutcome::AlreadyPerformed);
+        }
         transaction
             .execute(
                 "INSERT INTO drafts
@@ -1239,7 +1454,8 @@ impl Store {
             &row.draft_id.to_string(),
             row.created_at_ms,
         )?;
-        transaction.commit().map_err(TransferError::store)
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(ActionOutcome::Committed)
     }
 
     /// Returns one draft.
@@ -1289,8 +1505,12 @@ impl Store {
         expected: DraftRevision,
         text: &str,
         at_ms: TimestampMs,
+        action: Option<&RetainedAction>,
     ) -> Result<Option<DraftRevision>> {
         let transaction = self.begin()?;
+        if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
+            return Ok(None);
+        }
         let changed = transaction
             .execute(
                 "UPDATE drafts SET text = ?3, revision = revision + 1, updated_at_ms = ?4
@@ -1322,8 +1542,12 @@ impl Store {
         &mut self,
         binding: &BindingRow,
         expected: DraftRevision,
+        action: Option<&RetainedAction>,
     ) -> Result<Option<DraftRevision>> {
         let transaction = self.begin()?;
+        if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
+            return Ok(None);
+        }
         let changed = transaction
             .execute(
                 "UPDATE drafts SET revision = revision + 1, updated_at_ms = ?3
@@ -1513,12 +1737,16 @@ impl Store {
         action_id: Uuid,
         record: &ActionRecord,
     ) -> Result<()> {
+        // The first outcome recorded for an identifier is the one that stands. A later call with
+        // the same identifier must not replace it, because the caller that is retrying is entitled
+        // to the answer its action actually produced.
         self.connection
             .execute(
-                "INSERT OR REPLACE INTO actions
+                "INSERT INTO actions
                      (actor_id, action_id, method, payload_digest, result, error_code,
                       error_detail, recorded_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (actor_id, action_id) DO NOTHING",
                 params![
                     actor_id.as_str(),
                     uuid_sql(action_id),
@@ -1619,6 +1847,42 @@ impl Store {
     }
 }
 
+/// Writes an action's row inside the caller's transaction.
+///
+/// `ON CONFLICT DO NOTHING` is what makes this a claim: the first commit wins, and a second
+/// transaction carrying the same identifier finds nothing to do and changes no state either. Two
+/// callers racing the same action therefore produce one mutation and one retained result.
+fn claim_action(
+    transaction: &Transaction<'_>,
+    action: Option<&RetainedAction>,
+) -> Result<ActionOutcome> {
+    let Some(action) = action else {
+        return Ok(ActionOutcome::Committed);
+    };
+    let changed = transaction
+        .execute(
+            "INSERT INTO actions
+                 (actor_id, action_id, method, payload_digest, result, error_code, error_detail,
+                  recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)
+             ON CONFLICT (actor_id, action_id) DO NOTHING",
+            params![
+                action.actor_id.as_str(),
+                uuid_sql(action.action_id),
+                action.method,
+                action.payload_digest.as_bytes().as_slice(),
+                action.result,
+                as_i64(action.recorded_at_ms.get()),
+            ],
+        )
+        .map_err(TransferError::store)?;
+    if changed == 0 {
+        Ok(ActionOutcome::AlreadyPerformed)
+    } else {
+        Ok(ActionOutcome::Committed)
+    }
+}
+
 fn record_event(
     transaction: &Transaction<'_>,
     kind: &str,
@@ -1667,12 +1931,20 @@ fn read_upload(row: &rusqlite::Row<'_>) -> RowResult<UploadRow> {
         invalid_reason: row.get(11)?,
         reserved_byte_len: from_i64(row.get(12)?),
         content_digest: optional_digest(row, 13)?,
-        preview: row.get(14)?,
-        preview_unavailable: row.get(15)?,
-        created_at_ms: timestamp(row.get(16)?),
-        expires_at_ms: timestamp(row.get(17)?),
-        published_at_ms: row.get::<_, Option<i64>>(18)?.map(timestamp),
-        submitted_at_ms: row.get::<_, Option<i64>>(19)?.map(timestamp),
+        payload_identity: row
+            .get::<_, Option<i64>>(14)?
+            .zip(row.get::<_, Option<i64>>(15)?)
+            .map(|(device, file_id)| ObjectIdentity {
+                device: from_i64(device),
+                file_id: from_i64(file_id),
+            }),
+        cleanup_pending: row.get::<_, i64>(16)? != 0,
+        preview: row.get(17)?,
+        preview_unavailable: row.get(18)?,
+        created_at_ms: timestamp(row.get(19)?),
+        expires_at_ms: timestamp(row.get(20)?),
+        published_at_ms: row.get::<_, Option<i64>>(21)?.map(timestamp),
+        submitted_at_ms: row.get::<_, Option<i64>>(22)?.map(timestamp),
     }))
 }
 
@@ -1909,6 +2181,8 @@ mod tests {
             invalid_reason: None,
             reserved_byte_len: declared,
             content_digest: None,
+            payload_identity: None,
+            cleanup_pending: false,
             preview: None,
             preview_unavailable: None,
             created_at_ms: TimestampMs::new(1000),
@@ -1961,8 +2235,8 @@ mod tests {
         store
             .staging_name("aaaa", Limits::default())
             .expect("records");
-        store.insert_upload(&upload(1, 4096)).expect("writes");
-        store.insert_upload(&upload(2, 2048)).expect("writes");
+        store.insert_upload(&upload(1, 4096), None).expect("writes");
+        store.insert_upload(&upload(2, 2048), None).expect("writes");
         assert_eq!(store.staged_byte_len().expect("reads"), 6144);
         store
             .close_upload(
@@ -1972,6 +2246,9 @@ mod tests {
                 TimestampMs::new(2000),
             )
             .expect("writes");
+        // Closing the row does not release the bytes; removing the payload does.
+        assert_eq!(store.staged_byte_len().expect("reads"), 6144);
+        store.release_payload(transfer(2)).expect("writes");
         assert_eq!(store.staged_byte_len().expect("reads"), 4096);
     }
 
@@ -1981,11 +2258,15 @@ mod tests {
         store
             .staging_name("aaaa", Limits::default())
             .expect("records");
-        store.insert_upload(&upload(1, 4096)).expect("writes");
+        store.insert_upload(&upload(1, 4096), None).expect("writes");
         store
             .begin_publish(
                 transfer(1),
                 Digest256::from_bytes([1; 32]),
+                ObjectIdentity {
+                    device: 1,
+                    file_id: 2,
+                },
                 None,
                 None,
                 TimestampMs::new(2000),
@@ -2001,24 +2282,26 @@ mod tests {
     }
 
     #[test]
-    fn open_transfers_are_counted_per_device_and_per_local_actor() {
+    fn open_transfers_are_counted_for_the_authenticated_principal() {
         let mut store = Store::in_memory(environment()).expect("opens");
         store
             .staging_name("aaaa", Limits::default())
             .expect("records");
+        // The device identifier a request carries is metadata. Changing it per request must not
+        // give the same principal another allowance, so the count is per principal.
         let device = DeviceId::new(Uuid::from_bytes([7; 16]));
         let mut first = upload(1, 16);
         first.device_id = Some(device);
         let mut second = upload(2, 16);
-        second.device_id = Some(device);
-        store.insert_upload(&first).expect("writes");
-        store.insert_upload(&second).expect("writes");
-        store.insert_upload(&upload(3, 16)).expect("writes");
-        assert_eq!(
-            store.open_transfers(Some(device), &actor()).expect("reads"),
-            2
-        );
-        assert_eq!(store.open_transfers(None, &actor()).expect("reads"), 1);
+        second.device_id = Some(DeviceId::new(Uuid::from_bytes([8; 16])));
+        let mut third = upload(3, 16);
+        third.device_id = None;
+        store.insert_upload(&first, None).expect("writes");
+        store.insert_upload(&second, None).expect("writes");
+        store.insert_upload(&third, None).expect("writes");
+        assert_eq!(store.open_transfers(&actor()).expect("reads"), 3);
+        let other = ActorId::new("local:502").expect("a valid principal");
+        assert_eq!(store.open_transfers(&other).expect("reads"), 0);
     }
 
     #[test]
@@ -2027,7 +2310,7 @@ mod tests {
         store
             .staging_name("aaaa", Limits::default())
             .expect("records");
-        store.insert_upload(&upload(1, 3)).expect("writes");
+        store.insert_upload(&upload(1, 3), None).expect("writes");
         for index in [2_u64, 0, 1] {
             store
                 .record_chunk(
@@ -2067,7 +2350,7 @@ mod tests {
         store
             .staging_name("aaaa", Limits::default())
             .expect("records");
-        store.insert_upload(&upload(1, 16)).expect("writes");
+        store.insert_upload(&upload(1, 16), None).expect("writes");
         store
             .close_upload(
                 transfer(1),
@@ -2111,7 +2394,7 @@ mod tests {
         store
             .staging_name("aaaa", Limits::default())
             .expect("records");
-        store.insert_upload(&upload(1, 16)).expect("writes");
+        store.insert_upload(&upload(1, 16), None).expect("writes");
         store
             .close_upload(
                 transfer(1),
@@ -2126,7 +2409,24 @@ mod tests {
             row.invalid_reason.as_deref(),
             Some("chunk 3 arrived twice with different digests")
         );
+        // The bytes stay charged until the payload is gone, which is what stops a failed removal
+        // from leaving a file nothing accounts for.
+        assert!(row.cleanup_pending);
+        assert_eq!(row.reserved_byte_len, 16);
+        assert_eq!(
+            store
+                .uploads_needing_cleanup()
+                .expect("reads")
+                .iter()
+                .map(|row| row.transfer_id)
+                .collect::<Vec<_>>(),
+            vec![transfer(1)]
+        );
+        store.release_payload(transfer(1)).expect("writes");
+        let row = store.upload(transfer(1)).expect("reads").expect("exists");
+        assert!(!row.cleanup_pending);
         assert_eq!(row.reserved_byte_len, 0);
+        assert!(store.uploads_needing_cleanup().expect("reads").is_empty());
     }
 
     #[test]
@@ -2134,19 +2434,22 @@ mod tests {
         let mut store = Store::in_memory(environment()).expect("opens");
         let draft_id = DraftId::new(Uuid::from_bytes([3; 16]));
         store
-            .insert_draft(&DraftRow {
-                draft_id,
-                environment_id: environment(),
-                actor_id: actor(),
-                device_id: None,
-                session_id: None,
-                application_instance_id: None,
-                revision: DraftRevision::new(1),
-                state: DraftState::Open,
-                text: "first".to_owned(),
-                created_at_ms: TimestampMs::new(1000),
-                updated_at_ms: TimestampMs::new(1000),
-            })
+            .insert_draft(
+                &DraftRow {
+                    draft_id,
+                    environment_id: environment(),
+                    actor_id: actor(),
+                    device_id: None,
+                    session_id: None,
+                    application_instance_id: None,
+                    revision: DraftRevision::new(1),
+                    state: DraftState::Open,
+                    text: "first".to_owned(),
+                    created_at_ms: TimestampMs::new(1000),
+                    updated_at_ms: TimestampMs::new(1000),
+                },
+                None,
+            )
             .expect("writes");
         assert_eq!(
             store
@@ -2154,7 +2457,8 @@ mod tests {
                     draft_id,
                     DraftRevision::new(9),
                     "second",
-                    TimestampMs::new(2000)
+                    TimestampMs::new(2000),
+                    None,
                 )
                 .expect("reads"),
             None
@@ -2165,7 +2469,8 @@ mod tests {
                     draft_id,
                     DraftRevision::new(1),
                     "second",
-                    TimestampMs::new(2000)
+                    TimestampMs::new(2000),
+                    None,
                 )
                 .expect("writes"),
             Some(DraftRevision::new(2))

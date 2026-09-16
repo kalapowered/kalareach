@@ -638,21 +638,81 @@ fn the_transfer_methods_return_opaque_identifiers_and_never_a_client_path() {
         .finish(begun.transfer_id, &bytes)
         .expect("publishes the attachment");
 
-    // Every result is encoded and searched for the path the client sent. A CBOR text string holds
-    // its bytes literally, so a path anywhere in a result would show up here.
+    // Every one of the seven results is encoded and searched for the path the client sent. A CBOR
+    // text string holds its bytes literally, so a path anywhere in a result would show up here.
+    // The published handle is searched with its original filename removed, because that field is
+    // metadata the protocol returns as it arrived.
     let needle = b"/Users/someone/secret";
+    let mut scrubbed = finished.clone();
+    scrubbed.handle.original_file_name = String::new();
+
+    let download = harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &kr_protocol::transfer::DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(kr_protocol::transfer::DownloadSource::Attachment {
+                    transfer_id: finished.handle.transfer_id,
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect("opens the source");
+    let chunk = harness
+        .service
+        .download_chunk(
+            &harness.actor,
+            &kr_protocol::transfer::DownloadChunkParams {
+                transfer_id: download.transfer_id,
+                index: U64::new(0),
+            },
+        )
+        .expect("reads the chunk");
+
+    // A second upload, cancelled, so the seventh result is a real one.
+    let spare = harness
+        .begin(&bytes, "image/png", path_shaped)
+        .expect("reserves another upload");
+    let cancelled = harness
+        .service
+        .upload_cancel(
+            &harness.actor,
+            &UploadCancelParams {
+                transfer_id: spare.transfer_id,
+            },
+        )
+        .expect("cancels it");
+
     for (what, encoded) in [
         (
             "upload.begin",
             kr_cbor::to_canonical_vec(&begun).expect("encodes"),
         ),
         (
+            "upload.status",
+            kr_cbor::to_canonical_vec(&status).expect("encodes"),
+        ),
+        (
             "upload.chunk",
             kr_cbor::to_canonical_vec(&chunked).expect("encodes"),
         ),
         (
-            "upload.status",
-            kr_cbor::to_canonical_vec(&status).expect("encodes"),
+            "upload.finish",
+            kr_cbor::to_canonical_vec(&scrubbed).expect("encodes"),
+        ),
+        (
+            "upload.cancel",
+            kr_cbor::to_canonical_vec(&cancelled).expect("encodes"),
+        ),
+        (
+            "download.begin",
+            kr_cbor::to_canonical_vec(&download).expect("encodes"),
+        ),
+        (
+            "download.chunk",
+            kr_cbor::to_canonical_vec(&chunk).expect("encodes"),
         ),
     ] {
         assert!(
@@ -660,20 +720,12 @@ fn the_transfer_methods_return_opaque_identifiers_and_never_a_client_path() {
             "{what} carried a client path"
         );
     }
-    // `upload.finish` returns the original filename as metadata, and that is the only place the
-    // client's own text appears. Nothing in the handle is a path this host would open.
-    assert!(
-        !kr_cbor::to_canonical_vec(&finished.handle.transfer_id)
-            .expect("encodes")
-            .windows(needle.len())
-            .any(|window| window == needle),
-        "the handle's identity carried a client path"
-    );
     assert_eq!(
         finished.handle.original_file_name, path_shaped,
-        "the original name is metadata and is returned as it arrived"
+        "the original name is the one field that is metadata, returned as it arrived"
     );
-    let cancelled = harness
+
+    let refusal = harness
         .service
         .upload_cancel(
             &harness.actor,
@@ -682,7 +734,7 @@ fn the_transfer_methods_return_opaque_identifiers_and_never_a_client_path() {
             },
         )
         .expect_err("a published attachment is not cancelled");
-    assert_eq!(cancelled.code(), ErrorCode::ResourceUnavailable);
+    assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
 }
 
 /// KR-REQ-14.01: an upload binds to one environment and session, and identifiers from another
@@ -724,6 +776,7 @@ fn an_upload_binds_to_its_environment_and_session_and_never_aliases_another() {
                 declared_media_type: "application/octet-stream".to_owned(),
                 original_file_name: "notes.bin".to_owned(),
             },
+            None,
         )
         .expect_err("refuses another environment");
     assert_eq!(refusal.code(), ErrorCode::EnvironmentUnavailable);
@@ -748,16 +801,25 @@ fn an_upload_binds_to_its_environment_and_session_and_never_aliases_another() {
     );
 }
 
-/// KR-REQ-14.07: an upload belongs to the principal that began it.
+/// KR-REQ-14.07: an upload belongs to the principal that began it, and another principal's
+/// transfer is refused exactly as one that does not exist is.
 #[test]
-fn another_principal_cannot_continue_an_upload() {
+fn another_principal_cannot_continue_or_read_an_upload() {
     let harness = Harness::create();
     let bytes = pattern(24);
     let begun = harness
         .begin(&bytes, "application/octet-stream", "notes.bin")
         .expect("reserves the upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends every chunk");
+    harness
+        .finish(begun.transfer_id, &bytes)
+        .expect("publishes the attachment");
     let other = kr_protocol::ids::ActorId::new("local:someone-else").expect("a valid principal");
-    let refusal = harness
+    let absent = TransferId::new(Uuid::from_bytes([222; 16]));
+
+    let refused = harness
         .service
         .upload_status(
             &other,
@@ -766,7 +828,39 @@ fn another_principal_cannot_continue_an_upload() {
             },
         )
         .expect_err("refuses another principal");
-    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    let unknown = harness
+        .service
+        .upload_status(
+            &other,
+            &UploadStatusParams {
+                transfer_id: absent,
+            },
+        )
+        .expect_err("refuses an identifier that names nothing");
+    assert_eq!(
+        refused.code(),
+        unknown.code(),
+        "the refusal is never a signal that the identifier exists"
+    );
+    assert_eq!(refused.to_string(), unknown_shape(begun.transfer_id));
+
+    // The published handle is not reachable by another principal either.
+    assert_eq!(
+        harness
+            .service
+            .attachment_handle(&other, begun.transfer_id)
+            .expect_err("refuses another principal")
+            .code(),
+        unknown.code()
+    );
+    harness
+        .service
+        .attachment_handle(&harness.actor, begun.transfer_id)
+        .expect("its own principal reaches it");
+}
+
+fn unknown_shape(transfer_id: TransferId) -> String {
+    format!("no transfer {transfer_id}")
 }
 
 /// KR-REQ-14.11: an unfinished upload expires after twenty-four hours and a completed but unused
@@ -816,7 +910,7 @@ fn expiry_runs_at_twenty_four_hours_seven_days_and_the_session_retention() {
     assert!(
         harness
             .service
-            .attachment_handle(unused.transfer_id)
+            .attachment_handle(&harness.actor, unused.transfer_id)
             .is_err(),
         "an expired attachment has no handle"
     );
@@ -869,6 +963,7 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
                 application_instance_id: Nullable::null(),
                 text: "look at this".to_owned(),
             },
+            None,
         )
         .expect("creates the draft")
         .draft;
@@ -882,6 +977,7 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle),
             },
+            None,
         )
         .expect("binds the attachment");
     harness
@@ -899,7 +995,7 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
     );
     harness
         .service
-        .attachment_handle(handle.transfer_id)
+        .attachment_handle(&harness.actor, handle.transfer_id)
         .expect("the handle is still there");
 
     let sweep = harness
@@ -909,15 +1005,145 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
     assert_eq!(sweep.expired_attachments, 1);
 }
 
-/// KR-REQ-24.09: a daemon that dies mid-publish resolves the transfer by identifier, and the
-/// completed file's identity survives; what a worker's death invalidates is the insertion.
+/// KR-REQ-14.11: a session whose retention ends *before* the seven-day window takes what was
+/// submitted to it with it.
+#[test]
+fn a_session_retention_that_ends_early_expires_what_was_submitted_to_it() {
+    struct Retains(bool);
+    impl kr_transfer::SessionRetention for Retains {
+        fn retains(&self, _session_id: SessionId) -> bool {
+            self.0
+        }
+    }
+
+    let harness = Harness::create();
+    let session_id = SessionId::new(Uuid::from_bytes([12; 16]));
+    let bytes = pattern(32);
+    let begun = harness
+        .begin_for(
+            &bytes,
+            "application/octet-stream",
+            "submitted.bin",
+            Nullable::some(session_id),
+        )
+        .expect("reserves the upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends every chunk");
+    let handle = harness
+        .finish(begun.transfer_id, &bytes)
+        .expect("publishes the attachment")
+        .handle;
+    assert_eq!(
+        handle.expires_at_ms.get(),
+        support::START_MS + UNUSED_ATTACHMENT_LIFETIME.get(),
+        "an unsubmitted attachment carries the seven-day window"
+    );
+    let draft = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &kr_protocol::transfer::DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session_id),
+                application_instance_id: Nullable::null(),
+                text: "look at this".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &kr_protocol::transfer::AgentDraftAddAttachmentParams {
+                draft_id: draft.draft_id,
+                expected_revision: draft.revision,
+                transfer_id: handle.transfer_id,
+                contribution: contribution(&handle),
+            },
+            None,
+        )
+        .expect("binds the attachment");
+    harness
+        .service
+        .mark_submitted(&harness.actor, draft.draft_id)
+        .expect("records the submission");
+
+    // One hour later, long before seven days, the session's retention ends.
+    harness.clock.advance(60 * 60 * 1000);
+    let sweep = harness
+        .service
+        .sweep(&Retains(false))
+        .expect("runs a sweep");
+    assert_eq!(
+        sweep.expired_attachments, 1,
+        "a submitted attachment follows its session, not its own deadline"
+    );
+    assert!(
+        harness
+            .service
+            .attachment_handle(&harness.actor, handle.transfer_id)
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_dir(harness.service.staging().complete().display_path())
+            .expect("reads the completed area")
+            .count(),
+        0
+    );
+    assert_eq!(harness.service.staged_byte_len().expect("reads"), 0);
+}
+
+/// KR-REQ-14.10: a staging directory replaced at the same name is refused rather than used.
+#[test]
+fn a_replaced_staging_directory_is_refused() {
+    let host = kr_ipc::testing::TempHost::create();
+    let staging = {
+        let clock = Arc::new(ManualClock::new(support::START_MS));
+        let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
+            .expect("a transfer service");
+        service
+            .staging()
+            .complete()
+            .display_path()
+            .parent()
+            .expect("a staging directory")
+            .to_path_buf()
+    };
+    // Reopening the same environment finds the same object and is accepted.
+    {
+        let clock = Arc::new(ManualClock::new(support::START_MS));
+        TransferService::with_clock(&host.environment(), clock as Arc<_>)
+            .expect("the recorded staging directory is accepted");
+    }
+    // Something replaces the staging directory with a different one under the same name.
+    std::fs::rename(&staging, staging.with_extension("moved")).expect("moves it aside");
+    std::fs::create_dir(&staging).expect("creates a different directory");
+    let clock = Arc::new(ManualClock::new(support::START_MS));
+    let refusal = TransferService::with_clock(&host.environment(), clock as Arc<_>)
+        .expect_err("refuses a staging directory that is not the recorded object");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+}
+
+/// KR-REQ-24.09, KR-REQ-14.12: a daemon that dies mid-publish resolves the transfer by
+/// identifier, and the completed file's identity and bytes survive.
+///
+/// The daemon is ended the way its process exiting would end it: the service is dropped, its
+/// journal connection with it, and a replacement opens the same environment. The interrupted
+/// publish is written through the journal itself, because the service that would have finished the
+/// move is gone.
 #[test]
 fn a_restart_mid_publish_resolves_by_identifier_without_losing_the_completed_file() {
     let host = kr_ipc::testing::TempHost::create();
     let bytes = pattern(64);
     let actor = kr_protocol::ids::ActorId::new("local:transfer-test").expect("a valid principal");
-    let transfer_id: TransferId;
     let expected = digest(&bytes);
+    let transfer_id: TransferId;
+    let payload_identity: kr_transfer::ObjectIdentity;
+    let staged_path: std::path::PathBuf;
     {
         let clock = Arc::new(ManualClock::new(support::START_MS));
         let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
@@ -934,6 +1160,7 @@ fn a_restart_mid_publish_resolves_by_identifier_without_losing_the_completed_fil
                     declared_media_type: "application/octet-stream".to_owned(),
                     original_file_name: "notes.bin".to_owned(),
                 },
+                None,
             )
             .expect("reserves the upload");
         transfer_id = begun.transfer_id;
@@ -948,28 +1175,19 @@ fn a_restart_mid_publish_resolves_by_identifier_without_losing_the_completed_fil
                 },
             )
             .expect("accepts the chunk");
+        staged_path = std::fs::read_dir(service.staging().incomplete().display_path())
+            .expect("reads the incomplete area")
+            .next()
+            .expect("one staged payload")
+            .expect("a directory entry")
+            .path();
+        payload_identity = identity_of(&staged_path);
+        // The daemon dies here. Nothing else runs in this process for this environment.
     }
-    // The publish is interrupted between its two commits: the verification is durable and the
-    // payload is still in the incomplete area. This is what a killed daemon leaves behind, written
-    // through the journal itself because the service that would have finished the move is gone.
-    {
-        let mut store = kr_transfer::Store::open(
-            kr_transfer::StagingArea::store_path(&host.environment()),
-            host.environment_id(),
-        )
-        .expect("opens the journal");
-        store
-            .begin_publish(
-                transfer_id,
-                expected,
-                None,
-                None,
-                kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
-            )
-            .expect("records the verification");
-    }
+    // The publish is interrupted between its two commits: the verification is durable, carrying
+    // the identity of the object it verified, and the payload is still under its incomplete name.
+    interrupt_publish(&host, transfer_id, expected, payload_identity);
 
-    // A replacement service resolves it from the record, by identifier.
     let clock = Arc::new(ManualClock::new(support::START_MS + 5_000));
     let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
         .expect("a replacement service");
@@ -980,18 +1198,35 @@ fn a_restart_mid_publish_resolves_by_identifier_without_losing_the_completed_fil
     let recovery = service.recover().expect("recovers");
     assert_eq!(recovery.completed_publications, 1);
     assert_eq!(recovery.unresolved_publications, 0);
+
     let handle = service
-        .attachment_handle(transfer_id)
+        .attachment_handle(&actor, transfer_id)
         .expect("the completed file has a handle");
     assert_eq!(
         handle.content_digest, expected,
         "the completed file's identity is unchanged"
     );
+    let published = std::fs::read_dir(service.staging().complete().display_path())
+        .expect("reads the completed area")
+        .next()
+        .expect("one published payload")
+        .expect("a directory entry")
+        .path();
     assert_eq!(
-        std::fs::read_dir(service.staging().complete().display_path())
-            .expect("reads the completed area")
+        std::fs::read(&published).expect("reads the payload"),
+        bytes,
+        "the bytes are the ones that were verified"
+    );
+    assert_eq!(
+        identity_of(&published),
+        payload_identity,
+        "and the object is the one that was verified, not a replacement of the same length"
+    );
+    assert_eq!(
+        std::fs::read_dir(service.staging().incomplete().display_path())
+            .expect("reads the incomplete area")
             .count(),
-        1
+        0
     );
     // A second recovery pass changes nothing: the publish is already resolved.
     assert_eq!(
@@ -1000,10 +1235,10 @@ fn a_restart_mid_publish_resolves_by_identifier_without_losing_the_completed_fil
     );
 }
 
-/// KR-REQ-24.09: a verified publication whose payload is gone is invalidated rather than left as a
-/// handle that names nothing.
+/// KR-REQ-24.09: a verified publication whose payload was replaced is refused rather than
+/// published, and one whose payload is gone is invalidated.
 #[test]
-fn a_publication_whose_payload_is_gone_is_invalidated() {
+fn a_replaced_or_missing_payload_is_never_published() {
     let host = kr_ipc::testing::TempHost::create();
     let bytes = pattern(64);
     let actor = kr_protocol::ids::ActorId::new("local:transfer-test").expect("a valid principal");
@@ -1023,6 +1258,7 @@ fn a_publication_whose_payload_is_gone_is_invalidated() {
                 declared_media_type: "application/octet-stream".to_owned(),
                 original_file_name: "notes.bin".to_owned(),
             },
+            None,
         )
         .expect("reserves the upload");
     let (chunk, payload) = chunk_of(&bytes, 0);
@@ -1036,30 +1272,20 @@ fn a_publication_whose_payload_is_gone_is_invalidated() {
             },
         )
         .expect("accepts the chunk");
-    {
-        let mut store = kr_transfer::Store::open(
-            kr_transfer::StagingArea::store_path(&host.environment()),
-            host.environment_id(),
-        )
-        .expect("opens the journal");
-        store
-            .begin_publish(
-                begun.transfer_id,
-                expected,
-                None,
-                None,
-                kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
-            )
-            .expect("records the verification");
-    }
     let staged = std::fs::read_dir(service.staging().incomplete().display_path())
         .expect("reads the incomplete area")
         .next()
         .expect("one staged payload")
         .expect("a directory entry")
         .path();
-    std::fs::remove_file(&staged).expect("removes the payload");
+    let verified = identity_of(&staged);
+    interrupt_publish(&host, begun.transfer_id, expected, verified);
 
+    // Another writer replaces the payload with a file of the same length. Recovery finds an object
+    // that is not the one that was verified, so nothing is published.
+    std::fs::remove_file(&staged).expect("removes the payload");
+    std::fs::write(&staged, vec![0_u8; bytes.len()]).expect("writes a replacement");
+    assert_ne!(identity_of(&staged), verified);
     let recovery = service.recover().expect("recovers");
     assert_eq!(recovery.completed_publications, 0);
     assert_eq!(recovery.unresolved_publications, 1);
@@ -1073,6 +1299,128 @@ fn a_publication_whose_payload_is_gone_is_invalidated() {
         .expect("reads the status");
     assert_eq!(status.state, UploadState::Invalidated);
     assert!(status.handle.as_ref().is_none());
+    assert_eq!(
+        std::fs::read_dir(service.staging().complete().display_path())
+            .expect("reads the completed area")
+            .count(),
+        0,
+        "nothing reached the completed area"
+    );
+    // The invalidated upload's payload is removed and its bytes released.
+    assert_eq!(service.staged_byte_len().expect("reads the total"), 0);
+}
+
+/// KR-REQ-24.09: a payload a closed upload left behind is removed by the next recovery pass, and
+/// its bytes stay charged until it is.
+#[test]
+fn a_payload_a_closed_upload_left_behind_is_removed_by_recovery() {
+    let harness = Harness::create();
+    let bytes = pattern(64);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "abandoned.bin")
+        .expect("reserves the upload");
+    harness
+        .send(begun.transfer_id, &bytes, 0)
+        .expect("sends the chunk");
+    let staged = std::fs::read_dir(harness.service.staging().incomplete().display_path())
+        .expect("reads the incomplete area")
+        .next()
+        .expect("one staged payload")
+        .expect("a directory entry")
+        .path();
+
+    // The row is closed through the journal, which is the state a daemon that died between the
+    // commit and the unlink leaves behind.
+    {
+        let mut store = kr_transfer::Store::open(
+            kr_transfer::StagingArea::store_path(&harness.host.environment()),
+            harness.host.environment_id(),
+        )
+        .expect("opens the journal");
+        store
+            .close_upload(
+                begun.transfer_id,
+                UploadState::Cancelled,
+                None,
+                kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+            )
+            .expect("closes the row");
+    }
+    assert!(staged.exists(), "the payload is still there");
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        bytes.len() as u64,
+        "and its bytes are still charged"
+    );
+
+    let recovery = harness.service.recover().expect("recovers");
+    assert_eq!(recovery.removed_payloads, 1);
+    assert_eq!(recovery.unremovable_payloads, 0);
+    assert!(!staged.exists(), "the payload is gone");
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        0,
+        "and its bytes are released"
+    );
+    assert_eq!(
+        harness
+            .service
+            .recover()
+            .expect("recovers again")
+            .removed_payloads,
+        0
+    );
+}
+
+/// Records an interrupted publication in the journal, exactly as the service would have.
+fn interrupt_publish(
+    host: &kr_ipc::testing::TempHost,
+    transfer_id: TransferId,
+    digest: Digest256,
+    payload_identity: kr_transfer::ObjectIdentity,
+) {
+    let mut store = kr_transfer::Store::open(
+        kr_transfer::StagingArea::store_path(&host.environment()),
+        host.environment_id(),
+    )
+    .expect("opens the journal");
+    store
+        .begin_publish(
+            transfer_id,
+            digest,
+            payload_identity,
+            None,
+            None,
+            kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+        )
+        .expect("records the verification");
+}
+
+/// Returns a file's stable filesystem identity.
+fn identity_of(path: &std::path::Path) -> kr_transfer::ObjectIdentity {
+    let metadata = std::fs::metadata(path).expect("the file exists");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        kr_transfer::ObjectIdentity {
+            device: metadata.dev(),
+            file_id: metadata.ino(),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        kr_transfer::ObjectIdentity {
+            device: u64::from(
+                metadata
+                    .volume_serial_number()
+                    .expect("an identity from an opened file"),
+            ),
+            file_id: metadata
+                .file_index()
+                .expect("an identity from an opened file"),
+        }
+    }
 }
 
 fn contribution(

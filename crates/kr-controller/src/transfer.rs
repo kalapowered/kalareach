@@ -35,7 +35,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::ids::{ActorId, RequestId, SessionId};
 use kr_protocol::method::{Method, MethodGroup};
-use kr_transfer::service::{RetainedOutcome, SessionRetention};
+use kr_transfer::service::{Action, RetainedOutcome, SessionRetention};
 use kr_transfer::{Sweep, TransferService};
 
 use crate::error::{ControllerError, Result};
@@ -315,26 +315,53 @@ impl TransferModule {
                     }
                 };
             }
-            let outcome = match method {
-                Method::UploadBegin => encode(&service.upload_begin(&actor, &typed(&params)?)?),
-                Method::UploadChunk => encode(&service.upload_chunk(&actor, &typed(&params)?)?),
-                Method::UploadFinish => encode(&service.upload_finish(&actor, &typed(&params)?)?),
-                Method::UploadCancel => encode(&service.upload_cancel(&actor, &typed(&params)?)?),
-                Method::DraftCreate => encode(&service.draft_create(&actor, &typed(&params)?)?),
-                Method::DraftUpdate => encode(&service.draft_update(&actor, &typed(&params)?)?),
-                Method::AgentDraftAddAttachment => {
-                    encode(&service.draft_add_attachment(&actor, &typed(&params)?)?)
-                }
-                _ => Err(ProtocolError::new(
-                    ErrorCode::InvalidArgument,
-                    format!(
-                        "{} is not a transfer mutation this daemon serves",
-                        method.as_str()
-                    ),
-                )),
+            // The action this mutation is performed under. The three methods whose idempotency is
+            // their own identifier commit it beside the state they change, which is what makes a
+            // crash between the mutation and its record impossible.
+            let performed = Action {
+                actor_id: actor.clone(),
+                action_id,
+                method: name.to_owned(),
+                payload_digest: digest,
             };
+            // Every arm runs inside a closure, so a refusal the service decided reaches the
+            // retention below instead of returning from the task. An action whose failure was not
+            // retained could be performed again under the same identifier and succeed.
+            let outcome = (|| -> Answer<ParamsValue> {
+                match method {
+                    Method::UploadBegin => {
+                        encode(&service.upload_begin(&actor, &typed(&params)?, Some(&performed))?)
+                    }
+                    Method::UploadChunk => encode(&service.upload_chunk(&actor, &typed(&params)?)?),
+                    Method::UploadFinish => {
+                        encode(&service.upload_finish(&actor, &typed(&params)?)?)
+                    }
+                    Method::UploadCancel => {
+                        encode(&service.upload_cancel(&actor, &typed(&params)?)?)
+                    }
+                    Method::DraftCreate => {
+                        encode(&service.draft_create(&actor, &typed(&params)?, Some(&performed))?)
+                    }
+                    Method::DraftUpdate => {
+                        encode(&service.draft_update(&actor, &typed(&params)?, Some(&performed))?)
+                    }
+                    Method::AgentDraftAddAttachment => encode(&service.draft_add_attachment(
+                        &actor,
+                        &typed(&params)?,
+                        Some(&performed),
+                    )?),
+                    _ => Err(ProtocolError::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "{} is not a transfer mutation this daemon serves",
+                            method.as_str()
+                        ),
+                    )),
+                }
+            })();
             // The outcome is retained before it is returned, so the reply and the record cannot
-            // disagree about what happened.
+            // disagree about what happened. The three methods above recorded their own inside
+            // their transaction; this insert leaves an existing row alone and covers the rest.
             let record = match &outcome {
                 Ok(value) => {
                     RetainedOutcome::Ok(kr_cbor::to_canonical_vec(value).map_err(|error| {

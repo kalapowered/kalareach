@@ -61,7 +61,7 @@ impl TransferService {
             TransferError::invalid("a download names a source, or the transfer it resumes")
         })?;
         let now = self.clock.now_ms();
-        self.check_transfer_ceiling(actor, params.device_id.0)?;
+        self.check_transfer_ceiling(actor)?;
         match source {
             DownloadSource::Attachment { transfer_id } => {
                 self.open_attachment_source(actor, params, *transfer_id, now)
@@ -253,14 +253,10 @@ impl TransferService {
         Ok(row)
     }
 
-    fn check_transfer_ceiling(
-        &self,
-        actor: &ActorId,
-        device_id: Option<kr_protocol::ids::DeviceId>,
-    ) -> Result<()> {
+    fn check_transfer_ceiling(&self, actor: &ActorId) -> Result<()> {
         let store = self.locked()?;
         let limits = store.limits()?;
-        let open = store.open_transfers(device_id, actor)?;
+        let open = store.open_transfers(actor)?;
         if open >= limits.max_concurrent_transfers {
             return Err(TransferError::Concurrency {
                 detail: format!(
@@ -673,7 +669,7 @@ impl<'destination> DownloadWriter<'destination> {
         placement: &DownloadPlacement,
     ) -> Result<Self> {
         let final_name = RelativeName::parse(&placement.destination_name)?;
-        if destination.exists(&final_name) && !placement.allow_overwrite {
+        if destination.occupied(&final_name)? && !placement.allow_overwrite {
             return Err(TransferError::PermissionDenied {
                 detail: format!(
                     "{} already exists in this destination, and overwriting it is an action the \
@@ -792,7 +788,7 @@ impl<'destination> DownloadWriter<'destination> {
         }
         // Rechecked here, not only at the open: a destination that appeared while the download ran
         // is still the user's to decide about.
-        let exists = self.destination.exists(&self.final_name);
+        let exists = self.destination.occupied(&self.final_name)?;
         if exists && !self.placement.allow_overwrite {
             return Err(TransferError::PermissionDenied {
                 detail: format!(

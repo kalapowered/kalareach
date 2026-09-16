@@ -12,153 +12,371 @@
     "reserved_name": "a component names a device rather than a file",
     "too_long": "the name or a component exceeds its bound",
     "link": "a component is a symbolic link or a reparse point, and resolution follows neither",
-    "wrong_kind": "the opened object is not the kind the policy permits"
+    "wrong_kind": "the opened object is not the kind the policy permits",
+    "not_found": "the name does not exist beneath the authorised directory"
   },
   "names": [
-    { "name": "notes.txt", "refusal": "ok" },
-    { "name": "src/notes.txt", "refusal": "ok" },
-    { "name": "console.log", "refusal": "ok" },
-    { "name": "nullable.json", "refusal": "ok" },
-    { "name": "\u00e9t\u00e9.txt", "refusal": "ok" },
-    { "name": "", "refusal": "empty" },
-    { "name": "/etc/passwd", "refusal": "not_relative" },
-    { "name": "\\\\server\\share\\file", "refusal": "not_relative" },
-    { "name": "C:/Windows/System32/config", "refusal": "not_relative" },
-    { "name": "C:notes.txt", "refusal": "not_relative" },
-    { "name": "notes.txt:hidden", "refusal": "not_relative" },
-    { "name": "..", "refusal": "parent_segment" },
-    { "name": "../outside", "refusal": "parent_segment" },
-    { "name": "src/../../outside", "refusal": "parent_segment" },
-    { "name": "src/notes.txt/..", "refusal": "parent_segment" },
-    { "name": ".", "refusal": "current_segment" },
-    { "name": "./notes.txt", "refusal": "current_segment" },
-    { "name": "src/./notes.txt", "refusal": "current_segment" },
-    { "name": "src//notes.txt", "refusal": "empty_component" },
-    { "name": "src/", "refusal": "empty_component" },
-    { "name": "src\\notes.txt", "refusal": "forbidden_byte" },
-    { "name": "notes\u0000.txt", "refusal": "forbidden_byte" },
-    { "name": "notes\n.txt", "refusal": "forbidden_byte" },
-    { "name": "notes.", "refusal": "forbidden_byte" },
-    { "name": "notes ", "refusal": "forbidden_byte" },
-    { "name": "src./notes.txt", "refusal": "forbidden_byte" },
-    { "name": "NUL", "refusal": "reserved_name" },
-    { "name": "nul", "refusal": "reserved_name" },
-    { "name": "CON.txt", "refusal": "reserved_name" },
-    { "name": "aux.png", "refusal": "reserved_name" },
-    { "name": "com1", "refusal": "reserved_name" },
-    { "name": "LPT9.dat", "refusal": "reserved_name" },
-    { "name": "prn", "refusal": "reserved_name" },
-    { "name": "src/NUL", "refusal": "reserved_name" }
+    {
+      "name": "notes.txt",
+      "refusal": "ok"
+    },
+    {
+      "name": "src/notes.txt",
+      "refusal": "ok"
+    },
+    {
+      "name": "console.log",
+      "refusal": "ok"
+    },
+    {
+      "name": "nullable.json",
+      "refusal": "ok"
+    },
+    {
+      "name": "été.txt",
+      "refusal": "ok"
+    },
+    {
+      "name": "",
+      "refusal": "empty"
+    },
+    {
+      "name": "/etc/passwd",
+      "refusal": "not_relative"
+    },
+    {
+      "name": "\\\\server\\share\\file",
+      "refusal": "not_relative"
+    },
+    {
+      "name": "C:/Windows/System32/config",
+      "refusal": "not_relative"
+    },
+    {
+      "name": "C:notes.txt",
+      "refusal": "not_relative"
+    },
+    {
+      "name": "notes.txt:hidden",
+      "refusal": "not_relative"
+    },
+    {
+      "name": "..",
+      "refusal": "parent_segment"
+    },
+    {
+      "name": "../outside",
+      "refusal": "parent_segment"
+    },
+    {
+      "name": "src/../../outside",
+      "refusal": "parent_segment"
+    },
+    {
+      "name": "src/notes.txt/..",
+      "refusal": "parent_segment"
+    },
+    {
+      "name": ".",
+      "refusal": "current_segment"
+    },
+    {
+      "name": "./notes.txt",
+      "refusal": "current_segment"
+    },
+    {
+      "name": "src/./notes.txt",
+      "refusal": "current_segment"
+    },
+    {
+      "name": "src//notes.txt",
+      "refusal": "empty_component"
+    },
+    {
+      "name": "src/",
+      "refusal": "empty_component"
+    },
+    {
+      "name": "src\\notes.txt",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "notes\u0000.txt",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "notes\n.txt",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "notes.",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "notes ",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "src./notes.txt",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "NUL",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "nul",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "CON.txt",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "aux.png",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "com1",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "LPT9.dat",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "prn",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "src/NUL",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "report?.txt",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "report*.txt",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "say \"hello\".txt",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "a|b.txt",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "a<b.txt",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "a>b.txt",
+      "refusal": "forbidden_byte"
+    },
+    {
+      "name": "NUL .txt",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": " nul.txt",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "COM¹",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "LPT³.dat",
+      "refusal": "reserved_name"
+    },
+    {
+      "name": "src/ CON .log",
+      "refusal": "reserved_name"
+    }
   ],
   "tree": [
-    { "kind": "directory", "path": "src" },
-    { "kind": "file", "path": "notes.txt", "contents": "inside the authorised tree" },
-    { "kind": "file", "path": "src/notes.txt", "contents": "also inside" },
-    { "kind": "directory", "path": "src/deeper" },
-    { "kind": "file", "path": "src/deeper/notes.txt", "contents": "deeper still" },
+    {
+      "kind": "directory",
+      "path": "src"
+    },
+    {
+      "kind": "file",
+      "path": "notes.txt",
+      "contents": "inside the authorised tree"
+    },
+    {
+      "kind": "file",
+      "path": "src/notes.txt",
+      "contents": "also inside"
+    },
+    {
+      "kind": "directory",
+      "path": "src/deeper"
+    },
+    {
+      "kind": "file",
+      "path": "src/deeper/notes.txt",
+      "contents": "deeper still"
+    },
     {
       "kind": "symlink",
       "path": "escaping-file",
       "target": "../outside/secret.txt",
-      "platforms": ["unix"]
+      "platforms": [
+        "unix"
+      ]
     },
     {
       "kind": "symlink",
       "path": "escaping-directory",
       "target": "../outside",
-      "platforms": ["unix"]
+      "platforms": [
+        "unix"
+      ]
     },
     {
       "kind": "symlink",
       "path": "internal-alias",
       "target": "notes.txt",
-      "platforms": ["unix"]
+      "platforms": [
+        "unix"
+      ]
     },
     {
       "kind": "symlink",
       "path": "src/deeper-alias",
       "target": "deeper",
-      "platforms": ["unix"]
+      "platforms": [
+        "unix"
+      ]
     },
     {
       "kind": "fifo",
       "path": "waiting",
-      "platforms": ["unix"]
+      "platforms": [
+        "unix"
+      ]
     },
     {
       "kind": "hard_link",
       "path": "second-name",
       "target": "notes.txt",
-      "platforms": ["unix"]
+      "platforms": [
+        "unix"
+      ]
     },
     {
       "kind": "reparse_point",
       "path": "junction",
       "target": "../outside",
-      "platforms": ["windows"]
+      "platforms": [
+        "windows"
+      ]
     },
     {
       "kind": "reparse_point_file",
       "path": "escaping-reparse-file",
       "target": "../outside/secret.txt",
-      "platforms": ["windows"]
+      "platforms": [
+        "windows"
+      ]
     }
   ],
   "outside": [
-    { "kind": "file", "path": "secret.txt", "contents": "outside the authorised tree" }
+    {
+      "kind": "file",
+      "path": "secret.txt",
+      "contents": "outside the authorised tree"
+    }
   ],
   "lookups": [
-    { "name": "notes.txt", "refusal": "ok" },
-    { "name": "src/notes.txt", "refusal": "ok" },
-    { "name": "src/deeper/notes.txt", "refusal": "ok" },
-    { "name": "src", "refusal": "wrong_kind" },
+    {
+      "name": "notes.txt",
+      "refusal": "ok"
+    },
+    {
+      "name": "src/notes.txt",
+      "refusal": "ok"
+    },
+    {
+      "name": "src/deeper/notes.txt",
+      "refusal": "ok"
+    },
+    {
+      "name": "src",
+      "refusal": "wrong_kind"
+    },
     {
       "name": "escaping-file",
       "refusal": "link",
-      "platforms": ["unix"],
+      "platforms": [
+        "unix"
+      ],
       "note": "a symbolic link out of the tree is refused rather than followed"
     },
     {
       "name": "escaping-directory/secret.txt",
       "refusal": "link",
-      "platforms": ["unix"],
+      "platforms": [
+        "unix"
+      ],
       "note": "an intermediate component that is a link is refused during the walk"
     },
     {
       "name": "internal-alias",
       "refusal": "link",
-      "platforms": ["unix"],
+      "platforms": [
+        "unix"
+      ],
       "note": "the policy follows no link, inside the tree or out of it"
     },
     {
       "name": "src/deeper-alias/notes.txt",
       "refusal": "link",
-      "platforms": ["unix"],
+      "platforms": [
+        "unix"
+      ],
       "note": "an internal directory link is refused too"
     },
     {
       "name": "waiting",
       "refusal": "wrong_kind",
-      "platforms": ["unix"],
+      "platforms": [
+        "unix"
+      ],
       "note": "a named pipe is not a regular file, and the open does not wait for a writer"
     },
     {
       "name": "second-name",
       "refusal": "ok",
-      "platforms": ["unix"],
+      "platforms": [
+        "unix"
+      ],
       "note": "a hard link is a name in the directory, not a path that leaves it; a file the host only reads may carry more than one name"
     },
     {
       "name": "junction/secret.txt",
       "refusal": "link",
-      "platforms": ["windows"],
+      "platforms": [
+        "windows"
+      ],
       "note": "a directory junction is a reparse point and is refused during the walk"
     },
     {
       "name": "escaping-reparse-file",
       "refusal": "link",
-      "platforms": ["windows"],
+      "platforms": [
+        "windows"
+      ],
       "note": "a file reparse point out of the tree is refused rather than followed"
+    },
+    {
+      "name": "absent.txt",
+      "refusal": "not_found",
+      "note": "a name that is not there is refused the same way an unauthorised one is"
     }
   ]
 }

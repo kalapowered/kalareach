@@ -157,9 +157,19 @@ impl TransferError {
             // Section 23 has no distinct code for an identifier that names nothing, and inventing
             // one would tell a caller whether an identifier it guessed exists.
             Self::UnknownTransfer { .. } | Self::UnknownDraft { .. } => ErrorCode::InvalidArgument,
-            Self::UnknownScope { .. } | Self::PermissionDenied { .. } | Self::Escape(_) => {
+            Self::UnknownScope { .. } | Self::PermissionDenied { .. } => {
                 ErrorCode::PermissionDenied
             }
+            // A refusal about a name or an object is an authority answer; a failure the storage
+            // decided is a storage answer. Reporting both the same way would tell a caller to
+            // change its request when what it should do is wait, or the other way round.
+            Self::Escape(escape) => match escape {
+                crate::authority::Escape::Unopenable { .. } => ErrorCode::StorageUnavailable,
+                crate::authority::Escape::WrongEnvironment { .. } => {
+                    ErrorCode::EnvironmentUnavailable
+                }
+                _ => ErrorCode::PermissionDenied,
+            },
             Self::WrongState { .. } => ErrorCode::ResourceUnavailable,
             Self::Integrity { .. } => ErrorCode::AttachmentIntegrity,
             Self::SourceChanged { .. } => ErrorCode::SourceChanged,
@@ -217,8 +227,46 @@ mod tests {
     }
 
     #[test]
-    fn an_escape_is_a_permission_failure_rather_than_a_bad_argument() {
-        let error = TransferError::Escape(crate::authority::Escape::ParentSegment);
-        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    fn a_name_refusal_is_a_permission_failure_and_a_storage_failure_is_not() {
+        use crate::authority::Escape;
+
+        for escape in [
+            Escape::ParentSegment,
+            Escape::Empty,
+            Escape::NotFound {
+                component: "absent".to_owned(),
+            },
+            Escape::Link {
+                component: "alias".to_owned(),
+            },
+            Escape::WrongKind {
+                detail: "a directory".to_owned(),
+            },
+            Escape::IdentityChanged {
+                detail: "a different object".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                TransferError::Escape(escape.clone()).code(),
+                ErrorCode::PermissionDenied,
+                "{escape:?}"
+            );
+        }
+        assert_eq!(
+            TransferError::Escape(Escape::Unopenable {
+                component: "payload".to_owned(),
+                detail: "no space left on device".to_owned(),
+            })
+            .code(),
+            ErrorCode::StorageUnavailable
+        );
+        assert_eq!(
+            TransferError::Escape(Escape::WrongEnvironment {
+                holder: "a".to_owned(),
+                named: "b".to_owned(),
+            })
+            .code(),
+            ErrorCode::EnvironmentUnavailable
+        );
     }
 }

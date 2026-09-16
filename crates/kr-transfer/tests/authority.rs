@@ -84,6 +84,7 @@ fn refusal_of(outcome: &Result<(), Escape>) -> &'static str {
         Err(Escape::ReservedName { .. }) => "reserved_name",
         Err(Escape::TooLong { .. }) => "too_long",
         Err(Escape::Link { .. }) => "link",
+        Err(Escape::NotFound { .. }) => "not_found",
         Err(Escape::Unopenable { .. }) => "unopenable",
         Err(Escape::WrongKind { .. }) => "wrong_kind",
         Err(Escape::IdentityChanged { .. }) => "identity_changed",
@@ -126,30 +127,32 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
     for entry in &fixture.outside {
         build(&outside, entry).expect("builds the tree outside the authority");
     }
-    let mut unexercised = Vec::new();
+    // Every object the fixture names for *this* platform has to exist, or the run has not
+    // exercised the policy and must not pass as though it had. A case for the other platform is
+    // skipped by name, which is a stated exclusion rather than a silent one.
+    let mut missing = Vec::new();
     for entry in &fixture.tree {
         if !applies(&entry.platforms) {
             continue;
         }
         if let Err(reason) = build(&inside, entry) {
-            // An object this platform cannot create leaves its lookups unexercised. Saying so is
-            // the honest result; claiming the policy held for something that was never there is
-            // not.
-            unexercised.push(format!("{}: {reason}", entry.path));
+            missing.push(format!("{} ({}): {reason}", entry.path, entry.kind));
         }
     }
+    assert!(
+        missing.is_empty(),
+        "these objects the fixture requires on {} could not be created, so the policy was not \
+         exercised: {missing:?}",
+        platform()
+    );
 
     let authority =
         AuthorisedDirectory::open_root(environment(), &inside).expect("opens the authority");
-    let mut exercised = 0_usize;
+    let mut exercised = Vec::new();
+    let mut skipped = Vec::new();
     for case in &fixture.lookups {
         if !applies(&case.platforms) {
-            continue;
-        }
-        if unexercised.iter().any(|missing| {
-            case.name
-                .starts_with(missing.split(':').next().unwrap_or(""))
-        }) {
+            skipped.push(case.name.clone());
             continue;
         }
         let outcome = RelativeName::parse(&case.name).and_then(|name| {
@@ -163,14 +166,21 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
             "{:?} was {outcome:?}",
             case.name
         );
-        exercised += 1;
+        exercised.push(case.name.clone());
     }
-    assert!(exercised > 0, "the fixture exercised at least one lookup");
-    if !unexercised.is_empty() {
-        // Printed rather than asserted: the objects this platform cannot build are the other
-        // platform's to record.
-        println!("not exercised on {}: {unexercised:?}", platform());
-    }
+    let expected = fixture
+        .lookups
+        .iter()
+        .filter(|case| applies(&case.platforms))
+        .count();
+    assert_eq!(
+        exercised.len(),
+        expected,
+        "every lookup this platform covers has to run"
+    );
+    // The other platform's cases are named, so the qualification run there can see which ones it
+    // is responsible for rather than inferring them from a quiet pass here.
+    println!("{} skipped on {}: {skipped:?}", skipped.len(), platform());
     // Nothing beneath the authority ever reached the tree outside it.
     assert_eq!(
         std::fs::read_to_string(outside.join("secret.txt")).expect("the outside file is intact"),
@@ -248,6 +258,76 @@ fn a_handle_keeps_its_object_and_a_replaced_path_does_not_extend_the_grant() {
         reopened.check_identity(recorded),
         Err(Escape::IdentityChanged { .. })
     ));
+}
+
+/// KR-REQ-14.05: a directory moved out of the authorised tree during a lookup takes the rest of
+/// the lookup with it.
+///
+/// This is the case a component-wise walk from the *previous* component would miss: each open
+/// there carries the boundary of whatever it last reached. Every open here carries the boundary of
+/// the authorised directory, so the accumulated path stops resolving the moment the prefix leaves
+/// it.
+#[test]
+fn a_directory_moved_out_of_the_tree_takes_the_rest_of_the_lookup_with_it() {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let inside = root.path().join("authorised");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(inside.join("src")).expect("creates the authorised tree");
+    std::fs::create_dir_all(&outside).expect("creates the tree outside it");
+    std::fs::write(inside.join("src/notes.txt"), b"inside").expect("writes the source");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), &inside).expect("opens the authority");
+    let name = RelativeName::parse("src/notes.txt").expect("a valid relative name");
+    authority
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .expect("opens what is there");
+
+    // The intermediate directory, with the file still inside it, is moved out of the tree.
+    std::fs::rename(inside.join("src"), outside.join("src")).expect("moves the directory");
+    let refusal = authority
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .expect_err("the accumulated path no longer resolves beneath the root");
+    assert!(
+        matches!(refusal, Escape::NotFound { .. }),
+        "expected the name to be gone, got {refusal:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("src/notes.txt")).expect("still there"),
+        "inside",
+        "and the file that left is untouched"
+    );
+}
+
+/// KR-REQ-14.05: a rename refuses two authorities that belong to different environments.
+#[test]
+fn a_rename_refuses_two_environments() {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let from = root.path().join("one");
+    let to = root.path().join("two");
+    std::fs::create_dir_all(&from).expect("creates a tree");
+    std::fs::create_dir_all(&to).expect("creates a tree");
+    std::fs::write(from.join("payload.bin"), b"bytes").expect("writes the payload");
+    let source = AuthorisedDirectory::open_root(environment(), &from).expect("opens the authority");
+    let elsewhere =
+        AuthorisedDirectory::open_root(EnvironmentId::new(Uuid::from_bytes([200; 16])), &to)
+            .expect("opens the authority");
+    let name = RelativeName::parse("payload.bin").expect("a valid relative name");
+    let refusal = source
+        .rename_into(&name, &elsewhere, &name)
+        .expect_err("refuses two environments");
+    assert!(
+        matches!(refusal, Escape::WrongEnvironment { .. }),
+        "expected an environment refusal, got {refusal:?}"
+    );
+    assert!(from.join("payload.bin").exists(), "and nothing moved");
+    assert!(!to.join("payload.bin").exists());
+
+    // The same two names inside one environment do move.
+    let same = AuthorisedDirectory::open_root(environment(), &to).expect("opens the authority");
+    source
+        .rename_into(&name, &same, &name)
+        .expect("one environment, one authority");
+    assert!(to.join("payload.bin").exists());
 }
 
 /// KR-REQ-14.05: a handle from one environment is never accepted by another.

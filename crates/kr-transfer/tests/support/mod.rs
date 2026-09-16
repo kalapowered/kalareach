@@ -92,6 +92,7 @@ impl Harness {
                 declared_media_type: media_type.to_owned(),
                 original_file_name: original_file_name.to_owned(),
             },
+            None,
         )
     }
 

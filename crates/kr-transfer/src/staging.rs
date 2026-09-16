@@ -47,14 +47,23 @@ pub const COMPLETE_DIRECTORY: &str = "complete";
 /// Where download snapshots are staged.
 pub const SNAPSHOTS_DIRECTORY: &str = "snapshots";
 
-/// Extensions a staged payload never carries, whatever the original filename said.
+/// The extensions a staged payload may carry.
 ///
-/// The file never receives an executable bit, so on Unix none of these could run. On Windows an
-/// extension is what decides whether something runs, and a staging directory is not a place to
-/// leave a name that a double-click would execute.
-const REFUSED_EXTENSIONS: &[&str] = &[
-    "app", "bat", "cmd", "com", "cpl", "dll", "exe", "hta", "jse", "js", "lnk", "msc", "msi",
-    "msp", "pif", "ps1", "reg", "scf", "scr", "sh", "vb", "vbe", "vbs", "wsf", "wsh",
+/// An allowlist rather than a denylist, because the question is not "which extensions can Windows
+/// execute" (a list nobody can close) but "which extensions does an agent need". Section 14 permits
+/// a *validated* extension to be retained for an agent that requires one, and these are the media,
+/// document and text types an attachment is. Anything else keeps the bare identifier, which
+/// executes nothing on any platform.
+const PERMITTED_EXTENSIONS: &[&str] = &[
+    // The four formats the preview decoder reads, plus the other image types an agent may accept.
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif", "avif", "svg", "ico",
+    // Documents.
+    "pdf", "txt", "md", "markdown", "rtf", "csv", "tsv", "json", "jsonl", "yaml", "yml", "toml",
+    "xml", "html", "htm", "log", "diff", "patch", "ics", "vcf", "doc", "docx", "xls", "xlsx",
+    "ppt", "pptx", "odt", "ods", "odp", "epub", "tex", "bib", // Audio and video.
+    "mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "mp4", "m4v", "mov", "webm", "mkv", "avi",
+    // Archives and the plain binary case.
+    "zip", "gz", "bz2", "xz", "zst", "tar", "7z", "bin", "dat",
 ];
 
 /// Longest extension a staged payload keeps.
@@ -64,6 +73,7 @@ const MAX_EXTENSION_LEN: usize = 16;
 #[derive(Debug)]
 pub struct StagingArea {
     environment_id: EnvironmentId,
+    identity: crate::authority::ObjectIdentity,
     incomplete: AuthorisedDirectory,
     complete: AuthorisedDirectory,
     snapshots: AuthorisedDirectory,
@@ -125,6 +135,7 @@ impl StagingArea {
         let staging = create_private_staging_directory(root, &name)?;
         Ok(Self {
             environment_id: root.environment_id(),
+            identity: staging.identity(),
             incomplete: subdirectory(&staging, INCOMPLETE_DIRECTORY)?,
             complete: subdirectory(&staging, COMPLETE_DIRECTORY)?,
             snapshots: subdirectory(&staging, SNAPSHOTS_DIRECTORY)?,
@@ -135,6 +146,32 @@ impl StagingArea {
     #[must_use]
     pub const fn environment_id(&self) -> EnvironmentId {
         self.environment_id
+    }
+
+    /// Returns the identity of the staging directory the three areas live in.
+    #[must_use]
+    pub const fn identity(&self) -> crate::authority::ObjectIdentity {
+        self.identity
+    }
+
+    /// Checks that this area is the one whose identity was recorded earlier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::Escape`] when the identities differ.
+    pub fn check_identity(&self, expected: crate::authority::ObjectIdentity) -> Result<()> {
+        if expected == self.identity {
+            Ok(())
+        } else {
+            Err(TransferError::from(
+                crate::authority::Escape::IdentityChanged {
+                    detail: format!(
+                        "this environment's staging directory was recorded as {expected} and now                          names {}",
+                        self.identity
+                    ),
+                },
+            ))
+        }
     }
 
     /// Returns the area uploads receive chunks into.
@@ -369,7 +406,7 @@ fn validated_extension(original_file_name: &str) -> Option<String> {
         return None;
     }
     let lowered = extension.to_ascii_lowercase();
-    if REFUSED_EXTENSIONS.contains(&lowered.as_str()) {
+    if !PERMITTED_EXTENSIONS.contains(&lowered.as_str()) {
         return None;
     }
     Some(lowered)
@@ -421,6 +458,11 @@ mod tests {
     fn a_validated_extension_is_kept_and_nothing_else_is() {
         assert_eq!(validated_extension("photo.PNG").as_deref(), Some("png"));
         assert_eq!(validated_extension("report.tar.gz").as_deref(), Some("gz"));
+        // An allowlist, so anything not named keeps the bare identifier.
+        assert_eq!(validated_extension("payload.ws"), None);
+        assert_eq!(validated_extension("payload.wsc"), None);
+        assert_eq!(validated_extension("payload.appref"), None);
+        assert_eq!(validated_extension("payload.qqq"), None);
         assert_eq!(
             validated_extension("C:\\Users\\me\\photo.jpeg").as_deref(),
             Some("jpeg")
@@ -432,6 +474,8 @@ mod tests {
         assert_eq!(validated_extension("long.aaaaaaaaaaaaaaaaa"), None);
         assert_eq!(validated_extension("payload.exe"), None);
         assert_eq!(validated_extension("payload.Ps1"), None);
+        assert_eq!(validated_extension("payload.bat"), None);
+        assert_eq!(validated_extension("payload.lnk"), None);
         assert_eq!(validated_extension("escape.png/../sh"), None);
     }
 

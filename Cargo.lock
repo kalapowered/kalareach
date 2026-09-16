@@ -3085,6 +3085,7 @@ name = "kr-transfer"
 version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
+ "cap-primitives",
  "cap-std",
  "image",
  "kr-cbor",

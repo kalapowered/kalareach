@@ -92,7 +92,7 @@ fn partial_uploads_quotas_environments_links_and_concurrent_changes() {
     );
     harness
         .service
-        .attachment_handle(published.transfer_id)
+        .attachment_handle(&harness.actor, published.transfer_id)
         .expect("the published attachment is untouched by the refusal");
     harness
         .service
@@ -299,7 +299,7 @@ fn partial_uploads_quotas_environments_links_and_concurrent_changes() {
     // And the completed upload from step one is still exactly what it was.
     let handle = harness
         .service
-        .attachment_handle(published.transfer_id)
+        .attachment_handle(&harness.actor, published.transfer_id)
         .expect("the attachment survived every refusal");
     assert_eq!(handle.content_digest, digest(&bytes));
     assert_eq!(handle.byte_len, U64::new(bytes.len() as u64));

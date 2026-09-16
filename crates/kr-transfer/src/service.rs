@@ -38,7 +38,8 @@ use crate::clock::{Clock, SystemClock};
 use crate::error::{Result, TransferError};
 use crate::staging::{StagingArea, StorageName};
 use crate::store::{
-    ActionRecord, BindingRow, DraftRow, GrantRow, Limits, ScopeRow, SnapshotState, Store, UploadRow,
+    ActionOutcome, ActionRecord, BindingRow, DraftRow, GrantRow, Limits, RetainedAction, ScopeRow,
+    SnapshotState, Store, UploadRow,
 };
 
 /// How long a narrow read grant over one attachment lives.
@@ -93,6 +94,11 @@ pub struct Recovery {
     pub completed_publications: usize,
     /// Publications whose payload could not be found and are now invalidated.
     pub unresolved_publications: usize,
+    /// Payloads of closed uploads that were still on disk and have now been removed.
+    pub removed_payloads: usize,
+    /// Payloads that still could not be removed. Their bytes stay charged and the next pass
+    /// tries again.
+    pub unremovable_payloads: usize,
 }
 
 /// What an adapter reports after it offers an attachment to an agent.
@@ -108,6 +114,38 @@ pub enum InsertionOutcome {
         /// What went wrong, for the user.
         detail: String,
     },
+}
+
+/// The action one mutation is performed under.
+///
+/// A mutation whose idempotency is its action identifier commits this together with the state it
+/// changes, in one transaction. A second attempt at the same action therefore finds the first
+/// already recorded and changes nothing, whether it arrives after the reply was lost or beside it
+/// on another connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Action {
+    /// The actor performing it.
+    pub actor_id: ActorId,
+    /// The durable operation identity.
+    pub action_id: Uuid,
+    /// The method being performed.
+    pub method: String,
+    /// The digest of the payload it was submitted with.
+    pub payload_digest: Digest256,
+}
+
+impl Action {
+    /// Builds the row this action is retained as, with the result it produced.
+    fn retained(&self, result: Vec<u8>, recorded_at_ms: TimestampMs) -> RetainedAction {
+        RetainedAction {
+            actor_id: self.actor_id.clone(),
+            action_id: self.action_id,
+            method: self.method.clone(),
+            payload_digest: self.payload_digest,
+            result,
+            recorded_at_ms,
+        }
+    }
 }
 
 /// A retained mutation outcome.
@@ -156,6 +194,13 @@ impl TransferService {
         let store = Store::open(StagingArea::store_path(paths), paths.environment_id())?;
         let staging_name = store.staging_name(&StagingArea::random_name(), Limits::default())?;
         let staging = StagingArea::open(&root, &staging_name)?;
+        // The staging directory's own identity is recorded the first time it is opened and checked
+        // every time after. A directory replaced at the same name is refused rather than used:
+        // the name is not a secret, and what makes this area this environment's is the object.
+        match store.staging_identity()? {
+            Some(recorded) => staging.check_identity(recorded)?,
+            None => store.set_staging_identity(staging.identity())?,
+        }
         Ok(Self {
             environment_id: paths.environment_id(),
             store: Mutex::new(store),
@@ -247,17 +292,22 @@ impl TransferService {
 
     /// Reserves an upload's declared size and returns its identity, layout and expiry.
     ///
+    /// The payload file is created before the row that names it, and the directory that names the
+    /// file is flushed before the row is committed, so a record never claims a file the storage
+    /// has not made durable.
+    ///
     /// # Errors
     ///
     /// Returns [`TransferError::WrongEnvironment`] for another environment,
     /// [`TransferError::InvalidArgument`] for a size or a declaration this service will not accept,
     /// [`TransferError::QuotaExceeded`] when the environment's staged bytes would exceed their
-    /// limit, or [`TransferError::Concurrency`] when the device already holds as many transfers as
+    /// limit, or [`TransferError::Concurrency`] when the caller already holds as many transfers as
     /// it may.
     pub fn upload_begin(
         &self,
         actor: &ActorId,
         params: &UploadBeginParams,
+        action: Option<&Action>,
     ) -> Result<UploadBeginResult> {
         self.check_environment(params.environment_id)?;
         let declared = params.declared_byte_len.get();
@@ -268,83 +318,102 @@ impl TransferService {
         let storage = StorageName::derive(transfer_id, &params.original_file_name);
         let expires_at_ms =
             TimestampMs::new(now.get().saturating_add(UNFINISHED_UPLOAD_LIFETIME.get()));
-        let (staged, staged_limit) = {
-            let mut store = self.locked()?;
-            let limits = store.limits()?;
-            if declared > limits.max_file_len {
-                return Err(TransferError::QuotaExceeded {
-                    detail: format!(
-                        "a file is at most {} bytes in this environment, and this one declares \
-                         {declared}",
-                        limits.max_file_len
-                    ),
-                });
-            }
-            let open = store.open_transfers(params.device_id.0, actor)?;
-            if open >= limits.max_concurrent_transfers {
-                return Err(TransferError::Concurrency {
-                    detail: format!(
-                        "this device already holds {open} of {} concurrent transfers; finish or \
-                         cancel one first",
-                        limits.max_concurrent_transfers
-                    ),
-                });
-            }
-            let staged = store.staged_byte_len()?;
-            let after = staged.saturating_add(declared);
-            if after > limits.max_staged_len {
-                return Err(TransferError::QuotaExceeded {
-                    detail: format!(
-                        "this environment has {staged} of {} staged bytes, and {declared} more \
-                         would exceed it",
-                        limits.max_staged_len
-                    ),
-                });
-            }
-            // The payload file exists before the row does, so a row can never name a file that
-            // was refused, and the exclusive create is what proves the name was unused.
-            let incomplete = storage.incomplete()?;
-            let file = self.staging.incomplete().create_new(&incomplete)?;
-            drop(file);
-            let row = UploadRow {
-                transfer_id,
-                environment_id: params.environment_id,
-                session_id: params.session_id.0,
-                device_id: params.device_id.0,
-                actor_id: actor.clone(),
-                declared_byte_len: declared,
-                declared_digest: params.declared_digest,
-                declared_media_type: params.declared_media_type.clone(),
-                original_file_name: params.original_file_name.clone(),
-                stored_name: storage.published()?.as_str().to_owned(),
-                state: UploadState::Receiving,
-                invalid_reason: None,
-                reserved_byte_len: declared,
-                content_digest: None,
-                preview: None,
-                preview_unavailable: None,
-                created_at_ms: now,
-                expires_at_ms,
-                published_at_ms: None,
-                submitted_at_ms: None,
-            };
-            if let Err(error) = store.insert_upload(&row) {
-                // Nothing names the file yet, so the failed reservation takes it with it.
-                let _ = self.staging.incomplete().remove(&incomplete);
-                return Err(error);
-            }
-            (after, limits.max_staged_len)
-        };
         let layout = ChunkLayout::for_length(declared);
-        Ok(UploadBeginResult {
+        let mut store = self.locked()?;
+        let limits = store.limits()?;
+        if declared > limits.max_file_len {
+            return Err(TransferError::QuotaExceeded {
+                detail: format!(
+                    "a file is at most {} bytes in this environment, and this one declares \
+                     {declared}",
+                    limits.max_file_len
+                ),
+            });
+        }
+        let open = store.open_transfers(actor)?;
+        if open >= limits.max_concurrent_transfers {
+            return Err(TransferError::Concurrency {
+                detail: format!(
+                    "this device already holds {open} of {} concurrent transfers; finish or cancel \
+                     one first",
+                    limits.max_concurrent_transfers
+                ),
+            });
+        }
+        let staged = store.staged_byte_len()?;
+        let after = staged.saturating_add(declared);
+        if after > limits.max_staged_len {
+            return Err(TransferError::QuotaExceeded {
+                detail: format!(
+                    "this environment has {staged} of {} staged bytes, and {declared} more would \
+                     exceed it",
+                    limits.max_staged_len
+                ),
+            });
+        }
+        // The payload file exists before the row does, so a row can never name a file that was
+        // refused, and the exclusive create is what proves the name was unused.
+        let incomplete = storage.incomplete()?;
+        let file = self.staging.incomplete().create_new(&incomplete)?;
+        let payload_identity = file.identity();
+        drop(file);
+        self.staging.incomplete().sync()?;
+        let result = UploadBeginResult {
             transfer_id,
             environment_id: params.environment_id,
             layout,
             received_chunks: ChunkBitmap::empty(layout.chunk_count.get()).encode(),
             expires_at_ms,
-            staged_byte_len: U64::new(staged),
-            staged_byte_limit: U64::new(staged_limit),
-        })
+            staged_byte_len: U64::new(after),
+            staged_byte_limit: U64::new(limits.max_staged_len),
+        };
+        let retained = match action {
+            Some(action) => Some(action.retained(
+                kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
+                now,
+            )),
+            None => None,
+        };
+        let row = UploadRow {
+            transfer_id,
+            environment_id: params.environment_id,
+            session_id: params.session_id.0,
+            device_id: params.device_id.0,
+            actor_id: actor.clone(),
+            declared_byte_len: declared,
+            declared_digest: params.declared_digest,
+            declared_media_type: params.declared_media_type.clone(),
+            original_file_name: params.original_file_name.clone(),
+            stored_name: storage.published()?.as_str().to_owned(),
+            state: UploadState::Receiving,
+            invalid_reason: None,
+            reserved_byte_len: declared,
+            content_digest: None,
+            payload_identity: Some(payload_identity),
+            cleanup_pending: false,
+            preview: None,
+            preview_unavailable: None,
+            created_at_ms: now,
+            expires_at_ms,
+            published_at_ms: None,
+            submitted_at_ms: None,
+        };
+        match store.insert_upload(&row, retained.as_ref()) {
+            // Another attempt at the same action won the transaction. Nothing was written, so the
+            // file this attempt created goes with it and the caller is answered from the record.
+            Ok(ActionOutcome::AlreadyPerformed) => {
+                drop(store);
+                let _ = self.staging.incomplete().remove(&incomplete);
+                self.retained_result(action)
+            }
+            Ok(ActionOutcome::Committed) => Ok(result),
+            Err(error) => {
+                drop(store);
+                // Nothing names the file yet, so the failed reservation takes it with it.
+                let _ = self.staging.incomplete().remove(&incomplete);
+                Err(error)
+            }
+        }
     }
 
     /// Reports an upload's verified chunk status, and its handle once it is published.
@@ -453,10 +522,8 @@ impl TransferService {
                     Some(&reason),
                     now,
                 )?;
-                let _ = self
-                    .staging
-                    .incomplete()
-                    .remove(&StorageName::derive(row.transfer_id, "").incomplete()?);
+                drop(store);
+                self.discard_payloads(&row)?;
                 return Err(TransferError::integrity(reason));
             }
         }
@@ -490,6 +557,11 @@ impl TransferService {
     /// changed its mind about what it is sending needs a new upload identifier, because the
     /// reservation, the layout and every chunk already accepted belong to the first declaration.
     ///
+    /// The publish is two commits with a recoverable state between them, and the identity of the
+    /// verified object is what ties them together. The row records that identity before the file
+    /// moves; after the move the published name is opened and checked against it, so a file of the
+    /// same length that took the name in between is refused rather than published.
+    ///
     /// # Errors
     ///
     /// Returns [`TransferError::Integrity`] when the file does not verify,
@@ -502,30 +574,50 @@ impl TransferService {
     ) -> Result<UploadFinishResult> {
         let now = self.clock.now_ms();
         // A published upload is answered before anything is read. This is the retry after a lost
-        // reply, and it must never produce a second file.
+        // reply, and it must never produce a second file. An interrupted publish is resolved here
+        // too, so a caller does not have to wait for the next start to learn what happened.
         {
-            let store = self.locked()?;
-            let row = upload_of(&store, params.transfer_id, actor)?;
-            if row.state == UploadState::Published {
-                return Ok(UploadFinishResult {
-                    handle: handle_of(&row)?,
-                    already_published: true,
-                    preview_unavailable: Nullable(row.preview_unavailable.clone()),
-                });
+            let row = {
+                let store = self.locked()?;
+                upload_of(&store, params.transfer_id, actor)?
+            };
+            match row.state {
+                UploadState::Published => {
+                    check_declaration(&row, params)?;
+                    return Ok(UploadFinishResult {
+                        handle: handle_of(&row)?,
+                        already_published: true,
+                        preview_unavailable: Nullable(row.preview_unavailable.clone()),
+                    });
+                }
+                UploadState::Publishing => {
+                    check_declaration(&row, params)?;
+                    self.resolve_publication(&row, now)?;
+                    let store = self.locked()?;
+                    let row = upload_of(&store, params.transfer_id, actor)?;
+                    return match row.state {
+                        UploadState::Published => Ok(UploadFinishResult {
+                            handle: handle_of(&row)?,
+                            already_published: true,
+                            preview_unavailable: Nullable(row.preview_unavailable.clone()),
+                        }),
+                        state => Err(TransferError::WrongState {
+                            transfer: row.transfer_id.to_string(),
+                            state: state.as_str(),
+                            detail: "the verified payload could not be found, so no handle names \
+                                     it"
+                            .to_owned(),
+                        }),
+                    };
+                }
+                _ => {}
             }
         }
         let row = {
             let mut store = self.locked()?;
             let row = upload_of(&store, params.transfer_id, actor)?;
             self.check_live(&mut store, &row, "it cannot be finished")?;
-            if params.declared_byte_len.get() != row.declared_byte_len
-                || params.declared_digest != row.declared_digest
-            {
-                return Err(TransferError::source_changed(
-                    "this upload was reserved for a different size or digest; a changed source \
-                     needs a new upload identifier",
-                ));
-            }
+            check_declaration(&row, params)?;
             let layout = ChunkLayout::for_length(row.declared_byte_len);
             let chunks = store.chunks(params.transfer_id)?;
             let mut bitmap = ChunkBitmap::empty(layout.chunk_count.get());
@@ -551,6 +643,7 @@ impl TransferService {
         // payload, which for a large file takes long enough that holding the journal would stop
         // every other transfer in this environment.
         let mut file = self.open_incomplete(&row)?;
+        let payload_identity = file.identity();
         let (digest, byte_len) = digest_of(&mut file)?;
         if byte_len != row.declared_byte_len || digest != row.declared_digest {
             let reason = if byte_len == row.declared_byte_len {
@@ -561,18 +654,14 @@ impl TransferService {
                     row.declared_byte_len
                 )
             };
-            let mut store = self.locked()?;
-            store.close_upload(
+            drop(file);
+            self.locked()?.close_upload(
                 row.transfer_id,
                 UploadState::Invalidated,
                 Some(&reason),
                 now,
             )?;
-            drop(store);
-            let _ = self
-                .staging
-                .incomplete()
-                .remove(&StorageName::derive(row.transfer_id, "").incomplete()?);
+            self.discard_payloads(&row)?;
             return Err(TransferError::integrity(reason));
         }
         let (preview, preview_unavailable) =
@@ -581,15 +670,11 @@ impl TransferService {
                 Err(refusal) => (None, Some(refusal.to_string())),
             };
         let encoded_preview = match &preview {
-            Some(preview) => Some(
-                kr_cbor::to_canonical_vec(preview)
-                    .map_err(|error| TransferError::store(error.to_string()))?,
-            ),
+            Some(preview) => {
+                Some(kr_cbor::to_canonical_vec(preview).map_err(TransferError::store)?)
+            }
             None => None,
         };
-        let storage = StorageName::derive(row.transfer_id, &row.original_file_name);
-        let expires_at_ms =
-            TimestampMs::new(now.get().saturating_add(UNUSED_ATTACHMENT_LIFETIME.get()));
         let mut store = self.locked()?;
         // Rechecked under the lock: a cancellation could have landed while the file was read.
         let row = upload_of(&store, params.transfer_id, actor)?;
@@ -607,41 +692,136 @@ impl TransferService {
                 detail: "it cannot be finished".to_owned(),
             });
         }
-        // The intent is durable before the file moves, so an interrupted publish is resolved from
-        // the record rather than guessed at.
+        // The intent is durable before the file moves, and it carries the identity of the object
+        // that was verified, so an interrupted publish is resolved from the record rather than
+        // guessed at.
         store.begin_publish(
             row.transfer_id,
             digest,
+            payload_identity,
             encoded_preview.as_deref(),
             preview_unavailable.as_deref(),
             now,
         )?;
-        drop(file);
-        self.staging.incomplete().rename_into(
-            &storage.incomplete()?,
-            self.staging.complete(),
-            &storage.published()?,
-        )?;
-        store.complete_publish(row.transfer_id, now, expires_at_ms)?;
         drop(store);
-        let published = self
-            .locked()?
-            .upload(row.transfer_id)?
-            .ok_or_else(|| unknown(row.transfer_id))?;
-        // The published file is read back through the completed area's own handle, so what the
-        // handle describes is an object this host has opened rather than a row it trusts.
-        let mut file = self.open_published(&published)?;
-        file.revalidate()?;
-        if file.byte_len() != published.declared_byte_len {
-            return Err(TransferError::integrity(
-                "the published file is not the size that was verified",
-            ));
+        drop(file);
+        let published = UploadRow {
+            content_digest: Some(digest),
+            payload_identity: Some(payload_identity),
+            preview: encoded_preview,
+            preview_unavailable: preview_unavailable.clone(),
+            state: UploadState::Publishing,
+            ..row
+        };
+        self.resolve_publication(&published, now)?;
+        let store = self.locked()?;
+        let row = upload_of(&store, params.transfer_id, actor)?;
+        drop(store);
+        if row.state != UploadState::Published {
+            return Err(TransferError::WrongState {
+                transfer: row.transfer_id.to_string(),
+                state: row.state.as_str(),
+                detail: "the verified payload could not be moved into the completed area"
+                    .to_owned(),
+            });
         }
         Ok(UploadFinishResult {
-            handle: handle_of(&published)?,
+            handle: handle_of(&row)?,
             already_published: false,
             preview_unavailable: Nullable(preview_unavailable),
         })
+    }
+
+    /// Completes, or invalidates, one publication whose intent is already durable.
+    ///
+    /// Called by `upload.finish` for the publication it just recorded, by a retried finish, and by
+    /// recovery at startup. All three answer the same question: which name holds the object whose
+    /// identity the row recorded?
+    ///
+    /// * The published name holding that object means the move landed and only the row was behind.
+    /// * The incomplete name holding it means the move did not land, and the verified bytes are
+    ///   still there to move.
+    /// * Neither means no handle can name it, so the upload is invalidated. A storage failure is
+    ///   reported instead, because it is not evidence that the file is gone.
+    fn resolve_publication(&self, row: &UploadRow, now: TimestampMs) -> Result<()> {
+        let identity = row.payload_identity.ok_or_else(|| {
+            TransferError::store("a publication was recorded without the identity it verified")
+        })?;
+        let storage = StorageName::derive(row.transfer_id, &row.original_file_name);
+        let published = storage.published()?;
+        let incomplete = storage.incomplete()?;
+        let expires_at_ms = TimestampMs::new(
+            row.published_at_ms
+                .unwrap_or(now)
+                .get()
+                .saturating_add(UNUSED_ATTACHMENT_LIFETIME.get()),
+        );
+        if self.holds(self.staging.complete(), &published, identity)? {
+            self.locked()?
+                .complete_publish(row.transfer_id, now, expires_at_ms)?;
+            return Ok(());
+        }
+        if self.holds(self.staging.incomplete(), &incomplete, identity)? {
+            self.staging.incomplete().rename_into(
+                &incomplete,
+                self.staging.complete(),
+                &published,
+            )?;
+            // The name is durable before the record that depends on it. Without this the journal
+            // could say `published` while the rename was still only in the page cache.
+            self.staging.complete().sync()?;
+            self.staging.incomplete().sync()?;
+            if !self.holds(self.staging.complete(), &published, identity)? {
+                return Err(TransferError::integrity(
+                    "the published name does not hold the object that was verified",
+                ));
+            }
+            self.locked()?
+                .complete_publish(row.transfer_id, now, expires_at_ms)?;
+            return Ok(());
+        }
+        self.locked()?.close_upload(
+            row.transfer_id,
+            UploadState::Invalidated,
+            Some("the verified payload is not in the staging area, so no handle can name it"),
+            now,
+        )?;
+        self.discard_payloads(row)?;
+        Ok(())
+    }
+
+    /// Returns true when `name` in `directory` is the object whose identity was recorded.
+    ///
+    /// Opened without following a link and checked through the handle, so a replacement of the
+    /// same length reads as absent rather than as the verified file. A name that is not there is
+    /// `false`; a storage failure is reported, because it says nothing about what is there.
+    fn holds(
+        &self,
+        directory: &AuthorisedDirectory,
+        name: &RelativeName,
+        identity: crate::authority::ObjectIdentity,
+    ) -> Result<bool> {
+        match directory.open_read(name, ObjectPolicy::HostOwnedFile) {
+            Ok(file) => Ok(file.identity() == identity),
+            Err(crate::authority::Escape::NotFound { .. }) => Ok(false),
+            // A link or the wrong kind of object has taken the name. It is not the verified file,
+            // and saying so is what lets the caller look at the other name.
+            Err(
+                crate::authority::Escape::Link { .. } | crate::authority::Escape::WrongKind { .. },
+            ) => Ok(false),
+            Err(error) => Err(TransferError::from(error)),
+        }
+    }
+
+    /// Removes whichever payload names a closed upload may still hold, and releases its bytes.
+    ///
+    /// The reservation is released only when the payload is gone, so a removal that fails leaves
+    /// the row marked for cleanup and the bytes charged. Recovery retries it.
+    fn discard_payloads(&self, row: &UploadRow) -> Result<()> {
+        let storage = StorageName::derive(row.transfer_id, &row.original_file_name);
+        self.staging.incomplete().remove(&storage.incomplete()?)?;
+        self.staging.complete().remove(&storage.published()?)?;
+        self.locked()?.release_payload(row.transfer_id)
     }
 
     /// Cancels an unfinished upload and releases its reservation.
@@ -680,8 +860,9 @@ impl TransferService {
         }
         store.close_upload(row.transfer_id, UploadState::Cancelled, None, now)?;
         drop(store);
-        let storage = StorageName::derive(row.transfer_id, &row.original_file_name);
-        let _ = self.staging.incomplete().remove(&storage.incomplete()?);
+        // Both names, because a cancellation can arrive on an upload whose publish had already
+        // moved the file. The reservation is released only once the payload is gone.
+        self.discard_payloads(&row)?;
         Ok(UploadCancelResult {
             transfer_id: row.transfer_id,
             state: UploadState::Cancelled,
@@ -689,17 +870,22 @@ impl TransferService {
         })
     }
 
-    /// Returns one published attachment's handle.
+    /// Returns one published attachment's handle, for the principal that owns it.
+    ///
+    /// The actor is not optional. A handle names bytes, and a principal that did not upload them
+    /// has no claim on them: a transfer identifier is opaque, but it is not a credential.
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::UnknownTransfer`] when nothing is named, or
+    /// Returns [`TransferError::UnknownTransfer`] when nothing this principal owns is named, or
     /// [`TransferError::WrongState`] when the upload is not published.
-    pub fn attachment_handle(&self, transfer_id: TransferId) -> Result<AttachmentHandle> {
+    pub fn attachment_handle(
+        &self,
+        actor: &ActorId,
+        transfer_id: TransferId,
+    ) -> Result<AttachmentHandle> {
         let store = self.locked()?;
-        let row = store
-            .upload(transfer_id)?
-            .ok_or_else(|| unknown(transfer_id))?;
+        let row = upload_of(&store, transfer_id, actor)?;
         self.check_environment(row.environment_id)?;
         if row.state != UploadState::Published {
             return Err(TransferError::WrongState {
@@ -721,6 +907,7 @@ impl TransferService {
         &self,
         actor: &ActorId,
         params: &DraftCreateParams,
+        action: Option<&Action>,
     ) -> Result<DraftCreateResult> {
         self.check_environment(params.environment_id)?;
         let now = self.clock.now_ms();
@@ -738,10 +925,20 @@ impl TransferService {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        self.locked()?.insert_draft(&row)?;
-        Ok(DraftCreateResult {
+        let result = DraftCreateResult {
             draft: self.draft_record(&row, &[])?,
-        })
+        };
+        let retained = match action {
+            Some(action) => Some(action.retained(
+                kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
+                now,
+            )),
+            None => None,
+        };
+        match self.locked()?.insert_draft(&row, retained.as_ref())? {
+            ActionOutcome::AlreadyPerformed => self.retained_result(action),
+            ActionOutcome::Committed => Ok(result),
+        }
     }
 
     /// Replaces a draft's text at its exact revision.
@@ -753,32 +950,62 @@ impl TransferService {
         &self,
         actor: &ActorId,
         params: &DraftUpdateParams,
+        action: Option<&Action>,
     ) -> Result<DraftUpdateResult> {
         let now = self.clock.now_ms();
         let mut store = self.locked()?;
         let row = draft_of(&store, params.draft_id, actor)?;
         self.check_environment(row.environment_id)?;
-        let revision = store
-            .update_draft(params.draft_id, params.expected_revision, &params.text, now)?
-            .ok_or_else(|| TransferError::DraftConflict {
+        if row.revision != params.expected_revision {
+            return Err(TransferError::DraftConflict {
                 detail: format!(
                     "this draft is at revision {} and the update expects {}",
                     row.revision.get(),
                     params.expected_revision.get()
                 ),
-            })?;
+            });
+        }
+        // The result is built before the transaction, because the transaction commits it beside
+        // the state it changes.
         let bindings = store.bindings(params.draft_id)?;
         let handles = self.handles_of(&store, &bindings)?;
-        drop(store);
         let updated = DraftRow {
-            revision,
+            revision: DraftRevision::new(params.expected_revision.get().saturating_add(1)),
             text: params.text.clone(),
             updated_at_ms: now,
             ..row
         };
-        Ok(DraftUpdateResult {
+        let result = DraftUpdateResult {
             draft: self.compose_draft(&updated, &bindings, &handles)?,
-        })
+        };
+        let retained = match action {
+            Some(action) => Some(action.retained(
+                kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
+                now,
+            )),
+            None => None,
+        };
+        match store.update_draft(
+            params.draft_id,
+            params.expected_revision,
+            &params.text,
+            now,
+            retained.as_ref(),
+        )? {
+            Some(_) => Ok(result),
+            None => {
+                drop(store);
+                // Either the revision moved between the read and the write, or this action had
+                // already been performed. The record says which.
+                match self.retained_result(action) {
+                    Ok(retained) => Ok(retained),
+                    Err(_) => Err(TransferError::DraftConflict {
+                        detail: "this draft's revision moved while the update was written"
+                            .to_owned(),
+                    }),
+                }
+            }
+        }
     }
 
     /// Binds a completed attachment to a draft and records that the adapter was asked.
@@ -787,6 +1014,10 @@ impl TransferService {
     /// [`InsertionState::Recorded`], which says an adapter was asked and nothing more; the agent
     /// has accepted nothing until [`Self::record_insertion_outcome`] is given upstream evidence.
     /// Nothing here submits a prompt.
+    ///
+    /// The attachment and the draft must both belong to the caller, and where both name a session
+    /// it must be the same one: an attachment bound to one session would otherwise be retained
+    /// against it while a draft for another session held it.
     ///
     /// # Errors
     ///
@@ -797,13 +1028,33 @@ impl TransferService {
         &self,
         actor: &ActorId,
         params: &AgentDraftAddAttachmentParams,
+        action: Option<&Action>,
     ) -> Result<AgentDraftAddAttachmentResult> {
         let now = self.clock.now_ms();
-        let handle = self.attachment_handle(params.transfer_id)?;
-        check_contribution(&params.contribution, &handle)?;
         let mut store = self.locked()?;
         let row = draft_of(&store, params.draft_id, actor)?;
         self.check_environment(row.environment_id)?;
+        // The attachment is loaded under the same lock as the binding, through the same
+        // actor-authorised lookup the upload methods use.
+        let upload = upload_of(&store, params.transfer_id, actor)?;
+        self.check_environment(upload.environment_id)?;
+        if upload.state != UploadState::Published {
+            return Err(TransferError::WrongState {
+                transfer: params.transfer_id.to_string(),
+                state: upload.state.as_str(),
+                detail: "only a published attachment can be bound to a draft".to_owned(),
+            });
+        }
+        if let (Some(attachment_session), Some(draft_session)) = (upload.session_id, row.session_id)
+            && attachment_session != draft_session
+        {
+            return Err(TransferError::invalid(format!(
+                "this attachment belongs to session {attachment_session} and the draft targets \
+                 {draft_session}"
+            )));
+        }
+        let handle = handle_of(&upload)?;
+        check_contribution(&params.contribution, &handle)?;
         let existing = store.bindings(params.draft_id)?;
         if existing.len() as u64 >= params.contribution.max_count.get()
             && !existing
@@ -815,6 +1066,15 @@ impl TransferService {
                 params.contribution.max_count.get(),
                 existing.len()
             )));
+        }
+        if row.revision != params.expected_revision {
+            return Err(TransferError::DraftConflict {
+                detail: format!(
+                    "this draft is at revision {} and the binding expects {}",
+                    row.revision.get(),
+                    params.expected_revision.get()
+                ),
+            });
         }
         // A method that needs the agent to open the file gets a narrow read grant over that one
         // file, inside the staging area and outside every repository. A typed submission needs no
@@ -846,23 +1106,18 @@ impl TransferService {
             bound_at_ms: now,
             ordinal,
         };
-        let revision = store
-            .bind_attachment(&binding, params.expected_revision)?
-            .ok_or_else(|| TransferError::DraftConflict {
-                detail: format!(
-                    "this draft is at revision {} and the binding expects {}",
-                    row.revision.get(),
-                    params.expected_revision.get()
-                ),
-            })?;
-        let bindings = store.bindings(params.draft_id)?;
-        let handles = self.handles_of(&store, &bindings)?;
-        drop(store);
         let updated = DraftRow {
-            revision,
+            revision: DraftRevision::new(params.expected_revision.get().saturating_add(1)),
             updated_at_ms: now,
             ..row
         };
+        let mut bindings = existing
+            .into_iter()
+            .filter(|held| held.transfer_id != params.transfer_id)
+            .collect::<Vec<_>>();
+        bindings.push(binding.clone());
+        bindings.sort_by_key(|held| held.ordinal);
+        let handles = self.handles_of(&store, &bindings)?;
         let draft = self.compose_draft(&updated, &bindings, &handles)?;
         let attachment = draft
             .attachments
@@ -870,7 +1125,27 @@ impl TransferService {
             .find(|attachment| attachment.handle.transfer_id == params.transfer_id)
             .cloned()
             .ok_or_else(|| TransferError::store("the binding that was written is not readable"))?;
-        Ok(AgentDraftAddAttachmentResult { draft, attachment })
+        let result = AgentDraftAddAttachmentResult { draft, attachment };
+        let retained = match action {
+            Some(action) => Some(action.retained(
+                kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
+                now,
+            )),
+            None => None,
+        };
+        match store.bind_attachment(&binding, params.expected_revision, retained.as_ref())? {
+            Some(_) => Ok(result),
+            None => {
+                drop(store);
+                match self.retained_result(action) {
+                    Ok(retained) => Ok(retained),
+                    Err(_) => Err(TransferError::DraftConflict {
+                        detail: "this draft's revision moved while the binding was written"
+                            .to_owned(),
+                    }),
+                }
+            }
+        }
     }
 
     /// Records what an adapter reported about one binding.
@@ -923,7 +1198,7 @@ impl TransferService {
             },
         };
         store
-            .bind_attachment(&binding, row.revision)?
+            .bind_attachment(&binding, row.revision, None)?
             .ok_or_else(|| TransferError::store("the draft's revision moved during this record"))?;
         let bindings = store.bindings(draft_id)?;
         let handles = self.handles_of(&store, &bindings)?;
@@ -951,7 +1226,7 @@ impl TransferService {
     /// Returns [`TransferError::UnknownDraft`] when nothing is named.
     pub fn mark_submitted(&self, actor: &ActorId, draft_id: DraftId) -> Result<usize> {
         let now = self.clock.now_ms();
-        let store = self.locked()?;
+        let mut store = self.locked()?;
         let _ = draft_of(&store, draft_id, actor)?;
         let bindings = store.bindings(draft_id)?;
         for binding in &bindings {
@@ -1007,59 +1282,52 @@ impl TransferService {
         })
     }
 
-    /// Resolves every publication an earlier daemon did not finish.
+    /// Resolves everything an earlier daemon left unfinished.
     ///
-    /// A `publishing` row names both the incomplete and the published payload. Whichever exists
-    /// says what happened: the published name means the rename landed and only the row is behind,
-    /// and the incomplete name means it did not and the verified bytes are still there to move.
-    /// A row with neither is invalidated, because a handle whose file is gone is not a handle.
+    /// Two jobs, both idempotent.
+    ///
+    /// A publication interrupted between its two commits is resolved from the identity the row
+    /// recorded: whichever name holds that exact object says what happened, and a row whose object
+    /// is in neither place is invalidated because no handle can name it.
+    ///
+    /// A payload whose upload is closed but whose bytes are still on disk is removed, and only then
+    /// is its reservation released. That is the other half of the cleanup contract: a removal that
+    /// failed, or a daemon that died between the row and the unlink, leaves bytes charged and a row
+    /// marked, and this is what retries it.
     ///
     /// # Errors
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the journal cannot be read or written.
     pub fn recover(&self) -> Result<Recovery> {
         let now = self.clock.now_ms();
-        let pending = self.locked()?.uploads_in(&[UploadState::Publishing])?;
         let mut recovery = Recovery::default();
+        let pending = self.locked()?.uploads_in(&[UploadState::Publishing])?;
         for row in pending {
-            let storage = StorageName::derive(row.transfer_id, &row.original_file_name);
-            let published = storage.published()?;
-            let incomplete = storage.incomplete()?;
-            let expires_at_ms = TimestampMs::new(
-                row.published_at_ms
-                    .unwrap_or(now)
-                    .get()
-                    .saturating_add(UNUSED_ATTACHMENT_LIFETIME.get()),
-            );
-            if self.staging.complete().exists(&published) {
-                self.locked()?
-                    .complete_publish(row.transfer_id, now, expires_at_ms)?;
-                recovery.completed_publications += 1;
-            } else if self.staging.incomplete().exists(&incomplete) {
-                self.staging.incomplete().rename_into(
-                    &incomplete,
-                    self.staging.complete(),
-                    &published,
-                )?;
-                self.locked()?
-                    .complete_publish(row.transfer_id, now, expires_at_ms)?;
-                recovery.completed_publications += 1;
-            } else {
-                self.locked()?.close_upload(
-                    row.transfer_id,
-                    UploadState::Invalidated,
-                    Some(
-                        "the verified payload is not in the staging area, so no handle can name it",
-                    ),
-                    now,
-                )?;
-                recovery.unresolved_publications += 1;
+            self.resolve_publication(&row, now)?;
+            let resolved = self.locked()?.upload(row.transfer_id)?;
+            match resolved.map(|row| row.state) {
+                Some(UploadState::Published) => recovery.completed_publications += 1,
+                _ => recovery.unresolved_publications += 1,
+            }
+        }
+        let abandoned = self.locked()?.uploads_needing_cleanup()?;
+        for row in abandoned {
+            match self.discard_payloads(&row) {
+                Ok(()) => recovery.removed_payloads += 1,
+                // A removal that still fails keeps its row marked and its bytes charged. The next
+                // pass tries again rather than forgetting the file exists.
+                Err(_) => recovery.unremovable_payloads += 1,
             }
         }
         Ok(recovery)
     }
 
     /// Expires everything whose retention has run out.
+    ///
+    /// Every transition is conditional on the state the row is still in, because the candidates
+    /// were listed before the lock each transition takes: a finish, a cancellation or a submission
+    /// can land in between, and a sweep that overwrote one of those would expire an attachment its
+    /// session had just taken responsibility for.
     ///
     /// # Errors
     ///
@@ -1070,49 +1338,68 @@ impl TransferService {
         let unfinished = self
             .locked()?
             .uploads_in(&[UploadState::Receiving, UploadState::Publishing])?;
-        for row in unfinished {
+        for candidate in unfinished {
+            let mut store = self.locked()?;
+            let Some(row) = store.upload(candidate.transfer_id)? else {
+                continue;
+            };
             if row.expires_at_ms.get() > now.get() {
                 continue;
             }
-            self.locked()?.close_upload(
+            let moved = store.close_upload_from(
                 row.transfer_id,
+                row.state,
                 UploadState::Expired,
                 Some("this upload was unfinished for longer than its expiry"),
                 now,
             )?;
-            let storage = StorageName::derive(row.transfer_id, &row.original_file_name);
-            let _ = self.staging.incomplete().remove(&storage.incomplete()?);
-            sweep.expired_uploads += 1;
+            drop(store);
+            if moved {
+                let _ = self.discard_payloads(&row);
+                sweep.expired_uploads += 1;
+            }
         }
-        // Bound to a local first. A guard in the head of a `for` loop lives for the whole body,
-        // and the body takes the journal again.
         let published = self.locked()?.uploads_in(&[UploadState::Published])?;
-        for row in published {
-            // A submitted attachment follows its session, and a session the host still retains
-            // keeps it whatever its own expiry says.
-            if let Some(session_id) = row.session_id
-                && row.submitted_at_ms.is_some()
-                && retention.retains(session_id)
-            {
+        for candidate in published {
+            let mut store = self.locked()?;
+            let Some(row) = store.upload(candidate.transfer_id)? else {
+                continue;
+            };
+            if row.state != UploadState::Published {
                 continue;
             }
-            if row.expires_at_ms.get() > now.get() {
+            // Two retentions, and which one applies is which of them the attachment is under.
+            // A submitted attachment follows its session, whatever its own unused-attachment
+            // deadline says; an unsubmitted one follows that deadline.
+            let expired = match (row.submitted_at_ms, row.session_id) {
+                (Some(_), Some(session_id)) => !retention.retains(session_id),
+                (Some(_), None) => row.expires_at_ms.get() <= now.get(),
+                (None, _) => row.expires_at_ms.get() <= now.get(),
+            };
+            if !expired {
                 continue;
             }
-            self.locked()?.close_upload(
+            let moved = store.close_upload_from(
                 row.transfer_id,
+                UploadState::Published,
                 UploadState::Expired,
-                Some("this attachment went unused for longer than its expiry"),
+                Some("this attachment's retention has ended"),
                 now,
             )?;
-            self.locked()?.revoke_grants_for(row.transfer_id)?;
-            let storage = StorageName::derive(row.transfer_id, &row.original_file_name);
-            let _ = self.staging.complete().remove(&storage.published()?);
+            if !moved {
+                continue;
+            }
+            store.revoke_grants_for(row.transfer_id)?;
+            drop(store);
+            let _ = self.discard_payloads(&row);
             sweep.expired_attachments += 1;
         }
         let snapshots = self.locked()?.snapshots_in(SnapshotState::Open)?;
-        for row in snapshots {
-            if row.expires_at_ms.get() > now.get() {
+        for candidate in snapshots {
+            let Some(row) = self.locked()?.snapshot(candidate.transfer_id)? else {
+                continue;
+            };
+            if row.state != SnapshotState::Open || row.expires_at_ms.get() > now.get() {
                 continue;
             }
             self.release_snapshot(
@@ -1201,6 +1488,31 @@ impl TransferService {
             },
         };
         self.locked()?.record_action(actor, action_id, &record)
+    }
+
+    /// Returns the result an action already recorded, decoded into the method's own shape.
+    ///
+    /// Reached when a transaction carrying an action found it already recorded, which means
+    /// another attempt at the same action committed first. That attempt's result is the answer
+    /// this one owes its caller.
+    fn retained_result<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        action: Option<&Action>,
+    ) -> Result<T> {
+        let action = action.ok_or_else(|| {
+            TransferError::store("a transaction reported an action that was not supplied")
+        })?;
+        let record = self
+            .locked()?
+            .retained_action(&action.actor_id, action.action_id)?
+            .ok_or_else(|| {
+                TransferError::store("the action this transaction yielded to is not recorded")
+            })?;
+        let result = record.result.ok_or_else(|| {
+            TransferError::store("the action this transaction yielded to recorded no result")
+        })?;
+        kr_cbor::from_canonical_slice(&result, &kr_cbor::Limits::DEFAULT)
+            .map_err(TransferError::store)
     }
 
     pub(crate) fn locked(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
@@ -1385,30 +1697,38 @@ pub(crate) fn unknown(transfer_id: TransferId) -> TransferError {
     }
 }
 
+/// Returns one upload, for the principal that began it.
+///
+/// A transfer another principal owns is refused exactly as one that does not exist is, so a caller
+/// cannot learn from the refusal whether an identifier it guessed names anything.
 fn upload_of(store: &Store, transfer_id: TransferId, actor: &ActorId) -> Result<UploadRow> {
-    let row = store
-        .upload(transfer_id)?
-        .ok_or_else(|| unknown(transfer_id))?;
-    if &row.actor_id != actor {
-        return Err(TransferError::PermissionDenied {
-            detail: format!("{transfer_id} belongs to another principal"),
-        });
+    match store.upload(transfer_id)? {
+        Some(row) if &row.actor_id == actor => Ok(row),
+        _ => Err(unknown(transfer_id)),
     }
-    Ok(row)
 }
 
+/// Returns one draft, for the principal that owns it. Refused the same way as above.
 fn draft_of(store: &Store, draft_id: DraftId, actor: &ActorId) -> Result<DraftRow> {
-    let row = store
-        .draft(draft_id)?
-        .ok_or_else(|| TransferError::UnknownDraft {
+    match store.draft(draft_id)? {
+        Some(row) if &row.actor_id == actor => Ok(row),
+        _ => Err(TransferError::UnknownDraft {
             draft: draft_id.to_string(),
-        })?;
-    if &row.actor_id != actor {
-        return Err(TransferError::PermissionDenied {
-            detail: format!("{draft_id} belongs to another principal"),
-        });
+        }),
     }
-    Ok(row)
+}
+
+/// Refuses a finish whose declaration is not the one the reservation was made for.
+fn check_declaration(row: &UploadRow, params: &UploadFinishParams) -> Result<()> {
+    if params.declared_byte_len.get() != row.declared_byte_len
+        || params.declared_digest != row.declared_digest
+    {
+        return Err(TransferError::source_changed(
+            "this upload was reserved for a different size or digest; a changed source needs a \
+             new upload identifier",
+        ));
+    }
+    Ok(())
 }
 
 /// Builds the opaque handle of a published upload.

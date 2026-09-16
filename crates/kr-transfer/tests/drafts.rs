@@ -44,6 +44,7 @@ fn draft(harness: &Harness) -> kr_protocol::transfer::DraftRecord {
                 )),
                 text: "have a look at this".to_owned(),
             },
+            None,
         )
         .expect("creates the draft")
         .draft
@@ -71,6 +72,7 @@ fn a_draft_carries_its_owner_revision_and_environment() {
                 expected_revision: DraftRevision::new(99),
                 text: "changed".to_owned(),
             },
+            None,
         )
         .expect_err("refuses a stale revision");
     assert_eq!(stale.code(), ErrorCode::DraftConflict);
@@ -83,23 +85,26 @@ fn a_draft_carries_its_owner_revision_and_environment() {
                 expected_revision: created.revision,
                 text: "changed".to_owned(),
             },
+            None,
         )
         .expect("updates at the current revision")
         .draft;
     assert_eq!(updated.revision, DraftRevision::new(2));
     assert_eq!(updated.text, "changed");
 
+    // Another principal's draft and an identifier that names nothing are refused the same way, so
+    // the refusal is never a signal that something with that identifier exists.
     let other = kr_protocol::ids::ActorId::new("local:someone-else").expect("a valid principal");
     let refusal = harness
         .service
         .draft(&other, created.draft_id)
         .expect_err("refuses another principal");
-    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
     let unknown = harness
         .service
         .draft(&harness.actor, DraftId::new(Uuid::from_bytes([200; 16])))
         .expect_err("refuses an identifier that names nothing");
-    assert_eq!(unknown.code(), ErrorCode::InvalidArgument);
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+    assert_eq!(unknown.code(), refusal.code());
 }
 
 /// KR-REQ-12.28: `upload.finish`, `agent.draft.add_attachment` and `agent.prompt.submit` are three
@@ -133,6 +138,7 @@ fn transfer_insertion_and_submission_are_three_separate_actions() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
         )
         .expect("binds the attachment");
     assert_eq!(bound.attachment.state, InsertionState::Recorded);
@@ -202,6 +208,7 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
                     ..contribution(&handle, InsertionMethod::TypedSubmission)
                 },
             },
+            None,
         )
         .expect_err("refuses a type the operation does not accept");
     assert_eq!(wrong_type.code(), ErrorCode::InvalidArgument);
@@ -219,6 +226,7 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
                     ..contribution(&handle, InsertionMethod::TypedSubmission)
                 },
             },
+            None,
         )
         .expect_err("refuses a file above the selected model's limit");
     assert_eq!(too_large.code(), ErrorCode::InvalidArgument);
@@ -236,6 +244,7 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
                     ..contribution(&handle, InsertionMethod::TypedSubmission)
                 },
             },
+            None,
         )
         .expect_err("refuses an operation that accepts nothing");
     assert_eq!(none_accepted.code(), ErrorCode::InvalidArgument);
@@ -253,6 +262,7 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
                     ..contribution(&handle, InsertionMethod::TypedSubmission)
                 },
             },
+            None,
         )
         .expect("binds the attachment");
 
@@ -270,6 +280,7 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
                     ..contribution(&second, InsertionMethod::TypedSubmission)
                 },
             },
+            None,
         )
         .expect_err("refuses more attachments than the operation accepts");
     assert_eq!(over_count.code(), ErrorCode::InvalidArgument);
@@ -293,6 +304,7 @@ fn a_failed_insertion_keeps_the_draft_and_the_upload_and_only_evidence_accepts()
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::VerifiedComposerInsertion),
             },
+            None,
         )
         .expect("binds the attachment");
     assert_eq!(bound.attachment.state, InsertionState::Recorded);
@@ -324,7 +336,7 @@ fn a_failed_insertion_keeps_the_draft_and_the_upload_and_only_evidence_accepts()
     assert_eq!(read.attachments.len(), 1);
     harness
         .service
-        .attachment_handle(handle.transfer_id)
+        .attachment_handle(&harness.actor, handle.transfer_id)
         .expect("the completed upload is still there");
 
     // Acceptance needs evidence, and empty evidence is not evidence.
@@ -393,6 +405,7 @@ fn unsupported_media_is_never_offered_as_a_model_image() {
                     ..contribution(&handle, InsertionMethod::TypedSubmission)
                 },
             },
+            None,
         )
         .expect_err("refuses to present a file as a model image");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
@@ -408,6 +421,7 @@ fn unsupported_media_is_never_offered_as_a_model_image() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::ManualTerminalWorkflow),
             },
+            None,
         )
         .expect("binds it as a file");
 }
@@ -440,6 +454,7 @@ fn a_binding_needs_a_published_attachment_and_the_current_revision() {
                     model_media_capability: false,
                 },
             },
+            None,
         )
         .expect_err("refuses an attachment that is not published");
     assert_eq!(unpublished.code(), ErrorCode::ResourceUnavailable);
@@ -461,6 +476,7 @@ fn a_binding_needs_a_published_attachment_and_the_current_revision() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
         )
         .expect_err("refuses a stale revision");
     assert_eq!(stale.code(), ErrorCode::DraftConflict);
@@ -474,9 +490,130 @@ fn a_binding_needs_a_published_attachment_and_the_current_revision() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::TypedSubmission),
             },
+            None,
         )
         .expect("binds at the current revision");
     assert_eq!(bound.draft.revision, DraftRevision::new(2));
+}
+
+/// KR-REQ-14.01, KR-REQ-23.41: a binding needs the attachment and the draft to belong to the same
+/// principal, and to the same session where both name one.
+#[test]
+fn a_binding_needs_one_principal_and_one_session() {
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let session = SessionId::new(Uuid::from_bytes([21; 16]));
+    let other_session = SessionId::new(Uuid::from_bytes([22; 16]));
+
+    let begun = harness
+        .begin_for(&bytes, "image/png", "photo.png", Nullable::some(session))
+        .expect("reserves the upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends every chunk");
+    let handle = harness
+        .finish(begun.transfer_id, &bytes)
+        .expect("publishes the attachment")
+        .handle;
+
+    // A draft for another session cannot hold it: the attachment would be retained against one
+    // session while a draft for another held it.
+    let elsewhere = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(other_session),
+                application_instance_id: Nullable::null(),
+                text: "not this session".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    let refusal = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: elsewhere.draft_id,
+                expected_revision: elsewhere.revision,
+                transfer_id: handle.transfer_id,
+                contribution: contribution(&handle, InsertionMethod::TypedSubmission),
+            },
+            None,
+        )
+        .expect_err("refuses another session's draft");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+
+    // Another principal's draft cannot hold it either, and neither can this principal's draft hold
+    // another principal's attachment.
+    let other = kr_protocol::ids::ActorId::new("local:someone-else").expect("a valid principal");
+    let theirs = harness
+        .service
+        .draft_create(
+            &other,
+            &DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session),
+                application_instance_id: Nullable::null(),
+                text: "someone else's draft".to_owned(),
+            },
+            None,
+        )
+        .expect("creates their draft")
+        .draft;
+    let refusal = harness
+        .service
+        .draft_add_attachment(
+            &other,
+            &AgentDraftAddAttachmentParams {
+                draft_id: theirs.draft_id,
+                expected_revision: theirs.revision,
+                transfer_id: handle.transfer_id,
+                contribution: contribution(&handle, InsertionMethod::TypedSubmission),
+            },
+            None,
+        )
+        .expect_err("refuses another principal's attachment");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::InvalidArgument,
+        "and the refusal is the one an unknown identifier gets"
+    );
+
+    // The draft for the attachment's own session, under its own principal, does hold it.
+    let mine = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &DraftCreateParams {
+                environment_id: harness.environment_id(),
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session),
+                application_instance_id: Nullable::null(),
+                text: "this session".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: mine.draft_id,
+                expected_revision: mine.revision,
+                transfer_id: handle.transfer_id,
+                contribution: contribution(&handle, InsertionMethod::TypedSubmission),
+            },
+            None,
+        )
+        .expect("binds the attachment");
 }
 
 /// KR-REQ-23.41: a read grant is narrow, expires, and is refused once it has.
@@ -496,6 +633,7 @@ fn a_read_grant_is_narrow_and_expires() {
                 transfer_id: handle.transfer_id,
                 contribution: contribution(&handle, InsertionMethod::ManualTerminalWorkflow),
             },
+            None,
         )
         .expect("binds the attachment");
     let grant = bound

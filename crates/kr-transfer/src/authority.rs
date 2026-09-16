@@ -10,32 +10,50 @@
 //! ## The no-escape policy, qualified
 //!
 //! * A name is relative, in this crate's own accepted form: no root, no drive prefix, no `..`, no
-//!   `.`, no empty component, no NUL, no separator other than `/`, no trailing dot or space on a
-//!   component, no alternate-data-stream colon, and no Windows reserved device name with or
-//!   without an extension. The same rules apply on every platform, so a name that one host accepts
-//!   is a name every host accepts.
-//! * Resolution opens each intermediate component with the no-follow open, so a component that is
-//!   a symbolic link or a reparse point fails the lookup instead of redirecting it. Replacing a
-//!   component with a link *during* the walk fails the same way: the open that would have crossed
-//!   it is the one that refuses.
-//! * On Linux the underlying open uses `openat2` with `RESOLVE_BENEATH`; on other Unix systems it
-//!   is a component-wise `openat` with `O_NOFOLLOW`; on Windows it is a relative `NtCreateFile`
-//!   that rejects reparse points. [`cap_std`] owns those three implementations, which is why this
-//!   module is the policy and not the syscalls.
+//!   `.`, no empty component, no NUL or other control byte, no separator other than `/`, none of
+//!   the characters Windows refuses in a filename, no trailing dot or space on a component, no
+//!   alternate-data-stream colon, and no Windows reserved device name with or without an
+//!   extension. The same rules apply on every platform, so a name that one host accepts is a name
+//!   every host accepts.
+//! * **Every** open is made against the authorised directory's own handle, with the accumulated
+//!   path, never against the previous component's handle. That is what keeps the boundary the
+//!   platform enforces the *authorised* directory rather than whatever the walk last reached: a
+//!   directory moved out of the authorised tree between two components makes the next open fail,
+//!   because the accumulated path no longer resolves beneath the root.
+//! * Each prefix of the path is opened with the no-follow open before the object itself is, so a
+//!   component that is a symbolic link or a reparse point at the moment it is resolved fails the
+//!   lookup instead of redirecting it. The object itself is opened with the no-follow open too.
+//! * On Linux the underlying open is `openat2` with `RESOLVE_BENEATH`, which resolves the whole
+//!   accumulated path in one syscall; on other Unix systems it is a component-wise `openat` with
+//!   `O_NOFOLLOW` beneath the same start directory; on Windows it is a relative `NtCreateFile`.
+//!   [`cap_std`] owns those three implementations, which is why this module is the policy and not
+//!   the syscalls. On Windows this crate adds its own check for
+//!   `FILE_ATTRIBUTE_REPARSE_POINT`, because `cap_std`'s no-follow test recognises name-surrogate
+//!   reparse tags (junctions and symbolic links) and not every reparse point.
 //! * After the open, the object's stable filesystem identity (device and inode, or volume serial
 //!   and file index) is read back **through the handle** and checked against the policy the caller
 //!   asked for. A directory handle's own identity is recorded when it is opened, so a scope
 //!   reopened after a restart is refused unless it finds the same object.
 //! * An environment identity travels with every handle. A handle from one environment is never
 //!   accepted by another, which is how a Windows path and a WSL path stay separate rather than
-//!   aliasing.
+//!   aliasing. An operation across two handles, such as a rename, refuses two different
+//!   environments before it resolves either name.
 //!
 //! ## What this does not do
 //!
-//! It removes path-resolution races. It does not make an authorised file private: another process
-//! running as the same operating-system user can open and write a file this host has authorised,
-//! and nothing here prevents that. Where immutability matters, as it does for a download, the host
-//! stages its own copy instead of trusting an open handle.
+//! Three residuals, stated rather than implied.
+//!
+//! * It removes path-resolution races. It does not make an authorised file private: another
+//!   process running as the same operating-system user can open and write a file this host has
+//!   authorised, and nothing here prevents that. Where immutability matters, as it does for a
+//!   download, the host stages its own copy instead of trusting an open handle.
+//! * A component replaced with a symbolic link *between* the prefix pass and the open of the
+//!   object beneath it can be traversed. The destination is still beneath the authorised
+//!   directory, because every open carries the boundary, so this is a link followed inside the
+//!   tree and never an escape.
+//! * On Linux each accumulated path is resolved in one syscall, so there is no window inside a
+//!   resolution. On the other platforms the resolution is component-wise beneath the start
+//!   directory, and [`cap_std`]'s own documentation is the authority on what that leaves open.
 
 use std::path::{Path, PathBuf};
 
@@ -54,6 +72,13 @@ const RESERVED_STEMS: &[&str] = &[
     "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
     "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
+
+/// Characters Windows refuses in a filename.
+///
+/// A name this crate accepts has to be a name every platform accepts, so these are refused
+/// everywhere even though Unix would take them. The colon is refused earlier, for the whole name,
+/// because it also introduces a drive and an alternate data stream.
+const FORBIDDEN_CHARACTERS: &[char] = &['<', '>', '"', '|', '?', '*'];
 
 /// Why a name or an object was refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -101,7 +126,19 @@ pub enum Escape {
         /// The component that is a link.
         component: String,
     },
-    /// The object could not be opened relative to the authorised directory.
+    /// The name does not exist beneath the authorised directory.
+    ///
+    /// Reported the same way an unauthorised name is, so a caller cannot learn from the refusal
+    /// whether something with that name exists.
+    #[error("{component} is not beneath the authorised directory")]
+    NotFound {
+        /// The component that was not there.
+        component: String,
+    },
+    /// The object could not be opened for a reason the storage decided.
+    ///
+    /// A full disk, a read failure, a permission the operating system refused. This is a storage
+    /// failure rather than an authority refusal, and it is reported as one.
     #[error("{component} could not be opened beneath the authorised directory: {detail}")]
     Unopenable {
         /// The component that failed.
@@ -236,6 +273,14 @@ fn check_component(component: &str) -> Result<(), Escape> {
             ),
         });
     }
+    if let Some(character) = component
+        .chars()
+        .find(|character| FORBIDDEN_CHARACTERS.contains(character))
+    {
+        return Err(Escape::ForbiddenByte {
+            detail: format!("Windows refuses {character} in a filename"),
+        });
+    }
     // Windows strips a trailing dot or space, so `report.` and `report` would name one file while
     // reading as two names. Refusing both keeps one name meaning one file everywhere.
     if component.ends_with('.') || component.ends_with(' ') {
@@ -243,17 +288,46 @@ fn check_component(component: &str) -> Result<(), Escape> {
             detail: format!("{component} ends in a dot or a space, which Windows would strip"),
         });
     }
-    let stem = component
-        .split('.')
-        .next()
-        .unwrap_or(component)
-        .to_ascii_lowercase();
-    if RESERVED_STEMS.contains(&stem.as_str()) {
+    if RESERVED_STEMS.contains(&device_stem(component).as_str()) {
         return Err(Escape::ReservedName {
             component: component.to_owned(),
         });
     }
     Ok(())
+}
+
+/// Returns the stem Windows would compare against its device names.
+///
+/// Everything from the first dot is dropped, surrounding space is dropped, and the superscript
+/// digits Windows folds onto `1`, `2` and `3` are folded the same way. `NUL .txt` and `COM¹` name
+/// devices; a comparison against the raw text would not say so.
+fn device_stem(component: &str) -> String {
+    component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim()
+        .chars()
+        .map(|character| match character {
+            '¹' => '1',
+            '²' => '2',
+            '³' => '3',
+            other => other.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+/// What kind of object a name is taken by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Directory,
+    /// A symbolic link or a reparse point, examined without following it.
+    Link,
+    /// Something else: a device, a socket, a named pipe.
+    Other,
 }
 
 /// The stable filesystem identity of one object.
@@ -458,10 +532,10 @@ impl AuthorisedDirectory {
     ///
     /// Returns the first rule the name breaks, or the open failure.
     pub fn subdirectory(&self, name: &RelativeName) -> Result<Self, Escape> {
-        let mut directory = self.clone_handle()?;
+        self.check_prefixes(name, name.components().len())?;
+        let directory = open_directory(&self.directory, name.as_str())?;
         let mut display = self.display.clone();
         for component in name.components() {
-            directory = open_child_directory(&directory, component)?;
             display.push(component);
         }
         Self::from_handle(self.environment_id, directory, display)
@@ -470,28 +544,37 @@ impl AuthorisedDirectory {
     /// Creates a subdirectory, owner-only, and opens it as an authority of its own.
     ///
     /// An existing directory is opened rather than replaced; an existing non-directory is refused.
+    /// Every component is created and opened against this directory's own handle with the
+    /// accumulated path, so the boundary is this directory at every step.
     ///
     /// # Errors
     ///
     /// Returns the first rule the name breaks, or the create or open failure.
     pub fn create_subdirectory(&self, name: &RelativeName) -> Result<Self, Escape> {
-        let mut directory = self.clone_handle()?;
+        let components = name.components();
+        let mut prefix = String::new();
         let mut display = self.display.clone();
-        for component in name.components() {
-            let child = RelativeName::parse(component)?;
-            match create_owner_only_directory(&directory, &child) {
+        for component in &components {
+            check_component(component)?;
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            match create_owner_only_directory(&self.directory, &prefix) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(Escape::Unopenable {
-                        component: component.to_owned(),
+                        component: prefix.clone(),
                         detail: error.to_string(),
                     });
                 }
             }
-            directory = open_child_directory(&directory, component)?;
+            let child = open_directory(&self.directory, &prefix)?;
+            owner_only(&child, &prefix)?;
             display.push(component);
         }
+        let directory = open_directory(&self.directory, name.as_str())?;
         Self::from_handle(self.environment_id, directory, display)
     }
 
@@ -505,12 +588,12 @@ impl AuthorisedDirectory {
         name: &RelativeName,
         policy: ObjectPolicy,
     ) -> Result<AuthorisedFile, Escape> {
-        let (parent, leaf) = self.walk(name)?;
+        self.check_prefixes(name, name.components().len() - 1)?;
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         no_wait(&mut options);
-        let file = open_leaf(&parent, leaf, &options)?;
-        AuthorisedFile::adopt(self.environment_id, file, leaf, policy)
+        let file = open_object(&self.directory, name.as_str(), &options)?;
+        AuthorisedFile::adopt(self.environment_id, file, name.as_str(), policy)
     }
 
     /// Creates a descendant exclusively, refusing every link on the way.
@@ -522,7 +605,7 @@ impl AuthorisedDirectory {
     ///
     /// Returns the first rule the name breaks, or the create failure.
     pub fn create_new(&self, name: &RelativeName) -> Result<AuthorisedFile, Escape> {
-        let (parent, leaf) = self.walk(name)?;
+        self.check_prefixes(name, name.components().len() - 1)?;
         let mut options = OpenOptions::new();
         options
             .read(true)
@@ -531,8 +614,13 @@ impl AuthorisedDirectory {
             .follow(FollowSymlinks::No);
         no_wait(&mut options);
         owner_only_file(&mut options);
-        let file = open_leaf(&parent, leaf, &options)?;
-        AuthorisedFile::adopt(self.environment_id, file, leaf, ObjectPolicy::HostOwnedFile)
+        let file = open_object(&self.directory, name.as_str(), &options)?;
+        AuthorisedFile::adopt(
+            self.environment_id,
+            file,
+            name.as_str(),
+            ObjectPolicy::HostOwnedFile,
+        )
     }
 
     /// Opens a descendant this host created, for reading and writing.
@@ -541,41 +629,93 @@ impl AuthorisedDirectory {
     ///
     /// Returns the first rule the name or the object breaks.
     pub fn open_write(&self, name: &RelativeName) -> Result<AuthorisedFile, Escape> {
-        let (parent, leaf) = self.walk(name)?;
+        self.check_prefixes(name, name.components().len() - 1)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).follow(FollowSymlinks::No);
         no_wait(&mut options);
-        let file = open_leaf(&parent, leaf, &options)?;
-        AuthorisedFile::adopt(self.environment_id, file, leaf, ObjectPolicy::HostOwnedFile)
+        let file = open_object(&self.directory, name.as_str(), &options)?;
+        AuthorisedFile::adopt(
+            self.environment_id,
+            file,
+            name.as_str(),
+            ObjectPolicy::HostOwnedFile,
+        )
     }
 
-    /// Returns true when a descendant exists, whatever kind of object it is.
-    #[must_use]
-    pub fn exists(&self, name: &RelativeName) -> bool {
-        match self.walk(name) {
-            Ok((parent, leaf)) => parent.symlink_metadata(leaf).is_ok(),
-            Err(_) => false,
+    /// Reports what kind of object a descendant is, without following a link to find out.
+    ///
+    /// A caller that has to distinguish "it is not there" from "the storage would not say" needs
+    /// both answers, which is why this reports the refusal rather than a boolean.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Escape::NotFound`] when the name is absent, or the storage failure when the
+    /// platform would not answer.
+    pub fn probe(&self, name: &RelativeName) -> Result<ObjectKind, Escape> {
+        self.check_prefixes(name, name.components().len() - 1)?;
+        match self.directory.symlink_metadata(name.as_str()) {
+            Ok(metadata) => {
+                let kind = metadata.file_type();
+                Ok(if kind.is_symlink() {
+                    ObjectKind::Link
+                } else if kind.is_dir() {
+                    ObjectKind::Directory
+                } else if kind.is_file() {
+                    ObjectKind::File
+                } else {
+                    ObjectKind::Other
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(Escape::NotFound {
+                component: name.as_str().to_owned(),
+            }),
+            Err(error) => Err(classify(&self.directory, name.as_str(), &error)),
+        }
+    }
+
+    /// Returns whether a descendant's name is taken by anything at all.
+    ///
+    /// A directory, a link and a device all count as taken. A storage failure is reported rather
+    /// than read as an absence, because a caller that treated it as one would overwrite something
+    /// it could not see.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage failure when the platform would not answer.
+    pub fn occupied(&self, name: &RelativeName) -> Result<bool, Escape> {
+        match self.probe(name) {
+            Ok(_) => Ok(true),
+            Err(Escape::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
     /// Renames a descendant of this directory into a descendant of `destination`.
     ///
-    /// Both names are resolved component by component first, so neither side can be redirected by
-    /// a link. The rename itself is one operation relative to the two opened parents.
+    /// Both names have every prefix resolved against their own authorised directory first, so
+    /// neither side can be redirected by a link, and the rename itself is one operation relative
+    /// to the two authorised handles.
     ///
     /// # Errors
     ///
-    /// Returns the first rule either name breaks, or the rename failure.
+    /// Returns [`Escape::WrongEnvironment`] when the two handles belong to different environments,
+    /// the first rule either name breaks, or the rename failure.
     pub fn rename_into(
         &self,
         name: &RelativeName,
         destination: &Self,
         destination_name: &RelativeName,
     ) -> Result<(), Escape> {
-        let (from_parent, from_leaf) = self.walk(name)?;
-        let (to_parent, to_leaf) = destination.walk(destination_name)?;
-        from_parent
-            .rename(from_leaf, &to_parent, to_leaf)
+        // Two environments are never one filesystem authority, even when they share a disk.
+        destination.check_environment(self.environment_id)?;
+        self.check_prefixes(name, name.components().len() - 1)?;
+        destination.check_prefixes(destination_name, destination_name.components().len() - 1)?;
+        self.directory
+            .rename(
+                name.as_str(),
+                &destination.directory,
+                destination_name.as_str(),
+            )
             .map_err(|error| Escape::Unopenable {
                 component: destination_name.as_str().to_owned(),
                 detail: error.to_string(),
@@ -589,15 +729,31 @@ impl AuthorisedDirectory {
     /// Returns the first rule the name breaks, or the removal failure. A name that is already
     /// absent succeeds.
     pub fn remove(&self, name: &RelativeName) -> Result<(), Escape> {
-        let (parent, leaf) = self.walk(name)?;
-        match parent.remove_file_or_symlink(leaf) {
+        self.check_prefixes(name, name.components().len() - 1)?;
+        match self.directory.remove_file_or_symlink(name.as_str()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(Escape::Unopenable {
-                component: leaf.to_owned(),
+                component: name.as_str().to_owned(),
                 detail: error.to_string(),
             }),
         }
+    }
+
+    /// Flushes this directory's own entries to storage.
+    ///
+    /// A payload file that is created, or renamed into the completed area, is not durable until
+    /// the directory that names it is. The journal commits after this, so a record that says a
+    /// file exists is never more durable than the name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Escape::Unopenable`] when the flush fails.
+    pub fn sync(&self) -> Result<(), Escape> {
+        sync_directory(&self.directory).map_err(|error| Escape::Unopenable {
+            component: self.display.display().to_string(),
+            detail: error.to_string(),
+        })
     }
 
     /// Returns the host path of a descendant, for a grant that has to name one.
@@ -614,24 +770,24 @@ impl AuthorisedDirectory {
         path
     }
 
-    fn clone_handle(&self) -> Result<Dir, Escape> {
-        self.directory
-            .try_clone()
-            .map_err(|error| Escape::Unopenable {
-                component: self.display.display().to_string(),
-                detail: error.to_string(),
-            })
-    }
-
-    /// Opens every component but the last, returning that parent and the leaf name.
-    fn walk<'a>(&self, name: &'a RelativeName) -> Result<(Dir, &'a str), Escape> {
-        let mut components = name.components();
-        let leaf = components.pop().ok_or(Escape::Empty)?;
-        let mut directory = self.clone_handle()?;
-        for component in components {
-            directory = open_child_directory(&directory, component)?;
+    /// Opens the first `depth` prefixes of a name, each against this directory's own handle.
+    ///
+    /// Every open carries the boundary of *this* directory rather than of the previous component,
+    /// so a directory moved out of the authorised tree between two prefixes makes the next open
+    /// fail. Each open also refuses a link at its own position, which is the component-wise half
+    /// of the policy.
+    fn check_prefixes(&self, name: &RelativeName, depth: usize) -> Result<(), Escape> {
+        let components = name.components();
+        let mut prefix = String::new();
+        for component in components.iter().take(depth) {
+            check_component(component)?;
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            drop(open_directory(&self.directory, &prefix)?);
         }
-        Ok((directory, leaf))
+        Ok(())
     }
 }
 
@@ -787,18 +943,129 @@ fn directory_identity(directory: &Dir, what: &Path) -> Result<ObjectIdentity, Es
     })
 }
 
-fn open_child_directory(directory: &Dir, component: &str) -> Result<Dir, Escape> {
-    check_component(component)?;
-    directory
-        .open_dir_nofollow(component)
-        .map_err(|error| classify(directory, component, &error))
+/// Opens one path beneath `directory`, refusing a link at its final component.
+fn open_directory(directory: &Dir, path: &str) -> Result<Dir, Escape> {
+    let opened = directory
+        .open_dir_nofollow(path)
+        .map_err(|error| classify(directory, path, &error))?;
+    refuse_reparse_point(&opened, path)?;
+    Ok(opened)
 }
 
-fn open_leaf(directory: &Dir, leaf: &str, options: &OpenOptions) -> Result<File, Escape> {
-    check_component(leaf)?;
-    directory
-        .open_with(leaf, options)
-        .map_err(|error| classify(directory, leaf, &error))
+/// Opens one object beneath `directory` with the caller's options.
+fn open_object(directory: &Dir, path: &str, options: &OpenOptions) -> Result<File, Escape> {
+    let opened = directory
+        .open_with(path, options)
+        .map_err(|error| classify(directory, path, &error))?;
+    refuse_reparse_file(&opened, path)?;
+    Ok(opened)
+}
+
+/// Refuses an opened directory that is a reparse point of any tag.
+///
+/// `cap_std`'s no-follow test on Windows recognises the name-surrogate tags, which covers
+/// junctions and symbolic links and not every reparse point. This check is the attribute itself,
+/// read from the handle that was opened.
+#[cfg(windows)]
+fn refuse_reparse_point(directory: &Dir, path: &str) -> Result<(), Escape> {
+    use cap_primitives::fs::_WindowsByHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let metadata = directory
+        .dir_metadata()
+        .map_err(|error| classify(directory, path, &error))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Escape::Link {
+            component: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn refuse_reparse_point(_directory: &Dir, _path: &str) -> Result<(), Escape> {
+    Ok(())
+}
+
+/// Refuses an opened file that is a reparse point of any tag.
+#[cfg(windows)]
+fn refuse_reparse_file(file: &File, path: &str) -> Result<(), Escape> {
+    use cap_primitives::fs::_WindowsByHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let metadata = file.metadata().map_err(|error| Escape::Unopenable {
+        component: path.to_owned(),
+        detail: error.to_string(),
+    })?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Escape::Link {
+            component: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn refuse_reparse_file(_file: &File, _path: &str) -> Result<(), Escape> {
+    Ok(())
+}
+
+/// Checks that a directory this host created belongs to this user and is owner-only.
+#[cfg(unix)]
+fn owner_only(directory: &Dir, path: &str) -> Result<(), Escape> {
+    use cap_std::fs::MetadataExt as _;
+
+    let metadata = directory
+        .dir_metadata()
+        .map_err(|error| classify(directory, path, &error))?;
+    let expected = rustix_uid();
+    if metadata.uid() != expected {
+        return Err(Escape::WrongKind {
+            detail: format!(
+                "{path} belongs to user {} and this host runs as {expected}",
+                metadata.uid()
+            ),
+        });
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(Escape::WrongKind {
+            detail: format!(
+                "{path} is mode {:o} and a KalaReach directory is owner-only",
+                metadata.mode() & 0o777
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Windows has no mode bits. The staging root carries a protected access-control list, and
+/// checking that list is part of the Windows qualification pass rather than of this open.
+#[cfg(not(unix))]
+fn owner_only(_directory: &Dir, _path: &str) -> Result<(), Escape> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn rustix_uid() -> u32 {
+    kr_ipc::paths::current_uid()
+}
+
+/// Flushes a directory's entries to storage.
+#[cfg(unix)]
+fn sync_directory(directory: &Dir) -> std::io::Result<()> {
+    use std::os::fd::AsFd as _;
+
+    // The descriptor is duplicated so the flush owns what it closes; `fsync` on a directory
+    // descriptor is what makes the names inside it durable.
+    let descriptor = directory.as_fd().try_clone_to_owned()?;
+    std::fs::File::from(descriptor).sync_all()
+}
+
+/// Windows refuses a flush on a directory handle, and a rename inside one volume is the platform's
+/// own ordered metadata operation. The Windows qualification pass records what that leaves open.
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Dir) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Reads an open failure as a link refusal where it was one, and as an open failure otherwise.
@@ -814,11 +1081,17 @@ fn classify(directory: &Dir, component: &str, error: &std::io::Error) -> Escape 
     if is_link_errno(error) {
         return Escape::Link { component: owned };
     }
+    // Examined without following it. A name replaced between the failed open and this look is
+    // reported as whichever it is now, which changes the diagnosis and never the refusal: the open
+    // failed either way.
     if directory
         .symlink_metadata(component)
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
         return Escape::Link { component: owned };
+    }
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Escape::NotFound { component: owned };
     }
     Escape::Unopenable {
         component: owned,
@@ -880,19 +1153,19 @@ fn owner_only_file(options: &mut OpenOptions) {
 fn owner_only_file(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
-fn create_owner_only_directory(directory: &Dir, name: &RelativeName) -> std::io::Result<()> {
+fn create_owner_only_directory(directory: &Dir, path: &str) -> std::io::Result<()> {
     use cap_std::fs::DirBuilderExt as _;
 
     let mut builder = cap_std::fs::DirBuilder::new();
     builder.mode(0o700);
-    directory.create_dir_with(name.as_str(), &builder)
+    directory.create_dir_with(path, &builder)
 }
 
 #[cfg(not(unix))]
-fn create_owner_only_directory(directory: &Dir, name: &RelativeName) -> std::io::Result<()> {
+fn create_owner_only_directory(directory: &Dir, path: &str) -> std::io::Result<()> {
     // The staging root carries the owner-only access-control list and blocks inheritance from
     // above it; a directory created beneath it inherits that list.
-    directory.create_dir(name.as_str())
+    directory.create_dir(path)
 }
 
 #[cfg(test)]
@@ -1255,8 +1528,16 @@ mod tests {
         incomplete
             .rename_into(&name("staged.part"), &complete, &name("published.bin"))
             .expect("renames");
-        assert!(!incomplete.exists(&name("staged.part")));
-        assert!(complete.exists(&name("published.bin")));
+        assert!(
+            !incomplete
+                .occupied(&name("staged.part"))
+                .expect("the storage answers")
+        );
+        assert!(
+            complete
+                .occupied(&name("published.bin"))
+                .expect("the storage answers")
+        );
         assert_eq!(
             std::fs::read(root.path().join("complete").join("published.bin")).expect("reads"),
             b"verified"
