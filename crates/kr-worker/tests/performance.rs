@@ -100,20 +100,67 @@ fn build() -> BuildId {
     BuildId::new("kr-perf/0").expect("a build identifier")
 }
 
-/// Creates one session, or says why it could not be created.
+/// What a measurement is responsible for closing.
+///
+/// A create the daemon answered names a session. A create whose answer was lost names nothing yet,
+/// and what it may have made is exactly what nobody else will close, so its identifier stays here
+/// until the daemon is asked again and says what that identifier made.
+#[derive(Default)]
+struct Owned {
+    sessions: Vec<SessionCreateResult>,
+    unresolved: Vec<ActionId>,
+}
+
+/// Creates one session, recording what it owns, or says why it could not be created.
 ///
 /// Nothing here panics. A measurement that panicked part way through would leave every session it
 /// had already made running, so each step reports its failure and the caller closes what it owns
 /// before it reports anything.
-async fn create(host: &Host) -> Result<SessionCreateResult, String> {
+async fn create(host: &Host, owned: &mut Owned) -> Result<SessionCreateResult, String> {
+    // The identifier is decided before the call and kept. A create whose answer never arrives has
+    // still happened, so asking again with the same identifier is how the measurement learns what
+    // it owns rather than leaving a session nobody will close; the daemon answers a repeat with the
+    // outcome it recorded the first time. It goes into the record before the call, because the
+    // moment it is on the wire is the moment it can have made something.
+    let action = ActionId::new(kr_ipc::new_uuid());
+    owned.unresolved.push(action);
+    let asked = ask_create(host, action, CREATE_ATTEMPTS).await;
+    match asked {
+        Ok(created) => {
+            owned.unresolved.retain(|held| *held != action);
+            owned.sessions.push(created.clone());
+            Ok(created)
+        }
+        Err(Unresolved::Nothing(failure)) => {
+            // The daemon answered that it made nothing, so there is nothing to own.
+            owned.unresolved.retain(|held| *held != action);
+            Err(failure)
+        }
+        // Whether this identifier made a session is still unknown, so it stays owned and cleanup
+        // asks about it again.
+        Err(Unresolved::Unknown(failure)) => Err(failure),
+    }
+}
+
+/// Why a create did not name a session.
+enum Unresolved {
+    /// The daemon answered that it made nothing.
+    Nothing(String),
+    /// What that identifier made, if anything, the answer does not say.
+    Unknown(String),
+}
+
+/// Asks the daemon to perform one create, repeating the same identifier while the answer is lost.
+async fn ask_create(
+    host: &Host,
+    action: ActionId,
+    attempts: usize,
+) -> Result<SessionCreateResult, Unresolved> {
     let endpoint = host
         .temp
         .environment()
         .controller_endpoint()
-        .map_err(|error| format!("the daemon's endpoint: {error}"))?;
-    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-        .await
-        .map_err(|error| format!("connect to the daemon: {error}"))?;
+        .map_err(|error| Unresolved::Unknown(format!("the daemon's endpoint: {error}")))?;
     let params = SessionCreateParams {
         environment_id: host.environment_id,
         presentation: Presentation::Invisible,
@@ -127,18 +174,20 @@ async fn create(host: &Host) -> Result<SessionCreateResult, String> {
             value: "/usr/bin:/bin".to_owned(),
         }],
     };
-    // The identifier is decided before the call and kept. A create whose answer never arrives has
-    // still happened, so asking again with the same identifier is how the measurement learns what
-    // it owns rather than leaving a session nobody will close; the daemon answers a repeat with the
-    // outcome it recorded the first time.
-    let action = ActionId::new(kr_ipc::new_uuid());
     let mut failure = String::new();
-    for attempt in 0..CREATE_ATTEMPTS {
-        if attempt > 0 {
-            client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-                .await
-                .map_err(|error| format!("connect to the daemon: {error}"))?;
-        }
+    for _ in 0..attempts {
+        let mut client = match LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await {
+            Ok(client) => client,
+            Err(error) => {
+                failure = format!("connect to the daemon: {error}");
+                continue;
+            }
+        };
+        // Each connection carries its own freshness window, and section 23 binds the window into
+        // the payload digest: a repeat over a new connection is a new first admission rather than
+        // an automatic retry, and the daemon says so. That answer still tells this caller
+        // something - the identifier reached the daemon and made a reservation - but not what it
+        // made, which is why such an identifier stays owned.
         match client
             .mutate(
                 Method::SessionCreate,
@@ -151,22 +200,81 @@ async fn create(host: &Host) -> Result<SessionCreateResult, String> {
             Ok(Ok(value)) => {
                 return value
                     .to_typed()
-                    .map_err(|error| format!("the create result: {error}"));
+                    .map_err(|error| Unresolved::Nothing(format!("the create result: {error}")));
             }
-            // The daemon answered and refused. Nothing was created, so there is nothing to own.
-            Ok(Err(error)) => return Err(format!("the create failed: {error}")),
+            Ok(Err(error)) if error.code == kr_protocol::error::ErrorCode::IdConflict => {
+                return Err(Unresolved::Unknown(format!(
+                    "the identifier had already been admitted under another window: {error}"
+                )));
+            }
+            Ok(Err(error)) => return Err(Unresolved::Nothing(format!("the create failed: {error}"))),
             // The answer was lost. Whether the session exists is exactly what asking again settles.
             Err(error) => failure = format!("the create call: {error}"),
         }
     }
-    Err(failure)
+    Err(Unresolved::Unknown(failure))
 }
+
+/// How many times cleanup asks the daemon what this environment holds before it gives up.
+const LIST_ATTEMPTS: usize = 5;
 
 /// How many times a measurement asks for the same create before it gives up.
 ///
 /// The identifier does not change between them, so this is one create being asked about rather
 /// than several being made.
 const CREATE_ATTEMPTS: usize = 3;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_answer_was_lost_is_closed_by_the_run_that_asked_for_it() {
+    // A measurement owns a session from the moment it asks for one, not from the moment it is told
+    // about it. The daemon's list is not enough on its own: a worker it momentarily cannot read is
+    // absent from it, and the session would outlive the run that made it.
+    let host = host().await;
+    let endpoint = host
+        .temp
+        .environment()
+        .controller_endpoint()
+        .expect("the daemon's endpoint");
+    let mut owned = Owned::default();
+    create(&host, &mut owned)
+        .await
+        .expect("creates one the ordinary way");
+    assert_eq!(owned.sessions.len(), 1);
+    assert!(
+        owned.unresolved.is_empty(),
+        "a create that was answered leaves nothing hanging"
+    );
+
+    // And one whose answer never arrived: the identifier is all the run has, which is exactly what
+    // `create` leaves in the record when it cannot resolve it.
+    let lost = ActionId::new(kr_ipc::new_uuid());
+    owned.unresolved.push(lost);
+    close_all(&host, &owned)
+        .await
+        .expect("closes everything the run owns");
+
+    // Cleanup asked under that identifier, so the daemon has admitted it: asking now, on another
+    // connection and so under another window, is refused as the new first admission it would be.
+    // That refusal is the evidence, because an identifier nobody had used would create a session
+    // here instead - which is exactly what the environment would have been left holding.
+    match ask_create(&host, lost, CREATE_ATTEMPTS).await {
+        Err(Unresolved::Unknown(_)) => {}
+        Ok(created) => panic!(
+            "the run never asked what that identifier made, and made {} asking now",
+            created.session.session_id
+        ),
+        Err(Unresolved::Nothing(failure)) => panic!("the daemon's answer: {failure}"),
+    }
+    assert!(
+        list_sessions(&endpoint, host.environment_id)
+            .await
+            .expect("the daemon's session list")
+            .is_empty(),
+        "and the run leaves no session of its own running"
+    );
+    let _ = host.controller;
+    let _ = host.worker;
+}
 
 /// Returns the resident size of a process, in kibibytes.
 ///
@@ -229,7 +337,7 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
     // Every session this measurement creates is recorded here as it is created, and every one of
     // them is closed below whatever the measurement itself did. A measurement that ended by
     // panicking would otherwise leave a worker running for each session it had made.
-    let mut owned = Vec::new();
+    let mut owned = Owned::default();
     let measured = idle(&host, &mut owned).await;
     let closed = close_all(&host, &owned).await;
 
@@ -250,18 +358,18 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
 }
 
 /// Takes the idle measurement, reporting a failure rather than ending the process on one.
-async fn idle(host: &Host, owned: &mut Vec<SessionCreateResult>) -> Result<Idle, String> {
+async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     for _ in 0..IDLE_SESSIONS {
-        owned.push(create(host).await?);
+        create(host, owned).await?;
     }
-    if owned.len() != IDLE_SESSIONS {
+    if owned.sessions.len() != IDLE_SESSIONS {
         return Err(format!("{IDLE_SESSIONS} sessions were created"));
     }
 
     // Thirty-two views, spread over the sessions, each subscribed to output.
     let mut views = Vec::new();
     for index in 0..ATTACHED_VIEWS {
-        let created = &owned[index % owned.len()];
+        let created = &owned.sessions[index % owned.sessions.len()];
         let endpoint = kr_ipc::paths::Endpoint::from_path(
             created
                 .endpoint
@@ -276,7 +384,7 @@ async fn idle(host: &Host, owned: &mut Vec<SessionCreateResult>) -> Result<Idle,
     // it. The worker is where the canonical grid and the retained output live, so a measurement
     // that counted only the shell would leave out the thing it is meant to be measuring.
     let mut measured: Vec<u32> = Vec::new();
-    for created in owned.iter() {
+    for created in &owned.sessions {
         // A session with no root process, or a worker the kernel will not name, is a measurement
         // this host cannot take. Quietly leaving it out would make the answer smaller than the
         // truth, which is the one direction a resource measurement must never be wrong in.
@@ -335,7 +443,7 @@ async fn idle(host: &Host, owned: &mut Vec<SessionCreateResult>) -> Result<Idle,
 async fn attach_to_a_usable_screen() {
     let host = host().await;
     // As above: what was created is closed whatever the measurement did with it.
-    let mut owned = Vec::new();
+    let mut owned = Owned::default();
     let measured = attach(&host, &mut owned).await;
     let closed = close_all(&host, &owned).await;
 
@@ -349,9 +457,9 @@ async fn attach_to_a_usable_screen() {
 }
 
 /// Times the attachments and returns the slowest, reporting a failure rather than ending on one.
-async fn attach(host: &Host, owned: &mut Vec<SessionCreateResult>) -> Result<Duration, String> {
-    owned.push(create(host).await?);
-    let created = owned.last().ok_or_else(|| "a session".to_owned())?;
+async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
+    create(host, owned).await?;
+    let created = owned.sessions.last().ok_or_else(|| "a session".to_owned())?;
 
     // Both presentations are measured. A terminal of the session's own size is handed the stream
     // directly; one of any other size is drawn a rendering of the canonical grid, and a person
@@ -395,7 +503,7 @@ async fn attach(host: &Host, owned: &mut Vec<SessionCreateResult>) -> Result<Dur
 /// it. Every session a run creates is therefore closed by that run. What is waited for is the
 /// daemon's own record of the closure rather than the worker's entry in the process table, because
 /// a process that has exited and has not yet been reaped is still an entry and is not a session.
-async fn close_all(host: &Host, sessions: &[SessionCreateResult]) -> Result<(), String> {
+async fn close_all(host: &Host, owned: &Owned) -> Result<(), String> {
     let endpoint = host
         .temp
         .environment()
@@ -409,13 +517,43 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) -> Result<(), 
     // What the daemon says this environment holds, not only what the measurement kept a note of.
     // A create whose answer never arrived is a session all the same, and this host is the
     // measurement's own, so everything in it is the measurement's to close.
-    let mut wanted: std::collections::BTreeSet<_> = sessions
+    let mut wanted: std::collections::BTreeSet<_> = owned
+        .sessions
         .iter()
         .map(|created| created.session.session_id)
         .collect();
-    match list_sessions(&endpoint, host.environment_id).await {
+    // Asked until it answers. A list that failed once is not an empty environment, and treating it
+    // as one is how a live worker outlives the run that made it.
+    let mut listing = Err("the daemon's session list was never asked".to_owned());
+    for _ in 0..LIST_ATTEMPTS {
+        listing = list_sessions(&endpoint, host.environment_id).await;
+        if listing.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    match listing {
         Ok(listed) => wanted.extend(listed),
         Err(error) => refused.push(format!("the daemon's session list: {error}")),
+    }
+    // A create whose answer was lost is asked about again here, under the identifier it was made
+    // with. The daemon answers a repeat with the outcome it recorded, so this names the session
+    // that create made; if it made none, this makes one, which is then closed with the rest. Either
+    // way nothing this measurement started is left behind, which is what the list alone cannot
+    // promise: a worker the daemon momentarily cannot read is absent from it.
+    for action in &owned.unresolved {
+        match ask_create(host, *action, CREATE_ATTEMPTS).await {
+            Ok(created) => {
+                wanted.insert(created.session.session_id);
+            }
+            Err(Unresolved::Nothing(_)) => {}
+            // The daemon holds a reservation under this identifier and will not name what it made.
+            // Everything live in this environment is closed below whatever that was, and the run
+            // says it could not account for the identifier rather than ending quietly.
+            Err(Unresolved::Unknown(failure)) => {
+                refused.push(format!("{action}: what it made was never named: {failure}"));
+            }
+        }
     }
     if wanted.is_empty() {
         return if refused.is_empty() {
