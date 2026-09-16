@@ -142,6 +142,10 @@ impl ControlTransport for IpcTransport {
             // One frame at a time. A second caller waits for the first's turn rather than finding
             // an empty slot and reporting a connection that is perfectly alive as ended.
             let _turn = self.turn.lock().await;
+            // The notification is registered *before* the last look at the flag, so a close that
+            // lands between the two is delivered to this future rather than missed: a `Notified`
+            // created afterwards would wait for the next notification, and there is not one.
+            let closing = self.ending.notified();
             if self.has_closed() {
                 return Err(ClientError::ConnectionEnded);
             }
@@ -153,7 +157,6 @@ impl ControlTransport for IpcTransport {
             let Some(mut writer) = self.writer.lock().await.take() else {
                 return Err(ClientError::ConnectionEnded);
             };
-            let closing = self.ending.notified();
             let outcome = tokio::select! {
                 outcome = writer.write_message(frame) => outcome,
                 // Closing while this was waiting for the socket. The half is dropped with this
@@ -183,6 +186,9 @@ impl ControlTransport for IpcTransport {
 
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
         Box::pin(async move {
+            // As in `send`: the notification is registered before the flag is read, so a close
+            // that lands in between reaches this future.
+            let closing = self.ending.notified();
             if self.has_closed() {
                 return Ok(None);
             }
@@ -194,7 +200,6 @@ impl ControlTransport for IpcTransport {
             let Some(mut reader) = self.reader.lock().await.take() else {
                 return Err(ClientError::ConnectionEnded);
             };
-            let closing = self.ending.notified();
             // A local frame reader reports the end of the stream as a failure rather than as an
             // absent message, because every local exchange has a next frame until the peer goes
             // away. To a session the two are one thing: the connection ended.
