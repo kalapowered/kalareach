@@ -712,6 +712,52 @@ async fn type_and_observe(
     panic!("the session's output never carried what was typed: {seen:?}");
 }
 
+/// Closes a session and waits for the daemon to record that its worker has gone.
+///
+/// A worker is deliberately not a child of whatever created it, so a test that only asked for a
+/// close and walked away would leave a process running until the machine was restarted. The
+/// acceptance says `closing`; this waits for the record.
+async fn close_session(client: &mut LocalClient, host: &Host, session_id: SessionId) {
+    let _ = client
+        .mutate(
+            Method::SessionClose,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget {
+                environment_id: host.environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &SessionCloseParams { session_id },
+        )
+        .await
+        .expect("the call reaches the daemon");
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while tokio::time::Instant::now() < deadline {
+        let listed: kr_protocol::session::SessionListResult = client
+            .request(
+                Method::SessionList,
+                &kr_protocol::session::SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed: true,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the list succeeds")
+            .to_typed()
+            .expect("decodes");
+        if listed.sessions.iter().any(|summary| {
+            summary.session_id == session_id && summary.state == SessionState::Closed
+        }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the session did not finish closing");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor() {
     let Some(host) = Host::create() else {
@@ -797,20 +843,7 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     );
 
     session.close();
-    let _ = local
-        .mutate(
-            Method::SessionClose,
-            ActionId::new(kr_ipc::new_uuid()),
-            ActionTarget {
-                environment_id: host.environment_id,
-                session_id: Nullable::some(session_id),
-                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
-                application_instance_id: Nullable::null(),
-                agent_binding_revision: Nullable::null(),
-            },
-            &SessionCloseParams { session_id },
-        )
-        .await;
+    close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
 
@@ -881,6 +914,7 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     );
 
     session.close();
+    close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
 
@@ -935,6 +969,7 @@ async fn one_session_runs_over_a_local_socket_and_over_the_network() {
 
     over_socket.close();
     over_network.close();
+    close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
 
@@ -1014,6 +1049,8 @@ async fn the_remote_path_ending_takes_neither_the_worker_nor_a_local_attachment(
     );
     let _ = local_attachment;
 
+    drop(attached_locally);
+    close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
 
@@ -1186,5 +1223,7 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
         "and the local attachment is still attached"
     );
 
+    drop(attached_locally);
+    close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }

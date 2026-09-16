@@ -413,8 +413,12 @@ impl NetworkHost {
             self.devices.revoke(device_id, kr_ipc::now_ms())?;
             registry.advance_authority_revision()?;
             let revision = registry.authority_revision()?;
+            // The connections this fences are this device's. Nobody else's authority was
+            // withdrawn, and a local terminal losing its connection because a phone was revoked
+            // would be a fence on the wrong thing.
+            let revoked = kr_transport::listener::device_principal(&device_id);
             let mut admitted = controller.admitted.lock().await;
-            admitted.retain(|_, connection| connection.admitted_revision >= revision);
+            admitted.retain(|_, connection| connection.actor_id != revoked);
             drop(admitted);
             revision
         };

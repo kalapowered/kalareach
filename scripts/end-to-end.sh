@@ -74,7 +74,13 @@ suites=(
   "kr-controller:contracts|the two contracts the transport names: a revocable registration and a durable commit that outlives its caller"
   "kr-controller:envelope|what the daemon accepts on its client endpoint"
   "kr-cli:attach|a killed attachment restoring its terminal, and a detach from another window"
+  "kr-controller:network|a device pairing over iroh and over a relay, attaching, subscribing from a cursor, typing under the input lease, reconnecting, being revoked mid-connection, and losing its path without taking the session with it"
 )
+
+# The network suite starts a worker process, and the only place it can look for one is beside its
+# own binary. Building it first is what makes the suite run rather than say it could not.
+echo "building the worker the suites launch"
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build -p kr-worker --bin kr-worker
 
 failed=0
 for entry in "${suites[@]}"; do
