@@ -616,7 +616,8 @@ impl RemoteConnection {
             Err(error) => return failure(request.request_id, error),
         };
         let envelope = self.envelope(validated);
-        match proxy.forward_read(request, &envelope).await {
+        let authority = self.authority_deadline();
+        match proxy.forward_read(request, &envelope, authority).await {
             Ok(response) => ControlFrame::Response(Response {
                 request_id: request.request_id,
                 outcome: response.outcome,
@@ -773,6 +774,25 @@ impl RemoteConnection {
         if let Some(proxy) = self.proxy.lock().await.take() {
             proxy.close();
         }
+    }
+
+    /// Returns when the authority behind this connection's requests runs out.
+    ///
+    /// On the machine's own continuous clock, which is the clock the worker reads, and shortened
+    /// rather than lengthened by a pause between the two readings. A read carries no accepted
+    /// deadline of its own, and raw input is a read: without this, a batch admitted a moment
+    /// before the grant expired could still be written to the application after it. Null when the
+    /// grant does not expire.
+    fn authority_deadline(&self) -> kr_protocol::scalars::Nullable<kr_protocol::scalars::U64> {
+        let Some(deadline) = self.authority.grant_deadline else {
+            return kr_protocol::scalars::Nullable::null();
+        };
+        kr_protocol::scalars::Nullable(crate::service::remaining_deadline(
+            &*self.controller.shared_clock,
+            &*self.controller.clock,
+            deadline,
+            None,
+        ))
     }
 
     /// Returns the envelope every request on this connection is attributed to.

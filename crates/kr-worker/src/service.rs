@@ -1391,7 +1391,8 @@ impl WorkerService {
         self.request(
             state,
             &forwarded.request,
-            &Caller::forwarded(&forwarded.actor),
+            &Caller::forwarded(&forwarded.actor)
+                .until(forwarded.authority_deadline_boot_ms.0.map(U64::get)),
         )
     }
 
@@ -1770,6 +1771,29 @@ impl WorkerService {
         Ok(())
     }
 
+    /// Refuses a request whose authority has run out, and fences what it was allowed to do.
+    ///
+    /// Read on the machine's own continuous clock, which is the clock the daemon expressed the
+    /// deadline on. Called inside the boundary that decides what reaches the application, because
+    /// that is the only place the answer cannot go stale: a batch that passed the daemon's check
+    /// can wait here while the grant behind it ends.
+    ///
+    /// The refusal alone is not the fence. Input this caller has already handed over and the
+    /// terminal has not taken goes with it, on the writer's own boundary, the same way a takeover
+    /// discards the previous holder's bytes.
+    fn check_authority_deadline(&self, caller: &Caller, session: &mut Session) -> Result<()> {
+        let Some(deadline) = caller.authority_deadline_boot_ms else {
+            return Ok(());
+        };
+        if self.shared_clock.boot_elapsed_ms() < deadline {
+            return Ok(());
+        }
+        self.fence_remote_input(session);
+        Err(WorkerError::GenerationFenced {
+            detail: "the authority this request was admitted under has run out".to_owned(),
+        })
+    }
+
     /// Checks the subject preconditions the mutation requires.
     ///
     /// `expected` is a closed map of the subject facts the caller believes. Anything it names that
@@ -2137,9 +2161,11 @@ impl WorkerService {
         let accepted = {
             let mut session = self.runtime.session();
             // Inside the session's own boundary, where the lease and the fence are: a forwarded
-            // batch can wait here while the controller installs a newer authority revision, and
-            // what the boundary decides is what actually reaches the application.
+            // batch can wait here while the controller installs a newer authority revision or the
+            // grant behind it runs out, and what the boundary decides is what actually reaches the
+            // application.
             self.check_validated_revision(caller)?;
+            self.check_authority_deadline(caller, &mut session)?;
             Self::check_session(&session, params.session_id)?;
             Self::check_capability(&session, params.attachment_id, AttachmentCapability::Input)?;
             let accepted = session.write_input(
@@ -2367,6 +2393,13 @@ pub struct Caller {
     /// A forwarded request carries one; a local caller does not, because its authority is the
     /// operating-system identity the socket authenticated rather than a grant.
     pub validated_revision: Option<kr_protocol::ids::AuthorityRevision>,
+    /// When the authority behind the request runs out, on the machine's own continuous clock.
+    ///
+    /// A mutation carries its accepted deadline, but a read carries none of its own and raw input
+    /// is a read. Without this, input admitted a moment before a grant expired could still be
+    /// written to the application afterwards, because the queue it waits in is not the check that
+    /// admitted it. Absent for a caller whose authority does not expire.
+    pub authority_deadline_boot_ms: Option<u64>,
 }
 
 impl Caller {
@@ -2378,6 +2411,7 @@ impl Caller {
             ingress: ActorIngress::LocalIpc,
             grant_id: Nullable::null(),
             validated_revision: None,
+            authority_deadline_boot_ms: None,
         }
     }
 
@@ -2389,7 +2423,15 @@ impl Caller {
             ingress: actor.ingress,
             grant_id: actor.grant_id,
             validated_revision: actor.grant_revision.as_ref().copied(),
+            authority_deadline_boot_ms: None,
         }
+    }
+
+    /// Returns the same caller, with when the authority behind its request runs out.
+    #[must_use]
+    pub const fn until(mut self, authority_deadline_boot_ms: Option<u64>) -> Self {
+        self.authority_deadline_boot_ms = authority_deadline_boot_ms;
+        self
     }
 
     /// Returns true when this caller reached the host over a network transport.

@@ -4373,6 +4373,17 @@
           "$ref": "#/$defs/ActorEnvelope",
           "description": "The actor the host verified, with the ingress it arrived on."
         },
+        "authority_deadline_boot_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the authority behind this request runs out, on the machine's own continuous clock.\n\nA read is not a mutation and carries no accepted deadline, but the authority behind it\nstill ends: a grant expires while the request is in the worker's queue, and raw input is a\nrequest. The worker compares this inside the boundary that decides what reaches the\napplication, so bytes admitted a moment before an expiry are not written after it. Null\nwhen the caller's authority is not something that expires, which is what a locally\nauthenticated caller's operating-system identity is."
+        },
         "request": {
           "$ref": "#/$defs/Request",
           "description": "The caller's request, exactly as it arrived at the host."
@@ -4380,7 +4391,8 @@
       },
       "required": [
         "request",
-        "actor"
+        "actor",
+        "authority_deadline_boot_ms"
       ],
       "type": "object"
     },

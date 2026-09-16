@@ -26,7 +26,7 @@ use kr_protocol::local::{
     ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalClientKind,
 };
 use kr_protocol::method::Method;
-use kr_protocol::scalars::U64;
+use kr_protocol::scalars::{Nullable, U64};
 use tokio::sync::{Mutex, oneshot};
 
 use crate::directory::KnownWorker;
@@ -298,13 +298,19 @@ impl WorkerProxy {
     /// # Errors
     ///
     /// As [`Self::forward_mutation`].
-    pub async fn forward_read(&self, request: &Request, actor: &ActorEnvelope) -> Result<Response> {
+    pub async fn forward_read(
+        &self,
+        request: &Request,
+        actor: &ActorEnvelope,
+        authority_deadline_boot_ms: Nullable<U64>,
+    ) -> Result<Response> {
         let request_id = self.next_request_id();
         let mut forwarded = request.clone();
         forwarded.request_id = request_id;
         let frame = ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
             request: forwarded,
             actor: actor.clone(),
+            authority_deadline_boot_ms,
         }));
         self.call(request_id, &frame).await
     }

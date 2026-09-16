@@ -3268,6 +3268,17 @@ export interface MutationRequest1 {
  */
 export interface ForwardedRequest {
   actor: ActorEnvelope2
+  /**
+   * When the authority behind this request runs out, on the machine's own continuous clock.
+   *
+   * A read is not a mutation and carries no accepted deadline, but the authority behind it
+   * still ends: a grant expires while the request is in the worker's queue, and raw input is a
+   * request. The worker compares this inside the boundary that decides what reaches the
+   * application, so bytes admitted a moment before an expiry are not written after it. Null
+   * when the caller's authority is not something that expires, which is what a locally
+   * authenticated caller's operating-system identity is.
+   */
+  authority_deadline_boot_ms: U64 | null
   request: Request1
 }
 /**
