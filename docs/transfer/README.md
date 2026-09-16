@@ -56,7 +56,17 @@ them; nothing in the protocol depends on the defaults.
 
 A submitted attachment follows its session's retention instead of the seven-day window, which is why
 submission is recorded rather than inferred from age. The host tells the service which sessions its
-retention still covers; the service never guesses.
+retention still covers; the service never guesses. An attachment uploaded without a session takes
+the draft's session when it is submitted to one, so the retention that applies is the session's
+rather than the seven-day window that applied while nothing held it.
+
+What the host currently answers with is the session registry: a session is covered while it has a
+launch reservation in any phase, which includes failed and closed ones. That preserves files rather
+than losing them, and it is deliberately the conservative direction, but it is not yet the session
+retention policy the archive owns. Until the archive's retained-session state is the thing the
+sweep asks, a submitted attachment can be preserved longer than that policy would keep it. The
+service asks one question through one interface, so making the archive the authority is a change to
+the answer and not to the sweep.
 
 The environment's staged total counts three things together: receiving uploads at their declared
 size, published attachments still on disk, and open download snapshots. A snapshot is storage this
@@ -101,6 +111,16 @@ mutation with an ordinary action window and an ordinary response. That is what k
 inside the host's admission path rather than beside it. `kr_transfer::chunks::ChunkChannel` is the
 client half; it replaces the window whenever the host renews one, so a long chunk sequence never has
 to think about freshness.
+
+The two endpoints carry disjoint sets of methods, and a caller that uses the wrong one is refused.
+Without that the larger bound would also admit an oversized ordinary request that the control
+endpoint would have refused, which would make the second endpoint a second admission rather than the
+same admission at a second frame size.
+
+Whoever runs the daemon binds both endpoints and owns the tasks that serve them. A listener has to
+be released before the next daemon binds the same address, and only the owner of the task holding it
+can release it at a known moment: an in-process restart releases both and binds them again, which
+is what the restart test does.
 
 ## Storage layout
 
@@ -181,9 +201,17 @@ The directory that names a payload is flushed before the record that depends on 
 `publishing` row the same way, so a caller does not have to wait for the next start to learn what
 happened.
 
-Recovery at startup does two jobs, both idempotent. It resolves every interrupted publication as
-above, and it removes every payload whose upload is closed but whose bytes are still on disk,
-releasing those bytes only once the file is gone.
+Cleanup is owned by the row, not by the caller that happened to close it. Closing an upload or a
+snapshot marks it as still holding a payload, and the reservation is released only when the file is
+actually gone. A removal that fails leaves the mark and the charge in place, and the next pass tries
+again: a removal failure never turns into forgotten bytes.
+
+Recovery at startup does three jobs, all idempotent. It resolves every interrupted publication as
+above. It retries every payload whose row says the bytes are still there. And it reconciles the
+three staging areas against the journal: every payload name is derived from a transfer identifier,
+so a name no live row accounts for is a file an interrupted `upload.begin` created before its row
+existed, and it is removed. The hourly sweep runs the same retry, so a removal that failed once does
+not wait for the next start.
 
 That is what makes the ownership contract true rather than merely stated. A worker's death
 invalidates an insertion; it does not change the identity of a file this service already verified.
@@ -268,11 +296,23 @@ tag.
 An open is non-blocking on Unix, so a name replaced with a named pipe cannot hold the service open
 waiting for a writer. The handle's own metadata then decides whether it is a regular file.
 
+The service's own directories are owner-only, and that is checked on every open rather than assumed
+from the create. On Unix the check is the owner and the mode read from the opened handle. Windows
+has no mode bits, so the equivalent is the access-control list: the staging directory is created
+with a protected list naming its owner, and every open reads the list back and refuses one that
+names any account except the directory's owner, the local system and the administrators group, or
+that carries an entry this host cannot evaluate. The staging directory is additionally required to
+hold a *protected* list, which is what stops the user profile above it from propagating an entry
+into it; the directories beneath it inherit their owner entry from it by design, so their lists are
+checked for the accounts they name.
+
 `fixtures/transfer/no-escape.json` is the policy in one document: the names the validator accepts and
 refuses, the tree a lookup runs against, and what each lookup must do. The Unix cases run in
 `crates/kr-transfer/tests/authority.rs`. The Windows cases are in the same fixture and are built
 when the running platform can build them; where it cannot, the case is reported as not exercised
-rather than counted as passed.
+rather than counted as passed, and the run prints the names it skipped so a Windows qualification
+pass knows which ones it owns. The Windows access-list checks have their own tests beside the code
+that performs them, and they run on Windows.
 
 ### What this does not promise
 
@@ -281,9 +321,11 @@ Three residuals, stated rather than implied.
 Handle-based resolution removes path-resolution races. It does not make an authorised file private
 from another process running as the same operating-system user: such a process can open and write a
 file this host has authorised, before or after it is published, and nothing in this crate prevents
-it. What the host does instead is verify: `upload.finish` reads the whole staged file back and
-refuses to publish bytes that do not match the declaration, and a download stages its own copy
-rather than trusting an open handle.
+it. What the host does instead is detect: `upload.finish` reads the whole staged file back and
+refuses to publish bytes that do not match the declaration, a published payload's recorded identity
+is compared before it is served, and every chunk's digest is compared against the bytes that come
+off the disk. A tampered attachment is refused rather than delivered. For a source this service
+never verified, detection is not enough and it stages its own copy.
 
 A component replaced with a symbolic link between the prefix pass and the open of the object
 beneath it can be traversed. The destination is still beneath the authorised directory, because
@@ -295,18 +337,48 @@ and `cap-std`'s own documentation is the authority on what that leaves open.
 
 ## Verified downloads
 
-One distinction decides everything else. A published attachment is already an immutable
-revision, because nothing writes it after it is verified, so it is read where it lies. Any other source is
-concurrently writable, and an open handle does not make it otherwise, so the host stages a bounded
-immutable copy and serves that. `download.begin` says which of the two happened in its result, so
-nothing has to infer it.
+One distinction decides everything else. A published attachment is written once by this service,
+verified, and never written by it again, so it is read where it lies. Any other source is a file
+something else owns, and an open handle does not make it otherwise, so the host stages its own
+bounded copy and serves that. `download.begin` says which of the three cases it took, so nothing
+has to infer it: `immutable_source` for an attachment read in place, `cloned_snapshot` for a
+copy-on-write clone, `staged_snapshot` for a byte copy.
 
-A snapshot records the source's stable identity, its size and its modification time as they were
-when the copy was taken. If any of them moved by the time the copy finished, or the source grew past
-the size the snapshot reserved for it, the snapshot fails with `SOURCE_CHANGED` and keeps a failed
-record. It never serves chunks that came from two versions of a file. The staged copy is then read
-back through its own handle and verified, so a snapshot something else wrote during staging fails
-there rather than serving bytes nothing checked.
+The first of those is worth stating exactly, because it is easy to read as more than it is. This
+service writes an attachment once and no client can reach it: the staging area is the
+environment's own, owner-only, and the bytes are named only by an opaque handle. What it is *not*
+is protection from another process running as the same operating-system user. Such a process can
+open and write the file, and nothing in this crate prevents it.
+
+What the service does instead is refuse to serve bytes it cannot vouch for. The publication records
+the payload's filesystem identity, every chunk's digest is recorded when it is verified, and both
+are checked when bytes are served: a replaced file fails its identity, and changed bytes fail their
+chunk digest. A download of a tampered attachment is refused rather than delivered.
+
+Staging a second copy of an attachment would not add a guarantee here. The same process could write
+the copy, which the same digests would catch, and every download would charge the environment twice
+for bytes it already holds. So the answer for an attachment is detection plus accounting rather than
+duplication; the answer for a source this service does not own is a snapshot, because there the
+bytes are not ones it ever verified.
+
+A snapshot is taken one of two ways, and the result says which.
+
+Where the platform and the filesystem offer a copy-on-write clone, the host clones the source:
+`clonefile` on Apple platforms, the `FICLONE` ioctl on Linux. A clone is atomic with respect to the
+source, so the snapshot is one revision of it whatever a writer does next, and the result is
+`cloned_snapshot`.
+
+Everywhere else the host copies the bytes, which is not atomic, and the result is `staged_snapshot`.
+There the source's stable identity, its size and its modification time are recorded before the copy
+and compared after it. If any of them moved, or the source grew past the size the snapshot reserved
+for it, the snapshot fails with `SOURCE_CHANGED` and keeps a failed record. Metadata equality is
+evidence, not proof: a writer that rewrote the same number of bytes and restored the modification
+time would pass it. What the comparison rules out is every change that leaves a trace, and what the
+chunk digests then rule out is a snapshot changed after it was taken.
+
+Either way the staged file is read back through its own handle and its digests computed from what
+is actually on disk, so a snapshot never serves bytes nothing checked, and never serves chunks that
+came from two versions of a file.
 
 Resuming names the transfer. The same snapshot answers with the same identity, size, digest, chunk
 layout and expiry. A snapshot that has expired, failed or been released is refused rather than
@@ -359,6 +431,12 @@ selected model's size limit, how many attachments a draft may carry, the inserti
 external destination. The host checks the handle against that declaration. An operation that claims
 a model media capability cannot bind bytes that did not decode as an image.
 
+A declared external destination is a disclosure, and the host's job is to keep it. It is recorded
+with the binding and returned by the draft, so a client can show where the bytes go before the
+prompt is submitted and can still say so afterwards. A destination declared without being named, or
+longer than a person reads, is refused: an unnamed destination discloses nothing. The host does not
+resolve the destination, reach it, or check it against anything; it refuses to lose it.
+
 Section 12 allows three insertion methods and no others:
 
 | Method | Needs a readable path | What it is |
@@ -374,10 +452,26 @@ widened and no file is placed in a repository. A typed submission needs no path 
 
 ## Previews
 
-Section 14 fixes four numbers and a format list, and the decoder is those bounds and nothing else:
-40 megapixels of input, 256 MiB of decode memory, a 16 MiB decoded-thumbnail budget, and PNG, JPEG,
-WebP and the first frame of a GIF. The `image` crate is pinned at 0.25.10 with only those four
-decoders compiled in.
+Section 14 fixes four numbers and a format list: 40 megapixels of input, 256 MiB of decode memory, a
+16 MiB decoded-thumbnail budget, and PNG, JPEG, WebP and the first frame of a GIF. The `image` crate
+is pinned at 0.25.10 with only those four decoders compiled in.
+
+Two of those numbers need this crate's own enforcement rather than the library's. `image` documents
+its allocation limit as advisory, and several of its decoders hold an intermediate buffer the size
+of the output, so the limit is set on the decoder *and* the decode is refused in advance on an
+estimate: the declared pixels charged at eight bytes each, four for the pixel and four for one
+working buffer beside it. An image inside the pixel limit whose estimate is above the budget
+publishes as a file. The encoded input is bounded too, at 48 MiB, because both reader passes are
+taken over the same handle and a small image with a large trailing payload would otherwise spend the
+budget in the pass that was supposed to read a header.
+
+The third is a bound the specification does not state and a result cannot do without: a reply travels
+in one frame, and a draft's reply carries one preview per bound attachment. So an encoded thumbnail
+is at most 48 KiB, and an image whose thumbnail does not fit is re-encoded at 320, 192 and then 96
+pixels until it does. The smallest of those is small enough that its raw pixels fit the budget
+whatever they are, so the ladder always ends. The dimensions are also re-checked on the decoded
+image rather than trusted from the header, because a GIF's logical screen is not always its first
+frame's size.
 
 The format comes from the bytes. A declared media type is a claim and an extension is metadata, so
 the crate's own sniffing decides which decoder runs. The dimensions are read from the header before
@@ -428,3 +522,8 @@ source registers it with `register_scope` and addresses files beneath it by rela
 `AuthorisedDirectory` is the type the project and change-set services reuse. The policy is the
 same whether it authorises a staging area, a repository working tree or a client's chosen
 destination.
+
+The daemon side is `crates/kr-controller/src/transfer.rs`: it binds the attachment-chunk endpoint
+with `bind_chunk_endpoint`, serves it with `serve_chunks`, answers the service's one question about
+session retention, and sweeps hourly. Everything else a transfer method needs, from the action
+window to the receipt, is the daemon's ordinary path.

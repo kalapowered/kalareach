@@ -380,16 +380,26 @@ endpoints and the retention.
 
 Admission is the ordinary path. A transfer read is checked against current authority before and
 after it runs. A transfer mutation carries an action window, is checked against the method registry,
-and runs on a task a dropped connection cannot cancel part way. A retry after a lost reply is
+and runs on a task a dropped connection cannot cancel part way. The admission is checked once more
+immediately before the write, because everything in between can wait for a lock or a thread: an
+action whose accepted deadline passed while it queued does not go on to write. A request whose
+envelope names a different session from the object its parameters name is refused, because the
+receipt would otherwise name a session the effect never touched. A retry after a lost reply is
 answered from the retained record before the freshness window is considered, because the retry
 carries the window it was first admitted under.
 
 A 1 MiB attachment chunk does not fit a control frame, so chunk traffic has its own endpoint,
 `t.sock`, framed at the attachment bound. Everything else about that connection is the control
-connection's: the same handshake, the same peer credentials and the same action windows.
+connection's: the same handshake, the same peer credentials and the same action windows. The two
+endpoints carry disjoint sets of methods, so the larger bound is not a second admission: a chunk on
+the control endpoint and an ordinary request on the chunk endpoint are both refused. The daemon
+process binds both and owns the tasks that serve them, so a restart releases the addresses before it
+binds them again.
 
 The service cannot know which sessions this host still retains, so the daemon answers for them: a
-session the registry has a reservation for keeps what was submitted to it. An hourly sweep expires
+session the registry has a reservation for, in any launch phase, keeps what was submitted to it.
+That preserves files rather than losing them, and it is not yet the archive's retention policy; when
+the archive owns that state, the answer to this one question changes and the sweep does not. An hourly sweep expires
 unfinished uploads after twenty-four hours, unused attachments after seven days, and download
 snapshots at their own expiry. At startup the service resolves any publication an earlier daemon
 left between its two commits, so a handle never names a file this host has not found.
