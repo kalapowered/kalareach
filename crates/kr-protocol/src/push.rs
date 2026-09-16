@@ -1281,9 +1281,12 @@ pub enum PushDeliveryState {
     ///
     /// It is the honest answer to "did the provider take it", and the answer is not yet. Section 16
     /// retries transient failures with exponential backoff and jitter and stops at expiry, so this
-    /// state ends as `queued` or as `expired` and never as anything a host has to poll for. A
-    /// duplicate presented while one is retrying is answered `duplicate`, because the request is
-    /// already held.
+    /// state settles on its own rather than becoming something a host has to poll for. It ends as
+    /// `queued` when the provider takes it, as `token_disabled` or `refused` when the provider
+    /// rejects the token or the message, as `revoked` when the authorisation ends first, as
+    /// `abandoned` when the gateway stops trying, and as `expired` when the notification's moment
+    /// passes. A duplicate presented while one is retrying is answered `duplicate`, because the
+    /// request is already held.
     Retrying,
     /// The destination is over its rate policy; this collapsed into an attention update.
     Collapsed,
