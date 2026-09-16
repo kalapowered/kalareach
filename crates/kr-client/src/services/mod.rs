@@ -65,16 +65,19 @@ pub enum RelayDirection {
 /// so a caller that respects them is a caller whose refusals are about capacity:
 ///
 /// - the two endpoints differ;
-/// - `byte_ceiling` is at least 64 KiB and fits an unsigned 64-bit counter, and it is the
-///   *cumulative* figure for the reservation rather than an increment;
+/// - `byte_ceiling` is at least 64 KiB and at most 2^53 - 1, which is the largest whole number the
+///   service's own arithmetic carries exactly, and it is the *cumulative* figure for the
+///   reservation rather than an increment;
 /// - `duration_seconds` is between 30 and 900;
 /// - `payer`, when it names an account, carries that account's identifier and the identifier of the
 ///   authorisation it gave this caller, which is a lower-case hyphenated UUID;
 /// - `lease_id`, when it names one, is a lower-case hyphenated UUID.
 ///
 /// The payer's own bound applies on top: an account authorisation states the most one lease may
-/// hold outstanding under it, and an installation paying for itself is bounded by the free
-/// allowance and by the 8 MiB aggregate section 17 gives every principal.
+/// hold outstanding against that account's allowance, and an installation paying for itself is
+/// bounded by the free allowance and by the 8 MiB aggregate section 17 gives every principal. The
+/// bounded grace a principal is granted when its allowance runs out is not measured against the
+/// authorisation's figure, because it is not taken from the allowance the figure protects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaseRequest {
     /// The endpoint the traffic comes from.
@@ -83,7 +86,7 @@ pub struct LeaseRequest {
     pub destination: EndpointKey,
     /// Which way the lease permits traffic to flow.
     pub direction: RelayDirection,
-    /// The cumulative bytes the payer is asking to reserve. At least 64 KiB.
+    /// The cumulative bytes the payer is asking to reserve. At least 64 KiB, at most 2^53 - 1.
     pub byte_ceiling: u64,
     /// How long the lease should last, in seconds. Between 30 and 900.
     pub duration_seconds: u32,

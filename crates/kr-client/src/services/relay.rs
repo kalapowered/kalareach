@@ -299,17 +299,26 @@ pub struct RelayWarning {
 ///
 /// Section 17 grants 15 minutes or 100 MiB after the first exhaustion, whichever ends first, shared
 /// across every connection of the principal, and requires the remaining interval to be visible
-/// before the relay closes. [`Self::remaining_ms`] is that interval.
+/// before the relay closes.
+///
+/// These figures are that window, which is the principal's rather than any one connection's. A
+/// connection stops at the earlier of the window's end and its own lease's deadline, and
+/// [`RelayLease::effective_deadline_ms`] is the figure the relay enforces for it: the two differ
+/// when the reservation's deadline comes first, which a billing period ending inside the window is
+/// enough to cause. So a client counting down one connection counts down to its lease, and a client
+/// showing the account counts down to this.
+///
+/// [`RelayLease::effective_deadline_ms`]: kr_protocol::relay::RelayLease::effective_deadline_ms
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayGraceRemainder {
     /// When the first exhaustion happened.
     pub started_at: String,
-    /// When the grace ends, whatever is left of its bytes.
+    /// When the window ends, whatever is left of its bytes.
     pub ends_at: String,
-    /// Milliseconds left before the relay closes.
+    /// Milliseconds left of the window, for the principal rather than for one connection.
     pub remaining_ms: U64,
-    /// Bytes left of the shared allowance.
+    /// Bytes left of the window, across every connection of this principal.
     pub remaining_bytes: U64,
 }
 
