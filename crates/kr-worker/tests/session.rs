@@ -1001,6 +1001,53 @@ async fn a_succession_the_budget_refuses_leaves_the_size_unowned_rather_than_wit
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn input_for_a_terminal_that_has_gone_is_refused_rather_than_acknowledged() {
+    // The writer sets this latch on its way out, and it goes out for one reason: a terminal that
+    // will take nothing more. An acknowledgement after that would say bytes reached an application
+    // that nothing can reach, which is the one thing an acknowledgement must not mean.
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 120");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let attachment = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    session
+        .attach(&terminal_attachment(session_id), requested, attachment)
+        .expect("attaches");
+    let held = session
+        .acquire_input(attachment, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("takes the keys");
+    let epoch = held.lease.epoch.get();
+    session
+        .write_input(attachment, epoch, 0, b"before", std::time::Instant::now())
+        .expect("an ordinary write while the terminal is there");
+
+    session
+        .terminal_gone_latch()
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let refused = session
+        .write_input(attachment, epoch, 1, b"after", std::time::Instant::now())
+        .expect_err("the terminal takes nothing more");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "and it is the resource it is rather than a closure: {refused}"
+    );
+    assert_eq!(
+        session.state(),
+        SessionState::Live,
+        "the session itself is still open; what happened to the shell is the monitor's question"
+    );
+
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
 /// An attachment that never declared what terminal it is, which is what `--no-probe` chooses.
 fn undeclared_attachment(session_id: SessionId) -> SessionAttachParams {
     let mut params = terminal_attachment(session_id);

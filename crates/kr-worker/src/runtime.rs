@@ -199,6 +199,15 @@ enum Delivery {
     Gone,
 }
 
+/// Sets the session's latch when the writer thread ends, however it ends.
+struct TerminalEnded(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for TerminalEnded {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The terminal a batch is written into, and what it will do to a writer.
 ///
 /// `answers` is whether a write comes straight back rather than waiting for the application to
@@ -491,6 +500,9 @@ impl SessionRuntime {
         // which is what lets the bytes that lease left behind be counted once it can no longer be
         // writing them.
         let fence = session.input_fence_handle();
+        // Set when the writer ends. A terminal that will take nothing more is one this session
+        // cannot accept input for, and saying so is better than acknowledging bytes nothing writes.
+        let terminal_gone = session.terminal_gone_latch();
         let session = Arc::new(Mutex::new(session));
         let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<InputBatch>();
         // Bounded on purpose. Section 9 says a slow *client* must never hold the read loop, and it
@@ -586,8 +598,14 @@ impl SessionRuntime {
         let writer_lease = Arc::clone(&queued_lease);
         let writer_paste_open = Arc::clone(&delivered_paste_open);
         let writer_lease_change = Arc::clone(&lease_change_queued);
+        let writer_gone = Arc::clone(&terminal_gone);
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
+
+            // Set on every way out of the loop below. The writer ends for one reason - a terminal
+            // that will take nothing more - and from then on this session refuses input rather than
+            // acknowledging bytes nothing will write.
+            let _ended = TerminalEnded(writer_gone);
 
             // What the application is actually inside, which is the only thing that decides
             // whether it needs a paste terminator. The framer says what the accepted stream means;

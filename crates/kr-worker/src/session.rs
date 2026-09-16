@@ -140,6 +140,12 @@ pub struct Session {
     delivered_paste_open: Arc<std::sync::atomic::AtomicBool>,
     /// The boundary the writer and a lease change share, described at [`Session::input_gate`].
     input_gate: Arc<std::sync::Mutex<()>>,
+    /// Set by the writer on its way out, when the terminal will take nothing more.
+    ///
+    /// Input accepted after that would be acknowledged and never written, which is the one thing an
+    /// acknowledgement must not mean. The writer ends only for a terminal that has actually gone:
+    /// it waits out an application that has merely paused.
+    terminal_gone: Arc<std::sync::atomic::AtomicBool>,
     /// The lease epoch the writer compares every queued batch against.
     ///
     /// The session publishes it the moment the lease changes, which is what lets the count of what
@@ -217,6 +223,7 @@ impl Session {
             queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             queued_lease_bytes: Arc::new(crate::runtime::LeaseBytes::new()),
             input_gate: Arc::new(std::sync::Mutex::new(())),
+            terminal_gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             input_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             delivered_paste_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lease_change_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -395,6 +402,15 @@ impl Session {
     #[must_use]
     pub fn input_gate(&self) -> Arc<std::sync::Mutex<()>> {
         Arc::clone(&self.input_gate)
+    }
+
+    /// Returns the latch the writer sets when the terminal will take nothing more.
+    ///
+    /// The writer holds it for the one moment it ends: a terminal that has gone. From then on this
+    /// session refuses input rather than acknowledging bytes nothing will write.
+    #[must_use]
+    pub fn terminal_gone_latch(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.terminal_gone)
     }
 
     /// Renders the session for the wire.
@@ -829,6 +845,18 @@ impl Session {
     ) -> Result<InputAccepted> {
         if !self.state.accepts_input() {
             return Err(WorkerError::SessionClosed);
+        }
+        // A terminal that has gone takes nothing, and an acknowledgement here would say the
+        // opposite. The session itself is still open - what happened to the shell is the child
+        // monitor's question, not this one's - so this is the resource it is rather than a closure.
+        if self
+            .terminal_gone
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(WorkerError::ResourceUnavailable {
+                detail: "this session's terminal has gone, so nothing can be written to it"
+                    .to_owned(),
+            });
         }
         match self.lease.accept_write(attachment_id, epoch, sequence) {
             Ok(()) => {}
