@@ -697,11 +697,38 @@ it. The alert channel holds a bounded number of alerts, each cut to a bounded le
 Nothing else is refused. Text, titles and the rows that scroll off all draw on room the geometry
 already reserved, so an admitted session can fill its screens, set a title as often as it likes and
 push its stack to the bound without meeting a refusal. Rows that scroll off the screen are charged
-to the historical cache where they join it, counted by where the history ends rather than by how
-many rows it holds, so a row that arrives while the library drops an older one is still counted, and
-the cache is brought back under its bound there rather than at the next measurement: two rows can
-carry more than the whole of it. A resize moves rows between a screen and the history, and the two
-are charged to different bounds, so both are measured again at the resize.
+to the historical cache where they join it, and the cache is brought back under its bound there
+rather than at the next measurement: two rows can carry more than the whole of it. A resize moves
+rows between a screen and the history, and the two are charged to different bounds, so both are
+measured again at the resize.
+
+**What the retained rows cost is carried, not measured.** A row is charged once, where it leaves
+the screen, and gives its charge back once, where it is dropped; the running figure is what
+`CanonicalGrid::history_bytes` reads, in one read however long the history is. Which rows joined
+and which were given up comes from the two ends of the retained range, so a row that arrives while
+the library drops an older one is still counted, and each row that joined is reached by its own
+index rather than by walking to it. Nothing re-reads a row that has already been charged, because
+nothing changes one: the library compresses a row as it scrolls it off and never touches it again.
+The two operations that do rewrite the retained rows — a resize, which reflows them, and an
+erasure, which discards them — say so, and the account is built again from the rows themselves.
+`CanonicalGrid::measure_history_bytes` is the same figure worked out by walking the rows, and a
+test compares the two after every operation of a randomised sequence of prints, resizes, buffer
+switches, erasures and evictions.
+
+That is what makes the byte bound affordable. Working the figure out by walking the history made
+every read cost what the whole history cost, so a session printing steadily paid a scan of
+everything it had retained on every read: on one machine 0.10 MiB/s of scrolling output against
+the 5 MiB/s of KR-PERF-007, and a read behind 1,841 retained rows costing sixty-two times a read
+behind ninety. `cargo test -p kr-term --release --test perf` asserts both ends of that: the rate on
+a stream that scrolls, and that a read behind a full cache costs what a read behind an empty one
+costs.
+
+Eviction reads the same figures. The rows to give up are chosen by what each one costs, oldest
+first, until what is left costs no more than the bound, so one pass lands under it rather than
+converging towards it, and no cell is read to decide. A row count worked out from the average cost
+of a row would land on the wrong side of the bound whenever the rows are not all the same size,
+which is the usual case.
+
 
 Where a reservation and a measurement look at the same thing, the reservation is the larger. Both
 work a link's parameter table out through the same rounding, from the separators the parameter field
@@ -885,3 +912,10 @@ cargo test -p kr-term --release --test perf -- --nocapture
 It drains a 5 MiB stream of mixed text, colour changes, cursor movement, wide characters,
 hyperlinks, alternate-screen churn and queries, and checks that the response lane, the row cache and
 the session budget all stayed inside their bounds while it did.
+
+It drains a second 5 MiB stream that scrolls. The first one clears its screen as often as it prints,
+so rows rarely leave it and the historical cache stays empty; an application printing into a session
+scrolls, every row it prints joins the cache, and the cache is enforced on the way. That is the load
+a host actually carries, and it has to hold the target too. Beside it is a benchmark that feeds the
+same bytes to two sessions, one whose history is emptied before every read and one whose history is
+at its bound and evicting on every row, and asserts that the two reads cost about the same.

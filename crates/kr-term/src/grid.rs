@@ -16,7 +16,7 @@
 //! * The Unicode model is pinned rather than defaulted, so the width of a cell is a property of
 //!   the profile and not of whatever the library's default happened to be that month.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -167,7 +167,39 @@ pub const ALERT_LIST_BYTES: u64 =
 struct RowsBytes {
     cell_slots: u64,
     records: u64,
-    history: u64,
+}
+
+/// What the retained rows cost, kept as they move rather than worked out by walking them.
+///
+/// The bound in section 8 is on bytes, and a row can carry a hundred times what the row beside it
+/// carries, so the cache cannot be enforced by counting rows. Walking the whole history for every
+/// row that joins it is what the bound used to cost, and it grows with the history: a session
+/// printing steadily paid a scan of everything it had retained on every read.
+///
+/// So the figure is carried instead. A row is charged once, where it leaves the screen, and its
+/// charge is given back once, where the row is dropped. Nothing re-reads a row that has already
+/// been charged, because nothing changes one: the library compresses a row as it scrolls it off
+/// and never touches it again. The two operations that do rewrite the retained rows — a resize,
+/// which reflows them, and an erasure, which discards them — say so, and the account is built
+/// again from the rows themselves.
+///
+/// [`CanonicalGrid::measure_history_bytes`] is the same figure worked out the long way, and the
+/// two agree after every operation.
+#[derive(Debug, Default)]
+struct HistoryAccount {
+    /// What each retained row costs, oldest first.
+    ///
+    /// One entry a row, so the rows dropped to bring the cache back under its bound are chosen by
+    /// what they cost rather than by an average of what the rows cost.
+    charges: VecDeque<u64>,
+    /// The sum of `charges`.
+    total: u64,
+    /// The stable identifier of the oldest retained row.
+    start: i64,
+    /// The stable identifier one past the newest retained row.
+    end: i64,
+    /// Whether something rewrote or discarded the rows this account is holding.
+    stale: bool,
 }
 
 /// What the grid is holding, measured in one pass.
@@ -192,8 +224,6 @@ pub struct BufferBytes {
     /// link counted in one place and not the other would look like an allocation where nothing was
     /// allocated.
     pub links: u64,
-    /// What the retained rows hold, against the historical cache's own bound.
-    pub history: u64,
 }
 
 /// The configuration the grid library runs under.
@@ -436,6 +466,8 @@ pub struct CanonicalGrid {
     dropped_marks: u64,
     /// Whether a resize left each buffer holding more than its geometry can, primary first.
     stale: [bool; 2],
+    /// What the retained rows cost, carried rather than measured.
+    history: HistoryAccount,
 }
 
 /// The cell a text run ended on, so a later combining mark can still join it.
@@ -507,7 +539,7 @@ impl CanonicalGrid {
             dropped: Arc::clone(&alerts_dropped),
         }));
         budget.commit_geometry(footprint);
-        Ok(Self {
+        let mut grid = Self {
             terminal,
             writer_log,
             alerts,
@@ -519,7 +551,10 @@ impl CanonicalGrid {
             tail: None,
             dropped_marks: 0,
             stale: [false, false],
-        })
+            history: HistoryAccount::default(),
+        };
+        grid.sync_history();
+        Ok(grid)
     }
 
     /// Applies one approved event.
@@ -546,6 +581,7 @@ impl CanonicalGrid {
             && let Ok(text) = core::str::from_utf8(event.raw())
         {
             self.print(text);
+            self.sync_history();
             return adapted;
         }
         // Anything that is not printed text ends the cell, exactly as it would have done inside one
@@ -554,6 +590,7 @@ impl CanonicalGrid {
         if !adapted.actions.is_empty() {
             self.terminal.perform_actions(adapted.actions.clone());
         }
+        self.sync_history();
         adapted
     }
 
@@ -874,21 +911,30 @@ impl CanonicalGrid {
 
     /// Lowers the scrollback row count so the retained rows fit the byte bound.
     ///
-    /// Returns whether the rows were over it. `bytes` is what they cost now, which the caller has
-    /// already measured. The caller applies it while the primary buffer is showing: the library
-    /// drops the rows it is told to drop as it appends, and nothing appends to a buffer that is
-    /// not showing.
+    /// Returns whether the rows were over it. The caller applies it while the primary buffer is
+    /// showing: the library drops the rows it is told to drop as it appends, and nothing appends
+    /// to a buffer that is not showing.
     ///
     /// One pass is enough, and it lands under the bound rather than converging towards it. The row
-    /// count kept is read off the rows themselves: the oldest rows are dropped one at a time until
-    /// what is left costs no more than the bound, and that count becomes the library's scrollback
-    /// size. Working it out from the average cost of a row would leave the answer wrong whenever
-    /// the rows are not all the same size, which is the usual case.
-    pub fn enforce_row_cache(&mut self, bytes: u64, limit: u64) -> bool {
-        if bytes <= limit {
+    /// count kept is read off what the rows cost: the oldest are given up one at a time until what
+    /// is left costs no more than the bound, and that count becomes the library's scrollback size.
+    /// Working it out from the average cost of a row would leave the answer wrong whenever the
+    /// rows are not all the same size, which is the usual case. Nothing is walked and no cell is
+    /// read: every one of those figures was taken where its row left the screen.
+    pub fn enforce_row_cache(&mut self, limit: u64) -> bool {
+        if self.history.total <= limit {
             return false;
         }
-        let keep = self.newest_history_rows_within(bytes, limit);
+        let mut remaining = self.history.total;
+        let mut given_up = 0usize;
+        for charge in &self.history.charges {
+            if remaining <= limit {
+                break;
+            }
+            remaining = remaining.saturating_sub(*charge);
+            given_up += 1;
+        }
+        let keep = self.history.charges.len().saturating_sub(given_up);
         let current = self.configuration.scrollback_rows.load(Ordering::Relaxed);
         // There is no floor: the retained rows are a cache, and at a wide geometry even a screen's
         // worth of them can pass the bound on its own. Keeping none of them is the right answer
@@ -902,37 +948,8 @@ impl CanonicalGrid {
                 .fetch_add(1, Ordering::Relaxed);
         }
         self.trim_scrollback();
+        self.sync_history();
         true
-    }
-
-    /// How many of the newest retained rows cost no more than `limit`, given that all of them
-    /// cost `total`.
-    ///
-    /// The rows are visited oldest first, so what is dropped is counted rather than what is kept:
-    /// once the rows still ahead cost no more than the bound, the rest of the walk changes
-    /// nothing. Every row is visited at most once.
-    fn newest_history_rows_within(&self, total: u64, limit: u64) -> usize {
-        let screen = self.primary_screen();
-        let history = screen
-            .scrollback_rows()
-            .saturating_sub(self.size.rows as usize);
-        let mut remaining = total;
-        let mut dropped = 0usize;
-        let mut index = 0usize;
-        // The links are not wanted here, only the size, so they are counted into a total nothing
-        // reads.
-        let mut seen = BTreeSet::new();
-        let mut links = 0u64;
-        screen.for_each_phys_line(|_, line| {
-            let oldest = index < history;
-            index += 1;
-            if !oldest || remaining <= limit {
-                return;
-            }
-            remaining = remaining.saturating_sub(history_row_bytes(line, &mut seen, &mut links));
-            dropped += 1;
-        });
-        history.saturating_sub(dropped)
     }
 
     /// Drops the rows that are now past the scrollback bound, without waiting for more output.
@@ -983,6 +1000,9 @@ impl CanonicalGrid {
         self.terminal.resize(to_library_size(size));
         self.size = size;
         self.stale = [true, true];
+        // The reflow rewrote every retained row and joined and split some of them, so what the
+        // account is carrying describes rows that no longer exist.
+        self.history.stale = true;
         self.normalise_storage();
         budget.commit_geometry(footprint);
         Ok(())
@@ -1015,6 +1035,10 @@ impl CanonicalGrid {
     fn normalise_storage(&mut self) {
         let alternate = self.alternate_active();
         self.stale[usize::from(alternate)] = false;
+        // Every row of the screen that is showing is cut to the columns the geometry has, retained
+        // rows included, so the charges taken when those rows left the screen no longer describe
+        // them.
+        self.history.stale = true;
         let cols = self.size.cols as usize;
         let rows = self.size.rows as usize;
         let seqno = self.terminal.current_seqno();
@@ -1047,9 +1071,11 @@ impl CanonicalGrid {
             if screen.scrollback_rows() > rows {
                 screen.erase_scrollback();
             }
+            self.sync_history();
             return;
         }
         self.trim_scrollback();
+        self.sync_history();
     }
 
     /// Ends the hyperlink the pen is inside, if it is inside one.
@@ -1061,6 +1087,7 @@ impl CanonicalGrid {
             .perform_actions(vec![Action::OperatingSystemCommand(Box::new(
                 OperatingSystemCommand::SetHyperlink(None),
             ))]);
+        self.sync_history();
     }
 
     /// Turns newline mode back on, after something in the reducer cleared it.
@@ -1069,12 +1096,14 @@ impl CanonicalGrid {
             .perform_actions(vec![Action::CSI(CSI::Mode(Mode::SetMode(
                 TerminalMode::Code(TerminalModeCode::AutomaticNewline),
             )))]);
+        self.sync_history();
     }
 
     /// Selects the shift-out character set again, after something in the reducer cleared it.
     pub fn set_shift_out(&mut self) {
         self.terminal
             .perform_actions(vec![Action::Control(ControlCode::ShiftOut)]);
+        self.sync_history();
     }
 
     /// The DECSCUSR style the reducer is using.
@@ -1391,7 +1420,6 @@ impl CanonicalGrid {
             cell_slots: rows.cell_slots,
             row_records: rows.records,
             links,
-            history: rows.history,
         }
     }
 
@@ -1441,83 +1469,139 @@ impl CanonicalGrid {
             rows.records = rows.records.saturating_add(ROW_SLOT_BYTES);
             // Every link object once, wherever the row it is on sits: a row that scrolls off takes
             // no object with it and gives none up, so both measurements read them the same way.
+            count_row_links(line, seen, links);
             if showing {
-                content = content.saturating_add(row_content_bytes(line, seen, links));
+                content = content.saturating_add(row_content_bytes(line));
                 rows.cell_slots = rows
                     .cell_slots
                     .saturating_add((line.len() as u64).saturating_mul(CELL_OVERHEAD_BYTES));
-            } else {
-                rows.history = rows
-                    .history
-                    .saturating_add(history_row_bytes(line, seen, links));
             }
         });
         content
     }
 
-    /// The stable identifier the retained history ends at, which is the top visible row.
+    /// Brings the account of the retained rows up to date with the screen.
     ///
-    /// It advances by one for every row that leaves the screen, whether or not the library dropped
-    /// an older row to make room, so it counts arrivals where a row count cannot.
-    #[must_use]
-    pub fn history_end(&self) -> i64 {
-        let screen = self.primary_screen();
-        i64::try_from(screen.visible_row_to_stable_row(0)).unwrap_or(0)
-    }
-
-    /// What the newest `rows` of the retained history cost.
+    /// Every operation that can move a row leaves this called, so what the account holds is what
+    /// the screen holds whenever anything reads it. The work is proportional to the rows that
+    /// moved: an operation that moved none costs two reads and a comparison.
     ///
-    /// The rows that have just left the screen, so the cache can be charged where they join it
-    /// rather than at the next measurement: two rows can carry more than the whole cache.
-    #[must_use]
-    pub fn newest_history_bytes(&self, rows: usize) -> u64 {
+    /// The retained rows are the stable identifiers `[start, end)`, and both ends only ever move
+    /// forwards while rows are being added and dropped. A row that leaves the screen advances the
+    /// end; a row the library drops to make room advances the start. So the two ends say exactly
+    /// which rows joined and which were given up, without reading a row to find out.
+    ///
+    /// An end that went backwards, or a rewrite that said so, means the rows themselves changed
+    /// rather than moved, and the account is built again from them. Only a resize and an erasure
+    /// do that, and neither is on the path a printing application takes.
+    fn sync_history(&mut self) {
         let screen = self.primary_screen();
         let history = screen
             .scrollback_rows()
             .saturating_sub(self.size.rows as usize);
-        let first = history.saturating_sub(rows);
-        let mut bytes = 0u64;
-        let mut index = 0usize;
-        // The links are not wanted here, only the size: they are charged to the session's one
-        // hyperlink envelope wherever they are, and a row joining the cache moves none of them.
-        let mut seen = BTreeSet::new();
-        let mut links = 0u64;
-        screen.for_each_phys_line(|_, line| {
-            let counted = index >= first && index < history;
-            index += 1;
-            if counted {
-                bytes = bytes.saturating_add(history_row_bytes(line, &mut seen, &mut links));
+        let start = i64::try_from(screen.phys_to_stable_row_index(0)).unwrap_or(0);
+        let end = start.saturating_add(i64::try_from(history).unwrap_or(0));
+        if self.history.stale || start < self.history.start || end < self.history.end {
+            self.rebuild_history(start, end);
+            return;
+        }
+        // The rows the library dropped to make room. They are the oldest, so their charges are at
+        // the front of the account. A drop count past what the account holds means a row joined
+        // and was given up between two of these calls, and a row that was never charged gives
+        // nothing back.
+        let dropped = usize::try_from(start.saturating_sub(self.history.start)).unwrap_or(0);
+        for _ in 0..dropped.min(self.history.charges.len()) {
+            let charge = self.history.charges.pop_front().unwrap_or(0);
+            self.history.total = self.history.total.saturating_sub(charge);
+        }
+        // What is left is what the rows that have just arrived cost, and they are the newest rows
+        // of the history. Each is read once, here, and never again, and each is reached by its own
+        // index rather than by walking to it, so a read that scrolled one row reads one row.
+        let arrived = history.saturating_sub(self.history.charges.len());
+        if arrived > 0 {
+            if self.alternate_active() {
+                // Nothing prints into the primary buffer while the alternate one is showing, so a
+                // row can only have reached its history through a resize, and a resize says so
+                // rather than arriving here. Charging one would mean reaching into the screen that
+                // is not showing, which the library does not offer, so the account is built again.
+                self.rebuild_history(start, end);
+                return;
             }
+            let first = history - arrived;
+            let mut charges = core::mem::take(&mut self.history.charges);
+            let mut total = self.history.total;
+            let screen = self.terminal.screen_mut();
+            for index in first..history {
+                let charge = history_row_bytes(screen.line_mut(index));
+                total = total.saturating_add(charge);
+                charges.push_back(charge);
+            }
+            self.history.charges = charges;
+            self.history.total = total;
+        }
+        self.history.start = start;
+        self.history.end = end;
+    }
+
+    /// Builds the account again from the rows themselves.
+    ///
+    /// The one walk of the retained rows there is. It happens where the rows changed rather than
+    /// moved: a resize reflows them, and an erasure discards them.
+    fn rebuild_history(&mut self, start: i64, end: i64) {
+        let mut charges =
+            VecDeque::with_capacity(usize::try_from(end.saturating_sub(start)).unwrap_or_default());
+        let mut total = 0u64;
+        self.walk_history(|charge| {
+            total = total.saturating_add(charge);
+            charges.push_back(charge);
         });
-        bytes
+        self.history = HistoryAccount {
+            charges,
+            total,
+            start,
+            end,
+            stale: false,
+        };
+    }
+
+    /// Hands `charge` what each retained row costs, oldest first.
+    fn walk_history<F: FnMut(u64)>(&self, mut charge: F) {
+        let screen = self.primary_screen();
+        let history = screen
+            .scrollback_rows()
+            .saturating_sub(self.size.rows as usize);
+        let mut index = 0usize;
+        screen.for_each_phys_line(|_, line| {
+            if index < history {
+                charge(history_row_bytes(line));
+            }
+            index += 1;
+        });
     }
 
     /// Bytes the retained rows are currently using.
     ///
+    /// Carried rather than measured: a row is charged where it leaves the screen and gives its
+    /// charge back where it is dropped, so this is a read of one figure however long the history
+    /// is. [`Self::measure_history_bytes`] is the same answer worked out by walking the rows, and
+    /// the two agree after every operation.
+    ///
     /// This counts the encoded text plus the per-cell bookkeeping the grid keeps for it, because
     /// the bound in section 8 is on resident state rather than on characters.
     #[must_use]
-    pub fn history_bytes(&self) -> u64 {
-        let screen = self.primary_screen();
-        // Only the rows above the screen. The screens have a cost of their own in the session
-        // budget, and charging them twice would make a wide grid look like it had passed a bound it
-        // has nothing to do with.
-        let history = screen
-            .scrollback_rows()
-            .saturating_sub(self.size.rows as usize);
-        let mut bytes = 0u64;
-        let mut index = 0usize;
-        // The links are not wanted here, only the size.
-        let mut seen = BTreeSet::new();
-        let mut links = 0u64;
-        screen.for_each_phys_line(|_, line| {
-            let counted = index < history;
-            index += 1;
-            if counted {
-                bytes = bytes.saturating_add(history_row_bytes(line, &mut seen, &mut links));
-            }
-        });
-        bytes
+    pub const fn history_bytes(&self) -> u64 {
+        self.history.total
+    }
+
+    /// What a walk of the retained rows says they cost.
+    ///
+    /// The long way round, and the proof that the carried figure is the right one. Nothing on the
+    /// path a printing application takes calls it.
+    #[must_use]
+    pub fn measure_history_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        self.walk_history(|charge| total = total.saturating_add(charge));
+        total
     }
 }
 
@@ -1528,13 +1612,12 @@ impl CanonicalGrid {
 /// admitted, scrollback slots included, so charging it again would count it twice. And the
 /// hyperlink objects on it are charged to the session's one hyperlink envelope wherever they are,
 /// so that a row scrolling off the screen moves no charge from one account to another.
-fn history_row_bytes(
-    line: &wezterm_term::Line,
-    seen: &mut BTreeSet<*const Hyperlink>,
-    links: &mut u64,
-) -> u64 {
+///
+/// What is left depends on the row and on nothing else, which is what lets the charge be taken
+/// once, where the row leaves the screen, and carried until the row is dropped.
+fn history_row_bytes(line: &wezterm_term::Line) -> u64 {
     let cells = line.len() as u64;
-    row_content_bytes(line, seen, links).saturating_add(cells.saturating_mul(CELL_OVERHEAD_BYTES))
+    row_content_bytes(line).saturating_add(cells.saturating_mul(CELL_OVERHEAD_BYTES))
 }
 
 /// Adds one link object, if it has not been counted already.
@@ -1726,11 +1809,7 @@ fn attributes_are_allocated(attrs: &CellAttributes) -> bool {
 /// The text as it is encoded, the allocation each cell that needs one keeps for its attributes,
 /// and the header a cell keeps once its text is too big to live inside the cell. Counting the text
 /// alone would report a screen of coloured cells as costing what a screen of plain ones costs.
-fn row_content_bytes(
-    line: &wezterm_term::Line,
-    seen: &mut BTreeSet<*const Hyperlink>,
-    links: &mut u64,
-) -> u64 {
+fn row_content_bytes(line: &wezterm_term::Line) -> u64 {
     // What the row allocates for itself before anything is on it, and then the text as the row is
     // holding it rather than as it reads: a row grows its string by appending, so it can be
     // holding twice what it shows. Nothing here asks a row for the semantic zones it can cache, so
@@ -1746,15 +1825,32 @@ fn row_content_bytes(
         if cell_text_is_on_the_heap(cell.str(), width) {
             bytes = bytes.saturating_add(CELL_TEXT_HEAP_BYTES);
         }
-        // The links are read from the same cells, in the same walk. A row carries a flag saying
-        // whether any of its cells is inside a link, and it is the row's flag rather than the
-        // cells', so a row built from cells that hold links does not have it set. Reading the
-        // cells is the answer that cannot be wrong.
+    }
+    bytes
+}
+
+/// Adds the link objects one row's cells hold to the session's running total.
+///
+/// Separate from what the row costs, because the two are counted against different things and at
+/// different moments. What a row costs is its own and is charged once, where the row moves. A link
+/// object is shared: the cells of one link hold the same object, one link can appear on rows that
+/// are not next to each other, and one envelope covers both screens and the retained rows
+/// together, so a row moving between them moves no charge. So the objects are gathered by the walk
+/// that measures the session's links, wherever the rows sit.
+///
+/// A row carries a flag saying whether any of its cells is inside a link, and it is the row's flag
+/// rather than the cells', so a row built from cells that hold links does not have it set. Reading
+/// the cells is the answer that cannot be wrong.
+fn count_row_links(
+    line: &wezterm_term::Line,
+    seen: &mut BTreeSet<*const Hyperlink>,
+    links: &mut u64,
+) {
+    for cell in line.visible_cells() {
         if let Some(link) = cell.attrs().hyperlink() {
             add_link_object(link, seen, links);
         }
     }
-    bytes
 }
 
 fn to_library_size(size: GridSize) -> TerminalSize {

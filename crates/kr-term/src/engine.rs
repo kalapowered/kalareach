@@ -237,7 +237,6 @@ pub struct Engine {
     measured_rows: usize,
     measure_now: bool,
     alternate_seen: bool,
-    history_end_seen: i64,
     links_seen: u64,
     title_truncated: bool,
     dropped_marks: u64,
@@ -284,7 +283,6 @@ impl Engine {
             measured_rows: 0,
             measure_now: false,
             alternate_seen: false,
-            history_end_seen: 0,
             links_seen: 0,
             title_truncated: false,
             dropped_marks: 0,
@@ -815,52 +813,37 @@ impl Engine {
     /// Charges the rows that have just left the screen, and evicts when they pass the bound.
     ///
     /// The historical cache is a byte bound rather than a row count, and two rows can carry more
-    /// than the whole of it, so it is enforced where the rows arrive. Counting rows is cheap;
-    /// measuring the ones that arrived is proportional to them rather than to the scrollback.
+    /// than the whole of it, so it is enforced where the rows arrive rather than at whichever read
+    /// comes next. The grid carries what the retained rows cost, charging each row where it leaves
+    /// the screen, so this reads one figure however long the history is.
     fn charge_rows_that_left_the_screen(&mut self, now_ms: u64) {
         if self.grid.alternate_active() {
             // The alternate buffer keeps no history, and its rows are numbered separately.
             return;
         }
-        // Where the history ends rather than how many rows it holds: that is what catches a row
-        // arriving while the library drops an older one to make room, where the count would be the
-        // same afterwards and the cache would be holding something else.
-        let end = self.grid.history_end();
-        let added = end.saturating_sub(self.history_end_seen);
-        self.history_end_seen = end;
-        let Ok(added) = usize::try_from(added) else {
-            return;
-        };
-        if added == 0 {
-            return;
-        }
-        self.budget
-            .add_row_cache(self.grid.newest_history_bytes(added));
-        if self.budget.row_cache_over_budget() {
-            self.evict_history(self.grid.history_bytes(), now_ms);
+        if self.budget.set_row_cache(self.grid.history_bytes()) {
+            self.evict_history(now_ms);
         }
     }
 
     /// Brings the historical cache back under its bound.
     ///
-    /// One pass. The grid works the row count out from the rows themselves rather than from an
-    /// average, so what is left after it costs no more than the bound; the measurement afterwards
-    /// is what the rows cost, not an estimate of it.
-    fn evict_history(&mut self, bytes: u64, now_ms: u64) {
+    /// One pass. The grid works the row count out from what each row costs rather than from an
+    /// average of what the rows cost, so what is left after it costs no more than the bound; the
+    /// figure afterwards is what those rows cost, not an estimate of it.
+    fn evict_history(&mut self, now_ms: u64) {
         let limit = self.budget.limits().row_cache_bytes;
-        if self.grid.enforce_row_cache(bytes, limit) {
-            self.measured_rows = self.grid.scrollback_rows();
-            self.history_end_seen = self.grid.history_end();
-            self.diagnostics.record(
-                DiagnosticKind::ResidentStateTruncated,
-                self.lexer.offset(),
-                now_ms,
-                format!("historical rows passed the {limit}-byte cache bound; older rows evicted"),
-            );
-            self.budget.set_row_cache(self.grid.history_bytes());
+        if !self.grid.enforce_row_cache(limit) {
             return;
         }
-        self.budget.set_row_cache(bytes);
+        self.measured_rows = self.grid.scrollback_rows();
+        self.diagnostics.record(
+            DiagnosticKind::ResidentStateTruncated,
+            self.lexer.offset(),
+            now_ms,
+            format!("historical rows passed the {limit}-byte cache bound; older rows evicted"),
+        );
+        self.budget.set_row_cache(self.grid.history_bytes());
     }
 
     /// Reports content the grid could not keep whole.
@@ -923,7 +906,7 @@ impl Engine {
             .set_links(buffers.links.saturating_add(self.link_table_bytes()));
         self.budget
             .set_titles(self.titles.resident_bytes() + crate::grid::GRID_TITLE_BYTES);
-        self.budget.set_row_cache(buffers.history);
+        self.budget.set_row_cache(self.grid.history_bytes());
         if self.grid.alternate_active() {
             // Nothing appends to the primary buffer while the alternate one is showing, so its
             // history cannot grow here; a resize can still move rows into it, which is why it was
@@ -932,8 +915,7 @@ impl Engine {
             // drop as it appends to them, and it appends only to the buffer that is showing.
             return;
         }
-        self.evict_history(buffers.history, now_ms);
-        self.history_end_seen = self.grid.history_end();
+        self.evict_history(now_ms);
     }
 
     /// What the table of distinct hyperlink targets holds.
@@ -1313,7 +1295,6 @@ impl Engine {
         // read comes next. The row the history ends at is read again for the same reason: the rows
         // that moved did not arrive from the screen and must not be charged as if they had.
         self.measured_rows = self.grid.scrollback_rows();
-        self.history_end_seen = self.grid.history_end();
         self.measure_now_unconditionally(now_ms);
         self.dimensions_revision = self.next_revision();
         self.advance_projection();

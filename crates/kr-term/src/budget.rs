@@ -407,14 +407,6 @@ impl SessionBudget {
         bytes > self.limits.row_cache_bytes
     }
 
-    /// Charges rows that have just joined the historical cache.
-    ///
-    /// The cache is a byte bound, and two rows can carry more than the whole of it, so what they
-    /// cost is charged where they join rather than at the next measurement.
-    pub const fn add_row_cache(&mut self, bytes: u64) {
-        self.usage.rows = self.usage.rows.saturating_add(bytes);
-    }
-
     /// Whether the historical row cache is over its bound.
     #[must_use]
     pub const fn row_cache_over_budget(&self) -> bool {

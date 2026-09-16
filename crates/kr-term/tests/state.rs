@@ -2367,3 +2367,155 @@ fn rows_a_reflow_builds_behind_the_alternate_buffer_are_reported() {
         "the rows past what the geometry keeps were dropped when the buffer came back"
     );
 }
+
+/// A deterministic source of randomness for the sequence below.
+///
+/// A property this test proves has to be provable again from the same numbers, so the sequence is
+/// generated rather than recorded and the generator is fixed.
+struct Numbers(u64);
+
+impl Numbers {
+    fn next(&mut self) -> u64 {
+        // xorshift64*, which is short enough to read and good enough to pick operations with.
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
+
+/// What the retained rows cost is carried, and it is exact.
+///
+/// The figure is charged as rows leave the screen and given back as rows are dropped, so nothing
+/// walks the history to find it. This runs the two apart: a random sequence of prints, resizes,
+/// buffer switches, erasures and evictions, with the carried figure compared against a walk of the
+/// rows after every one of them.
+#[test]
+fn the_carried_history_figure_matches_a_walk_of_the_rows() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(40, 8),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let mut numbers = Numbers(0x5eed_1234_9abc_def1);
+    let mut operations = 0usize;
+    let mut resizes = 0usize;
+    let mut erasures = 0usize;
+    let mut deepest = 0usize;
+    let mut dearest = 0u64;
+
+    for step in 0..700u32 {
+        let before = engine.grid().scrollback_rows();
+        match numbers.below(64) {
+            // Plain text, sometimes with a line ending and sometimes without, so a row is
+            // sometimes finished and sometimes left open across the next operation.
+            0..=27 => {
+                let lines = numbers.below(6);
+                let mut input = String::new();
+                for _ in 0..=lines {
+                    let width = numbers.below(60);
+                    for _ in 0..width {
+                        input.push('x');
+                    }
+                    if numbers.below(4) != 0 {
+                        input.push_str("\r\n");
+                    }
+                }
+                engine.feed(input.as_bytes(), u64::from(step));
+            }
+            // Rows that cost far more than a plain one: colour, wide characters and a hyperlink,
+            // so the rows in the history are not all the same size.
+            28..=39 => {
+                let mut input = String::from("\x1b[38;2;10;20;30;48;5;9m");
+                if numbers.below(2) == 0 {
+                    input.push_str("\x1b]8;;https://example.invalid/a\x1b\\");
+                }
+                for _ in 0..=numbers.below(40) {
+                    input.push('\u{754c}');
+                }
+                input.push_str("\x1b]8;;\x1b\\\x1b[0m\r\n");
+                engine.feed(input.as_bytes(), u64::from(step));
+            }
+            // A burst that costs more than the whole cache, which evicts.
+            40..=41 => {
+                let mut input = String::from("\x1b[38;2;10;20;30;48;5;9m");
+                for _ in 0..1_200 {
+                    for _ in 0..20 {
+                        input.push('\u{754c}');
+                    }
+                    input.push_str("\r\n");
+                }
+                input.push_str("\x1b[0m");
+                engine.feed(input.as_bytes(), u64::from(step));
+            }
+            // A resize, which reflows every retained row and moves rows between the screen and the
+            // history in both directions. A geometry the budget refuses leaves the grid alone, and
+            // the account has to match after that too.
+            42..=51 => {
+                let rows = 2 + u32::try_from(numbers.below(20)).unwrap_or(0);
+                let cols = 8 + u32::try_from(numbers.below(80)).unwrap_or(0);
+                if engine
+                    .resize(GridSize::new(cols, rows), u64::from(step))
+                    .is_ok()
+                {
+                    resizes += 1;
+                }
+            }
+            // Into the alternate buffer and back, where the primary buffer's history is out of
+            // reach and a resize still moves rows into it.
+            52..=55 => {
+                engine.feed(b"\x1b[?1049h", u64::from(step));
+            }
+            56..=59 => {
+                engine.feed(b"\x1b[?1049l", u64::from(step));
+            }
+            // The two erasures: the scrollback on its own, and a full reset.
+            60..=61 => {
+                if numbers.below(2) == 0 {
+                    engine.feed(b"\x1b[3J", u64::from(step));
+                } else {
+                    engine.feed(b"\x1bc", u64::from(step));
+                }
+                erasures += 1;
+            }
+            // Nothing at all, which still has to leave the account matching.
+            _ => {}
+        }
+        if numbers.below(3) == 0 {
+            engine.quiesce(u64::from(step));
+        }
+        operations += 1;
+        deepest = deepest.max(engine.grid().scrollback_rows());
+        dearest = dearest.max(engine.grid().history_bytes());
+        let carried = engine.grid().history_bytes();
+        let walked = engine.grid().measure_history_bytes();
+        assert_eq!(
+            carried,
+            walked,
+            "step {step} left the carried figure at {carried} and a walk of the rows at {walked}; \
+             the history held {before} rows before it and {} after",
+            engine.grid().scrollback_rows()
+        );
+        assert!(
+            engine.grid().history_bytes() <= BudgetLimits::DEFAULT.row_cache_bytes
+                || engine.grid().alternate_active(),
+            "step {step} left the cache over its bound"
+        );
+    }
+
+    assert!(operations >= 700);
+    assert!(resizes > 60, "the sequence has to resize: {resizes}");
+    assert!(erasures > 8, "the sequence has to erase: {erasures}");
+    assert!(
+        deepest > 500,
+        "the history has to get deep enough for a walk of it to be the wrong answer: {deepest}"
+    );
+    assert!(
+        dearest > BudgetLimits::DEFAULT.row_cache_bytes * 9 / 10,
+        "the cache has to reach its bound for eviction to be exercised: {dearest}"
+    );
+}
