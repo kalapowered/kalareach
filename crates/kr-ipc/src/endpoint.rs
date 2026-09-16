@@ -654,9 +654,19 @@ pub(crate) mod platform {
         }
 
         /// Returns this connection's own overlapped handle on the pipe.
+        ///
+        /// The runtime adopts the duplicate, so this is asked for inside a runtime or not at all: a
+        /// caller outside one is told so here rather than being panicked at from inside the
+        /// adoption, and it falls back to waiting the way a connection with no handle does.
         pub(super) fn writability(&self) -> Result<Writable> {
             use std::os::windows::io::AsHandle as _;
 
+            if tokio::runtime::Handle::try_current().is_err() {
+                return Err(IpcError::socket(
+                    "adopt the connection",
+                    std::io::Error::other("no runtime is running to adopt this handle"),
+                ));
+            }
             let interprocess::local_socket::tokio::Stream::NamedPipe(pipe) = &self.0;
             let duplicate = handle::duplicate(pipe.as_handle())
                 .map_err(|error| IpcError::socket("duplicate the connection", error))?;
