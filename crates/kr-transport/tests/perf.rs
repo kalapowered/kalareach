@@ -332,7 +332,22 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         added.as_secs_f64() * 1000.0,
         ADDED_LIMIT.as_secs_f64() * 1000.0
     ));
-    if shortfalls.is_empty() {
+    // What the measurement was of, before what it came to. A transfer that never started or that
+    // stopped part way leaves some of the loaded phase idle, and a figure taken against an idle
+    // connection is not a figure about a transfer whatever it says.
+    let invalid = if during == 0 {
+        Some("the transfer moved nothing while the round trips ran")
+    } else if transfer_ran_throughout {
+        None
+    } else {
+        Some("the transfer stopped part way through the loaded phase")
+    };
+    if let Some(reason) = invalid {
+        lines.push(format!(
+            "  verdict           this measurement is not valid: {reason}, so the figure above is \
+             not a figure about a transfer and the target is neither met nor missed here"
+        ));
+    } else if shortfalls.is_empty() {
         lines.push(format!(
             "  verdict           {}",
             if added < ADDED_LIMIT {
@@ -365,6 +380,11 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
              acceptance record"
                 .to_owned(),
         );
+    }
+    if invalid.is_some() {
+        for shortfall in &shortfalls {
+            lines.push(format!("  condition missing {shortfall}"));
+        }
     }
     // Before the assertions, so a run the target failed on retains the figure and the verdict.
     report("KR-PERF-005 remote input under a bulk transfer", &lines);

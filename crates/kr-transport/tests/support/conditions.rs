@@ -393,23 +393,32 @@ pub fn report(measurement: &str, lines: &[String]) {
     let Some(dir) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") else {
         return;
     };
+    // A run that asked for its evidence to be kept and could not keep it has no evidence, and a
+    // retained directory that happens to hold an earlier record would hide that. So a write that
+    // fails fails the run, naming where it was writing and why it could not. The lines are already
+    // printed by the time this runs, so nothing measured is lost with the file.
     let dir = std::path::PathBuf::from(dir);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
     let mut record = format!("## {measurement}\n\n");
     for line in lines {
         record.push_str(line);
         record.push('\n');
     }
     record.push('\n');
-    let opened = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("kr-transport-scheduling.md"));
-    if let Ok(mut file) = opened {
+    let path = dir.join("kr-transport-scheduling.md");
+    let write = || -> std::io::Result<()> {
         use std::io::Write;
-        let _ = file.write_all(record.as_bytes());
+        std::fs::create_dir_all(&dir)?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?
+            .write_all(record.as_bytes())
+    };
+    if let Err(error) = write() {
+        panic!(
+            "this run could not keep its evidence at {}: {error}",
+            path.display()
+        );
     }
 }
 
