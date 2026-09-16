@@ -1293,6 +1293,16 @@ pub enum PushDeliveryState {
     ///
     /// Nothing more is sent to it until a native registration proves receipt again.
     TokenDisabled,
+    /// The provider refused the notification itself, and a retry cannot change that.
+    ///
+    /// It is the honest answer to a payload the provider will not take: too large, or malformed.
+    /// The host fixes what it sent rather than sending it again.
+    Refused,
+    /// The authorisation this was sent under ended before the provider accepted it.
+    ///
+    /// A revocation reaches work that is already queued, and a notification that was waiting when
+    /// it arrived is not an exception to it. The host needs a new authorisation from the device.
+    Revoked,
     /// The notification expired before the provider accepted it.
     Expired,
 }

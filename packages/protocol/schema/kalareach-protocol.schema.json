@@ -4390,6 +4390,16 @@
           "type": "string"
         },
         {
+          "const": "refused",
+          "description": "The provider refused the notification itself, and a retry cannot change that.\n\nIt is the honest answer to a payload the provider will not take: too large, or malformed.\nThe host fixes what it sent rather than sending it again.",
+          "type": "string"
+        },
+        {
+          "const": "revoked",
+          "description": "The authorisation this was sent under ended before the provider accepted it.\n\nA revocation reaches work that is already queued, and a notification that was waiting when\nit arrived is not an exception to it. The host needs a new authorisation from the device.",
+          "type": "string"
+        },
+        {
           "const": "expired",
           "description": "The notification expired before the provider accepted it.",
           "type": "string"

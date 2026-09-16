@@ -2472,7 +2472,15 @@ export interface PushDeliveryAck {
   /**
    * What became of it.
    */
-  state: 'queued' | 'retrying' | 'collapsed' | 'duplicate' | 'token_disabled' | 'expired'
+  state:
+    | 'queued'
+    | 'retrying'
+    | 'collapsed'
+    | 'duplicate'
+    | 'token_disabled'
+    | 'refused'
+    | 'revoked'
+    | 'expired'
   /**
    * What was suppressed, when anything was.
    */
