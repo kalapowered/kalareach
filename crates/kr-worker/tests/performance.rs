@@ -262,6 +262,11 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
          to the tasks that add them"
     );
 
+    // Closed before the bounds are checked, so a measurement that misses one still leaves nothing
+    // running: a failed assertion here would otherwise skip every close.
+    drop(views);
+    close_all(&host, &sessions).await;
+
     assert!(
         cores < IDLE_CORE_FRACTION,
         "idle processor use is under one per cent of a core: {cores:.5}"
@@ -270,8 +275,6 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
         resident < RESIDENT_BOUND_KIB,
         "idle resident memory is under {RESIDENT_BOUND_KIB} KiB: {resident} KiB"
     );
-    drop(views);
-    close_all(&host, &sessions).await;
     let _ = host.controller;
     let _ = host.worker;
 }
@@ -309,20 +312,22 @@ async fn attach_to_a_usable_screen() {
         .max()
         .copied()
         .expect("samples");
+    // Closed before the bound is checked, for the same reason.
+    close_all(&host, std::slice::from_ref(&created)).await;
     assert!(
         worst < ATTACH_BOUND,
         "the slowest attach reached a usable screen within {ATTACH_BOUND:?}: {worst:?}"
     );
-    close_all(&host, std::slice::from_ref(&created)).await;
     let _ = host.controller;
 }
 
-/// Closes every session this measurement created and waits for its worker to end.
+/// Closes every session this measurement created and waits for the daemon to record each closure.
 ///
-/// A worker is deliberately not this process's child: a measurement that simply exited would leave
-/// one running per session it made, for as long as the machine stayed up. Every session a run
-/// creates is therefore closed by that run, and the wait is for the worker process itself rather
-/// than for the acceptance, because an acceptance is not an exit.
+/// A measurement that simply exited would leave a worker running for every session it made, for as
+/// long as the machine stayed up, because a worker is deliberately not ended by whatever created
+/// it. Every session a run creates is therefore closed by that run. What is waited for is the
+/// daemon's own record of the closure rather than the worker's entry in the process table, because
+/// a process that has exited and has not yet been reaped is still an entry and is not a session.
 async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
     let mut client = LocalClient::connect(
         &host
@@ -335,15 +340,8 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
     )
     .await
     .expect("connects to the daemon");
-    let mut workers = Vec::new();
     for created in sessions {
-        if let Some(root) = created.session.root_process.as_ref()
-            && let Ok(shell) = u32::try_from(root.pid.get())
-            && let Some(worker) = parent_of(shell)
-        {
-            workers.push(worker);
-        }
-        let _ = client
+        let outcome = client
             .mutate(
                 Method::SessionClose,
                 ActionId::new(kr_ipc::new_uuid()),
@@ -360,24 +358,47 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
             )
             .await
             .expect("the call reaches the daemon");
+        assert!(
+            outcome.is_ok(),
+            "the daemon accepted the close of {}: {outcome:?}",
+            created.session.session_id
+        );
     }
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline {
-        workers.retain(|pid| running(*pid));
-        if workers.is_empty() {
+    let wanted: std::collections::BTreeSet<_> = sessions
+        .iter()
+        .map(|created| created.session.session_id)
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let listed: kr_protocol::session::SessionListResult = client
+            .request(
+                Method::SessionList,
+                &kr_protocol::session::SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed: true,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the list succeeds")
+            .to_typed()
+            .expect("decodes");
+        let closed: std::collections::BTreeSet<_> = listed
+            .sessions
+            .iter()
+            .filter(|summary| summary.state == kr_protocol::session::SessionState::Closed)
+            .map(|summary| summary.session_id)
+            .collect();
+        let remaining: Vec<_> = wanted.difference(&closed).copied().collect();
+        if remaining.is_empty() {
             return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "every session this measurement created finished closing: {remaining:?} did not"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    panic!("every worker this measurement started has ended: {workers:?} are still running");
-}
-
-/// Returns whether a process is still running.
-fn running(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-o", "pid=", "-p", &pid.to_string()])
-        .output()
-        .is_ok_and(|listing| !String::from_utf8_lossy(&listing.stdout).trim().is_empty())
 }
 
 /// Returns a process's parent, which for a session's root shell is its worker.
