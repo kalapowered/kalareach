@@ -200,18 +200,24 @@ fn create_params(host: &Host) -> SessionCreateParams {
 
 /// Why a create did not name a session.
 enum Unresolved {
-    /// The daemon answered that it made nothing.
+    /// The daemon refused it before it made anything.
     Nothing(String),
-    /// What that identifier made, if anything, the answer does not say.
+    /// What that request made, if anything, the answer does not say.
     Unknown(String),
 }
 
-/// Sends one create, and sends the same request again while the answer is lost.
+/// Sends a request the daemon has already admitted, again, until it answers with what that made.
 ///
-/// The request is sent exactly as it was composed, over whichever connection this can open. That is
+/// The request goes exactly as it was composed, over whichever connection this can open. That is
 /// what makes a repeat an exact duplicate rather than a new first admission: the daemon holds the
 /// payload digest of what it admitted, the freshness window is part of that payload, and only the
 /// original request still matches it.
+///
+/// **Only an answer that names a session settles anything.** A repeat asks about an action the
+/// daemon has already taken, so a refusal says nothing about what that action made: the daemon
+/// checks current authority before it looks for a retained action, and the answer it builds for one
+/// is read from the live worker, which can be unreachable for a moment. Every other outcome
+/// therefore leaves the request owned, and the run reports what it could not account for.
 async fn ask_create(
     host: &Host,
     request: &kr_protocol::envelope::MutationRequest,
@@ -236,23 +242,9 @@ async fn ask_create(
             Ok(Ok(value)) => {
                 return value
                     .to_typed()
-                    .map_err(|error| Unresolved::Nothing(format!("the create result: {error}")));
+                    .map_err(|error| Unresolved::Unknown(format!("the create result: {error}")));
             }
-            Ok(Err(error)) if error.code == kr_protocol::error::ErrorCode::IdConflict => {
-                return Err(Unresolved::Unknown(format!(
-                    "the identifier was admitted under a different payload: {error}"
-                )));
-            }
-            // The daemon retains no such action, so it fell through to first admission and refused
-            // a window that is not this connection's. Nothing was made under this request.
-            Ok(Err(error)) if error.code == kr_protocol::error::ErrorCode::PermissionDenied => {
-                return Err(Unresolved::Nothing(format!(
-                    "the daemon has no record of this action: {error}"
-                )));
-            }
-            Ok(Err(error)) => {
-                return Err(Unresolved::Nothing(format!("the create failed: {error}")));
-            }
+            Ok(Err(error)) => failure = format!("the daemon's answer: {error}"),
             // The answer was lost. Whether the session exists is exactly what asking again settles.
             Err(error) => failure = format!("the create call: {error}"),
         }
@@ -325,6 +317,33 @@ async fn a_create_whose_answer_was_lost_is_closed_by_the_run_that_asked_for_it()
         again.deduplicated,
         "and the daemon says it is the one it recorded rather than a second launch"
     );
+
+    // And an answer that is not a session settles nothing. Here the same identifier is sent under
+    // another connection's window, which is a different payload and is refused; a run that read
+    // that refusal as "nothing was made" would stop looking for a session that exists.
+    let mut elsewhere = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the daemon");
+    let different = elsewhere
+        .compose(
+            Method::SessionCreate,
+            request.action_id,
+            ActionTarget::environment(host.environment_id),
+            &create_params(&host),
+        )
+        .await
+        .expect("composes the same identifier under another window");
+    drop(elsewhere);
+    match ask_create(&host, &different, 1).await {
+        Err(Unresolved::Unknown(_)) => {}
+        Err(Unresolved::Nothing(failure)) => {
+            panic!("a refusal is not proof that nothing was made: {failure}")
+        }
+        Ok(created) => panic!(
+            "the daemon answered a different payload with {}",
+            created.session.session_id
+        ),
+    }
 
     // So a run that holds only the request closes what that request made.
     let mut owned = Owned::default();
