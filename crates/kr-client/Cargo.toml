@@ -15,13 +15,13 @@ kr-crypto.workspace = true
 kr-protocol.workspace = true
 kr-transport.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 iroh = { workspace = true, features = ["test-utils"] }
-serde_json.workspace = true
 
 [lints]
 workspace = true

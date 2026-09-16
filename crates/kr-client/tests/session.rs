@@ -538,12 +538,15 @@ async fn an_action_window_renewal_replaces_the_current_one() {
 #[tokio::test]
 async fn a_client_with_no_managed_service_reports_it() {
     assert!(ServiceClients::none().is_empty());
-    let request = kr_client::services::RelayLeaseRequest {
+    let request = kr_client::services::LeaseRequest {
         source: EndpointKey::from_bytes([1; 32]),
         destination: EndpointKey::from_bytes([2; 32]),
         direction: kr_client::services::RelayDirection::Bidirectional,
         byte_ceiling: 8 * 1024 * 1024,
-        relay_scope: "eu-west".to_owned(),
+        duration_seconds: 300,
+        region_preference: None,
+        payer: None,
+        lease_id: None,
     };
     let error = NullService
         .issue(&request)

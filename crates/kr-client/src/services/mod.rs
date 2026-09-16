@@ -6,18 +6,28 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! Only the traits and one null implementation live here. The managed implementations belong to
-//! the web-integration work, and a self-hosted deployment supplies its own. A client with no
-//! managed service configured is a complete client: direct connections, local sessions, plugins,
-//! local descriptions and user-operated alternatives need none of these.
+//! The traits and one null implementation live here, and [`relay`] holds the one managed
+//! implementation this crate carries: the relay-lease client, because a lease is the one managed
+//! resource a client cannot do without and still use a relay at all. A self-hosted deployment
+//! supplies its own, and a client with no managed service configured is a complete client: direct
+//! connections, local sessions, plugins, local descriptions and user-operated alternatives need
+//! none of these.
+
+pub mod relay;
 
 use std::future::Future;
 use std::pin::Pin;
 
-use kr_protocol::ids::InstallationId;
+use kr_protocol::ids::{InstallationId, RelayLeaseId};
 use kr_protocol::scalars::EndpointKey;
 
 use crate::error::{ClientError, Result};
+
+pub use relay::{
+    ManagedRelayLeaseService, RelayAllowance, RelayGraceRemainder, RelayLeaseAnswer,
+    RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayWarning, ServiceHttp,
+    ServiceHttpAnswer, ServiceSigner,
+};
 
 /// A boxed future, so every service client stays usable behind a trait object.
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -33,7 +43,8 @@ pub struct AccountSession {
 }
 
 /// Which way a relay lease permits traffic to flow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RelayDirection {
     /// From the source endpoint to the destination endpoint only.
     SourceToDestination,
@@ -46,38 +57,59 @@ pub enum RelayDirection {
 /// Section 17: before forwarding a peer payload the relay must possess a current signed capability
 /// binding the source and destination endpoint keys, the direction, the payer principal and its
 /// authorisation, the lease and reservation identities, a byte ceiling, an expiry, the relay scope,
-/// the issuer key and a revision. The client's half of that is everything below; the signature and
-/// the revision are the service's.
+/// the issuer key and a revision. The client's half of that is everything below; the payer, the
+/// route, the signature and the revision are the service's, because a client that chose its own
+/// metering boundary could choose one that counts nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RelayLeaseRequest {
+pub struct LeaseRequest {
     /// The endpoint the traffic comes from.
     pub source: EndpointKey,
     /// The endpoint the traffic goes to.
     pub destination: EndpointKey,
     /// Which way the lease permits traffic to flow.
     pub direction: RelayDirection,
-    /// The bytes the payer is asking to reserve.
+    /// The cumulative bytes the payer is asking to reserve.
     pub byte_ceiling: u64,
-    /// The relay scope the lease is for, as the service names it.
-    pub relay_scope: String,
+    /// How long the lease should last, in seconds.
+    pub duration_seconds: u32,
+    /// The region the requester would rather be carried in, or null for no preference. A hint.
+    pub region_preference: Option<String>,
+    /// Who pays, or null for the default: the account this caller has selected, else itself.
+    pub payer: Option<LeasePayer>,
+    /// The lease to refill, or null to ask for a new one.
+    pub lease_id: Option<RelayLeaseId>,
 }
 
-/// A relay lease the payer installed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RelayLeaseHandle {
-    /// The lease identity the service assigned.
-    ///
-    /// Opaque here on purpose: the signed lease object is the relay's contract with the service,
-    /// and a client only has to name the lease it obtained.
-    pub lease_id: String,
-    /// The reservation this lease draws its bytes from.
-    pub reservation_id: String,
-    /// The byte ceiling the lease reserved.
-    pub byte_ceiling: u64,
-    /// The relay scope the lease covers.
-    pub relay_scope: String,
-    /// When the lease stops being valid, in UTC milliseconds.
-    pub expires_at_ms: u64,
+/// Who a client asks to be billed.
+///
+/// The two cases are written the way every other tagged object of this protocol is: a case that
+/// carries nothing is its own name, and a case that carries facts is a map under it. One serde
+/// definition therefore produces the JSON the service reads and the canonical bytes the credential
+/// covers, which is what keeps the two from drifting.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeasePayer {
+    /// This installation itself, drawing on the free allowance.
+    Installation,
+    /// An account, under an authorisation that account issued to this caller.
+    Account {
+        /// The account to bill.
+        account_id: String,
+        /// The authorisation record that makes it the payer.
+        authorisation_id: String,
+    },
+}
+
+/// Why a client is ending a lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseEndReason {
+    /// The pair is no longer paired, so nothing may be carried for it.
+    Unpaired,
+    /// The payer withdrew the authorisation the lease was issued under.
+    PayerWithdrew,
+    /// The traffic is finished and the reservation should be settled.
+    Finished,
 }
 
 /// A push registration.
@@ -98,16 +130,27 @@ pub trait AccountService: Send + Sync + std::fmt::Debug {
     fn refresh<'a>(&'a self, refresh_token: &'a str) -> ServiceFuture<'a, AccountSession>;
 }
 
-/// Where relay leases are obtained and installed.
+/// Where relay leases are obtained.
 ///
-/// The payer's client obtains a lease from the service and installs it on the relay. Endpoint
-/// admission alone never authorises peer traffic or billing.
+/// The service holds the ledger the lease spends from, signs the lease with the admission key the
+/// relay pins, and installs it on the relay before answering, so what a client receives is a
+/// capability that is already in force. Endpoint admission alone never authorises peer traffic or
+/// billing, and nothing a client says decides who pays.
+///
+/// An answer is not always a lease. An allowance that is spent and a service with no relay to offer
+/// are answers about capacity, carrying what is left of the bounded grace and the paths that still
+/// work, and [`RelayLeaseAnswer`] is that distinction: section 17 requires an exhausted managed
+/// allowance to be reported as unavailable capacity with alternatives rather than as a failure.
 pub trait RelayLeaseService: Send + Sync + std::fmt::Debug {
-    /// Obtains a lease for a pair of endpoints.
-    fn issue<'a>(&'a self, request: &'a RelayLeaseRequest) -> ServiceFuture<'a, RelayLeaseHandle>;
+    /// Obtains a lease for a pair of endpoints, or a refill of the one that pair holds.
+    fn issue<'a>(&'a self, request: &'a LeaseRequest) -> ServiceFuture<'a, RelayLeaseAnswer>;
 
-    /// Releases a lease early.
-    fn release<'a>(&'a self, lease_id: &'a str) -> ServiceFuture<'a, ()>;
+    /// Ends a lease, so the relay stops carrying the pair and the reservation is settled.
+    fn revoke<'a>(
+        &'a self,
+        lease_id: RelayLeaseId,
+        reason: LeaseEndReason,
+    ) -> ServiceFuture<'a, RelayLeaseEnding>;
 }
 
 /// Where a device registers for push.
@@ -209,11 +252,15 @@ impl AccountService for NullService {
 }
 
 impl RelayLeaseService for NullService {
-    fn issue<'a>(&'a self, _request: &'a RelayLeaseRequest) -> ServiceFuture<'a, RelayLeaseHandle> {
+    fn issue<'a>(&'a self, _request: &'a LeaseRequest) -> ServiceFuture<'a, RelayLeaseAnswer> {
         unconfigured("relay leases")
     }
 
-    fn release<'a>(&'a self, _lease_id: &'a str) -> ServiceFuture<'a, ()> {
+    fn revoke<'a>(
+        &'a self,
+        _lease_id: RelayLeaseId,
+        _reason: LeaseEndReason,
+    ) -> ServiceFuture<'a, RelayLeaseEnding> {
         unconfigured("relay leases")
     }
 }
@@ -267,12 +314,15 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::HostNotConfigured);
         assert!(error.to_string().contains("account login"));
 
-        let request = RelayLeaseRequest {
+        let request = LeaseRequest {
             source: EndpointKey::from_bytes([1; 32]),
             destination: EndpointKey::from_bytes([2; 32]),
             direction: RelayDirection::Bidirectional,
             byte_ceiling: 8 * 1024 * 1024,
-            relay_scope: "eu-west".to_owned(),
+            duration_seconds: 300,
+            region_preference: None,
+            payer: None,
+            lease_id: None,
         };
         let error = NullService
             .issue(&request)
