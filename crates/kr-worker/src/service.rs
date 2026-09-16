@@ -273,7 +273,10 @@ impl WorkerService {
         // accounting for what that attempt sent. Waiting for the peer happens outside it, on the
         // readiness handle beside it, which is what lets a withdrawal take the same lock and know
         // that no write can begin after it.
-        let writable = writer.writable();
+        let writable = Writing {
+            turn: Arc::new(tokio::sync::Mutex::new(())),
+            readiness: writer.writable(),
+        };
         let writer = Arc::new(Mutex::new(writer));
         let mut state =
             ConnectionState::new(connection_id, &peer, Arc::new(Mutex::new(Vec::new())));
@@ -912,7 +915,7 @@ impl WorkerService {
         &self,
         connection_id: ConnectionId,
         writer: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
-        writable: &kr_ipc::framed::Writable,
+        writable: &Writing,
     ) -> Registration {
         let registration = Registration {
             withdrawn: Arc::new(Withdrawal::default()),
@@ -2268,8 +2271,8 @@ struct Registration {
     attachments: Arc<Mutex<Vec<AttachmentId>>>,
     /// The connection's writer, so a withdrawal is decided on the same lock the writes are.
     writer: Arc<Mutex<kr_ipc::framed::FrameWriter>>,
-    /// Its readiness, which is where a write waits when the peer has stopped reading.
-    writable: kr_ipc::framed::Writable,
+    /// Whose turn it is to write, and where a write waits when the peer has stopped reading.
+    writable: Writing,
 }
 
 /// A registration's withdrawal, as something every part of a connection can watch at once.
@@ -2339,7 +2342,7 @@ pub const MAX_OUTPUT_EVENT_BYTES: usize = 256 * 1024;
 /// latch, so after it returns no frame of that connection's can begin, and one that had begun is
 /// left half written and ends the connection rather than being finished later.
 async fn write_frame(
-    writable: &kr_ipc::framed::Writable,
+    writable: &Writing,
     writer: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
     frame: &ControlFrame,
     withdrawn: &Withdrawal,
@@ -2347,6 +2350,19 @@ async fn write_frame(
 ) -> bool {
     let Ok(bytes) = kr_ipc::framed::FrameWriter::encode(StreamKind::Control, frame) else {
         return false;
+    };
+    // One frame at a time on this connection. A frame the peer had no room for is retained by the
+    // writer until it is finished, so a second writer starting one in between would interleave two
+    // frames on a stream that carries them whole. This is where a writer waits for its turn, and a
+    // withdrawal ends that wait rather than joining it.
+    let _turn = if protected {
+        tokio::select! {
+            biased;
+            () = withdrawn.wait() => return false,
+            turn = writable.turn.lock() => turn,
+        }
+    } else {
+        writable.turn.lock().await
     };
     let mut begun = false;
     loop {
@@ -2374,22 +2390,34 @@ async fn write_frame(
             Ok(kr_ipc::framed::Wrote::Blocked) => begun = true,
             Err(_) => return false,
         }
-        // The peer has no room. Waiting for it happens here, where the lock is not held and a
-        // withdrawal can both take that lock and end this wait.
+        // The peer has no room. Waiting for it happens here, where the boundary is not held and a
+        // withdrawal can both take that boundary and end this wait.
         if protected {
             tokio::select! {
                 biased;
                 () = withdrawn.wait() => return false,
-                ready = writable.ready() => {
+                ready = writable.readiness.ready() => {
                     if ready.is_err() {
                         return false;
                     }
                 }
             }
-        } else if writable.ready().await.is_err() {
+        } else if writable.readiness.ready().await.is_err() {
             return false;
         }
     }
+}
+
+/// What a connection needs to write a frame without holding the boundary while it waits.
+///
+/// Two things, and they are different: whose turn it is to put a frame on this stream, and whether
+/// the peer has room for more of it. The turn is held for a whole frame, because a stream carries
+/// frames whole; the readiness is waited on inside that turn, and neither is the boundary that
+/// decides whether the frame may be sent at all.
+#[derive(Clone, Debug)]
+struct Writing {
+    turn: Arc<tokio::sync::Mutex<()>>,
+    readiness: kr_ipc::framed::Writable,
 }
 
 /// Writes a span of the output stream, in frames the control stream can carry.
@@ -2397,7 +2425,7 @@ async fn write_frame(
 /// Each frame carries the cursor its own bytes start at, because they are consecutive positions in
 /// one stream.
 async fn send_stream(
-    writable: &kr_ipc::framed::Writable,
+    writable: &Writing,
     sender: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
     withdrawn: &Withdrawal,
     stream_id: &StreamId,
@@ -2433,7 +2461,7 @@ async fn send_stream(
 /// Every frame carries the same cursor: they are parts of one screen at one moment, not
 /// consecutive positions in a stream, and a client draws them in the order they arrive.
 async fn send_screen(
-    writable: &kr_ipc::framed::Writable,
+    writable: &Writing,
     sender: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
     withdrawn: &Withdrawal,
     stream_id: &StreamId,
@@ -2609,7 +2637,7 @@ mod tests {
     use kr_transport::clock::ManualClock;
 
     use super::{
-        ContinuousClock, ContinuousInstant, MAX_OUTPUT_EVENT_BYTES, StreamId, Withdrawal,
+        ContinuousClock, ContinuousInstant, MAX_OUTPUT_EVENT_BYTES, StreamId, Withdrawal, Writing,
         notification, send_stream, vouched_deadline, write_frame,
     };
 
@@ -2726,7 +2754,7 @@ mod tests {
     /// A connected pair of frame halves, on an endpoint of this test's own.
     async fn connected() -> (
         kr_ipc::testing::TempHost,
-        kr_ipc::framed::Writable,
+        Writing,
         Arc<Mutex<kr_ipc::framed::FrameWriter>>,
         kr_ipc::framed::FrameReader,
     ) {
@@ -2746,7 +2774,10 @@ mod tests {
             .expect("accepts");
         let (_, writer) = kr_ipc::framed::split(server, kr_protocol::frame::StreamKind::Control);
         let (reader, _) = kr_ipc::framed::split(client, kr_protocol::frame::StreamKind::Control);
-        let writable = writer.writable();
+        let writable = Writing {
+            turn: Arc::new(tokio::sync::Mutex::new(())),
+            readiness: writer.writable(),
+        };
         (temp, writable, Arc::new(Mutex::new(writer)), reader)
     }
 

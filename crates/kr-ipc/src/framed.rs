@@ -7,14 +7,18 @@
 //! Reading and writing are separate halves on purpose. A worker publishes output while a client is
 //! still sending input, and one task owning both directions would serialise them.
 
+#[cfg(not(unix))]
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(not(unix))]
 use std::task::{Context, Poll};
 
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, StreamKind};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncReadExt as _, AsyncWrite as _, ReadHalf, WriteHalf};
+#[cfg(not(unix))]
+use tokio::io::AsyncWrite as _;
+use tokio::io::{AsyncReadExt as _, ReadHalf, WriteHalf};
 
 use crate::endpoint::Connection;
 use crate::error::{IpcError, Result};
@@ -23,6 +27,13 @@ use crate::error::{IpcError, Result};
 #[must_use]
 pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWriter) {
     let writable = Writable::of(&connection);
+    // A descriptor of this connection's own to write through. The bytes go to the same socket, and
+    // the attempt is the kernel's own answer rather than a runtime's record of what it last saw:
+    // what decides whether a frame may be sent is a lock this writer is holding, and a write that
+    // consulted a reactor's bookkeeping instead could be told to wait by something the socket does
+    // not know about.
+    #[cfg(unix)]
+    let descriptor = connection.writability().ok();
     let (reader, writer) = tokio::io::split(connection);
     (
         FrameReader {
@@ -40,6 +51,8 @@ pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWri
             pending: Vec::new(),
             sent: 0,
             writable,
+            #[cfg(unix)]
+            descriptor,
         },
     )
 }
@@ -226,11 +239,21 @@ impl FrameReader {
 /// leaves a partial frame pending rather than lost, and the next call finishes it.
 #[derive(Debug)]
 pub struct FrameWriter {
+    /// The connection's write half, which keeps this end of it open for as long as the writer
+    /// lives. On a platform with descriptors the bytes go through [`FrameWriter::descriptor`]
+    /// instead, because a socket's own answer is what the boundary this writer sits inside needs.
+    #[cfg_attr(
+        unix,
+        expect(dead_code, reason = "it owns the half rather than writing through it")
+    )]
     half: WriteHalf<Connection>,
     codec: FrameCodec,
     pending: Vec<u8>,
     sent: usize,
     writable: Writable,
+    /// This connection's own descriptor, which is what the attempt writes through.
+    #[cfg(unix)]
+    descriptor: Option<std::os::fd::OwnedFd>,
 }
 
 impl FrameWriter {
@@ -315,9 +338,33 @@ impl FrameWriter {
 
     /// Writes what it can and stops at the first byte the socket will not take.
     ///
+    /// What this reports is the socket's own answer now. Waiting for a different answer is
+    /// [`Writable::ready`]'s job, somewhere this writer is not held.
+    #[cfg(unix)]
+    fn attempt(&mut self) -> Result<Wrote> {
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return Err(IpcError::PeerClosed);
+        };
+        while self.sent < self.pending.len() {
+            match rustix::io::write(descriptor, &self.pending[self.sent..]) {
+                Ok(0) => return Err(IpcError::PeerClosed),
+                Ok(written) => self.sent += written,
+                Err(rustix::io::Errno::AGAIN) => return Ok(Wrote::Blocked),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET) => {
+                    return Err(IpcError::PeerClosed);
+                }
+                Err(error) => return Err(IpcError::socket("write", error.into())),
+            }
+        }
+        Ok(Wrote::Complete)
+    }
+
+    /// Writes what it can and stops at the first byte the socket will not take.
+    ///
     /// The poll is made with a waker nothing wakes: what this reports is the socket's answer now,
-    /// and waiting for a different answer is [`Writable::ready`]'s job, somewhere this writer is
-    /// not held.
+    /// and waiting for a different answer is [`Writable::ready`]'s job.
+    #[cfg(not(unix))]
     fn attempt(&mut self) -> Result<Wrote> {
         let waker = std::task::Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -447,6 +494,17 @@ mod tests {
         assert!(
             writer.begin_frame(&frame).is_err(),
             "a new frame is refused while one is part way to the peer"
+        );
+        // And the waiting is real: a socket with no room does not report readiness, so a caller
+        // that waits here parks rather than spinning through attempt after attempt.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                writer.writable().ready()
+            )
+            .await
+            .is_err(),
+            "a full socket keeps the waiter waiting"
         );
         server.abort();
     }
