@@ -1174,7 +1174,7 @@
         {
           "bytes": "1b5b3e3575",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "RequireProjection",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -1198,18 +1198,13 @@
           ]
         }
       ],
-      "forward": [
-        [
-          0,
-          5
-        ]
-      ],
+      "forward": [],
       "grid_unrecognised": 0,
       "grid_writes": 0,
       "ground_after": true,
       "id": "kitty_keyboard_query",
       "input": "1b5b3e35751b5b3f75",
-      "projection_required_at": null,
+      "projection_required_at": 0,
       "refusals": [],
       "responses": [
         "1b5b3f3575"

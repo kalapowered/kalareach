@@ -2519,3 +2519,90 @@ fn the_carried_history_figure_matches_a_walk_of_the_rows() {
         "the cache has to reach its bound for eviction to be exercised: {dearest}"
     );
 }
+
+/// A restoration carries the keyboard stack as it carries the title stack.
+///
+/// The stack is the session's, not the terminal's, so nothing outside the session can be asked
+/// what is on it. A reconnecting client is handed the flags in force as a state, and the entries
+/// behind them travel with the snapshot so that an application's next pop lands where it would
+/// have landed had nothing been disconnected.
+#[test]
+fn a_restoration_reproduces_the_keyboard_stack() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(40, 8),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    // The shell negotiates, then a full-screen application negotiates its own on the other buffer.
+    engine.feed(b"\x1b[>4;2m\x1b[>1u\x1b[>5u", 0);
+    engine.feed(b"\x1b[?1049h\x1b[>9u\x1b[>3u", 0);
+    engine.quiesce(0);
+
+    let (snapshot, _) = engine.snapshot(viewport(&engine), 0);
+    assert_eq!(snapshot.keyboard.modify_other_keys, 2);
+    assert_eq!(snapshot.keyboard.primary.flags, Some(5));
+    assert_eq!(snapshot.keyboard.primary.stack, vec![0, 1]);
+    assert_eq!(snapshot.keyboard.alternate.flags, Some(3));
+    assert_eq!(snapshot.keyboard.alternate.stack, vec![0, 9]);
+
+    let installed = restoration_operations(&snapshot)
+        .into_iter()
+        .find_map(|op| match op {
+            RestoreOp::SetKeyboard { keyboard } => Some(keyboard),
+            _ => None,
+        })
+        .expect("the restoration installs the keyboard state");
+    assert_eq!(
+        installed, snapshot.keyboard,
+        "the whole of it, both buffers and both stacks"
+    );
+
+    // And a session built from it holds what the first one held.
+    let mut restored = kr_term::modes::ModeState::new();
+    restored.restore_keyboard(
+        snapshot.keyboard.modify_other_keys,
+        [
+            (
+                snapshot.keyboard.primary.flags,
+                snapshot.keyboard.primary.stack.clone(),
+            ),
+            (
+                snapshot.keyboard.alternate.flags,
+                snapshot.keyboard.alternate.stack.clone(),
+            ),
+        ],
+    );
+    assert_eq!(restored.kitty_buffer(false), (Some(5), vec![0, 1]));
+    assert_eq!(restored.kitty_buffer(true), (Some(3), vec![0, 9]));
+}
+
+/// A restoration puts back no more than a session could have built.
+///
+/// A snapshot is state a session once held, but it arrives from outside. Flags the profile does
+/// not advertise and a stack deeper than a session can push are both refused here rather than
+/// carried into the encoder the attachment has to satisfy.
+#[test]
+fn a_restored_keyboard_stack_is_bounded_and_qualified() {
+    let mut modes = kr_term::modes::ModeState::new();
+    let deep: Vec<u8> = (0..64).map(|index| 0xffu8.wrapping_sub(index)).collect();
+    modes.restore_keyboard(9, [(Some(0xff), deep), (None, Vec::new())]);
+
+    let (flags, stack) = modes.kitty_buffer(false);
+    assert_eq!(
+        flags,
+        Some(kr_term::modes::KITTY_QUALIFIED_FLAGS),
+        "only the flags the profile advertises survive"
+    );
+    assert_eq!(
+        stack.len(),
+        16,
+        "the stack is no deeper than one a push builds"
+    );
+    assert!(
+        stack
+            .iter()
+            .all(|entry| entry & !kr_term::modes::KITTY_QUALIFIED_FLAGS == 0),
+        "and every entry on it is qualified too"
+    );
+    assert_eq!(stack.capacity(), stack.len(), "with no room kept beyond it");
+}

@@ -91,11 +91,26 @@ for text association, which the input encoders cannot produce, so it is `X` rath
 application believes it got. A colon sublist belongs to ordinary SGR and nowhere else, so
 `CSI > 4 : 99 m` is not a level.
 
-What is qualified is a mode, and a mode is forwarded live. A direct terminal that did not see the
-negotiation would keep sending the old encoding, which is exactly the mismatch the negotiation
-exists to prevent. The profile still tracks it, and still keeps it away from the canonical grid,
-which has nothing to do with key encodings. Each screen buffer keeps its own Kitty stack, so a
-full-screen application's negotiation cannot leak into the shell's when it exits.
+The flags in force are a mode, and a mode is forwarded live: `CSI = flags ; mode u` goes to a
+direct terminal unchanged, because a terminal that did not see the negotiation would keep sending
+the old encoding, which is exactly the mismatch the negotiation exists to prevent. The profile
+still tracks it, and still keeps it away from the canonical grid, which has nothing to do with key
+encodings.
+
+**The Kitty keyboard stack is virtualised, like the title stack.** `CSI > flags u` and
+`CSI < count u` stop at the engine. The stack a direct attachment's terminal holds belongs to
+whatever was running when the attachment arrived: an application inside the session that emits
+`CSI < 65535 u` would empty it, and a program that had pushed an entry before would then pop into a
+state that is not its own. So the session keeps a stack of its own, sixteen entries deep, one for
+each screen buffer, and a push or a pop leaves the attachment projecting. The restoration that
+projection produces installs the resulting flags as an absolute state, so a direct attachment
+receives only flag settings and never a push or a pop, and the flags it needs still arrive. A push
+or a pop the profile does not qualify is `X`: it changed nothing, so it needs no projection either.
+
+Each screen buffer keeps its own flags and its own stack, so a full-screen application's
+negotiation cannot leak into the shell's when it exits, and both travel in a snapshot. A
+restoration puts back no more than a session could have built: every entry is masked to the
+qualified flags and the stack is cut to its depth, into an array of exactly the entries kept.
 
 **DECSCA is not classified as display.** Nothing in the profile implements selective erase, so the
 attribute is `X` and DA1 does not claim `6`. Advertising a capability and then dropping it is worse
@@ -260,7 +275,8 @@ count of such sequences is zero for the supported corpus.
 
 Three kinds of sequence never reach the library, because the profile owns them outright:
 
-- the virtualised title stack (`CSI 22 t` and `CSI 23 t`),
+- the virtualised title stack (`CSI 22 t` and `CSI 23 t`) and the virtualised Kitty keyboard stack
+  (`CSI > flags u` and `CSI < count u`),
 - OSC 633, which the library does not model, and
 - DEC modes 66, 67, 1007 and 1034, which change what a keyboard or mouse encoder produces and
   nothing about the screen.
@@ -484,9 +500,9 @@ carried because a projection and a person find them useful.
 A snapshot is presentation state. It is not a serialised process and not a durable parser
 checkpoint. It carries the projection generation, the active buffer, the canonical dimensions, the
 viewport, the cursor, the margins, the current rendition, the tab stops, the character sets, every
-tracked mode, the keypad mode, the keyboard protocol an input encoder has to reproduce, the titles
-and the virtual title stack, the hyperlink ranges, the whole palette with its source, and paged rows
-with stable identifiers and wrap markers.
+tracked mode, the keypad mode, the keyboard protocol an input encoder has to reproduce with each
+buffer's virtual Kitty stack, the titles and the virtual title stack, the hyperlink ranges, the
+whole palette with its source, and paged rows with stable identifiers and wrap markers.
 
 It also carries the pending wrap, the saved cursor of each buffer with the rendition and character
 sets that were saved with it, and the rows of the buffer that is not showing. A saved cursor is
@@ -728,7 +744,6 @@ first, until what is left costs no more than the bound, so one pass lands under 
 converging towards it, and no cell is read to decide. A row count worked out from the average cost
 of a row would land on the wrong side of the bound whenever the rows are not all the same size,
 which is the usual case.
-
 
 Where a reservation and a measurement look at the same thing, the reservation is the larger. Both
 work a link's parameter table out through the same rounding, from the separators the parameter field

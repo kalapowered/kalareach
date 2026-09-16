@@ -1694,7 +1694,7 @@
         {
           "bytes": "1b5b3e3175",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "RequireProjection",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -1705,18 +1705,13 @@
           ]
         }
       ],
-      "forward": [
-        [
-          0,
-          5
-        ]
-      ],
+      "forward": [],
       "grid_unrecognised": 0,
       "grid_writes": 0,
       "ground_after": true,
       "id": "kitty_push",
       "input": "1b5b3e3175",
-      "projection_required_at": null,
+      "projection_required_at": 0,
       "refusals": [],
       "responses": [],
       "side_effects": []
@@ -1762,7 +1757,7 @@
         {
           "bytes": "1b5b3c3175",
           "class": "M",
-          "disposition": "Forward",
+          "disposition": "RequireProjection",
           "eight_bit": false,
           "ground_after": true,
           "kind": "csi",
@@ -1773,18 +1768,13 @@
           ]
         }
       ],
-      "forward": [
-        [
-          0,
-          5
-        ]
-      ],
+      "forward": [],
       "grid_unrecognised": 0,
       "grid_writes": 0,
       "ground_after": true,
       "id": "kitty_pop",
       "input": "1b5b3c3175",
-      "projection_required_at": null,
+      "projection_required_at": 0,
       "refusals": [],
       "responses": [],
       "side_effects": []
