@@ -692,3 +692,166 @@ fn a_read_costs_the_same_whatever_the_history_holds() {
         shallow * 1_000.0
     );
 }
+
+/// How many rows a read reads is a property of the geometry, not of the history behind the screen.
+///
+/// The timing above says the two cost about the same; this says why, in a figure a loaded machine
+/// cannot move. Every resident figure but one is read from the rows that are showing, from how many
+/// rows there are, or from what the account carries. The one that has to be found wherever it sits
+/// is what the hyperlink objects cost, because an object is shared and a row that is not showing can
+/// be the only place one sits; that reads every row of both buffers, and it is taken on its own
+/// schedule rather than on every read.
+///
+/// So a session whose history is at its bound reads a few more rows over a run than one whose
+/// history is empty — the scheduled measurements are wider — and not hundreds of times more. Before
+/// the account carried what the retained rows cost, every read read every retained row.
+#[test]
+fn a_read_reads_as_many_rows_as_the_geometry_has() {
+    /// Reads per session, over several of the scheduled measurement's intervals.
+    const READS: usize = 200;
+    /// How much further apart the two may be before the reading is growing with the history.
+    ///
+    /// The scheduled measurement reads every row of both buffers, so a deep session's scheduled
+    /// reads are wider than a shallow one's by the rows it is holding. Over this many reads that is
+    /// a few intervals' worth against a screen's worth on every read, and a read that read the
+    /// history would be twenty times the shallow figure rather than under twice it.
+    const TOLERANCE: u64 = 2;
+
+    let read = build_scrolling_stream(4 * 1024);
+    let session = || {
+        Engine::new(EngineConfig {
+            size: GridSize::new(120, 40),
+            ..EngineConfig::DEFAULT
+        })
+        .expect("engine")
+    };
+    let mut now_ms = 0u64;
+
+    // Emptied before every read, so the history behind each one is nothing.
+    let mut shallow = session();
+    let mut shallow_rows = 0usize;
+    for _ in 0..READS {
+        now_ms += 1;
+        shallow.feed(b"\x1b[3J", now_ms);
+        shallow.feed(&read, now_ms);
+        shallow_rows = shallow_rows.max(shallow.grid().scrollback_rows());
+    }
+    let shallow_read = shallow.grid().rows_read();
+
+    // Filled until eviction is running, then read the same bytes the same number of times.
+    let mut deep = session();
+    let limit = deep.budget().limits().row_cache_bytes;
+    let mut fills = 0usize;
+    while deep.grid().history_bytes() <= limit * 9 / 10 && fills < 4_096 {
+        now_ms += 1;
+        fills += 1;
+        deep.feed(&read, now_ms);
+    }
+    let filled = deep.grid().rows_read();
+    let deep_rows = deep.grid().scrollback_rows();
+    for _ in 0..READS {
+        now_ms += 1;
+        deep.feed(&read, now_ms);
+    }
+    let deep_read = deep.grid().rows_read() - filled;
+
+    println!("KR-PERF-007 rows read against history depth");
+    println!("  reads             {READS}");
+    println!("  shallow history   at most {shallow_rows} rows");
+    println!("  shallow rows read {shallow_read}");
+    println!(
+        "  deep history      {deep_rows} rows, {} bytes",
+        deep.grid().history_bytes()
+    );
+    println!("  deep rows read    {deep_read}");
+
+    assert!(
+        deep_rows > shallow_rows * 10,
+        "the two sessions have to differ in depth: {deep_rows} rows against at most {shallow_rows}"
+    );
+    assert!(
+        deep_read <= shallow_read.saturating_mul(TOLERANCE),
+        "a session holding {deep_rows} rows read {deep_read} rows over {READS} reads against \
+         {shallow_read} behind at most {shallow_rows}; the reading is growing with the history"
+    );
+}
+
+/// The hyperlink envelope is never passed, and a link is refused only against a measurement.
+///
+/// Every link is charged what it will cost where it arrives, because one read can carry a session's
+/// worth of them. What is charged is at or above what the object turns out to hold, and a row that
+/// is dropped gives nothing back until the objects on it are measured again, so the charged figure
+/// drifts above the truth while a session prints. The engine reads the truth before it refuses
+/// anything, so a session that has scrolled its links away keeps admitting them; and the reading
+/// happens before anything is charged, so it cannot erase a reservation taken for the link being
+/// admitted.
+#[test]
+fn the_link_envelope_holds_across_a_measurement() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(120, 40),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let envelope = engine.budget().reserved().links;
+    let target: String = std::iter::repeat_n('a', 1_024).collect();
+    let mut admitted = 0usize;
+    let mut refused = 0usize;
+    let mut measured_after_refusal = false;
+
+    // Each read opens one link, prints into it, closes it and ends the line, so every link's cells
+    // scroll off the screen and the objects on them are given up. A session that only ever counted
+    // what it charged would stop admitting links; this one keeps going.
+    for index in 0..4_096u32 {
+        let input = format!(
+            "\x1b]8;id={index};https://example.invalid/{target}\x1b\\link\x1b]8;;\x1b\\ text\r\n"
+        );
+        let outcome = engine.feed(input.as_bytes(), u64::from(index));
+        let truncated = outcome
+            .diagnostics
+            .iter()
+            .any(|entry| entry.detail.contains("hyperlink is not recorded"));
+        if truncated {
+            refused += 1;
+            // A refusal is against a measurement, so what the session is holding is at or below
+            // the envelope at that point rather than a drifted figure above it.
+            measured_after_refusal = true;
+        } else {
+            admitted += 1;
+        }
+        assert!(
+            engine.budget().usage().links <= envelope,
+            "the hyperlink state reached {} bytes against a {envelope}-byte envelope at read {index}",
+            engine.budget().usage().links
+        );
+        assert_eq!(
+            engine.budget().excess(),
+            0,
+            "a measurement found more than the admitted geometry reserved at read {index}"
+        );
+    }
+    engine.quiesce(4_096);
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "the settled session holds more than the admitted geometry reserved"
+    );
+    assert!(
+        engine.budget().usage().links <= envelope,
+        "the settled session holds {} bytes of hyperlink state against a {envelope}-byte envelope",
+        engine.budget().usage().links
+    );
+    println!("KR-PERF-007 hyperlink admission across a measurement");
+    println!("  links admitted    {admitted}");
+    println!("  links refused     {refused}");
+    println!("  envelope          {envelope} bytes");
+    println!(
+        "  holding           {} bytes",
+        engine.budget().usage().links
+    );
+    assert!(
+        admitted > 1_024,
+        "a session that scrolls its links away has to keep admitting them: {admitted} admitted, \
+         {refused} refused"
+    );
+    let _ = measured_after_refusal;
+}

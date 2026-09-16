@@ -17,7 +17,7 @@
 //!   the profile and not of whatever the library's default happened to be that month.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use wezterm_escape_parser::csi::{CSI, Mode, TerminalMode, TerminalModeCode};
@@ -548,6 +548,13 @@ pub struct CanonicalGrid {
     stale: [bool; 2],
     /// What the retained rows cost, carried rather than measured.
     history: HistoryAccount,
+    /// How many rows a measurement has read the cells of.
+    ///
+    /// Reading a row's cells is the expensive part of every figure the resident budgets are
+    /// measured from, and how many rows are read is the property that has to stay a property of
+    /// the geometry rather than of how long the session has been printing. It is counted so a test
+    /// can hold that, rather than left to a timing to notice.
+    rows_read: AtomicU64,
 }
 
 /// The cell a text run ended on, so a later combining mark can still join it.
@@ -630,6 +637,7 @@ impl CanonicalGrid {
             dropped_marks: 0,
             stale: [false, false],
             history: HistoryAccount::default(),
+            rows_read: AtomicU64::new(0),
         };
         grid.sync_history();
         Ok(grid)
@@ -979,6 +987,18 @@ impl CanonicalGrid {
     #[must_use]
     pub fn alerts_dropped(&self) -> usize {
         self.alerts_dropped.load(Ordering::Relaxed)
+    }
+
+    /// How many rows a measurement has read the cells of since the session started.
+    ///
+    /// What the screens hold is read from the rows that are showing, so that part of a measurement
+    /// reads as many rows as the geometry has. What the hyperlink objects cost has to be found
+    /// wherever the objects sit, so that part reads every row of both buffers, and it is taken on
+    /// its own schedule rather than on every read. This counts both, so a test can hold that a
+    /// read's reading is a property of the geometry and the schedule rather than of the history.
+    #[must_use]
+    pub fn rows_read(&self) -> u64 {
+        self.rows_read.load(Ordering::Relaxed)
     }
 
     /// The library's change counter, which a delta uses as its base.
@@ -1561,9 +1581,14 @@ impl CanonicalGrid {
                 add_link_object(link, &mut seen, &mut links);
             }
         }
+        let mut read = 0u64;
         for screen in [self.terminal.screen(), self.terminal.inactive_screen()] {
-            screen.for_each_phys_line(|_, line| count_row_links(line, &mut seen, &mut links));
+            screen.for_each_phys_line(|_, line| {
+                read += 1;
+                count_row_links(line, &mut seen, &mut links);
+            });
         }
+        self.rows_read.fetch_add(read, Ordering::Relaxed);
         links
     }
 
@@ -1607,16 +1632,19 @@ impl CanonicalGrid {
             .saturating_add((held as u64).saturating_mul(ROW_SLOT_BYTES));
         let mut content = 0u64;
         let mut index = 0usize;
+        let mut read = 0u64;
         screen.for_each_phys_line(|_, line| {
             let showing = index >= retained;
             index += 1;
             if showing {
+                read += 1;
                 content = content.saturating_add(row_content_bytes(line));
                 rows.cell_slots = rows
                     .cell_slots
                     .saturating_add((line.len() as u64).saturating_mul(CELL_OVERHEAD_BYTES));
             }
         });
+        self.rows_read.fetch_add(read, Ordering::Relaxed);
         content
     }
 
