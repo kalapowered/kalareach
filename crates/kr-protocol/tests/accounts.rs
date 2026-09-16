@@ -412,6 +412,39 @@ fn a_published_chain_is_checked_before_any_signature() {
 }
 
 #[test]
+fn a_chain_authenticates_forward_from_the_revision_a_host_pinned() {
+    let authority = published_authority();
+
+    // A host that pinned the first revision reaches both: the pin, and the
+    // revision the pin's key signed the link for.
+    let from_first = authority
+        .authenticated_from(PolicyKeyRevision::new(1))
+        .expect("the chain carries revision 1");
+    assert_eq!(from_first.len(), 2);
+
+    // A host that pinned the second reaches the second and anything after it,
+    // and not the first: nothing it has authenticates a revision from before its
+    // pin, so a lease signed by that revision is refused rather than checked
+    // against a key it has no reason to trust.
+    let from_second = authority
+        .authenticated_from(PolicyKeyRevision::new(2))
+        .expect("the chain carries revision 2");
+    assert_eq!(from_second.len(), 1);
+    assert_eq!(from_second[0], rotation_link());
+    assert!(
+        !from_second
+            .iter()
+            .any(|link| link.payload.key_revision == PolicyKeyRevision::new(1))
+    );
+
+    assert!(
+        authority
+            .authenticated_from(PolicyKeyRevision::new(3))
+            .is_none()
+    );
+}
+
+#[test]
 fn a_closed_schema_refuses_a_field_nobody_agreed_on() {
     let mut json = serde_json::to_value(owner_lease()).expect("serialise");
     json["payload"]["scope"] = Json::String("everything".to_owned());

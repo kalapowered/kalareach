@@ -425,11 +425,15 @@ impl PolicyAuthority {
     /// 6. refuses a head below the highest revision it has already accepted, and only then records
     ///    the new highest revision.
     ///
-    /// A lease is checked separately, against the public key of the revision the lease names: its
-    /// signature, its own window, its lifetime, that its ceiling stays inside its role, and that
-    /// the revision that signed it was the signing revision when the lease was issued — its
-    /// `not_before_ms` is at or before the lease's `issued_at_ms`, and its successor's, where the
-    /// chain has one, is after.
+    /// A lease is checked separately, and only against a revision this host has authenticated:
+    /// the revision it pinned, or one it reached from the pin by the succession above.
+    /// [`PolicyAuthority::authenticated_from`] returns exactly those. A revision *before* the pin
+    /// is not one of them — the chain authenticates forward, not backward — so a lease naming one
+    /// is refused however well formed the chain around it looks. Then, under that revision's
+    /// public key: the lease's signature, its own window, its lifetime, that its ceiling stays
+    /// inside its role, and that the revision which signed it was the signing revision when the
+    /// lease was issued — its `not_before_ms` is at or before the lease's `issued_at_ms`, and its
+    /// successor's, where the chain has one, is after.
     ///
     /// # Errors
     ///
@@ -508,6 +512,25 @@ impl PolicyAuthority {
     #[must_use]
     pub fn current_revision(&self) -> PolicyKeyRevision {
         self.head.payload.key_revision
+    }
+
+    /// The links a host may verify anything against, given the revision it pinned.
+    ///
+    /// A chain authenticates forward: the pinned revision is trusted because the host pinned it,
+    /// and every later revision because the one before it signed the link that establishes it.
+    /// Nothing authenticates a revision *before* the pin, so a lease or a head naming one is
+    /// refused rather than checked against a key the host has no reason to trust.
+    ///
+    /// Returns `None` when the chain does not carry the pinned revision at all, which is a chain
+    /// about some other pin.
+    #[must_use]
+    pub fn authenticated_from(&self, pinned: PolicyKeyRevision) -> Option<&[PolicyAuthorityLink]> {
+        let position = self
+            .chain
+            .iter()
+            .position(|link| link.payload.key_revision == pinned)?;
+
+        Some(&self.chain[position..])
     }
 
     /// Returns the link that establishes `revision`.

@@ -437,11 +437,18 @@ own, so the head statement is what says the chain is complete.
 
 `PolicyAuthority::check_structure` makes every check that needs neither a signature nor the clock:
 ordering, succession, activation times, that the head names the last revision, and that it was not
-issued before that revision took over. Accepting a chain is that check, then the signature of each
-link under the key of the revision it names as its predecessor, then the head under the key of the
-revision the head names, then that the head is valid at the current time, then refusing a head
-below the highest revision this host has already accepted — and only then recording the new
-highest revision.
+issued before that revision took over. Accepting a chain is that check, then matching the pinned
+link against the pin itself — organisation, revision and public key — rather than verifying its
+signature, which belongs to its predecessor at every revision after the first, then the signature
+of each later link under the key of the revision it names as its predecessor, then the head under
+the key of the revision the head names, then that the head is valid at the current time, then
+refusing a head below the highest revision this host has already accepted — and only then
+recording the new highest revision.
+
+A chain authenticates forward. `PolicyAuthority::authenticated_from` returns the links a host may
+verify anything against, given the revision it pinned: the pin and everything after it. A lease
+naming a revision from before the pin is refused rather than checked against a key nothing the host
+holds authenticates.
 
 What that proves has a boundary worth stating. A head expires, so a captured head stops being
 usable, and a host that has accepted a later revision refuses one naming an earlier revision.
