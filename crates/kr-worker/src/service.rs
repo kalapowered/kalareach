@@ -314,19 +314,28 @@ impl WorkerService {
                         break;
                     };
                     let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(window));
-                    if !write_unless_withdrawn(&writer, &renewed, &withdrawn).await {
+                    // A window is this host's own offer and carries nothing of the session, so it
+                    // is written or it is not; what it must not do is wait for a peer that has
+                    // stopped reading while this connection still holds anything.
+                    if !write_frame(&writer, &renewed, &withdrawn, !fenced).await {
                         break;
                     }
                     continue;
                 }
                 _ = keepalive.tick(), if state.negotiated => {
                     let beat = ControlFrame::Event(ControlEvent::Keepalive);
-                    if !write_unless_withdrawn(&writer, &beat, &withdrawn).await {
+                    if !write_frame(&writer, &beat, &withdrawn, !fenced).await {
                         break;
                     }
                     continue;
                 }
             };
+            // Whether this connection still held its registration when the answer was *produced*
+            // is what decides how the answer may be written. One produced while it held it carries
+            // what that authority gave it, and a withdrawal that lands before it reaches the peer
+            // must stop it. One produced afterwards is a refusal, and the caller is owed that
+            // refusal rather than a socket that closed.
+            let protected = !withdrawn.is_set();
             let reply = self.handle(&mut state, &peer, message).await;
             if let Some(reply) = reply {
                 // A close that was admitted happens, whether or not its acceptance can be written.
@@ -339,10 +348,7 @@ impl WorkerService {
                         gate.release_on_delivery(crate::runtime::ACCEPTANCE_DELIVERY_TIMEOUT),
                     )
                 });
-                // The write answers to the withdrawal as well as to the socket. A peer that has
-                // stopped reading would otherwise hold this reply, and with it this connection's
-                // authority, for as long as it stayed away.
-                let written = write_unless_withdrawn(&writer, &reply, &withdrawn).await;
+                let written = write_frame(&writer, &reply, &withdrawn, protected).await;
                 if let Some((action_id, delivery)) = armed {
                     if written && state.client_kind == LocalClientKind::Controller {
                         // The requester is not the peer that was just written to: the daemon still
@@ -361,7 +367,7 @@ impl WorkerService {
                 // A controller announces itself in its hello; the worker answers with a challenge
                 // it will only accept once.
                 if let Some(challenge) = state.pending_challenge.take()
-                    && !write_unless_withdrawn(&writer, &challenge, &withdrawn).await
+                    && !write_frame(&writer, &challenge, &withdrawn, protected).await
                 {
                     break;
                 }
@@ -2251,27 +2257,35 @@ impl Withdrawal {
 /// restoration that was written as one frame would simply fail to be written at all.
 pub const MAX_OUTPUT_EVENT_BYTES: usize = 256 * 1024;
 
-/// Writes one frame unless the connection's registration is withdrawn first.
+/// Writes one frame, and stops a protected one from reaching a withdrawn connection.
 ///
-/// Returns whether the frame reached the peer. A peer that has stopped reading blocks a write for
-/// as long as it likes, and everything this connection still holds (its authority, its
-/// attachments, its subscription) would be held with it. The withdrawal ends the wait instead, and
-/// the caller treats an abandoned write as a connection that has finished.
-async fn write_unless_withdrawn(
+/// Returns whether the frame reached the peer. `protected` says whether this frame was produced
+/// while the connection still held its registration. Such a frame carries what that authority gave
+/// it, so the withdrawal wins every race against it: a peer that has stopped reading would
+/// otherwise hold it, and with it everything the connection still owns, for as long as it stayed
+/// away, and a peer that starts reading again would be handed something the host no longer stands
+/// behind.
+///
+/// An unprotected frame is one this host produced *after* the withdrawal: the refusal a fenced
+/// caller is owed, or a keepalive. It is written ordinarily, so a fenced connection learns why its
+/// next request failed rather than finding a socket that closed.
+async fn write_frame(
     writer: &Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
     frame: &ControlFrame,
     withdrawn: &Withdrawal,
+    protected: bool,
 ) -> bool {
-    // The write is polled first, so a frame the peer is ready for still goes: a fenced connection
-    // is told why its next request was refused rather than finding a socket that closed. Only a
-    // write that would *wait* is abandoned, which is the case the withdrawal exists for.
+    if !protected {
+        let mut sender = writer.lock().await;
+        return sender.write_message(frame).await.is_ok();
+    }
     tokio::select! {
         biased;
+        () = withdrawn.wait() => false,
         written = async {
             let mut sender = writer.lock().await;
             sender.write_message(frame).await.is_ok()
         } => written,
-        () = withdrawn.wait() => false,
     }
 }
 
