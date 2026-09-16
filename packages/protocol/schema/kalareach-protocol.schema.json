@@ -4400,6 +4400,11 @@
           "type": "string"
         },
         {
+          "const": "abandoned",
+          "description": "The gateway stopped trying before the notification's own expiry.\n\nA provider that refused for long enough, or a destination with more waiting than a gateway\nholds for one installation. It is separate from `expired` because the notification's moment\nhad not passed: the host may still have something to say about it.",
+          "type": "string"
+        },
+        {
           "const": "expired",
           "description": "The notification expired before the provider accepted it.",
           "type": "string"

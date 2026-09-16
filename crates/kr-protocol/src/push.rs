@@ -1303,6 +1303,12 @@ pub enum PushDeliveryState {
     /// A revocation reaches work that is already queued, and a notification that was waiting when
     /// it arrived is not an exception to it. The host needs a new authorisation from the device.
     Revoked,
+    /// The gateway stopped trying before the notification's own expiry.
+    ///
+    /// A provider that refused for long enough, or a destination with more waiting than a gateway
+    /// holds for one installation. It is separate from `expired` because the notification's moment
+    /// had not passed: the host may still have something to say about it.
+    Abandoned,
     /// The notification expired before the provider accepted it.
     Expired,
 }

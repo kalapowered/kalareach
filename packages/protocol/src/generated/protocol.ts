@@ -2480,6 +2480,7 @@ export interface PushDeliveryAck {
     | 'token_disabled'
     | 'refused'
     | 'revoked'
+    | 'abandoned'
     | 'expired'
   /**
    * What was suppressed, when anything was.
