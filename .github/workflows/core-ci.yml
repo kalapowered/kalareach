@@ -15,6 +15,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Section 27 puts every test artefact in one platform-resolved directory and asks for a release
+  # run's evidence to be retained. Each performance measurement writes its host, its figure and its
+  # verdict here before it asserts anything, so a run the target failed on keeps the number.
+  KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
 
 jobs:
   rust:
@@ -90,6 +94,17 @@ jobs:
       - name: Transport scheduling and reconnect
         if: ${{ !cancelled() }}
         run: cargo test --locked --release -p kr-transport --test perf -- --nocapture --test-threads=1
+
+      # The figures and verdicts the two steps above wrote, kept whether or not they met their
+      # targets: a run that fell short is the evidence for how far short it fell, and on which
+      # processor.
+      - name: Keep the performance evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: performance-evidence
+          path: /tmp/kr-test-artifacts
+          if-no-files-found: error
 
   typescript:
     name: typescript

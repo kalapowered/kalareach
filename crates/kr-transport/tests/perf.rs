@@ -64,7 +64,9 @@ use kr_transport::handshake::{self, Admitted, PairedDirectory};
 use kr_transport::scheduler::{SendLimits, StreamBudget};
 use kr_transport::streams::StreamRegistry;
 use std::sync::Arc;
-use support::conditions::{Host, MAX_STOLEN_SHARE, SchedulingProbe, StolenSample, StolenTime};
+use support::conditions::{
+    Host, MAX_STOLEN_SHARE, SchedulingProbe, StolenSample, StolenTime, report,
+};
 use support::{OneDevice, Side, direct_addr, epochs, ledger, paired_pair, windows};
 
 /// One input round trip, and the payload it carried.
@@ -289,47 +291,83 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
 
     let added = loaded_p95.saturating_sub(baseline_p95);
     let host = Host::read();
-    println!("KR-PERF-005 remote input under a bulk transfer");
-    for line in host.lines() {
-        println!("{line}");
-    }
-    println!(
-        "  woken late        {:.3} ms at p95, over {} asks, as evidence beside the figure",
-        scheduling_p95.as_secs_f64() * 1000.0,
-        lateness.len()
-    );
+    let shortfalls = host.shortfalls(stolen_share);
     let phase_share = |share: Option<f64>| {
         share.map_or_else(
             || "unverified".to_owned(),
             |share| format!("{:.2}%", share * 100.0),
         )
     };
-    if stolen_idle.is_none() && stolen_loaded.is_none() {
-        println!("  taken by the host not accounted for here, so unverified in both phases");
+    let mut lines = host.lines();
+    lines.push(format!(
+        "  woken late        {:.3} ms at p95, over {} asks, as evidence beside the figure",
+        scheduling_p95.as_secs_f64() * 1000.0,
+        lateness.len()
+    ));
+    lines.push(if stolen_idle.is_none() && stolen_loaded.is_none() {
+        "  taken by the host not accounted for here, so unverified in both phases".to_owned()
     } else {
-        println!(
+        format!(
             "  taken by the host {} of the idle phase and {} of the loaded one, against a {:.2}% \
              cutoff",
             phase_share(stolen_idle),
             phase_share(stolen_loaded),
             MAX_STOLEN_SHARE * 100.0
-        );
-    }
-    println!("  samples           {SAMPLES} round trips");
-    println!("  transfer          {during} chunks of 512 KiB while they ran");
-    println!(
+        )
+    });
+    lines.push(format!("  samples           {SAMPLES} round trips"));
+    lines.push(format!(
+        "  transfer          {during} chunks of 512 KiB while they ran"
+    ));
+    lines.push(format!(
         "  path round trip   {:.3} ms p95",
         baseline_p95.as_secs_f64() * 1000.0
-    );
-    println!(
+    ));
+    lines.push(format!(
         "  under transfer    {:.3} ms p95",
         loaded_p95.as_secs_f64() * 1000.0
-    );
-    println!(
+    ));
+    lines.push(format!(
         "  added             {:.3} ms p95 against a {:.3} ms target",
         added.as_secs_f64() * 1000.0,
         ADDED_LIMIT.as_secs_f64() * 1000.0
-    );
+    ));
+    if shortfalls.is_empty() {
+        lines.push(format!(
+            "  verdict           {}",
+            if added < ADDED_LIMIT {
+                "no measured shortfall, and the target is met on this host"
+            } else {
+                "no measured shortfall, and the target is not met on this host"
+            }
+        ));
+        lines.push(
+            "  conditions        no measured shortfall, so the target is asserted here; what the \
+             lines above call unverified stays unverified"
+                .to_owned(),
+        );
+    } else {
+        lines.push(format!(
+            "  verdict           {} the target, with a condition missing, so it is recorded and \
+             not asserted here",
+            if added < ADDED_LIMIT {
+                "inside"
+            } else {
+                "outside"
+            }
+        ));
+        for shortfall in &shortfalls {
+            lines.push(format!("  condition missing {shortfall}"));
+        }
+        lines.push(
+            "  conditions        not met, so the figure above is recorded and the target is not \
+             asserted here; the target's evidence is the reference-host run in the release \
+             acceptance record"
+                .to_owned(),
+        );
+    }
+    // Before the assertions, so a run the target failed on retains the figure and the verdict.
+    report("KR-PERF-005 remote input under a bulk transfer", &lines);
 
     // Whatever the host, the measurement has to have measured something: a transfer that never
     // started, or one that stopped part way, leaves some or all of the loaded phase idle and the
@@ -350,26 +388,10 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         "the transfer moved nothing while the round trips ran, so they were not measured under one"
     );
 
-    let shortfalls = host.shortfalls(stolen_share);
     if shortfalls.is_empty() {
-        println!(
-            "  conditions        no measured shortfall, so the target is asserted here; what the \
-             lines above call unverified stays unverified"
-        );
         assert!(
             added < ADDED_LIMIT,
             "application scheduling added {added:?} above the measured path round trip"
-        );
-    } else {
-        for shortfall in &shortfalls {
-            println!("  condition missing {shortfall}");
-        }
-        println!(
-            "  conditions        not met, so the figure above is recorded and the target is not \
-             asserted here"
-        );
-        println!(
-            "  the target's evidence is the reference-host run in the release acceptance record"
         );
     }
 
@@ -543,15 +565,22 @@ async fn a_reconnect_reaches_usable_state_within_two_seconds() {
 
     assert_eq!(bytes_of(&snapshot).len(), SCREEN_BYTES);
     let host = Host::read();
-    println!("KR-PERF-006 the transport's share of a reconnect");
-    for line in host.lines() {
-        println!("{line}");
-    }
-    println!("  screen            120x40, {SCREEN_BYTES} bytes");
-    println!(
+    let mut lines = host.lines();
+    lines.push(format!("  screen            120x40, {SCREEN_BYTES} bytes"));
+    lines.push(format!(
         "  usable state      {:.3} ms against a 2000.000 ms target",
         elapsed.as_secs_f64() * 1000.0
-    );
+    ));
+    lines.push(format!(
+        "  verdict           {}",
+        if elapsed < USABLE_LIMIT {
+            "the target is met on this host"
+        } else {
+            "the target is not met on this host"
+        }
+    ));
+    // Before the assertion, so a run the target failed on retains the figure and the verdict.
+    report("KR-PERF-006 the transport's share of a reconnect", &lines);
     assert!(
         elapsed < USABLE_LIMIT,
         "usable state took {elapsed:?}, against a {USABLE_LIMIT:?} target"

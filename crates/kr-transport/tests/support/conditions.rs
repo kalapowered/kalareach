@@ -378,6 +378,41 @@ fn load_average() -> Option<f64> {
     None
 }
 
+/// Prints one measurement's lines and retains them where a run keeps its evidence.
+///
+/// Section 27 asks for the figures to be recorded with the host they were taken on and for a
+/// release run's evidence to be kept. `KR_TEST_ARTIFACTS_DIR` is where this build puts that, and a
+/// run that has not set it prints the record and keeps nothing. Call it before a target is
+/// asserted, so a run the target failed on retains the figure and the verdict rather than only the
+/// panic.
+pub fn report(measurement: &str, lines: &[String]) {
+    println!("{measurement}");
+    for line in lines {
+        println!("{line}");
+    }
+    let Some(dir) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let mut record = format!("## {measurement}\n\n");
+    for line in lines {
+        record.push_str(line);
+        record.push('\n');
+    }
+    record.push('\n');
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("kr-transport-scheduling.md"));
+    if let Ok(mut file) = opened {
+        use std::io::Write;
+        let _ = file.write_all(record.as_bytes());
+    }
+}
+
 /// What the platform calls this processor, where it says.
 fn processor_model() -> Option<String> {
     if cfg!(target_os = "linux") {

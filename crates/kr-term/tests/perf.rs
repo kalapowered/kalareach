@@ -34,6 +34,122 @@ fn processors() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
+/// What one rate measurement reports: the host it ran on, every pass, the figure and the verdict.
+///
+/// One shape for both streams, so the retained record and the step's output say the same thing in
+/// the same order whichever of them a reader is looking at.
+fn rate_lines(
+    stream: &[u8],
+    warm: &Run,
+    runs: &[Run],
+    passes: &[Run],
+    sustained: f64,
+) -> Vec<String> {
+    let best = fastest(runs);
+    let (lane, session, cache) = peaks(passes);
+    let mut lines = vec![
+        format!(
+            "  build             {}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        ),
+        format!("  host              {HOST_OS} {HOST_ARCH}"),
+        format!("  processors        {}", processors()),
+        format!("  processor         {}", processor_model()),
+        format!("  stream            {} bytes", stream.len()),
+        format!("  chunk             {CHUNK_BYTES} bytes"),
+        format!(
+            "  warm-up pass      {:.3} s, {:.2} MiB/s, discarded",
+            warm.elapsed_secs, warm.mib_per_second
+        ),
+    ];
+    for (pass, run) in runs.iter().enumerate() {
+        lines.push(format!(
+            "  pass {pass}            {:.3} s, {:.2} MiB/s",
+            run.elapsed_secs, run.mib_per_second
+        ));
+    }
+    lines.push(format!(
+        "  sustained         {sustained:.2} MiB/s over every pass, against a \
+         {TARGET_MIB_PER_SECOND:.1} MiB/s target"
+    ));
+    lines.push(format!(
+        "  fastest pass      {:.2} MiB/s, observed",
+        best.mib_per_second
+    ));
+    lines.push(format!(
+        "  verdict           {}",
+        if sustained >= TARGET_MIB_PER_SECOND {
+            "the target is met on this host"
+        } else if cfg!(debug_assertions) {
+            "below the target, and not asserted on an unoptimised build"
+        } else {
+            "below the target on this host"
+        }
+    ));
+    lines.push(format!("  events            {}", best.events));
+    lines.push(format!("  replies accepted  {}", best.responses));
+    lines.push(format!("  peak events/chunk {}", best.peak_pending_events));
+    lines.push(format!("  degraded          {}", best.degraded));
+    lines.push(format!(
+        "  peak lane bytes   {lane} of {}, over every pass",
+        LaneLimits::DEFAULT.max_queue_bytes
+    ));
+    lines.push(format!(
+        "  peak session      {session} bytes of {}, over every pass",
+        kr_term::budget::BudgetLimits::DEFAULT.session_bytes
+    ));
+    lines.push(format!(
+        "  peak row cache    {cache} bytes of {}, over every pass",
+        kr_term::budget::BudgetLimits::DEFAULT.row_cache_bytes
+    ));
+    lines
+}
+
+/// Prints one measurement's lines and retains them where a run keeps its evidence.
+fn report(measurement: &str, lines: &[String]) {
+    println!("{measurement}");
+    for line in lines {
+        println!("{line}");
+    }
+    record_evidence(measurement, lines);
+}
+
+/// Writes one performance record where a run retains its evidence, and returns the lines it wrote.
+///
+/// Section 27 asks for the figures to be recorded with the host they were taken on and for a
+/// release run's evidence to be kept. `KR_TEST_ARTIFACTS_DIR` is where this build puts that, and a
+/// run that has not set it prints the record and keeps nothing. The record is written before the
+/// target is asserted, so a run the target failed on retains the figure and the verdict rather
+/// than only the panic.
+fn record_evidence(measurement: &str, lines: &[String]) {
+    let Some(dir) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let mut record = format!("## {measurement}\n\n");
+    for line in lines {
+        record.push_str(line);
+        record.push('\n');
+    }
+    record.push('\n');
+    let path = dir.join("kr-term-output-handling.md");
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path);
+    if let Ok(mut file) = opened {
+        use std::io::Write;
+        let _ = file.write_all(record.as_bytes());
+    }
+}
+
 /// What the platform calls this processor, where it says.
 ///
 /// Section 27 records the host beside every figure because a rate depends on it, and two hosts of
@@ -328,55 +444,15 @@ fn drains_five_mebibytes_without_unbounded_queues() {
     let stream = build_stream(STREAM_BYTES);
     let (warm, runs) = drain_passes(&stream, true);
     let sustained = sustained_mib_per_second(&runs);
-    let best = fastest(&runs);
     // Every pass a bound had to hold through, the discarded warm-up included.
     let passes: Vec<Run> = std::iter::once(warm.clone())
         .chain(runs.iter().cloned())
         .collect();
 
-    println!("KR-PERF-007 kr-term output handling");
-    println!(
-        "  build             {}",
-        if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        }
+    report(
+        "KR-PERF-007 kr-term output handling",
+        &rate_lines(&stream, &warm, &runs, &passes, sustained),
     );
-    println!("  host              {HOST_OS} {HOST_ARCH}");
-    println!("  processors        {}", processors());
-    println!("  processor         {}", processor_model());
-    println!("  stream            {} bytes", stream.len());
-    println!("  chunk             {CHUNK_BYTES} bytes");
-    println!(
-        "  warm-up pass      {:.3} s, {:.2} MiB/s, discarded",
-        warm.elapsed_secs, warm.mib_per_second
-    );
-    for (pass, run) in runs.iter().enumerate() {
-        println!(
-            "  pass {pass}            {:.3} s, {:.2} MiB/s",
-            run.elapsed_secs, run.mib_per_second
-        );
-    }
-    println!(
-        "  sustained         {sustained:.2} MiB/s over every pass, against a \
-         {TARGET_MIB_PER_SECOND:.1} MiB/s target"
-    );
-    println!(
-        "  fastest pass      {:.2} MiB/s, observed",
-        best.mib_per_second
-    );
-    println!("  events            {}", best.events);
-    println!("  replies accepted  {}", best.responses);
-    println!("  peak events/chunk {}", best.peak_pending_events);
-    println!("  degraded          {}", best.degraded);
-    let (lane, session, cache) = peaks(&passes);
-    println!(
-        "  peak lane bytes   {lane} of {}, over every pass",
-        LaneLimits::DEFAULT.max_queue_bytes
-    );
-    println!("  peak session      {session} bytes, over every pass");
-    println!("  peak row cache    {cache} bytes, over every pass");
 
     // Before the rate, so a host too slow for the target still reports whether anything grew
     // without bound. The rate is the figure a host can fail; these are the ones nothing may.
@@ -399,40 +475,17 @@ fn drains_a_scrolling_stream_at_the_target_rate() {
     let stream = build_scrolling_stream(scrolling_bytes(STREAM_BYTES));
     let (warm, runs) = drain_passes(&stream, true);
     let sustained = sustained_mib_per_second(&runs);
-    let best = fastest(&runs);
     let passes: Vec<Run> = std::iter::once(warm.clone())
         .chain(runs.iter().cloned())
         .collect();
 
-    println!("KR-PERF-007 kr-term scrolling output");
-    println!("  host              {HOST_OS} {HOST_ARCH}");
-    println!("  processors        {}", processors());
-    println!("  processor         {}", processor_model());
-    println!("  stream            {} bytes", stream.len());
-    println!(
-        "  warm-up pass      {:.3} s, {:.2} MiB/s, discarded",
-        warm.elapsed_secs, warm.mib_per_second
+    report(
+        "KR-PERF-007 kr-term scrolling output",
+        &rate_lines(&stream, &warm, &runs, &passes, sustained),
     );
-    for (pass, run) in runs.iter().enumerate() {
-        println!(
-            "  pass {pass}            {:.3} s, {:.2} MiB/s",
-            run.elapsed_secs, run.mib_per_second
-        );
-    }
-    println!(
-        "  sustained         {sustained:.2} MiB/s over every pass, against a \
-         {TARGET_MIB_PER_SECOND:.1} MiB/s target"
-    );
-    println!(
-        "  fastest pass      {:.2} MiB/s, observed",
-        best.mib_per_second
-    );
-    println!("  events            {}", best.events);
-    let (_, session, cache) = peaks(&passes);
-    println!("  peak session      {session} bytes, over every pass");
-    println!("  peak row cache    {cache} bytes, over every pass");
 
     // Before the rate, for the reason above.
+    let (_, _, cache) = peaks(&passes);
     assert!(
         cache > 0,
         "the rows that scrolled off have to reach the cache for this to say anything"
