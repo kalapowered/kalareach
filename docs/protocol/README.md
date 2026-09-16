@@ -417,6 +417,62 @@ Reading the fields:
 - `input.write` is the only method with `ordered_stream` idempotency and an `input_lease` freshness
   context. Raw input is an ordered stream per connection, never replayed after a reconnect.
 
+## The root integration
+
+Six methods carry the trusted root shell's side of section 7, and `crates/kr-protocol/src/root.rs`
+holds the types they exchange. Five of them are private-IPC only: `root.editor.enter`,
+`root.editor.leave`, `root.editor.fence`, `root.eof.detach` and `root.command.accepted` list
+`local_ipc` alone, so a network caller is denied whatever grant it holds. `shell.launch` is
+reachable from a paired device, because a launch button is a client action, but it still installs
+through the reader rather than through the terminal.
+
+| Method | Parameters | Result |
+| --- | --- | --- |
+| `root.editor.enter` | `RootEditorEnterParams`: the root process, prompt generation, reader revision, which reader started, the reader's state and the shell's working-directory revision | `RootEditorEnterResult`: the state, and the fence exchange the worker started |
+| `root.editor.leave` | `RootEditorLeaveParams`: the prompt generation, the reader revision and the reason | `RootEditorLeaveResult`: the state. Leaving invalidates the fence |
+| `root.editor.fence` | `RootEditorFenceParams`: the identity the fence will have, the prompt generation, the reader revision, the hold and the cause | `RootEditorFenceResult`: an acknowledgement carrying the queue drain report, the atomic key-queue snapshot, the buffer state and the working-directory revision, or a refusal with its reason |
+| `root.eof.detach` | `RootEofDetachParams`: `fence_id`, `prompt_generation`, `input_epoch` | `RootEofDetachResult`: the attachment that was removed, the state and the discarded bytes |
+| `root.command.accepted` | `RootCommandAcceptedParams`: the fence, the prompt generation and the origin the reader can prove | `RootCommandAcceptedResult`: the origin the worker recorded |
+| `shell.launch` | `ShellLaunchParams`: an argument vector or an already-quoted command, the expected prompt generation and the expected empty-buffer revision, which are the three section 7 gives the caller | `ShellLaunchResult`: the fence, the prompt generation and the buffer revision at acceptance |
+
+`EditorFence` is the ownership proof the whole group rests on: the root process with the kernel's
+record of when it started, the prompt generation, the reader revision, the input-lease epoch and
+exactly one originating attachment. `FencePublication` is how the worker states whether a fence
+became live, stayed withheld, or has since been invalidated. A bridge can infer none of the three:
+the 250 ms hold may have expired while its acknowledgement was in flight, and a fence it was given
+lasts only until the worker says otherwise.
+
+The hold is `FENCE_EXCHANGE_TIMEOUT`, 250 milliseconds, and it applies to editor entry, to a lease
+takeover and to a launch transaction alike. When it expires the lease change still stands: the held
+input is released in its original order, the editor stays unfenced for a fence exchange or returns to
+fenced for a launch, and `EditorBusyEvent` is emitted on the attachments stream as `editor_busy`.
+That event is an editor event, not a failed `input.acquire` response, which is why it carries the
+attachment it goes to, the epoch that now holds input and the number of bytes that were released. A
+fence acknowledgement that arrives after its hold expired publishes nothing.
+
+`LAUNCH_READER_BUDGET` is 200 milliseconds: the reader's own budget for a launch, shorter than the
+worker's hold because the two measure on their own clocks. The decision between installing and
+cancelling belongs to the reader, in the step where it reads its mailbox: the frames on the bridge
+endpoint are ordered, the worker revokes the transaction when its hold expires, and the reader
+checks for that revocation in the same atomic step in which it would install. The caller's answer
+then waits for the reader's word: `EDITOR_BUSY` when it installed nothing, the installed result when
+it had already installed, and `OUTCOME_UNKNOWN` when the reader can no longer answer at all. The
+host installs no command by any other means.
+
+Section 23's other preconditions of `shell.launch`, the current input lease, the qualified root
+editor with its fence and empty prompt, the working-directory revision and the launch profile, are
+the worker's own: `CwdRevision` travels on the reader-boundary events so the worker has a recorded
+revision to check, and the profile is the session's configuration rather than a client field.
+
+Three error codes belong to this group. `EDITOR_BUSY` says the editor could not be fenced or
+reserved, and it is transient. `DRAFT_CONFLICT` says the editor's own state had moved, which is an
+intervening local edit rather than a busy editor. `AMBIGUOUS_ATTACHMENT` answers a `kr detach` with
+no attachment identifier when the recorded origin is mixed or no longer verifiable.
+
+[docs/shell-integration/README.md](../shell-integration/README.md) is the contract a shell-package
+author implements against: the bridge endpoint, the `kr-shell-bridge/1` handshake, the reader-thread
+rules, the state machine and the cross-shell scenarios.
+
 ## Account authority objects
 
 An organisation states membership with a signed object, so a host can check it while the service is

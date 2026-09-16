@@ -22,6 +22,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-client` | The native client library: connections, typed calls, cursors, receipts and replaceable service clients |
 | `crates/kr-plugin-sdk` | The plugin package contract: manifests, the WIT package, effect classes, the catalogue index and the package validator |
 | `crates/kr-term` | The terminal engine: the kr-vt/1 profile, sequence classes, canonical grid, query broker and snapshots |
+| `crates/kr-shell-integration` | The root-editor bridge contract: the handshake, the reader events, the fence and detach state machine and the cross-shell scenarios |
 | `packages/protocol` | The generated TypeScript package: types, a byte-compatible codec and the JSON adapter |
 | `packages/plugin-sdk` | The generated plugin SDK package: types, the package contract as data and the published WIT file |
 | `fixtures/` | Cross-language conformance vectors and fixture packages that both languages test against |
@@ -33,6 +34,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `docs/transport/` | The transport reference |
 | `docs/plugins/` | The plugin reference |
 | `docs/terminal/` | The terminal reference |
+| `docs/shell-integration/` | The root-editor bridge contract for shell packages |
 | `docs/releases/` | How the generated packages are released, and how a consumer pins one |
 
 Rust is canonical. The JSON Schema in `packages/protocol/schema/` and `packages/plugin-sdk/schema/`
@@ -59,6 +61,7 @@ cargo run -p kr-pairing --bin kr-pairing-vectors -- --check
 cargo run -p kr-plugin-sdk --bin kr-plugin-sdk-gen -- --check
 cargo run -p kr-plugin-sdk --bin kr-plugin-sandbox -- fixtures/plugins/valid/example-declarative
 cargo run -p kr-term --bin kr-term-fixtures -- --check
+cargo run -p kr-shell-integration --bin kr-shell-fixtures -- --check
 
 pnpm install --frozen-lockfile
 pnpm -r test
@@ -99,6 +102,12 @@ pnpm -C packages/plugin-sdk generate
 cargo run -p kr-term --bin kr-term-fixtures
 ```
 
+After changing the shell-bridge contract, rewrite its scenarios and commit them with the change:
+
+```bash
+cargo run -p kr-shell-integration --bin kr-shell-fixtures
+```
+
 [docs/protocol/README.md](docs/protocol/README.md) explains the encoding, the framing, the
 envelopes, the receipt contract, the error codes and the authority table.
 [docs/host/README.md](docs/host/README.md) explains how the host runs sessions, and
@@ -114,3 +123,6 @@ envelopes, action windows, the dispatch lease and the self-hosting fields.
 effect classes, the node union, the predicate grammar and the limits.
 [docs/terminal/README.md](docs/terminal/README.md) explains the kr-vt/1 profile, the sequence class
 table, the byte policy, the query broker, snapshots and the probe contract.
+[docs/shell-integration/README.md](docs/shell-integration/README.md) explains what a managed shell
+package implements: the bridge endpoint and handshake, the reader events, the reader-thread rules,
+the fence and detach state machine, the qualification rules and the cross-shell scenarios.
