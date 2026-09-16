@@ -75,7 +75,10 @@ jobs:
 
       # KR-PERF-007 is a throughput target, so the figure comes from an optimised build. Serially,
       # because three of the tests in this file are timings and they measure each other otherwise.
+      # Each measurement step below runs whatever the one before it did, so a figure one of them
+      # could not meet does not hide the next one's result. A failure still fails the job.
       - name: Terminal output handling
+        if: ${{ !cancelled() }}
         run: cargo test --locked --release -p kr-term --test perf -- --nocapture --test-threads=1
 
       # KR-PERF-005 and KR-PERF-006 are timed targets, so their figures come from an optimised
@@ -85,6 +88,7 @@ jobs:
       # figure is asserted on every run, in the test step above. Serially, because the two
       # measurements would otherwise time each other.
       - name: Transport scheduling and reconnect
+        if: ${{ !cancelled() }}
         run: cargo test --locked --release -p kr-transport --test perf -- --nocapture --test-threads=1
 
   typescript:
