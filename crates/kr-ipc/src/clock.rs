@@ -12,7 +12,7 @@
 //! | --- | --- | --- |
 //! | Apple | `mach_continuous_time` | yes |
 //! | Linux | `CLOCK_BOOTTIME` | yes |
-//! | Windows | `QueryUnbiasedInterruptTime` | no |
+//! | Windows | `QueryInterruptTime` | yes |
 //! | anything else | `CLOCK_MONOTONIC` | the platform's answer, not this crate's |
 //!
 //! A reading of one of those is comparable between two processes, so a deadline expressed in it is
@@ -139,15 +139,15 @@ pub fn boot_elapsed_ms() -> u64 {
 
 /// Returns the machine's continuous clock, in milliseconds since this boot.
 ///
-/// `QueryUnbiasedInterruptTime` counts in hundreds of nanoseconds since the boot and every process
-/// reads the same counter, which is what a deadline crossing a pipe needs. It does not count a
-/// suspend, so a deadline held across one lasts longer in wall-clock terms here than it does on the
-/// other platforms above; that is stated rather than hidden, and closing it belongs to the platform
-/// time adapter section 9 describes rather than to a second clock beside this one.
+/// `QueryInterruptTime` counts in hundreds of nanoseconds since the boot and every process reads
+/// the same counter, which is what a deadline crossing a pipe needs. It is the *biased* count,
+/// which is the one that includes the time the machine spent asleep; the unbiased counter beside it
+/// does not, and a deadline measured on that would outlive a suspension of any length, which is the
+/// one thing section 9 says a clock must not let happen.
 #[must_use]
 #[cfg(windows)]
 pub fn boot_elapsed_ms() -> u64 {
-    windows::unbiased_interrupt_time() / 10_000
+    windows::interrupt_time() / 10_000
 }
 
 /// The one place in this crate that calls the operating system without a safe interface.
@@ -162,17 +162,17 @@ mod windows {
         reason = "the machine's interrupt-time counter has no safe interface on this platform"
     )]
 
-    /// Returns the machine's unbiased interrupt time, in hundreds of nanoseconds since the boot.
-    pub fn unbiased_interrupt_time() -> u64 {
+    /// Returns the machine's interrupt time, in hundreds of nanoseconds since the boot.
+    ///
+    /// The biased count, which includes time the machine spent asleep.
+    pub fn interrupt_time() -> u64 {
         let mut ticks = 0_u64;
         // SAFETY: the call writes one unsigned 64-bit word through the pointer it is given and has
         // no other effect. The pointer is to a live local of exactly that type.
-        let ok = unsafe {
-            windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime(
-                &raw mut ticks,
-            )
-        };
-        if ok == 0 { 0 } else { ticks }
+        unsafe {
+            windows_sys::Win32::System::WindowsProgramming::QueryInterruptTime(&raw mut ticks);
+        }
+        ticks
     }
 }
 
