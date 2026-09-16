@@ -154,6 +154,15 @@ impl Pty {
             .map_err(|error| WorkerError::pty("write to the pseudo-terminal", error))
     }
 
+    /// Returns a handle that can be waited on until the terminal will take more input.
+    ///
+    /// `None` on a platform where the terminal cannot be waited on, and a writer there waits inside
+    /// its own write instead.
+    #[must_use]
+    pub fn input_waiter(&self) -> Option<InputWaiter> {
+        InputWaiter::of(self.master.as_ref())
+    }
+
     /// Returns the process group the terminal currently has in the foreground.
     ///
     /// This changes with every command an interactive shell runs, so it is read now rather than
@@ -567,5 +576,93 @@ mod tests {
         assert_eq!(exit.code, 3);
         shell.request_stop().expect("asking again succeeds");
         shell.force_stop().expect("forcing again succeeds");
+    }
+}
+
+/// A handle on the terminal that can be waited on until it will take more input.
+///
+/// The writer needs to know *when* the terminal will take more without being inside a write while
+/// it finds out: a write that waits holds the bytes it was given in a system call, where nothing
+/// can decide that the lease they belong to has ended. This waits instead, so a takeover reaches a
+/// waiting writer at once and the bytes it was holding are abandoned rather than delivered.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct InputWaiter {
+    handle: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl InputWaiter {
+    /// Builds a waiter for a terminal, or `None` when it has no descriptor to wait on.
+    fn of(master: &dyn MasterPty) -> Option<Self> {
+        let raw = master.as_raw_fd()?;
+        Some(Self {
+            handle: descriptor::duplicate(raw)?,
+        })
+    }
+
+    /// Waits until the terminal will take more input, or until `timeout` passes.
+    ///
+    /// Returns false when the terminal cannot be waited on at all, which is a terminal the writer
+    /// is finished with.
+    #[must_use]
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        use std::os::fd::AsFd as _;
+
+        let handle = self.handle.as_fd();
+        let mut fds = [rustix::event::PollFd::new(
+            &handle,
+            rustix::event::PollFlags::OUT,
+        )];
+        let timeout = rustix::event::Timespec {
+            tv_sec: 0,
+            tv_nsec: i64::try_from(timeout.as_nanos()).unwrap_or(0),
+        };
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+            Ok(_) => true,
+            Err(rustix::io::Errno::INTR) => true,
+            Err(_) => false,
+        }
+    }
+}
+
+/// A waiter on a platform where the terminal has no descriptor to wait on.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct InputWaiter {}
+
+#[cfg(not(unix))]
+impl InputWaiter {
+    /// Builds a waiter for a terminal, or `None` when it has no descriptor to wait on.
+    const fn of(_master: &dyn MasterPty) -> Option<Self> {
+        None
+    }
+
+    /// Waits until the terminal will take more input, or until `timeout` passes.
+    #[must_use]
+    pub const fn wait(&self, _timeout: std::time::Duration) -> bool {
+        false
+    }
+}
+
+/// The one place in this crate that borrows a descriptor the operating system owns.
+///
+/// The workspace forbids unsafe code; this crate denies it and relaxes the rule here alone, because
+/// duplicating a descriptor the terminal owns has no safe form: the terminal library hands out a
+/// raw number and nothing else.
+#[cfg(unix)]
+mod descriptor {
+    #![expect(
+        unsafe_code,
+        reason = "duplicating a descriptor the terminal owns has no safe form"
+    )]
+
+    /// Duplicates a descriptor the caller keeps open for at least the length of this call.
+    pub fn duplicate(raw: std::os::fd::RawFd) -> Option<std::os::fd::OwnedFd> {
+        // SAFETY: `raw` is the terminal's own master descriptor, which the `Pty` that produced it
+        // holds open, and this borrow lives no longer than this call. The duplicate it makes is a
+        // descriptor of its own, closed when it is dropped.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+        rustix::io::dup(borrowed).ok()
     }
 }

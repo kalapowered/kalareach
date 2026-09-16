@@ -21,7 +21,7 @@ kr-term.workspace = true
 kr-transport.workspace = true
 portable-pty.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
-rustix = { workspace = true, features = ["process", "termios"] }
+rustix = { workspace = true, features = ["event", "process", "termios"] }
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -34,5 +34,12 @@ kr-controller.workspace = true
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 
-[lints]
-workspace = true
+# The workspace forbids unsafe code, which a crate that waits on the terminal's own descriptor
+# cannot honour. This crate denies it instead and allows it in exactly one module, `pty::descriptor`,
+# which owns that single call. Nothing else in this crate may relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

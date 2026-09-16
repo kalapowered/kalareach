@@ -557,6 +557,24 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_takeover_closes_a_delivered_paste_and_abandons_the_old_lease_bytes() {
+    // The end of the paste arrives in a frame of its own, behind the body.
+    takeover_mid_paste(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_closes_a_paste_whose_end_was_in_the_half_that_never_arrived() {
+    // One frame carries the whole paste, start to end. The framer reads it as a paste that opened
+    // and closed, so nothing about the batch's *final* framing says a terminator is needed; what
+    // needs one is the half of it the application actually received.
+    takeover_mid_paste(true).await;
+}
+
+/// Takes the lease over from a writer that is part way through a paste.
+///
+/// `one_frame` decides where the end of the paste is: behind the body in a frame of its own, or in
+/// the same frame as the start. Either way the application is given the start and not the end, and
+/// either way it must be given an end before the next actor's input.
+async fn takeover_mid_paste(one_frame: bool) {
     let host = kr_ipc::testing::TempHost::create();
     // The application sets the modes a full-screen application sets, then reads nothing for five
     // seconds, so the writer is inside a batch when the takeover happens, and then reads
@@ -606,14 +624,19 @@ async fn a_takeover_closes_a_delivered_paste_and_abandons_the_old_lease_bytes() 
     const BODY: usize = 32 * 1024;
     let mut start = Vec::from(b"\x1b[200~");
     start.extend(lines(BODY));
+    if one_frame {
+        start.extend_from_slice(b"\x1b[201~");
+    }
     {
         let mut session = runtime.session();
         session
             .write_input(first, epoch, 0, &start, std::time::Instant::now())
             .expect("writes the start of the paste");
-        session
-            .write_input(first, epoch, 1, b"\x1b[201~", std::time::Instant::now())
-            .expect("writes the terminator");
+        if !one_frame {
+            session
+                .write_input(first, epoch, 1, b"\x1b[201~", std::time::Instant::now())
+                .expect("writes the terminator");
+        }
         runtime.flush_locked(&mut session);
     }
 

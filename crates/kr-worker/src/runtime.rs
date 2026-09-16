@@ -25,23 +25,18 @@ pub const READ_QUEUE_DEPTH: usize = 64;
 
 /// The most input the writer offers the pseudo-terminal in one write.
 ///
-/// A whole batch in one call can block for as long as the application takes to read it, and the
+/// A whole batch in one call can wait for as long as the application takes to read it, and the
 /// fence cannot be looked at while it does. This bounds how much of an ended lease's input can
-/// still be in flight when a takeover succeeds; four kibibytes is a comfortable multiple of a
-/// terminal's own input buffer, so an application that is reading pays nothing for it.
-pub const WRITE_PIECE_BYTES: usize = 4 * 1024;
+/// still be in flight when a takeover succeeds. It is deliberately smaller than a terminal's own
+/// input queue, so a write the terminal has room for is a write that finishes: what the writer
+/// spends its time in is the wait below, where a takeover reaches it at once.
+pub const WRITE_PIECE_BYTES: usize = 512;
 
-/// Gives back what a counter was holding for bytes that have reached the application or gone.
-fn release(counter: &std::sync::atomic::AtomicUsize, bytes: usize) {
-    if bytes == 0 {
-        return;
-    }
-    let _ = counter.fetch_update(
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-        |held| Some(held.saturating_sub(bytes)),
-    );
-}
+/// How long the writer waits for the terminal to have room before it looks at the fence again.
+///
+/// The wait ends by itself when the application reads, so this is only the interval at which a
+/// writer that is waiting reconsiders whether the bytes it is holding are still wanted.
+pub const WRITE_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// How often the root shell's status is checked, independently of the terminal.
 ///
@@ -64,6 +59,18 @@ pub const OWNERSHIP_OBSERVE_INTERVAL: std::time::Duration = std::time::Duration:
 /// How often a closing session is asked whether its processes have stopped.
 pub const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Gives back what a counter was holding for bytes that have reached the application or gone.
+fn release(counter: &std::sync::atomic::AtomicUsize, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let _ = counter.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |held| Some(held.saturating_sub(bytes)),
+    );
+}
+
 /// A running session and the tasks around it.
 #[derive(Debug)]
 pub struct SessionRuntime {
@@ -85,6 +92,7 @@ impl SessionRuntime {
         let mut writer = session.input_writer()?;
         // What the host owes the application is bounded by what has been *written*, not by what is
         // waiting in the session, because the session hands its queue over on every flush.
+        let input_waiter = session.input_waiter();
         let queued_input = session.queued_input_bytes();
         let queued_lease = session.queued_lease_bytes();
         let delivered_paste_open = session.delivered_paste_open();
@@ -173,7 +181,7 @@ impl SessionRuntime {
                         paste,
                     } => (Some(*epoch), bytes.as_slice(), *paste),
                     InputBatch::Reply { bytes } => {
-                        (None, bytes.as_slice(), PasteTransition::Unchanged)
+                        (None, bytes.as_slice(), PasteTransition::default())
                     }
                     InputBatch::LeaseChanged => continue,
                 };
@@ -182,8 +190,9 @@ impl SessionRuntime {
                 // the new holder's command line. The host's own answer to a query the application
                 // asked is not a keystroke and is never dropped: nothing else can supply it.
                 if epoch.is_some_and(|epoch| epoch < fence) {
+                    // Only the whole budget is given back. The lease's own share was taken by the
+                    // lease change that made these bytes stale, and reported there as discarded.
                     release(&writer_queued, bytes.len());
-                    release(&writer_lease, bytes.len());
                     continue;
                 }
                 // Written in pieces, with the fence looked at again before each one. A single
@@ -200,6 +209,17 @@ impl SessionRuntime {
                         abandoned = true;
                         break;
                     }
+                    // The waiting happens *here*, before the write, so that a writer holding bytes
+                    // an application is not reading is a writer this loop can still steer. A write
+                    // that waited instead would hold those bytes inside a system call where the
+                    // fence cannot be looked at, and a takeover during one would be followed by the
+                    // rest of them.
+                    if let Some(waiter) = input_waiter.as_ref()
+                        && !waiter.wait(WRITE_WAIT)
+                    {
+                        broken = true;
+                        break;
+                    }
                     let end = delivered.saturating_add(WRITE_PIECE_BYTES).min(bytes.len());
                     match std::io::Write::write(&mut writer, &bytes[delivered..end]) {
                         // A terminal that takes nothing and reports no error is one this writer
@@ -212,7 +232,13 @@ impl SessionRuntime {
                             delivered += written;
                             // Released only once the application has it. Until then it is owed.
                             release(&writer_queued, written);
-                            if epoch.is_some() {
+                            // The lease's share only while these bytes are still the current
+                            // lease's: once a lease change has taken that counter, what it took is
+                            // what it reported, and giving any of it back here would count the
+                            // next lease's bytes as already written.
+                            if epoch
+                                .is_some_and(|epoch| epoch == writer_fence.load(Ordering::Acquire))
+                            {
                                 release(&writer_lease, written);
                             }
                         }
@@ -232,19 +258,17 @@ impl SessionRuntime {
                     // written. What was delivered is what the application has, and the takeover
                     // reports the remainder as discarded.
                     release(&writer_queued, bytes.len().saturating_sub(delivered));
-                    release(&writer_lease, bytes.len().saturating_sub(delivered));
                     // Half a batch may have carried a paste start and not the delimiter that
-                    // completes it. The conservative answer is that the application may be inside
-                    // one, so the next lease change closes it.
-                    if transition == PasteTransition::Opened {
+                    // completes it, whichever way the whole batch would have ended. The
+                    // conservative answer is that the application may be inside one, so the next
+                    // lease change closes it.
+                    if transition.starts {
                         writer_paste_open.store(true, Ordering::Release);
                     }
                     continue;
                 }
-                match transition {
-                    PasteTransition::Opened => writer_paste_open.store(true, Ordering::Release),
-                    PasteTransition::Closed => writer_paste_open.store(false, Ordering::Release),
-                    PasteTransition::Unchanged => {}
+                if let Some(open) = transition.open_after {
+                    writer_paste_open.store(open, Ordering::Release);
                 }
             }
         });
