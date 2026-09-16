@@ -463,9 +463,11 @@ measuring an idle connection twice.
 
 ### The property behind the figure
 
-`crates/kr-transport/tests/priority.rs` holds what KR-PERF-005 is about, with no clock in it, so it
-is asserted on every run: optimised or not, shared runner or reference host. Two things, one for
-each half of the mechanism above.
+`crates/kr-transport/tests/priority.rs` holds what KR-PERF-005 is about, with nothing timed in it,
+so it is asserted on every run: optimised or not, shared runner or reference host. Two things, one
+for each half of the mechanism above. The one deadline in that file turns a peer that has stopped
+answering into a named failure instead of a job that runs until CI kills it, and it decides nothing
+about the property.
 
 At the connection's own default limits, a transfer holding every byte its ceiling allows still
 leaves the control reserve: one more transfer frame is refused, and a keystroke the size of the
