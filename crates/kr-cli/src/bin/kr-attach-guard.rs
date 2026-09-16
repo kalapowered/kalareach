@@ -114,11 +114,12 @@ fn restore(saved: &SavedModes, keyboard: &KeyboardState) -> bool {
             Ok(()) => {
                 let mut handle = terminal.lock();
                 let _ = handle.write_all(RESET_SEQUENCES);
-                // What this terminal had negotiated for itself, put back after the clearing. The
+                // What this terminal had negotiated for itself, cleared and then put back. The
                 // attach process read it before it changed anything and handed it over here, so a
                 // guard that acts because that process was killed restores the same state a normal
-                // exit would have.
-                let _ = handle.write_all(&keyboard.restore_sequences());
+                // exit would have. A guard that was never told leaves the keyboard protocols
+                // alone: nothing it is cleaning up had begun to change them.
+                let _ = handle.write_all(&keyboard.cleanup_sequences());
                 let _ = handle.flush();
                 return true;
             }

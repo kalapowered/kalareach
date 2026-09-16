@@ -191,7 +191,7 @@ mod console {
             set_console_mode(&self.output, saved.output)?;
             let mut handle = &self.output;
             let _ = handle.write_all(RESET_SEQUENCES);
-            let _ = handle.write_all(&keyboard.restore_sequences());
+            let _ = handle.write_all(&keyboard.cleanup_sequences());
             let _ = handle.flush();
             Ok(())
         }

@@ -51,11 +51,25 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// cursor, so the primary screen is not disturbed by the visit. Leaving a terminal in an enhanced key encoding is the failure a
 /// person cannot work around: their shell receives escape sequences where it expects characters.
 ///
-/// Clearing is the first half of the answer. The second is [`KeyboardState`]: the outer terminal is
-/// *asked* what it had negotiated before the attachment began, and whatever it said is put back
-/// after these sequences have cleared what the session left. A person whose own shell had an
-/// enhanced encoding gets that encoding back rather than having it taken away.
-pub const RESET_SEQUENCES: &[u8] = b"\x1b[<65535u\x1b[>4;0m\x1b[?1049h\x1b[<65535u\x1b[>4;0m\x1b[?1049l\x1b[<65535u\x1b[>4;0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
+/// These cover the modes an application can leave enabled *other than* the keyboard protocols. The
+/// keyboard protocols are in [`KEYBOARD_RESET_SEQUENCES`] and are only ever sent together with what
+/// replaces them, because clearing one this attachment never changed would take away something the
+/// person set up for themselves.
+pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
+
+/// The sequences that clear the keyboard protocols a session may have negotiated, in both buffers.
+///
+/// Each screen buffer has its own Kitty stack and its own `modifyOtherKeys` level, and a terminal
+/// can be left in either buffer, so both are visited: cleared where the terminal is, then in the
+/// alternate buffer, then in the primary one it is left in. Entering and leaving the alternate
+/// buffer through `?1049` saves and restores the cursor, so the primary screen is not disturbed by
+/// the visit.
+///
+/// They are sent only when what the terminal had is known and is about to be put back. A cleanup
+/// that ran before the outer terminal was ever asked leaves them alone: the attachment had not
+/// begun forwarding, so nothing it did could have changed them.
+pub const KEYBOARD_RESET_SEQUENCES: &[u8] =
+    b"\x1b[<65535u\x1b[>4;0m\x1b[?1049h\x1b[<65535u\x1b[>4;0m\x1b[?1049l\x1b[<65535u\x1b[>4;0m";
 
 /// The whole probe's deadline.
 ///
@@ -127,6 +141,20 @@ impl KeyboardState {
     #[must_use]
     pub const fn is_known(&self) -> bool {
         self.kitty.is_some() || self.modify_other_keys.is_some()
+    }
+
+    /// Returns the sequences that clear the session's keyboard protocols and put these back.
+    ///
+    /// Empty when nothing was ever read from the terminal, because then nothing here is known to
+    /// have changed and clearing would take away what the person set up for themselves.
+    #[must_use]
+    pub fn cleanup_sequences(&self) -> Vec<u8> {
+        if !self.is_known() {
+            return Vec::new();
+        }
+        let mut out = Vec::from(KEYBOARD_RESET_SEQUENCES);
+        out.extend_from_slice(&self.restore_sequences());
+        out
     }
 
     /// Returns the sequences that put a terminal back into this state.
@@ -355,7 +383,9 @@ mod unix {
             let saved = self.modes()?;
             let mut raw = saved.clone();
             raw.make_raw();
-            rustix::termios::tcsetattr(&self.handle, OptionalActions::Flush, &raw).map_err(
+            // `Now` rather than `Flush`: what the person typed before this moment is theirs, and
+            // discarding the terminal's input queue on the way into raw mode would lose it.
+            rustix::termios::tcsetattr(&self.handle, OptionalActions::Now, &raw).map_err(
                 |error| CliError::Terminal(format!("set the terminal's modes: {error}")),
             )?;
             Ok(saved)
@@ -378,7 +408,7 @@ mod unix {
             )?;
             let mut handle = &self.handle;
             let _ = handle.write_all(RESET_SEQUENCES);
-            let _ = handle.write_all(&keyboard.restore_sequences());
+            let _ = handle.write_all(&keyboard.cleanup_sequences());
             let _ = handle.flush();
             Ok(())
         }
@@ -394,6 +424,12 @@ mod unix {
         /// What the person typed while the host was asking comes back with the answers rather than
         /// being discarded or mistaken for one of them.
         ///
+        /// The device-attributes answer is the one reply this exchange requires, and its absence
+        /// fails the attach. The keyboard queries are reads of state a terminal may simply not
+        /// have: a terminal that implements neither protocol answers neither, and that silence is
+        /// its answer rather than a failure. The terminator is what proves it had the chance to
+        /// give one, which is why the exchange ends with it rather than with a clock.
+        ///
         /// # Errors
         ///
         /// Returns [`CliError::TerminalProbeFailed`] when the terminator does not arrive inside
@@ -408,11 +444,13 @@ mod unix {
             // bound in tenths of a second, so the deadline below is the one that decides.
             asking.special_codes[SpecialCodeIndex::VMIN] = 0;
             asking.special_codes[SpecialCodeIndex::VTIME] = 1;
-            rustix::termios::tcsetattr(&self.handle, OptionalActions::Flush, &asking).map_err(
+            rustix::termios::tcsetattr(&self.handle, OptionalActions::Now, &asking).map_err(
                 |error| CliError::Terminal(format!("set the terminal's modes: {error}")),
             )?;
             let answer = self.ask(KeyboardState::QUERIES);
-            rustix::termios::tcsetattr(&self.handle, OptionalActions::Flush, &saved).map_err(
+            // `Now` again, for the same reason: the exchange ends at the terminator, and anything
+            // the person typed after it is still in the terminal's queue and is still theirs.
+            rustix::termios::tcsetattr(&self.handle, OptionalActions::Now, &saved).map_err(
                 |error| CliError::Terminal(format!("restore the terminal's modes: {error}")),
             )?;
             let (keyboard, answered, typed) = KeyboardState::read(&answer);
@@ -724,8 +762,42 @@ mod tests {
     #[test]
     fn the_reset_sequences_turn_off_the_modes_an_application_may_have_left() {
         let text = String::from_utf8_lossy(RESET_SEQUENCES);
-        for sequence in ["?1000l", "?1006l", "?1049l", "?2004l", "?25h"] {
+        for sequence in ["?1000l", "?1006l", "?2004l", "?25h"] {
             assert!(text.contains(sequence), "{sequence} is undone");
         }
+        // The keyboard protocols are not among them, because clearing one this attachment never
+        // changed would take away what the person set up for themselves.
+        assert!(
+            !text.contains("65535u"),
+            "the Kitty stack is not cleared here"
+        );
+        assert!(!text.contains(">4;0m"), "and neither is modifyOtherKeys");
+    }
+
+    #[test]
+    fn the_keyboard_is_cleared_only_together_with_what_replaces_it() {
+        // A terminal that answered: cleared in both buffers, then put back.
+        let known = KeyboardState {
+            kitty: Some(5),
+            modify_other_keys: Some(2),
+        };
+        let cleanup = String::from_utf8_lossy(&known.cleanup_sequences()).into_owned();
+        assert!(
+            cleanup.contains("?1049h"),
+            "the alternate buffer is visited"
+        );
+        assert_eq!(
+            cleanup.matches("\u{1b}[<65535u").count(),
+            3,
+            "the Kitty stack is cleared where the terminal is and in both buffers"
+        );
+        assert!(
+            cleanup.ends_with("\u{1b}[=5;1u\u{1b}[>4;2m"),
+            "and what it had comes back last: {cleanup:?}"
+        );
+
+        // A terminal that was never asked: nothing is cleared, because nothing is known to have
+        // changed and the person's own negotiation is not this attachment's to undo.
+        assert!(KeyboardState::EMPTY.cleanup_sequences().is_empty());
     }
 }
