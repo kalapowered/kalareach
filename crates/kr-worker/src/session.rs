@@ -129,11 +129,12 @@ pub struct Session {
     /// The part of that which belongs to the **current** lease, and which a lease change discards.
     ///
     /// What is left is the response lane's share, so the two bounds section 8 and section 9 name
-    /// are read from one pair of counters rather than three. A lease change takes this counter and
-    /// leaves zero behind, so the bytes it reports as discarded are that lease's and are reported
-    /// exactly once; the writer releases it only for bytes it writes under the current fence, and
-    /// what it drops afterwards has already been accounted for here.
-    queued_lease_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// are read from one pair of counters rather than three. The lease's epoch travels with the
+    /// count in one word, because the two have to move together: a lease change takes the word and
+    /// leaves the next epoch with nothing, and a writer still finishing the previous lease's bytes
+    /// finds an epoch that is no longer its own and subtracts nothing. That is what makes the bytes
+    /// a takeover reports as discarded that lease's own, counted once.
+    queued_lease_bytes: Arc<crate::runtime::LeaseBytes>,
     /// Whether the application is inside a bracketed paste, as the writer has actually delivered
     /// it. The framer says what the accepted stream means; this says what arrived.
     delivered_paste_open: Arc<std::sync::atomic::AtomicBool>,
@@ -207,7 +208,7 @@ impl Session {
             engine,
             restoration_losses: crate::render::Carried::default(),
             queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            queued_lease_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            queued_lease_bytes: Arc::new(crate::runtime::LeaseBytes::new()),
             delivered_paste_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lease_change_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
@@ -555,8 +556,7 @@ impl Session {
         self.lease.release_attachment(attachment_id);
         if held {
             self.framer.close_for_takeover();
-            self.queued_lease_bytes
-                .store(0, std::sync::atomic::Ordering::Release);
+            let _ = self.queued_lease_bytes.take(self.lease.epoch());
         }
         self.note_lease_holder();
         self.pump_replies();
@@ -692,10 +692,9 @@ impl Session {
         // including the rest of a batch it is part way through. Taking the counter rather than
         // reading it is what makes the answer that lease's own: the next takeover starts from zero
         // and cannot report these bytes a second time.
-        let mut discarded = self
-            .queued_lease_bytes
-            .swap(0, std::sync::atomic::Ordering::AcqRel) as u64;
-        discarded += self.lease.acquire(attachment_id, connection_id);
+        let discarded_queue = self.lease.acquire(attachment_id, connection_id);
+        let mut discarded = self.queued_lease_bytes.take(self.lease.epoch()) as u64;
+        discarded += discarded_queue;
         discarded += framing.discarded_prefix.len() as u64;
         // A paste is reported as closed when one was open in the stream this lease accepted, or
         // when one is open at the application: the writer keeps the second, because a terminator
@@ -731,8 +730,7 @@ impl Session {
             .ok_or(WorkerError::LeaseLost)?;
         // What this lease handed over and the writer has not written goes with it, and the counter
         // starts again for whoever takes the lease next.
-        self.queued_lease_bytes
-            .store(0, std::sync::atomic::Ordering::Release);
+        let _ = self.queued_lease_bytes.take(self.lease.epoch());
         // A paste this lease opened is closed as it goes. Leaving it open would put the
         // application into a bracketed paste that nothing was ever going to end, so the next
         // keystroke would arrive inside somebody else's paste. The writer supplies the terminator,
@@ -794,7 +792,8 @@ impl Session {
             // did not. Whether a start is among them is the separate question the writer asks when
             // it has delivered only part of the batch.
             let paste = PasteTransition {
-                starts: outcome.paste_started,
+                first_delimiter_end: outcome.first_delimiter_end,
+                last_delimiter_end: outcome.last_delimiter_end,
                 open_after: (outcome.paste_started || outcome.paste_ended)
                     .then(|| self.framer.paste_open()),
             };
@@ -1013,10 +1012,7 @@ impl Session {
             let queued = self
                 .queued_input_bytes
                 .load(std::sync::atomic::Ordering::Acquire);
-            let held = queued.saturating_sub(
-                self.queued_lease_bytes
-                    .load(std::sync::atomic::Ordering::Acquire),
-            );
+            let held = queued.saturating_sub(self.queued_lease_bytes.load());
             // Two bounds, both of them this reply's: its own share, so an application that asks
             // questions without reading the answers cannot fill the terminal by itself, and the
             // whole budget, so its share cannot be spent on top of a full queue.
@@ -1037,9 +1033,8 @@ impl Session {
     fn queue_input(&mut self, batch: InputBatch) {
         self.queued_input_bytes
             .fetch_add(batch.len(), std::sync::atomic::Ordering::AcqRel);
-        if matches!(batch, InputBatch::Lease { .. }) {
-            self.queued_lease_bytes
-                .fetch_add(batch.len(), std::sync::atomic::Ordering::AcqRel);
+        if let InputBatch::Lease { epoch, .. } = batch {
+            self.queued_lease_bytes.add(epoch, batch.len());
         }
         self.pending_input.push(batch);
     }
@@ -1052,7 +1047,7 @@ impl Session {
 
     /// Returns the counter holding the current lease's share of the queue.
     #[must_use]
-    pub fn queued_lease_bytes(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+    pub fn queued_lease_bytes(&self) -> Arc<crate::runtime::LeaseBytes> {
         Arc::clone(&self.queued_lease_bytes)
     }
 
@@ -1297,8 +1292,7 @@ impl Session {
                     self.lease.release_attachment(holder);
                 }
                 self.framer.close_for_takeover();
-                self.queued_lease_bytes
-                    .store(0, std::sync::atomic::Ordering::Release);
+                let _ = self.queued_lease_bytes.take(self.lease.epoch());
                 self.note_lease_holder();
                 CloseAcceptance {
                     state: SessionState::Closing,
@@ -1594,18 +1588,37 @@ impl InputBatch {
 /// drops or abandons never happened as far as the application is concerned, however the framer read
 /// it.
 ///
-/// The two fields answer two different questions, and one batch can need both. `open_after` is what
-/// the framing is once all of the bytes arrive, which is what a batch the writer finished says.
-/// `starts` is whether the bytes contain a paste start at all, which is what a batch the writer
-/// abandoned part way says: one frame can carry a whole paste, start to end, and a takeover during
-/// it can leave the application inside a paste whose end was in the half that never arrived.
+/// The fields are what the writer needs to answer one question: what the framing is at the point
+/// where delivery stopped. When every delimiter arrived the answer is exact; when none did, nothing
+/// changed; and in between, where one frame carried a paste whose end was in the half that never
+/// arrived, the answer is the conservative one, because an application left inside a paste reads
+/// the next actor's keystrokes as pasted text and a spare terminator outside one is ignored.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PasteTransition {
-    /// Whether the bytes complete a paste start, so any part of them reaching the application may
-    /// leave it inside a paste.
-    pub starts: bool,
+    /// The offset just past the first delimiter these bytes complete.
+    pub first_delimiter_end: Option<usize>,
+    /// The offset just past the last one.
+    pub last_delimiter_end: Option<usize>,
     /// What the application's framing is after all of the bytes reach it, when they change it.
     pub open_after: Option<bool>,
+}
+
+impl PasteTransition {
+    /// Returns the application's framing once `delivered` bytes of the batch have reached it.
+    ///
+    /// `None` means these bytes decided nothing and whatever was true before still is.
+    #[must_use]
+    pub fn after(&self, delivered: usize) -> Option<bool> {
+        let first = self.first_delimiter_end?;
+        if delivered < first {
+            return None;
+        }
+        let last = self.last_delimiter_end?;
+        if delivered >= last {
+            return self.open_after;
+        }
+        Some(true)
+    }
 }
 
 /// What accepting input produced.

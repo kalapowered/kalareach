@@ -59,6 +59,105 @@ pub const OWNERSHIP_OBSERVE_INTERVAL: std::time::Duration = std::time::Duration:
 /// How often a closing session is asked whether its processes have stopped.
 pub const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// The current lease's share of the queued input, and the epoch it belongs to, in one word.
+///
+/// The two have to move together. A lease change hands the count to the takeover receipt and leaves
+/// the next epoch with nothing; a writer that is still finishing the previous lease's bytes finds an
+/// epoch that is no longer its own and subtracts nothing, so it cannot debit the lease that
+/// replaced it. Reading and updating them as two values leaves exactly that gap.
+#[derive(Debug)]
+pub struct LeaseBytes {
+    /// The epoch in the high thirty-two bits, the byte count in the low thirty-two.
+    ///
+    /// A session's queued input is bounded far below four gibibytes and a lease epoch counts lease
+    /// changes, so neither half is near its limit; both saturate rather than wrap if one ever is.
+    packed: std::sync::atomic::AtomicU64,
+}
+
+impl LeaseBytes {
+    /// Builds an empty count at epoch zero.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            packed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Returns how many bytes the current lease has queued and unwritten.
+    #[must_use]
+    pub fn load(&self) -> usize {
+        Self::bytes(self.packed.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Adds bytes queued under `epoch`, if that is still the epoch this count belongs to.
+    pub fn add(&self, epoch: u64, bytes: usize) {
+        let _ = self.packed.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |packed| {
+                (Self::epoch(packed) == epoch)
+                    .then(|| Self::pack(epoch, Self::bytes(packed).saturating_add(bytes)))
+            },
+        );
+    }
+
+    /// Gives back bytes that reached the application, if they were this lease's.
+    pub fn release(&self, epoch: u64, bytes: usize) {
+        let _ = self.packed.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |packed| {
+                (Self::epoch(packed) == epoch)
+                    .then(|| Self::pack(epoch, Self::bytes(packed).saturating_sub(bytes)))
+            },
+        );
+    }
+
+    /// Ends the current lease and returns what it had queued and unwritten.
+    ///
+    /// Everything that count names is discarded by the change, and the epoch it moves to starts
+    /// from nothing, so the same bytes are never reported twice.
+    #[must_use]
+    pub fn take(&self, next_epoch: u64) -> usize {
+        Self::bytes(self.packed.swap(
+            Self::pack(next_epoch, 0),
+            std::sync::atomic::Ordering::AcqRel,
+        ))
+    }
+
+    /// The mask of the low half, which is where the byte count lives.
+    const BYTES: u64 = 0xFFFF_FFFF;
+
+    const fn pack(epoch: u64, bytes: usize) -> u64 {
+        let epoch = if epoch > Self::BYTES {
+            Self::BYTES
+        } else {
+            epoch
+        };
+        let bytes = bytes as u64;
+        let bytes = if bytes > Self::BYTES {
+            Self::BYTES
+        } else {
+            bytes
+        };
+        (epoch << 32) | bytes
+    }
+
+    const fn epoch(packed: u64) -> u64 {
+        packed >> 32
+    }
+
+    const fn bytes(packed: u64) -> usize {
+        (packed & Self::BYTES) as usize
+    }
+}
+
+impl Default for LeaseBytes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Gives back what a counter was holding for bytes that have reached the application or gone.
 fn release(counter: &std::sync::atomic::AtomicUsize, bytes: usize) {
     if bytes == 0 {
@@ -195,6 +294,7 @@ impl SessionRuntime {
                     release(&writer_queued, bytes.len());
                     continue;
                 }
+                let lease_epoch = epoch.unwrap_or_default();
                 // Written in pieces, with the fence looked at again before each one. A single
                 // write of a whole batch can block for as long as the application takes to read
                 // it, and a takeover that happened during it would otherwise be followed by the
@@ -205,19 +305,32 @@ impl SessionRuntime {
                 let mut abandoned = false;
                 let mut broken = false;
                 while delivered < bytes.len() {
-                    if epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire)) {
-                        abandoned = true;
-                        break;
-                    }
                     // The waiting happens *here*, before the write, so that a writer holding bytes
                     // an application is not reading is a writer this loop can still steer. A write
                     // that waited instead would hold those bytes inside a system call where the
                     // fence cannot be looked at, and a takeover during one would be followed by the
-                    // rest of them.
-                    if let Some(waiter) = input_waiter.as_ref()
-                        && !waiter.wait(WRITE_WAIT)
-                    {
-                        broken = true;
+                    // rest of them. The fence is looked at after the wait as well as before it,
+                    // because the wait is where a takeover arrives.
+                    if let Some(waiter) = input_waiter.as_ref() {
+                        match waiter.wait(WRITE_WAIT) {
+                            crate::pty::Room::Ready => {}
+                            crate::pty::Room::NotYet => {
+                                if epoch.is_some_and(|epoch| {
+                                    epoch < writer_fence.load(Ordering::Acquire)
+                                }) {
+                                    abandoned = true;
+                                    break;
+                                }
+                                continue;
+                            }
+                            crate::pty::Room::Gone => {
+                                broken = true;
+                                break;
+                            }
+                        }
+                    }
+                    if epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire)) {
+                        abandoned = true;
                         break;
                     }
                     let end = delivered.saturating_add(WRITE_PIECE_BYTES).min(bytes.len());
@@ -233,13 +346,11 @@ impl SessionRuntime {
                             // Released only once the application has it. Until then it is owed.
                             release(&writer_queued, written);
                             // The lease's share only while these bytes are still the current
-                            // lease's: once a lease change has taken that counter, what it took is
-                            // what it reported, and giving any of it back here would count the
-                            // next lease's bytes as already written.
-                            if epoch
-                                .is_some_and(|epoch| epoch == writer_fence.load(Ordering::Acquire))
-                            {
-                                release(&writer_lease, written);
+                            // lease's. The epoch travels with the count, so a lease change that
+                            // happened while this write was in the terminal leaves nothing here to
+                            // subtract from.
+                            if epoch.is_some() {
+                                writer_lease.release(lease_epoch, written);
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -253,22 +364,17 @@ impl SessionRuntime {
                 if broken {
                     break;
                 }
+                // What the application's framing is now is decided by the delimiters that reached
+                // it, whether or not the rest of the batch did.
+                if let Some(open) = transition.after(delivered) {
+                    writer_paste_open.store(open, Ordering::Release);
+                }
                 if abandoned {
                     // The rest of the batch belongs to a lease that has ended, so it is not
                     // written. What was delivered is what the application has, and the takeover
                     // reports the remainder as discarded.
                     release(&writer_queued, bytes.len().saturating_sub(delivered));
-                    // Half a batch may have carried a paste start and not the delimiter that
-                    // completes it, whichever way the whole batch would have ended. The
-                    // conservative answer is that the application may be inside one, so the next
-                    // lease change closes it.
-                    if transition.starts {
-                        writer_paste_open.store(true, Ordering::Release);
-                    }
                     continue;
-                }
-                if let Some(open) = transition.open_after {
-                    writer_paste_open.store(open, Ordering::Release);
                 }
             }
         });

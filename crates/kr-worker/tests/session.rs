@@ -658,7 +658,7 @@ async fn takeover_mid_paste(one_frame: bool) {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let queued = runtime.session().queued_lease_bytes();
     assert!(
-        queued.load(std::sync::atomic::Ordering::Acquire) > 0,
+        queued.load() > 0,
         "and is waiting inside it, because the application is not reading"
     );
     let taken = {

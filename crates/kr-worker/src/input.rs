@@ -60,6 +60,13 @@ pub struct FramingOutcome {
     pub paste_started: bool,
     /// True when this push completed a paste end delimiter.
     pub paste_ended: bool,
+    /// The offset in `forward` just past the first delimiter this push completed.
+    ///
+    /// A writer that delivers only part of a batch needs to know which delimiters went with the
+    /// part it delivered, and a boolean cannot say that.
+    pub first_delimiter_end: Option<usize>,
+    /// The offset in `forward` just past the last delimiter this push completed.
+    pub last_delimiter_end: Option<usize>,
 }
 
 impl Default for PasteFramer {
@@ -126,6 +133,8 @@ impl PasteFramer {
         let mut forward: Vec<u8> = Vec::with_capacity(pending.len());
         let mut paste_started = false;
         let mut paste_ended = false;
+        let mut first_delimiter_end = None;
+        let mut last_delimiter_end = None;
         let mut index = 0;
 
         while index < pending.len() {
@@ -142,6 +151,8 @@ impl PasteFramer {
                         paste_ended = true;
                     }
                     forward.extend_from_slice(delimiter);
+                    first_delimiter_end.get_or_insert(forward.len());
+                    last_delimiter_end = Some(forward.len());
                     index += delimiter.len();
                     continue;
                 }
@@ -157,6 +168,7 @@ impl PasteFramer {
             index += 1;
         }
 
+        let prefix = expired.len();
         if !expired.is_empty() {
             // The expired prefix goes first, because it arrived first.
             expired.extend_from_slice(&forward);
@@ -168,6 +180,10 @@ impl PasteFramer {
             deadline: self.deadline(),
             paste_started,
             paste_ended,
+            // The offsets are into what is forwarded, so an expired prefix that went in front of it
+            // moves them along with it.
+            first_delimiter_end: first_delimiter_end.map(|end| end + prefix),
+            last_delimiter_end: last_delimiter_end.map(|end| end + prefix),
         }
     }
 

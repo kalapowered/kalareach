@@ -579,6 +579,17 @@ mod tests {
     }
 }
 
+/// What waiting on the terminal established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Room {
+    /// The terminal will take more input now.
+    Ready,
+    /// It will not yet. Nothing is wrong; the caller may look at its own state and wait again.
+    NotYet,
+    /// The terminal has gone, and nothing more will reach it.
+    Gone,
+}
+
 /// A handle on the terminal that can be waited on until it will take more input.
 ///
 /// The writer needs to know *when* the terminal will take more without being inside a write while
@@ -602,11 +613,8 @@ impl InputWaiter {
     }
 
     /// Waits until the terminal will take more input, or until `timeout` passes.
-    ///
-    /// Returns false when the terminal cannot be waited on at all, which is a terminal the writer
-    /// is finished with.
     #[must_use]
-    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+    pub fn wait(&self, timeout: std::time::Duration) -> Room {
         use std::os::fd::AsFd as _;
 
         let handle = self.handle.as_fd();
@@ -619,9 +627,25 @@ impl InputWaiter {
             tv_nsec: i64::try_from(timeout.as_nanos()).unwrap_or(0),
         };
         match rustix::event::poll(&mut fds, Some(&timeout)) {
-            Ok(_) => true,
-            Err(rustix::io::Errno::INTR) => true,
-            Err(_) => false,
+            // Interrupted, or nothing happened before the deadline. Neither says the terminal has
+            // room, and neither says it never will; the caller looks at its own state and asks
+            // again.
+            Ok(0) | Err(rustix::io::Errno::INTR) => Room::NotYet,
+            Ok(_) => {
+                let ready = fds[0].revents();
+                if ready.intersects(
+                    rustix::event::PollFlags::HUP
+                        | rustix::event::PollFlags::ERR
+                        | rustix::event::PollFlags::NVAL,
+                ) {
+                    Room::Gone
+                } else if ready.contains(rustix::event::PollFlags::OUT) {
+                    Room::Ready
+                } else {
+                    Room::NotYet
+                }
+            }
+            Err(_) => Room::Gone,
         }
     }
 }
@@ -640,8 +664,8 @@ impl InputWaiter {
 
     /// Waits until the terminal will take more input, or until `timeout` passes.
     #[must_use]
-    pub const fn wait(&self, _timeout: std::time::Duration) -> bool {
-        false
+    pub const fn wait(&self, _timeout: std::time::Duration) -> Room {
+        Room::Gone
     }
 }
 
