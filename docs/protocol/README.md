@@ -559,20 +559,23 @@ working credentials.
 
 **Delivery.** A `PushDeliveryRequest` carries a notification identifier, a collapse label, an
 expiry, the sealed preview and a choice from a closed alert vocabulary. There is no field for text a
-sender supplies, and each of the other fields is shaped so it cannot become one:
+sender supplies, and the rest of the shape is what a gateway can actually check:
 
-- the notification and collapse identifiers are 128 opaque bits, not text, so neither can carry a
-  project or session name;
 - the alert is one of six values whose words live in `PushAlert::generic_text`, which is how section
   16's "the plaintext alert is generic" is enforced rather than asked for;
+- the notification and collapse identifiers are 128-bit values rather than text, so nothing that
+  reads as a project or session name fits in either;
 - the preview is a `SealedEnvelope` rather than arbitrary bytes, and
-  `PushDeliveryRequest::preview_is_well_formed` checks the three things a gateway can check about a
-  ciphertext it cannot read: that the envelope expires when the notification does, that its declared
-  size bucket is a notification bucket, and that its ciphertext is exactly that bucket plus the
-  seal's overhead.
+  `PushDeliveryRequest::preview_is_well_formed` checks that the envelope expires when the
+  notification does, that its declared size bucket is a notification bucket, and that its ciphertext
+  is exactly that bucket plus the seal's overhead.
 
-What that does not prove is that the plaintext inside was encrypted correctly, which only the
-destination can tell. A host that seals nonsense to its own paired device has harmed no one else.
+Those are checks of format and length. They do not inspect a producer, and they cannot: nothing here
+proves the ciphertext is ciphertext, that it was sealed to the right key, or that the identifiers
+mean nothing. A host that encoded something into its own identifiers, or sealed the wrong thing, has
+disclosed it to the provider and to the gateway. Section 16 puts that obligation on the producer,
+and so does this contract: generate the notification identifier at random, derive the collapse label
+from a host-local secret, and seal the preview to the destination's notification-preview key.
 
 Previews may be disabled on the device, in which case `preview` is null and the generic alert still
 arrives.

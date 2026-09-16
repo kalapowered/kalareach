@@ -398,9 +398,11 @@ uuid_id!(
 uuid_id!(
     /// One notification, as the host that produced it names it. 128 random bits.
     ///
-    /// The gateway deduplicates by this value and never reads it. It is 128 opaque bits rather than
-    /// text because it travels to a provider in the clear: a text identifier could carry a project
-    /// or session name, and this cannot.
+    /// The gateway deduplicates by this value and never reads it. It travels to a provider in the
+    /// clear, so the producer generates it at random rather than deriving it from anything about
+    /// the work. Being 128 bits rather than text leaves no room for a name that reads as one; it
+    /// does not stop a producer encoding something into the bits, which is the producer's own rule
+    /// to keep.
     NotificationId,
     "One notification, named by the host that produced it. 128 random bits, opaque to the gateway and the provider."
 );
@@ -408,10 +410,11 @@ uuid_id!(
     /// The group a notification replaces others in on the device.
     ///
     /// A host derives it from its own secret and whatever it wants to group by, so two notifications
-    /// about one thing collapse into one. Like the notification identifier it is 128 opaque bits,
-    /// because it reaches the provider in plaintext and must reveal no project or session name.
+    /// about one thing collapse into one and the value tells a provider nothing about what that
+    /// thing is. Like the notification identifier it reaches the provider in the clear, and like it
+    /// the producer is the one that keeps it meaningless.
     CollapseId,
-    "The group a notification replaces others in on the device. 128 opaque bits revealing no project or session name."
+    "The group a notification replaces others in on the device. 128 bits a host derives from its own secret."
 );
 uuid_id!(
     /// One attempt to bind a push token to an installation. 128 random bits.

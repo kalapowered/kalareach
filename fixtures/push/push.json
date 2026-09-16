@@ -781,6 +781,132 @@
       }
     },
     {
+      "cbor_hex": "82716b722d707573682d726571756573742f31a16c73656e6465725f72656e6577a16772657175657374a165626567696ea16772657175657374a17073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
+      "description": "The body of the request that asks for the nonce a renewal will answer.",
+      "domain": "kr-push-request/1",
+      "id": "body_sender_renew_begin",
+      "json": {
+        "sender_renew": {
+          "request": {
+            "begin": {
+              "request": {
+                "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+              }
+            }
+          }
+        }
+      },
+      "sha256": "96b47989c4c3449755bfee3de5e1f2c9f7520a03a04dac92a48a7130694b7c7d",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-request/1"
+          },
+          {
+            "map": [
+              [
+                "sender_renew",
+                {
+                  "map": [
+                    [
+                      "request",
+                      {
+                        "map": [
+                          [
+                            "begin",
+                            {
+                              "map": [
+                                [
+                                  "request",
+                                  {
+                                    "map": [
+                                      [
+                                        "sender_record_id",
+                                        {
+                                          "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                                        }
+                                      ]
+                                    ]
+                                  }
+                                ]
+                              ]
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82716b722d707573682d726571756573742f31a16d73656e6465725f7265766f6b65a16772657175657374a165626567696ea16772657175657374a17073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
+      "description": "The body of the request that asks for the nonce a revocation will answer.",
+      "domain": "kr-push-request/1",
+      "id": "body_sender_revoke_begin",
+      "json": {
+        "sender_revoke": {
+          "request": {
+            "begin": {
+              "request": {
+                "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+              }
+            }
+          }
+        }
+      },
+      "sha256": "fda99411e173dd162d4b2d30b0fc43e189436d4ab801988d24b08484924ed8e9",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-request/1"
+          },
+          {
+            "map": [
+              [
+                "sender_revoke",
+                {
+                  "map": [
+                    [
+                      "request",
+                      {
+                        "map": [
+                          [
+                            "begin",
+                            {
+                              "map": [
+                                [
+                                  "request",
+                                  {
+                                    "map": [
+                                      [
+                                        "sender_record_id",
+                                        {
+                                          "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                                        }
+                                      ]
+                                    ]
+                                  }
+                                ]
+                              ]
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
       "cbor_hex": "82716b722d707573682d726571756573742f31a16c73656e6465725f72656e6577a16772657175657374a168636f6d706c657465a16772656e6577616ca2677061796c6f6164a46d676174657761795f6e6f6e6365582071717171717171717171717171717171717171717171717171717171717171716e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f6f7265717565737465645f61745f6d731b0000019bed4cec007073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4697369676e617475726558405d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d",
       "description": "The body of the request that presents a renewal proof.",
       "domain": "kr-push-request/1",
@@ -1186,6 +1312,16 @@
       "body": "body_sender_issue",
       "method": "push.sender.issue",
       "signer": "installation"
+    },
+    {
+      "body": "body_sender_renew_begin",
+      "method": "push.sender.renew",
+      "signer": "host"
+    },
+    {
+      "body": "body_sender_revoke_begin",
+      "method": "push.sender.revoke",
+      "signer": "host"
     },
     {
       "body": "body_sender_renew",

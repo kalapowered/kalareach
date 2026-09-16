@@ -583,7 +583,14 @@ export function previewIsWellFormed (request: PushDeliveryRequest): boolean {
   )
 }
 
-/** The digest a delivery credential's request signature covers as its body. */
+/**
+ * The digest the gateway recognises a notification by.
+ *
+ * Delivery carries the bearer credential the host was issued rather than a signature, so this is not
+ * a signing input. It is how a retry of the same notification is recognised as the same request,
+ * and how a second request reusing a notification identifier with anything else changed is
+ * recognised as a conflict rather than a retry.
+ */
 export async function deliveryRequestDigest (request: PushDeliveryRequest): Promise<Uint8Array> {
   const digest = await crypto.subtle.digest(
     'SHA-256',

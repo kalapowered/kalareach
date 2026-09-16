@@ -32,8 +32,8 @@ use crate::push::{
     PushDeliveryRequest, PushInstallationBinding, PushPlatform, PushPlatformHints, PushRatePolicy,
     PushRegistrationAnswer, PushRegistrationChallenge, PushRegistrationProposal,
     PushRegistrationRequest, PushRequest, PushRevocationReason, PushSenderBinding,
-    PushSenderIssueRequest, PushSenderRecord, PushSenderRenewRequest, PushSenderRenewal,
-    PushSenderRenewalPayload, PushSenderRevocation, PushSenderRevocationPayload,
+    PushSenderIssueRequest, PushSenderNonceRequest, PushSenderRecord, PushSenderRenewRequest,
+    PushSenderRenewal, PushSenderRenewalPayload, PushSenderRevocation, PushSenderRevocationPayload,
     PushSenderRevokeRequest, PushSenderState, PushTokenState, REGISTRATION_CHALLENGE_LIFETIME_MS,
     RegistrationToken, SENDER_RENEWAL_WINDOW_MS, token_digest,
 };
@@ -434,9 +434,23 @@ fn push() -> Value {
             sender_record_id: sender_record_id(),
         },
     };
+    let renew_begin = PushRequest::SenderRenew {
+        request: PushSenderRenewRequest::Begin {
+            request: PushSenderNonceRequest {
+                sender_record_id: sender_record_id(),
+            },
+        },
+    };
     let renew_body = PushRequest::SenderRenew {
         request: PushSenderRenewRequest::Complete {
             renewal: renewal.clone(),
+        },
+    };
+    let revoke_begin = PushRequest::SenderRevoke {
+        request: PushSenderRevokeRequest::Begin {
+            request: PushSenderNonceRequest {
+                sender_record_id: sender_record_id(),
+            },
         },
     };
     let revoke_body = PushRequest::SenderRevoke {
@@ -494,6 +508,8 @@ fn push() -> Value {
             { "body": "body_registration_propose", "method": propose.method().as_str(), "signer": propose.signer().as_str() },
             { "body": "body_registration_answer", "method": answer_body.method().as_str(), "signer": answer_body.signer().as_str() },
             { "body": "body_sender_issue", "method": issue_body.method().as_str(), "signer": issue_body.signer().as_str() },
+            { "body": "body_sender_renew_begin", "method": renew_begin.method().as_str(), "signer": renew_begin.signer().as_str() },
+            { "body": "body_sender_revoke_begin", "method": revoke_begin.method().as_str(), "signer": revoke_begin.signer().as_str() },
             { "body": "body_sender_renew", "method": renew_body.method().as_str(), "signer": renew_body.signer().as_str() },
             { "body": "body_sender_revoke", "method": revoke_body.method().as_str(), "signer": revoke_body.signer().as_str() }
         ],
@@ -570,6 +586,20 @@ fn push() -> Value {
                 crate::push::PUSH_REQUEST_DOMAIN,
                 &issue_body,
                 &issue_body.signing_input().expect("a body signing input"),
+            ),
+            case(
+                "body_sender_renew_begin",
+                "The body of the request that asks for the nonce a renewal will answer.",
+                crate::push::PUSH_REQUEST_DOMAIN,
+                &renew_begin,
+                &renew_begin.signing_input().expect("a body signing input"),
+            ),
+            case(
+                "body_sender_revoke_begin",
+                "The body of the request that asks for the nonce a revocation will answer.",
+                crate::push::PUSH_REQUEST_DOMAIN,
+                &revoke_begin,
+                &revoke_begin.signing_input().expect("a body signing input"),
             ),
             case(
                 "body_sender_renew",

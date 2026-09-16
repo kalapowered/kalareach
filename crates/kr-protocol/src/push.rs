@@ -28,10 +28,15 @@
 //!
 //! It is not an account system and not a host authorisation service. Nothing here mentions an
 //! account, because none is needed: a self-hosted installation forwards through the official
-//! gateway on the strength of its own key. It is not a decryption point either. The preview is
-//! sealed to the destination device's notification-preview key (section 10), which the gateway
-//! never holds, so the most a compromised gateway can do is refuse to forward, deliver something
-//! the device cannot open, or learn how often a device is notified.
+//! gateway on the strength of its own key.
+//!
+//! It is not a decryption point either. The preview is sealed to the destination device's
+//! notification-preview key (section 10), which the gateway never holds, so no preview text is
+//! readable there. What a compromised gateway does have is everything outside the seal: the routing
+//! metadata, which host sends to which installation and how often, the alert each notification
+//! carries, and the ability to withhold a notification, replay one, or send one of its own with any
+//! alert in the vocabulary. The device's own state, not the alert, is what an action is taken
+//! against.
 //!
 //! # What is signed, and by whom
 //!
@@ -191,9 +196,20 @@ pub const MAX_REGISTRATION_TOKEN_LEN: usize = 1024;
 /// It reaches the gateway once, in a registration request, and is never carried in a record that
 /// leaves it. Anything holding one can have messages delivered to that device, which is why the
 /// records here carry [`token_digest`] instead.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct RegistrationToken(String);
+
+impl core::fmt::Debug for RegistrationToken {
+    /// Renders the length and nothing else.
+    ///
+    /// A token is a delivery capability, so a debug rendering of a registration request, or of the
+    /// enclosing [`PushRequest`], must not put one in a log. The length is enough to tell an empty
+    /// field from a present one while debugging.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "RegistrationToken({} bytes)", self.0.len())
+    }
+}
 
 /// A registration token that is empty, over-long or not printable ASCII.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1006,9 +1022,10 @@ impl PushRequest {
 /// The generic alert a device shows before anything is decrypted.
 ///
 /// Section 16 requires the plaintext alert to be generic, and this is how: a sender chooses from a
-/// closed vocabulary and the text comes from here. There is no field anywhere in a delivery request
-/// for sender-supplied text, so command text and approval arguments cannot reach a lock screen by
-/// mistake, by a bug in a host, or by a host that decided to.
+/// closed vocabulary and the text comes from here. A delivery request has no field for text a
+/// sender supplies, so command text and approval arguments cannot reach a lock screen by mistake or
+/// by a bug in a host. What reaches it is one of six sentences, each of which names no session,
+/// project, host or command.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -1134,9 +1151,15 @@ pub struct PushPlatformHints {
 /// One notification, as a host hands it to the gateway.
 ///
 /// The host writes the underlying event first and then sends this, so a notification that is never
-/// delivered has already been recorded somewhere the person can find it. Nothing here is plaintext
-/// that describes the work: the identifier is opaque, the collapse label names no project, the
-/// alert comes from a closed vocabulary, and the preview is sealed to the device.
+/// delivered has already been recorded somewhere the person can find it.
+///
+/// Nothing here is a field for plaintext that describes the work. The alert comes from a closed
+/// vocabulary, the two identifiers are 128-bit values rather than text, and the preview is a sealed
+/// envelope whose shape [`PushDeliveryRequest::preview_is_well_formed`] checks. Those are the
+/// checks a gateway can make. What they do not do is inspect a producer: a host that put meaning
+/// into its own identifiers, or sealed the wrong thing, has disclosed it to the provider and to the
+/// gateway. Keeping the identifiers meaningless and the preview correctly sealed is the producer's
+/// obligation, and section 16 places it there.
 ///
 /// Larger detail does not belong here. Section 16 bounds the preview plaintext to
 /// [`MAX_PREVIEW_PLAINTEXT_BYTES`] and the complete provider payload to
@@ -1212,8 +1235,10 @@ impl PushDeliveryRequest {
     /// * the ciphertext is exactly that bucket plus the seal's overhead, so a payload that was not
     ///   padded to a bucket is refused rather than forwarded.
     ///
-    /// Together they bound what a host can put in front of a provider. They do not prove the
-    /// plaintext was encrypted correctly, which only the destination can tell.
+    /// They are checks of format and length, and that is all they are. Nothing here proves the
+    /// ciphertext is ciphertext, that it was sealed to the right key, or that what it covers is a
+    /// preview: a producer that put plaintext in the field and padded it to a bucket would pass.
+    /// Only the destination can tell, because only the destination holds the key.
     ///
     /// A request with no preview is well formed: previews can be disabled on the device, and the
     /// generic alert still arrives.
