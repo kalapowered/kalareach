@@ -184,8 +184,30 @@ fn reservation() -> RelayReservationId {
     RelayReservationId::new(uuid(0x11))
 }
 
+/// The service admission key the published signature vectors are made with.
+///
+/// It is the public half of the fixed seed in `kr-crypto`'s vector generator, written out here
+/// because `kr-protocol` is below `kr-crypto` and cannot derive it. The generator checks that these
+/// bytes are still its key, so a changed seed fails there rather than producing a lease that names
+/// one key and is signed by another.
 fn admission_key() -> ServiceAdmissionKey {
-    ServiceAdmissionKey::from_bytes([0x41; 32])
+    ServiceAdmissionKey::from_bytes(hex_key(
+        "70082ae9f98861b514d4846bc5e02fb096fb36ca953c92830909816dcf38a0a1",
+    ))
+}
+
+/// The relay instance key those vectors are made with, on the same terms.
+fn instance_key() -> RelayInstanceKey {
+    RelayInstanceKey::from_bytes(hex_key(
+        "dcbe4fdaf43c6146889b82b0e690fc88c12866052ea3ea042b1f7988bca5ae08",
+    ))
+}
+
+fn hex_key(text: &str) -> [u8; 32] {
+    hex::decode(text)
+        .expect("valid hex")
+        .try_into()
+        .expect("thirty-two bytes")
 }
 
 /// The base vector: an account pays for a two-way pair, metered as it enters the relay.
@@ -271,7 +293,7 @@ fn registration() -> RelayInstanceRegistration {
     RelayInstanceRegistration {
         relay_instance_id: frankfurt(),
         revision: RelayRegistrationRevision::new(1),
-        instance_key: RelayInstanceKey::from_bytes([0x61; 32]),
+        instance_key: instance_key(),
         relay_url: NetworkHint::new("https://relay-1.reach.kala.to").expect("a relay URL"),
         region: RelayRegion::new("eu-central").expect("a region"),
         valid_from_ms: TimestampMs::new(1_800_000_000_000),

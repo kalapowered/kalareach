@@ -468,22 +468,25 @@ impl RelayLease {
     /// against and may only raise the ceiling. A replacement that takes a new reservation is a new
     /// allocation, and the service settles the one it closed.
     ///
-    /// A grace already in force is carried unchanged. Section 17 gives a principal one grace,
-    /// starting at its first exhaustion, that reconnects and new endpoints cannot restart; a
-    /// replacement that could move either end of the window would be exactly that restart, taken
-    /// one revision at a time.
+    /// A grace already in force is carried unchanged *within one reservation*. Section 17 gives a
+    /// principal one grace, starting at its first exhaustion, that reconnects and new endpoints
+    /// cannot restart; a replacement that could move either end of the window would be exactly that
+    /// restart, taken one revision at a time. A replacement that takes a new reservation is a new
+    /// allocation whose figures are its own, and the principal's single grace is the service's to
+    /// enforce across the reservations it issues.
     #[must_use]
     pub fn supersedes(&self, previous: &Self) -> bool {
         if self.lease_id != previous.lease_id || self.revision.get() <= previous.revision.get() {
             return false;
         }
-        if !self.continues_grace_of(previous) {
-            return false;
-        }
         if self.reservation_id != previous.reservation_id {
+            // A new allocation. Its ceiling is its own, and so is its grace: the figures of the
+            // reservation it replaces were priced against a payer and a pair this one need not
+            // share, so comparing them would refuse a lawful change of payer.
             return true;
         }
-        self.binds_reservation_as(previous)
+        self.continues_grace_of(previous)
+            && self.binds_reservation_as(previous)
             && self.effective_byte_ceiling() >= previous.effective_byte_ceiling()
     }
 
@@ -1409,6 +1412,18 @@ mod tests {
         let mut restored = hollow.clone();
         restored.byte_ceiling = U64::new(grace.byte_ceiling.get() + 1);
         assert!(restored.supersedes(&first));
+
+        // A new allocation carries its own figures: a replacement for another payer, with a
+        // reservation of its own, is not refused because the one it replaces was in grace.
+        let mut reallocated = first.clone();
+        reallocated.revision = RelayLeaseRevision::new(2);
+        reallocated.reservation_id = RelayReservationId::new(Uuid::from_bytes([0x19; 16]));
+        reallocated.payer = PayerPrincipal::Installation {
+            installation_id: InstallationId::new(Uuid::from_bytes([0x1a; 16])),
+        };
+        reallocated.byte_ceiling = U64::new(1024);
+        reallocated.grace = Nullable::null();
+        assert!(reallocated.supersedes(&first));
 
         // And the three-revision walk that the hollow step would have opened: out of grace at a
         // ceiling that restores nothing, then into a fresh window.

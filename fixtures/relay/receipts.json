@@ -115,5 +115,5 @@
   ],
   "description": "Signed relay consumption receipts.",
   "name": "relay-receipts",
-  "note": "value is the object in the fixtures/cbor description grammar; cbor_hex is its canonical KR-CBOR-1 encoding; signing_input_hex is CBOR([domain, value]) and sha256 is that input's digest; json is the managed HTTP representation of the same object. bytes_consumed is cumulative for the reservation, on the same scale as the lease's byte_ceiling."
+  "note": "value is the object in the fixtures/cbor description grammar; cbor_hex is its canonical KR-CBOR-1 encoding; signing_input_hex is CBOR([domain, value]) and sha256 is that input's digest; json is the managed HTTP representation of the same object. The keys these objects name are the ones fixtures/crypto/relay.json signs them with. bytes_consumed is cumulative for the reservation, on the same scale as the lease's byte_ceiling."
 }

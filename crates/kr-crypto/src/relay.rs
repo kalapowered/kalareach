@@ -97,44 +97,24 @@ impl RelayInstanceKeyPair {
     /// [`CryptoError::StoredSecretLength`] when what is there is not a seed, and a library error
     /// when libsodium fails.
     pub fn open(directory: &Path) -> Result<Self> {
-        if directory.is_symlink() {
-            return Err(CryptoError::SecretStore {
-                message: format!("{} is a symbolic link", directory.display()),
-            });
-        }
-        std::fs::create_dir_all(directory).map_err(|error| CryptoError::SecretStore {
-            message: format!("create {}: {error}", directory.display()),
-        })?;
-        set_mode(directory, 0o700)?;
-        check_owner_only(directory)?;
-
+        let owner = open_private_directory(directory)?;
         let path = directory.join(INSTANCE_KEY_FILE);
-        if path.is_symlink() {
-            return Err(CryptoError::SecretStore {
-                message: format!("{} is a symbolic link", path.display()),
-            });
-        }
 
-        match std::fs::read(&path) {
-            Ok(stored) => {
-                check_file_owner_only(&path)?;
-                let seed = Secret::<RELAY_SEED_LEN>::from_slice("the relay instance seed", &stored)
-                    .map_err(|_| CryptoError::StoredSecretLength {
-                        name: INSTANCE_KEY_FILE.to_owned(),
-                        expected: RELAY_SEED_LEN,
-                        actual: stored.len(),
-                    })?;
-                Self::from_seed(seed)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        match read_seed(&path, owner)? {
+            Some(seed) => Self::from_seed(seed),
+            None => {
                 let seed = Secret::<RELAY_SEED_LEN>::random()?;
-                write_owner_only(&path, seed.expose())?;
-                sync_directory(directory)?;
-                Self::from_seed(seed)
+                publish_seed(directory, &path, seed.expose())?;
+                // Read it back rather than trusting the write: whatever is on disk is what every
+                // later start will use, and a key that differs from the one this process is about
+                // to sign with would be discovered later, by a receipt that does not verify.
+                match read_seed(&path, owner)? {
+                    Some(written) => Self::from_seed(written),
+                    None => Err(CryptoError::SecretStore {
+                        message: format!("{} was not written", path.display()),
+                    }),
+                }
             }
-            Err(error) => Err(CryptoError::SecretStore {
-                message: format!("read {}: {error}", path.display()),
-            }),
         }
     }
 
@@ -185,20 +165,83 @@ impl RelayInstanceKeyPair {
     }
 }
 
-/// Refuses a key file that anyone but its owner can read.
+/// Opens the key directory, refusing one that is unsafe rather than making it safe.
 ///
-/// A key the rest of the machine can read is a key the rest of the machine can sign with, and the
-/// receipts it signs would verify. The relay stops rather than pretending otherwise.
+/// An existing directory is checked as it is found: widening its permissions to match the rule
+/// would be repairing the very thing the rule is there to detect, and by then whatever could read
+/// it has already had the chance. Only a directory this call creates has its mode set.
+///
+/// Returns the account that owns it, which [`check_owner_only`] has just proved is the account
+/// this process runs as. That is what the key file is checked against, so neither check needs to
+/// ask the operating system who this process is.
 #[cfg(unix)]
-fn check_file_owner_only(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
+fn open_private_directory(directory: &Path) -> Result<u32> {
+    use std::os::unix::fs::MetadataExt as _;
 
-    let metadata = std::fs::metadata(path).map_err(|error| CryptoError::SecretStore {
+    if directory.is_symlink() {
+        return Err(CryptoError::SecretStore {
+            message: format!("{} is a symbolic link", directory.display()),
+        });
+    }
+    if directory.exists() {
+        check_owner_only(directory)?;
+    } else {
+        std::fs::create_dir_all(directory).map_err(|error| CryptoError::SecretStore {
+            message: format!("create {}: {error}", directory.display()),
+        })?;
+        set_mode(directory, 0o700)?;
+        check_owner_only(directory)?;
+    }
+    Ok(std::fs::metadata(directory)
+        .map_err(|error| CryptoError::SecretStore {
+            message: format!("stat {}: {error}", directory.display()),
+        })?
+        .uid())
+}
+
+/// The relay tier runs on Unix hosts.
+#[cfg(not(unix))]
+fn open_private_directory(directory: &Path) -> Result<u32> {
+    Err(CryptoError::SecretStore {
+        message: format!(
+            "{} cannot be protected on this platform; the relay runs on Unix hosts",
+            directory.display()
+        ),
+    })
+}
+
+/// Reads the seed from `path`, or `None` when there is nothing there yet.
+///
+/// The file is opened without following a link and then checked through that open handle, so what
+/// is checked is what is read: a link swapped in between a check and a read would otherwise let
+/// somebody else's seed be read as this host's. It is refused unless it is a regular file, owned
+/// by this account, readable by nobody else, and exactly a seed long, so nothing here blocks on a
+/// device and nothing allocates for a file somebody made large.
+#[cfg(unix)]
+fn read_seed(path: &Path, owner: u32) -> Result<Option<Secret<RELAY_SEED_LEN>>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_o_nofollow())
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CryptoError::SecretStore {
+                message: format!("open {}: {error}", path.display()),
+            });
+        }
+    };
+
+    let metadata = file.metadata().map_err(|error| CryptoError::SecretStore {
         message: format!("stat {}: {error}", path.display()),
     })?;
     if !metadata.is_file() {
         return Err(CryptoError::SecretStore {
-            message: format!("{} is not a file", path.display()),
+            message: format!("{} is not a regular file", path.display()),
         });
     }
     if metadata.permissions().mode() & 0o077 != 0 {
@@ -206,12 +249,90 @@ fn check_file_owner_only(path: &Path) -> Result<()> {
             message: format!("{} is readable by another account", path.display()),
         });
     }
-    Ok(())
+    if metadata.uid() != owner {
+        return Err(CryptoError::SecretStore {
+            message: format!("{} is owned by another account", path.display()),
+        });
+    }
+    if metadata.len() != RELAY_SEED_LEN as u64 {
+        return Err(CryptoError::StoredSecretLength {
+            name: INSTANCE_KEY_FILE.to_owned(),
+            expected: RELAY_SEED_LEN,
+            actual: usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+        });
+    }
+
+    // Into a fixed buffer rather than a growing one: a heap allocation the seed passed through
+    // would outlive this function unwiped, which section 20 does not allow.
+    let mut bytes = [0u8; RELAY_SEED_LEN];
+    let read = (&file).read_exact(&mut bytes);
+    let seed = Secret::from_bytes(bytes);
+    sodium::memzero(&mut bytes);
+    read.map_err(|error| CryptoError::SecretStore {
+        message: format!("read {}: {error}", path.display()),
+    })?;
+    Ok(Some(seed))
 }
 
-/// The relay tier runs on Unix hosts; elsewhere there is no owner-only file to check.
+/// The relay tier runs on Unix hosts; elsewhere there is no owner-only file to read.
 #[cfg(not(unix))]
-fn check_file_owner_only(path: &Path) -> Result<()> {
+fn read_seed(path: &Path, _owner: u32) -> Result<Option<Secret<RELAY_SEED_LEN>>> {
+    Err(CryptoError::SecretStore {
+        message: format!(
+            "{} cannot be protected on this platform; the relay runs on Unix hosts",
+            path.display()
+        ),
+    })
+}
+
+/// `O_NOFOLLOW`, without taking a dependency on a libc binding for one constant.
+#[cfg(unix)]
+const fn libc_o_nofollow() -> i32 {
+    // The value is fixed by each platform's ABI. Linux and the BSDs, including macOS, are the
+    // systems a relay runs on.
+    #[cfg(target_os = "linux")]
+    {
+        0o400_000
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0x0100
+    }
+}
+
+/// Writes the seed to a staging file, flushes it, and publishes it without replacing a key.
+///
+/// The final name appears only once its contents are on the device, so a crash halfway through the
+/// first start leaves no truncated key for every later start to fail on. Publishing with a link
+/// rather than a rename is what makes it refuse to replace an existing key: a second process that
+/// got there first keeps its key, and this one reads that instead.
+#[cfg(unix)]
+fn publish_seed(directory: &Path, path: &Path, seed: &[u8]) -> Result<()> {
+    let staging = directory.join(format!(
+        ".{}.{}.instance-key",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default()
+    ));
+    write_owner_only(&staging, seed)?;
+    let linked = std::fs::hard_link(&staging, path);
+    let _ = std::fs::remove_file(&staging);
+    match linked {
+        Ok(()) => sync_directory(directory),
+        // Somebody else published one first. Theirs is the key this host has, and the caller reads
+        // it back rather than overwriting it.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(CryptoError::SecretStore {
+            message: format!("publish {}: {error}", path.display()),
+        }),
+    }
+}
+
+/// The relay tier runs on Unix hosts.
+#[cfg(not(unix))]
+fn publish_seed(_directory: &Path, path: &Path, _seed: &[u8]) -> Result<()> {
     Err(CryptoError::SecretStore {
         message: format!(
             "{} cannot be protected on this platform; the relay runs on Unix hosts",
@@ -408,14 +529,24 @@ mod tests {
         );
     }
 
+    /// The directory a relay's unit names, which `open` creates owner-only on the first start.
+    ///
+    /// A temporary directory is not it: the system one is world-traversable, and `open` refuses a
+    /// directory it did not make private rather than making it private itself.
+    #[cfg(unix)]
+    fn key_directory(parent: &tempfile::TempDir) -> std::path::PathBuf {
+        parent.path().join("kr-relay")
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_host_gets_the_same_key_back_at_every_start() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let first = RelayInstanceKeyPair::open(directory.path()).expect("a first start");
-        let again = RelayInstanceKeyPair::open(directory.path()).expect("a restart");
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let directory = key_directory(&parent);
+        let first = RelayInstanceKeyPair::open(&directory).expect("a first start");
+        let again = RelayInstanceKeyPair::open(&directory).expect("a restart");
 
         // The same key, so the receipts the first run signed still verify after the second.
         assert_eq!(first.public(), again.public());
@@ -427,7 +558,7 @@ mod tests {
         verify_relay_object(again.public(), RELAY_RECEIPT_DOMAIN, &object, &signature)
             .expect("the restarted relay answers for what the first one signed");
 
-        let mode = std::fs::metadata(directory.path())
+        let mode = std::fs::metadata(&directory)
             .expect("the directory")
             .permissions()
             .mode()
@@ -437,17 +568,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_directory_anybody_could_read_is_refused_rather_than_repaired() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let directory = key_directory(&parent);
+        RelayInstanceKeyPair::open(&directory).expect("a first start");
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+            .expect("widened permissions");
+
+        // Narrowing it here would repair the very thing the rule is there to detect, and by then
+        // whatever could read the key has already had the chance.
+        assert!(RelayInstanceKeyPair::open(&directory).is_err());
+        let mode = std::fs::metadata(&directory)
+            .expect("the directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "the refusal changed nothing");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_seed_of_the_wrong_length_is_refused_rather_than_stretched() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        RelayInstanceKeyPair::open(directory.path()).expect("a first start");
-        write_owner_only(&directory.path().join("truncated"), &[0x21; 16]).expect("a short file");
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let directory = key_directory(&parent);
+        RelayInstanceKeyPair::open(&directory).expect("a first start");
+        write_owner_only(&directory.join("truncated"), &[0x21; 16]).expect("a short file");
         std::fs::rename(
-            directory.path().join("truncated"),
-            directory.path().join(INSTANCE_KEY_FILE),
+            directory.join("truncated"),
+            directory.join(INSTANCE_KEY_FILE),
         )
         .expect("a replaced key file");
 
-        assert!(RelayInstanceKeyPair::open(directory.path()).is_err());
+        assert!(RelayInstanceKeyPair::open(&directory).is_err());
     }
 
     #[cfg(unix)]
@@ -455,15 +610,34 @@ mod tests {
     fn a_key_anybody_could_read_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        RelayInstanceKeyPair::open(directory.path()).expect("a first start");
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let directory = key_directory(&parent);
+        RelayInstanceKeyPair::open(&directory).expect("a first start");
 
-        let path = directory.path().join(INSTANCE_KEY_FILE);
+        let path = directory.join(INSTANCE_KEY_FILE);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("widened permissions");
 
         // A key the rest of the machine can read is a key the rest of the machine can sign with,
         // and the receipts it signs would still verify. The relay stops rather than pretending.
-        assert!(RelayInstanceKeyPair::open(directory.path()).is_err());
+        assert!(RelayInstanceKeyPair::open(&directory).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_reached_through_a_link_is_refused() {
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let directory = key_directory(&parent);
+        let elsewhere = parent.path().join("elsewhere");
+        RelayInstanceKeyPair::open(&directory).expect("a first start");
+        RelayInstanceKeyPair::open(&elsewhere).expect("another instance's key");
+
+        // The key file is replaced by a link to somebody else's, which is the swap that a check
+        // made separately from the read would miss.
+        let path = directory.join(INSTANCE_KEY_FILE);
+        std::fs::remove_file(&path).expect("the original key");
+        std::os::unix::fs::symlink(elsewhere.join(INSTANCE_KEY_FILE), &path).expect("a link");
+
+        assert!(RelayInstanceKeyPair::open(&directory).is_err());
     }
 }

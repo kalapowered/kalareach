@@ -398,7 +398,7 @@ pub const FILE_FALLBACK_SUPPORTED: bool = cfg!(all(
 /// An existing directory is validated before its mode is changed, so this never relaxes or
 /// tightens something that belongs to another account, and the mode it sets is the mode of the
 /// directory it believes it is writing to.
-pub(crate) fn prepare_private_directory(directory: &Path) -> Result<()> {
+fn prepare_private_directory(directory: &Path) -> Result<()> {
     // Every component is checked before anything is created. `create_dir_all` on
     // `parent/link/new` would otherwise create `new` through the link and only then be rejected.
     reject_ancestor_links(directory)?;
@@ -418,7 +418,7 @@ pub(crate) fn prepare_private_directory(directory: &Path) -> Result<()> {
 ///
 /// A component that does not exist yet is not a link, so this is meaningful before the directory
 /// is created as well as after.
-pub(crate) fn reject_ancestor_links(path: &Path) -> Result<()> {
+fn reject_ancestor_links(path: &Path) -> Result<()> {
     let mut component = Some(path);
     while let Some(current) = component {
         if current.is_symlink() {

@@ -15,10 +15,13 @@ use kr_crypto::vectors::{
     client_authorisation_key, envelope_recipient_key, envelope_sender_key, generated_files,
     host_authorisation_key, recovery_seed,
 };
-use kr_crypto::{archive, envelope, kdf, sign};
+use kr_crypto::{archive, envelope, kdf, relay, sign};
 use kr_protocol::archive::{KeyWrapContext, SealedKeyWrap};
 use kr_protocol::mailbox::{SealedEnvelope, mailbox_size_bucket, notification_size_bucket};
 use kr_protocol::pairing::KeyPurpose;
+use kr_protocol::relay::{
+    RelayConsumptionReceipt, RelayInstanceRegistration, RelayLease, RelayLeaseRevocation,
+};
 use kr_protocol::scalars::{
     AuthorisationKey, Mac256, RelayInstanceKey, ServiceAdmissionKey, Signature64,
 };
@@ -378,72 +381,87 @@ fn every_relay_vector_verifies_under_the_key_its_signer_names() {
     assert!(!cases.is_empty(), "the vector covers the relay objects");
 
     for case in cases {
-        let message = hex::decode(case["message_hex"].as_str().expect("a message")).expect("hex");
+        let id = case["id"].as_str().expect("an identifier");
         let domain = case["domain"].as_str().expect("a domain");
-        let transcript = SigningTranscript::from_canonical_bytes(domain, message.clone())
-            .expect("a domain-separated transcript");
-        assert_eq!(
-            transcript.digest().as_bytes(),
-            &fixed::<32>(case, "/message_sha256")
-        );
         let signature = Signature64::from_bytes(fixed(case, "/signature_hex"));
+        let message = hex::decode(case["message_hex"].as_str().expect("a message")).expect("hex");
+        assert_eq!(
+            kr_cbor::sha256(&message),
+            fixed::<32>(case, "/message_sha256")
+        );
 
-        match case["signer"].as_str().expect("a signer") {
-            "relay_instance" => {
-                relay_keys::verify_relay_object_bytes(&relay, &transcript, &signature)
-                    .unwrap_or_else(|error| panic!("case {} does not verify: {error}", case["id"]));
-                // The other key does not answer for it: the two are separate authorities, not two
-                // spellings of one.
+        // The typed object, rebuilt from the managed representation the relay fixtures publish,
+        // verified through the public helpers. That is the path the relay and the service take, so
+        // it is the one the vectors have to hold for. Each case is also checked against the other
+        // key, because two authorities that verified each other's work would be one authority.
+        let json = relay_object_json(id);
+        match domain {
+            "kr-relay/lease/1" => {
+                let object: RelayLease = serde_json::from_value(json).expect("a lease");
+                assert_eq!(object.issuer_key, admission, "{id} names another issuer");
+                relay::verify_admission_object(&admission, domain, &object, &signature)
+                    .unwrap_or_else(|error| panic!("{id} does not verify: {error}"));
                 assert!(
-                    relay_keys::verify_admission_object_bytes(&admission, &transcript, &signature)
+                    relay::verify_relay_object(&relay, domain, &object, &signature).is_err(),
+                    "{id} verified under the instance key"
+                );
+            }
+            "kr-relay/revoke/1" => {
+                let object: RelayLeaseRevocation =
+                    serde_json::from_value(json).expect("a revocation");
+                assert_eq!(object.issuer_key, admission, "{id} names another issuer");
+                relay::verify_admission_object(&admission, domain, &object, &signature)
+                    .unwrap_or_else(|error| panic!("{id} does not verify: {error}"));
+                assert!(
+                    relay::verify_relay_object(&relay, domain, &object, &signature).is_err(),
+                    "{id} verified under the instance key"
+                );
+            }
+            "kr-relay/receipt/1" => {
+                let object: RelayConsumptionReceipt =
+                    serde_json::from_value(json).expect("a receipt");
+                relay::verify_relay_object(&relay, domain, &object, &signature)
+                    .unwrap_or_else(|error| panic!("{id} does not verify: {error}"));
+                assert!(
+                    relay::verify_admission_object(&admission, domain, &object, &signature)
                         .is_err(),
-                    "case {} verified under the admission key",
-                    case["id"]
+                    "{id} verified under the admission key"
                 );
             }
-            "service_admission" => {
-                relay_keys::verify_admission_object_bytes(&admission, &transcript, &signature)
-                    .unwrap_or_else(|error| panic!("case {} does not verify: {error}", case["id"]));
+            "kr-relay/instance/1" => {
+                let object: RelayInstanceRegistration =
+                    serde_json::from_value(json).expect("a registration");
+                assert_eq!(
+                    object.instance_key, relay,
+                    "{id} names another instance key"
+                );
+                relay::verify_relay_object(&relay, domain, &object, &signature)
+                    .unwrap_or_else(|error| panic!("{id} does not verify: {error}"));
                 assert!(
-                    relay_keys::verify_relay_object_bytes(&relay, &transcript, &signature).is_err(),
-                    "case {} verified under the instance key",
-                    case["id"]
+                    relay::verify_admission_object(&admission, domain, &object, &signature)
+                        .is_err(),
+                    "{id} verified under the admission key"
                 );
             }
-            other => panic!("case {} names an unknown signer {other}", case["id"]),
+            other => panic!("{id} signs under an unknown domain {other}"),
         }
     }
 }
 
-/// The relay verifiers, reached the way a caller outside this crate reaches them.
-mod relay_keys {
-    use kr_crypto::Result;
-    use kr_crypto::sign::{SigningTranscript, verify};
-    use kr_protocol::scalars::{
-        AuthorisationKey, RelayInstanceKey, ServiceAdmissionKey, Signature64,
-    };
-
-    pub fn verify_relay_object_bytes(
-        key: &RelayInstanceKey,
-        transcript: &SigningTranscript,
-        signature: &Signature64,
-    ) -> Result<()> {
-        verify(
-            &AuthorisationKey::from_bytes(*key.as_bytes()),
-            transcript,
-            signature,
-        )
-    }
-
-    pub fn verify_admission_object_bytes(
-        key: &ServiceAdmissionKey,
-        transcript: &SigningTranscript,
-        signature: &Signature64,
-    ) -> Result<()> {
-        verify(
-            &AuthorisationKey::from_bytes(*key.as_bytes()),
-            transcript,
-            signature,
-        )
-    }
+/// The managed representation of the object a signature case names.
+fn relay_object_json(id: &str) -> Value {
+    let (source, name) = id.split_once(':').expect("a source-qualified identifier");
+    let file = format!("{}.json", source.trim_start_matches("relay/"));
+    let path = repository_root().join("fixtures/relay").join(&file);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let document: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+    document["cases"]
+        .as_array()
+        .expect("cases")
+        .iter()
+        .find(|entry| entry["id"] == name)
+        .unwrap_or_else(|| panic!("no relay case {name} in {file}"))["json"]
+        .clone()
 }

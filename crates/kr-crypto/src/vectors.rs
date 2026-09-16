@@ -192,6 +192,31 @@ fn relay_signatures(repository_root: &Path) -> Result<Value> {
             let message = decode_hex(hex)?;
             let transcript = SigningTranscript::from_canonical_bytes(domain, message.clone())?;
 
+            // The object names the key it is to be verified under. If that is not the key signing
+            // it here, the vector would publish a signature that authorises nothing, so the seeds
+            // and the relay fixtures are held to each other rather than drifting apart quietly.
+            let named = case.get("json").and_then(|json| {
+                json.get("issuer_key")
+                    .or_else(|| json.get("instance_key"))
+                    .and_then(Value::as_str)
+            });
+            if let Some(named) = named {
+                let admission_public = admission.public();
+                let expected = match domain {
+                    RELAY_LEASE_DOMAIN | RELAY_REVOKE_DOMAIN => admission_public.as_bytes(),
+                    _ => instance.public().as_bytes(),
+                };
+                if kr_protocol::scalars::to_base64url(expected) != named {
+                    return Err(CryptoError::SecretStore {
+                        message: format!(
+                            "case {id} in {source} names a key the vectors do not sign with; \
+                             regenerate fixtures/relay with {}",
+                            kr_protocol::scalars::to_base64url(expected)
+                        ),
+                    });
+                }
+            }
+
             let (signer, signature) = match domain {
                 RELAY_LEASE_DOMAIN | RELAY_REVOKE_DOMAIN => (
                     "service_admission",
