@@ -100,18 +100,20 @@ fn build() -> BuildId {
     BuildId::new("kr-perf/0").expect("a build identifier")
 }
 
-async fn create(host: &Host) -> SessionCreateResult {
-    let mut client = LocalClient::connect(
-        &host
-            .temp
-            .environment()
-            .controller_endpoint()
-            .expect("an endpoint"),
-        LocalClientKind::Cli,
-        build(),
-    )
-    .await
-    .expect("connects to the daemon");
+/// Creates one session, or says why it could not be created.
+///
+/// Nothing here panics. A measurement that panicked part way through would leave every session it
+/// had already made running, so each step reports its failure and the caller closes what it owns
+/// before it reports anything.
+async fn create(host: &Host) -> Result<SessionCreateResult, String> {
+    let endpoint = host
+        .temp
+        .environment()
+        .controller_endpoint()
+        .map_err(|error| format!("the daemon's endpoint: {error}"))?;
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .map_err(|error| format!("connect to the daemon: {error}"))?;
     let params = SessionCreateParams {
         environment_id: host.environment_id,
         presentation: Presentation::Invisible,
@@ -133,76 +135,121 @@ async fn create(host: &Host) -> SessionCreateResult {
             &params,
         )
         .await
-        .expect("the call reaches the daemon")
-        .map(|value| value.to_typed().expect("decodes"))
-        .unwrap_or_else(|error| panic!("the create failed: {error}"))
+        .map_err(|error| format!("the create call: {error}"))?
+        .map_err(|error| format!("the create failed: {error}"))?
+        .to_typed()
+        .map_err(|error| format!("the create result: {error}"))
 }
 
 /// Returns the resident size of a process, in kibibytes.
 ///
 /// A reading this host could not take is not zero. Treating it as zero would make the total smaller
 /// than the truth, and a measurement that can only be wrong downwards is not evidence.
-fn resident_kib(pid: u32) -> u64 {
+fn resident_kib(pid: u32) -> Result<u64, String> {
     let output = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
-        .expect("reads the process table");
+        .map_err(|error| format!("read the process table: {error}"))?;
     String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()
-        .unwrap_or_else(|_| panic!("the kernel reports process {pid}'s resident size"))
+        .map_err(|_| format!("the kernel reports process {pid}'s resident size"))
 }
 
 /// Returns the processor time a process has used, in seconds.
-fn processor_seconds(pid: u32) -> f64 {
+fn processor_seconds(pid: u32) -> Result<f64, String> {
     let output = std::process::Command::new("ps")
         .args(["-o", "time=", "-p", &pid.to_string()])
         .output()
-        .expect("reads the process table");
+        .map_err(|error| format!("read the process table: {error}"))?;
     // `ps` prints elapsed processor time as `[[dd-]hh:]mm:ss`.
     let text = String::from_utf8_lossy(&output.stdout);
     let text = text.trim();
     if text.is_empty() {
-        return 0.0;
+        return Ok(0.0);
     }
     let mut seconds = 0.0;
     for part in text.split(':') {
         let part: f64 = part.trim().parse().unwrap_or(0.0);
         seconds = seconds * 60.0 + part;
     }
-    seconds
+    Ok(seconds)
+}
+
+/// Adds up one reading across every process, or says which one could not be taken.
+fn total<T: std::iter::Sum>(
+    pids: &[u32],
+    daemon: u32,
+    reading: impl Fn(u32) -> Result<T, String>,
+) -> Result<T, String> {
+    pids.iter()
+        .copied()
+        .chain(std::iter::once(daemon))
+        .map(reading)
+        .sum()
+}
+
+/// What the idle measurement established.
+struct Idle {
+    cores: f64,
+    resident: u64,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "runs for five minutes by design; scripts/performance.sh runs it"]
 async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
     let host = host().await;
-    let mut sessions = Vec::new();
+    // Every session this measurement creates is recorded here as it is created, and every one of
+    // them is closed below whatever the measurement itself did. A measurement that ended by
+    // panicking would otherwise leave a worker running for each session it had made.
+    let mut owned = Vec::new();
+    let measured = idle(&host, &mut owned).await;
+    let closed = close_all(&host, &owned).await;
+
+    let measured = measured.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
+    closed.unwrap_or_else(|failure| panic!("the sessions this measurement created: {failure}"));
+    assert!(
+        measured.cores < IDLE_CORE_FRACTION,
+        "idle processor use is under one per cent of a core: {:.5}",
+        measured.cores
+    );
+    assert!(
+        measured.resident < RESIDENT_BOUND_KIB,
+        "idle resident memory is under {RESIDENT_BOUND_KIB} KiB: {} KiB",
+        measured.resident
+    );
+    let _ = host.controller;
+    let _ = host.worker;
+}
+
+/// Takes the idle measurement, reporting a failure rather than ending the process on one.
+async fn idle(host: &Host, owned: &mut Vec<SessionCreateResult>) -> Result<Idle, String> {
     for _ in 0..IDLE_SESSIONS {
-        sessions.push(create(&host).await);
+        owned.push(create(host).await?);
     }
-    assert_eq!(sessions.len(), IDLE_SESSIONS);
+    if owned.len() != IDLE_SESSIONS {
+        return Err(format!("{IDLE_SESSIONS} sessions were created"));
+    }
 
     // Thirty-two views, spread over the sessions, each subscribed to output.
     let mut views = Vec::new();
     for index in 0..ATTACHED_VIEWS {
-        let session = &sessions[index % sessions.len()].session;
+        let created = &owned[index % owned.len()];
         let endpoint = kr_ipc::paths::Endpoint::from_path(
-            sessions[index % sessions.len()]
+            created
                 .endpoint
                 .as_ref()
-                .expect("a live session has an endpoint"),
+                .ok_or_else(|| "a live session has an endpoint".to_owned())?,
         )
-        .expect("an endpoint");
-        views.push(observer(&endpoint, host.environment_id, session.session_id).await);
+        .map_err(|error| format!("a session's endpoint: {error}"))?;
+        views.push(observer(&endpoint, host.environment_id, created.session.session_id).await?);
     }
-    assert_eq!(views.len(), ATTACHED_VIEWS);
 
     // Every process this host is paying for: each session's root shell, and the worker that owns
     // it. The worker is where the canonical grid and the retained output live, so a measurement
     // that counted only the shell would leave out the thing it is meant to be measuring.
     let mut measured: Vec<u32> = Vec::new();
-    for created in &sessions {
+    for created in owned.iter() {
         // A session with no root process, or a worker the kernel will not name, is a measurement
         // this host cannot take. Quietly leaving it out would make the answer smaller than the
         // truth, which is the one direction a resource measurement must never be wrong in.
@@ -210,10 +257,13 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
             .session
             .root_process
             .as_ref()
-            .expect("every live session names its root process");
-        let shell = u32::try_from(root.pid.get()).expect("a process identifier");
+            .ok_or_else(|| "every live session names its root process".to_owned())?;
+        let shell = u32::try_from(root.pid.get()).map_err(|_| "a process identifier".to_owned())?;
         measured.push(shell);
-        measured.push(parent_of(shell).expect("the kernel names each root shell's worker"));
+        measured.push(
+            parent_of(shell)
+                .ok_or_else(|| "the kernel names each root shell's worker".to_owned())?,
+        );
     }
     measured.sort_unstable();
     measured.dedup();
@@ -222,22 +272,12 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
     let daemon = std::process::id();
 
     let started = Instant::now();
-    let before: f64 = workers
-        .iter()
-        .map(|pid| processor_seconds(*pid))
-        .sum::<f64>()
-        + processor_seconds(daemon);
+    let before = total(&workers, daemon, processor_seconds)?;
     tokio::time::sleep(IDLE_WINDOW).await;
-    let after: f64 = workers
-        .iter()
-        .map(|pid| processor_seconds(*pid))
-        .sum::<f64>()
-        + processor_seconds(daemon);
+    let after = total(&workers, daemon, processor_seconds)?;
     let elapsed = started.elapsed().as_secs_f64();
     let cores = (after - before) / elapsed;
-
-    let resident: u64 =
-        workers.iter().map(|pid| resident_kib(*pid)).sum::<u64>() + resident_kib(daemon);
+    let resident = total(&workers, daemon, resident_kib)?;
 
     println!("KR-PERF-003 measurement");
     let grid = kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS;
@@ -248,10 +288,7 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
         grid.columns.get(),
         grid.rows.get()
     );
-    println!(
-        "  processor: {cores:.5} of one core averaged over {:.0} seconds",
-        elapsed
-    );
+    println!("  processor: {cores:.5} of one core averaged over {elapsed:.0} seconds");
     println!(
         "  resident: {resident} KiB across {} processes (each session's worker and its root shell) \
          and the daemon",
@@ -261,35 +298,39 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
         "  not measured: the whole-product figure with adapters and a model active, which belongs \
          to the tasks that add them"
     );
-
-    // Closed before the bounds are checked, so a measurement that misses one still leaves nothing
-    // running: a failed assertion here would otherwise skip every close.
+    // The views hold connections to the workers. They go before the sessions are closed.
     drop(views);
-    close_all(&host, &sessions).await;
-
-    assert!(
-        cores < IDLE_CORE_FRACTION,
-        "idle processor use is under one per cent of a core: {cores:.5}"
-    );
-    assert!(
-        resident < RESIDENT_BOUND_KIB,
-        "idle resident memory is under {RESIDENT_BOUND_KIB} KiB: {resident} KiB"
-    );
-    let _ = host.controller;
-    let _ = host.worker;
+    Ok(Idle { cores, resident })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a measurement rather than a test; scripts/performance.sh runs it"]
 async fn attach_to_a_usable_screen() {
     let host = host().await;
-    let created = create(&host).await;
+    // As above: what was created is closed whatever the measurement did with it.
+    let mut owned = Vec::new();
+    let measured = attach(&host, &mut owned).await;
+    let closed = close_all(&host, &owned).await;
+
+    let worst = measured.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
+    closed.unwrap_or_else(|failure| panic!("the sessions this measurement created: {failure}"));
+    assert!(
+        worst < ATTACH_BOUND,
+        "the slowest attach reached a usable screen within {ATTACH_BOUND:?}: {worst:?}"
+    );
+    let _ = host.controller;
+}
+
+/// Times the attachments and returns the slowest, reporting a failure rather than ending on one.
+async fn attach(host: &Host, owned: &mut Vec<SessionCreateResult>) -> Result<Duration, String> {
+    owned.push(create(host).await?);
+    let created = owned.last().ok_or_else(|| "a session".to_owned())?;
 
     // Both presentations are measured. A terminal of the session's own size is handed the stream
     // directly; one of any other size is drawn a rendering of the canonical grid, and a person
     // waits for the screen either way.
-    let direct = attach_samples(&host, &created, Dimensions::new(120, 40)).await;
-    let projected = attach_samples(&host, &created, Dimensions::new(80, 24)).await;
+    let direct = attach_samples(host, created, Dimensions::new(120, 40)).await;
+    let projected = attach_samples(host, created, Dimensions::new(80, 24)).await;
 
     println!("KR-PERF-004 measurement");
     println!(
@@ -306,18 +347,18 @@ async fn attach_to_a_usable_screen() {
         "  projected, a terminal of 80x24 onto the same session: {}",
         report(&projected)
     );
-    let worst = direct.iter().chain(projected.iter()).max().copied();
-    // Closed before anything is checked, so a measurement that fell short still leaves nothing
-    // running: an assertion here would otherwise skip every close.
-    close_all(&host, std::slice::from_ref(&created)).await;
-    assert_eq!(direct.len(), 5, "every direct attachment reached a screen");
-    assert_eq!(projected.len(), 5, "and so did every projected attachment");
-    let worst = worst.expect("samples");
-    assert!(
-        worst < ATTACH_BOUND,
-        "the slowest attach reached a usable screen within {ATTACH_BOUND:?}: {worst:?}"
-    );
-    let _ = host.controller;
+    if direct.len() != 5 {
+        return Err("every direct attachment reached a screen".to_owned());
+    }
+    if projected.len() != 5 {
+        return Err("every projected attachment reached a screen".to_owned());
+    }
+    direct
+        .iter()
+        .chain(projected.iter())
+        .max()
+        .copied()
+        .ok_or_else(|| "samples".to_owned())
 }
 
 /// Closes every session this measurement created and waits for the daemon to record each closure.
@@ -327,55 +368,89 @@ async fn attach_to_a_usable_screen() {
 /// it. Every session a run creates is therefore closed by that run. What is waited for is the
 /// daemon's own record of the closure rather than the worker's entry in the process table, because
 /// a process that has exited and has not yet been reaped is still an entry and is not a session.
-async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
+async fn close_all(host: &Host, sessions: &[SessionCreateResult]) -> Result<(), String> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
     let endpoint = host
         .temp
         .environment()
         .controller_endpoint()
-        .expect("an endpoint");
-    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-        .await
-        .expect("connects to the daemon");
-    // Every session is asked, whatever any one of them answers. Stopping at the first refusal
-    // would leave the rest running, which is the thing this exists to prevent; what each one
-    // answered is reported at the end.
+        .map_err(|error| format!("the daemon's endpoint: {error}"))?;
+    // The connection is opened again whenever it fails. A transport failure on one close would
+    // otherwise leave every session after it in the list unasked, which is the thing this exists
+    // to prevent.
+    let mut client = None;
     let mut refused = Vec::new();
     for created in sessions {
-        // Whatever any one of them answers, including the connection itself failing. Stopping at
-        // the first would leave the rest running, which is the thing this exists to prevent.
-        match client
-            .mutate(
-                Method::SessionClose,
-                ActionId::new(kr_ipc::new_uuid()),
-                ActionTarget {
-                    environment_id: host.environment_id,
-                    session_id: Nullable::some(created.session.session_id),
-                    session_epoch: Nullable::some(SessionEpoch::V1),
-                    application_instance_id: Nullable::null(),
-                    agent_binding_revision: Nullable::null(),
-                },
-                &kr_protocol::session::SessionCloseParams {
-                    session_id: created.session.session_id,
-                },
-            )
-            .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => refused.push(format!("{}: {error}", created.session.session_id)),
-            Err(error) => refused.push(format!("{}: {error}", created.session.session_id)),
+        let session_id = created.session.session_id;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let connected = match client.take() {
+                Some(client) => client,
+                None => {
+                    match LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await {
+                        Ok(client) => client,
+                        Err(error) => {
+                            refused.push(format!("{session_id}: connect: {error}"));
+                            break;
+                        }
+                    }
+                }
+            };
+            let mut connected = connected;
+            match connected
+                .mutate(
+                    Method::SessionClose,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget {
+                        environment_id: host.environment_id,
+                        session_id: Nullable::some(session_id),
+                        session_epoch: Nullable::some(SessionEpoch::V1),
+                        application_instance_id: Nullable::null(),
+                        agent_binding_revision: Nullable::null(),
+                    },
+                    &kr_protocol::session::SessionCloseParams { session_id },
+                )
+                .await
+            {
+                Ok(Ok(_)) => {
+                    client = Some(connected);
+                    break;
+                }
+                // The daemon answered and refused. The connection is still good, and the answer is
+                // reported at the end rather than stopping the rest of the closes.
+                Ok(Err(error)) => {
+                    client = Some(connected);
+                    refused.push(format!("{session_id}: {error}"));
+                    break;
+                }
+                // The connection failed. It is opened again and this session asked once more,
+                // because a session that was never asked is a worker that keeps running.
+                Err(error) => {
+                    if attempts >= 2 {
+                        refused.push(format!("{session_id}: {error}"));
+                        break;
+                    }
+                }
+            }
         }
     }
-    assert!(
-        refused.is_empty(),
-        "the daemon accepted every close: {refused:?}"
-    );
+
     let wanted: std::collections::BTreeSet<_> = sessions
         .iter()
         .map(|created| created.session.session_id)
         .collect();
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        let listed: kr_protocol::session::SessionListResult = client
+        let mut connected = match client.take() {
+            Some(client) => client,
+            None => LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .map_err(|error| format!("connect to the daemon: {error}"))?,
+        };
+        let listed = connected
             .request(
                 Method::SessionList,
                 &kr_protocol::session::SessionListParams {
@@ -384,10 +459,15 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
                 },
             )
             .await
-            .expect("the call reaches the daemon")
-            .expect("the list succeeds")
-            .to_typed()
-            .expect("decodes");
+            .map_err(|error| format!("the list call: {error}"))
+            .and_then(|answer| answer.map_err(|error| format!("the list failed: {error}")))
+            .and_then(|value| {
+                value
+                    .to_typed::<kr_protocol::session::SessionListResult>()
+                    .map_err(|error| format!("the list result: {error}"))
+            });
+        client = Some(connected);
+        let listed = listed?;
         let closed: std::collections::BTreeSet<_> = listed
             .sessions
             .iter()
@@ -396,13 +476,20 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
             .collect();
         let remaining: Vec<_> = wanted.difference(&closed).copied().collect();
         if remaining.is_empty() {
-            return;
+            break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "every session this measurement created finished closing: {remaining:?} did not"
-        );
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "every session this measurement created finished closing: {remaining:?} did not"
+            ));
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("the daemon accepted every close: {refused:?}"))
     }
 }
 
@@ -537,10 +624,10 @@ async fn observer(
     endpoint: &kr_ipc::paths::Endpoint,
     environment_id: EnvironmentId,
     session_id: SessionId,
-) -> LocalClient {
+) -> Result<LocalClient, String> {
     let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
         .await
-        .expect("connects");
+        .map_err(|error| format!("connect to a worker: {error}"))?;
     let mut requested = CanonicalSet::new();
     requested.insert(AttachmentCapability::ObserveTerminal);
     let attached: kr_protocol::attachment::SessionAttachResult = client
@@ -567,10 +654,10 @@ async fn observer(
             },
         )
         .await
-        .expect("the call reaches the worker")
-        .expect("the attach succeeds")
+        .map_err(|error| format!("the attach call: {error}"))?
+        .map_err(|error| format!("the attach failed: {error}"))?
         .to_typed()
-        .expect("decodes");
+        .map_err(|error| format!("the attach result: {error}"))?;
     let mut streams = CanonicalSet::new();
     streams.insert(EventStream::Output);
     client
@@ -584,7 +671,7 @@ async fn observer(
             },
         )
         .await
-        .expect("the call reaches the worker")
-        .expect("the subscription succeeds");
-    client
+        .map_err(|error| format!("the subscribe call: {error}"))?
+        .map_err(|error| format!("the subscription failed: {error}"))?;
+    Ok(client)
 }
