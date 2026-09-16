@@ -1206,10 +1206,11 @@ mod tests {
             let released = std::sync::Arc::clone(&released);
             let fence = std::sync::Arc::clone(&fence);
             move || {
-                announced.recv().expect("the writer announces its first piece");
+                announced
+                    .recv()
+                    .expect("the writer announces its first piece");
                 let _boundary = gate.lock().expect("the input boundary is not poisoned");
-                let with_the_application =
-                    taken.lock().expect("the record is not poisoned").len();
+                let with_the_application = taken.lock().expect("the record is not poisoned").len();
                 let counted = released.load(Ordering::SeqCst);
                 fence.store(true, Ordering::SeqCst);
                 (with_the_application, counted)

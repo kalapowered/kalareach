@@ -972,7 +972,9 @@ async fn a_succession_the_budget_refuses_leaves_the_size_unowned_rather_than_wit
         .expect("attaches the one next in line");
 
     let before = session.geometry();
-    let refused = session.detach(owner).expect_err("the succession is refused");
+    let refused = session
+        .detach(owner)
+        .expect_err("the succession is refused");
     assert_eq!(
         refused.to_protocol_error().code,
         kr_protocol::error::ErrorCode::ResourceUnavailable,
@@ -984,7 +986,10 @@ async fn a_succession_the_budget_refuses_leaves_the_size_unowned_rather_than_wit
         "the terminal the application is looking at did not move"
     );
     assert!(
-        after.owner.0.is_none_or(|owner| owner != before.owner.0.unwrap_or(owner)),
+        after
+            .owner
+            .0
+            .is_none_or(|owner| owner != before.owner.0.unwrap_or(owner)),
         "and the size is not left with the attachment that has gone: {:?}",
         after.owner
     );
@@ -1017,7 +1022,11 @@ async fn a_controller_that_cannot_send_what_the_application_negotiated_is_refuse
     requested.insert(AttachmentCapability::Input);
     let declared = AttachmentId::new(kr_ipc::new_uuid());
     session
-        .attach(&terminal_attachment(session_id), requested.clone(), declared)
+        .attach(
+            &terminal_attachment(session_id),
+            requested.clone(),
+            declared,
+        )
         .expect("attaches the one that declared its terminal");
     let undeclared = AttachmentId::new(kr_ipc::new_uuid());
     session
@@ -1054,7 +1063,7 @@ async fn a_controller_that_cannot_send_what_the_application_negotiated_is_refuse
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_application_that_negotiates_mid_session_takes_the_keys_from_a_holder_that_cannot_follow()
-{
+ {
     // Section 8 again: a mid-session mode change re-evaluates every controller, and an incompatible
     // one loses the lease explicitly rather than going on sending an encoding it advertises and the
     // application does not read.
@@ -1086,13 +1095,7 @@ async fn an_application_that_negotiates_mid_session_takes_the_keys_from_a_holder
         "the lease does not stay with a controller that cannot send what the application now reads"
     );
     let refused = session
-        .write_input(
-            undeclared,
-            epoch,
-            1,
-            b"x",
-            std::time::Instant::now(),
-        )
+        .write_input(undeclared, epoch, 1, b"x", std::time::Instant::now())
         .expect_err("and its next keystroke is refused");
     assert_eq!(
         refused.to_protocol_error().code,

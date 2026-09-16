@@ -176,7 +176,8 @@ async fn ask_create(
     };
     let mut failure = String::new();
     for _ in 0..attempts {
-        let mut client = match LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await {
+        let mut client = match LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
+        {
             Ok(client) => client,
             Err(error) => {
                 failure = format!("connect to the daemon: {error}");
@@ -207,7 +208,9 @@ async fn ask_create(
                     "the identifier had already been admitted under another window: {error}"
                 )));
             }
-            Ok(Err(error)) => return Err(Unresolved::Nothing(format!("the create failed: {error}"))),
+            Ok(Err(error)) => {
+                return Err(Unresolved::Nothing(format!("the create failed: {error}")));
+            }
             // The answer was lost. Whether the session exists is exactly what asking again settles.
             Err(error) => failure = format!("the create call: {error}"),
         }
@@ -459,7 +462,10 @@ async fn attach_to_a_usable_screen() {
 /// Times the attachments and returns the slowest, reporting a failure rather than ending on one.
 async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
     create(host, owned).await?;
-    let created = owned.sessions.last().ok_or_else(|| "a session".to_owned())?;
+    let created = owned
+        .sessions
+        .last()
+        .ok_or_else(|| "a session".to_owned())?;
 
     // Both presentations are measured. A terminal of the session's own size is handed the stream
     // directly; one of any other size is drawn a rendering of the canonical grid, and a person

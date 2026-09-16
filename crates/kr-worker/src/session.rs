@@ -1727,8 +1727,7 @@ impl PasteTransition {
 }
 
 /// What an attachment that never declared its terminal can offer.
-const UNDECLARED_TERMINAL: &str =
-    "this attachment never declared what terminal it is, so its keys are whatever its terminal \
+const UNDECLARED_TERMINAL: &str = "this attachment never declared what terminal it is, so its keys are whatever its terminal \
      already sent";
 
 /// What accepting input produced.
