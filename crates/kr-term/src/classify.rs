@@ -66,9 +66,15 @@ impl CsiView {
             intermediates.insert(0, *byte);
             rest = &rest[..rest.len() - 1];
         }
-        // A slot is at most one item of what is left, so the room is known before the walk and the
-        // list never grows while it is being built.
-        let mut numbers = Vec::with_capacity(rest.len());
+        // Every item of what is left opens at most one slot, and the last slot is closed by the
+        // end of the list rather than by a separator, so one more than the items there are is the
+        // room the slot list needs and it never grows while it is being built. A list with nothing
+        // left in it fills no slot at all and asks for no room.
+        let mut numbers = if rest.is_empty() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(rest.len() + 1)
+        };
         let mut slot: Option<i64> = None;
         let mut slot_open = false;
         let mut sub_parameters = false;
