@@ -642,6 +642,12 @@ pub enum ProjectionResetReason {
     Geometry,
     /// The client's base cursor is outside the bounded replay window.
     ReplayGap,
+    /// What changed is larger than one bounded update, so the screen is sent again.
+    ///
+    /// An update carries the rows that changed. When that is most of the grid it is not an update,
+    /// and sending it as one would mean one message larger than a page bound; the snapshot pages
+    /// instead.
+    Repaint,
     /// Retained rows the client was holding have been evicted.
     HistoryEvicted,
 }
@@ -655,6 +661,7 @@ impl ProjectionResetReason {
             Self::BufferSwitch => "buffer_switch",
             Self::Geometry => "geometry",
             Self::ReplayGap => "replay_gap",
+            Self::Repaint => "repaint",
             Self::HistoryEvicted => "history_evicted",
         }
     }

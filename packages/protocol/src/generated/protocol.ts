@@ -6929,7 +6929,7 @@ export interface ProjectionReset {
   /**
    * Why.
    */
-  reason: 'attached' | 'buffer_switch' | 'geometry' | 'replay_gap' | 'history_evicted'
+  reason: 'attached' | 'buffer_switch' | 'geometry' | 'replay_gap' | 'repaint' | 'history_evicted'
 }
 /**
  * One page of rows belonging to one buffer of one snapshot.

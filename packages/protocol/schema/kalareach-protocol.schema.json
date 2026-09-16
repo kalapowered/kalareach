@@ -9512,6 +9512,11 @@
           "type": "string"
         },
         {
+          "const": "repaint",
+          "description": "What changed is larger than one bounded update, so the screen is sent again.\n\nAn update carries the rows that changed. When that is most of the grid it is not an update,\nand sending it as one would mean one message larger than a page bound; the snapshot pages\ninstead.",
+          "type": "string"
+        },
+        {
           "const": "history_evicted",
           "description": "Retained rows the client was holding have been evicted.",
           "type": "string"
