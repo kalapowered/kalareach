@@ -22,7 +22,7 @@ use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::ipc::IpcTransport;
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
-use kr_controller::registry::Registry;
+use kr_controller::registry::{LaunchPhase, Registry};
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::{self, Network, NetworkSetup};
 use kr_controller::service::{Controller, ControllerSetup};
@@ -74,6 +74,9 @@ use kr_transport::scheduler::SendLimits;
 /// How long a test waits for something the machine has to do before it calls it a failure.
 const PATIENCE: Duration = Duration::from_secs(30);
 
+/// How long the fixture waits for a worker it signalled to go, before it stops it outright.
+const STRAY_PATIENCE: Duration = Duration::from_secs(5);
+
 /// What the shell prints when it has actually run what was typed.
 ///
 /// The command's own text does not contain it, so a terminal that merely echoed the keystrokes
@@ -119,39 +122,101 @@ impl Host {
         self.temp.environment()
     }
 
-    /// Ends every worker this host started that is still running.
+    /// Ends every worker this host started that is still running, and waits for it to go.
     ///
     /// A worker is deliberately not a child of whatever created it, so a test that panicked before
-    /// it could close its session would leave one running until the machine was restarted. The
-    /// registry holds the process identity of each worker this host started, and a process is
-    /// signalled only when the kernel agrees it is still the process that identity names: a reused
-    /// identifier is never signalled.
+    /// it could close its session would leave one running until the machine was restarted. Two
+    /// records find them. The worker table holds the workers that reported themselves ready; the
+    /// launch records hold the process identity of everything that was started, which is the only
+    /// thing that can find a worker whose ready report failed or stalled - and losing that report
+    /// is something a worker survives on purpose.
+    ///
+    /// A process is signalled only when the kernel agrees it is still the process that identity
+    /// names, so a reused identifier is never signalled. Then this waits: the host's tree goes
+    /// when it returns, and a worker still inside it would be reading a directory that had been
+    /// removed.
     fn end_stray_workers(&self) {
         let Ok(registry) = Registry::open(self.paths().registry_database(), self.environment_id)
         else {
             return;
         };
-        let Ok(workers) = registry.workers() else {
-            return;
-        };
-        for worker in workers {
+        let mut started: Vec<(kr_protocol::identity::ProcessStartIdentity, String)> = Vec::new();
+        if let Ok(workers) = registry.workers() {
+            started.extend(workers.into_iter().map(|worker| {
+                (
+                    worker.process_identity,
+                    format!("session {}", worker.session_id),
+                )
+            }));
+        }
+        // Every phase in which something may be running. `Reserved` has nothing started yet, and
+        // `Failed` and `Closed` are the phases that say the process is gone.
+        for phase in [
+            LaunchPhase::Spawned,
+            LaunchPhase::Claimed,
+            LaunchPhase::Live,
+            LaunchPhase::Fenced,
+        ] {
+            let Ok(reservations) = registry.reservations_in(phase) else {
+                continue;
+            };
+            started.extend(reservations.into_iter().filter_map(|reservation| {
+                reservation.launcher_identity.map(|identity| {
+                    (
+                        identity,
+                        format!("the launch for session {}", reservation.session_id),
+                    )
+                })
+            }));
+        }
+        started.sort_by_key(|(identity, _)| identity.pid.get());
+        started.dedup_by_key(|(identity, _)| identity.pid.get());
+
+        let mut signalled = Vec::new();
+        for (identity, what) in started {
             if !matches!(
-                kr_ipc::identity::process_state(&worker.process_identity),
+                kr_ipc::identity::process_state(&identity),
                 kr_ipc::identity::ProcessState::Running
             ) {
                 continue;
             }
-            let Ok(pid) = i32::try_from(worker.process_identity.pid.get()) else {
+            let Ok(raw) = i32::try_from(identity.pid.get()) else {
                 continue;
             };
-            let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+            let Some(pid) = rustix::process::Pid::from_raw(raw) else {
                 continue;
             };
-            eprintln!(
-                "ending a worker this test started and did not close: session {}",
-                worker.session_id
-            );
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+            eprintln!("ending a worker this test started and did not close: {what}");
+            if rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok() {
+                signalled.push((identity, pid, what));
+            }
+        }
+        let deadline = std::time::Instant::now() + STRAY_PATIENCE;
+        let insist_at = deadline - STRAY_PATIENCE / 2;
+        let mut insisted = false;
+        while !signalled.is_empty() {
+            signalled.retain(|(identity, _, _)| {
+                matches!(
+                    kr_ipc::identity::process_state(identity),
+                    kr_ipc::identity::ProcessState::Running
+                )
+            });
+            let now = std::time::Instant::now();
+            if signalled.is_empty() || now >= deadline {
+                break;
+            }
+            // A worker that will not stop for the request is stopped outright. Leaving it running
+            // while its tree is removed is worse than ending it abruptly.
+            if !insisted && now >= insist_at {
+                for (_, pid, _) in &signalled {
+                    let _ = rustix::process::kill_process(*pid, rustix::process::Signal::KILL);
+                }
+                insisted = true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for (_, _, what) in &signalled {
+            eprintln!("a worker this test started is still running: {what}");
         }
     }
 
@@ -675,12 +740,75 @@ fn output_stream() -> StreamId {
     StreamId::new("session.output").expect("a stream identifier")
 }
 
-/// Attaches, subscribes from a cursor and returns the attachment and the subscription.
+/// What one device holds on a session: the attachment it watches with, and the one it types on.
+struct Attached {
+    /// The attachment whose output this device follows, and whose cursor it carries.
+    watching: AttachmentId,
+    /// The attachment that takes the input lease.
+    typing: AttachmentId,
+    /// What the subscription on `watching` returned.
+    subscribed: EventsSubscribeResult,
+}
+
+/// Attaches twice, subscribes the watching attachment from a cursor, and returns both.
+///
+/// Watching and typing are separate attachments because the two are sent different kinds of
+/// chunk, and they count differently. A projected attachment is sent a rendering of the screen at
+/// the cursor it names, so that cursor is the position applying the chunk reaches. The holder of
+/// the input lease is *additionally* sent the application's own replies, which are a span of the
+/// stream and carry the position their bytes begin at. Keeping the roles apart is what makes every
+/// chunk this test applies one whose own cursor is the position it reached, which is what the
+/// restoration later resumes from.
 async fn attach(
     session: &Session,
     environment_id: EnvironmentId,
     session_id: SessionId,
-) -> (AttachmentId, EventsSubscribeResult) {
+) -> Attached {
+    let watching = attach_one(
+        session,
+        environment_id,
+        session_id,
+        &[AttachmentCapability::ObserveTerminal],
+    )
+    .await;
+    let typing = attach_one(
+        session,
+        environment_id,
+        session_id,
+        &[
+            AttachmentCapability::ObserveTerminal,
+            AttachmentCapability::Input,
+        ],
+    )
+    .await;
+
+    // Section 8's order: subscribe from the cursor first, then install what it returns. The
+    // subscription is opened before the events it queues are read, and the events themselves are
+    // what the restoration installs, so nothing here pretends to have installed a snapshot it was
+    // never given.
+    let mut restoration = Restoration::start(output_stream(), &session.cursors().await);
+    let params = restoration
+        .subscribe_params(session_id, watching, &[EventStream::Output])
+        .expect("the stream is waiting to subscribe");
+    let subscribed = session
+        .subscribe_events(&params)
+        .await
+        .expect("the subscription succeeds");
+    restoration.subscribed().expect("the order is kept");
+    Attached {
+        watching,
+        typing,
+        subscribed,
+    }
+}
+
+/// Attaches once with the capabilities asked for.
+async fn attach_one(
+    session: &Session,
+    environment_id: EnvironmentId,
+    session_id: SessionId,
+    requested: &[AttachmentCapability],
+) -> AttachmentId {
     let attached: SessionAttachResult = session
         .mutate(
             Method::SessionAttach,
@@ -699,12 +827,7 @@ async fn attach(
                 claim_geometry: false,
                 dimensions: Nullable::null(),
                 terminal_profile_id: Nullable::null(),
-                requested: [
-                    AttachmentCapability::ObserveTerminal,
-                    AttachmentCapability::Input,
-                ]
-                .into_iter()
-                .collect(),
+                requested: requested.iter().copied().collect(),
             },
             DurationMs::new(120_000),
         )
@@ -712,22 +835,7 @@ async fn attach(
         .expect("the attach is settled")
         .to_typed()
         .expect("an attachment");
-    let attachment_id = attached.attachment.attachment_id;
-
-    // Section 8's order: subscribe from the cursor first, then install what it returns. The
-    // subscription is opened before the events it queues are read, and the events themselves are
-    // what the restoration installs, so nothing here pretends to have installed a snapshot it was
-    // never given.
-    let mut restoration = Restoration::start(output_stream(), &session.cursors().await);
-    let params = restoration
-        .subscribe_params(session_id, attachment_id, &[EventStream::Output])
-        .expect("the stream is waiting to subscribe");
-    let subscribed = session
-        .subscribe_events(&params)
-        .await
-        .expect("the subscription succeeds");
-    restoration.subscribed().expect("the order is kept");
-    (attachment_id, subscribed)
+    attached.attachment.attachment_id
 }
 
 /// Reads the session's output until `wanted` appears, applying everything it takes as it goes.
@@ -753,9 +861,11 @@ async fn observe(
         }
         let event: OutputEvent = notification.payload.to_typed().expect("an output event");
         seen.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
-        // The event's own cursor, never a position derived from how many bytes it carried: a
-        // restoration's chunks are a rendering of the screen at one position rather than a run of
-        // source output, so adding their lengths would claim a position the session never reached.
+        // The event's own cursor, never a position derived from how many bytes it carried. Every
+        // chunk this attachment receives is a rendering of the screen at the cursor it names -
+        // which is what attaching separately to watch and to type buys - so the cursor *is* the
+        // position applying the chunk reaches, and adding the rendering's length would claim a
+        // position the session never produced.
         session
             .applied_content(&output_stream(), event.cursor)
             .await;
@@ -891,16 +1001,16 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         .expect("the device reads the session");
     assert_eq!(read.session.state, SessionState::Live);
 
-    let (attachment_id, subscribed) = attach(&session, host.environment_id, session_id).await;
+    let attached = attach(&session, host.environment_id, session_id).await;
     assert!(
-        subscribed.gap.as_ref().is_none(),
+        attached.subscribed.gap.as_ref().is_none(),
         "a fresh subscription has no gap in its history"
     );
     let seen = type_and_observe(
         &session,
         host.environment_id,
         session_id,
-        attachment_id,
+        attached.typing,
         MARKER_COMMAND,
     )
     .await;
@@ -913,7 +1023,7 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     session
         .write_input(&InputWriteParams {
             session_id,
-            attachment_id,
+            attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
             sequence: kr_protocol::ids::InputSequence::new(1),
             bytes: kr_protocol::scalars::Bytes::new(away.as_bytes().to_vec()),
@@ -1003,7 +1113,9 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         "the reconnect subscribes from the cursor it carried"
     );
     let mut events = session.events();
-    let (_attachment_id, resumed) = attach(&session, host.environment_id, session_id).await;
+    let resumed = attach(&session, host.environment_id, session_id)
+        .await
+        .subscribed;
     assert!(
         resumed.from_cursor.get() >= resumed_from.get(),
         "a resumed subscription starts no earlier than the position the client held"
@@ -1062,7 +1174,7 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     let device = Device::create(&loopback()).await;
     let record = pair(&daemon, &device, &owner).await;
     let session = connect(&daemon, &device, &record).await;
-    let (_attachment_id, _subscribed) = attach(&session, host.environment_id, session_id).await;
+    let _attached = attach(&session, host.environment_id, session_id).await;
 
     // The device is revoked while its connection is authorised and its subscription is running.
     daemon
@@ -1230,7 +1342,7 @@ async fn the_remote_path_ending_takes_neither_the_worker_nor_a_local_attachment(
     let device = Device::create(&loopback()).await;
     let record = pair(&daemon, &device, &owner).await;
     let session = connect(&daemon, &device, &record).await;
-    let (_attachment_id, _subscribed) = attach(&session, host.environment_id, session_id).await;
+    let _attached = attach(&session, host.environment_id, session_id).await;
 
     // The remote path goes: the device's endpoint is closed, which is every route it had.
     device.endpoint.close().await;
@@ -1422,12 +1534,12 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
     .await
     .expect("the paired device connects over the relay");
     let session = Session::start(Arc::new(transport)).expect("a session");
-    let (attachment_id, _subscribed) = attach(&session, host.environment_id, session_id).await;
+    let attached = attach(&session, host.environment_id, session_id).await;
     let seen = type_and_observe(
         &session,
         host.environment_id,
         session_id,
-        attachment_id,
+        attached.typing,
         MARKER_COMMAND,
     )
     .await;
@@ -1618,7 +1730,7 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
     assert_eq!(history.code(), ErrorCode::PermissionDenied);
 
     // An attachment identifier is not permission: the device may detach its own and nothing else.
-    let (attachment_id, _subscribed) = attach(&session, host.environment_id, session_id).await;
+    let attached = attach(&session, host.environment_id, session_id).await;
     let stolen = session
         .mutate(
             Method::SessionDetach,
@@ -1656,7 +1768,9 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
                 },
                 None,
                 &ParamsValue::empty(),
-                &kr_protocol::attachment::SessionDetachParams { attachment_id },
+                &kr_protocol::attachment::SessionDetachParams {
+                    attachment_id: attached.watching,
+                },
                 DurationMs::new(120_000),
             )
             .await
