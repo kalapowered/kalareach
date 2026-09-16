@@ -88,7 +88,13 @@ const MARKER_COMMAND: &str = "printf 'kala%s-ran\n' reach\n";
 
 /// A host tree on the internal disk, with the worker beside it.
 struct Host {
-    temp: kr_ipc::testing::TempHost,
+    /// The tree, held in an option so cleanup can keep it rather than remove it.
+    ///
+    /// Removing it is the ordinary end. A worker this fixture started and could not confirm had
+    /// exited is the other one: the tree stays, because a live worker reading a directory that had
+    /// been removed underneath it is a worse state to leave the machine in than a directory the
+    /// operator has to remove.
+    temp: Option<kr_ipc::testing::TempHost>,
     worker: PathBuf,
     environment_id: EnvironmentId,
 }
@@ -112,14 +118,18 @@ impl Host {
         // no test can leave another launching a worker from a directory it has just removed.
         move_to_internal_disk();
         Some(Self {
-            temp,
+            temp: Some(temp),
             worker,
             environment_id,
         })
     }
 
     fn paths(&self) -> kr_ipc::paths::EnvironmentPaths {
-        self.temp.environment()
+        self.tree().environment()
+    }
+
+    fn tree(&self) -> &kr_ipc::testing::TempHost {
+        self.temp.as_ref().expect("the host tree is still held")
     }
 
     /// Ends every worker this host started that is still running, and waits for it to go.
@@ -135,10 +145,10 @@ impl Host {
     /// names, so a reused identifier is never signalled. Then this waits: the host's tree goes
     /// when it returns, and a worker still inside it would be reading a directory that had been
     /// removed.
-    fn end_stray_workers(&self) {
+    fn end_stray_workers(&self) -> Vec<String> {
         let Ok(registry) = Registry::open(self.paths().registry_database(), self.environment_id)
         else {
-            return;
+            return Vec::new();
         };
         let mut started: Vec<(kr_protocol::identity::ProcessStartIdentity, String)> = Vec::new();
         if let Ok(workers) = registry.workers() {
@@ -191,14 +201,17 @@ impl Host {
                 signalled.push((identity, pid, what));
             }
         }
+        // Nothing is released until the kernel says each signalled process has ended. "Not
+        // running" is not that answer: a query the operating system refused establishes neither
+        // outcome, and treating it as death is what would remove a tree from under a live worker.
         let deadline = std::time::Instant::now() + STRAY_PATIENCE;
         let insist_at = deadline - STRAY_PATIENCE / 2;
         let mut insisted = false;
         while !signalled.is_empty() {
             signalled.retain(|(identity, _, _)| {
-                matches!(
+                !matches!(
                     kr_ipc::identity::process_state(identity),
-                    kr_ipc::identity::ProcessState::Running
+                    kr_ipc::identity::ProcessState::Ended
                 )
             });
             let now = std::time::Instant::now();
@@ -215,9 +228,10 @@ impl Host {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        for (_, _, what) in &signalled {
-            eprintln!("a worker this test started is still running: {what}");
-        }
+        signalled
+            .into_iter()
+            .map(|(_, _, what)| what)
+            .collect::<Vec<_>>()
     }
 
     /// Starts the daemon and puts it on the network with the endpoint configuration given.
@@ -335,9 +349,22 @@ fn worker_program() -> Option<PathBuf> {
 impl Drop for Host {
     fn drop(&mut self) {
         // The successful paths close their sessions and wait for the record. This is the failing
-        // path: unwinding cannot await, so what it can do is end the processes this host started
-        // before its tree goes.
-        self.end_stray_workers();
+        // path: unwinding cannot await, so what it can do is end the processes this host started,
+        // and establish that they have ended, before its tree goes.
+        let unresolved = self.end_stray_workers();
+        if unresolved.is_empty() {
+            return;
+        }
+        // Not established as ended. The tree is kept, and where it is is printed, because the
+        // alternative is removing the directories a live worker is reading.
+        let kept = self.temp.take().map(std::mem::forget);
+        debug_assert!(kept.is_some(), "the tree was held until here");
+        for what in unresolved {
+            eprintln!(
+                "could not establish that a worker this test started has ended: {what}; \
+                 its host tree has been kept"
+            );
+        }
     }
 }
 
@@ -401,7 +428,7 @@ async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
             Method::SessionCreate,
             ActionId::new(kr_ipc::new_uuid()),
             ActionTarget::environment(host.environment_id),
-            &create_params(host.environment_id, host.temp.root()),
+            &create_params(host.environment_id, host.tree().root()),
         )
         .await
         .expect("the call reaches the daemon")
