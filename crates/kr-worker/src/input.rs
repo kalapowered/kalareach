@@ -509,6 +509,16 @@ impl InputLease {
         self.holder
     }
 
+    /// Returns whether the lease in force has written anything at all.
+    ///
+    /// A lease that wrote nothing cannot have left a paste open at the application, which is what
+    /// tells a second lease change in a row apart from the first: the paste the writer is still
+    /// holding open belongs to the lease that opened it, and that lease has already been told.
+    #[must_use]
+    pub const fn wrote_anything(&self) -> bool {
+        self.next_sequence > 0
+    }
+
     /// Takes the lease for an attachment, advancing the epoch.
     ///
     /// Returns the bytes the previous epoch lost. A takeover does not wait for consent, and it

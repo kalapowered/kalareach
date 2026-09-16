@@ -367,16 +367,55 @@ async fn drive(
                             // A size report is a report, not an insistence. Another attachment may
                             // own the size, and the answer then says so; the terminal is shown that
                             // size rather than taking it, and the attachment carries on.
-                            (Outstanding::Resize, outcome) => {
-                                if let kr_protocol::envelope::Outcome::Ok(value) = outcome
-                                    && let Ok(result) = value
+                            (Outstanding::Resize, outcome) => match outcome {
+                                kr_protocol::envelope::Outcome::Ok(value) => {
+                                    if let Ok(result) = value
                                         .to_typed::<kr_protocol::attachment::GeometryResult>()
-                                {
-                                    geometry_epoch = result.geometry.epoch;
-                                    owns_geometry =
-                                        result.geometry.owner.as_ref() == Some(&attachment_id);
+                                    {
+                                        geometry_epoch = result.geometry.epoch;
+                                        owns_geometry =
+                                            result.geometry.owner.as_ref() == Some(&attachment_id);
+                                    }
                                 }
-                            }
+                                // Somebody else owns the size now, or owns it at another epoch.
+                                // The refusal carries neither, so this asks the only question whose
+                                // answer does: a viewport report, which says who owns the size and
+                                // at which epoch and changes nothing. Without it this terminal would
+                                // go on sending owner-only resizes for the rest of the attachment
+                                // and go on being refused them.
+                                kr_protocol::envelope::Outcome::Error(error)
+                                    if error.code == ErrorCode::GeometryNotOwner =>
+                                {
+                                    owns_geometry = false;
+                                    let Ok(size) = terminal.size() else {
+                                        continue;
+                                    };
+                                    let request_id =
+                                        kr_protocol::ids::RequestId::new(next_request);
+                                    next_request += 1;
+                                    let params =
+                                        kr_protocol::attachment::AttachmentViewportParams {
+                                            attachment_id,
+                                            dimensions: Dimensions::new(
+                                                u64::from(size.columns),
+                                                u64::from(size.rows),
+                                            ),
+                                        };
+                                    if !send_geometry(
+                                        client,
+                                        descriptor,
+                                        request_id,
+                                        Method::AttachmentViewport,
+                                        &params,
+                                    )
+                                    .await
+                                    {
+                                        return AttachOutcome::Disconnected;
+                                    }
+                                    outstanding.insert(request_id, Outstanding::Viewport);
+                                }
+                                kr_protocol::envelope::Outcome::Error(_) => {}
+                            },
                             // A viewport report answers with the presentation it produced as well
                             // as the geometry, so it has its own result type and its own decoder.
                             (Outstanding::Viewport, outcome) => {

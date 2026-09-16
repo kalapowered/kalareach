@@ -244,6 +244,14 @@ pub enum KeyboardEncoding {
 }
 
 impl KeyboardEncoding {
+    /// The Kitty flags this encoder produces.
+    ///
+    /// Alternate-key reporting is outside it: that flag asks for the shifted and base forms of a
+    /// key beside the one that was pressed, and this encoder reports the key it was given. Text
+    /// association is outside the kr-vt/1 profile altogether. A caller that asks for either is
+    /// refused rather than served an encoding that leaves the flag's own field out.
+    pub const KITTY_SUPPORTED_FLAGS: u8 = 0b0000_1011;
+
     /// Bit 1: disambiguate escape codes.
     pub const KITTY_DISAMBIGUATE: u8 = 0b0000_0001;
     /// Bit 2: report event types, which is what makes a release expressible.
@@ -415,7 +423,15 @@ fn legacy_character(character: char, modifiers: Modifiers, modify_other_keys: u8
         // it: an application can then tell Control-I from Tab.
         return modify_other_keys_report(u32::from(character), modifiers);
     }
-    if modify_other_keys > 0 && (modifiers.control || (modifiers.alt && modifiers.shift)) {
+    // Level two reports every chord, which is what makes it level two; level one reports the ones
+    // the ordinary encoding has no spelling for. Shift on its own is in neither, because the
+    // character the layout produced already carries it.
+    let reported = if modify_other_keys >= 2 {
+        modifiers.control || modifiers.alt
+    } else {
+        modify_other_keys > 0 && (modifiers.control || (modifiers.alt && modifiers.shift))
+    };
+    if reported {
         return modify_other_keys_report(u32::from(character), modifiers);
     }
     let mut bytes = Vec::new();
@@ -529,6 +545,15 @@ fn function_key(number: u8, modifiers: Modifiers) -> Result<Vec<u8>, Unsupported
 
 /// Spells a key under the Kitty keyboard protocol.
 fn kitty(event: KeyEvent, flags: u8) -> Result<Vec<u8>, Unsupported> {
+    if flags & !KeyboardEncoding::KITTY_SUPPORTED_FLAGS != 0 {
+        // An application that asked for a flag this encoder does not produce would read a report
+        // with the flag's own field missing, which is the falsely advertised encoding section 8
+        // forbids. The host refuses such a controller the lease; a caller that reaches here
+        // directly is refused too.
+        return Err(Unsupported::NotExpressible {
+            what: "a Kitty keyboard flag this encoder does not produce",
+        });
+    }
     let reports_events = flags & KeyboardEncoding::KITTY_EVENT_TYPES != 0;
     let disambiguates = flags & KeyboardEncoding::KITTY_DISAMBIGUATE != 0;
     let all_as_escapes = flags & KeyboardEncoding::KITTY_ALL_AS_ESCAPES != 0;
@@ -553,14 +578,22 @@ fn kitty(event: KeyEvent, flags: u8) -> Result<Vec<u8>, Unsupported> {
     // application that asked for event types and nothing else still expects Control-C to be one
     // byte.
     if kind == KeyEventKind::Press && !event.modifiers.superkey && !all_as_escapes {
-        let ambiguous = event.modifiers.control || event.modifiers.alt;
         let keeps_its_spelling = match event.key {
             // Disambiguation exists for exactly this: Escape on its own, so an application can
             // tell it from the start of a sequence.
             Key::Escape => !disambiguates,
-            Key::Char(_) | Key::Enter | Key::Tab | Key::Backspace => !(disambiguates && ambiguous),
-            // A functional key is the same sequence in both encodings.
-            _ => true,
+            // A printable key is its own text, and shift is already in that text. What
+            // disambiguation changes is the chords the ordinary encoding spells ambiguously:
+            // Control-I and Tab, Alt-a and Escape then a.
+            Key::Char(_) => !(disambiguates && (event.modifiers.control || event.modifiers.alt)),
+            // These three keep their bytes unmodified and are reported once anything is held,
+            // which is what lets an application tell Shift-Enter from Enter.
+            Key::Enter | Key::Tab | Key::Backspace => !disambiguates || event.modifiers.is_empty(),
+            // A functional key with nothing held is the same sequence in both encodings. A
+            // modified one is not: this protocol numbers several of them differently from the
+            // ordinary encoding, and F3's ordinary form with a modifier is also a valid
+            // cursor-position report.
+            _ => event.modifiers.is_empty(),
         };
         if keeps_its_spelling {
             return legacy(
@@ -678,34 +711,20 @@ pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
 
 /// Removes every paste delimiter, including one that removing another brought into existence.
 ///
-/// One pass is not enough. `ESC[20` followed by `ESC[201~` followed by `1~` holds one delimiter;
-/// taking it out joins `ESC[20` to `1~` and spells another. Each pass removes at least six bytes,
-/// so the loop ends, and it ends with a payload that contains neither delimiter.
+/// Scanning the input once is not enough. `ESC[20` followed by `ESC[201~` followed by `1~` holds
+/// one delimiter; taking it out joins `ESC[20` to `1~` and spells another. So the check is made on
+/// the *output* instead: each byte is appended and the tail is examined, so a delimiter that has
+/// just been spelled is removed at the moment it appears. The result therefore contains neither
+/// delimiter, and each byte is looked at a bounded number of times whatever the payload.
 fn strip_delimiters(bytes: &[u8]) -> Vec<u8> {
-    let mut kept = bytes.to_vec();
-    loop {
-        let mut pass = Vec::with_capacity(kept.len());
-        let mut index = 0;
-        let mut removed = false;
-        while index < kept.len() {
-            if kept[index..].starts_with(PASTE_END) {
-                index += PASTE_END.len();
-                removed = true;
-                continue;
-            }
-            if kept[index..].starts_with(PASTE_START) {
-                index += PASTE_START.len();
-                removed = true;
-                continue;
-            }
-            pass.push(kept[index]);
-            index += 1;
-        }
-        kept = pass;
-        if !removed {
-            return kept;
+    let mut kept: Vec<u8> = Vec::with_capacity(bytes.len());
+    for byte in bytes {
+        kept.push(*byte);
+        if kept.ends_with(PASTE_END) || kept.ends_with(PASTE_START) {
+            kept.truncate(kept.len() - PASTE_END.len());
         }
     }
+    kept
 }
 
 /// Which mouse reporting encoding the application turned on.
@@ -808,12 +827,10 @@ pub fn mouse(event: MouseEvent, encoding: MouseEncoding) -> Result<Vec<u8>, Unsu
             } else {
                 'M'
             };
-            Ok(format!(
-                "\x1b[<{code};{};{}{final_byte}",
-                event.column + 1,
-                event.row + 1
-            )
-            .into_bytes())
+            // One based on the wire. A coordinate at the end of its range has no one-based form, so
+            // it is refused rather than wrapped to the opposite corner of the grid.
+            let (column, row) = one_based(event)?;
+            Ok(format!("\x1b[<{code};{column};{row}{final_byte}").into_bytes())
         }
         MouseEncoding::X10 => {
             // The original report spells every release the same way: button code three, which says
@@ -828,8 +845,7 @@ pub fn mouse(event: MouseEvent, encoding: MouseEncoding) -> Result<Vec<u8>, Unsu
                 MouseAction::Wheel(WheelDirection::Up) => 64,
                 MouseAction::Wheel(WheelDirection::Down) => 65,
             });
-            let column = event.column + 1;
-            let row = event.row + 1;
+            let (column, row) = one_based(event)?;
             if column > 223 || row > 223 || code > 223 {
                 return Err(Unsupported::NotExpressible {
                     what: "a position beyond the original report's range",
@@ -841,6 +857,23 @@ pub fn mouse(event: MouseEvent, encoding: MouseEncoding) -> Result<Vec<u8>, Unsu
             bytes.push(u8::try_from(row + 32).unwrap_or(u8::MAX));
             Ok(bytes)
         }
+    }
+}
+
+/// Returns the one-based coordinates a mouse report carries.
+///
+/// # Errors
+///
+/// Returns [`Unsupported`] for a coordinate at the very end of its range, which has no one-based
+/// form. Wrapping it would report the opposite corner of the grid.
+fn one_based(event: MouseEvent) -> Result<(u32, u32), Unsupported> {
+    let column = event.column.checked_add(1);
+    let row = event.row.checked_add(1);
+    match (column, row) {
+        (Some(column), Some(row)) => Ok((column, row)),
+        _ => Err(Unsupported::NotExpressible {
+            what: "a coordinate at the end of its range, which has no one-based form",
+        }),
     }
 }
 
@@ -1027,6 +1060,94 @@ mod tests {
         );
     }
 
+    /// KR-REQ-08.59: a modified key the ordinary encoding spells ambiguously is disambiguated.
+    #[test]
+    fn a_modified_special_or_functional_key_takes_the_protocols_own_form() {
+        let disambiguate = KeyboardEncoding::Kitty {
+            flags: KeyboardEncoding::KITTY_DISAMBIGUATE,
+        };
+        // Shift-Enter has no ordinary spelling of its own: a terminal sends the same byte for it as
+        // for Enter, which is what disambiguation exists to fix.
+        assert_eq!(
+            key(KeyEvent::with(Key::Enter, Modifiers::shift()), disambiguate).expect("encodes"),
+            b"\x1b[13;2u"
+        );
+        assert_eq!(
+            key(KeyEvent::with(Key::Tab, Modifiers::control()), disambiguate).expect("encodes"),
+            b"\x1b[9;5u"
+        );
+        assert_eq!(
+            key(
+                KeyEvent::with(Key::Backspace, Modifiers::control()),
+                disambiguate
+            )
+            .expect("encodes"),
+            b"\x1b[127;5u"
+        );
+        // F3 is numbered differently under this protocol, and its ordinary form with a modifier is
+        // also a valid cursor-position report, which an application would read as one.
+        assert_eq!(
+            key(
+                KeyEvent::with(Key::Function(3), Modifiers::shift()),
+                disambiguate
+            )
+            .expect("encodes"),
+            b"\x1b[13;2~"
+        );
+        // The functional keys whose numbering the two encodings share come out the same either way.
+        assert_eq!(
+            key(
+                KeyEvent::with(Key::Arrow(Arrow::Up), Modifiers::control()),
+                disambiguate
+            )
+            .expect("encodes"),
+            b"\x1b[1;5A"
+        );
+        assert_eq!(
+            key(
+                KeyEvent::with(Key::Delete, Modifiers::shift()),
+                disambiguate
+            )
+            .expect("encodes"),
+            b"\x1b[3;2~"
+        );
+        assert_eq!(
+            key(
+                KeyEvent::with(Key::Function(1), Modifiers::shift()),
+                disambiguate
+            )
+            .expect("encodes"),
+            b"\x1b[1;2P"
+        );
+    }
+
+    /// KR-REQ-08.60: a flag this encoder does not produce is refused, not half-served.
+    #[test]
+    fn a_kitty_flag_this_encoder_does_not_produce_is_refused() {
+        for flags in [
+            KeyboardEncoding::KITTY_ALTERNATE_KEYS,
+            KeyboardEncoding::KITTY_DISAMBIGUATE | KeyboardEncoding::KITTY_ALTERNATE_KEYS,
+            0b0001_0000,
+        ] {
+            assert_eq!(
+                key(
+                    KeyEvent::press(Key::Char('a')),
+                    KeyboardEncoding::Kitty { flags }
+                ),
+                Err(Unsupported::NotExpressible {
+                    what: "a Kitty keyboard flag this encoder does not produce"
+                }),
+                "flags {flags}"
+            );
+        }
+        assert_eq!(
+            KeyboardEncoding::KITTY_SUPPORTED_FLAGS,
+            KeyboardEncoding::KITTY_DISAMBIGUATE
+                | KeyboardEncoding::KITTY_EVENT_TYPES
+                | KeyboardEncoding::KITTY_ALL_AS_ESCAPES
+        );
+    }
+
     /// KR-REQ-08.59: event types, and what a stream without them can say.
     #[test]
     fn an_event_type_is_reported_only_when_the_application_asked_for_them() {
@@ -1174,6 +1295,14 @@ mod tests {
         // And text built so that removing one delimiter spells another. One pass would leave
         // `ESC[20` joined to `1~`, which is a terminator the payload did not contain and the
         // encoder would have made.
+        // And the same construction repeated, which a payload could hold any number of times.
+        let repeated = paste(&"\x1b[20\x1b[201~1~".repeat(64), true);
+        assert_eq!(
+            repeated,
+            b"\x1b[200~\x1b[201~".to_vec(),
+            "every delimiter a removal spelled is removed as it appears: {}",
+            String::from_utf8_lossy(&repeated).escape_debug()
+        );
         let manufactured = paste("\x1b[20\x1b[201~1~rest", true);
         assert_eq!(
             manufactured,
@@ -1277,6 +1406,22 @@ mod tests {
             mouse(far, MouseEncoding::Sgr).is_ok(),
             "which is what mode 1006 exists for"
         );
+        // A coordinate at the very end of its range has no one-based form. Wrapping it would
+        // report the opposite corner of the grid, so both encodings refuse it.
+        let unrepresentable = MouseEvent {
+            column: u32::MAX,
+            row: u32::MAX,
+            ..press
+        };
+        for encoding in [MouseEncoding::Sgr, MouseEncoding::X10] {
+            assert_eq!(
+                mouse(unrepresentable, encoding),
+                Err(Unsupported::NotExpressible {
+                    what: "a coordinate at the end of its range, which has no one-based form"
+                }),
+                "{encoding:?}"
+            );
+        }
     }
 
     /// KR-REQ-08.58: focus events are two sequences and nothing else.
@@ -1335,6 +1480,26 @@ mod tests {
             key(KeyEvent::with(Key::Char('c'), control_alt), level_two).expect("encodes"),
             b"\x1b[27;7;99~",
             "and level two reports the chord rather than spelling it"
+        );
+        // Alt on its own has an ordinary spelling, and level two reports it too, which is what
+        // lets an application tell Alt-C from an Escape followed by a `c`.
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::NONE
+        };
+        assert_eq!(
+            key(KeyEvent::with(Key::Char('c'), alt), LEGACY).expect("encodes"),
+            b"\x1bc"
+        );
+        assert_eq!(
+            key(KeyEvent::with(Key::Char('c'), alt), level_two).expect("encodes"),
+            b"\x1b[27;3;99~"
+        );
+        // Shift on its own is in neither level: the character the layout produced already carries
+        // it, and reporting it would tell the application about a key that was not pressed.
+        assert_eq!(
+            key(KeyEvent::from_key('c', 'C', Modifiers::shift()), level_two).expect("encodes"),
+            b"C"
         );
         // Back-tab has one spelling and no room for a second modifier on it.
         assert_eq!(

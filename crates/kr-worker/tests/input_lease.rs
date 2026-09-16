@@ -507,6 +507,36 @@ async fn a_takeover_ends_the_other_lease_and_the_approval_executes_once() {
         !contains(&seen, b"kr-granted:2:"),
         "the prompt is still waiting rather than having consumed both answers"
     );
+    assert_eq!(
+        second_lease.discarded_bytes.get(),
+        0,
+        "the takeover discarded nothing here, because the first holder had not written yet"
+    );
+
+    // And the fixture can report a second execution, which is what makes one report above
+    // evidence rather than a property of the fixture: the holder answers the next prompt and a
+    // second line appears.
+    write_over(
+        &mut second,
+        &wired,
+        held_by_second,
+        second_lease.lease.epoch,
+        1,
+        b"y",
+    )
+    .await
+    .expect("the next prompt's answer");
+    let seen = retained_within(&wired.runtime, b"kr-granted:2:", Duration::from_secs(10)).await;
+    assert!(
+        contains(&seen, b"kr-granted:2:y."),
+        "a second approval is reportable, and reports the answer it was given: {}",
+        String::from_utf8_lossy(&seen).escape_debug()
+    );
+    assert_eq!(
+        count(&seen, b"kr-granted:"),
+        2,
+        "two prompts, two answers, one each"
+    );
 
     drop(first);
     drop(second);

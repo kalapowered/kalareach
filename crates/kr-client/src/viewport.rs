@@ -296,6 +296,12 @@ impl Delivery {
 /// worthless and the display asks for a fresh snapshot instead.
 pub const MAX_HELD_BYTES: usize = 4 * 1024 * 1024;
 
+/// How many deliveries a display holds while a repaint is being installed.
+///
+/// A byte bound alone is not a bound: an unbounded number of empty deliveries costs memory and
+/// spends none of it.
+pub const MAX_HELD_DELIVERIES: usize = 4_096;
+
 /// One client's display of a session.
 ///
 /// It owns the viewport, the pan mode, the presentation the host selected, and the one piece of
@@ -315,6 +321,12 @@ pub struct Display {
     cursor: u64,
     /// Whether the state on screen is unusable and only a snapshot can replace it.
     needs_snapshot: bool,
+    /// The cursor up to which output has gone, when any has.
+    ///
+    /// A snapshot is a complete picture of the screen at one cursor, so one taken at or after this
+    /// replaces everything that went. One taken before it does not: the client would resume with a
+    /// hole in the middle of what it drew and no way to know there was one.
+    missing_until: Option<u64>,
     switching: Option<Switch>,
     /// Counts the switches this display has begun, so a snapshot for an older one is refused.
     switch_generation: u64,
@@ -352,6 +364,7 @@ impl Display {
             presentation,
             cursor,
             needs_snapshot: false,
+            missing_until: None,
             switching: None,
             switch_generation: 0,
         }
@@ -503,14 +516,39 @@ impl Display {
         match self.switching.as_mut() {
             Some(switch) => {
                 switch.held_bytes = switch.held_bytes.saturating_add(delivery.len());
-                if switch.held_bytes > MAX_HELD_BYTES {
+                if switch.held_bytes > MAX_HELD_BYTES || switch.held.len() >= MAX_HELD_DELIVERIES {
+                    // What was being held goes, and with it any claim to be continuous with the
+                    // stream. Where it reached is remembered, so a snapshot from before that cannot
+                    // be mistaken for a replacement for it.
+                    let reached = switch
+                        .held
+                        .iter()
+                        .chain(std::iter::once(&delivery))
+                        .map(Delivery::ends_at)
+                        .max()
+                        .unwrap_or(self.cursor);
                     switch.held.clear();
                     switch.held_bytes = 0;
                     switch.partial = true;
                     self.needs_snapshot = true;
+                    self.missing_until = Some(
+                        self.missing_until
+                            .map_or(reached, |already| already.max(reached)),
+                    );
                     return None;
                 }
                 switch.held.push(delivery);
+                None
+            }
+            None if self.needs_snapshot => {
+                // The state on screen describes nothing this delivery continues. Drawing over it is
+                // the mixed display the row forbids, so nothing is drawn until a snapshot arrives,
+                // and this delivery goes with everything else that has.
+                let reached = delivery.ends_at();
+                self.missing_until = Some(
+                    self.missing_until
+                        .map_or(reached, |already| already.max(reached)),
+                );
                 None
             }
             None => {
@@ -547,10 +585,18 @@ impl Display {
             self.switching = Some(switch);
             return Err(NotSwitching);
         }
+        if self.missing_until.is_some_and(|until| at < until) {
+            // Output up to `until` has gone and this snapshot describes the session before it.
+            // Installing it would leave a hole in the middle of what the client draws and no way to
+            // know there was one, so the switch stays open and waits for a later snapshot.
+            self.switching = Some(switch);
+            return Err(NotSwitching);
+        }
         self.viewport.window_resized(window);
         self.presentation = switch.into;
         self.cursor = at;
         self.needs_snapshot = false;
+        self.missing_until = None;
         let mut resumed = Vec::new();
         for delivery in switch.held {
             if delivery.ends_at() <= at {
@@ -598,7 +644,20 @@ impl Display {
             return Vec::new();
         };
         if switch.partial || repaint_reached_the_screen {
+            // The screen holds part of a repaint and part of something else, so it describes no
+            // cursor at all. What was held is abandoned with it, and where that reached is what a
+            // replacement snapshot has to cover.
             self.needs_snapshot = true;
+            let reached = switch
+                .held
+                .iter()
+                .map(Delivery::ends_at)
+                .max()
+                .unwrap_or(self.cursor);
+            self.missing_until = Some(
+                self.missing_until
+                    .map_or(reached, |already| already.max(reached)),
+            );
             return Vec::new();
         }
         let mut resumed = Vec::new();
@@ -965,7 +1024,7 @@ mod tests {
         assert!(!display.is_painting());
     }
 
-    /// KR-REQ-08.77: held output is bounded, and past it a snapshot replaces the state.
+    /// KR-REQ-08.77: held output is bounded, and past it only a later snapshot will do.
     #[test]
     fn held_output_is_bounded_rather_than_drained_into_the_client() {
         let mut display = Display::new((80, 24), (80, 24), 0, Presentation::Direct);
@@ -984,15 +1043,83 @@ mod tests {
             display.needs_snapshot(),
             "the client bounds its own share of what the host bounds"
         );
+        // A snapshot taken before the output that went cannot replace it: the client would resume
+        // with a hole in the middle of what it drew and no way to know there was one.
+        assert_eq!(
+            display.install(generation, 0, (40, 12)),
+            Err(NotSwitching),
+            "an older snapshot is refused rather than papered over a gap"
+        );
+        assert!(display.is_painting(), "so the switch is still waiting");
         let resumed = display
             .install(generation, cursor, (40, 12))
-            .expect("installs");
+            .expect("a snapshot from after what went installs");
         assert!(
             resumed.is_empty(),
             "and what it was holding went, because the snapshot replaces it"
         );
         assert!(!display.needs_snapshot());
         assert_eq!(display.cursor(), cursor);
+    }
+
+    /// KR-REQ-08.77: nothing is drawn over state that only a snapshot can replace.
+    #[test]
+    fn output_after_an_abandoned_repaint_is_not_drawn_over_what_is_on_the_screen() {
+        let mut display = Display::new((80, 24), (80, 24), 0, Presentation::Direct);
+        display.begin_switch(Presentation::Viewport);
+        display.hold(Delivery::Bytes {
+            cursor: 0,
+            bytes: b"ab".to_vec(),
+        });
+        // Part of the repaint drew, and then the switch could not be finished.
+        assert!(display.abandon_switch(true).is_empty());
+        assert!(display.needs_snapshot());
+        assert!(!display.is_painting());
+        // Live output now has nothing continuous to be drawn onto.
+        assert_eq!(
+            display.hold(Delivery::Bytes {
+                cursor: 2,
+                bytes: b"cd".to_vec()
+            }),
+            None,
+            "which is the mixed display the row forbids"
+        );
+        assert!(display.needs_snapshot(), "and it still needs a snapshot");
+
+        // A resynchronisation is asked for the same way a presentation change is, with the
+        // presentation the host is already serving.
+        let at = display.begin_switch(display.presentation());
+        let generation = display.switch_generation();
+        assert_eq!(at, display.cursor());
+        display
+            .install(generation, 4, (80, 24))
+            .expect("a snapshot from after what went installs");
+        assert!(!display.needs_snapshot());
+        assert_eq!(
+            display.hold(Delivery::Bytes {
+                cursor: 4,
+                bytes: b"ef".to_vec()
+            }),
+            Some(b"ef".to_vec()),
+            "and the display draws again"
+        );
+    }
+
+    /// KR-REQ-08.77: a bound on deliveries as well as on their bytes.
+    #[test]
+    fn an_unbounded_number_of_empty_deliveries_is_bounded_too() {
+        let mut display = Display::new((80, 24), (80, 24), 0, Presentation::Direct);
+        display.begin_switch(Presentation::Viewport);
+        for cursor in 0..u64::try_from(MAX_HELD_DELIVERIES).expect("fits") + 1 {
+            display.hold(Delivery::Bytes {
+                cursor,
+                bytes: Vec::new(),
+            });
+        }
+        assert!(
+            display.needs_snapshot(),
+            "a byte bound alone is not a bound when a delivery can carry no bytes"
+        );
     }
 
     /// KR-REQ-08.76: the window follows the canonical grid when the session is resized.

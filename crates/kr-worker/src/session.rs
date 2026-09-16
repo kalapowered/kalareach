@@ -484,7 +484,21 @@ impl Session {
             // Back to the size the grid still has. A second window-change notification is visible
             // to the application; a kernel and a grid that disagree for the rest of the session
             // are not, until something draws in the wrong place.
-            let _ = self.pty.resize(previous);
+            if let Err(rollback) = self.pty.resize(previous) {
+                // Both directions have now failed, which means the terminal is taking nothing at
+                // all. Reporting the first refusal alone would say the size did not move when the
+                // kernel's did, so this says what actually happened and names both.
+                return Err(WorkerError::ResourceUnavailable {
+                    detail: format!(
+                        "the canonical grid refused {}x{} ({error}) and the terminal would not go \
+                         back to {}x{} ({rollback}), so the two no longer agree",
+                        dimensions.columns.get(),
+                        dimensions.rows.get(),
+                        previous.columns.get(),
+                        previous.rows.get()
+                    ),
+                });
+            }
             return Err(error);
         }
         // A resize advances the engine's projection: every client's screen is at the old size and
@@ -660,6 +674,7 @@ impl Session {
         // it had open is closed first, so the application is not left inside a bracketed paste
         // whose source has gone.
         let held = self.lease.holder() == Some(attachment_id);
+        let wrote = self.lease.wrote_anything();
         let discarded_queue = self.lease.release_attachment(attachment_id);
         if held {
             let framing = self.framer.close_for_takeover();
@@ -673,10 +688,8 @@ impl Session {
                 .saturating_add(discarded_queue)
                 .saturating_add(left)
                 .saturating_add(framing.discarded_prefix.len() as u64);
-            self.interrupted.closed_open_paste |= framing.terminator.is_some()
-                || self
-                    .delivered_paste_open
-                    .load(std::sync::atomic::Ordering::Acquire);
+            self.interrupted.closed_open_paste |=
+                framing.terminator.is_some() || self.delivered_paste_is_ours(wrote);
         } else {
             self.note_lease_holder();
         }
@@ -711,16 +724,20 @@ impl Session {
         dimensions: Dimensions,
     ) -> Result<TerminalPresentationMode> {
         let before = self.presentation_of_attachment(attachment_id);
+        let before_dimensions = self.attachments.own_dimensions(attachment_id).flatten();
         let presentation = self.attachments.viewport(attachment_id, dimensions)?;
         // A window that changed size is looking at a different part of the grid, and one that
         // changed presentation is being served a different thing altogether. Either way what it
         // holds is no longer continuous with what it is about to be sent, so it is told now rather
         // than on the next byte the application happens to write - which for an idle session may
         // be never, and the person would sit looking at a screen drawn for another size.
-        // A presentation that changed needs a fresh screen, and so does a viewport that stayed a
-        // viewport: what it is drawn is clipped to its own window, and the window moved.
-        let no_longer_continuous =
-            before != Some(presentation) || presentation == TerminalPresentationMode::Viewport;
+        // A presentation that changed needs a fresh screen, and so does a viewport whose window
+        // moved: what it is drawn is clipped to that window. A report that repeated the size the
+        // attachment already had changed nothing, and stopping its output to redraw the same screen
+        // would make an idle client that reports its size on a timer never see anything else.
+        let no_longer_continuous = before != Some(presentation)
+            || (presentation == TerminalPresentationMode::Viewport
+                && before_dimensions != Some(dimensions));
         if no_longer_continuous {
             let next = self.history.next_cursor();
             let oldest = self.history.oldest_retained_cursor();
@@ -874,6 +891,8 @@ impl Session {
         // An interrupted paste is closed before the new lease writes, so the application never
         // sees a paste finished under a different actor.
         let framing = self.framer.close_for_takeover();
+        // Read before the lease moves: it is the ending lease's answer, not the new one's.
+        let ending_lease_wrote = self.lease.wrote_anything();
         let discarded_queue = self.lease.acquire(attachment_id, connection_id);
         // The lease ends and what it left behind is counted in one step, on the boundary the writer
         // takes for every write: no byte of this lease's can be written after it, and none was
@@ -886,10 +905,8 @@ impl Session {
         // A paste is reported as closed when one was open in the stream this lease accepted, or
         // when one is open at the application: the writer keeps the second, because a terminator
         // the framer accepted may have been queued behind a writer that never wrote it.
-        let mut closed_open_paste = framing.terminator.is_some()
-            || self
-                .delivered_paste_open
-                .load(std::sync::atomic::Ordering::Acquire);
+        let mut closed_open_paste =
+            framing.terminator.is_some() || self.delivered_paste_is_ours(ending_lease_wrote);
         // Plus whatever a lease the host ended by itself left behind. It had no answer of its own
         // to be reported in, so it is reported here, once, and then it is nobody's any more.
         let carried = std::mem::take(&mut self.interrupted);
@@ -916,17 +933,30 @@ impl Session {
         attachment_id: AttachmentId,
         epoch: u64,
     ) -> Result<InputLeaseState> {
-        self.lease
+        let wrote = self.lease.wrote_anything();
+        let discarded_queue = self
+            .lease
             .release(attachment_id, epoch)
             .ok_or(WorkerError::LeaseLost)?;
         // A paste this lease opened is closed as it goes. Leaving it open would put the
         // application into a bracketed paste that nothing was ever going to end, so the next
         // keystroke would arrive inside somebody else's paste. The writer supplies the terminator,
         // because it is the only thing that knows whether the application ever saw the start.
-        self.framer.close_for_takeover();
+        let framing = self.framer.close_for_takeover();
         // What this lease handed over and the writer has not written goes with it, counted on the
-        // same boundary that stopped the writer from touching it.
-        let _ = self.end_lease();
+        // same boundary that stopped the writer from touching it. The answer to a release is the
+        // lease state, which has nowhere to say it, so it is carried to whoever takes the keys next
+        // rather than dropped: an actor that let go of the keys still interrupted whatever it had
+        // not delivered.
+        let left = self.end_lease();
+        self.interrupted.bytes = self
+            .interrupted
+            .bytes
+            .saturating_add(discarded_queue)
+            .saturating_add(left)
+            .saturating_add(framing.discarded_prefix.len() as u64);
+        self.interrupted.closed_open_paste |=
+            framing.terminator.is_some() || self.delivered_paste_is_ours(wrote);
         self.pump_replies();
         Ok(self.lease.to_wire())
     }
@@ -1236,6 +1266,7 @@ impl Session {
         if self.attachments.supplies_encoding(holder, required) {
             return false;
         }
+        let wrote = self.lease.wrote_anything();
         let discarded_queue = self.lease.release_attachment(holder);
         let framing = self.framer.close_for_takeover();
         let left = self.end_lease();
@@ -1247,12 +1278,25 @@ impl Session {
             .saturating_add(discarded_queue)
             .saturating_add(left)
             .saturating_add(framing.discarded_prefix.len() as u64);
-        self.interrupted.closed_open_paste |= framing.terminator.is_some()
-            || self
-                .delivered_paste_open
-                .load(std::sync::atomic::Ordering::Acquire);
+        self.interrupted.closed_open_paste |=
+            framing.terminator.is_some() || self.delivered_paste_is_ours(wrote);
         self.pump_replies();
         true
+    }
+
+    /// Returns whether a paste the writer is still holding open belongs to the lease just ending.
+    ///
+    /// The writer keeps this latch because a terminator the framer accepted may have been queued
+    /// behind a writer that never wrote it, and it clears the latch when it writes the correction.
+    /// Between a lease change and the writer acting on it the latch is still set, so a second lease
+    /// change in that window would report the same closure again. A lease that wrote nothing cannot
+    /// have opened a paste, and that is what tells the two apart: the paste belongs to whoever
+    /// wrote into it, and that actor has already been told.
+    fn delivered_paste_is_ours(&self, ending_lease_wrote: bool) -> bool {
+        ending_lease_wrote
+            && self
+                .delivered_paste_open
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Returns what a lease the host ended by itself left behind and nobody has been told about.

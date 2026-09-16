@@ -485,6 +485,46 @@ impl Dimensions {
         }
         Ok(())
     }
+
+    /// Returns every constraint this geometry violates, in the order section 8 states them.
+    ///
+    /// [`Dimensions::validate`] stops at the first, which is what an error carries. A request can
+    /// break more than one at a time - too many columns *and* too many cells - and a caller that
+    /// wants to tell somebody everything that is wrong with what they asked for reads this.
+    #[must_use]
+    pub fn violations(self) -> Vec<DimensionsError> {
+        let columns = self.columns.get();
+        let rows = self.rows.get();
+        let mut violated = Vec::new();
+        if columns == 0 || columns > MAX_COLUMNS {
+            violated.push(DimensionsError::Columns {
+                requested: columns,
+                limit: MAX_COLUMNS,
+            });
+        }
+        if rows == 0 || rows > MAX_ROWS {
+            violated.push(DimensionsError::Rows {
+                requested: rows,
+                limit: MAX_ROWS,
+            });
+        }
+        // Zero cells break no cell bound, so a zero dimension is reported as the zero it is rather
+        // than as a cell count as well.
+        if columns > 0 && rows > 0 {
+            match columns.checked_mul(rows) {
+                Some(cells) if cells <= MAX_CELLS => {}
+                Some(cells) => violated.push(DimensionsError::Cells {
+                    requested: cells,
+                    limit: MAX_CELLS,
+                }),
+                None => violated.push(DimensionsError::Cells {
+                    requested: u64::MAX,
+                    limit: MAX_CELLS,
+                }),
+            }
+        }
+        violated
+    }
 }
 
 impl fmt::Display for Dimensions {
@@ -635,6 +675,71 @@ pub struct SessionCloseResult {
 
 #[cfg(test)]
 mod tests {
+    /// KR-REQ-08.71: a request can break more than one constraint, and all of them are reportable.
+    #[test]
+    fn every_violated_constraint_is_reportable_and_the_error_carries_the_first() {
+        use super::{DimensionsError, MAX_CELLS, MAX_COLUMNS, MAX_ROWS};
+
+        assert!(Dimensions::new(80, 24).violations().is_empty());
+        // Inside both independent maxima and outside the cell count, which is the case the "all
+        // three at once" rule exists for.
+        assert_eq!(
+            Dimensions::new(MAX_COLUMNS, MAX_ROWS).violations(),
+            vec![DimensionsError::Cells {
+                requested: 2_097_152,
+                limit: MAX_CELLS
+            }]
+        );
+        // Two at once: too many columns and, with them, too many cells.
+        assert_eq!(
+            Dimensions::new(MAX_COLUMNS + 1, 1_000).violations(),
+            vec![
+                DimensionsError::Columns {
+                    requested: MAX_COLUMNS + 1,
+                    limit: MAX_COLUMNS
+                },
+                DimensionsError::Cells {
+                    requested: 2_049_000,
+                    limit: MAX_CELLS
+                }
+            ]
+        );
+        // Three at once, with a product that would wrap if it were not checked.
+        assert_eq!(
+            Dimensions::new(u64::MAX, u64::MAX).violations(),
+            vec![
+                DimensionsError::Columns {
+                    requested: u64::MAX,
+                    limit: MAX_COLUMNS
+                },
+                DimensionsError::Rows {
+                    requested: u64::MAX,
+                    limit: MAX_ROWS
+                },
+                DimensionsError::Cells {
+                    requested: u64::MAX,
+                    limit: MAX_CELLS
+                }
+            ]
+        );
+        // A zero dimension is the zero it is, and breaks no cell bound.
+        assert_eq!(
+            Dimensions::new(0, 24).violations(),
+            vec![DimensionsError::Columns {
+                requested: 0,
+                limit: MAX_COLUMNS
+            }]
+        );
+        // And the error carries the first of them, which is what a refusal names.
+        assert_eq!(
+            Dimensions::new(u64::MAX, u64::MAX).validate(),
+            Err(DimensionsError::Columns {
+                requested: u64::MAX,
+                limit: MAX_COLUMNS
+            })
+        );
+    }
+
     use super::*;
 
     #[test]
