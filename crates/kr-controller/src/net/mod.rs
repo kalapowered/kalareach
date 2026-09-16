@@ -590,7 +590,19 @@ async fn relay_loop(
         // for as long as the write waits, so a revocation that lands while this frame is queued
         // stops it there. The item holds its charge against the connection's queue until it has
         // been written or dropped.
-        if !remote.output().send(item.frame()).await {
+        //
+        // The write is raced against the link it is relaying, because a device that has stopped
+        // consuming output would otherwise hold this frame, and the connection, for as long as it
+        // liked: the link ending while a frame waits for the peer has to end the connection too.
+        let written = tokio::select! {
+            written = remote.output().send(item.frame()) => written,
+            () = remote.link_lost() => {
+                remote.output().withdraw();
+                remote.release().await;
+                return;
+            }
+        };
+        if !written {
             return;
         }
         drop(item);
