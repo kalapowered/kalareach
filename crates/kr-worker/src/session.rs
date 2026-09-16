@@ -459,7 +459,7 @@ impl Session {
         // attachments that were already watching. Delivering it here is what stops one client's
         // snapshot swallowing a character that was owed to another.
         self.deliver(settled);
-        self.note_restoration(&restoration);
+        self.note_restoration(attachment_id, &restoration);
         Ok((cursor, restoration.bytes))
     }
 
@@ -467,8 +467,17 @@ impl Session {
     ///
     /// Nothing is silently lost: the renderer counts every omission, and this is where the session
     /// keeps the count so a person asking the host doctor can be told.
-    fn note_restoration(&mut self, restoration: &crate::render::Restoration) {
+    fn note_restoration(
+        &mut self,
+        attachment_id: AttachmentId,
+        restoration: &crate::render::Restoration,
+    ) {
         let carried = restoration.carried;
+        // What this screen could not carry decides how the attachment that was given it is served
+        // from here: a terminal that continues the raw stream from a screen missing the state the
+        // application is about to address shows something the session does not have.
+        self.attachments
+            .note_restoration(attachment_id, carried.continues_the_stream());
         self.restoration_losses.inactive_rows += carried.inactive_rows;
         self.restoration_losses.other_saved_cursors += carried.other_saved_cursors;
         self.restoration_losses.title_stack += carried.title_stack;
@@ -1153,7 +1162,7 @@ impl Session {
             let (cursor, restoration, settled) =
                 self.engine
                     .restoration(dimensions, gate, kr_ipc::now_ms().get());
-            self.note_restoration(&restoration);
+            self.note_restoration(attachment_id, &restoration);
             let shared = Arc::new(restoration.bytes);
             if self
                 .hub

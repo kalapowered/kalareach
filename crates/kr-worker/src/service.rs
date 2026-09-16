@@ -1699,15 +1699,17 @@ impl WorkerService {
         Self::check_attachment(state, params.attachment_id)?;
         let mut session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
-        let stream = session.subscribe(params.attachment_id)?;
         let from = params
             .from_cursor
             .as_ref()
             .map_or_else(|| session.output_cursor(), |cursor| cursor.get());
-        // The screen, taken under the same lock that started the live queue. The restoration ends
-        // at the cursor it names and the live queue begins there, so the two meet exactly and
-        // nothing arrives twice or goes missing at the handover.
+        // The screen comes first, under the same lock that starts the live queue. The restoration
+        // ends at the cursor it names and the live queue begins there, so the two meet exactly and
+        // nothing arrives twice or goes missing at the handover. Its order matters for one more
+        // reason: what that screen could not carry decides how this attachment is served, so the
+        // queue is started in the presentation the screen it was actually given supports.
         let (cursor, bytes) = session.restoration(params.attachment_id)?;
+        let stream = session.subscribe(params.attachment_id)?;
         let oldest = session.snapshot().oldest_retained_cursor.get();
         // A client whose position has fallen out of the retained window is told so. The screen it
         // is about to be drawn is current either way; the gap says that what happened in between is

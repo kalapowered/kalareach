@@ -41,6 +41,14 @@ pub struct Attachment {
     pub granted: CanonicalSet<AttachmentCapability>,
     /// When it joined.
     pub attached_at_ms: TimestampMs,
+    /// Whether the screen this attachment was last given carried everything a terminal continuing
+    /// the raw stream needs.
+    ///
+    /// It starts true, because an attachment that has been given nothing has lost nothing. Every
+    /// restoration rendered for it sets it again, and one that could not carry the state the
+    /// application will address keeps the attachment on a projection instead, where the host paints
+    /// the canonical screen rather than trusting the terminal to already match it.
+    pub restoration_continues: bool,
 }
 
 impl Attachment {
@@ -83,6 +91,11 @@ impl Attachment {
     ///   unqualified one the host knows, and the answer is that they would not do the right thing.
     /// * **The stream.** The engine reports when the output stops being something a physical
     ///   terminal can be handed at all, and `carryable` is that answer.
+    /// * **The screen it was given.** A terminal continues the stream from the screen the host drew
+    ///   it. A restoration that could not carry the state the application is about to address —
+    ///   a pending wrap, a saved cursor of the other buffer, the virtual title stack — leaves that
+    ///   terminal disagreeing with the canonical grid, and the next byte lands in the wrong place.
+    ///   Such an attachment keeps a projection, where the host paints the screen.
     ///
     /// Everything else displays a clipped viewport of the canonical grid; nothing is reflowed.
     fn presentation(
@@ -96,6 +109,7 @@ impl Attachment {
         match self.dimensions {
             Some(own)
                 if carryable
+                    && self.restoration_continues
                     && own == geometry
                     && self
                         .terminal_profile_id
@@ -303,6 +317,7 @@ impl AttachmentTable {
             terminal_profile_id: params.terminal_profile_id.as_ref().cloned(),
             granted,
             attached_at_ms: now,
+            restoration_continues: true,
         };
         let eligible = attachment.is_eligible();
         self.attachments.insert(ordinal, attachment);
@@ -432,6 +447,20 @@ impl AttachmentTable {
                 }
             })
             .collect()
+    }
+
+    /// Records whether the screen an attachment was just given continues the raw stream.
+    ///
+    /// Every restoration rendered for an attachment passes through here, because the answer is a
+    /// property of that screen rather than of the session: the same grid restores completely for
+    /// one terminal and not for another the moment a pending wrap or a saved cursor appears.
+    pub fn note_restoration(&mut self, id: AttachmentId, continues: bool) {
+        let Some(ordinal) = self.by_id.get(&id) else {
+            return;
+        };
+        if let Some(attachment) = self.attachments.get_mut(ordinal) {
+            attachment.restoration_continues = continues;
+        }
     }
 
     /// Returns an attachment's own physical dimensions, when it has reported them.

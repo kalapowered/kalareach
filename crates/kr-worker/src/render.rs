@@ -81,6 +81,27 @@ impl Carried {
             && !self.other_keyboard
             && !self.pending_wrap
     }
+
+    /// Returns whether a terminal given this restoration can be handed the raw stream afterwards.
+    ///
+    /// This is a narrower question than [`Carried::complete`], and the difference is one member.
+    /// Everything else a restoration cannot carry is state the *application* can address, so the
+    /// next bytes it writes land somewhere the terminal disagrees with: a pending wrap decides
+    /// whether the next character wraps or replaces the last cell, a saved cursor decides where a
+    /// restore goes, a title stack decides what a pop shows, and an inactive buffer or its keyboard
+    /// negotiation decides what a switch back reveals. A soft-wrap marker decides none of them: no
+    /// sequence sets one, nothing the application writes reads one, and what it changes is what a
+    /// selection copies. A row clipped to a narrower window is not this question either, because a
+    /// terminal narrower than the session is never handed the stream in the first place.
+    #[must_use]
+    pub const fn continues_the_stream(self) -> bool {
+        self.inactive_rows == 0
+            && self.other_saved_cursors == 0
+            && self.title_stack == 0
+            && self.clipped_rows == 0
+            && !self.other_keyboard
+            && !self.pending_wrap
+    }
 }
 
 /// One rendered restoration.

@@ -50,6 +50,10 @@ fn build() -> BuildId {
 }
 
 async fn host(script: &str) -> Host {
+    host_sized(script, Dimensions::new(CANONICAL.0, CANONICAL.1)).await
+}
+
+async fn host_sized(script: &str, canonical: Dimensions) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -86,7 +90,7 @@ async fn host(script: &str) -> Host {
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
-        dimensions: Dimensions::new(CANONICAL.0, CANONICAL.1),
+        dimensions: canonical,
         journal_path: Some(environment.journal_database(session_id)),
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes: 1024 * 1024,
@@ -184,6 +188,31 @@ async fn attached(
         .expect("the call reaches the worker")
         .expect("the subscription succeeds");
     (client, presentation, attached.attachment.attachment_id)
+}
+
+/// Collects each output payload the worker sends this client for `window`, one per notification.
+///
+/// A direct attachment receives spans of the raw stream; a projection receives whole repaints of
+/// the canonical screen. Which one a client is being served is visible in the payloads themselves,
+/// which is why these are kept apart rather than run together.
+async fn collect_payloads(client: &mut LocalClient, window: Duration) -> Vec<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut seen = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let Ok(Ok(frame)) = tokio::time::timeout(remaining, client.recv()).await else {
+            break;
+        };
+        if let ControlFrame::Notification(notification) = frame
+            && notification.event_type.as_str() == "session.output"
+            && let Ok(event) = notification
+                .payload
+                .to_typed::<kr_protocol::recovery::OutputEvent>()
+        {
+            seen.push(event.bytes.as_slice().to_vec());
+        }
+    }
+    seen
 }
 
 /// Collects everything the worker sends this client for `window`.
@@ -326,4 +355,40 @@ async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
         !watched.contains(&0x07),
         "and reaches nobody else, because a side effect has one destination"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_screen_a_restoration_cannot_carry_is_never_continued_as_a_raw_stream() {
+    // Four columns, and the application has printed exactly four characters. The canonical grid
+    // holds `abcd` with a pending wrap: the next character belongs on the row below. No sequence
+    // sets a pending wrap, so a restoration cannot put a physical terminal into that state, and a
+    // terminal given the raw `X` afterwards would replace the `d` instead of wrapping.
+    let host = host_sized(
+        "printf 'abcd'; sleep 1; printf 'X'; sleep 20",
+        Dimensions::new(4, 5),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (mut client, _, _) = attached(&host, Dimensions::new(4, 5)).await;
+
+    let payloads = collect_payloads(&mut client, Duration::from_secs(4)).await;
+    let text: Vec<String> = payloads
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .collect();
+    let carrying = text
+        .iter()
+        .filter(|payload| payload.contains('X'))
+        .collect::<Vec<_>>();
+    assert!(
+        !carrying.is_empty(),
+        "the attachment was shown the character the application printed: {text:?}"
+    );
+    for payload in carrying {
+        assert!(
+            payload.contains("abcd") && payload.contains("\u{1b}["),
+            "the character arrives inside a repaint of the canonical screen rather than as a span \
+             of the raw stream: {payload:?}"
+        );
+    }
 }
