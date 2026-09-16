@@ -239,8 +239,14 @@ impl TerminalEngine {
     /// ran before this attachment sends key events an application expecting the ordinary encoding
     /// reads as something else entirely, which is the same failure as the other direction.
     #[must_use]
+    pub fn keyboard_negotiated(&self) -> KeyboardEncoding {
+        self.engine.modes().keyboard_encoding()
+    }
+
+    /// Describes that encoding for a refusal a caller reads.
+    #[must_use]
     pub fn keyboard_in_force(&self) -> String {
-        match self.engine.modes().keyboard_encoding() {
+        match self.keyboard_negotiated() {
             KeyboardEncoding::Legacy => "the ordinary terminal encoding".to_owned(),
             KeyboardEncoding::Kitty(flags) => {
                 format!("the Kitty keyboard protocol with flags {flags}")

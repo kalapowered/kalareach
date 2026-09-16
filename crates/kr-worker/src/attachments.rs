@@ -501,22 +501,52 @@ impl AttachmentTable {
         }
     }
 
-    /// Returns whether this attachment's keys follow whatever the application negotiates.
+    /// Returns what this attachment's input path can put on the wire.
     ///
     /// A semantic attachment builds its keys from the logical key and its modifiers through the
-    /// shared encoder, so it can produce whichever protocol is in force. A terminal attachment
-    /// sends what its terminal sends, so it follows the negotiation only when the host may put its
-    /// terminal into it, which is what declaring the terminal allows. An attachment that declared
-    /// nothing, which is what `--no-probe` chooses, keeps whatever encoding its terminal already
-    /// had, and section 8 does not let it hold the lease over an application expecting another.
+    /// shared encoder, so it produces whichever protocol is in force. A terminal attachment sends
+    /// what its terminal sends, so what it offers is what that terminal implements, which is why
+    /// the declaration matters: `crate::input::KEYBOARD_PROTOCOLS` says what a named terminal is
+    /// known to implement, and a name outside it still sends the ordinary encoding.
+    ///
+    /// `None` is an attachment that declared nothing, which is what `--no-probe` chooses. Nothing
+    /// was established about it in either direction, so section 8 does not let it hold the lease
+    /// over an application expecting any particular encoding - the ordinary one included, because a
+    /// terminal nobody was allowed to ask about is as likely to have been left in an enhanced
+    /// protocol by whatever ran before it.
+    ///
+    /// The outer `Option` answers whether the attachment exists; the inner one answers whether
+    /// anything is established about its keys.
     #[must_use]
-    pub fn keys_follow_the_negotiation(&self, id: AttachmentId) -> bool {
-        self.by_id
+    pub fn encoders(&self, id: AttachmentId) -> Option<Option<crate::input::Encoders>> {
+        let attachment = self
+            .by_id
             .get(&id)
-            .and_then(|ordinal| self.attachments.get(ordinal))
-            .is_some_and(|attachment| {
-                attachment.mode != AttachMode::Terminal || attachment.terminal_profile_id.is_some()
-            })
+            .and_then(|ordinal| self.attachments.get(ordinal))?;
+        if attachment.mode != AttachMode::Terminal {
+            return Some(Some(crate::input::Encoders::TYPED));
+        }
+        Some(
+            attachment
+                .terminal_profile_id
+                .as_deref()
+                .map(crate::input::terminal_encoders),
+        )
+    }
+
+    /// Returns whether this attachment can deliver the encoding the application has negotiated.
+    ///
+    /// This is the question `input.acquire` asks before it hands over the keys, and the same
+    /// question every mid-session mode change asks again of whoever holds them.
+    #[must_use]
+    pub fn supplies_encoding(
+        &self,
+        id: AttachmentId,
+        required: kr_term::modes::KeyboardEncoding,
+    ) -> bool {
+        self.encoders(id)
+            .flatten()
+            .is_some_and(|encoders| encoders.supplies(required))
     }
 
     /// Returns an attachment's own physical dimensions, when it has reported them.

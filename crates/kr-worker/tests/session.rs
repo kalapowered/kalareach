@@ -1152,12 +1152,15 @@ async fn a_controller_whose_keys_cannot_be_established_is_refused_the_keys() {
     requested.insert(AttachmentCapability::ObserveTerminal);
     requested.insert(AttachmentCapability::Input);
     let declared = AttachmentId::new(kr_ipc::new_uuid());
+    // A terminal that implements the protocol this test then has the application negotiate. What a
+    // declared name buys is what that terminal is known to implement, so the name has to be one
+    // whose keyboard covers the encoding the application asks for.
+    let kitty_capable = SessionAttachParams {
+        terminal_profile_id: Nullable::some("xterm-kitty".to_owned()),
+        ..terminal_attachment(session_id)
+    };
     session
-        .attach(
-            &terminal_attachment(session_id),
-            requested.clone(),
-            declared,
-        )
+        .attach(&kitty_capable, requested.clone(), declared)
         .expect("attaches the one that declared its terminal");
     let undeclared = AttachmentId::new(kr_ipc::new_uuid());
     session

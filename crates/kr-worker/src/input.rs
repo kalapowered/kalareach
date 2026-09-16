@@ -28,6 +28,138 @@ use std::time::{Duration, Instant};
 use kr_protocol::ids::{AttachmentId, ConnectionId, InputLeaseEpoch, InputSequence};
 use kr_protocol::input::InputLeaseState;
 use kr_protocol::scalars::Nullable;
+use kr_term::modes::{KITTY_QUALIFIED_FLAGS, KeyboardEncoding};
+
+/// What one controller's input path can put on the wire.
+///
+/// Section 8 makes this a precondition of the lease rather than a hope: a controller holds input
+/// only while it can supply the encoding the application has negotiated, and one that cannot is
+/// refused so it never sends an encoding it merely advertises. The comparison is
+/// [`Encoders::supplies`], and it is made again whenever the application changes the negotiation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Encoders {
+    /// The highest `modifyOtherKeys` level this controller can deliver. Zero for none.
+    pub modify_other_keys: u8,
+    /// The Kitty keyboard flags this controller can deliver.
+    pub kitty_flags: u8,
+}
+
+impl Encoders {
+    /// A controller that builds each key from the logical key and its modifiers.
+    ///
+    /// It produces whichever protocol is in force, because it encodes from the source information
+    /// rather than passing on whatever a terminal happened to send. What it may not do is invent
+    /// what the source does not contain - a key release, a modifier or a scan code that was never
+    /// reported - and that obligation belongs to the encoder itself rather than to this
+    /// declaration.
+    pub const TYPED: Self = Self {
+        modify_other_keys: 2,
+        kitty_flags: KITTY_QUALIFIED_FLAGS,
+    };
+
+    /// A terminal that implements neither enhanced protocol.
+    ///
+    /// Every terminal sends the ordinary encoding, so this still controls an application that has
+    /// negotiated nothing. It is what a declared terminal outside [`KEYBOARD_PROTOCOLS`] offers.
+    pub const LEGACY_ONLY: Self = Self {
+        modify_other_keys: 0,
+        kitty_flags: 0,
+    };
+
+    /// Returns whether this controller can deliver `required`.
+    ///
+    /// The ordinary encoding is always deliverable: it is what a terminal sends when nothing has
+    /// been installed into it. `modifyOtherKeys` is a level, so a controller at level 2 serves an
+    /// application that asked for level 1. The Kitty flags are a set, so every flag the
+    /// application turned on has to be one this controller produces; a controller that reports
+    /// only key presses cannot serve an application that asked for event types.
+    #[must_use]
+    pub const fn supplies(self, required: KeyboardEncoding) -> bool {
+        match required {
+            KeyboardEncoding::Legacy => true,
+            KeyboardEncoding::ModifyOtherKeys(level) => self.modify_other_keys >= level,
+            KeyboardEncoding::Kitty(flags) => self.kitty_flags & flags == flags,
+        }
+    }
+
+    /// Describes what this controller offers, for the refusal a caller reads.
+    #[must_use]
+    pub fn describe(self) -> String {
+        match (self.modify_other_keys, self.kitty_flags) {
+            (0, 0) => "the ordinary terminal encoding only".to_owned(),
+            (0, flags) => format!("the Kitty keyboard protocol with flags {flags}"),
+            (level, 0) => format!("modifyOtherKeys up to level {level}"),
+            (level, flags) => format!(
+                "modifyOtherKeys up to level {level} and the Kitty keyboard protocol with flags \
+                 {flags}"
+            ),
+        }
+    }
+}
+
+/// The keyboard protocols each terminal this build has measured is known to implement.
+///
+/// What a *presentation* needs is a different question from what a keyboard needs, so this is a
+/// different list from [`crate::attachments::QUALIFIED_TERMINALS`]. A terminal outside this one is
+/// not refused the keys: it is taken to send the ordinary encoding, which every terminal sends, and
+/// it holds the lease while that is what the application reads.
+///
+/// What the list rests on is stated rather than implied. Each row is what that terminal's own
+/// documentation says it implements, and a `TERM` name is the client's claim about which terminal
+/// it is rather than a measurement of it - the same limit [`crate::attachments::QUALIFIED_TERMINALS`]
+/// carries. So the rows are conservative: a protocol a terminal implements only under a setting, or
+/// only by passing it through to something else, is not claimed here, because a controller that
+/// advertised it and then sent something else is exactly what section 8 refuses to allow.
+pub const KEYBOARD_PROTOCOLS: &[TerminalKeyboard] = &[
+    // xterm defines `modifyOtherKeys` and implements no Kitty protocol.
+    TerminalKeyboard::new("xterm-256color", 2, 0),
+    // The Kitty protocol is kitty's own.
+    TerminalKeyboard::new("xterm-kitty", 0, KITTY_QUALIFIED_FLAGS),
+    TerminalKeyboard::new("wezterm", 2, KITTY_QUALIFIED_FLAGS),
+    // Alacritty implements the Kitty protocol and not `modifyOtherKeys`.
+    TerminalKeyboard::new("alacritty", 0, KITTY_QUALIFIED_FLAGS),
+    TerminalKeyboard::new("foot", 2, KITTY_QUALIFIED_FLAGS),
+    TerminalKeyboard::new("ghostty", 2, KITTY_QUALIFIED_FLAGS),
+    // tmux implements `modifyOtherKeys`. It forwards the Kitty protocol only under its own
+    // extended-keys setting and to whatever is outside it, so nothing here claims it.
+    TerminalKeyboard::new("tmux-256color", 2, 0),
+    // GNU screen implements neither.
+    TerminalKeyboard::new("screen-256color", 0, 0),
+];
+
+/// One terminal's keyboard protocols.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalKeyboard {
+    /// The terminfo name a client declares.
+    pub name: &'static str,
+    /// The encoders that name is known to offer.
+    pub encoders: Encoders,
+}
+
+impl TerminalKeyboard {
+    const fn new(name: &'static str, modify_other_keys: u8, kitty_flags: u8) -> Self {
+        Self {
+            name,
+            encoders: Encoders {
+                modify_other_keys,
+                kitty_flags,
+            },
+        }
+    }
+}
+
+/// Returns what a declared terminal offers.
+///
+/// A name this build has not measured still sends the ordinary encoding, so it is
+/// [`Encoders::LEGACY_ONLY`] rather than nothing at all. Withholding the declaration entirely is
+/// the case that offers nothing, and that is decided by the caller rather than here.
+#[must_use]
+pub fn terminal_encoders(name: &str) -> Encoders {
+    KEYBOARD_PROTOCOLS
+        .iter()
+        .find(|terminal| terminal.name == name)
+        .map_or(Encoders::LEGACY_ONLY, |terminal| terminal.encoders)
+}
 
 /// The bracketed-paste start delimiter.
 pub const PASTE_START: &[u8] = b"\x1b[200~";
@@ -461,6 +593,92 @@ impl InputLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-08.60: the check is against what the application negotiated, not against a label.
+    #[test]
+    fn a_controller_supplies_an_encoding_only_when_it_produces_every_part_of_it() {
+        let xterm = terminal_encoders("xterm-256color");
+        assert!(xterm.supplies(KeyboardEncoding::Legacy));
+        assert!(xterm.supplies(KeyboardEncoding::ModifyOtherKeys(1)));
+        assert!(xterm.supplies(KeyboardEncoding::ModifyOtherKeys(2)));
+        assert!(
+            !xterm.supplies(KeyboardEncoding::Kitty(0b0001)),
+            "xterm implements no Kitty protocol"
+        );
+
+        let kitty = terminal_encoders("xterm-kitty");
+        assert!(kitty.supplies(KeyboardEncoding::Kitty(KITTY_QUALIFIED_FLAGS)));
+        assert!(kitty.supplies(KeyboardEncoding::Kitty(0b0101)));
+        assert!(
+            !kitty.supplies(KeyboardEncoding::ModifyOtherKeys(1)),
+            "and nothing claims modifyOtherKeys for it"
+        );
+
+        // A flag the controller does not produce is not covered by the flags it does.
+        let partial = Encoders {
+            modify_other_keys: 0,
+            kitty_flags: 0b0001,
+        };
+        assert!(partial.supplies(KeyboardEncoding::Kitty(0b0001)));
+        assert!(
+            !partial.supplies(KeyboardEncoding::Kitty(0b0011)),
+            "a controller that reports no event types cannot serve one that asked for them"
+        );
+    }
+
+    /// KR-REQ-08.60: a name this build has not measured still sends the ordinary encoding.
+    #[test]
+    fn an_unmeasured_terminal_offers_the_ordinary_encoding_and_no_more() {
+        let unknown = terminal_encoders("vt100");
+        assert_eq!(unknown, Encoders::LEGACY_ONLY);
+        assert!(unknown.supplies(KeyboardEncoding::Legacy));
+        assert!(!unknown.supplies(KeyboardEncoding::ModifyOtherKeys(1)));
+        assert!(!unknown.supplies(KeyboardEncoding::Kitty(0b0001)));
+    }
+
+    /// KR-REQ-08.60: the typed encoder produces whichever protocol is in force.
+    #[test]
+    fn the_typed_encoder_supplies_every_protocol_this_profile_advertises() {
+        for required in [
+            KeyboardEncoding::Legacy,
+            KeyboardEncoding::ModifyOtherKeys(1),
+            KeyboardEncoding::ModifyOtherKeys(2),
+            KeyboardEncoding::Kitty(KITTY_QUALIFIED_FLAGS),
+        ] {
+            assert!(Encoders::TYPED.supplies(required), "{required:?}");
+        }
+        assert!(
+            !Encoders::TYPED.supplies(KeyboardEncoding::Kitty(0b0001_0000)),
+            "text association is outside the profile, so nothing advertises it"
+        );
+    }
+
+    /// KR-REQ-08.60: every name a presentation may be direct for has a keyboard row as well, so a
+    /// terminal can never be handed the stream by one table and left unexplained by the other.
+    #[test]
+    fn every_qualified_terminal_has_a_keyboard_row() {
+        for name in crate::attachments::QUALIFIED_TERMINALS {
+            assert!(
+                KEYBOARD_PROTOCOLS
+                    .iter()
+                    .any(|terminal| terminal.name == *name),
+                "{name} is qualified for a direct presentation and has no keyboard row"
+            );
+        }
+        for terminal in KEYBOARD_PROTOCOLS {
+            assert_eq!(
+                terminal.encoders.kitty_flags & !KITTY_QUALIFIED_FLAGS,
+                0,
+                "{} claims a Kitty flag outside the profile",
+                terminal.name
+            );
+            assert!(
+                terminal.encoders.modify_other_keys <= 2,
+                "{} claims a modifyOtherKeys level above the protocol's",
+                terminal.name
+            );
+        }
+    }
 
     #[test]
     fn every_delimiter_is_reported_with_where_it_sits() {

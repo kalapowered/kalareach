@@ -761,11 +761,23 @@ impl Session {
         // other keys. It is refused whichever way the mismatch runs: a terminal nobody was allowed
         // to ask about is as likely to be in an enhanced protocol somebody else left it in as it is
         // to be in the ordinary one, and neither this host nor that terminal can say which.
-        if !self.attachments.keys_follow_the_negotiation(attachment_id) {
-            return Err(WorkerError::InputIncompatible {
-                required: self.engine.keyboard_in_force(),
-                offered: UNDECLARED_TERMINAL.to_owned(),
-            });
+        let required = self.engine.keyboard_negotiated();
+        match self.attachments.encoders(attachment_id) {
+            Some(Some(encoders)) if encoders.supplies(required) => {}
+            Some(offered) => {
+                return Err(WorkerError::InputIncompatible {
+                    required: self.engine.keyboard_in_force(),
+                    offered: offered.map_or_else(
+                        || UNDECLARED_TERMINAL.to_owned(),
+                        crate::input::Encoders::describe,
+                    ),
+                });
+            }
+            None => {
+                return Err(WorkerError::UnknownAttachment {
+                    attachment: attachment_id.to_string(),
+                });
+            }
         }
 
         // An interrupted paste is closed before the new lease writes, so the application never
@@ -1071,7 +1083,40 @@ impl Session {
         // which is the first moment the answer exists.
         self.framer
             .set_bracketed_paste(self.engine.bracketed_paste());
+        // The same batch may have changed the keyboard negotiation, and whoever holds the keys has
+        // to be able to produce whatever it changed to.
+        self.reevaluate_lease();
         self.deliver(filtered)
+    }
+
+    /// Takes the keys from a holder that can no longer supply what the application reads.
+    ///
+    /// Section 8 requires a mid-session mode change to re-evaluate each controller, and an
+    /// incompatible lease to be released explicitly rather than left sending an encoding it only
+    /// advertises. It runs in both directions and needs no separate arming for either: an
+    /// application that turns an enhanced protocol on takes the keys from a terminal that cannot
+    /// produce it, and one that turns it off leaves the ordinary encoding, which every declared
+    /// terminal produces, so that terminal can acquire again.
+    ///
+    /// The release is the ordinary one. The epoch advances, the fence goes out, a paste this lease
+    /// had open is closed before anything else reaches the application, and the bytes it handed over
+    /// and the writer has not written go with it. The holder learns on its next write, which is
+    /// `LEASE_LOST`: nothing is queued under a lease that has stopped existing.
+    ///
+    /// Returns whether the keys were taken.
+    fn reevaluate_lease(&mut self) -> bool {
+        let Some(holder) = self.lease.holder() else {
+            return false;
+        };
+        let required = self.engine.keyboard_negotiated();
+        if self.attachments.supplies_encoding(holder, required) {
+            return false;
+        }
+        self.lease.release_attachment(holder);
+        self.framer.close_for_takeover();
+        let _ = self.end_lease();
+        self.pump_replies();
+        true
     }
 
     /// Settles the screen when the terminal's output goes quiet.
