@@ -467,9 +467,104 @@ rotation cannot tell a fresh revision-1 head signed by a retained revision-1 key
 one. Rotation therefore destroys the private half of the revision it retires, and a host that must
 detect a compromised predecessor needs evidence from outside this chain.
 
+## The service credential
+
+Every method in the `Services` group of section 23 is authenticated the same way, by one credential
+defined in `crates/kr-protocol/src/service.rs`. No account is involved. What a caller proves is that
+it holds the private half of one key, and that the request in front of the service is the request
+that key signed.
+
+A signature covers `CBOR([domain, ServiceRequestPayload])`, and the payload carries five fields:
+
+| Field | What omitting it would allow |
+| --- | --- |
+| `gateway_origin` | A signature made for one deployment replayed against another |
+| `method` | A signature for a read presented as the authorisation for a write |
+| `nonce` | The same signed request accepted twice |
+| `signed_at_ms` | A captured request held and presented much later |
+| `body_digest` | The body swapped for another under a signature that still verifies |
+
+Two kinds of caller reach these methods, so there are two domains and no other difference. A native
+installation signs under `kr-service-request/1` with its device authorisation key. A host signs under
+`kr-service-request/1/host` with its host signing key, which is how `push.sender.renew`,
+`push.sender.revoke` and a host's `authority.sync` are proven. The separation is in the bytes rather
+than in a label beside them, so relabelling a signature cannot turn one into the other.
+
+A service admits a signature whose `signed_at_ms` is inside five minutes of its own clock, in either
+direction, and remembers the nonce for twice that long: a signature dated the full window ahead is
+still admissible for another whole window after it was made. `ServiceRequestPayload::is_fresh_at` is
+the first check and `nonce_retained_until_ms` says how long the second one has to remember.
+
+`InstallationId` is the first sixteen bytes of the SHA-256 of the device authorisation public key,
+written in hyphenated form. It is derived rather than asserted: a caller that presents a key and a
+signature has already proved which installation it is, so nothing in a request body says who the
+caller is. A service records the key it first saw against that identifier and refuses a later request
+carrying a different one, which makes replacing an installation key a deliberate step rather than a
+side effect of asking.
+
+## Push objects
+
+`crates/kr-protocol/src/push.rs` holds the notification contract of section 16. Three things happen
+in order, and each refuses to start before the one before it finished.
+
+**Registration.** An installation asks the gateway to bind a provider token to its identity. The
+gateway sends a single-use challenge through the provider, to that token, and waits for it to come
+back signed under `kr-push-registration/1`. An authenticated request proves the caller holds a key;
+only the round trip proves the caller receives what is sent to that token. Until the answer returns,
+the registration stays pending and no sender credential is issued.
+
+The answer covers the whole challenge: the token digest, the registration identifier, the gateway
+origin, the platform, the installation and the five-minute expiry. Without the token digest an answer
+would activate a token nobody proved receipt of; without the origin it would answer a different
+deployment's challenge; without the registration identifier it would complete whichever attempt
+happened to be pending.
+
+A token is recorded as `SHA-256(CBOR(["kr-push-token/1", platform, token]))` rather than in the
+clear, because a registration token is a delivery capability. The platform is inside the digest, so
+one token registered on two platforms is two destinations. There is exactly one canonical active
+binding per token digest, which is what stops an installation registering the same token under a
+second identity to start its rate history again.
+
+**Authorisation.** `PushSenderBinding` holds everything one authorisation fixes for its lifetime:
+the destination installation, the host's endpoint and signing keys, the gateway and the rate policy.
+It is digested under `kr-push-sender/1`, so `PushSenderRecord::renewal_preserves_binding` is a
+comparison of one digest rather than a list of fields somebody has to remember to extend.
+
+The authorisation and the credential have different lifetimes on purpose. The authorisation is the
+installation's decision and lasts until it is revoked. The credential is a bearer a host keeps on
+disk, so it expires in thirty days and is renewed by the host signing `kr-push-sender-renewal/1` over
+a nonce the gateway issued. Renewal opens seven days before expiry and does not close at expiry: a
+host that was offline for a month renews on reconnect, because its credential lapsed and the
+authorisation behind it did not. A revoked record renews never. The gateway stores the SHA-256 of the
+bearer under `kr-push-credential/1`, never the bearer, so a copy of the database is not a set of
+working credentials.
+
+**Delivery.** A `PushDeliveryRequest` carries an opaque notification identifier, a collapse label
+that names no project, an expiry, the sealed preview and a choice from a closed alert vocabulary. It
+carries no field for sender-supplied text at all, which is how section 16's "the plaintext alert is
+generic" is enforced: `PushAlert::generic_text` is where the words come from, so command text and
+approval arguments cannot reach a lock screen by mistake or by a host that decided to. Previews may
+be disabled on the device, in which case `preview` is null and the generic alert still arrives.
+
+The size bound is measured rather than estimated. The preview plaintext stays under 1,800 bytes and
+the complete provider payload under 3,500 after encryption and base64;
+`provider_payload_within_policy` takes the length of the request the gateway is about to send,
+because that is the only figure a provider sees. Larger detail belongs in a referenced encrypted
+object.
+
+Delivery is answered with a `PushDeliveryAck`. `queued` means the provider accepted it for delivery
+and nothing more: it does not mean displayed, read or executed, and review state comes from host
+events and client acknowledgements instead. The other states are an acknowledgement that something
+else happened, and each is a fact the host needs: a duplicate notification identifier, a destination
+over its rate policy whose notification collapsed into an attention update, a token the provider
+rejected and the gateway disabled, or a notification that expired first. A suppressed notification is
+reported back with what it collapsed into and when the next update may be sent, so the host can
+record the suppression locally and keep the pending decision visible.
+
 ## Fixtures
 
-`fixtures/cbor/`, `fixtures/protocol/`, `fixtures/relay/` and `fixtures/accounts/` hold the vectors
+`fixtures/cbor/`, `fixtures/protocol/`, `fixtures/relay/`, `fixtures/accounts/`, `fixtures/service/`
+and `fixtures/push/` hold the vectors
 both languages run against. The Rust
 tests read them from `crates/*/tests/`, and the vitest suites read the same files.
 
@@ -534,6 +629,8 @@ keys, expected signatures and negative verification cases beside them.
 ```text
 Rust types  ──generate──>  packages/protocol/schema/*.json  ──generate──>  src/generated/protocol.ts
             <──  check  ──                                  <──  check  ──
+            ──generate──>  fixtures/service/*.json, fixtures/push/*.json
+            <──  check  ──
 ```
 
 ```bash
@@ -542,7 +639,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# Regenerate the schema and the method table, then check them
+# Regenerate the schema, the method table and the service and push vectors, then check them
 cargo run -p kr-protocol --bin kr-protocol-gen
 cargo run -p kr-protocol --bin kr-protocol-gen -- --check
 
