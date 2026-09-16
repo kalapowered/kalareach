@@ -177,7 +177,6 @@ fn owner_key(text: &str) -> Result<AuthorisationKey> {
 /// A daemon that is on the network.
 #[derive(Debug)]
 pub struct Network {
-    listener: kr_transport::listener::NetworkListener,
     host: Arc<NetworkHost>,
 }
 
@@ -185,7 +184,7 @@ impl Network {
     /// Returns this host's endpoint identity, which is what a pairing invitation pins.
     #[must_use]
     pub fn endpoint_id(&self) -> EndpointKey {
-        self.listener.endpoint_id()
+        self.host.endpoint_id
     }
 
     /// Returns the configuration a pairing invitation carries, with this endpoint's current hints.
@@ -203,8 +202,7 @@ impl Network {
             .to_network_config()
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         config.direct_addresses = self
-            .listener
-            .endpoint()
+            .host
             .bound_sockets()
             .into_iter()
             .filter_map(|socket| kr_protocol::pairing::NetworkHint::new(socket.to_string()).ok())
@@ -216,7 +214,7 @@ impl Network {
     /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
     #[must_use]
     pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
-        self.listener.endpoint().bound_sockets()
+        self.host.bound_sockets()
     }
 
     /// Returns the host's pairing state machine, for the owner operations it serves.
@@ -252,7 +250,7 @@ impl Network {
 
     /// Stops accepting connections and closes the endpoint.
     pub async fn shutdown(self) {
-        self.listener.shutdown().await;
+        self.host.shutdown().await;
     }
 }
 
@@ -290,6 +288,17 @@ pub struct NetworkHost {
     /// at its worker. Nothing else needs them, which is why they are recorded here rather than in
     /// the daemon's own authority store.
     live: std::sync::Mutex<std::collections::BTreeMap<ConnectionId, Arc<RemoteConnection>>>,
+    /// This host's endpoint identity, which is what a pairing invitation pins.
+    endpoint_id: EndpointKey,
+    /// The listener serving this host, once it is accepting.
+    ///
+    /// The host is recorded on the daemon before the listener exists, because a revocation has to
+    /// be able to reach a connection from the moment one can be admitted. The listener is put here
+    /// afterwards so the daemon owns it for as long as it owns the host, and taken out again by a
+    /// shutdown, which consumes it.
+    listener: std::sync::Mutex<Option<kr_transport::listener::NetworkListener>>,
+    /// The task that keeps this host's record of the wall clock moving.
+    clock_mark: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -455,12 +464,22 @@ impl NetworkHost {
         let controller = self.daemon()?;
         let observed = self.devices.utc_at_least(kr_ipc::now_ms())?;
         if observed.behind_ms > CLOCK_TOLERANCE_MS {
-            return Err(ControllerError::ClockUntrusted {
-                detail: format!(
-                    "this host's wall clock is {} ms behind the latest moment it has recorded, so                      it cannot say whether this device's grant has run out",
-                    observed.behind_ms
-                ),
-            });
+            // Written down, because the next connection would otherwise ask a clock this host has
+            // already found unreliable, and be answered plausibly.
+            self.devices.note_clock_untrusted(observed.now)?;
+        }
+        if self.devices.clock_untrusted()? {
+            if observed.behind_ms > 0 {
+                return Err(ControllerError::ClockUntrusted {
+                    detail: format!(
+                        "this host's wall clock is {} ms behind a moment it has already recorded, so it cannot say whether this device's grant has run out",
+                        observed.behind_ms
+                    ),
+                });
+            }
+            // The clock has caught up with everything this host recorded, which is the evidence
+            // that was missing. Nothing else clears it.
+            self.devices.trust_clock()?;
         }
         let remaining = expires_at_ms.get().saturating_sub(observed.now.get());
         if remaining > 0 {
@@ -587,6 +606,39 @@ impl NetworkHost {
         controller.announce_authority_revision().await
     }
 
+    /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
+    fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+        self.listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|listener| listener.endpoint().bound_sockets())
+            .unwrap_or_default()
+    }
+
+    /// Stops accepting connections and closes the endpoint.
+    async fn shutdown(&self) {
+        let (listener, clock_mark) = {
+            let listener = self
+                .listener
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let clock_mark = self
+                .clock_mark
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            (listener, clock_mark)
+        };
+        if let Some(clock_mark) = clock_mark {
+            clock_mark.abort();
+        }
+        if let Some(listener) = listener {
+            listener.shutdown().await;
+        }
+    }
+
     /// Fences every live connection whose registration has gone.
     ///
     /// A registration is what a remote connection writes under, and a revocation that withdraws
@@ -644,6 +696,22 @@ impl NetworkHost {
         self.controller
             .upgrade()
             .ok_or_else(|| ControllerError::NotConfigured("this daemon has stopped".to_owned()))
+    }
+}
+
+/// How often this host writes down what its wall clock reads.
+///
+/// It bounds how much real time can pass unrecorded, which is how far a clock can be stepped
+/// backwards without this host noticing.
+pub const CLOCK_MARK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Keeps this host's record of the wall clock moving for as long as it is on the network.
+async fn mark_the_clock(devices: Arc<DeviceDirectory>) {
+    loop {
+        tokio::time::sleep(CLOCK_MARK_INTERVAL).await;
+        if let Err(error) = devices.utc_at_least(kr_ipc::now_ms()) {
+            eprintln!("kr-controller: could not record the moment this host is at: {error}");
+        }
     }
 }
 
@@ -797,7 +865,30 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         clock: Arc::clone(&clock),
         grant_deadlines: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         live: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        endpoint_id,
+        listener: std::sync::Mutex::new(None),
+        clock_mark: std::sync::Mutex::new(None),
     });
+    // The record of the wall clock moves while this host runs, whether or not anything asks it a
+    // question. A mark that only advanced when a device connected would stand still through a
+    // quiet night, and a clock stepped back to where it stood then would look perfectly ordinary:
+    // a grant that ran out while nothing was watching would come back. This is what makes the
+    // mark evidence of time having passed rather than of connections having arrived.
+    let marking = tokio::spawn(mark_the_clock(Arc::clone(&host.devices)));
+    *host
+        .clock_mark
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(marking.abort_handle());
+    // Before the listener serves anything. The daemon reaches these connections through this
+    // handle when it withdraws their registrations, and a connection admitted before the handle
+    // was there would be one a revocation could not fence. A daemon is a singleton, so it is set
+    // once and never replaced: a second listener on one environment's identity is a mistake, not a
+    // configuration.
+    if controller.network.set(Arc::clone(&host)).is_err() {
+        return Err(ControllerError::NotConfigured(
+            "this daemon is already on the network".to_owned(),
+        ));
+    }
     let mut config = ListenerConfig::new(
         setup.settings.endpoint,
         HostEpochs {
@@ -817,7 +908,11 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     )
     .await
     .map_err(|error| ControllerError::NotConfigured(error.to_string()))?;
-    Ok(Network { listener, host })
+    *host
+        .listener
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(listener);
+    Ok(Network { host })
 }
 
 /// Loads this host's network device keys, creating them on a genuine first start.
@@ -881,8 +976,8 @@ impl Controller {
     /// Called where registrations are withdrawn without the devices holding them being named.
     /// A host with no network has none to fence.
     pub(crate) async fn fence_network_connections(&self) {
-        if let Some(network) = self.network.get() {
-            network.host.fence_withdrawn().await;
+        if let Some(host) = self.network.get() {
+            host.fence_withdrawn().await;
         }
     }
 
@@ -1125,9 +1220,9 @@ impl Controller {
         self.registry.lock().await.authority_revision()
     }
 
-    /// Returns the network this daemon is on, when its environment selected one.
+    /// Returns the host serving this daemon's network, when its environment selected one.
     #[must_use]
-    pub fn network(&self) -> Option<&Network> {
+    pub fn network_host(&self) -> Option<&Arc<NetworkHost>> {
         self.network.get()
     }
 }
@@ -1144,13 +1239,9 @@ pub async fn register_from_environment(controller: &Arc<Controller>) -> Result<(
     let Some(setup) = NetworkSetup::from_environment(controller.paths())? else {
         return Ok(());
     };
-    let network = register(controller, setup).await?;
-    // A daemon is a singleton, so this is set once and never replaced. A second attempt would mean
-    // two listeners on one environment's identity.
-    if controller.network.set(network).is_err() {
-        return Err(ControllerError::NotConfigured(
-            "this daemon is already on the network".to_owned(),
-        ));
-    }
+    // Registering records the host on the daemon and hands the listener to it, so the daemon owns
+    // both for as long as it runs and a revocation can reach the connections they serve. The handle
+    // returned here is for a caller that registers a network of its own.
+    register(controller, setup).await?;
     Ok(())
 }

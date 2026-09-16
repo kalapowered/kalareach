@@ -125,7 +125,13 @@ pub struct Controller {
     /// renew a lease it did not issue.
     leases: LeaseIssuer,
     /// The network this daemon is on, when its environment selects one.
-    network: std::sync::OnceLock<net::Network>,
+    /// The network host this daemon serves, once it is on a network.
+    ///
+    /// The host is what a revocation needs: withdrawing a registration stops the next request, and
+    /// the connections holding those registrations have to lose their write boundary with it. It is
+    /// recorded before the listener serves anything, so no connection can be admitted before the
+    /// revocation path can reach it.
+    network: std::sync::OnceLock<Arc<net::NetworkHost>>,
     supervisor: Box<dyn WorkerSupervisor>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
