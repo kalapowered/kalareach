@@ -198,13 +198,6 @@ const REPLAY_WINDOW: usize = 64;
 /// it enforces. Every 64 reads is often enough that the cache overshoots by a fraction of itself.
 const ROW_CACHE_INTERVAL: u32 = 64;
 
-/// How many rows the scrollback may gain or lose before it is measured again, whatever the read
-/// count says.
-const ROW_CACHE_ROW_STEP: usize = 32;
-
-/// How many hyperlinks may arrive before the resident state is measured again.
-const LINK_MEASURE_INTERVAL: u64 = 64;
-
 /// How many rows a history page builds at a time before checking its byte bound.
 const PAGE_BATCH_ROWS: usize = 32;
 
@@ -234,10 +227,8 @@ pub struct Engine {
     dimensions_revision: u64,
     presentation_revision: u64,
     saved_revision: u64,
-    measured_rows: usize,
     measure_now: bool,
     alternate_seen: bool,
-    links_seen: u64,
     title_truncated: bool,
     dropped_marks: u64,
     keyboard_revision: u64,
@@ -280,10 +271,8 @@ impl Engine {
             dimensions_revision: 0,
             presentation_revision: 0,
             saved_revision: 0,
-            measured_rows: 0,
             measure_now: false,
             alternate_seen: false,
-            links_seen: 0,
             title_truncated: false,
             dropped_marks: 0,
             keyboard_revision: 0,
@@ -442,7 +431,6 @@ impl Engine {
         self.lexer.flush_tail(&mut events);
         let mut outcome = self.consume(&events, now_ms);
         self.scratch = events;
-        self.measured_rows = self.grid.scrollback_rows();
         self.measure_now = false;
         self.measure_now_unconditionally(now_ms);
         outcome.resident_pressure = self.resident_pressure();
@@ -740,13 +728,6 @@ impl Engine {
         if parts.len() < 3 {
             return None;
         }
-        // Every link the application opens is a link object the grid holds, whether or not it is
-        // one the session has seen before, so the count that decides when to measure again is of
-        // occurrences rather than of distinct targets.
-        self.links_seen = self.links_seen.wrapping_add(1);
-        if self.links_seen.is_multiple_of(LINK_MEASURE_INTERVAL) {
-            self.measure_now = true;
-        }
         // A URI may contain the separator, so everything after the parameter field is the target.
         let uri = parts[2..].join(&b';');
         if uri.is_empty() {
@@ -776,7 +757,7 @@ impl Engine {
         // noticed at the next measurement. One read can carry a session's worth of links.
         let parameters = parts[1].iter().filter(|byte| **byte == b':').count() + 1;
         let resident = crate::grid::link_cost(&uri, parameters);
-        if !self.budget.links_fit(resident) {
+        if !self.links_would_fit(resident) {
             self.budget.record_truncation();
             return Some("the session has no room left for another hyperlink");
         }
@@ -793,7 +774,7 @@ impl Engine {
             } else {
                 0
             };
-        if self.links.len() >= self.budget.limits().unique_links || !self.budget.links_fit(cost) {
+        if self.links.len() >= self.budget.limits().unique_links || !self.links_would_fit(cost) {
             // The link is refused after all, so what was reserved for it is given back rather than
             // left to be corrected at the next measurement.
             self.budget.release_links(resident);
@@ -803,6 +784,22 @@ impl Engine {
         self.budget.add_links(cost);
         self.links.insert(uri);
         None
+    }
+
+    /// Whether another `bytes` of hyperlink state fits the envelope, measuring first if it does not.
+    ///
+    /// Every hyperlink is charged what it will cost where it arrives, because one read can carry a
+    /// session's worth of them and a bound that is only checked afterwards is not a bound. What is
+    /// charged is at or above what the object turns out to hold, and a row that is dropped gives
+    /// nothing back until the objects on it are measured again, so the charged figure drifts above
+    /// the truth while a session prints. A refusal on that figure would refuse a link the session
+    /// has room for, so the truth is read before anything is refused, and only then.
+    fn links_would_fit(&mut self, bytes: u64) -> bool {
+        if self.budget.links_fit(bytes) {
+            return true;
+        }
+        self.measure_links();
+        self.budget.links_fit(bytes)
     }
 
     /// Notices that the buffers have swapped, and settles the one that has come back.
@@ -847,7 +844,6 @@ impl Engine {
         if !self.grid.enforce_row_cache(limit) {
             return;
         }
-        self.measured_rows = self.grid.scrollback_rows();
         self.diagnostics.record(
             DiagnosticKind::ResidentStateTruncated,
             self.lexer.offset(),
@@ -883,41 +879,21 @@ impl Engine {
 
     /// Measures and enforces the resident-state bounds.
     ///
-    /// Measuring the retained rows means walking the scrollback, so it is not done on every read.
-    /// Counting them is cheap, though, so a read that added rows is measured however few reads have
-    /// happened: one read can carry a megabyte, and waiting for the next sixty-three would let the
-    /// cache grow far past its bound before anyone looked.
+    /// What the screens hold, the slots their rows take and the historical cache are read on every
+    /// call: the first two cost what a screen costs, and the third is carried. What the hyperlink
+    /// objects cost has to be found wherever the objects sit, which means reading every retained
+    /// row, so it is read periodically and whenever something asked. Between two of those readings
+    /// every hyperlink is charged what it will cost where it arrives, so the figure the envelope is
+    /// checked against is at or above the truth and a link is never admitted on a stale reading.
     ///
     /// While the alternate buffer is active the primary buffer's history is not reachable and is
     /// not changing either, so the last measurement of it stands rather than being replaced by the
     /// alternate buffer's nothing.
     fn enforce_resident_state(&mut self, now_ms: u64) {
-        // Measuring walks every cell of both screens and every retained row, so it happens when
-        // the rows have grown, when something asked, or periodically. Between two of them what the
-        // screens hold is already reserved, and every hyperlink charged itself where it arrived,
-        // so the bounds hold without a walk on every read.
-        let rows = self.grid.scrollback_rows();
-        let grew = rows.abs_diff(self.measured_rows) >= ROW_CACHE_ROW_STEP;
-        if !grew && !self.measure_now && !self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) {
-            return;
+        self.measure_screens();
+        if core::mem::take(&mut self.measure_now) || self.feeds.is_multiple_of(ROW_CACHE_INTERVAL) {
+            self.measure_links();
         }
-        self.measure_now = false;
-        self.measured_rows = rows;
-        self.measure_now_unconditionally(now_ms);
-    }
-
-    /// Takes the measurement, whatever the interval says.
-    fn measure_now_unconditionally(&mut self, now_ms: u64) {
-        let buffers = self.grid.buffer_bytes();
-        self.budget.set_screen_content(false, buffers.content[0]);
-        self.budget.set_screen_content(true, buffers.content[1]);
-        self.budget
-            .set_row_storage(buffers.cell_slots, buffers.row_records);
-        self.budget
-            .set_links(buffers.links.saturating_add(self.link_table_bytes()));
-        self.budget
-            .set_titles(self.titles.resident_bytes() + crate::grid::GRID_TITLE_BYTES);
-        self.budget.set_row_cache(self.grid.history_bytes());
         if self.grid.alternate_active() {
             // Nothing appends to the primary buffer while the alternate one is showing, so its
             // history cannot grow here; a resize can still move rows into it, which is why it was
@@ -927,6 +903,37 @@ impl Engine {
             return;
         }
         self.evict_history(now_ms);
+    }
+
+    /// Takes the whole measurement, whatever the interval says.
+    fn measure_now_unconditionally(&mut self, now_ms: u64) {
+        self.measure_screens();
+        self.measure_links();
+        if self.grid.alternate_active() {
+            return;
+        }
+        self.evict_history(now_ms);
+    }
+
+    /// Measures what the screens hold, what their rows take in slots, and the historical cache.
+    fn measure_screens(&mut self) {
+        let screens = self.grid.screen_bytes();
+        self.budget.set_screen_content(false, screens.content[0]);
+        self.budget.set_screen_content(true, screens.content[1]);
+        self.budget
+            .set_row_storage(screens.cell_slots, screens.row_records);
+        self.budget
+            .set_titles(self.titles.resident_bytes() + crate::grid::GRID_TITLE_BYTES);
+        self.budget.set_row_cache(self.grid.history_bytes());
+    }
+
+    /// Measures what the session's hyperlink state holds, which replaces what was charged for it.
+    fn measure_links(&mut self) {
+        self.budget.set_links(
+            self.grid
+                .link_bytes()
+                .saturating_add(self.link_table_bytes()),
+        );
     }
 
     /// What the table of distinct hyperlink targets holds.
@@ -1303,9 +1310,7 @@ impl Engine {
         self.grid.resize(size, &mut self.budget)?;
         // Rows move between the screen and the history when the grid reflows, and the two are
         // charged to different bounds, so both are measured again here rather than at whichever
-        // read comes next. The row the history ends at is read again for the same reason: the rows
-        // that moved did not arrive from the screen and must not be charged as if they had.
-        self.measured_rows = self.grid.scrollback_rows();
+        // read comes next.
         self.measure_now_unconditionally(now_ms);
         self.dimensions_revision = self.next_revision();
         self.advance_projection();

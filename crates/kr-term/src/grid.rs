@@ -255,6 +255,21 @@ impl HistoryAccount {
     }
 }
 
+/// What the rows of both buffers hold, apart from the hyperlink objects on them.
+///
+/// Read from the rows that are showing and from how many rows there are, so what it costs to read
+/// is a property of the geometry rather than of how long the session has been printing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScreenBytes {
+    /// What each buffer's rows that are showing hold beyond their cell slots, primary first.
+    pub content: [u64; 2],
+    /// What the cells of those rows cost in the slots they take.
+    pub cell_slots: u64,
+    /// What every row record of both buffers costs in the array it sits in, retained rows
+    /// included, and the room the retained rows' account keeps for its charges.
+    pub row_records: u64,
+}
+
 /// What the grid is holding, measured in one pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BufferBytes {
@@ -1424,14 +1439,60 @@ impl CanonicalGrid {
     /// What the grid is holding.
     ///
     /// Both buffers, because the one that is not showing still holds its own: a session can fill
-    /// the primary buffer, switch, and fill the alternate one as well. One walk of each screen
-    /// answers for its rows, its retained rows and its hyperlinks together, because all three are
-    /// read from the same cells.
+    /// the primary buffer, switch, and fill the alternate one as well.
     #[must_use]
     pub fn buffer_bytes(&self) -> BufferBytes {
-        // Each distinct link object once, wherever it is held. The cells of one link share it, a
-        // link can run past the end of a row, and the pen keeps the one it is inside, so counting
-        // it where it appears would report a session as holding many times what it does.
+        let screens = self.screen_bytes();
+        BufferBytes {
+            content: screens.content,
+            cell_slots: screens.cell_slots,
+            row_records: screens.row_records,
+            links: self.link_bytes(),
+        }
+    }
+
+    /// What the rows of both buffers hold, apart from the hyperlink objects on them.
+    ///
+    /// The rows that are showing are read; the retained rows are counted. A retained row's content
+    /// is the historical cache's to carry, and it is carried, charged where the row leaves the
+    /// screen. What is left of a retained row is the slot it takes in the array its screen keeps,
+    /// and how many slots a screen has taken is a number the library already has. So this costs
+    /// what a screen costs however much history sits behind it, and a session printing steadily
+    /// can afford it on every read.
+    #[must_use]
+    pub fn screen_bytes(&self) -> ScreenBytes {
+        let alternate = self.alternate_active();
+        let mut rows = RowsBytes::default();
+        let active = self.showing_content_of(self.terminal.screen(), !alternate, &mut rows);
+        let inactive =
+            self.showing_content_of(self.terminal.inactive_screen(), alternate, &mut rows);
+        let content = if alternate {
+            [inactive, active]
+        } else {
+            [active, inactive]
+        };
+        ScreenBytes {
+            content,
+            cell_slots: rows.cell_slots,
+            // The retained rows' account is an array of row slots like the screens' own, and it
+            // holds its room whether or not the charges are on it, so what is measured is the room
+            // rather than the charges.
+            row_records: rows.records.saturating_add(
+                (self.history.charges.capacity() as u64).saturating_mul(HISTORY_CHARGE_SLOT_BYTES),
+            ),
+        }
+    }
+
+    /// What every hyperlink object the grid holds costs.
+    ///
+    /// The one walk of every row there is, and the reason it is a walk: a link object is shared.
+    /// The cells of one link hold the same object, one link can be on rows that are not next to
+    /// each other and in either buffer, and the pen keeps the one it is inside, so an object has to
+    /// be found wherever it sits and counted once. A row moving between a screen and the retained
+    /// rows moves no object, and this reads the two the same way, so nothing appears or disappears
+    /// when a row scrolls off.
+    #[must_use]
+    pub fn link_bytes(&self) -> u64 {
         let mut seen = BTreeSet::new();
         let mut links = 0u64;
         // The pen's link and the saved cursors' links come first, because they are on no row: a
@@ -1447,38 +1508,10 @@ impl CanonicalGrid {
                 add_link_object(link, &mut seen, &mut links);
             }
         }
-        let alternate = self.alternate_active();
-        let mut rows = RowsBytes::default();
-        let active = self.content_of(
-            self.terminal.screen(),
-            !alternate,
-            &mut seen,
-            &mut links,
-            &mut rows,
-        );
-        let inactive = self.content_of(
-            self.terminal.inactive_screen(),
-            alternate,
-            &mut seen,
-            &mut links,
-            &mut rows,
-        );
-        let content = if alternate {
-            [inactive, active]
-        } else {
-            [active, inactive]
-        };
-        BufferBytes {
-            content,
-            cell_slots: rows.cell_slots,
-            // The retained rows' account is an array of row slots like the screens' own, and it
-            // holds its room whether or not the charges are on it, so what is measured is the room
-            // rather than the charges.
-            row_records: rows.records.saturating_add(
-                (self.history.charges.capacity() as u64).saturating_mul(HISTORY_CHARGE_SLOT_BYTES),
-            ),
-            links,
+        for screen in [self.terminal.screen(), self.terminal.inactive_screen()] {
+            screen.for_each_phys_line(|_, line| count_row_links(line, &mut seen, &mut links));
         }
+        links
     }
 
     /// The screen the history belongs to, wherever it is.
@@ -1495,39 +1528,35 @@ impl CanonicalGrid {
         }
     }
 
-    /// What one screen's rows that are showing hold, adding its retained rows and every screen's
-    /// links to running totals.
+    /// What one screen's rows that are showing hold, adding its row records to a running total.
     ///
     /// `keeps_history` says whether the rows above the screen belong to the historical cache,
     /// which has a bound of its own. Only the primary buffer keeps one. The alternate buffer's
     /// rows are all its own, including any the library is still holding from a taller geometry, so
     /// treating the oldest of them as somebody else's would leave them in no account at all.
-    fn content_of(
+    fn showing_content_of(
         &self,
         screen: &wezterm_term::screen::Screen,
         keeps_history: bool,
-        seen: &mut BTreeSet<*const Hyperlink>,
-        links: &mut u64,
         rows: &mut RowsBytes,
     ) -> u64 {
+        let held = screen.scrollback_rows();
         let retained = if keeps_history {
-            screen
-                .scrollback_rows()
-                .saturating_sub(self.size.rows as usize)
+            held.saturating_sub(self.size.rows as usize)
         } else {
             0
         };
+        // Every row record, showing or retained: the record is a slot in the array its screen
+        // keeps, and a screen holding more rows than its geometry has is holding more slots. How
+        // many it holds is all this needs, so no row is read to count it.
+        rows.records = rows
+            .records
+            .saturating_add((held as u64).saturating_mul(ROW_SLOT_BYTES));
         let mut content = 0u64;
         let mut index = 0usize;
         screen.for_each_phys_line(|_, line| {
             let showing = index >= retained;
             index += 1;
-            // Every row record, showing or retained: the record is a slot in the array its screen
-            // keeps, and a screen holding more rows than its geometry has is holding more slots.
-            rows.records = rows.records.saturating_add(ROW_SLOT_BYTES);
-            // Every link object once, wherever the row it is on sits: a row that scrolls off takes
-            // no object with it and gives none up, so both measurements read them the same way.
-            count_row_links(line, seen, links);
             if showing {
                 content = content.saturating_add(row_content_bytes(line));
                 rows.cell_slots = rows
