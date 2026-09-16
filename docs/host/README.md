@@ -359,12 +359,21 @@ What the grant decides, for every request:
 * **History.** Retained history is not served to a device at all: its scope is the grant's lower
   bound, that bound is a moment in time and a history page is a byte range, and a host that cannot
   narrow content to a grant refuses it rather than serving more than the grant allows. The
-  session's live screen and the stream that follows it are served when the grant includes them.
+  session's live screen and the stream that follows it are served when the grant includes them,
+  and "the live screen" means the screen that is showing: a device's attachment is drawn the active
+  buffer alone, and the rows of the buffer that is not showing are counted among what its
+  restoration did not carry. The exception section 10 names is the visible screen, and never the
+  inactive buffer, the scrollback or the backing transcript.
 
-What the subject decides stays the subject's. Resource ownership is the clearest case: a device
-detaches the attachment its own connection created and nothing else, and the worker enforces that
-inside its own dispatch barrier where the attachment cannot move. A local caller keeps its
-cross-window detach, because every local caller is the same authenticated operating-system user.
+What the subject decides stays the subject's, and the conditional requirements the daemon cannot
+evaluate are exactly those: whose subject it is. A device detaches the attachment its own
+connection created and nothing else, and it cancels or reads its own action and nothing else,
+because the worker enforces both inside its own dispatch barrier — the attachment list is the
+connection's, and the receipt journal is keyed by the verified actor and the action together. A
+local caller keeps its cross-window detach, because every local caller is the same authenticated
+operating-system user. An `action.read` names an action rather than a session, so it goes to the
+session the device's connection is already serving, which is where its actions on this host were
+performed.
 
 Remote dispatch needs a live lease, and a lease is renewed only after the worker has acknowledged
 the authority revision in force. A worker starts having acknowledged nothing, so the daemon asks
@@ -373,6 +382,12 @@ finds no lease; asking every worker would make one paused session everybody's wa
 carries the revision the grant was checked at, and the worker refuses inside its barrier an action
 validated under a revision it has since installed past. Local input and stopping owned execution
 depend on none of this: neither is remote dispatch.
+
+An action whose fate the daemon cannot establish is reported as unknown rather than as refused. A
+frame that reached a worker before the link failed may have been dispatched, so a proxy link that
+was interrupted part way through a frame, or that did not answer in time, answers
+`OUTCOME_UNKNOWN`: nothing retries it, and the client keeps it on the list of actions whose outcome
+it must ask about.
 
 A device that falls behind is told rather than waited for. What the daemon holds for one device is
 bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that
