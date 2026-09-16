@@ -119,8 +119,8 @@ impl Host {
             && share > MAX_STOLEN_SHARE
         {
             missing.push(format!(
-                "the hypervisor took {:.2}% of the measurement from this guest, above the {:.2}% a \
-                 host idle apart from the measurement shows",
+                "the hypervisor took {:.2}% of a phase of the measurement from this guest, above \
+                 the {:.2}% this harness admits",
                 share * 100.0,
                 MAX_STOLEN_SHARE * 100.0
             ));
@@ -183,6 +183,8 @@ impl Host {
 /// `user` and `nice`.
 #[derive(Debug)]
 pub struct StolenTime {
+    /// The reading the next span starts from, which is `None` before the first successful one and
+    /// again whenever a reading fails.
     started: Option<StolenSample>,
 }
 
@@ -201,16 +203,22 @@ impl StolenTime {
         }
     }
 
-    /// Returns the share of the processor time the hypervisor took since [`StolenTime::start`],
-    /// where this platform accounts for it, and starts a fresh span from this reading.
+    /// Returns the share of the processor time the hypervisor took since the last reading, where
+    /// this platform accounts for it, and starts a fresh span from this one.
     ///
     /// Reading it per phase is what lets a run say that each phase stayed inside the cutoff. One
     /// average over a whole run cannot: a phase that lost a tenth of its processor and a phase
     /// that lost nothing average to a figure that looks like neither.
+    ///
+    /// Every call replaces the reading the next span starts from, including the calls that answer
+    /// nothing. A reading that failed therefore leaves the span it ended unverified rather than
+    /// rolling that span into the next one, where time from the phase before it would be reported
+    /// as the phase after it. A later span recovers on the next successful pair.
     pub fn take(&mut self) -> Option<f64> {
-        let first = self.started?;
-        let last = stolen_sample()?;
-        self.started = Some(last);
+        let last = stolen_sample();
+        let first = self.started.replace(last?);
+        let first = first?;
+        let last = last?;
         let stolen = last.stolen.checked_sub(first.stolen)?;
         let total = last.total.checked_sub(first.total)?;
         if total == 0 {

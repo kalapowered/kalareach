@@ -20,28 +20,33 @@
 //! ```
 //!
 //! Both are timed, so both print what section 27 asks to be recorded beside a figure: the build,
-//! the operating system and architecture, the processors, the memory, the load average, how much
-//! of the measurement the hypervisor took from this guest, and how late a thread of its own was
-//! woken while the measurement ran. `tests/support/conditions.rs` says which of those is a
-//! condition and which is evidence, and why.
+//! the operating system and architecture, the processor, the processors, the memory and the load
+//! average. KR-PERF-005 prints two readings besides, because it is the one whose target the
+//! conditions decide: the share of each phase the hypervisor took from this guest, and how late a
+//! thread of its own was woken while it measured. `tests/support/conditions.rs` says which of
+//! those is a condition and which is evidence, and why.
 //!
-//! KR-PERF-005 is asserted where the host can be shown to meet section 27's conditions, and
-//! recorded with the shortfall named where it cannot. Its figure is a difference of two
+//! KR-PERF-005 is asserted where the host meets every condition it can be shown against, and
+//! recorded with the shortfall named where it does not. Its figure is a difference of two
 //! percentiles on the same host, so noise enters it twice and does not cancel: on a host the
-//! hypervisor kept taking the processor from, the difference is about contention rather than about
-//! this application. Lateness alone never suppresses it, because the application under test can
-//! cause lateness and a regression must not be able to switch off the check that would catch it.
-//! `tests/priority.rs` holds the property behind the figure, with nothing timed in it, and that
-//! one is asserted everywhere.
+//! hypervisor kept taking the processor from, the difference is not evidence about this
+//! application. What it is not is proof of the reverse: a run with no measured shortfall is a run
+//! with no measured shortfall, not a certified reference-host measurement, and positive stolen
+//! time does not establish that contention caused the whole difference either. Lateness alone
+//! never suppresses anything, because the application under test can cause lateness and a
+//! regression must not be able to switch off the check that would catch it. `tests/priority.rs`
+//! holds the property behind the figure, with nothing timed in it, and that one is asserted
+//! everywhere.
 //!
 //! KR-PERF-006 is asserted on every run, unoptimised builds included. It has held on every host
-//! this has run on, by three orders of magnitude, and a reconnect that does take two seconds is a
-//! defect however busy the host was. What it measures is the transport's share alone: a
-//! screen-sized frame arriving, not a screen rendered from it.
+//! this has run on by three orders of magnitude, which is why it is asserted unconditionally: that
+//! is a choice about where the line sits rather than a claim that no host could miss it. What it
+//! measures is the transport's share alone: a screen-sized frame arriving, not a screen rendered
+//! from it.
 //!
-//! One thing both assert whatever the host: the transfer was running while KR-PERF-005 measured,
-//! and the snapshot arrived whole. A harness that measured an idle connection, or read an empty
-//! frame, would otherwise pass by measuring nothing.
+//! One thing both assert whatever the host: the transfer was still running at the end of the phase
+//! KR-PERF-005 measured, and the snapshot arrived whole. A harness that measured an idle
+//! connection, or read an empty frame, would otherwise pass by measuring nothing.
 
 mod support;
 
@@ -240,21 +245,22 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
     let bulk_connection_id = authorised.connection_id;
     let chunks = Arc::new(AtomicUsize::new(0));
     let bulk_chunks = Arc::clone(&chunks);
-    let bulk = tokio::spawn(async move {
-        let mut stream = bulk_streams
-            .open(&bulk_connection, attachment_header(bulk_connection_id))
-            .await
-            .expect("a bulk stream");
-        let chunk = payload(&vec![0u8; 512 * 1024]);
-        loop {
-            // The bulk write goes through the data stream, so every chunk is charged against the
-            // connection's queued-bytes ceiling before it is handed to the connection.
-            if stream.write_message(&chunk).await.is_err() {
-                return;
+    let bulk: tokio::task::JoinHandle<Result<(), kr_transport::error::TransportError>> =
+        tokio::spawn(async move {
+            let mut stream = bulk_streams
+                .open(&bulk_connection, attachment_header(bulk_connection_id))
+                .await
+                .expect("a bulk stream");
+            let chunk = payload(&vec![0u8; 512 * 1024]);
+            loop {
+                // The bulk write goes through the data stream, so every chunk is charged against
+                // the connection's queued-bytes ceiling before it is handed to the connection. The
+                // error that ends it is what this task returns, so a measurement taken after the
+                // transfer stopped says which write stopped it rather than saying a task ended.
+                stream.write_message(&chunk).await?;
+                bulk_chunks.fetch_add(1, Ordering::Relaxed);
             }
-            bulk_chunks.fetch_add(1, Ordering::Relaxed);
-        }
-    });
+        });
     // Let the transfer reach steady state before the keystrokes are measured against it.
     tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -263,6 +269,9 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
     let before = chunks.load(Ordering::Relaxed);
     let mut loaded = round_trips(&mut input, SAMPLES).await;
     let during = chunks.load(Ordering::Relaxed) - before;
+    // Before the abort, because a transfer that stopped part way through leaves the rest of the
+    // loaded phase measured against an idle connection, and `during` alone cannot see that.
+    let transfer_ran_throughout = !bulk.is_finished();
     let stolen_loaded = stolen.take();
     // The worse of the two phases: a figure is inside the cutoff only if both phases were.
     let stolen_share = match (stolen_idle, stolen_loaded) {
@@ -270,7 +279,6 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         (single, None) | (None, single) => single,
     };
     let mut lateness = probe.stop();
-    bulk.abort();
     // Before the percentile, which has no answer for an empty set.
     assert!(
         !lateness.is_empty(),
@@ -290,18 +298,23 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         scheduling_p95.as_secs_f64() * 1000.0,
         lateness.len()
     );
-    println!(
-        "  taken by the host {}",
-        match (stolen_idle, stolen_loaded) {
-            (Some(idle), Some(loaded)) => format!(
-                "{:.2}% of the idle phase and {:.2}% of the loaded one, against a {:.2}% cutoff",
-                idle * 100.0,
-                loaded * 100.0,
-                MAX_STOLEN_SHARE * 100.0
-            ),
-            _ => "not accounted for here, so unverified".to_owned(),
-        }
-    );
+    let phase_share = |share: Option<f64>| {
+        share.map_or_else(
+            || "unverified".to_owned(),
+            |share| format!("{:.2}%", share * 100.0),
+        )
+    };
+    if stolen_idle.is_none() && stolen_loaded.is_none() {
+        println!("  taken by the host not accounted for here, so unverified in both phases");
+    } else {
+        println!(
+            "  taken by the host {} of the idle phase and {} of the loaded one, against a {:.2}% \
+             cutoff",
+            phase_share(stolen_idle),
+            phase_share(stolen_loaded),
+            MAX_STOLEN_SHARE * 100.0
+        );
+    }
     println!("  samples           {SAMPLES} round trips");
     println!("  transfer          {during} chunks of 512 KiB while they ran");
     println!(
@@ -319,11 +332,22 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
     );
 
     // Whatever the host, the measurement has to have measured something: a transfer that never
-    // started leaves the loaded phase idle, and the figure would be a second idle measurement.
+    // started, or one that stopped part way, leaves some or all of the loaded phase idle and the
+    // figure would be a second idle measurement.
     assert!(
         during > 0,
         "the transfer moved nothing while the round trips ran, so they were not measured under one"
     );
+    if !transfer_ran_throughout {
+        // It only ends by failing: nothing else leaves that loop. Awaiting it names the write.
+        match bulk.await {
+            Ok(Err(error)) => {
+                panic!("the transfer stopped part way through the loaded phase: {error}")
+            }
+            Err(join) => panic!("the transfer's task ended during the loaded phase: {join}"),
+            Ok(Ok(())) => unreachable!("the transfer's loop has no successful exit"),
+        }
+    }
 
     let shortfalls = host.shortfalls(stolen_share);
     if shortfalls.is_empty() {
@@ -348,6 +372,7 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         );
     }
 
+    bulk.abort();
     connection.close(0u32.into(), b"done");
     serving.abort();
 }

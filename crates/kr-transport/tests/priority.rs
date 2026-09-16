@@ -26,8 +26,8 @@
 //! the connection's default of zero and fails here.
 //!
 //! Beside those two, the end-to-end consequence: every keystroke is answered, each echo carries
-//! what was sent, and the transfer is still moving chunks at the far end when they are done. That
-//! one is a progress check rather than an ordering one. On loopback the receiver keeps up, so the
+//! what was sent, and the transfer moves a further chunk at the far end after they began. That one
+//! is a progress check rather than an ordering one. On loopback the receiver keeps up, so the
 //! standing backlog a keystroke could overtake is small, and stalling the receiver instead would
 //! exhaust the connection's flow-control window, which no stream priority reaches past.
 
@@ -350,7 +350,7 @@ async fn the_connection_uses_the_priority_each_kind_is_scheduled_at() {
 /// Every keystroke is answered, in order, while a transfer that never ends keeps moving through
 /// the same connection. Nothing is timed: what is asserted is that each echo carried the keystroke
 /// that was sent, that the transfer was still writing when the keystrokes were done, and that a
-/// further chunk of it reached the far end while they ran. A connection whose transfer had taken
+/// further chunk of it reached the far end after they began. A connection whose transfer had taken
 /// the link could not do all three.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_keystroke_is_answered_while_a_transfer_runs() {
@@ -446,7 +446,7 @@ async fn every_keystroke_is_answered_while_a_transfer_runs() {
     let bulk_connection = connection.clone();
     let bulk_streams = Arc::clone(&streams);
     let bulk_connection_id = authorised.connection_id;
-    let bulk = tokio::spawn(async move {
+    let bulk: tokio::task::JoinHandle<Result<(), TransportError>> = tokio::spawn(async move {
         let mut stream = bulk_streams
             .open(&bulk_connection, attachment_header(bulk_connection_id))
             .await
@@ -458,8 +458,11 @@ async fn every_keystroke_is_answered_while_a_transfer_runs() {
         );
         let chunk = payload(&vec![0u8; CHUNK_BYTES]);
         // Until the test aborts it. A transfer that stopped on its own would leave the keystrokes
-        // measured against nothing, and the assertions below say so.
-        while stream.write_message(&chunk).await.is_ok() {}
+        // measured against nothing, so the error that stopped it is what this task returns: the
+        // assertion below reports the write that failed rather than reporting that a task ended.
+        loop {
+            stream.write_message(&chunk).await?;
+        }
     });
 
     for chunk in 0..CHUNKS_BEFORE {
@@ -498,17 +501,23 @@ async fn every_keystroke_is_answered_while_a_transfer_runs() {
 
     // The transfer never ends, so a further chunk has to reach the far end. Waiting for one is
     // deterministic where comparing two counters is a race: a keystroke round trip is smaller than
-    // a chunk, so all of them can finish inside one chunk's flight.
+    // a chunk, so every keystroke can finish inside one chunk's flight and the chunk arrive after
+    // them. What this establishes is that the transfer went on moving from the moment the
+    // keystrokes began, not that a chunk landed between two of them.
     tokio::time::timeout(DEADLINE, chunk_arrived.recv())
         .await
-        .expect("a further chunk of the transfer reached the host while the keystrokes ran")
+        .expect("a further chunk of the transfer reached the host after the keystrokes began")
         .expect("the transfer reached the host");
     let after = taken.load(Ordering::Relaxed);
 
     if bulk.is_finished() {
-        // It only finishes by failing: nothing else ends that loop. Awaiting it surfaces why.
-        let outcome = bulk.await;
-        panic!("the transfer stopped while the keystrokes ran: {outcome:?}");
+        // It only ends by failing: nothing else leaves that loop. Awaiting it names the write that
+        // failed, or the panic, rather than saying that a task ended.
+        match bulk.await {
+            Ok(Err(error)) => panic!("the transfer stopped while the keystrokes ran: {error}"),
+            Err(join) => panic!("the transfer's task ended while the keystrokes ran: {join}"),
+            Ok(Ok(())) => unreachable!("the transfer's loop has no successful exit"),
+        }
     }
     println!(
         "KR-PERF-005 property keystrokes={KEYSTROKES} chunks_during={} chunk_bytes={CHUNK_BYTES}",
