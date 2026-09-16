@@ -1181,6 +1181,22 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "Read encrypted mailbox envelopes. The service never sees their plaintext.";
 
+    MailboxDeliver = "mailbox.deliver", Services,
+    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    selectors: [Mailbox],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
+    confirmation: None, idempotency: keyed("envelope id"),
+    doc: "Place one sealed envelope in a recipient's mailbox. The service stores the routing \
+          record and the ciphertext and never a plaintext field.";
+
+    MailboxAcknowledge = "mailbox.acknowledge", Services,
+    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    selectors: [Mailbox],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
+    confirmation: None, idempotency: keyed("acknowledged sequence"),
+    doc: "Acknowledge mailbox items the recipient has stored durably, so the service may remove \
+          them. The replay identifiers outlive the items.";
+
     AuthoritySync = "authority.sync", Services,
     effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
     selectors: [Host, Grant],

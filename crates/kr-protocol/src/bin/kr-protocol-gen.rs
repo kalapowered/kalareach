@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use kr_protocol::schema::generated_files;
-use kr_protocol::vectors::{PUSH_FILE_NAME, SERVICE_REQUESTS_FILE_NAME};
+use kr_protocol::vectors::{PUSH_FILE_NAME, SERVICE_REQUESTS_FILE_NAME, SERVICES_FILE_NAME};
 
 fn default_out_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/protocol/schema")
@@ -29,7 +29,7 @@ fn vector_files() -> Vec<(PathBuf, String)> {
     kr_protocol::vectors::generated_files()
         .into_iter()
         .map(|(name, contents)| {
-            let area = if name == SERVICE_REQUESTS_FILE_NAME {
+            let area = if name == SERVICE_REQUESTS_FILE_NAME || name == SERVICES_FILE_NAME {
                 "service"
             } else if name == PUSH_FILE_NAME {
                 "push"

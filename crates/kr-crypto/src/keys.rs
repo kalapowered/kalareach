@@ -15,8 +15,7 @@
 //! * [`DeviceKeys::public_keys`] produces a bundle that fails
 //!   [`DevicePublicKeys::purposes_are_distinct`] if two purposes ever share a key.
 
-use kr_cbor::{CanonicalValue, sha256, signing_value};
-use kr_protocol::pairing::{DevicePublicKeys, KEY_ID_DOMAIN, KeyPurpose};
+use kr_protocol::pairing::{DevicePublicKeys, KeyPurpose};
 use kr_protocol::scalars::{
     AuthorisationKey, EndpointKey, KeyId, NotificationPreviewKey, StoredEnvelopeKey,
 };
@@ -27,18 +26,12 @@ use crate::sodium;
 
 /// Returns the identifier of one public key: `SHA256(CBOR(["kr-key-id/1", purpose, key]))`.
 ///
-/// The purpose is inside the hash, so the same 32 bytes declared under two purposes produce two
-/// identifiers and a receiver can never confuse them.
+/// The derivation belongs to the wire contract, so it is `kr_protocol::pairing::key_id` and this is
+/// the name the key types here reach it by. One implementation, one set of bytes: a second one
+/// would be a second answer to a question the protocol has already settled.
 #[must_use]
 pub fn key_id(purpose: KeyPurpose, public_key: &[u8; 32]) -> KeyId {
-    let value = signing_value(
-        KEY_ID_DOMAIN,
-        vec![
-            CanonicalValue::text(purpose.as_str()),
-            CanonicalValue::bytes(public_key.as_slice()),
-        ],
-    );
-    KeyId::from_bytes(sha256(&kr_cbor::encode(&value)))
+    kr_protocol::pairing::key_id(purpose, public_key)
 }
 
 /// Declares one purpose's private seed.

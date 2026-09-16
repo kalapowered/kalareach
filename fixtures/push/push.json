@@ -294,7 +294,7 @@
       }
     },
     {
-      "cbor_hex": "82726b722d707573682d64656c69766572792f31a66568696e7473a265616c65727470617070726f76616c5f77616974696e6767757267656e637969617474656e74696f6e6770726576696577a3656e6f6e6365581893939393939393939393939393939393939393939393939367726f7574696e67a56b656e76656c6f70655f6964508a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a6d657870697265735f61745f6d731b0000019b76e863a06d73656e6465725f6b65795f69645820929292929292929292929292929292929292929292929292929292929292929270726563697069656e745f6b65795f6964582091919191919191919191919191919191919191919191919191919191919191917173697a655f6275636b65745f62797465731904006a63697068657274657874590410abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab6b636f6c6c617073655f696450c8b1f0a41d274e538b6f029a7745d1306d657870697265735f61745f6d731b0000019b76e863a06f6e6f74696669636174696f6e5f6964500f3a9c7e51d24b08a6143e85cb609f227073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
+      "cbor_hex": "82726b722d707573682d64656c69766572792f31a66568696e7473a265616c65727470617070726f76616c5f77616974696e6767757267656e637969617474656e74696f6e6770726576696577a3656e6f6e6365581893939393939393939393939393939393939393939393939367726f7574696e67a7697468726561645f6964f66b656e76656c6f70655f6964508a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a6c7061796c6f61645f74797065746e6f74696669636174696f6e5f707265766965776d657870697265735f61745f6d731b0000019b76e863a06d73656e6465725f6b65795f69645820929292929292929292929292929292929292929292929292929292929292929270726563697069656e745f6b65795f6964582091919191919191919191919191919191919191919191919191919191919191917173697a655f6275636b65745f62797465731904006a63697068657274657874590410abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab6b636f6c6c617073655f696450c8b1f0a41d274e538b6f029a7745d1306d657870697265735f61745f6d731b0000019b76e863a06f6e6f74696669636174696f6e5f6964500f3a9c7e51d24b08a6143e85cb609f227073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
       "description": "One notification with a sealed preview. The digest is how the gateway recognises a request it has already handled.",
       "domain": "kr-push-delivery/1",
       "id": "delivery_request",
@@ -312,14 +312,16 @@
           "routing": {
             "envelope_id": "8a8a8a8a-8a8a-8a8a-8a8a-8a8a8a8a8a8a",
             "expires_at_ms": "1767226500000",
+            "payload_type": "notification_preview",
             "recipient_key_id": "kZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZE",
             "sender_key_id": "kpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpI",
-            "size_bucket_bytes": "1024"
+            "size_bucket_bytes": "1024",
+            "thread_id": null
           }
         },
         "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
       },
-      "sha256": "af9aa2e00414c771cc2223c3d1ef3561e01fd7626da8e86d9fc72763ff9aebf0",
+      "sha256": "ae47605d3a636b4e10a7b497c50510e46714e630c9790f6839cc0996fdbe3ffd",
       "value": {
         "array": [
           {
@@ -361,9 +363,21 @@
                       {
                         "map": [
                           [
+                            "thread_id",
+                            {
+                              "null": null
+                            }
+                          ],
+                          [
                             "envelope_id",
                             {
                               "bytes": "8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a"
+                            }
+                          ],
+                          [
+                            "payload_type",
+                            {
+                              "text": "notification_preview"
                             }
                           ],
                           [

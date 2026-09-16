@@ -129,6 +129,28 @@ pub const OWNER_CONFIRM_DOMAIN: &str = "kr-pair/owner-confirm/1";
 /// The domain a key identifier is derived under.
 pub const KEY_ID_DOMAIN: &str = "kr-key-id/1";
 
+/// Returns the identifier of one purpose-separated public key.
+///
+/// `SHA256(CBOR(["kr-key-id/1", purpose, key]))`. The purpose is inside the hash, so the same 32
+/// bytes declared under two purposes produce two identifiers and a receiver can never confuse
+/// them.
+///
+/// It lives here, beside the domain and the purpose vocabulary, so that the one place a key
+/// identifier is derived is the place the wire contract is defined. `kr-crypto` re-exports it
+/// rather than deriving it again, and a managed service that is handed a public key derives the
+/// identifier instead of believing a claimed one.
+#[must_use]
+pub fn key_id(purpose: KeyPurpose, public_key: &[u8; 32]) -> KeyId {
+    let value = signing_value(
+        KEY_ID_DOMAIN,
+        vec![
+            CanonicalValue::text(purpose.as_str()),
+            CanonicalValue::bytes(public_key.as_slice()),
+        ],
+    );
+    KeyId::from_bytes(sha256(&kr_cbor::encode(&value)))
+}
+
 /// Characters in a verification value.
 pub const VERIFICATION_VALUE_LEN: usize = 8;
 

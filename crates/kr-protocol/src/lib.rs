@@ -118,5 +118,6 @@ pub mod schema;
 pub mod semantic;
 pub mod service;
 pub mod session;
+pub mod sync;
 pub mod vectors;
 pub mod worker;

@@ -13,7 +13,7 @@ use kr_cbor::{CanonicalValue, CborError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
+use crate::ids::{ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, DeviceId};
 use crate::scalars::{
     AuthorisationKey, Bytes, CanonicalSet, Digest256, KeyId, Nonce192, SecretBytes32, Signature64,
     TimestampMs, U64,
@@ -317,6 +317,9 @@ pub enum DescriptorError {
     /// The recovery kit does not name the service origin a restore is trying.
     #[error("the recovery kit does not name that service origin")]
     UnknownServiceOrigin,
+    /// The publication names a writer the collection's owner has not enrolled.
+    #[error("that writer is not the one this collection's owner enrolled")]
+    WriterNotEnrolled,
     /// The bytes were not a canonical descriptor.
     #[error("the archive descriptor is not canonical KR-CBOR-1: {0}")]
     Encoding(#[from] CborError),
@@ -399,6 +402,136 @@ impl ArchiveDescriptor {
             recipients.push(wrap.context.recipient_key_id);
         }
         Ok(())
+    }
+}
+
+/// The domain one collection's writer enrolment covers.
+pub const BACKUP_WRITER_DOMAIN: &str = "kr-backup-writer/1";
+
+/// The domain one published generation covers.
+pub const BACKUP_PUBLICATION_DOMAIN: &str = "kr-backup-publication/1";
+
+/// Which writer may publish generations of one collection, as its owner states it.
+///
+/// A managed service cannot read a manifest, so it cannot tell a genuine generation from one
+/// somebody else uploaded. What it can do is refuse a publication that is not signed by the writer
+/// the collection's owner enrolled, and that is what this record establishes: the owner's
+/// authorisation key signs the writer's signing key into the collection.
+///
+/// The revision is what makes a replacement deliberate. A service that has accepted revision three
+/// refuses revision two, so a captured earlier enrolment cannot restore a writer whose key the
+/// owner has since retired.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BackupWriterRecordPayload {
+    /// The archive whose generations this writer may publish.
+    pub archive_id: ArchiveId,
+    /// The writer the owner enrols.
+    pub writer: TrustedWriter,
+    /// The revision of this collection's enrolment. Only the owner advances it.
+    pub writer_revision: BackupWriterRevision,
+    /// The owner's authorisation key identifier.
+    pub owner_key_id: KeyId,
+    /// When the owner signed it, in UTC milliseconds.
+    pub enrolled_at_ms: TimestampMs,
+}
+
+impl BackupWriterRecordPayload {
+    /// Builds the canonical bytes an enrolment signature covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the payload cannot be represented in KR-CBOR-1.
+    pub fn signing_input(&self) -> Result<Vec<u8>, CborError> {
+        Ok(kr_cbor::encode(&kr_cbor::signing_value(
+            BACKUP_WRITER_DOMAIN,
+            vec![kr_cbor::to_canonical_value(self)?],
+        )))
+    }
+}
+
+/// One collection's writer enrolment, signed by the collection owner's authorisation key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BackupWriterRecord {
+    /// What the owner states.
+    pub payload: BackupWriterRecordPayload,
+    /// The owner's signature over [`BackupWriterRecordPayload::signing_input`].
+    pub signature: Signature64,
+}
+
+/// One generation of one archive, as its writer publishes it.
+///
+/// The descriptor is the public half of an archive: the opaque archive identifier, the encrypted
+/// manifest's reference and hash, and the manifest key wrapped once per authorised recipient. The
+/// writer signs it so that a device fetching it verifies the writer's own statement rather than the
+/// service's word about what was published.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BackupGenerationPublicationPayload {
+    /// The public descriptor of this generation.
+    pub descriptor: ArchiveDescriptor,
+    /// The writer's signing key identifier.
+    pub writer_key_id: KeyId,
+    /// When the writer published it, in UTC milliseconds.
+    pub published_at_ms: TimestampMs,
+}
+
+impl BackupGenerationPublicationPayload {
+    /// Builds the canonical bytes a publication signature covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the payload cannot be represented in KR-CBOR-1.
+    pub fn signing_input(&self) -> Result<Vec<u8>, CborError> {
+        Ok(kr_cbor::encode(&kr_cbor::signing_value(
+            BACKUP_PUBLICATION_DOMAIN,
+            vec![kr_cbor::to_canonical_value(self)?],
+        )))
+    }
+}
+
+/// One published generation and the writer's signature over it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BackupGenerationPublication {
+    /// What the writer published.
+    pub payload: BackupGenerationPublicationPayload,
+    /// The writer's signature over [`BackupGenerationPublicationPayload::signing_input`].
+    pub signature: Signature64,
+}
+
+impl BackupGenerationPublication {
+    /// Validates the publication before anything is stored for it.
+    ///
+    /// `descriptor_len` is the size of the descriptor as it arrived, which is the quantity section
+    /// 20 bounds. The descriptor's own rules are checked first, because an invalid descriptor must
+    /// fail before allocation, and then the two facts that tie the publication to it: the writer
+    /// the payload names is the writer the signature will be checked against, and the archive the
+    /// descriptor names is the archive the enrolment covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the publication breaks.
+    pub fn check_structure(
+        &self,
+        descriptor_len: usize,
+        enrolled: &BackupWriterRecordPayload,
+    ) -> Result<(), DescriptorError> {
+        self.payload.descriptor.validate(descriptor_len)?;
+        if self.payload.writer_key_id != enrolled.writer.writer_key_id {
+            return Err(DescriptorError::WriterNotEnrolled);
+        }
+        if self.payload.descriptor.archive_id != enrolled.archive_id {
+            return Err(DescriptorError::WrapArchiveMismatch);
+        }
+        Ok(())
+    }
+
+    /// The generation this publication is of.
+    #[must_use]
+    pub const fn backup_generation(&self) -> BackupGeneration {
+        self.payload.descriptor.backup_generation
     }
 }
 
@@ -550,6 +683,98 @@ mod tests {
             encrypted_manifest: object_ref(7),
             manifest_key_wraps: wraps,
         }
+    }
+
+    fn enrolment(writer_key: u8, revision: u64) -> BackupWriterRecordPayload {
+        BackupWriterRecordPayload {
+            archive_id: ArchiveId::new(Uuid::from_bytes([9; 16])),
+            writer: TrustedWriter {
+                writer_key_id: KeyId::from_bytes([writer_key; 32]),
+                signing_key: AuthorisationKey::from_bytes([writer_key; 32]),
+                enrolled_at_ms: TimestampMs::new(1_000),
+            },
+            writer_revision: BackupWriterRevision::new(revision),
+            owner_key_id: KeyId::from_bytes([0x0e; 32]),
+            enrolled_at_ms: TimestampMs::new(1_000),
+        }
+    }
+
+    fn publication(writer_key: u8) -> BackupGenerationPublication {
+        let manifest = object_ref(7);
+        BackupGenerationPublication {
+            payload: BackupGenerationPublicationPayload {
+                descriptor: descriptor(vec![wrap(&manifest, 1)]),
+                writer_key_id: KeyId::from_bytes([writer_key; 32]),
+                published_at_ms: TimestampMs::new(2_000),
+            },
+            signature: Signature64::from_bytes([0x5e; 64]),
+        }
+    }
+
+    #[test]
+    fn a_publication_is_admitted_for_the_writer_the_owner_enrolled() {
+        let enrolled = enrolment(0x77, 1);
+        let published = publication(0x77);
+        assert_eq!(published.check_structure(1024, &enrolled), Ok(()));
+        assert_eq!(published.backup_generation(), BackupGeneration::new(3));
+    }
+
+    #[test]
+    fn a_publication_by_another_writer_is_refused() {
+        let enrolled = enrolment(0x77, 1);
+        assert_eq!(
+            publication(0x78).check_structure(1024, &enrolled),
+            Err(DescriptorError::WriterNotEnrolled)
+        );
+    }
+
+    #[test]
+    fn a_publication_for_another_archive_is_refused() {
+        let mut enrolled = enrolment(0x77, 1);
+        enrolled.archive_id = ArchiveId::new(Uuid::from_bytes([0x0a; 16]));
+        assert_eq!(
+            publication(0x77).check_structure(1024, &enrolled),
+            Err(DescriptorError::WrapArchiveMismatch)
+        );
+    }
+
+    #[test]
+    fn a_publication_whose_descriptor_is_over_the_limit_is_refused_first() {
+        let enrolled = enrolment(0x77, 1);
+        assert!(matches!(
+            publication(0x77).check_structure(MAX_ARCHIVE_DESCRIPTOR_LEN + 1, &enrolled),
+            Err(DescriptorError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn the_two_backup_domains_cover_different_bytes() {
+        let enrolled = enrolment(0x77, 1);
+        let published = publication(0x77);
+        let writer_bytes = enrolled.signing_input().expect("an enrolment input");
+        let publication_bytes = published
+            .payload
+            .signing_input()
+            .expect("a publication input");
+        assert_ne!(writer_bytes, publication_bytes);
+        assert!(
+            writer_bytes
+                .windows(BACKUP_WRITER_DOMAIN.len())
+                .any(|window| window == BACKUP_WRITER_DOMAIN.as_bytes())
+        );
+        assert!(
+            publication_bytes
+                .windows(BACKUP_PUBLICATION_DOMAIN.len())
+                .any(|window| window == BACKUP_PUBLICATION_DOMAIN.as_bytes())
+        );
+    }
+
+    #[test]
+    fn an_enrolment_of_a_later_revision_covers_different_bytes() {
+        assert_ne!(
+            enrolment(0x77, 1).signing_input().expect("an input"),
+            enrolment(0x77, 2).signing_input().expect("an input")
+        );
     }
 
     #[test]

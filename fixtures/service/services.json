@@ -1,0 +1,878 @@
+{
+  "cases": [
+    {
+      "cbor_hex": "ad677061796c6f6164507a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a6776657273696f6e6c6b722d6d61696c626f782f31686772616e745f6964f6697468726561645f6964503f1c880a526d4b198e270d61aa3477906a73657373696f6e5f6964f66b656e76656c6f70655f6964508a441e7b29034c5db16e3892cf05612d6c7061796c6f61645f747970656b73796e635f6368616e67656d637265617465645f61745f6d731b0000019b76daa8006d657870697265735f61745f6d731b0000019b7c0104006d73656e6465725f6b65795f6964582092929292929292929292929292929292929292929292929292929292929292926d73657373696f6e5f65706f6368f66e656e7669726f6e6d656e745f6964502121212121212121212121212121212170726563697069656e745f6b65795f696458209191919191919191919191919191919191919191919191919191919191919191",
+      "description": "One sealed mailbox item. The routing record declares the payload kind, the coalescing thread and the size bucket; the plaintext authenticates every one of them, so a service that relabelled or re-threaded an item is caught when the recipient opens it.",
+      "domain": null,
+      "id": "mailbox_item",
+      "json": {
+        "plaintext": {
+          "created_at_ms": "1767225600000",
+          "envelope_id": "8a441e7b-2903-4c5d-b16e-3892cf05612d",
+          "environment_id": "21212121-2121-2121-2121-212121212121",
+          "expires_at_ms": "1767312000000",
+          "grant_id": null,
+          "payload": "enp6enp6enp6enp6enp6eg",
+          "payload_type": "sync_change",
+          "recipient_key_id": "kZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZE",
+          "sender_key_id": "kpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpI",
+          "session_epoch": null,
+          "session_id": null,
+          "thread_id": "3f1c880a-526d-4b19-8e27-0d61aa347790",
+          "version": "kr-mailbox/1"
+        },
+        "sealed": {
+          "ciphertext": "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s",
+          "nonce": "k5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OT",
+          "routing": {
+            "envelope_id": "8a441e7b-2903-4c5d-b16e-3892cf05612d",
+            "expires_at_ms": "1767312000000",
+            "payload_type": "sync_change",
+            "recipient_key_id": "kZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZE",
+            "sender_key_id": "kpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpI",
+            "size_bucket_bytes": "1024",
+            "thread_id": "3f1c880a-526d-4b19-8e27-0d61aa347790"
+          }
+        }
+      },
+      "sha256": "a4ad0d807b64dafa86173bc5b4d25ff80b72b46f111107ec96fb279702ede381",
+      "stored_bytes": "1320",
+      "value": {
+        "map": [
+          [
+            "payload",
+            {
+              "bytes": "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"
+            }
+          ],
+          [
+            "version",
+            {
+              "text": "kr-mailbox/1"
+            }
+          ],
+          [
+            "grant_id",
+            {
+              "null": null
+            }
+          ],
+          [
+            "thread_id",
+            {
+              "bytes": "3f1c880a526d4b198e270d61aa347790"
+            }
+          ],
+          [
+            "session_id",
+            {
+              "null": null
+            }
+          ],
+          [
+            "envelope_id",
+            {
+              "bytes": "8a441e7b29034c5db16e3892cf05612d"
+            }
+          ],
+          [
+            "payload_type",
+            {
+              "text": "sync_change"
+            }
+          ],
+          [
+            "created_at_ms",
+            {
+              "int": "1767225600000"
+            }
+          ],
+          [
+            "expires_at_ms",
+            {
+              "int": "1767312000000"
+            }
+          ],
+          [
+            "sender_key_id",
+            {
+              "bytes": "9292929292929292929292929292929292929292929292929292929292929292"
+            }
+          ],
+          [
+            "session_epoch",
+            {
+              "null": null
+            }
+          ],
+          [
+            "environment_id",
+            {
+              "bytes": "21212121212121212121212121212121"
+            }
+          ],
+          [
+            "recipient_key_id",
+            {
+              "bytes": "9191919191919191919191919191919191919191919191919191919191919191"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "cbor_hex": "876f6b722d7265766f636174696f6e2f31506b0e77319a454f82b3581d0ce6249311502c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c504d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4da16764657669636573a16a6465766963655f69647381505e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e1b0000019b76daa80058207171717171717171717171717171717171717171717171717171717171717171",
+      "description": "A remote owner's signed revocation request. It carries no host revision at all: only the target host issues its ordered revisions, so a device cannot assign one to its own request.",
+      "domain": "kr-revocation/1",
+      "id": "revocation_request",
+      "json": {
+        "host_device_id": "4d4d4d4d-4d4d-4d4d-4d4d-4d4d4d4d4d4d",
+        "issued_at_ms": "1767225600000",
+        "issuer_device_id": "2c2c2c2c-2c2c-2c2c-2c2c-2c2c2c2c2c2c",
+        "issuer_key_id": "cXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXE",
+        "request_id": "6b0e7731-9a45-4f82-b358-1d0ce6249311",
+        "signature": "XFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXA",
+        "target": {
+          "devices": {
+            "device_ids": [
+              "5e5e5e5e-5e5e-5e5e-5e5e-5e5e5e5e5e5e"
+            ]
+          }
+        }
+      },
+      "sha256": "fa2c50eaad04abc82a53aff171d00410d0c77d6e7597e23960007b48d3c4110a",
+      "value": {
+        "array": [
+          {
+            "text": "kr-revocation/1"
+          },
+          {
+            "bytes": "6b0e77319a454f82b3581d0ce6249311"
+          },
+          {
+            "bytes": "2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c"
+          },
+          {
+            "bytes": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
+          },
+          {
+            "map": [
+              [
+                "devices",
+                {
+                  "map": [
+                    [
+                      "device_ids",
+                      {
+                        "array": [
+                          {
+                            "bytes": "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+                          }
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ]
+            ]
+          },
+          {
+            "int": "1767225600000"
+          },
+          {
+            "bytes": "7171717171717171717171717171717171717171717171717171717171717171"
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "876e6b722d617574686f726974792f31504d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d0c0b81506b0e77319a454f82b3581d0ce62493111b0000019b76daabe858207272727272727272727272727272727272727272727272727272727272727272",
+      "description": "The host's own ordered authority revision, naming the requests it applied and the revision it follows.",
+      "domain": "kr-authority/1",
+      "id": "authority_revision_record",
+      "json": {
+        "applied_requests": [
+          "6b0e7731-9a45-4f82-b358-1d0ce6249311"
+        ],
+        "authority_revision": "12",
+        "host_device_id": "4d4d4d4d-4d4d-4d4d-4d4d-4d4d4d4d4d4d",
+        "host_key_id": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI",
+        "issued_at_ms": "1767225601000",
+        "previous_revision": "11",
+        "signature": "XV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXQ"
+      },
+      "sha256": "8bc8d82239bec0b0e97525e294669443195ab9e9c342a698a7f492f99f3e9985",
+      "value": {
+        "array": [
+          {
+            "text": "kr-authority/1"
+          },
+          {
+            "bytes": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
+          },
+          {
+            "int": "12"
+          },
+          {
+            "int": "11"
+          },
+          {
+            "array": [
+              {
+                "bytes": "6b0e77319a454f82b3581d0ce6249311"
+              }
+            ]
+          },
+          {
+            "int": "1767225601000"
+          },
+          {
+            "bytes": "7272727272727272727272727272727272727272727272727272727272727272"
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "a6646b696e646873657474696e6773666f626a656374a3656e6f6e636558189494949494949494949494949494949494949494949494946a63697068657274657874590410cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd7173697a655f6275636b65745f6279746573190400687265766973696f6e5035353535353535353535353535353535696f626a6563745f696450343434343434343434343434343434346d636f6c6c656374696f6e5f696450333333333333333333333333333333336d757064617465645f61745f6d731b0000019b76daa800",
+      "description": "One synchronised object as the service holds it: the kind, the revision the content was accepted as, and the sealed object. Nothing about what it contains is outside the encryption.",
+      "domain": null,
+      "id": "sync_object_record",
+      "json": {
+        "collection_id": "33333333-3333-3333-3333-333333333333",
+        "kind": "settings",
+        "object": {
+          "ciphertext": "zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0",
+          "nonce": "lJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSU",
+          "size_bucket_bytes": "1024"
+        },
+        "object_id": "34343434-3434-3434-3434-343434343434",
+        "revision": "35353535-3535-3535-3535-353535353535",
+        "updated_at_ms": "1767225600000"
+      },
+      "sha256": "bc3179b0f45579496b821dc8e3c2fef86dcc61518c47b8aaf4b810784710210f",
+      "stored_bytes": "1320",
+      "value": {
+        "map": [
+          [
+            "kind",
+            {
+              "text": "settings"
+            }
+          ],
+          [
+            "object",
+            {
+              "map": [
+                [
+                  "nonce",
+                  {
+                    "bytes": "949494949494949494949494949494949494949494949494"
+                  }
+                ],
+                [
+                  "ciphertext",
+                  {
+                    "bytes": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+                  }
+                ],
+                [
+                  "size_bucket_bytes",
+                  {
+                    "int": "1024"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "revision",
+            {
+              "bytes": "35353535353535353535353535353535"
+            }
+          ],
+          [
+            "object_id",
+            {
+              "bytes": "34343434343434343434343434343434"
+            }
+          ],
+          [
+            "collection_id",
+            {
+              "bytes": "33333333333333333333333333333333"
+            }
+          ],
+          [
+            "updated_at_ms",
+            {
+              "int": "1767225600000"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "cbor_hex": "a7646b696e64656472616674666f626a656374a3656e6f6e636558189494949494949494949494949494949494949494949494946a63697068657274657874590410cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd7173697a655f6275636b65745f6279746573190400696f626a6563745f696450343434343434343434343434343434346b636f6e666c6963745f696450363636363636363636363636363636366e7265636f726465645f61745f6d731b0000019b76db92607063757272656e745f7265766973696f6e50353535353535353535353535353535357165787065637465645f7265766973696f6e5037373737373737373737373737373737",
+      "description": "A write that lost its comparison, kept unchanged for the person to choose from. The revision it expected and the revision the object held are both recorded; no clock decides between them.",
+      "domain": null,
+      "id": "sync_conflict_copy",
+      "json": {
+        "conflict_id": "36363636-3636-3636-3636-363636363636",
+        "current_revision": "35353535-3535-3535-3535-353535353535",
+        "expected_revision": "37373737-3737-3737-3737-373737373737",
+        "kind": "draft",
+        "object": {
+          "ciphertext": "zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0",
+          "nonce": "lJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSU",
+          "size_bucket_bytes": "1024"
+        },
+        "object_id": "34343434-3434-3434-3434-343434343434",
+        "recorded_at_ms": "1767225660000"
+      },
+      "sha256": "431c56bf2c65f360af51893942647cc0066ead0d4df7b77fecde4766bd3a6344",
+      "value": {
+        "map": [
+          [
+            "kind",
+            {
+              "text": "draft"
+            }
+          ],
+          [
+            "object",
+            {
+              "map": [
+                [
+                  "nonce",
+                  {
+                    "bytes": "949494949494949494949494949494949494949494949494"
+                  }
+                ],
+                [
+                  "ciphertext",
+                  {
+                    "bytes": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+                  }
+                ],
+                [
+                  "size_bucket_bytes",
+                  {
+                    "int": "1024"
+                  }
+                ]
+              ]
+            }
+          ],
+          [
+            "object_id",
+            {
+              "bytes": "34343434343434343434343434343434"
+            }
+          ],
+          [
+            "conflict_id",
+            {
+              "bytes": "36363636363636363636363636363636"
+            }
+          ],
+          [
+            "recorded_at_ms",
+            {
+              "int": "1767225660000"
+            }
+          ],
+          [
+            "current_revision",
+            {
+              "bytes": "35353535353535353535353535353535"
+            }
+          ],
+          [
+            "expected_revision",
+            {
+              "bytes": "37373737373737373737373737373737"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82726b722d6261636b75702d7772697465722f31a566777269746572a36b7369676e696e675f6b6579582074747474747474747474747474747474747474747474747474747474747474746d7772697465725f6b65795f6964582073737373737373737373737373737373737373737373737373737373737373736e656e726f6c6c65645f61745f6d731b0000019b76daa8006a617263686976655f696450383838383838383838383838383838386c6f776e65725f6b65795f6964582075757575757575757575757575757575757575757575757575757575757575756e656e726f6c6c65645f61745f6d731b0000019b76daa8006f7772697465725f7265766973696f6e01",
+      "description": "The collection owner's enrolment of the writer that may publish its generations, signed by the owner's authorisation key.",
+      "domain": "kr-backup-writer/1",
+      "id": "backup_writer_record",
+      "json": {
+        "payload": {
+          "archive_id": "38383838-3838-3838-3838-383838383838",
+          "enrolled_at_ms": "1767225600000",
+          "owner_key_id": "dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXU",
+          "writer": {
+            "enrolled_at_ms": "1767225600000",
+            "signing_key": "dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHQ",
+            "writer_key_id": "c3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3M"
+          },
+          "writer_revision": "1"
+        },
+        "signature": "X19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fXw"
+      },
+      "sha256": "a9c984047b450514f6a31eda8490bd392c38623a78ee37487af4379ffd6ebc3b",
+      "value": {
+        "array": [
+          {
+            "text": "kr-backup-writer/1"
+          },
+          {
+            "map": [
+              [
+                "writer",
+                {
+                  "map": [
+                    [
+                      "signing_key",
+                      {
+                        "bytes": "7474747474747474747474747474747474747474747474747474747474747474"
+                      }
+                    ],
+                    [
+                      "writer_key_id",
+                      {
+                        "bytes": "7373737373737373737373737373737373737373737373737373737373737373"
+                      }
+                    ],
+                    [
+                      "enrolled_at_ms",
+                      {
+                        "int": "1767225600000"
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "archive_id",
+                {
+                  "bytes": "38383838383838383838383838383838"
+                }
+              ],
+              [
+                "owner_key_id",
+                {
+                  "bytes": "7575757575757575757575757575757575757575757575757575757575757575"
+                }
+              ],
+              [
+                "enrolled_at_ms",
+                {
+                  "int": "1767225600000"
+                }
+              ],
+              [
+                "writer_revision",
+                {
+                  "int": "1"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82776b722d6261636b75702d7075626c69636174696f6e2f31a36a64657363726970746f72a56776657273696f6e016a617263686976655f69645038383838383838383838383838383838716261636b75705f67656e65726174696f6e0772656e637279707465645f6d616e6966657374a3696f626a6563745f696450393939393939393939393939393939396d656e637279707465645f6c656e1a0001000075656e637279707465645f6f626a6563745f6861736858203a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a726d616e69666573745f6b65795f777261707381a3656e6f6e6365581895959595959595959595959595959595959595959595959567636f6e74657874a866666f726d61746c6b722d6b6579777261702f3167707572706f73656c6d616e69666573745f6b6579696f626a6563745f696450393939393939393939393939393939396a617263686976655f696450383838383838383838383838383838386d73656e6465725f6b65795f69645820737373737373737373737373737373737373737373737373737373737373737370726563697069656e745f6b65795f696458209191919191919191919191919191919191919191919191919191919191919191716261636b75705f67656e65726174696f6e0775656e637279707465645f6f626a6563745f6861736858203a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a6a636970686572746578745830efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef6d7772697465725f6b65795f6964582073737373737373737373737373737373737373737373737373737373737373736f7075626c69736865645f61745f6d731b0000019b76dc7cc0",
+      "description": "One published generation: the public descriptor, signed by the enrolled writer, so a device verifies the writer's own statement rather than the service's word about it.",
+      "domain": "kr-backup-publication/1",
+      "id": "backup_generation_publication",
+      "json": {
+        "payload": {
+          "descriptor": {
+            "archive_id": "38383838-3838-3838-3838-383838383838",
+            "backup_generation": "7",
+            "encrypted_manifest": {
+              "encrypted_len": "65536",
+              "encrypted_object_hash": "Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo",
+              "object_id": "39393939-3939-3939-3939-393939393939"
+            },
+            "manifest_key_wraps": [
+              {
+                "ciphertext": "7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v",
+                "context": {
+                  "archive_id": "38383838-3838-3838-3838-383838383838",
+                  "backup_generation": "7",
+                  "encrypted_object_hash": "Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo",
+                  "format": "kr-keywrap/1",
+                  "object_id": "39393939-3939-3939-3939-393939393939",
+                  "purpose": "manifest_key",
+                  "recipient_key_id": "kZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZE",
+                  "sender_key_id": "c3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3M"
+                },
+                "nonce": "lZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWV"
+              }
+            ],
+            "version": "1"
+          },
+          "published_at_ms": "1767225720000",
+          "writer_key_id": "c3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3M"
+        },
+        "signature": "YGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYA"
+      },
+      "sha256": "edc6e84f4a63bd73e35eb7fa7de5a536bd896a529b7e128183d29101fe9addb3",
+      "value": {
+        "array": [
+          {
+            "text": "kr-backup-publication/1"
+          },
+          {
+            "map": [
+              [
+                "descriptor",
+                {
+                  "map": [
+                    [
+                      "version",
+                      {
+                        "int": "1"
+                      }
+                    ],
+                    [
+                      "archive_id",
+                      {
+                        "bytes": "38383838383838383838383838383838"
+                      }
+                    ],
+                    [
+                      "backup_generation",
+                      {
+                        "int": "7"
+                      }
+                    ],
+                    [
+                      "encrypted_manifest",
+                      {
+                        "map": [
+                          [
+                            "object_id",
+                            {
+                              "bytes": "39393939393939393939393939393939"
+                            }
+                          ],
+                          [
+                            "encrypted_len",
+                            {
+                              "int": "65536"
+                            }
+                          ],
+                          [
+                            "encrypted_object_hash",
+                            {
+                              "bytes": "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a"
+                            }
+                          ]
+                        ]
+                      }
+                    ],
+                    [
+                      "manifest_key_wraps",
+                      {
+                        "array": [
+                          {
+                            "map": [
+                              [
+                                "nonce",
+                                {
+                                  "bytes": "959595959595959595959595959595959595959595959595"
+                                }
+                              ],
+                              [
+                                "context",
+                                {
+                                  "map": [
+                                    [
+                                      "format",
+                                      {
+                                        "text": "kr-keywrap/1"
+                                      }
+                                    ],
+                                    [
+                                      "purpose",
+                                      {
+                                        "text": "manifest_key"
+                                      }
+                                    ],
+                                    [
+                                      "object_id",
+                                      {
+                                        "bytes": "39393939393939393939393939393939"
+                                      }
+                                    ],
+                                    [
+                                      "archive_id",
+                                      {
+                                        "bytes": "38383838383838383838383838383838"
+                                      }
+                                    ],
+                                    [
+                                      "sender_key_id",
+                                      {
+                                        "bytes": "7373737373737373737373737373737373737373737373737373737373737373"
+                                      }
+                                    ],
+                                    [
+                                      "recipient_key_id",
+                                      {
+                                        "bytes": "9191919191919191919191919191919191919191919191919191919191919191"
+                                      }
+                                    ],
+                                    [
+                                      "backup_generation",
+                                      {
+                                        "int": "7"
+                                      }
+                                    ],
+                                    [
+                                      "encrypted_object_hash",
+                                      {
+                                        "bytes": "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a"
+                                      }
+                                    ]
+                                  ]
+                                }
+                              ],
+                              [
+                                "ciphertext",
+                                {
+                                  "bytes": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+                                }
+                              ]
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "writer_key_id",
+                {
+                  "bytes": "7373737373737373737373737373737373737373737373737373737373737373"
+                }
+              ],
+              [
+                "published_at_ms",
+                {
+                  "int": "1767225720000"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "8278186b722d6f7267616e69736174696f6e2d706f6c6963792f31aa666261636b7570a2687265717569726564f5727265636f766572795f726563697069656e74a4646e616d65764b616c6120486f6c64696e6773207265636f766572796b6e616d65645f61745f6d731b0000019b76daa8006d726563697069656e745f6b65795820777777777777777777777777777777777777777777777777777777777777777770726563697069656e745f6b65795f6964582076767676767676767676767676767676767676767676767676767676767676766c6973737565645f61745f6d731b0000019b76daa8006c6b65795f7265766973696f6e026f6f7267616e69736174696f6e5f6964503b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b6f706f6c6963795f7265766973696f6e0471616461707465725f616c6c6f776c69737482756b616c6172656163682e636c617564652d636f64656f6b616c6172656163682e636f6465787265787465726e616c5f70726f766964657273716f7267616e69736174696f6e5f6f6e6c797461756469745f726574656e74696f6e5f6461797319016d766d696e696d756d5f636c69656e745f76657273696f6e65312e342e3078196d6178696d756d5f6772616e745f6c69666574696d655f6d731a240c8400",
+      "description": "One revision of an organisation's host policy, signed by the revision of its policy-signing key that a host follows the chain to. It narrows what a host allows and carries no content key.",
+      "domain": "kr-organisation-policy/1",
+      "id": "organisation_policy",
+      "json": {
+        "payload": {
+          "adapter_allowlist": [
+            "kalareach.claude-code",
+            "kalareach.codex"
+          ],
+          "audit_retention_days": "365",
+          "backup": {
+            "recovery_recipient": {
+              "name": "Kala Holdings recovery",
+              "named_at_ms": "1767225600000",
+              "recipient_key": "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3c",
+              "recipient_key_id": "dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnY"
+            },
+            "required": true
+          },
+          "external_providers": "organisation_only",
+          "issued_at_ms": "1767225600000",
+          "key_revision": "2",
+          "maximum_grant_lifetime_ms": "604800000",
+          "minimum_client_version": "1.4.0",
+          "organisation_id": "3b3b3b3b-3b3b-3b3b-3b3b-3b3b3b3b3b3b",
+          "policy_revision": "4"
+        },
+        "signature": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYQ"
+      },
+      "sha256": "2b5798e09106bb6c7c77e4db942035ca9c195818acc5f808c674abfb5bc7b4d3",
+      "value": {
+        "array": [
+          {
+            "text": "kr-organisation-policy/1"
+          },
+          {
+            "map": [
+              [
+                "backup",
+                {
+                  "map": [
+                    [
+                      "required",
+                      {
+                        "bool": true
+                      }
+                    ],
+                    [
+                      "recovery_recipient",
+                      {
+                        "map": [
+                          [
+                            "name",
+                            {
+                              "text": "Kala Holdings recovery"
+                            }
+                          ],
+                          [
+                            "named_at_ms",
+                            {
+                              "int": "1767225600000"
+                            }
+                          ],
+                          [
+                            "recipient_key",
+                            {
+                              "bytes": "7777777777777777777777777777777777777777777777777777777777777777"
+                            }
+                          ],
+                          [
+                            "recipient_key_id",
+                            {
+                              "bytes": "7676767676767676767676767676767676767676767676767676767676767676"
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "issued_at_ms",
+                {
+                  "int": "1767225600000"
+                }
+              ],
+              [
+                "key_revision",
+                {
+                  "int": "2"
+                }
+              ],
+              [
+                "organisation_id",
+                {
+                  "bytes": "3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b"
+                }
+              ],
+              [
+                "policy_revision",
+                {
+                  "int": "4"
+                }
+              ],
+              [
+                "adapter_allowlist",
+                {
+                  "array": [
+                    {
+                      "text": "kalareach.claude-code"
+                    },
+                    {
+                      "text": "kalareach.codex"
+                    }
+                  ]
+                }
+              ],
+              [
+                "external_providers",
+                {
+                  "text": "organisation_only"
+                }
+              ],
+              [
+                "audit_retention_days",
+                {
+                  "int": "365"
+                }
+              ],
+              [
+                "minimum_client_version",
+                {
+                  "text": "1.4.0"
+                }
+              ],
+              [
+                "maximum_grant_lifetime_ms",
+                {
+                  "int": "604800000"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "description": "The mailbox, the authority feed, settings sync, backup manifests and organisation policy: what a managed service stores, and the exact bytes each signature covers.",
+  "key_identifiers": {
+    "description": "SHA256(CBOR([\"kr-key-id/1\", purpose, key])) for one 32-byte key declared under each purpose. A service derives the identifier from the key a caller presents rather than believing a claimed one, so the same bytes under two purposes name two different keys.",
+    "domain": "kr-key-id/1",
+    "identifiers": [
+      {
+        "key_id": "SsU9FUtRRCwPk6oUxXMlnBKy0CWFe7tQVMfUM3h12Pk",
+        "key_id_hex": "4ac53d154b51442c0f93aa14c573259c12b2d025857bbb5054c7d4337875d8f9",
+        "purpose": "transport"
+      },
+      {
+        "key_id": "0wYEMVr7nBtciXszSX4bl9QpY-jUP2aDbAqGTSVV5ko",
+        "key_id_hex": "d30604315afb9c1b5c897b33497e1b97d42963e8d43f66836c0a864d2555e64a",
+        "purpose": "authorisation"
+      },
+      {
+        "key_id": "Y4hzPikEYInnn5Oyv3UBz5JSuknbjj2953gUm3tI-yU",
+        "key_id_hex": "6388733e29046089e79f93b2bf7501cf9252ba49db8e3dbde778149b7b48fb25",
+        "purpose": "stored_envelope"
+      },
+      {
+        "key_id": "0mx8TWEydv7-2hVHdiDrXNlRE7DZ7ygELlZ2ZXDJw9c",
+        "key_id_hex": "d26c7c4d613276fefeda15477620eb5cd95113b0d9ef28042e56766570c9c3d7",
+        "purpose": "notification_preview"
+      }
+    ],
+    "public_key": "REREREREREREREREREREREREREREREREREREREREREQ"
+  },
+  "mailbox_limits": {
+    "bytes_per_device": "33554432",
+    "coalesced_payload_types": [
+      "authority_feed_change",
+      "notification_preview",
+      "sync_change"
+    ],
+    "item_lifetime_ms": "86400000",
+    "items_per_device": "1000",
+    "payload_types": [
+      "authority_feed_change",
+      "signed_authority_object",
+      "notification_preview",
+      "sync_change"
+    ],
+    "seal_overhead_bytes": "16"
+  },
+  "name": "services",
+  "note": "Values use the same description grammar as fixtures/cbor. cbor_hex is the canonical KR-CBOR-1 encoding of CBOR([domain, payload]), the bytes a signature or a digest covers; sha256 is its digest. json is the managed HTTP representation of the whole record, signature included. The signatures and secrets in json are fixed test bytes, not verifiable material: signature vectors need a signing implementation and live with the cryptography fixtures.",
+  "sync_limits": {
+    "conflict_copies_per_object": "8",
+    "object_kinds": [
+      "settings",
+      "draft",
+      "client_selection"
+    ],
+    "object_plaintext_bytes": "65536",
+    "objects_per_collection": "256"
+  }
+}

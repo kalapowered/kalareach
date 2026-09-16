@@ -24,6 +24,7 @@ import {
 } from './cbor/value.js'
 import { base64UrlToBytes, jsonToU64, jsonToUuid } from './json.js'
 import { DIGEST_BYTES, NONCE_BYTES, fixedBytes, gatewayOrigin } from './service.js'
+import { MAILBOX_PAYLOAD_TYPES, SEAL_OVERHEAD_BYTES } from './services.js'
 import type {
   PushDeliveryAck,
   PushDeliveryRequest,
@@ -104,9 +105,6 @@ export const FREE_PUSH_PER_HOUR = 60
 
 /** How often suppressed notifications collapse into one attention update, in milliseconds. */
 export const PUSH_COLLAPSE_WINDOW_MS = 5 * 60 * 1000
-
-/** Bytes `crypto_box_easy` adds to the plaintext it seals. */
-export const SEAL_OVERHEAD_BYTES = 16
 
 /** The granularity a notification's plaintext is padded to, in bytes. */
 export const NOTIFICATION_GRANULARITY_BYTES = 1024
@@ -487,9 +485,11 @@ function hintsValue (value: unknown): CanonicalValue {
 const ENVELOPE_ROUTING_FIELDS = [
   'envelope_id',
   'expires_at_ms',
+  'payload_type',
   'recipient_key_id',
   'sender_key_id',
-  'size_bucket_bytes'
+  'size_bucket_bytes',
+  'thread_id'
 ] as const
 
 const SEALED_ENVELOPE_FIELDS = ['ciphertext', 'nonce', 'routing'] as const
@@ -525,6 +525,12 @@ function sealedEnvelopeValue (value: unknown): CanonicalValue {
         ['envelope_id', uuid('an envelope identifier', routing['envelope_id'])],
         ['expires_at_ms', counter('an envelope expiry', routing['expires_at_ms'])],
         [
+          'payload_type',
+          krText(
+            member('a mailbox payload kind', routing['payload_type'], MAILBOX_PAYLOAD_TYPES)
+          )
+        ],
+        [
           'recipient_key_id',
           krBytes(fixedBytes('a recipient key identifier', routing['recipient_key_id'], KEY_ID_BYTES))
         ],
@@ -532,7 +538,13 @@ function sealedEnvelopeValue (value: unknown): CanonicalValue {
           'sender_key_id',
           krBytes(fixedBytes('a sender key identifier', routing['sender_key_id'], KEY_ID_BYTES))
         ],
-        ['size_bucket_bytes', counter('a declared size bucket', routing['size_bucket_bytes'])]
+        ['size_bucket_bytes', counter('a declared size bucket', routing['size_bucket_bytes'])],
+        [
+          'thread_id',
+          routing['thread_id'] === null
+            ? krNull()
+            : uuid('a coalescing thread identifier', routing['thread_id'])
+        ]
       ])
     ]
   ])

@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 127,
+  "method_count": 129,
   "methods": [
     {
       "capability": "none",
@@ -3679,6 +3679,64 @@
         "mailbox"
       ],
       "summary": "Read encrypted mailbox envelopes. The service never sees their plaintext.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "envelope id"
+        }
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "mailbox.deliver",
+      "name": "mailbox.deliver",
+      "required_rights": [
+        {
+          "authority": "service_credential",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "mailbox"
+      ],
+      "summary": "Place one sealed envelope in a recipient's mailbox. The service stores the routing record and the ciphertext and never a plaintext field.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "acknowledged sequence"
+        }
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "mailbox.acknowledge",
+      "name": "mailbox.acknowledge",
+      "required_rights": [
+        {
+          "authority": "service_credential",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "mailbox"
+      ],
+      "summary": "Acknowledge mailbox items the recipient has stored durably, so the service may remove them. The replay identifiers outlive the items.",
       "version": 1
     },
     {

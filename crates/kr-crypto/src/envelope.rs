@@ -77,6 +77,8 @@ pub fn seal_envelope(
             recipient_key_id: plaintext.recipient_key_id,
             sender_key_id: plaintext.sender_key_id,
             expires_at_ms: plaintext.expires_at_ms,
+            payload_type: plaintext.payload_type,
+            thread_id: plaintext.thread_id,
             size_bucket_bytes: U64::new(bucket),
         },
         nonce,
@@ -313,6 +315,7 @@ mod tests {
             environment_id: Nullable::null(),
             session_id: Nullable::null(),
             session_epoch: Nullable::null(),
+            thread_id: Nullable::null(),
             payload: Bytes::new(b"body".to_vec()),
         }
     }

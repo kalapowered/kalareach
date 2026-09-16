@@ -214,10 +214,27 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             "{name} is missing from the registry"
         );
     }
+
+    // Section 23's table is the minimum public surface, and the two below are the whole of what
+    // this build adds to it. The mailbox is written and acknowledged as well as read, and section
+    // 23 requires each effect to carry its own exhaustive authority entry with its own effect
+    // class, so a write does not travel under the read entry. Every other method is the
+    // specification's own; a third addition changes this list and is noticed here.
+    let added = ["mailbox.deliver", "mailbox.acknowledge"];
+    for name in added {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, EffectClass::Write, "{name} is a write");
+        assert_eq!(
+            entry.group,
+            MethodGroup::Services,
+            "{name} is a service method"
+        );
+    }
+
     assert_eq!(
         REGISTRY.len(),
-        required.len(),
-        "the registry holds exactly the required methods"
+        required.len() + added.len(),
+        "the registry holds the required methods and the two named additions"
     );
 }
 

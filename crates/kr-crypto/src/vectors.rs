@@ -582,6 +582,7 @@ fn envelope_plaintext(
         environment_id: Nullable::some(EnvironmentId::new(Uuid::from_bytes([0x23; 16]))),
         session_id: Nullable::some(SessionId::new(Uuid::from_bytes([0x24; 16]))),
         session_epoch: Nullable::some(SessionEpoch::V1),
+        thread_id: Nullable::null(),
         payload: Bytes::new(b"kr-authority-feed-change".to_vec()),
     })
 }
@@ -612,6 +613,8 @@ fn envelopes() -> Result<Value> {
             recipient_key_id: plaintext.recipient_key_id,
             sender_key_id: plaintext.sender_key_id,
             expires_at_ms: plaintext.expires_at_ms,
+            payload_type: plaintext.payload_type,
+            thread_id: plaintext.thread_id,
             size_bucket_bytes: U64::new(bucket),
         },
         nonce: Nonce192::from_bytes(ENVELOPE_NONCE),

@@ -193,6 +193,10 @@ export type ActionId = string
  */
 export type EnvironmentId = string
 /**
+ * The group repeated state notifications coalesce in. The sender derives it; the service only compares it.
+ */
+export type MailboxThreadId = string
+/**
  * One transport connection, allocated by the host during hello.
  */
 export type ConnectionId = string
@@ -549,6 +553,10 @@ export type ResourceSelectorKind =
   | 'mailbox'
   | 'agent_target'
 /**
+ * The least client version a policy accepts: alphanumeric with dots, hyphens and plus signs.
+ */
+export type ClientVersion = string
+/**
  * What `pair.status` reports.
  *
  * It never reveals secret material, and the host returns it only to the candidate's authenticated
@@ -781,6 +789,10 @@ export type RootEditorFenceResult =
  * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
  */
 export type NetworkHint = string
+/**
+ * One revision of one synchronised object. A fresh 128-bit value per accepted write.
+ */
+export type SyncRevisionId = string
 
 /**
  * Generated from the Rust wire types in crates/kr-protocol. Rust is canonical: edit the Rust types and regenerate. Every property below names one root message; $defs holds the referenced types.
@@ -800,6 +812,8 @@ export interface KalaReachProtocol {
   authority_revision_ack?: AuthorityRevisionAck
   authority_revision_notice?: AuthorityRevisionNotice
   authority_revision_record?: AuthorityRevisionRecord
+  backup_generation_publication?: BackupGenerationPublication
+  backup_writer_record?: BackupWriterRecord
   client_offer?: ClientOffer
   closure_record?: ClosureRecord
   connect_reply?: ConnectReply
@@ -927,6 +941,7 @@ export interface KalaReachProtocol {
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
   notification?: Notification
+  organisation_policy?: OrganisationPolicy
   output_event?: OutputEvent
   owner_confirmation_proof?: OwnerConfirmationProof
   owner_confirmation_request?: OwnerConfirmationRequest1
@@ -996,6 +1011,8 @@ export interface KalaReachProtocol {
   signed_relay_consumption_receipt?: SignedRelayConsumptionReceipt
   signed_relay_instance_registration?: SignedRelayInstanceRegistration
   stream_header?: StreamHeader
+  sync_conflict_copy?: SyncConflictCopy
+  sync_object_record?: SyncObjectRecord
   terminal_geometry_transfer_params?: TerminalGeometryTransferParams
   terminal_resize_params?: TerminalResizeParams
   worker_descriptor?: WorkerDescriptor
@@ -1591,6 +1608,101 @@ export interface AuthorityRevisionRecord {
    * The Ed25519 signature over `CBOR(["kr-authority/1", record without this field])`.
    */
   signature: string
+}
+/**
+ * One published generation and the writer's signature over it.
+ */
+export interface BackupGenerationPublication {
+  payload: BackupGenerationPublicationPayload
+  /**
+   * The writer's signature over [`BackupGenerationPublicationPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the writer published.
+ */
+export interface BackupGenerationPublicationPayload {
+  descriptor: ArchiveDescriptor1
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  published_at_ms: string
+  /**
+   * The writer's signing key identifier.
+   */
+  writer_key_id: string
+}
+/**
+ * The public descriptor of this generation.
+ */
+export interface ArchiveDescriptor1 {
+  /**
+   * The archive.
+   */
+  archive_id: string
+  /**
+   * The generation this descriptor points at.
+   */
+  backup_generation: string
+  encrypted_manifest: EncryptedObjectRef
+  /**
+   * The manifest key, wrapped once per authorised recipient.
+   */
+  manifest_key_wraps: SealedKeyWrap[]
+  /**
+   * The descriptor version.
+   */
+  version: string
+}
+/**
+ * One collection's writer enrolment, signed by the collection owner's authorisation key.
+ */
+export interface BackupWriterRecord {
+  payload: BackupWriterRecordPayload
+  /**
+   * The owner's signature over [`BackupWriterRecordPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the owner states.
+ */
+export interface BackupWriterRecordPayload {
+  /**
+   * The archive whose generations this writer may publish.
+   */
+  archive_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  enrolled_at_ms: string
+  /**
+   * The owner's authorisation key identifier.
+   */
+  owner_key_id: string
+  writer: TrustedWriter
+  /**
+   * The revision of this collection's enrolment. Only the owner advances it.
+   */
+  writer_revision: string
+}
+/**
+ * The writer the owner enrols.
+ */
+export interface TrustedWriter {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  enrolled_at_ms: string
+  /**
+   * The writer's Ed25519 signing public key.
+   */
+  signing_key: string
+  /**
+   * The writer's signing key identifier.
+   */
+  writer_key_id: string
 }
 /**
  * The client's complete `hello` offer.
@@ -2778,6 +2890,13 @@ export interface EnvelopePlaintext {
    */
   session_id: SessionId | null
   /**
+   * The thread repeated state notifications coalesce in, when the sender asks for coalescing.
+   *
+   * It is authenticated here as well as declared in the routing record, so a recipient can see
+   * that the value the service coalesced by is the value the sender chose.
+   */
+  thread_id: MailboxThreadId | null
+  /**
    * The envelope format version.
    */
   version: 'kr-mailbox/1'
@@ -3915,6 +4034,8 @@ export interface MethodEntry {
     | 'push.sender.renew'
     | 'push.sender.revoke'
     | 'mailbox.read'
+    | 'mailbox.deliver'
+    | 'mailbox.acknowledge'
     | 'authority.sync'
     | 'sync.compare_exchange'
     | 'backup.manifest'
@@ -4008,6 +4129,102 @@ export interface RequiredRight {
     | 'other_actor'
     | 'candidate_endpoint'
     | 'issuing_owner'
+}
+/**
+ * One organisation's host policy, signed by its policy-signing key.
+ *
+ * A host that pinned the organisation's policy-signing authority follows the chain to the revision
+ * signing now and checks this signature against it, so what a host applies is the organisation's
+ * own statement rather than the service's word about it.
+ */
+export interface OrganisationPolicy {
+  payload: OrganisationPolicyPayload
+  /**
+   * The policy-signing key's signature over [`OrganisationPolicyPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the organisation states.
+ */
+export interface OrganisationPolicyPayload {
+  /**
+   * The adapters members may run, or null for every adapter the host qualifies.
+   */
+  adapter_allowlist: PluginId[] | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  audit_retention_days: string
+  backup: BackupPolicy
+  /**
+   * What members' clients may reach outside KalaReach.
+   */
+  external_providers: 'forbidden' | 'organisation_only' | 'any'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * The policy-key revision that signed it.
+   */
+  key_revision: string
+  /**
+   * The longest a grant issued under this organisation may last, or null for the host's own
+   * rule.
+   */
+  maximum_grant_lifetime_ms: DurationMs | null
+  /**
+   * The least client version the organisation accepts, or null for any.
+   */
+  minimum_client_version: ClientVersion | null
+  /**
+   * The organisation the policy belongs to.
+   */
+  organisation_id: string
+  /**
+   * The revision this record establishes. A host refuses one below the revision it holds.
+   */
+  policy_revision: string
+}
+/**
+ * What the organisation requires of backups.
+ */
+export interface BackupPolicy {
+  /**
+   * The recipient every archive is also wrapped for, when the organisation names one.
+   */
+  recovery_recipient: OrganisationRecoveryRecipient | null
+  /**
+   * Whether a member's host must keep managed backups.
+   */
+  required: boolean
+}
+/**
+ * The recipient an organisation's archives are also wrapped for.
+ *
+ * Organisation recovery is optional and never implicit. A policy that carries this names the
+ * public key the recipient is, and a host records its own visible enrolment before any archive is
+ * wrapped for it: administering billing or membership gives nobody a content key, and an
+ * organisation with no named recipient and no enrolment cannot decrypt a personal archive at all.
+ */
+export interface OrganisationRecoveryRecipient {
+  /**
+   * A display name for the recipient, so an enrolment can be shown for what it is.
+   */
+  name: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  named_at_ms: string
+  /**
+   * The recipient's X25519 public key. Only its public half ever exists in the service.
+   */
+  recipient_key: string
+  /**
+   * The recipient's stored-envelope key identifier.
+   */
+  recipient_key_id: string
 }
 /**
  * One batch of output bytes on the output stream.
@@ -4564,6 +4781,16 @@ export interface EnvelopeRouting {
    */
   expires_at_ms: string
   /**
+   * What the payload is.
+   *
+   * The service is told the kind so that it can refuse a kind the mailbox does not carry, which
+   * is section 9's rule that it queues no keystroke, command, decision or closure. It learns the
+   * kind and nothing about the payload; the recipient checks the declaration against the kind
+   * the box authenticated and drops the item when the two differ.
+   */
+  payload_type:
+    'authority_feed_change' | 'signed_authority_object' | 'notification_preview' | 'sync_change'
+  /**
    * The recipient the service delivers to.
    */
   recipient_key_id: string
@@ -4575,6 +4802,13 @@ export interface EnvelopeRouting {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   size_bucket_bytes: string
+  /**
+   * The thread the item coalesces in, when the sender asks for coalescing.
+   *
+   * Null means the item stands on its own and nothing replaces it. A value is opaque: the
+   * service compares it and never derives anything from it.
+   */
+  thread_id: MailboxThreadId | null
 }
 /**
  * The canonical active binding of one provider token to one installation.
@@ -4919,7 +5153,7 @@ export interface PushRatePolicy {
    */
   burst: string
   /**
-   * How often excess collapses into one attention update.
+   * A duration in milliseconds, as a decimal string in JSON.
    */
   collapse_window_ms: string
   /**
@@ -5027,7 +5261,7 @@ export interface RecoveryBundle {
   /**
    * The writers a restore may trust.
    */
-  trusted_writers: TrustedWriter[]
+  trusted_writers: TrustedWriter1[]
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -5077,7 +5311,7 @@ export interface CollectionLocator {
 /**
  * A backup writer a restore is allowed to trust.
  */
-export interface TrustedWriter {
+export interface TrustedWriter1 {
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -5807,7 +6041,7 @@ export interface RootEditorFenceParams {
    */
   cause: 'editor_entry' | 'lease_change' | 'retry'
   /**
-   * How long the worker will hold input for this exchange.
+   * A duration in milliseconds, as a decimal string in JSON.
    */
   deadline_ms: string
   /**
@@ -6197,6 +6431,8 @@ export interface ServiceRequestPayload {
     | 'push.sender.renew'
     | 'push.sender.revoke'
     | 'mailbox.read'
+    | 'mailbox.deliver'
+    | 'mailbox.acknowledge'
     | 'authority.sync'
     | 'sync.compare_exchange'
     | 'backup.manifest'
@@ -7125,6 +7361,101 @@ export interface StreamResource {
    * The transfer, for attachment chunk streams.
    */
   transfer_id: TransferId | null
+}
+/**
+ * A write that lost its comparison, kept for the person to choose from.
+ *
+ * Section 20 keeps conflicting copies for user selection instead of silently choosing by
+ * wall-clock time, so the rejected content is retained exactly as it arrived and the revision it
+ * expected is retained beside it. Nothing here says which copy is right: the person does.
+ */
+export interface SyncConflictCopy {
+  /**
+   * The copy.
+   */
+  conflict_id: string
+  /**
+   * The revision the object actually held when the write was refused.
+   */
+  current_revision: string
+  /**
+   * The revision the writer expected to replace, or null when it expected the object not to
+   * exist.
+   */
+  expected_revision: SyncRevisionId | null
+  /**
+   * What kind of object it is.
+   */
+  kind: 'settings' | 'draft' | 'client_selection'
+  object: SealedSyncObject
+  /**
+   * The object the rejected write was about.
+   */
+  object_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at_ms: string
+}
+/**
+ * The rejected content, unchanged.
+ */
+export interface SealedSyncObject {
+  /**
+   * The sealed object.
+   */
+  ciphertext: string
+  /**
+   * The fresh 24-byte nonce, from libsodium's random generator.
+   */
+  nonce: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  size_bucket_bytes: string
+}
+/**
+ * One synchronised object as the service holds it now.
+ */
+export interface SyncObjectRecord {
+  /**
+   * The collection it belongs to.
+   */
+  collection_id: string
+  /**
+   * What kind of object it is.
+   */
+  kind: 'settings' | 'draft' | 'client_selection'
+  object: SealedSyncObject1
+  /**
+   * The object.
+   */
+  object_id: string
+  /**
+   * One revision of one synchronised object. A fresh 128-bit value per accepted write.
+   */
+  revision: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  updated_at_ms: string
+}
+/**
+ * The sealed object.
+ */
+export interface SealedSyncObject1 {
+  /**
+   * The sealed object.
+   */
+  ciphertext: string
+  /**
+   * The fresh 24-byte nonce, from libsodium's random generator.
+   */
+  nonce: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  size_bucket_bytes: string
 }
 /**
  * Parameters of `terminal.geometry.transfer`.

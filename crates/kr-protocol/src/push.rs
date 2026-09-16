@@ -1628,6 +1628,8 @@ mod tests {
                 recipient_key_id: KeyId::from_bytes([0x91; 32]),
                 sender_key_id: KeyId::from_bytes([0x92; 32]),
                 expires_at_ms: TimestampMs::new(expires_at_ms),
+                payload_type: crate::mailbox::MailboxPayloadType::NotificationPreview,
+                thread_id: Nullable::null(),
                 size_bucket_bytes: U64::new(bucket),
             },
             nonce: Nonce192::from_bytes([0x93; 24]),

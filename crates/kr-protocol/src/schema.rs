@@ -11,9 +11,12 @@
 use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings, json_schema};
 use serde_json::{Map, Value, json};
 
-use crate::account::{MembershipLease, PolicyAuthority};
+use crate::account::{MembershipLease, OrganisationPolicy, PolicyAuthority};
 use crate::actor::ActorEnvelope;
-use crate::archive::{ArchiveDescriptor, RecoveryBundle, RecoveryKit, SignedArchiveManifest};
+use crate::archive::{
+    ArchiveDescriptor, BackupGenerationPublication, BackupWriterRecord, RecoveryBundle,
+    RecoveryKit, SignedArchiveManifest,
+};
 use crate::attachment::{
     AttachmentConfigureParams, AttachmentSummary, AttachmentViewportParams,
     AttachmentViewportResult, GeometryResult, GeometryState, SessionAttachParams,
@@ -71,6 +74,7 @@ use crate::session::{
     SessionCreateResult, SessionListParams, SessionListResult, SessionReadParams,
     SessionReadResult, SessionSummary,
 };
+use crate::sync::{SyncConflictCopy, SyncObjectRecord};
 use crate::worker::{
     AuthorityRevisionAck, AuthorityRevisionNotice, ControllerGenerationToken, GenerationAccepted,
     GenerationChallenge, WorkerDescriptor, WorkerLaunchSpec, WorkerReady, WorkerRendezvous,
@@ -111,6 +115,8 @@ pub fn protocol_schema() -> Value {
         "action_window" => ActionWindow,
         "actor_envelope" => ActorEnvelope,
         "archive_descriptor" => ArchiveDescriptor,
+        "backup_generation_publication" => BackupGenerationPublication,
+        "backup_writer_record" => BackupWriterRecord,
         "attachment_configure_params" => AttachmentConfigureParams,
         "attachment_summary" => AttachmentSummary,
         "attachment_viewport_params" => AttachmentViewportParams,
@@ -158,6 +164,7 @@ pub fn protocol_schema() -> Value {
         "method_entry" => MethodEntry,
         "mutation_request" => MutationRequest,
         "notification" => Notification,
+        "organisation_policy" => OrganisationPolicy,
         "output_event" => OutputEvent,
         "policy_authority" => PolicyAuthority,
         "owner_confirmation_proof" => OwnerConfirmationProof,
@@ -227,6 +234,8 @@ pub fn protocol_schema() -> Value {
         "signed_relay_consumption_receipt" => SignedRelayConsumptionReceipt,
         "signed_relay_instance_registration" => SignedRelayInstanceRegistration,
         "stream_header" => StreamHeader,
+        "sync_conflict_copy" => SyncConflictCopy,
+        "sync_object_record" => SyncObjectRecord,
         "terminal_geometry_transfer_params" => TerminalGeometryTransferParams,
         "terminal_resize_params" => TerminalResizeParams,
         "worker_descriptor" => WorkerDescriptor,

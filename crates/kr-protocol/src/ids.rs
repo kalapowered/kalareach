@@ -430,6 +430,38 @@ uuid_id!(
     PushSenderRecordId,
     "One installation's authorisation of one paired host to send it notifications."
 );
+uuid_id!(
+    /// The group repeated state notifications coalesce in inside one mailbox.
+    ///
+    /// The sender derives it from its own secret and whatever the notifications are about, so the
+    /// newest of a run replaces the older unread one without the service learning what the run is
+    /// about. Section 9 coalesces by this value and keeps the authoritative events on the host.
+    MailboxThreadId,
+    "The group repeated state notifications coalesce in. The sender derives it; the service only compares it."
+);
+uuid_id!(
+    /// One synchronised collection of encrypted settings, drafts and client positions.
+    SyncCollectionId,
+    "One synchronised collection of encrypted settings, drafts and client positions."
+);
+uuid_id!(
+    /// One synchronised object inside a collection.
+    SyncObjectId,
+    "One synchronised object inside a collection."
+);
+uuid_id!(
+    /// One revision of one synchronised object, issued by the service on every accepted write.
+    ///
+    /// It is a fresh 128-bit value rather than a counter, so a revision an object once had cannot
+    /// be reached again by removing that object and writing a new one in its place.
+    SyncRevisionId,
+    "One revision of one synchronised object. A fresh 128-bit value per accepted write."
+);
+uuid_id!(
+    /// One retained conflict copy of a rejected synchronised write.
+    SyncConflictId,
+    "One retained conflict copy of a rejected synchronised write."
+);
 
 counter_id!(
     /// The session epoch. Fixed at 1 in version 1 of the protocol.
@@ -512,6 +544,16 @@ counter_id!(
     /// The backup generation an archive belongs to. Only its producer advances it.
     BackupGeneration,
     "The backup generation an archive belongs to. Only its producer advances it."
+);
+counter_id!(
+    /// The revision of one collection's enrolled backup writer. Only its owner advances it.
+    BackupWriterRevision,
+    "The revision of one collection's enrolled backup writer. Only the collection's owner advances it."
+);
+counter_id!(
+    /// The revision of one organisation's signed policy. Only its administrators advance it.
+    OrganisationPolicyRevision,
+    "The revision of one organisation's signed policy, advanced on every policy change."
 );
 counter_id!(
     /// The sequence number of one message inside a pairing bundle exchange.

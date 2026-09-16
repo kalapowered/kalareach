@@ -47,9 +47,14 @@ use kr_cbor::{CborError, signing_value};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AccountId, OrganisationId, PolicyKeyRevision};
+use crate::ids::{
+    AccountId, OrganisationId, OrganisationPolicyRevision, PluginId, PolicyKeyRevision,
+};
 use crate::rights::ActionRight;
-use crate::scalars::{AuthorisationKey, CanonicalSet, Nullable, Signature64, TimestampMs};
+use crate::scalars::{
+    AuthorisationKey, CanonicalSet, DurationMs, KeyId, Nullable, Signature64, StoredEnvelopeKey,
+    TimestampMs, U64,
+};
 
 /// The domain a membership lease signature covers.
 pub const MEMBERSHIP_LEASE_DOMAIN: &str = "kr-membership-lease/1";
@@ -59,6 +64,9 @@ pub const POLICY_AUTHORITY_DOMAIN: &str = "kr-policy-authority/1";
 
 /// The domain the statement of the current revision covers.
 pub const POLICY_AUTHORITY_HEAD_DOMAIN: &str = "kr-policy-authority-head/1";
+
+/// The domain one organisation's signed policy covers.
+pub const ORGANISATION_POLICY_DOMAIN: &str = "kr-organisation-policy/1";
 
 /// The longest a membership lease may last, in milliseconds (section 17).
 pub const MEMBERSHIP_LEASE_MAX_LIFETIME_MS: u64 = 15 * 60 * 1000;
@@ -211,6 +219,335 @@ pub struct MembershipLease {
     /// What the organisation states.
     pub payload: MembershipLeasePayload,
     /// The policy-signing key's signature over [`MembershipLeasePayload::signing_input`].
+    pub signature: Signature64,
+}
+
+// --- Host policy ------------------------------------------------------------
+
+/// The longest a client version string may be, in bytes.
+pub const MAX_CLIENT_VERSION_LEN: usize = 64;
+
+/// The most adapters an allowlist may name.
+pub const MAX_ADAPTER_ALLOWLIST: usize = 64;
+
+/// The shortest audit retention an organisation may set, in days.
+pub const MIN_AUDIT_RETENTION_DAYS: u64 = 30;
+
+/// The longest audit retention an organisation may set, in days.
+pub const MAX_AUDIT_RETENTION_DAYS: u64 = 3_650;
+
+/// The longest grant lifetime an organisation policy may permit, in milliseconds.
+///
+/// A policy shortens what a host would otherwise allow; it never lengthens it. The bound is here so
+/// a policy cannot state a lifetime no host would honour and leave a person believing it applies.
+pub const MAX_POLICY_GRANT_LIFETIME_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+/// A client version, as a policy names the least it accepts.
+///
+/// Text rather than a triple, because what counts as a version is the release's own name and a
+/// policy compares it with what a client reports. It is bounded and restricted to the characters a
+/// release name uses, so it cannot carry a control character, a line break or an unbounded string
+/// through a signed record.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ClientVersion(String);
+
+/// Text that is not a client version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientVersionError(&'static str);
+
+impl core::fmt::Display for ClientVersionError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ClientVersionError {}
+
+impl ClientVersion {
+    /// Validates and wraps a version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientVersionError`] naming the rule the text breaks.
+    pub fn new(value: impl Into<String>) -> Result<Self, ClientVersionError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ClientVersionError("a client version must not be empty"));
+        }
+        if value.len() > MAX_CLIENT_VERSION_LEN {
+            return Err(ClientVersionError("a client version is at most 64 bytes"));
+        }
+        if !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+')
+        }) {
+            return Err(ClientVersionError(
+                "a client version is alphanumeric with dots, hyphens and plus signs",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the version text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for ClientVersion {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl core::str::FromStr for ClientVersion {
+    type Err = ClientVersionError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::new(text)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::new(text).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for ClientVersion {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ClientVersion".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        "kalareach::ClientVersion".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_CLIENT_VERSION_LEN,
+            "description": "The least client version a policy accepts: alphanumeric with dots, hyphens and plus signs."
+        })
+    }
+}
+
+/// What an organisation permits its members' clients to reach outside KalaReach.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExternalProviderPolicy {
+    /// No external provider. Managed and self-hosted paths only.
+    Forbidden,
+    /// Only the providers the organisation itself configures.
+    OrganisationOnly,
+    /// Any provider a member configures, including their own credential.
+    Any,
+}
+
+impl ExternalProviderPolicy {
+    /// Every value, from the most restrictive to the least.
+    pub const ALL: [Self; 3] = [Self::Forbidden, Self::OrganisationOnly, Self::Any];
+
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forbidden => "forbidden",
+            Self::OrganisationOnly => "organisation_only",
+            Self::Any => "any",
+        }
+    }
+}
+
+/// The recipient an organisation's archives are also wrapped for.
+///
+/// Organisation recovery is optional and never implicit. A policy that carries this names the
+/// public key the recipient is, and a host records its own visible enrolment before any archive is
+/// wrapped for it: administering billing or membership gives nobody a content key, and an
+/// organisation with no named recipient and no enrolment cannot decrypt a personal archive at all.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrganisationRecoveryRecipient {
+    /// The recipient's stored-envelope key identifier.
+    pub recipient_key_id: KeyId,
+    /// The recipient's X25519 public key. Only its public half ever exists in the service.
+    pub recipient_key: StoredEnvelopeKey,
+    /// A display name for the recipient, so an enrolment can be shown for what it is.
+    pub name: String,
+    /// When the organisation named it, in UTC milliseconds.
+    pub named_at_ms: TimestampMs,
+}
+
+/// What an organisation requires of its members' backups.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BackupPolicy {
+    /// Whether a member's host must keep managed backups.
+    pub required: bool,
+    /// The recipient every archive is also wrapped for, when the organisation names one.
+    pub recovery_recipient: Nullable<OrganisationRecoveryRecipient>,
+}
+
+/// One revision of an organisation's host policy, and exactly what its signature covers.
+///
+/// Administrators set what section 17 lets them set: which adapters may run, the least client
+/// version they accept, how long a grant may last, what reaches an external provider, what they
+/// require of backups, and how long the audit is kept. None of it is a content key, and none of it
+/// widens what a host allows: a host intersects a policy with its own rules, so a policy can only
+/// narrow them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrganisationPolicyPayload {
+    /// The organisation the policy belongs to.
+    pub organisation_id: OrganisationId,
+    /// The revision this record establishes. A host refuses one below the revision it holds.
+    pub policy_revision: OrganisationPolicyRevision,
+    /// The adapters members may run, or null for every adapter the host qualifies.
+    pub adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
+    /// The least client version the organisation accepts, or null for any.
+    pub minimum_client_version: Nullable<ClientVersion>,
+    /// The longest a grant issued under this organisation may last, or null for the host's own
+    /// rule.
+    pub maximum_grant_lifetime_ms: Nullable<DurationMs>,
+    /// What members' clients may reach outside KalaReach.
+    pub external_providers: ExternalProviderPolicy,
+    /// What the organisation requires of backups.
+    pub backup: BackupPolicy,
+    /// How long the organisation keeps its audit events, in days.
+    pub audit_retention_days: U64,
+    /// When the authority signed it, in UTC milliseconds.
+    pub issued_at_ms: TimestampMs,
+    /// The policy-key revision that signed it.
+    pub key_revision: PolicyKeyRevision,
+}
+
+/// Why a policy is not one this contract admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PolicyError {
+    /// The retention is outside the range an organisation may set.
+    #[error("audit retention is between {minimum} and {maximum} days; this policy says {days}")]
+    AuditRetention {
+        /// The retention the policy stated.
+        days: u64,
+        /// The shortest permitted.
+        minimum: u64,
+        /// The longest permitted.
+        maximum: u64,
+    },
+    /// The grant lifetime is zero or longer than a policy may state.
+    #[error("a policy grant lifetime is between 1 and {limit} ms; this policy says {lifetime}")]
+    GrantLifetime {
+        /// The lifetime the policy stated.
+        lifetime: u64,
+        /// The longest permitted.
+        limit: u64,
+    },
+    /// The allowlist is present and names nothing, which admits no adapter at all.
+    #[error("an adapter allowlist names at least one adapter; null permits every adapter")]
+    EmptyAllowlist,
+    /// The allowlist names more adapters than one may.
+    #[error("an adapter allowlist names at most {limit} adapters; this policy names {count}")]
+    AllowlistTooLong {
+        /// How many the policy named.
+        count: usize,
+        /// The limit.
+        limit: usize,
+    },
+    /// Backups are required and no recipient is named for the organisation's own recovery.
+    #[error("organisation recovery needs a named encryption recipient")]
+    RecoveryRecipientMissing,
+}
+
+impl OrganisationPolicyPayload {
+    /// Builds the canonical bytes a policy signature covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the payload cannot be represented in KR-CBOR-1.
+    pub fn signing_input(&self) -> Result<Vec<u8>, CborError> {
+        Ok(kr_cbor::encode(&signing_value(
+            ORGANISATION_POLICY_DOMAIN,
+            vec![kr_cbor::to_canonical_value(self)?],
+        )))
+    }
+
+    /// Every check a policy passes before it is signed or accepted.
+    ///
+    /// These need neither a signature nor the clock, so both the service that signs a policy and
+    /// the host that accepts one make them, and a policy that fails one is refused rather than
+    /// narrowed to the part that reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the policy breaks.
+    pub fn check_structure(&self) -> Result<(), PolicyError> {
+        let days = self.audit_retention_days.get();
+        if !(MIN_AUDIT_RETENTION_DAYS..=MAX_AUDIT_RETENTION_DAYS).contains(&days) {
+            return Err(PolicyError::AuditRetention {
+                days,
+                minimum: MIN_AUDIT_RETENTION_DAYS,
+                maximum: MAX_AUDIT_RETENTION_DAYS,
+            });
+        }
+
+        if let Some(lifetime) = self.maximum_grant_lifetime_ms.as_ref() {
+            let value = lifetime.get();
+            if value == 0 || value > MAX_POLICY_GRANT_LIFETIME_MS {
+                return Err(PolicyError::GrantLifetime {
+                    lifetime: value,
+                    limit: MAX_POLICY_GRANT_LIFETIME_MS,
+                });
+            }
+        }
+
+        if let Some(adapters) = self.adapter_allowlist.as_ref() {
+            if adapters.is_empty() {
+                return Err(PolicyError::EmptyAllowlist);
+            }
+            if adapters.len() > MAX_ADAPTER_ALLOWLIST {
+                return Err(PolicyError::AllowlistTooLong {
+                    count: adapters.len(),
+                    limit: MAX_ADAPTER_ALLOWLIST,
+                });
+            }
+        }
+
+        // A required backup with nowhere for the organisation to recover from is a requirement
+        // nobody can meet, and naming the recipient is what makes organisation recovery visible
+        // rather than assumed.
+        if self.backup.required && !self.backup.recovery_recipient.is_present() {
+            return Err(PolicyError::RecoveryRecipientMissing);
+        }
+
+        Ok(())
+    }
+
+    /// Returns true when this revision follows the one a host already holds.
+    ///
+    /// A host refuses a revision at or below the one it has accepted, so a captured earlier policy
+    /// cannot restore permissions the organisation has since withdrawn.
+    #[must_use]
+    pub const fn follows(&self, accepted: OrganisationPolicyRevision) -> bool {
+        self.policy_revision.get() > accepted.get()
+    }
+}
+
+/// One organisation's host policy, signed by its policy-signing key.
+///
+/// A host that pinned the organisation's policy-signing authority follows the chain to the revision
+/// signing now and checks this signature against it, so what a host applies is the organisation's
+/// own statement rather than the service's word about it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrganisationPolicy {
+    /// What the organisation states.
+    pub payload: OrganisationPolicyPayload,
+    /// The policy-signing key's signature over [`OrganisationPolicyPayload::signing_input`].
     pub signature: Signature64,
 }
 

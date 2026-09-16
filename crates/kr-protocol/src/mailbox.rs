@@ -14,7 +14,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{EnvelopeId, EnvironmentId, GrantId, SessionEpoch, SessionId};
+use crate::ids::{EnvelopeId, EnvironmentId, GrantId, MailboxThreadId, SessionEpoch, SessionId};
 use crate::scalars::{Bytes, KeyId, Nonce192, Nullable, TimestampMs, U64};
 
 /// The envelope format this build writes and reads.
@@ -57,6 +57,25 @@ pub enum MailboxPayloadType {
 }
 
 impl MailboxPayloadType {
+    /// Every payload kind, in declaration order.
+    pub const ALL: [Self; 4] = [
+        Self::AuthorityFeedChange,
+        Self::SignedAuthorityObject,
+        Self::NotificationPreview,
+        Self::SyncChange,
+    ];
+
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthorityFeedChange => "authority_feed_change",
+            Self::SignedAuthorityObject => "signed_authority_object",
+            Self::NotificationPreview => "notification_preview",
+            Self::SyncChange => "sync_change",
+        }
+    }
+
     /// Returns true when a payload of this type carries authority of its own.
     ///
     /// Section 20 requires an authorisation-bearing payload to be signed before encryption, so
@@ -102,6 +121,11 @@ pub struct EnvelopePlaintext {
     pub session_id: Nullable<SessionId>,
     /// The epoch of that session.
     pub session_epoch: Nullable<SessionEpoch>,
+    /// The thread repeated state notifications coalesce in, when the sender asks for coalescing.
+    ///
+    /// It is authenticated here as well as declared in the routing record, so a recipient can see
+    /// that the value the service coalesced by is the value the sender chose.
+    pub thread_id: Nullable<MailboxThreadId>,
     /// The payload. An authorisation-bearing payload is a signed object's canonical bytes.
     pub payload: Bytes,
 }
@@ -121,6 +145,18 @@ pub struct EnvelopeRouting {
     pub sender_key_id: KeyId,
     /// When the service may delete the item, in UTC milliseconds.
     pub expires_at_ms: TimestampMs,
+    /// What the payload is.
+    ///
+    /// The service is told the kind so that it can refuse a kind the mailbox does not carry, which
+    /// is section 9's rule that it queues no keystroke, command, decision or closure. It learns the
+    /// kind and nothing about the payload; the recipient checks the declaration against the kind
+    /// the box authenticated and drops the item when the two differ.
+    pub payload_type: MailboxPayloadType,
+    /// The thread the item coalesces in, when the sender asks for coalescing.
+    ///
+    /// Null means the item stands on its own and nothing replaces it. A value is opaque: the
+    /// service compares it and never derives anything from it.
+    pub thread_id: Nullable<MailboxThreadId>,
     /// The declared size bucket, in bytes: the length of the padded plaintext that was encrypted.
     ///
     /// Quota accounting measures the complete stored ciphertext rather than this figure.
@@ -135,6 +171,14 @@ impl EnvelopeRouting {
             && self.recipient_key_id == plaintext.recipient_key_id
             && self.sender_key_id == plaintext.sender_key_id
             && self.expires_at_ms == plaintext.expires_at_ms
+            && self.payload_type == plaintext.payload_type
+            && self.thread_id == plaintext.thread_id
+    }
+
+    /// Returns true when the declared bucket is a length one of section 20's rules produces.
+    #[must_use]
+    pub const fn bucket_is_declared(&self) -> bool {
+        granularity_for_bucket(self.size_bucket_bytes.get()).is_some()
     }
 }
 
@@ -160,11 +204,135 @@ pub const SEAL_OVERHEAD_BYTES: u64 = 16;
 /// How long a replay identifier is retained past its envelope's expiry, in milliseconds.
 pub const REPLAY_ID_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// The longest a mailbox item may live, in milliseconds (section 9).
+pub const MAX_MAILBOX_ITEM_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The most items one device's mailbox holds (section 9).
+pub const MAX_MAILBOX_ITEMS: u64 = 1_000;
+
+/// The most stored ciphertext one device's mailbox holds, in bytes (section 9).
+///
+/// Quota accounting measures the complete stored ciphertext and envelope, not the unpadded
+/// plaintext, so a sender cannot store more by padding less.
+pub const MAX_MAILBOX_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Returns the instant a replay identifier may be forgotten: expiry plus one day.
 #[must_use]
 pub const fn replay_id_retained_until_ms(expires_at_ms: u64) -> u64 {
     expires_at_ms.saturating_add(REPLAY_ID_RETENTION_MS)
 }
+
+/// Why a sealed envelope is not one this contract admits.
+///
+/// Every variant is a check a service can make without a key, which is the point: the service
+/// stores ciphertext it cannot read, so the only rules it can hold a sender to are the ones about
+/// the envelope's shape. [`SealedEnvelope::check_structure`] is the whole of them, in one place, so
+/// that a gateway and a producer cannot disagree about what a well-formed item is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum EnvelopeStructureError {
+    /// The declared bucket is not a length section 20's padding rules produce.
+    #[error("the declared size bucket of {bucket} bytes is not one the padding rules produce")]
+    UndeclaredBucket {
+        /// The bucket the routing record declared.
+        bucket: u64,
+    },
+    /// The ciphertext is not the declared bucket plus the seal's own overhead.
+    #[error("the ciphertext is {len} bytes; a bucket of {bucket} bytes seals to {expected}")]
+    CiphertextLength {
+        /// The ciphertext length that arrived.
+        len: u64,
+        /// The declared bucket.
+        bucket: u64,
+        /// The length the declared bucket seals to.
+        expected: u64,
+    },
+    /// The item expires later than section 9 lets a mailbox item live.
+    #[error("an item expires within {limit} ms; this one expires {ahead} ms from now")]
+    LifetimeTooLong {
+        /// How far ahead the expiry is.
+        ahead: u64,
+        /// The limit.
+        limit: u64,
+    },
+    /// The item has already expired, so storing it would store something to delete.
+    #[error("that item expired {behind} ms ago")]
+    AlreadyExpired {
+        /// How long ago it expired.
+        behind: u64,
+    },
+    /// An authority-bearing payload asked to be coalesced.
+    ///
+    /// Coalescing replaces an older unread item with a newer one of the same thread, and a
+    /// forwarded signed object is authority rather than a state notification: section 10 keeps
+    /// revocation records outside notification coalescing, so a payload that carries authority
+    /// carries no thread identifier either.
+    #[error("a payload that carries authority is never coalesced, so it names no thread")]
+    AuthorityCoalesced,
+}
+
+impl SealedEnvelope {
+    /// The bytes this envelope occupies in a mailbox: the ciphertext, the nonce and the routing.
+    ///
+    /// Quota accounting measures the complete stored ciphertext and envelope, so the figure
+    /// includes what the service stores around the ciphertext rather than the ciphertext alone.
+    #[must_use]
+    pub fn stored_bytes(&self) -> u64 {
+        let ciphertext = self.ciphertext.as_slice().len() as u64;
+        ciphertext
+            .saturating_add(Nonce192::LEN as u64)
+            .saturating_add(ROUTING_RECORD_BYTES)
+    }
+
+    /// Checks everything about this envelope that needs no key, at `now_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the envelope breaks.
+    pub fn check_structure(&self, now_ms: u64) -> Result<(), EnvelopeStructureError> {
+        let bucket = self.routing.size_bucket_bytes.get();
+        if granularity_for_bucket(bucket).is_none() {
+            return Err(EnvelopeStructureError::UndeclaredBucket { bucket });
+        }
+
+        let expected = bucket.saturating_add(SEAL_OVERHEAD_BYTES);
+        let len = self.ciphertext.as_slice().len() as u64;
+        if len != expected {
+            return Err(EnvelopeStructureError::CiphertextLength {
+                len,
+                bucket,
+                expected,
+            });
+        }
+
+        let expires = self.routing.expires_at_ms.get();
+        if expires <= now_ms {
+            return Err(EnvelopeStructureError::AlreadyExpired {
+                behind: now_ms - expires,
+            });
+        }
+        let ahead = expires - now_ms;
+        if ahead > MAX_MAILBOX_ITEM_LIFETIME_MS {
+            return Err(EnvelopeStructureError::LifetimeTooLong {
+                ahead,
+                limit: MAX_MAILBOX_ITEM_LIFETIME_MS,
+            });
+        }
+
+        if self.routing.payload_type.bears_authority() && self.routing.thread_id.is_present() {
+            return Err(EnvelopeStructureError::AuthorityCoalesced);
+        }
+
+        Ok(())
+    }
+}
+
+/// What the routing record and the item's own bookkeeping cost in a mailbox, in bytes.
+///
+/// It is a fixed allowance rather than a measurement: the record is a closed schema of two
+/// identifiers, two key identifiers, a timestamp, a payload kind, an optional thread and a counter,
+/// so its encoded size varies by a few bytes and a fixed figure keeps one sender's quota from
+/// depending on how the service happens to store it.
+pub const ROUTING_RECORD_BYTES: u64 = 256;
 
 /// One kibibyte.
 pub const KIB: u64 = 1024;
@@ -292,6 +460,22 @@ mod tests {
     }
 
     #[test]
+    fn the_payload_kinds_are_closed_and_none_of_them_is_an_action() {
+        // Section 9 is a list of what a mailbox does not queue: keystrokes, shell commands,
+        // approval decisions, process termination and session closure. The set below is what it
+        // does carry, and there is no kind an action could arrive under.
+        assert_eq!(
+            MailboxPayloadType::ALL.map(MailboxPayloadType::as_str),
+            [
+                "authority_feed_change",
+                "signed_authority_object",
+                "notification_preview",
+                "sync_change",
+            ]
+        );
+    }
+
+    #[test]
     fn only_a_forwarded_signed_object_bears_authority() {
         assert!(MailboxPayloadType::SignedAuthorityObject.bears_authority());
         // An announcement is not authority: the device synchronises the feed to learn what
@@ -299,6 +483,131 @@ mod tests {
         assert!(!MailboxPayloadType::AuthorityFeedChange.bears_authority());
         assert!(!MailboxPayloadType::NotificationPreview.bears_authority());
         assert!(!MailboxPayloadType::SyncChange.bears_authority());
+    }
+
+    fn sealed(bucket: u64, expires_at_ms: u64) -> SealedEnvelope {
+        SealedEnvelope {
+            routing: EnvelopeRouting {
+                envelope_id: EnvelopeId::new(crate::scalars::Uuid::from_bytes([1; 16])),
+                recipient_key_id: KeyId::from_bytes([2; 32]),
+                sender_key_id: KeyId::from_bytes([3; 32]),
+                expires_at_ms: TimestampMs::new(expires_at_ms),
+                payload_type: MailboxPayloadType::SyncChange,
+                thread_id: Nullable::null(),
+                size_bucket_bytes: U64::new(bucket),
+            },
+            nonce: Nonce192::from_bytes([4; 24]),
+            ciphertext: Bytes::from(vec![0u8; (bucket + SEAL_OVERHEAD_BYTES) as usize]),
+        }
+    }
+
+    #[test]
+    fn an_envelope_is_admitted_when_its_shape_is_the_one_the_rules_produce() {
+        let envelope = sealed(KIB, 1_000 + MAX_MAILBOX_ITEM_LIFETIME_MS);
+        assert_eq!(envelope.check_structure(1_000), Ok(()));
+        assert!(envelope.routing.bucket_is_declared());
+    }
+
+    #[test]
+    fn a_bucket_no_padding_rule_produces_is_refused() {
+        let envelope = sealed(KIB, 2_000);
+        let mut routing = envelope.routing.clone();
+        routing.size_bucket_bytes = U64::new(18 * KIB);
+        let claimed = SealedEnvelope {
+            routing,
+            ..envelope
+        };
+        assert_eq!(
+            claimed.check_structure(1_000),
+            Err(EnvelopeStructureError::UndeclaredBucket { bucket: 18 * KIB })
+        );
+        assert!(!claimed.routing.bucket_is_declared());
+    }
+
+    #[test]
+    fn a_ciphertext_that_is_not_its_bucket_sealed_is_refused() {
+        let mut envelope = sealed(KIB, 2_000);
+        envelope.ciphertext = Bytes::from(vec![0u8; (KIB + SEAL_OVERHEAD_BYTES - 1) as usize]);
+        assert_eq!(
+            envelope.check_structure(1_000),
+            Err(EnvelopeStructureError::CiphertextLength {
+                len: KIB + SEAL_OVERHEAD_BYTES - 1,
+                bucket: KIB,
+                expected: KIB + SEAL_OVERHEAD_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn an_item_lives_at_most_one_day_and_never_in_the_past() {
+        let long = sealed(KIB, 1_000 + MAX_MAILBOX_ITEM_LIFETIME_MS + 1);
+        assert_eq!(
+            long.check_structure(1_000),
+            Err(EnvelopeStructureError::LifetimeTooLong {
+                ahead: MAX_MAILBOX_ITEM_LIFETIME_MS + 1,
+                limit: MAX_MAILBOX_ITEM_LIFETIME_MS,
+            })
+        );
+        let past = sealed(KIB, 900);
+        assert_eq!(
+            past.check_structure(1_000),
+            Err(EnvelopeStructureError::AlreadyExpired { behind: 100 })
+        );
+    }
+
+    #[test]
+    fn a_forwarded_signed_object_names_no_thread() {
+        let mut envelope = sealed(KIB, 2_000);
+        envelope.routing.payload_type = MailboxPayloadType::SignedAuthorityObject;
+        envelope.routing.thread_id = Nullable::some(crate::ids::MailboxThreadId::new(
+            crate::scalars::Uuid::from_bytes([9; 16]),
+        ));
+        assert_eq!(
+            envelope.check_structure(1_000),
+            Err(EnvelopeStructureError::AuthorityCoalesced)
+        );
+        envelope.routing.thread_id = Nullable::null();
+        assert_eq!(envelope.check_structure(1_000), Ok(()));
+    }
+
+    #[test]
+    fn routing_is_checked_against_the_kind_and_thread_the_box_authenticated() {
+        let thread = crate::ids::MailboxThreadId::new(crate::scalars::Uuid::from_bytes([9; 16]));
+        let plaintext = EnvelopePlaintext {
+            version: EnvelopeVersion::V1,
+            envelope_id: EnvelopeId::new(crate::scalars::Uuid::from_bytes([1; 16])),
+            sender_key_id: KeyId::from_bytes([3; 32]),
+            recipient_key_id: KeyId::from_bytes([2; 32]),
+            payload_type: MailboxPayloadType::SyncChange,
+            created_at_ms: TimestampMs::new(1_000),
+            expires_at_ms: TimestampMs::new(2_000),
+            grant_id: Nullable::null(),
+            environment_id: Nullable::null(),
+            session_id: Nullable::null(),
+            session_epoch: Nullable::null(),
+            thread_id: Nullable::some(thread),
+            payload: Bytes::from(vec![7u8; 4]),
+        };
+        let mut routing = sealed(KIB, 2_000).routing;
+        routing.thread_id = Nullable::some(thread);
+        assert!(routing.matches(&plaintext));
+
+        // A service that coalesced by another thread, or relabelled the kind, is caught here.
+        let mut relabelled = routing.clone();
+        relabelled.payload_type = MailboxPayloadType::NotificationPreview;
+        assert!(!relabelled.matches(&plaintext));
+        let mut rethreaded = routing;
+        rethreaded.thread_id = Nullable::null();
+        assert!(!rethreaded.matches(&plaintext));
+    }
+
+    #[test]
+    fn stored_bytes_measure_the_ciphertext_the_nonce_and_the_routing() {
+        let envelope = sealed(KIB, 2_000);
+        assert_eq!(
+            envelope.stored_bytes(),
+            KIB + SEAL_OVERHEAD_BYTES + Nonce192::LEN as u64 + ROUTING_RECORD_BYTES
+        );
     }
 
     #[test]
