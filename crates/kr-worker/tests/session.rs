@@ -750,14 +750,21 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
             .expect("writes");
         runtime.flush_locked(&mut session);
     }
+    // The lease changes while the writer is part way through: some of the batch is with the
+    // application and the rest is waiting for a terminal that has no room.
+    let total = batch.len();
     let queued = runtime.session().queued_lease_bytes();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while queued.load() == 0 {
+    loop {
+        let waiting = queued.load();
+        if waiting > 0 && waiting < total {
+            break;
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the writer is holding bytes the application has not read"
+            "the writer delivered some of the batch and is waiting with the rest: {waiting}"
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     let taken = {
@@ -828,5 +835,109 @@ async fn a_geometry_the_session_budget_cannot_admit_is_refused_before_anything_m
         "and the terminal the application is looking at did not move"
     );
     let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
+    // The receipt is a promise about what reached the application, so it has to be exact in both
+    // directions: a byte counted as discarded must not arrive afterwards, and a byte that arrived
+    // must not be counted. The lease change and the writer share one boundary, so no write of the
+    // ended lease's bytes can begin after the count, and none was part way through while it was
+    // taken.
+    let host = kr_ipc::testing::TempHost::create();
+    // Raw mode, so every byte the application receives is the byte that was written, and nothing
+    // is read for five seconds, so the writer is inside the batch when the lease changes.
+    let config = configuration(
+        &host,
+        "stty raw -echo; printf 'kr-up\\n'; sleep 5; exec cat",
+    );
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let first = AttachmentId::new(kr_ipc::new_uuid());
+    let second = AttachmentId::new(kr_ipc::new_uuid());
+    for id in [first, second] {
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Input);
+        session
+            .attach(&terminal_attachment(session_id), requested, id)
+            .expect("attaches");
+    }
+    session
+        .acquire_input(first, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("takes the lease");
+    let epoch = session.lease().epoch.get();
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    // Nothing in this test's own markers is an `a`, because `a` is what the counting is about.
+    let ready = retained_within(&runtime, b"kr-up", Duration::from_secs(30)).await;
+    assert!(
+        ready.windows(5).any(|window| window == b"kr-up"),
+        "the application is running and its terminal takes bytes as they are"
+    );
+
+    // Nothing but `a`, so what the application received can be counted against what was sent.
+    const SENT: usize = 256 * 1024;
+    let batch = vec![b'a'; SENT];
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(first, epoch, 0, &batch, std::time::Instant::now())
+            .expect("writes");
+        runtime.flush_locked(&mut session);
+    }
+    // The lease changes while the writer is part way through: some of the batch is with the
+    // application and the rest is waiting for a terminal that has no room.
+    let total = batch.len();
+    let queued = runtime.session().queued_lease_bytes();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting = queued.load();
+        if waiting > 0 && waiting < total {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the writer delivered some of the batch and is waiting with the rest: {waiting}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let taken = {
+        let mut session = runtime.session();
+        let taken = session
+            .acquire_input(second, ConnectionId::new(kr_ipc::new_uuid()), None)
+            .expect("takes the lease over");
+        runtime.flush_locked(&mut session);
+        taken
+    };
+    let discarded = usize::try_from(taken.discarded_bytes.get()).expect("fits");
+    assert!(
+        discarded > 0 && discarded < SENT,
+        "some of it reached the application and some did not: {discarded} of {SENT}"
+    );
+
+    // The application starts reading, and what it echoes is what it was given. Nothing the receipt
+    // called discarded may appear in it, and nothing it received may be missing from it.
+    let next_epoch = taken.lease.epoch.get();
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(second, next_epoch, 0, b"kr-next", std::time::Instant::now())
+            .expect("the new lease writes");
+        runtime.flush_locked(&mut session);
+    }
+    let _ = retained_within(&runtime, b"kr-next", Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let seen = retained(&runtime);
+    let received = seen.iter().filter(|byte| **byte == b'a').count();
+    assert_eq!(
+        received + discarded,
+        SENT,
+        "every byte was either received or reported as discarded, and none was both: \
+         {received} received, {discarded} discarded, {SENT} sent"
+    );
+    let runtime = std::sync::Arc::clone(&runtime);
     runtime.close(ClosureReason::CloseRequested).1.release();
 }

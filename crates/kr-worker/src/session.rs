@@ -138,6 +138,8 @@ pub struct Session {
     /// Whether the application is inside a bracketed paste, as the writer has actually delivered
     /// it. The framer says what the accepted stream means; this says what arrived.
     delivered_paste_open: Arc<std::sync::atomic::AtomicBool>,
+    /// The boundary the writer and a lease change share, described at [`Session::input_gate`].
+    input_gate: Arc<std::sync::Mutex<()>>,
     /// The lease epoch the writer compares every queued batch against.
     ///
     /// The session publishes it the moment the lease changes, which is what lets the count of what
@@ -214,6 +216,7 @@ impl Session {
             restoration_losses: crate::render::Carried::default(),
             queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             queued_lease_bytes: Arc::new(crate::runtime::LeaseBytes::new()),
+            input_gate: Arc::new(std::sync::Mutex::new(())),
             input_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             delivered_paste_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lease_change_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -356,6 +359,38 @@ impl Session {
         self.pty.input_waiter()
     }
 
+    /// Returns the handle the read loop waits on when the application has written nothing.
+    #[must_use]
+    pub fn output_waiter(&self) -> Option<crate::pty::OutputWaiter> {
+        self.pty.output_waiter()
+    }
+
+    /// Ends the lease that was in force and returns what it left the writer holding.
+    ///
+    /// The fence and the count are one step, taken on the boundary the writer also takes: after
+    /// this returns, no write of that lease's bytes can begin, and none was part way through while
+    /// the count was taken. That is what makes the number a receipt can quote exact rather than an
+    /// estimate of what a writer might still be doing.
+    fn end_lease(&mut self) -> u64 {
+        let gate = Arc::clone(&self.input_gate);
+        let boundary = gate.lock().expect("the input boundary is not poisoned");
+        self.note_lease_holder();
+        let left = self.queued_lease_bytes.take(self.lease.epoch()) as u64;
+        drop(boundary);
+        left
+    }
+
+    /// Returns the boundary the writer and a lease change share.
+    ///
+    /// Inside it are the fence, one write that refuses to wait, and the accounting for what that
+    /// write sent; outside it is the waiting for a terminal with no room. A lease change takes the
+    /// same boundary, which is what makes "this lease's bytes are no longer wanted" and "these
+    /// bytes have just been written" one order rather than two races.
+    #[must_use]
+    pub fn input_gate(&self) -> Arc<std::sync::Mutex<()>> {
+        Arc::clone(&self.input_gate)
+    }
+
     /// Renders the session for the wire.
     #[must_use]
     pub fn summary(&self) -> SessionSummary {
@@ -476,9 +511,10 @@ impl Session {
             })?
             .unwrap_or_else(|| self.attachments.geometry().dimensions);
         let gate = self.lane_gate();
+        let keyboard = self.attachments.keyboard_control(attachment_id);
         let (cursor, restoration, settled) =
             self.engine
-                .restoration(dimensions, gate, kr_ipc::now_ms().get());
+                .restoration(dimensions, gate, kr_ipc::now_ms().get(), keyboard);
         // Taking a snapshot settles the screen, and whatever that released belongs to the
         // attachments that were already watching. Delivering it here is what stops one client's
         // snapshot swallowing a character that was owed to another.
@@ -571,10 +607,9 @@ impl Session {
         self.lease.release_attachment(attachment_id);
         if held {
             self.framer.close_for_takeover();
-        }
-        self.note_lease_holder();
-        if held {
-            let _ = self.queued_lease_bytes.take(self.lease.epoch());
+            let _ = self.end_lease();
+        } else {
+            self.note_lease_holder();
         }
         self.pump_replies();
         self.hub.detached(attachment_id);
@@ -705,12 +740,12 @@ impl Session {
         // sees a paste finished under a different actor.
         let framing = self.framer.close_for_takeover();
         let discarded_queue = self.lease.acquire(attachment_id, connection_id);
-        // The fence is published first, so the writer has already stopped writing this lease's
-        // bytes by the time they are counted. Everything it had not written is discarded by this
-        // takeover, and taking the counter rather than reading it is what makes the answer that
-        // lease's own: the next takeover starts from zero and cannot report these bytes again.
-        self.note_lease_holder();
-        let mut discarded = self.queued_lease_bytes.take(self.lease.epoch()) as u64;
+        // The lease ends and what it left behind is counted in one step, on the boundary the writer
+        // takes for every write: no byte of this lease's can be written after it, and none was
+        // being written while it was counted. Taking the counter rather than reading it is what
+        // makes the answer that lease's own: the next takeover starts from zero and cannot report
+        // these bytes again.
+        let mut discarded = self.end_lease();
         discarded += discarded_queue;
         discarded += framing.discarded_prefix.len() as u64;
         // A paste is reported as closed when one was open in the stream this lease accepted, or
@@ -749,10 +784,9 @@ impl Session {
         // keystroke would arrive inside somebody else's paste. The writer supplies the terminator,
         // because it is the only thing that knows whether the application ever saw the start.
         self.framer.close_for_takeover();
-        self.note_lease_holder();
-        // What this lease handed over and the writer has not written goes with it, counted after
-        // the fence above stopped the writer from touching it.
-        let _ = self.queued_lease_bytes.take(self.lease.epoch());
+        // What this lease handed over and the writer has not written goes with it, counted on the
+        // same boundary that stopped the writer from touching it.
+        let _ = self.end_lease();
         self.pump_replies();
         Ok(self.lease.to_wire())
     }
@@ -1186,9 +1220,10 @@ impl Session {
 
         for (attachment_id, dimensions) in projected {
             let gate = self.lane_gate();
+            let keyboard = self.attachments.keyboard_control(attachment_id);
             let (cursor, restoration, settled) =
                 self.engine
-                    .restoration(dimensions, gate, kr_ipc::now_ms().get());
+                    .restoration(dimensions, gate, kr_ipc::now_ms().get(), keyboard);
             self.note_restoration(attachment_id, &restoration);
             let shared = Arc::new(restoration.bytes);
             if self
@@ -1311,8 +1346,7 @@ impl Session {
                     self.lease.release_attachment(holder);
                 }
                 self.framer.close_for_takeover();
-                self.note_lease_holder();
-                let _ = self.queued_lease_bytes.take(self.lease.epoch());
+                let _ = self.end_lease();
                 CloseAcceptance {
                     state: SessionState::Closing,
                     durability: self.durability(),

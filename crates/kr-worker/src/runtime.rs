@@ -34,6 +34,19 @@ pub const READ_QUEUE_DEPTH: usize = 64;
 /// below, where a takeover reaches it at once.
 pub const WRITE_PIECE_BYTES: usize = 512;
 
+/// How long the read loop waits for the application to write something before it asks again.
+///
+/// The wait ends by itself when output arrives, so this is only the interval at which a reader with
+/// nothing to read reconsiders whether the terminal is still there.
+pub const READ_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long the writer keeps offering a correction the application must have before it gives up.
+///
+/// A terminal that has taken nothing at all for this long is one whose application has stopped
+/// reading for longer than a paste can sensibly stay open, and a writer that waited for ever there
+/// would never write anything again.
+pub const INSIST_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long the writer waits for the terminal to have room before it looks at the fence again.
 ///
 /// The wait ends by itself when the application reads, so this is only the interval at which a
@@ -185,92 +198,184 @@ enum Delivery {
 
 /// Hands one batch to the terminal a piece at a time, and says how far it got.
 ///
-/// `stale` is the fence, asked before every piece; `wrote` is told what the application now has
-/// that it did not have before, which is what the write returned rather than what was offered.
+/// `gate` is the boundary this shares with whatever changes the lease: inside it are the fence,
+/// one write that refuses to wait, and the accounting for what that write sent. `stale` is the
+/// fence, asked inside that boundary; `wrote` is told what the application now has that it did not
+/// have before, which is what the write returned rather than what was offered, and it is told
+/// inside the boundary too. Nothing waits while the boundary is held, so a lease change never waits
+/// for a terminal, and no write of an ended lease's bytes can begin after that change.
 ///
 /// A piece is at most [`WRITE_PIECE_BYTES`], so a takeover reaches a writer between pieces instead
-/// of behind a whole batch, and `room` is waited on before each one so that the waiting happens
-/// where the fence can still be looked at rather than inside a write. A piece never *ends* inside a
-/// paste delimiter: a terminal takes what it has room for, so a short write can stop in the middle
-/// of one, and the writer finishes those few bytes before it looks at the fence again. Half a
-/// delimiter is the one thing an abandoned batch cannot leave behind, because the next actor's
-/// first bytes would complete it and their paste would begin inside the previous actor's.
+/// of behind a whole batch, and `room` is waited on outside the boundary. A piece never *ends*
+/// inside a paste delimiter: a terminal takes what it has room for, so a short write can stop in
+/// the middle of one, and the writer finishes those few bytes before it looks at the fence again.
+/// Half a delimiter is the one thing an abandoned batch cannot leave behind, because the next
+/// actor's first bytes would complete it and their paste would begin inside the previous actor's.
 fn write_batch(
     writer: &mut impl std::io::Write,
     bytes: &[u8],
     transition: &crate::session::PasteTransition,
     room: Option<&crate::pty::InputWaiter>,
+    gate: &std::sync::Mutex<()>,
     stale: &mut impl FnMut() -> bool,
     wrote: &mut impl FnMut(usize),
 ) -> (usize, Delivery) {
     let mut delivered = 0_usize;
     while delivered < bytes.len() {
-        // The waiting happens here, before the write, so that a writer holding bytes an
-        // application is not reading is a writer this loop can still steer. A write that waited
-        // instead would hold those bytes inside a system call where the fence cannot be looked at.
-        // The fence is looked at after the wait as well as before it, because the wait is where a
-        // takeover arrives.
-        if let Some(waiter) = room {
-            match waiter.wait(WRITE_WAIT) {
-                crate::pty::Room::Ready => {}
-                crate::pty::Room::NotYet => {
-                    if stale() {
-                        return (delivered, Delivery::Abandoned);
-                    }
-                    continue;
-                }
-                crate::pty::Room::Gone => return (delivered, Delivery::Gone),
+        // The waiting happens here, outside the boundary, so that a writer holding bytes an
+        // application is not reading holds nothing else: a lease change takes the boundary while
+        // this waits, and the next look at the fence sees it.
+        if !wait_for_room(room, gate, stale) {
+            return (
+                delivered,
+                if room.is_some_and(|waiter| {
+                    waiter.wait(std::time::Duration::ZERO) == crate::pty::Room::Gone
+                }) {
+                    Delivery::Gone
+                } else {
+                    Delivery::Abandoned
+                },
+            );
+        }
+        let attempt = {
+            let _boundary = gate.lock().expect("the input boundary is not poisoned");
+            if stale() {
+                return (delivered, Delivery::Abandoned);
             }
-        }
-        if stale() {
-            return (delivered, Delivery::Abandoned);
-        }
-        let offered = delivered.saturating_add(WRITE_PIECE_BYTES).min(bytes.len());
-        let offered = transition
-            .unfinished(offered)
-            .unwrap_or(offered)
-            .min(bytes.len());
-        match writer.write(&bytes[delivered..offered]) {
+            let offered = delivered.saturating_add(WRITE_PIECE_BYTES).min(bytes.len());
+            let offered = transition
+                .unfinished(offered)
+                .unwrap_or(offered)
+                .min(bytes.len());
+            let attempt = writer.write(&bytes[delivered..offered]);
+            if let Ok(written) = attempt.as_ref() {
+                delivered += written;
+                wrote(*written);
+            }
+            attempt
+        };
+        match attempt {
             // A terminal that takes nothing and reports no error is one this writer cannot make
             // progress on.
             Ok(0) => return (delivered, Delivery::Gone),
-            Ok(written) => {
-                delivered += written;
-                wrote(written);
-                // The rest of a delimiter this write stopped inside of goes now, fence or no
-                // fence: its first bytes are already with the application.
-                while let Some(end) = transition.unfinished(delivered) {
-                    let end = end.min(bytes.len());
-                    match writer.write(&bytes[delivered..end]) {
-                        Ok(0) => return (delivered, Delivery::Gone),
-                        Ok(rest) => {
-                            delivered += rest;
-                            wrote(rest);
-                        }
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                            ) =>
-                        {
-                            // A few bytes with nowhere to go yet. The terminal is waited on rather
-                            // than spun on, and this is the one place the writer waits for room it
-                            // has already committed to using.
-                            if let Some(waiter) = room
-                                && waiter.wait(WRITE_WAIT) == crate::pty::Room::Gone
-                            {
-                                return (delivered, Delivery::Gone);
-                            }
-                        }
-                        Err(_) => return (delivered, Delivery::Gone),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => return (delivered, Delivery::Gone),
+        }
+        // The rest of a delimiter this write stopped inside of goes now, fence or no fence: its
+        // first bytes are already with the application, and the next actor's input must not be
+        // what completes them.
+        while let Some(end) = transition.unfinished(delivered) {
+            let end = end.min(bytes.len());
+            let attempt = {
+                let _boundary = gate.lock().expect("the input boundary is not poisoned");
+                let attempt = writer.write(&bytes[delivered..end]);
+                if let Ok(written) = attempt.as_ref() {
+                    delivered += written;
+                    wrote(*written);
+                }
+                attempt
+            };
+            match attempt {
+                Ok(0) => return (delivered, Delivery::Gone),
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    // A few bytes with nowhere to go yet. The terminal is waited on rather than
+                    // spun on, and this is the one wait the fence does not end: these bytes are
+                    // already half with the application.
+                    if let Some(waiter) = room
+                        && waiter.wait(WRITE_WAIT) == crate::pty::Room::Gone
+                    {
+                        return (delivered, Delivery::Gone);
                     }
                 }
+                Err(_) => return (delivered, Delivery::Gone),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return (delivered, Delivery::Gone),
         }
     }
     (delivered, Delivery::Complete)
+}
+
+/// Writes a few bytes the application must have, waiting for the terminal as often as it takes.
+///
+/// This is not a lease's input and no fence applies to it: the paste terminator is the one thing
+/// that can end a paste nothing else is going to end, so it goes through. It is bounded by what it
+/// is: a handful of bytes that a terminal with any room at all takes whole.
+fn insist(
+    writer: &mut impl std::io::Write,
+    bytes: &[u8],
+    room: Option<&crate::pty::InputWaiter>,
+    gate: &std::sync::Mutex<()>,
+) -> bool {
+    let mut sent = 0_usize;
+    let deadline = std::time::Instant::now() + INSIST_LIMIT;
+    while sent < bytes.len() {
+        let attempt = {
+            let _boundary = gate.lock().expect("the input boundary is not poisoned");
+            writer.write(&bytes[sent..])
+        };
+        match attempt {
+            Ok(0) => return false,
+            Ok(written) => sent += written,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                if let Some(waiter) = room
+                    && waiter.wait(WRITE_WAIT) == crate::pty::Room::Gone
+                {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    let _ = std::io::Write::flush(writer);
+    true
+}
+
+/// Waits until the terminal will take more, and says whether the batch is still wanted.
+///
+/// Returns false when the batch should stop: the lease it belongs to has ended, or the terminal
+/// has. The fence is looked at inside the boundary, because that is the only place its answer
+/// stays true for as long as it takes to act on it.
+fn wait_for_room(
+    room: Option<&crate::pty::InputWaiter>,
+    gate: &std::sync::Mutex<()>,
+    stale: &mut impl FnMut() -> bool,
+) -> bool {
+    let Some(waiter) = room else {
+        return true;
+    };
+    loop {
+        match waiter.wait(WRITE_WAIT) {
+            crate::pty::Room::Ready => return true,
+            crate::pty::Room::NotYet => {
+                let _boundary = gate.lock().expect("the input boundary is not poisoned");
+                if stale() {
+                    return false;
+                }
+            }
+            crate::pty::Room::Gone => return false,
+        }
+    }
 }
 
 /// A running session and the tasks around it.
@@ -295,6 +400,13 @@ impl SessionRuntime {
         // What the host owes the application is bounded by what has been *written*, not by what is
         // waiting in the session, because the session hands its queue over on every flush.
         let input_waiter = session.input_waiter();
+        let output_waiter = session.output_waiter();
+        // The boundary the writer and the lease share. What is inside it is the fence, one write
+        // that refuses to wait, and the accounting for what that write sent; the waiting for the
+        // terminal is outside it. A lease change takes the same boundary, so a write cannot begin
+        // after the lease it belongs to has ended, and the count of what that lease left behind
+        // cannot be taken while a write of its own is part way through.
+        let gate = session.input_gate();
         let queued_input = session.queued_input_bytes();
         let queued_lease = session.queued_lease_bytes();
         let delivered_paste_open = session.delivered_paste_open();
@@ -316,30 +428,74 @@ impl SessionRuntime {
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
 
-        // The read loop runs on a blocking thread because the terminal's reader is a blocking
-        // descriptor. It sends what it read and immediately reads again.
+        // The read loop runs on its own thread. The terminal answers a read with nothing to read
+        // rather than waiting inside it, so this waits on the descriptor and then reads what is
+        // there.
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut buffer = vec![0_u8; 64 * 1024];
+            let mut filled = 0_usize;
             loop {
-                match std::io::Read::read(&mut reader, &mut buffer) {
+                match std::io::Read::read(&mut reader, &mut buffer[filled..]) {
                     Ok(0) => {
+                        if filled > 0 {
+                            let _ = output_sender
+                                .blocking_send(ReadEvent::Bytes(buffer[..filled].to_vec()));
+                        }
                         let _ = output_sender.blocking_send(ReadEvent::Ended);
                         break;
                     }
                     Ok(read) => {
+                        // Taken together rather than one read at a time. What the terminal has is
+                        // read until the buffer is full or it has no more, and that is one batch:
+                        // an application printing steadily hands the engine and every subscriber a
+                        // few large deliveries rather than thousands of small ones.
+                        filled += read;
+                        if filled < buffer.len() {
+                            continue;
+                        }
                         if output_sender
-                            .blocking_send(ReadEvent::Bytes(buffer[..read].to_vec()))
+                            .blocking_send(ReadEvent::Bytes(buffer[..filled].to_vec()))
                             .is_err()
                         {
                             break;
                         }
+                        filled = 0;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // The terminal has no more for now, so what was read goes on its way and
+                        // this waits. The wait happens here rather than inside the read, and a
+                        // terminal that has gone is reported by the wait itself.
+                        if filled > 0 {
+                            if output_sender
+                                .blocking_send(ReadEvent::Bytes(buffer[..filled].to_vec()))
+                                .is_err()
+                            {
+                                break;
+                            }
+                            filled = 0;
+                        }
+                        match output_waiter.as_ref().map(|waiter| waiter.wait(READ_WAIT)) {
+                            Some(crate::pty::Room::Gone) => {
+                                let _ = output_sender.blocking_send(ReadEvent::Ended);
+                                break;
+                            }
+                            // No descriptor to wait on: the read is asked again after a moment
+                            // rather than in a loop that spins.
+                            None => std::thread::sleep(READ_WAIT),
+                            Some(_) => {}
+                        }
+                    }
                     Err(_) => {
                         // A closed terminal reads as an error on some platforms and as end of file
                         // on others. Either way the terminal is finished; whether the root shell
-                        // ended is decided by the child monitor, not by this read.
+                        // ended is decided by the child monitor, not by this read. What was read
+                        // before it happened is still the application's output.
+                        if filled > 0 {
+                            let _ = output_sender
+                                .blocking_send(ReadEvent::Bytes(buffer[..filled].to_vec()));
+                        }
                         let _ = output_sender.blocking_send(ReadEvent::Ended);
                         break;
                     }
@@ -348,6 +504,7 @@ impl SessionRuntime {
         });
 
         let writer_fence = Arc::clone(&fence);
+        let writer_gate = Arc::clone(&gate);
         let writer_queued = Arc::clone(&queued_input);
         let writer_lease = Arc::clone(&queued_lease);
         let writer_paste_open = Arc::clone(&delivered_paste_open);
@@ -372,9 +529,12 @@ impl SessionRuntime {
                 if fence != last_fence {
                     last_fence = fence;
                     if writer_paste_open.swap(false, Ordering::AcqRel)
-                        && (std::io::Write::write_all(&mut writer, crate::input::PASTE_END)
-                            .is_err()
-                            || std::io::Write::flush(&mut writer).is_err())
+                        && !insist(
+                            &mut writer,
+                            crate::input::PASTE_END,
+                            input_waiter.as_ref(),
+                            &writer_gate,
+                        )
                     {
                         break;
                     }
@@ -408,6 +568,7 @@ impl SessionRuntime {
                     bytes,
                     &transition,
                     input_waiter.as_ref(),
+                    &writer_gate,
                     &mut || epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire)),
                     &mut |written| {
                         // Released only once the application has it. Until then it is owed.
@@ -897,6 +1058,7 @@ mod tests {
             &bytes,
             &transition,
             None,
+            &std::sync::Mutex::new(()),
             &mut || {
                 pieces += 1;
                 pieces > 1
@@ -937,6 +1099,7 @@ mod tests {
             &bytes,
             &PasteTransition::default(),
             None,
+            &std::sync::Mutex::new(()),
             &mut || false,
             &mut |count| written += count,
         );
@@ -959,6 +1122,7 @@ mod tests {
             b"kr",
             &PasteTransition::default(),
             None,
+            &std::sync::Mutex::new(()),
             &mut || false,
             &mut |count| written += count,
         );

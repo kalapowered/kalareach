@@ -79,6 +79,12 @@ impl Pty {
         let pair = native_pty_system()
             .openpty(pty_size(dimensions))
             .map_err(|error| WorkerError::pty("create the pseudo-terminal", error))?;
+        // The terminal answers rather than waits. A read with nothing to read and a write the
+        // terminal has no room for both come straight back, which is what lets the loops on either
+        // side of it decide what to do next instead of being held inside a system call: the writer
+        // can be told the lease it is writing for has ended, and the reader can be stopped. Both
+        // wait on the descriptor itself when there is nothing to do.
+        answer_rather_than_wait(pair.master.as_ref());
         Ok(Self {
             master: pair.master,
             slave: Some(pair.slave),
@@ -161,6 +167,15 @@ impl Pty {
     #[must_use]
     pub fn input_waiter(&self) -> Option<InputWaiter> {
         InputWaiter::of(self.master.as_ref())
+    }
+
+    /// Returns a handle that can be waited on until the application has written something.
+    ///
+    /// The terminal answers a read with nothing to read rather than waiting inside it, so the read
+    /// loop waits here instead.
+    #[must_use]
+    pub fn output_waiter(&self) -> Option<OutputWaiter> {
+        OutputWaiter::of(self.master.as_ref())
     }
 
     /// Returns the process group the terminal currently has in the foreground.
@@ -452,6 +467,45 @@ mod tests {
         ));
     }
 
+    /// Reads until `marker` appears, waiting on the terminal rather than inside the read.
+    ///
+    /// The terminal answers a read with nothing to read rather than waiting, which is what lets
+    /// the worker steer its own loops; a test that reads from one waits the same way.
+    fn read_until(pty: &Pty, reader: &mut Box<dyn Read + Send>, marker: &[u8]) -> Vec<u8> {
+        let waiter = pty.output_waiter();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut seen = Vec::new();
+        let mut buffer = [0_u8; 256];
+        while std::time::Instant::now() < deadline {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    seen.extend_from_slice(&buffer[..read]);
+                    if seen.windows(marker.len()).any(|window| window == marker) {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    match waiter
+                        .as_ref()
+                        .map(|waiter| waiter.wait(std::time::Duration::from_millis(50)))
+                    {
+                        Some(Room::Gone) => break,
+                        Some(_) => {}
+                        None => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        seen
+    }
+
     #[test]
     fn a_shell_runs_in_the_terminal_and_its_output_is_read_back() {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
@@ -460,17 +514,7 @@ mod tests {
             .launch(&shell("/bin/sh", &["-c", "printf hello"]))
             .expect("launches");
         assert!(shell.identity().pid.get() > 0);
-        let mut seen = Vec::new();
-        let mut buffer = [0_u8; 256];
-        while let Ok(read) = reader.read(&mut buffer) {
-            if read == 0 {
-                break;
-            }
-            seen.extend_from_slice(&buffer[..read]);
-            if seen.windows(5).any(|window| window == b"hello") {
-                break;
-            }
-        }
+        let seen = read_until(&pty, &mut reader, b"hello");
         assert!(
             seen.windows(5).any(|window| window == b"hello"),
             "the shell's output reached the reader"
@@ -495,17 +539,7 @@ mod tests {
                 &["-c", "printf %s \"[${HOME:-absent}]\""],
             ))
             .expect("launches");
-        let mut seen = Vec::new();
-        let mut buffer = [0_u8; 256];
-        while let Ok(read) = reader.read(&mut buffer) {
-            if read == 0 {
-                break;
-            }
-            seen.extend_from_slice(&buffer[..read]);
-            if seen.windows(8).any(|window| window == b"[absent]") {
-                break;
-            }
-        }
+        let seen = read_until(&pty, &mut reader, b"[absent]");
         shell.wait().expect("waits");
         assert!(
             seen.windows(8).any(|window| window == b"[absent]"),
@@ -615,38 +649,113 @@ impl InputWaiter {
     /// Waits until the terminal will take more input, or until `timeout` passes.
     #[must_use]
     pub fn wait(&self, timeout: std::time::Duration) -> Room {
-        use std::os::fd::AsFd as _;
+        wait_for(&self.handle, rustix::event::PollFlags::OUT, timeout)
+    }
+}
 
-        let handle = self.handle.as_fd();
-        let mut fds = [rustix::event::PollFd::new(
-            &handle,
-            rustix::event::PollFlags::OUT,
-        )];
-        let timeout = rustix::event::Timespec {
-            tv_sec: 0,
-            tv_nsec: i64::try_from(timeout.as_nanos()).unwrap_or(0),
-        };
-        match rustix::event::poll(&mut fds, Some(&timeout)) {
-            // Interrupted, or nothing happened before the deadline. Neither says the terminal has
-            // room, and neither says it never will; the caller looks at its own state and asks
-            // again.
-            Ok(0) | Err(rustix::io::Errno::INTR) => Room::NotYet,
-            Ok(_) => {
-                let ready = fds[0].revents();
-                if ready.intersects(
-                    rustix::event::PollFlags::HUP
-                        | rustix::event::PollFlags::ERR
-                        | rustix::event::PollFlags::NVAL,
-                ) {
-                    Room::Gone
-                } else if ready.contains(rustix::event::PollFlags::OUT) {
+/// A handle on the terminal that can be waited on until the application has written something.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct OutputWaiter {
+    handle: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl OutputWaiter {
+    /// Builds a waiter for a terminal, or `None` when it has no descriptor to wait on.
+    fn of(master: &dyn MasterPty) -> Option<Self> {
+        let raw = master.as_raw_fd()?;
+        Some(Self {
+            handle: descriptor::duplicate(raw)?,
+        })
+    }
+
+    /// Waits until the terminal has output to read, or until `timeout` passes.
+    #[must_use]
+    pub fn wait(&self, timeout: std::time::Duration) -> Room {
+        wait_for(&self.handle, rustix::event::PollFlags::IN, timeout)
+    }
+}
+
+/// Waits for one direction of a terminal to be usable.
+#[cfg(unix)]
+fn wait_for(
+    handle: &std::os::fd::OwnedFd,
+    interest: rustix::event::PollFlags,
+    timeout: std::time::Duration,
+) -> Room {
+    use std::os::fd::AsFd as _;
+
+    let handle = handle.as_fd();
+    let mut fds = [rustix::event::PollFd::new(&handle, interest)];
+    let timeout = rustix::event::Timespec {
+        tv_sec: 0,
+        tv_nsec: i64::try_from(timeout.as_nanos()).unwrap_or(0),
+    };
+    match rustix::event::poll(&mut fds, Some(&timeout)) {
+        // Interrupted, or nothing happened before the deadline. Neither says the terminal is ready,
+        // and neither says it never will be; the caller looks at its own state and asks again.
+        Ok(0) | Err(rustix::io::Errno::INTR) => Room::NotYet,
+        Ok(_) => {
+            let ready = fds[0].revents();
+            if ready.intersects(
+                rustix::event::PollFlags::HUP
+                    | rustix::event::PollFlags::ERR
+                    | rustix::event::PollFlags::NVAL,
+            ) {
+                // A terminal whose other side has gone still has what it was written: output that
+                // is there to be read is read before this is called an ending.
+                if interest.contains(rustix::event::PollFlags::IN)
+                    && ready.contains(rustix::event::PollFlags::IN)
+                {
                     Room::Ready
                 } else {
-                    Room::NotYet
+                    Room::Gone
                 }
+            } else if ready.contains(interest) {
+                Room::Ready
+            } else {
+                Room::NotYet
             }
-            Err(_) => Room::Gone,
         }
+        Err(_) => Room::Gone,
+    }
+}
+
+/// Puts a terminal into the mode where it answers rather than waits.
+#[cfg(unix)]
+fn answer_rather_than_wait(master: &dyn MasterPty) {
+    let Some(raw) = master.as_raw_fd() else {
+        return;
+    };
+    let Some(handle) = descriptor::duplicate(raw) else {
+        return;
+    };
+    if let Ok(flags) = rustix::fs::fcntl_getfl(&handle) {
+        let _ = rustix::fs::fcntl_setfl(&handle, flags | rustix::fs::OFlags::NONBLOCK);
+    }
+}
+
+/// A terminal on a platform with no descriptor to set the mode on.
+#[cfg(not(unix))]
+const fn answer_rather_than_wait(_master: &dyn MasterPty) {}
+
+/// A waiter on a platform where the terminal has no descriptor to wait on.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct OutputWaiter {}
+
+#[cfg(not(unix))]
+impl OutputWaiter {
+    /// Builds a waiter for a terminal, or `None` when it has no descriptor to wait on.
+    const fn of(_master: &dyn MasterPty) -> Option<Self> {
+        None
+    }
+
+    /// Waits until the terminal has output to read, or until `timeout` passes.
+    #[must_use]
+    pub const fn wait(&self, _timeout: std::time::Duration) -> Room {
+        Room::Gone
     }
 }
 
