@@ -497,7 +497,7 @@ impl Engine {
                         .get_or_insert(event.span.start());
                     disposition = DirectDisposition::Withhold;
                 } else {
-                    let adapted = self.grid.apply(event);
+                    let adapted = self.grid.apply_handing_over_actions(event);
                     self.note_buffer_switch();
                     self.charge_rows_that_left_the_screen(now_ms);
                     if adapted.clamped {
@@ -647,7 +647,7 @@ impl Engine {
             };
             let decision = self.policy.decide(&inner);
             if decision.apply_to_grid {
-                self.grid.apply(&inner);
+                self.grid.apply_handing_over_actions(&inner);
                 self.note_buffer_switch();
                 self.charge_rows_that_left_the_screen(now_ms);
                 self.revision = self.next_revision();

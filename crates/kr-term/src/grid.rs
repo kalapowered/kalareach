@@ -255,6 +255,18 @@ impl HistoryAccount {
     }
 }
 
+/// What applying one event to the grid decided.
+///
+/// The adaptation's own record carries the actions it produced as well; this is what is left once
+/// they have been applied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Applied {
+    /// Whether the grid library failed to recognise a sequence the engine classified as `D` or `M`.
+    pub unrecognised: bool,
+    /// Whether a parameter was reduced to the largest value the grid could act on.
+    pub clamped: bool,
+}
+
 /// What the rows of both buffers hold, apart from the hyperlink objects on them.
 ///
 /// Read from the rows that are showing and from how many rows there are, so what it costs to read
@@ -632,27 +644,52 @@ impl CanonicalGrid {
     /// worse than a consumed one: the canonical grid would do something the physical terminal on
     /// the other side would not, or the other way round.
     ///
-    /// The actions this applied are handed to the library rather than copied to it, so the record
-    /// it returns says what the adaptation decided and carries no actions. Copying them would put
-    /// a second list of every event's actions on the path every byte of output takes.
+    /// The record it returns carries the actions the adaptation produced, whether or not they were
+    /// applied. [`Self::apply_handing_over_actions`] is the same work without that copy.
     pub fn apply(&mut self, event: &Event) -> Adapted {
-        let mut adapted = adapt(
+        let adapted = self.adapt_event(event);
+        let mut applying = adapted.clone();
+        self.drive(event, &mut applying);
+        adapted
+    }
+
+    /// Applies one approved event, handing the adapted actions to the library.
+    ///
+    /// The same work as [`Self::apply`] and the same decisions, with the actions moved into the
+    /// library rather than copied to it, and only what the adaptation decided handed back. Every
+    /// byte of a session's output travels this path, so a second list of every event's actions on
+    /// it is a copy a session pays for and nothing reads.
+    pub(crate) fn apply_handing_over_actions(&mut self, event: &Event) -> Applied {
+        let mut adapted = self.adapt_event(event);
+        self.drive(event, &mut adapted);
+        Applied {
+            unrecognised: adapted.unrecognised,
+            clamped: adapted.clamped,
+        }
+    }
+
+    fn adapt_event(&self, event: &Event) -> Adapted {
+        adapt(
             event,
             AdaptContext {
                 rows: self.size.rows,
                 cols: self.size.cols,
             },
-        );
+        )
+    }
+
+    /// Performs one adapted event, taking the actions out of `adapted` as it applies them.
+    fn drive(&mut self, event: &Event, adapted: &mut Adapted) {
         if adapted.unrecognised {
             self.unrecognised = self.unrecognised.saturating_add(1);
-            return adapted;
+            return;
         }
         if let EventKind::Text { .. } = &event.kind
             && let Ok(text) = core::str::from_utf8(event.raw())
         {
             self.print(text);
             self.sync_history();
-            return adapted;
+            return;
         }
         // Anything that is not printed text ends the cell, exactly as it would have done inside one
         // read: the library flushes its own print buffer for the same reason.
@@ -662,7 +699,6 @@ impl CanonicalGrid {
                 .perform_actions(core::mem::take(&mut adapted.actions));
         }
         self.sync_history();
-        adapted
     }
 
     /// Draws a text run as the profile's width model says it should look.
