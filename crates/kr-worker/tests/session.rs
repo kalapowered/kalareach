@@ -1201,12 +1201,26 @@ async fn a_controller_whose_keys_cannot_be_established_is_refused_the_keys() {
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
+/// Returns the number a marker line carries, from bytes an attachment received.
+fn marked_number(output: &[u8], marker: &[u8]) -> Option<u64> {
+    let at = output
+        .windows(marker.len())
+        .position(|window| window == marker)?
+        + marker.len();
+    let digits: Vec<u8> = output[at..]
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    String::from_utf8(digits).ok()?.parse().ok()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn a_root_shell_that_exits_is_noticed_without_waiting_for_a_sweep() {
-    // The exit is an event the kernel reports, not something the host is asked to keep checking
-    // for: the session closes on the child signal, far inside the sweep that is only there in case
-    // one is lost. A host that had gone back to polling would still close the session, so the
-    // margin here is the assertion.
+async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
+    // The exit can happen before anything is watching for it: the shell is launched, and it is
+    // gone by the time the supervision has opened the child signal it would have been reported on.
+    // So the shell's status is asked for once before that supervision waits at all, and this is the
+    // case that proves it.
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(&host, "printf 'kr-leaving\\n'; exit 7");
     let started = tokio::time::Instant::now();
@@ -1222,31 +1236,78 @@ async fn a_root_shell_that_exits_is_noticed_without_waiting_for_a_sweep() {
         Some(7),
         "the shell's own status"
     );
-    // Well inside the sweep, not merely inside it. The closure sequence itself accounts for most
-    // of this: the grace period ends as soon as nothing the session owns is still running, and the
-    // output drain is two seconds.
     assert!(
         taken < kr_worker::lifecycle::IDLE_SWEEP_INTERVAL / 2,
-        "the exit reached the host before the sweep could have found it: {taken:?}"
+        "and nothing waited for the sweep to come round: {taken:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own_exit() {
+    // The case the child signal is actually for. The session is quiet for seconds before the shell
+    // exits, so nothing the session does can be what wakes the host, and a descendant holds the
+    // terminal open across the exit, so the terminal hanging up is not the evidence either. What is
+    // left is the exit itself, against a sweep that would not come round for thirty seconds.
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 30 & printf 'kr-settling\\n'; sleep 3; exit 7");
+    let started = tokio::time::Instant::now();
+    let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
+    let record = tokio::time::timeout(Duration::from_secs(45), runtime.wait_closed())
+        .await
+        .expect("the session closes on its own");
+    let taken = started.elapsed();
+
+    assert_eq!(record.reason, ClosureReason::RootExit);
+    assert_eq!(
+        record.root_exit_code.0.map(kr_protocol::scalars::U64::get),
+        Some(7),
+        "the shell's own status"
+    );
+    assert!(
+        taken < kr_worker::lifecycle::IDLE_SWEEP_INTERVAL / 2,
+        "the exit reached the host rather than the sweep finding it: {taken:?}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
-    // What the observation cadence is for. A closure only signals what is still running, so a job
-    // that started and finished while the session was live is in the record only because the host
-    // had already seen it - and what makes the host look is the session's own traffic, since a
-    // process starts from input it accepted or shows itself in output it produced.
+    // What the observation cadence is for. A closure signals what is still running, so a job that
+    // started and finished while the session was live is in the record only because the host had
+    // already seen it, and what makes the host look is the session's own traffic. The shell names
+    // the job and says when it has collected it, so the closure happens after the job is certainly
+    // gone rather than after a guess at how long it would take. It writes a line part way through
+    // as well: a subscriber that hears nothing for long enough stops listening, and the session
+    // this test wants is one that is running something rather than one that has gone quiet.
     let host = kr_ipc::testing::TempHost::create();
-    // The job prints nothing itself; what makes the host look is the shell's own line, written
-    // while the job is running. The shell then waits for it, which is what a shell does with its
-    // jobs: a job nobody collected the status of is a process this host would still find in the
-    // kernel's table at closure, and this test is about the record rather than about that.
-    let config = configuration(&host, "sleep 4 & printf 'kr-working\\n'; wait; exec cat");
-    let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
-    // Long enough for the job to have been observed while it ran, and to have ended and been
-    // collected afterwards.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    let config = configuration(
+        &host,
+        "sleep 4 & printf 'kr-job %s\\n' \"$!\"; sleep 2; printf 'kr-waiting\\n'; wait; \
+         printf 'kr-reaped\\n'; exec cat",
+    );
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    session
+        .attach(&terminal_attachment(session_id), requested, attachment_id)
+        .expect("attaches");
+    let mut stream = session.subscribe(attachment_id).expect("subscribes");
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+
+    let seen = collect(&mut stream, b"kr-reaped").await;
+    let job = marked_number(&seen, b"kr-job ").unwrap_or_else(|| {
+        panic!(
+            "the shell names the job it started: {}",
+            String::from_utf8_lossy(&seen)
+        )
+    });
+    assert!(
+        seen.windows(9).any(|window| window == b"kr-reaped"),
+        "the shell collected the job before this closes the session: {}",
+        String::from_utf8_lossy(&seen)
+    );
     assert_eq!(
         runtime.state(),
         SessionState::Live,
@@ -1260,8 +1321,11 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
 
     assert_eq!(record.reason, ClosureReason::CloseRequested);
     assert!(
-        record.terminated.len() >= 2,
-        "the record names the job as well as the root shell: {:?}",
+        record
+            .terminated
+            .iter()
+            .any(|process| process.identity.pid.get() == job),
+        "the record names the job the shell started and collected, process {job}: {:?}",
         record.terminated
     );
     assert!(
