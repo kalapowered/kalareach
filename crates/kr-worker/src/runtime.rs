@@ -824,8 +824,13 @@ impl SessionRuntime {
         for batch in batches {
             let _ = self.input.send(batch);
         }
-        // A new held prefix needs the timer to look again.
-        self.wake.notify_waiters();
+        // A new held prefix needs the timer to look again, and the permit has to survive the
+        // moment between the timer reading "no deadline" and beginning to wait. Waking whoever is
+        // already waiting is not enough: the timer that has just read an empty deadline is not
+        // waiting yet, and a notice it missed would leave a lone Escape waiting for the next
+        // keystroke, which is the one thing section 8 says it must never do. There is exactly one
+        // consumer of this signal, so storing a permit for it is what this needs.
+        self.wake.notify_one();
     }
 
     /// Admits a close and returns the acceptance, before anything is signalled.

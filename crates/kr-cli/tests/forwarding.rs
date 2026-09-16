@@ -381,10 +381,11 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
         "the session's screen reached the terminal: {}",
         output.text().escape_debug()
     );
+    let mut previous = 0_usize;
     for sequence in SEQUENCES {
         keyboard.types(sequence.bytes);
         // One sequence at a time, so an assertion that fails names the sequence that failed rather
-        // than a batch.
+        // than a batch, and so the order they arrived in is the order they were typed in.
         let before = retained(&hosted.runtime).len();
         let seen = retained_within(&hosted.runtime, sequence.bytes, Duration::from_secs(10));
         assert!(
@@ -392,6 +393,29 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
             "{} reached the application unchanged: {:?}",
             sequence.what,
             String::from_utf8_lossy(&seen[before.min(seen.len())..]).escape_debug()
+        );
+        // And it arrived after the one before it. A path that reordered or coalesced batches would
+        // put one of these in front of its predecessor.
+        let at = seen
+            .windows(sequence.bytes.len())
+            .rposition(|window| window == sequence.bytes)
+            .expect("the sequence is in the stream");
+        assert!(
+            at >= previous,
+            "{} arrived out of order: at {at}, after one at {previous}",
+            sequence.what
+        );
+        previous = at;
+    }
+    // Each framed marker arrived exactly once. A path that retried a batch, or that split one and
+    // sent both halves, would have doubled one of them.
+    let seen = retained(&hosted.runtime);
+    for marker in [&b"kr-cr\rZ"[..], &b"kr-lf\nZ"[..]] {
+        assert_eq!(
+            count(&seen, marker),
+            1,
+            "{} arrived more than once",
+            String::from_utf8_lossy(marker).escape_debug()
         );
     }
     // Nothing was substituted for what could not be decoded, which is the failure a text decoder

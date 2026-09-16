@@ -94,6 +94,19 @@ pub struct CloseAcceptance {
     pub initiated: bool,
 }
 
+/// What a lease the host ended by itself left behind, waiting to be reported.
+///
+/// Section 8 requires an interrupted paste and the input that never arrived to be reported. A
+/// takeover has an answer to report them in; a release the host performed on its own does not, so
+/// they are carried until the next acquire and reported with its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Interrupted {
+    /// Bytes that were accepted and never reached the application.
+    pub bytes: u64,
+    /// Whether a paste the application was inside was closed on its way out.
+    pub closed_open_paste: bool,
+}
+
 /// One live session.
 pub struct Session {
     config: SessionConfig,
@@ -103,6 +116,14 @@ pub struct Session {
     attachments: AttachmentTable,
     lease: InputLease,
     framer: PasteFramer,
+    /// What a lease that ended without anybody asking left behind, waiting to be reported.
+    ///
+    /// A takeover reports what the lease it displaced lost, in its own answer. A lease the host
+    /// ends by itself - because the application changed the keyboard negotiation to one that holder
+    /// cannot produce - has no such answer to be reported in, and dropping the count would make the
+    /// interruption unreportable. It is carried here until the next acquire, which reports it with
+    /// its own.
+    interrupted: Interrupted,
     history: OutputHistory,
     hub: OutputHub,
     journal: Option<Journal>,
@@ -207,6 +228,7 @@ impl Session {
             shell: None,
             lease: InputLease::new(),
             framer: PasteFramer::new(),
+            interrupted: Interrupted::default(),
             history,
             hub: OutputHub::new(),
             journal,
@@ -620,10 +642,23 @@ impl Session {
         // it had open is closed first, so the application is not left inside a bracketed paste
         // whose source has gone.
         let held = self.lease.holder() == Some(attachment_id);
-        self.lease.release_attachment(attachment_id);
+        let discarded_queue = self.lease.release_attachment(attachment_id);
         if held {
-            self.framer.close_for_takeover();
-            let _ = self.end_lease();
+            let framing = self.framer.close_for_takeover();
+            let left = self.end_lease();
+            // The source of this input has gone, which is the loss section 8 asks to be reported.
+            // The attachment that is leaving has no answer left to read it in, so it is carried to
+            // whoever takes the keys next.
+            self.interrupted.bytes = self
+                .interrupted
+                .bytes
+                .saturating_add(discarded_queue)
+                .saturating_add(left)
+                .saturating_add(framing.discarded_prefix.len() as u64);
+            self.interrupted.closed_open_paste |= framing.terminator.is_some()
+                || self
+                    .delivered_paste_open
+                    .load(std::sync::atomic::Ordering::Acquire);
         } else {
             self.note_lease_holder();
         }
@@ -795,10 +830,15 @@ impl Session {
         // A paste is reported as closed when one was open in the stream this lease accepted, or
         // when one is open at the application: the writer keeps the second, because a terminator
         // the framer accepted may have been queued behind a writer that never wrote it.
-        let closed_open_paste = framing.terminator.is_some()
+        let mut closed_open_paste = framing.terminator.is_some()
             || self
                 .delivered_paste_open
                 .load(std::sync::atomic::Ordering::Acquire);
+        // Plus whatever a lease the host ended by itself left behind. It had no answer of its own
+        // to be reported in, so it is reported here, once, and then it is nobody's any more.
+        let carried = std::mem::take(&mut self.interrupted);
+        discarded = discarded.saturating_add(carried.bytes);
+        closed_open_paste |= carried.closed_open_paste;
         // Nothing is queued for the terminator here. The writer closes a paste the application is
         // actually inside, before anything from the new lease reaches it; queueing a correction
         // under the old lease is what let one be discarded with it.
@@ -951,8 +991,34 @@ impl Session {
     }
 
     /// Records that the application has enabled or disabled bracketed-paste mode.
-    pub const fn set_bracketed_paste(&mut self, enabled: bool) {
-        self.framer.set_bracketed_paste(enabled);
+    ///
+    /// Turning it off with a mere delimiter prefix held releases those bytes at once: the framing
+    /// they were being held for no longer exists, so waiting out a deadline that now guards nothing
+    /// would delay a keystroke for no reason. A prefix held inside an open paste keeps waiting,
+    /// because that paste still has to be closed before another actor writes.
+    pub fn set_bracketed_paste(&mut self, enabled: bool) {
+        let released = self.framer.set_bracketed_paste(enabled);
+        self.release_prefix(released);
+    }
+
+    /// Queues bytes the recogniser has stopped holding, under the lease that sent them.
+    fn release_prefix(&mut self, released: Vec<u8>) {
+        if released.is_empty() {
+            return;
+        }
+        if self.lease.holder().is_none() {
+            // Nothing holds the keys, so these bytes belong to a lease that has ended and went
+            // with it. Writing them now would put an ended actor's input in front of the next one.
+            return;
+        }
+        self.queue_input(InputBatch::Lease {
+            epoch: self.lease.epoch(),
+            bytes: released,
+            paste: PasteTransition::default(),
+        });
+        // The held prefix has gone, so a frame that was open is closed and the response lane's
+        // gate is open again.
+        self.pump_replies();
     }
 
     /// Returns whether a bracketed paste has been started and not yet ended.
@@ -1081,8 +1147,10 @@ impl Session {
         // two reads, and one that appears inside a string and sets nothing, are both answered
         // correctly here and by nothing else. The recogniser is told after the batch is parsed,
         // which is the first moment the answer exists.
-        self.framer
+        let released = self
+            .framer
             .set_bracketed_paste(self.engine.bracketed_paste());
+        self.release_prefix(released);
         // The same batch may have changed the keyboard negotiation, and whoever holds the keys has
         // to be able to produce whatever it changed to.
         self.reevaluate_lease();
@@ -1112,11 +1180,32 @@ impl Session {
         if self.attachments.supplies_encoding(holder, required) {
             return false;
         }
-        self.lease.release_attachment(holder);
-        self.framer.close_for_takeover();
-        let _ = self.end_lease();
+        let discarded_queue = self.lease.release_attachment(holder);
+        let framing = self.framer.close_for_takeover();
+        let left = self.end_lease();
+        // What this lease lost is carried rather than dropped. Nobody asked for the release, so
+        // there is no answer to put it in; the next acquire reports it with its own.
+        self.interrupted.bytes = self
+            .interrupted
+            .bytes
+            .saturating_add(discarded_queue)
+            .saturating_add(left)
+            .saturating_add(framing.discarded_prefix.len() as u64);
+        self.interrupted.closed_open_paste |= framing.terminator.is_some()
+            || self
+                .delivered_paste_open
+                .load(std::sync::atomic::Ordering::Acquire);
         self.pump_replies();
         true
+    }
+
+    /// Returns what a lease the host ended by itself left behind and nobody has been told about.
+    ///
+    /// It is cleared by the next acquire, which reports it. A test reads it here because the wire
+    /// answer belongs to that acquire rather than to the release.
+    #[must_use]
+    pub const fn interrupted_input(&self) -> Interrupted {
+        self.interrupted
     }
 
     /// Settles the screen when the terminal's output goes quiet.

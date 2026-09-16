@@ -78,12 +78,17 @@ built to do and this one must not:
 | Clicks or drags | the mouse report, in whichever protocol the application enabled |
 | Moves the window's focus | a focus event, and only while this attachment holds the input lease |
 
-A terminal that may not type is told so once, on standard error, and goes on watching. That is what
-happens under `--no-probe`: the host checks that a controller can supply the encoding the
-application has negotiated, and a terminal nobody was allowed to ask about cannot be shown to. It is
-also what happens when an application turns on a keyboard protocol this terminal does not implement
-while the attachment is running; the next keystroke is refused and the command says which of the two
-it got.
+A terminal that may not type at all is told so once, on standard error, and goes on watching. That
+is what happens under `--no-probe`: the host checks that a controller can supply the encoding the
+application has negotiated, and a terminal nobody was allowed to ask about cannot be shown to.
+
+Losing the keys part way through is a different thing and ends the attachment. An application can
+turn on a keyboard protocol the outer terminal does not implement, and the host then takes the keys
+rather than let it send an encoding that means other keys; the next keystroke is refused with
+`LEASE_LOST`, and the command exits with the refused-request code (8) after putting the terminal
+back.
+Attaching again gives a terminal that watches, and the keys come back when the application leaves
+that protocol.
 
 What the host sends is not always every byte the application wrote. The session's canonical grid
 answers the application's queries itself and routes a bell, a clipboard write or a notification to

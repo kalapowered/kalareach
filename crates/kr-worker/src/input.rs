@@ -30,6 +30,9 @@ use kr_protocol::input::InputLeaseState;
 use kr_protocol::scalars::Nullable;
 use kr_term::modes::{KITTY_QUALIFIED_FLAGS, KeyboardEncoding};
 
+/// The Kitty flag that asks for the shifted and base forms of a key beside the one pressed.
+pub const KITTY_ALTERNATE_KEYS: u8 = 0b0000_0100;
+
 /// What one controller's input path can put on the wire.
 ///
 /// Section 8 makes this a precondition of the lease rather than a hope: a controller holds input
@@ -47,14 +50,18 @@ pub struct Encoders {
 impl Encoders {
     /// A controller that builds each key from the logical key and its modifiers.
     ///
-    /// It produces whichever protocol is in force, because it encodes from the source information
-    /// rather than passing on whatever a terminal happened to send. What it may not do is invent
-    /// what the source does not contain - a key release, a modifier or a scan code that was never
-    /// reported - and that obligation belongs to the encoder itself rather than to this
-    /// declaration.
+    /// It produces whichever protocol it is declared for, because it encodes from the source
+    /// information rather than passing on whatever a terminal happened to send. What it may not do
+    /// is invent what the source does not contain - a key release, a modifier or a scan code that
+    /// was never reported - and that obligation belongs to the encoder itself.
+    ///
+    /// Alternate-key reporting is **not** among the flags. That flag asks a controller to report
+    /// the shifted and base forms of a key alongside the one that was pressed, and
+    /// `kr_client::encoder` carries the base key but reports no alternates, so claiming it would
+    /// advertise an encoding this build's own encoder does not produce.
     pub const TYPED: Self = Self {
         modify_other_keys: 2,
-        kitty_flags: KITTY_QUALIFIED_FLAGS,
+        kitty_flags: KITTY_QUALIFIED_FLAGS & !KITTY_ALTERNATE_KEYS,
     };
 
     /// A terminal that implements neither enhanced protocol.
@@ -113,16 +120,22 @@ impl Encoders {
 pub const KEYBOARD_PROTOCOLS: &[TerminalKeyboard] = &[
     // xterm defines `modifyOtherKeys` and implements no Kitty protocol.
     TerminalKeyboard::new("xterm-256color", 2, 0),
-    // The Kitty protocol is kitty's own.
+    // The Kitty protocol is kitty's own, and an application turns it on with a sequence rather
+    // than a setting.
     TerminalKeyboard::new("xterm-kitty", 0, KITTY_QUALIFIED_FLAGS),
-    TerminalKeyboard::new("wezterm", 2, KITTY_QUALIFIED_FLAGS),
+    // WezTerm implements the Kitty protocol behind a configuration option that is off by default
+    // (`enable_kitty_keyboard`), so an application that turns it on reaches a terminal that may
+    // simply not answer. Nothing claims it here: what is claimed is what an unconfigured terminal
+    // of that name does.
+    TerminalKeyboard::new("wezterm", 2, 0),
     // Alacritty implements the Kitty protocol and not `modifyOtherKeys`.
     TerminalKeyboard::new("alacritty", 0, KITTY_QUALIFIED_FLAGS),
     TerminalKeyboard::new("foot", 2, KITTY_QUALIFIED_FLAGS),
     TerminalKeyboard::new("ghostty", 2, KITTY_QUALIFIED_FLAGS),
-    // tmux implements `modifyOtherKeys`. It forwards the Kitty protocol only under its own
-    // extended-keys setting and to whatever is outside it, so nothing here claims it.
-    TerminalKeyboard::new("tmux-256color", 2, 0),
+    // tmux is a multiplexer rather than a terminal: what it forwards depends on its own
+    // extended-keys setting and on whatever is outside it, and neither is established by the name.
+    // So it claims nothing beyond the ordinary encoding.
+    TerminalKeyboard::new("tmux-256color", 0, 0),
     // GNU screen implements neither.
     TerminalKeyboard::new("screen-256color", 0, 0),
 ];
@@ -239,8 +252,19 @@ impl PasteFramer {
     }
 
     /// Records whether the application has enabled canonical bracketed-paste mode.
-    pub const fn set_bracketed_paste(&mut self, enabled: bool) {
+    ///
+    /// Returns bytes to forward now. Section 8 tracks framing only while the mode is enabled, and
+    /// beyond that only until an already-open paste is safely terminated, so an application that
+    /// turns the mode off while a mere delimiter prefix is held has left nothing to protect: those
+    /// bytes are released at once rather than waiting out a deadline that now guards nothing. A
+    /// prefix held inside an open paste stays held, because that paste still has to be closed.
+    pub fn set_bracketed_paste(&mut self, enabled: bool) -> Vec<u8> {
         self.bracketed_paste_enabled = enabled;
+        if enabled || self.paste_open {
+            return Vec::new();
+        }
+        self.held_since = None;
+        std::mem::take(&mut self.held)
     }
 
     /// Returns true when a paste has started and not yet ended.
@@ -278,6 +302,11 @@ impl PasteFramer {
             self.held_since = None;
         }
         let mut pending = std::mem::take(&mut self.held);
+        // Where the bytes that were already held end. A prefix that starts inside them is the same
+        // prefix continued and keeps its original deadline; one that starts after them is a new
+        // prefix of its own, and giving it the old deadline would expire it early - which for the
+        // second half of a delimiter means never recognising it at all.
+        let prior = pending.len();
         let held_since = self.held_since.take();
         pending.extend_from_slice(bytes);
 
@@ -309,10 +338,15 @@ impl PasteFramer {
                     continue;
                 }
                 if is_proper_prefix(rest) {
-                    // Hold the tail and keep the original deadline: a new frame never buys the
-                    // recogniser more time.
+                    // Hold the tail. A prefix continued from the bytes already held keeps its
+                    // original deadline, because a new frame never buys the recogniser more time;
+                    // a prefix that begins after them has not been held before and starts its own.
                     self.held = rest.to_vec();
-                    self.held_since = Some(held_since.unwrap_or(now));
+                    self.held_since = Some(if index < prior {
+                        held_since.unwrap_or(now)
+                    } else {
+                        now
+                    });
                     break;
                 }
             }
@@ -636,17 +670,28 @@ mod tests {
         assert!(!unknown.supplies(KeyboardEncoding::Kitty(0b0001)));
     }
 
-    /// KR-REQ-08.60: the typed encoder produces whichever protocol is in force.
+    /// KR-REQ-08.60: the typed encoder produces what it is declared for, and no more.
     #[test]
-    fn the_typed_encoder_supplies_every_protocol_this_profile_advertises() {
+    fn the_typed_encoder_supplies_what_this_builds_encoder_actually_produces() {
         for required in [
             KeyboardEncoding::Legacy,
             KeyboardEncoding::ModifyOtherKeys(1),
             KeyboardEncoding::ModifyOtherKeys(2),
-            KeyboardEncoding::Kitty(KITTY_QUALIFIED_FLAGS),
+            KeyboardEncoding::Kitty(0b0000_0001),
+            KeyboardEncoding::Kitty(0b0000_0011),
+            KeyboardEncoding::Kitty(0b0000_1011),
         ] {
             assert!(Encoders::TYPED.supplies(required), "{required:?}");
         }
+        assert!(
+            !Encoders::TYPED.supplies(KeyboardEncoding::Kitty(KITTY_ALTERNATE_KEYS)),
+            "alternate-key reporting is a flag this build's encoder does not produce, so nothing \
+             claims it and an application that asks for it refuses the typed controller too"
+        );
+        assert!(
+            !Encoders::TYPED.supplies(KeyboardEncoding::Kitty(KITTY_QUALIFIED_FLAGS)),
+            "and the whole qualified set includes it"
+        );
         assert!(
             !Encoders::TYPED.supplies(KeyboardEncoding::Kitty(0b0001_0000)),
             "text association is outside the profile, so nothing advertises it"
@@ -680,6 +725,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-08.64: a completed delimiter is emitted once, and the writer is told where it sits.
     #[test]
     fn every_delimiter_is_reported_with_where_it_sits() {
         let mut framer = PasteFramer::new();
@@ -702,6 +748,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-08.64: an expired prefix is forwarded unchanged, in front of what followed it.
     #[test]
     fn a_prefix_that_expired_moves_the_offsets_along_with_it() {
         let mut framer = PasteFramer::new();
@@ -729,6 +776,7 @@ mod tests {
         ConnectionId::new(Uuid::from_bytes([byte; 16]))
     }
 
+    /// KR-REQ-08.64: with the mode off and no paste open, an Escape gets no prefix hold.
     #[test]
     fn an_escape_is_forwarded_at_once_when_bracketed_paste_is_off() {
         let mut framer = PasteFramer::new();
@@ -738,6 +786,7 @@ mod tests {
         assert!(outcome.deadline.is_none());
     }
 
+    /// KR-REQ-08.64, KR-PERF-002: the expiry runs on the clock, not on the next keystroke.
     #[test]
     fn a_lone_escape_is_held_and_then_expires_without_another_key() {
         let mut framer = PasteFramer::new();
@@ -754,6 +803,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-08.64, KR-PERF-002: recognition runs over the held prefix plus the new bytes.
     #[test]
     fn a_delimiter_split_across_frames_is_recognised_once_with_its_payload_kept() {
         let mut framer = PasteFramer::new();
@@ -769,6 +819,7 @@ mod tests {
         assert!(framer.paste_open());
     }
 
+    /// KR-REQ-08.64: a new frame does not buy a held prefix more time.
     #[test]
     fn a_later_frame_does_not_extend_the_original_deadline() {
         let mut framer = PasteFramer::new();
@@ -780,6 +831,7 @@ mod tests {
         assert_eq!(outcome.deadline, Some(start + RECOGNISER_DEADLINE));
     }
 
+    /// KR-REQ-08.64, KR-PERF-002: every prefix length is held, not only the first.
     #[test]
     fn every_prefix_length_of_the_start_delimiter_is_held() {
         for length in 1..PASTE_START.len() {
@@ -791,6 +843,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-08.64: bytes that match no delimiter are forwarded unchanged.
     #[test]
     fn bytes_that_match_no_delimiter_are_forwarded_unchanged() {
         let mut framer = PasteFramer::new();
@@ -800,6 +853,7 @@ mod tests {
         assert_eq!(outcome.held, 0);
     }
 
+    /// KR-REQ-08.64: an open paste is closed before the next lease's input.
     #[test]
     fn an_open_paste_is_closed_before_the_next_lease_writes() {
         let mut framer = PasteFramer::new();
@@ -811,6 +865,7 @@ mod tests {
         assert!(!framer.paste_open());
     }
 
+    /// KR-REQ-08.64: an undelivered delimiter is discarded on source loss, not forwarded.
     #[test]
     fn an_incomplete_delimiter_is_discarded_on_takeover_rather_than_forwarded() {
         let mut framer = PasteFramer::new();
@@ -822,6 +877,7 @@ mod tests {
         assert_eq!(framer.held_len(), 0);
     }
 
+    /// KR-REQ-08.64: framing is tracked until an already-open paste is safely terminated.
     #[test]
     fn a_paste_end_is_still_recognised_after_the_mode_is_disabled_mid_paste() {
         let mut framer = PasteFramer::new();
@@ -831,6 +887,57 @@ mod tests {
         let outcome = framer.push(b"\x1b[201~", Instant::now());
         assert!(outcome.paste_ended);
         assert!(!framer.paste_open());
+    }
+
+    /// KR-REQ-08.62: a takeover advances the epoch and drops what the old lease had not delivered.
+    /// KR-REQ-08.64: a prefix that begins after a completed delimiter starts its own deadline.
+    #[test]
+    fn a_new_prefix_after_a_completed_delimiter_gets_its_own_deadline() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        let start = Instant::now();
+        // A lone Escape is held. Twenty milliseconds later the rest of the start delimiter arrives,
+        // completes it, and is followed by the first byte of another delimiter.
+        framer.push(b"\x1b", start);
+        let outcome = framer.push(b"[200~text\x1b", start + Duration::from_millis(20));
+        assert!(outcome.paste_started);
+        assert_eq!(outcome.held, 1);
+        assert_eq!(
+            outcome.deadline,
+            Some(start + Duration::from_millis(20) + RECOGNISER_DEADLINE),
+            "the new prefix has its own deadline: the first one's would expire it in five \
+             milliseconds and the rest of a delimiter arriving after that would never be recognised"
+        );
+        // And the rest of that delimiter, ten milliseconds later, still completes it.
+        let ending = framer.push(b"[201~", start + Duration::from_millis(30));
+        assert!(ending.paste_ended, "{ending:?}");
+        assert_eq!(ending.forward, b"\x1b[201~".to_vec());
+    }
+
+    /// KR-REQ-08.64: framing stops when the mode goes off and there is no paste to terminate.
+    #[test]
+    fn turning_the_mode_off_releases_a_prefix_that_now_guards_nothing() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        let outcome = framer.push(b"\x1b[20", Instant::now());
+        assert_eq!(outcome.held, 4);
+        // The application turns canonical bracketed paste off. Nothing is open, so those bytes were
+        // being held for framing that no longer exists.
+        let released = framer.set_bracketed_paste(false);
+        assert_eq!(released, b"\x1b[20".to_vec());
+        assert_eq!(framer.held_len(), 0);
+        assert!(framer.deadline().is_none());
+        // A prefix held inside an open paste is a different case: that paste still has to be
+        // closed, so tracking continues.
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        framer.push(b"\x1b[200~text\x1b[20", Instant::now());
+        assert!(framer.paste_open());
+        assert!(
+            framer.set_bracketed_paste(false).is_empty(),
+            "nothing is released while a paste is still open"
+        );
+        assert_eq!(framer.held_len(), 4);
     }
 
     #[test]
@@ -849,6 +956,7 @@ mod tests {
         assert_eq!(lease.queued_bytes(), 0);
     }
 
+    /// KR-REQ-08.63: a stale epoch is refused and never acquires the lease.
     #[test]
     fn a_stale_epoch_is_refused_and_does_not_acquire_implicitly() {
         let mut lease = InputLease::new();
@@ -861,6 +969,7 @@ mod tests {
         assert_eq!(lease.holder(), Some(attachment(2)));
     }
 
+    /// KR-REQ-23.36: input sequences are acknowledged per connection and never replayed.
     #[test]
     fn input_sequences_must_follow_on_one_connection() {
         let mut lease = InputLease::new();
@@ -876,6 +985,7 @@ mod tests {
         lease.accept_write(attachment(1), 1, 1).expect("second");
     }
 
+    /// KR-REQ-23.36: a reconnecting holder gets a new stream identity rather than a replay.
     #[test]
     fn a_reconnecting_holder_starts_a_new_stream_rather_than_replaying() {
         let mut lease = InputLease::new();

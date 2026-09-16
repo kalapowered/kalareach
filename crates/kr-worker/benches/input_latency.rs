@@ -7,17 +7,24 @@
 //! # What is being measured, and what is deliberately not
 //!
 //! The path is the one `kr attach` uses: a client writes `input.write` on the session's own local
-//! socket, and the host answers after the bytes have been written into the pseudo-terminal. The
-//! response is the end of the measurement because the host encodes it only once the write has
-//! happened, so the figure is the host's own added latency.
+//! socket. What the measurement waits for is the byte arriving at the *application*, which the root
+//! program reports by echoing it, and then reaching the client again as output.
 //!
-//! What is outside it is what section 27 puts outside it: the application's own read and whatever
-//! it then does, and the physical terminal's render. Waiting for the application to answer would
-//! measure the application.
+//! That is deliberately **more** than section 27 asks for. The section excludes the application's
+//! own work and the terminal's render; this includes the application's read and echo and the host's
+//! whole output path. It is measured that way because the host's acknowledgement is not proof that
+//! the byte was written: the write is handed to the session's writer and the answer does not wait
+//! for it, so a figure that stopped at the answer would pass while a slow writer missed the bound.
+//! An upper bound that meets the target establishes the target; a figure that measures less than
+//! the target does not.
 //!
-//! The recogniser measurement is the other way round, and has to be. What it measures is a *wait*
-//! the host imposes deliberately, so it runs to the point where the held byte reaches the
-//! application, which the root program reports by echoing it back.
+//! The terminal's own render is still outside it, because no application here draws anything.
+//!
+//! The recogniser measurement runs the same way, and has to. What it measures is a *wait* the host
+//! imposes deliberately, so it runs to the point where the held byte reaches the application. Its
+//! own bound is checked twice: the deadline the host is built with is asserted against section 27's
+//! twenty-five milliseconds directly, and the observed arrival is bounded separately with a stated
+//! allowance for everything around it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,7 +33,7 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
-use kr_protocol::envelope::ActionTarget;
+use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
@@ -57,6 +64,10 @@ const RECOGNISER_DEADLINE: Duration = Duration::from_millis(25);
 /// The deadline is the host's; this covers the timer's own wake-up, the write, the application's
 /// echo and this measurement's polling interval. A figure beyond it is a wait the requirement does
 /// not allow, whatever caused it.
+///
+/// An allowance cannot tell a twenty-five millisecond deadline from a thirty-five millisecond one,
+/// so the deadline itself is asserted against section 27's figure separately. This bounds the path
+/// around it.
 const RECOGNISER_TOLERANCE: Duration = Duration::from_millis(15);
 
 /// How many keystrokes the latency measurement sends.
@@ -76,9 +87,6 @@ const ECHOES: &str = "stty raw -echo; printf 'kr-ready.'; exec cat";
 
 /// The same, with canonical bracketed paste enabled by the application.
 const ECHOES_BRACKETED: &str = "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec cat";
-
-/// A root program that reads its input and keeps nothing, so the terminal never fills.
-const DRAINS: &str = "stty raw -echo; printf 'kr-ready.'; exec cat > /dev/null";
 
 fn build() -> BuildId {
     BuildId::new("kr-perf/0").expect("a build identifier")
@@ -441,9 +449,11 @@ fn added_input_forwarding_latency() {
         "  conditions: a release build on a host of {} logical processors, with \
          {BACKGROUND_SESSIONS} live shells and {BACKGROUND_VIEWS} attached views; {SAMPLES} \
          single-byte writes from a client on the session's own local socket, each measured to the \
-         host's answer, which it sends only after the byte has been written into the \
-         pseudo-terminal. The application's own read and the terminal's render are excluded, as \
-         section 27 excludes them.",
+         byte arriving back at that client after the application echoed it. That is more than \
+         section 27 asks for - it includes the application's read and echo and the host's whole \
+         output path, where the section excludes the application - so it is an upper bound on the \
+         added forwarding latency rather than the figure itself. The terminal's render is outside \
+         it: nothing here draws.",
         processors()
     );
     println!(
@@ -471,7 +481,7 @@ fn added_input_forwarding_latency() {
 /// Sends the keystrokes and returns the sorted samples, plus what closing the sessions did.
 async fn measure_latency() -> (Result<Vec<Duration>, String>, Result<(), String>) {
     let (sessions, views) = background().await;
-    let measured = hosted(DRAINS).await;
+    let measured = hosted(ECHOES).await;
     let samples = latency_samples(&measured).await;
     // Everything this measurement started is closed before its figures are looked at, so a
     // failure never leaves a shell running.
@@ -498,6 +508,10 @@ async fn latency_samples(hosted: &Hosted) -> Result<Vec<Duration>, String> {
         return Err("the root program never started reading".to_owned());
     }
     let (mut client, attachment_id, epoch) = controlling(hosted).await;
+    // Everything the attachment was sent while it was joining: the screen it was drawn, and the
+    // application's own opening output. The measurement starts once that has stopped arriving.
+    drain(&mut client, Duration::from_millis(500)).await;
+
     let mut samples = Vec::with_capacity(SAMPLES);
     for sequence in 0..SAMPLES {
         let params = InputWriteParams {
@@ -507,16 +521,59 @@ async fn latency_samples(hosted: &Hosted) -> Result<Vec<Duration>, String> {
             sequence: kr_protocol::ids::InputSequence::new(sequence as u64),
             bytes: Bytes::new(b"x".to_vec()),
         };
+        let encoded = kr_protocol::envelope::ParamsValue::from_typed(&params)
+            .map_err(|error| format!("the request did not encode: {error}"))?;
+        let request_id = kr_protocol::ids::RequestId::new(sequence as u64 + 1);
+        // Written rather than asked, because the answer and the echo arrive on the same connection
+        // and a call that waited for the answer would read the echo as part of waiting for it.
         let started = Instant::now();
-        let outcome = client
-            .request(Method::InputWrite, &params)
+        client
+            .writer()
+            .write_message(&ControlFrame::Request(kr_protocol::envelope::Request {
+                request_id,
+                method: Method::InputWrite.into(),
+                method_version: kr_protocol::method::MethodVersion::V1,
+                params: encoded,
+            }))
             .await
             .map_err(|error| format!("the write did not reach the worker: {error}"))?;
-        let elapsed = started.elapsed();
-        let accepted: InputWriteResult = outcome
-            .map_err(|error| format!("the write was refused: {}", error.message))?
-            .to_typed()
-            .map_err(|error| format!("the answer did not decode: {error}"))?;
+        let mut accepted = None;
+        let elapsed = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), client.recv())
+                .await
+                .map_err(|_| "the echo of a keystroke never arrived".to_owned())?
+                .map_err(|error| format!("the connection ended: {error}"))?;
+            match frame {
+                ControlFrame::Response(response) => {
+                    let value = match response.outcome {
+                        kr_protocol::envelope::Outcome::Ok(value) => value,
+                        kr_protocol::envelope::Outcome::Error(error) => {
+                            return Err(format!("the write was refused: {}", error.message));
+                        }
+                    };
+                    accepted = Some(
+                        value
+                            .to_typed::<InputWriteResult>()
+                            .map_err(|error| format!("the answer did not decode: {error}"))?,
+                    );
+                }
+                ControlFrame::Notification(notification)
+                    if notification.event_type.as_str() == "session.output" =>
+                {
+                    let event = notification
+                        .payload
+                        .to_typed::<kr_protocol::recovery::OutputEvent>()
+                        .map_err(|error| format!("the output did not decode: {error}"))?;
+                    if !event.bytes.as_slice().is_empty() {
+                        break started.elapsed();
+                    }
+                }
+                _ => {}
+            }
+        };
+        let accepted = accepted.ok_or_else(|| {
+            "the host answered the write before the application echoed it".to_owned()
+        })?;
         if accepted.forwarded_bytes.get() != 1 {
             return Err(format!(
                 "a single ordinary byte was forwarded whole: {} forwarded, {} held",
@@ -529,6 +586,11 @@ async fn latency_samples(hosted: &Hosted) -> Result<Vec<Duration>, String> {
     drop(client);
     samples.sort_unstable();
     Ok(samples)
+}
+
+/// Reads whatever this client has waiting until nothing arrives for `quiet`.
+async fn drain(client: &mut LocalClient, quiet: Duration) {
+    while tokio::time::timeout(quiet, client.recv()).await.is_ok() {}
 }
 
 /// KR-PERF-002: the recogniser's deadline, per prefix length, and a split delimiter.
@@ -565,11 +627,25 @@ fn paste_prefix_recogniser_deadline() {
         "  a delimiter split across two frames: recognised once, in {:?}, with its payload kept",
         report.split
     );
+    // The requirement's own bound, on the deadline this host is built with. It is asserted here
+    // rather than inferred from a figure, because a measurement with an allowance around it cannot
+    // tell a twenty-five millisecond deadline from a thirty-five millisecond one.
+    assert_eq!(
+        kr_worker::input::RECOGNISER_DEADLINE,
+        Duration::from_millis(25),
+        "the recogniser's deadline is section 27's"
+    );
     let allowed = RECOGNISER_DEADLINE + RECOGNISER_TOLERANCE;
     for (what, held) in &report.holds {
         assert!(
             *held <= allowed,
-            "{what} was held for {held:?}, beyond the {RECOGNISER_DEADLINE:?} deadline"
+            "{what} was held for {held:?}, beyond the {RECOGNISER_DEADLINE:?} deadline and the \
+             stated allowance around it"
+        );
+        assert!(
+            *held >= RECOGNISER_DEADLINE,
+            "{what} was forwarded in {held:?}, before its deadline: the hold is what makes a split \
+             delimiter recognisable at all"
         );
     }
     assert!(
@@ -577,13 +653,20 @@ fn paste_prefix_recogniser_deadline() {
         "the split delimiter took {:?} to be recognised",
         report.split
     );
+    assert!(
+        report.paste_open_after_split,
+        "and the framer recorded the paste the delimiter opened, rather than passing its bytes \
+         through without recognising them"
+    );
 }
 
 struct Recogniser {
-    /// One entry per prefix length, plus the lone Escape, each measured on its own.
+    /// One entry per prefix of each delimiter, plus the lone Escape, each measured on its own.
     holds: Vec<(String, Duration)>,
     /// How long the split delimiter took to be recognised once its second half arrived.
     split: Duration,
+    /// Whether the framer recorded the paste that delimiter opened.
+    paste_open_after_split: bool,
 }
 
 async fn measure_recogniser() -> (Result<Recogniser, String>, Result<(), String>) {
@@ -609,54 +692,63 @@ async fn recogniser_samples(hosted: &Hosted) -> Result<Recogniser, String> {
     let mut sequence = 0_u64;
     let mut holds = Vec::new();
 
-    // Every proper prefix of the start delimiter, each one alone, and each one measured to the
-    // moment it reaches the application. A lone Escape is the shortest of them, and it is the case
-    // the requirement names outright: it must never wait for another keystroke.
-    let delimiter = b"\x1b[200~";
-    for length in 1..delimiter.len() {
-        let prefix = &delimiter[..length];
-        // A marker before the prefix, so what is waited for is this prefix rather than an earlier
-        // one. It is an ordinary byte and is forwarded at once.
-        let marker = format!("<{length}>");
-        write(
-            hosted,
-            &mut client,
-            attachment_id,
-            epoch,
-            &mut sequence,
-            marker.as_bytes(),
-        )
-        .await?;
-        let mut expected = marker.clone().into_bytes();
-        expected.extend_from_slice(prefix);
-        let started = Instant::now();
-        let accepted = write(
-            hosted,
-            &mut client,
-            attachment_id,
-            epoch,
-            &mut sequence,
-            prefix,
-        )
-        .await?;
-        if accepted.held_prefix_bytes.get() != length as u64 {
-            return Err(format!(
-                "a prefix of {length} bytes was held: {} held, {} forwarded",
-                accepted.held_prefix_bytes.get(),
-                accepted.forwarded_bytes.get()
-            ));
+    // Every proper prefix of both delimiters, each one alone, and each one measured to the moment
+    // it reaches the application. A lone Escape is the shortest of them, and it is the case the
+    // requirement names outright: it must never wait for another keystroke. The two delimiters
+    // share their first four bytes and differ at the fifth, so the end delimiter's own prefixes are
+    // measured rather than assumed to behave like the start's.
+    for (name, delimiter) in [("start", &b"\x1b[200~"[..]), ("end", &b"\x1b[201~"[..])] {
+        for length in 1..delimiter.len() {
+            let prefix = &delimiter[..length];
+            // A marker before the prefix, so what is waited for is this prefix rather than an
+            // earlier one. It is an ordinary byte and is forwarded at once.
+            let marker = format!("<{name}{length}>");
+            write(
+                hosted,
+                &mut client,
+                attachment_id,
+                epoch,
+                &mut sequence,
+                marker.as_bytes(),
+            )
+            .await?;
+            let mut expected = marker.clone().into_bytes();
+            expected.extend_from_slice(prefix);
+            let started = Instant::now();
+            let accepted = write(
+                hosted,
+                &mut client,
+                attachment_id,
+                epoch,
+                &mut sequence,
+                prefix,
+            )
+            .await?;
+            if accepted.held_prefix_bytes.get() != length as u64 {
+                return Err(format!(
+                    "a prefix of {length} bytes of the {name} delimiter was held: {} held, {} \
+                     forwarded",
+                    accepted.held_prefix_bytes.get(),
+                    accepted.forwarded_bytes.get()
+                ));
+            }
+            let held = arrival(&hosted.runtime, &expected, started, RECOGNISER_DEADLINE * 8)
+                .await
+                .ok_or_else(|| {
+                    format!(
+                        "a prefix of {length} bytes of the {name} delimiter never reached the \
+                         application on its own"
+                    )
+                })?;
+            let what = if length == 1 {
+                format!("a lone Escape, with no keystroke behind it (the {name} delimiter's pass)")
+            } else {
+                format!(
+                    "the {name} delimiter's prefix of {length} bytes, with no keystroke behind it"
+                )
+            };
+            holds.push((what, held));
         }
-        let held = arrival(&hosted.runtime, &expected, started, RECOGNISER_DEADLINE * 8)
-            .await
-            .ok_or_else(|| {
-                format!("a prefix of {length} bytes never reached the application on its own")
-            })?;
-        let what = if length == 1 {
-            "a lone Escape, with no keystroke behind it".to_owned()
-        } else {
-            format!("a prefix of {length} bytes, with no keystroke behind it")
-        };
-        holds.push((what, held));
     }
 
     // A delimiter split across two frames: recognised once, with the payload behind it kept.
@@ -704,8 +796,15 @@ async fn recogniser_samples(hosted: &Hosted) -> Result<Recogniser, String> {
             count(&seen, b"\x1b[200~")
         ));
     }
+    // What the framer made of it, rather than only what the application received: a path that
+    // forwarded the same bytes without recognising them would look identical in the output.
+    let paste_open_after_split = hosted.runtime.session().paste_open();
     drop(client);
-    Ok(Recogniser { holds, split })
+    Ok(Recogniser {
+        holds,
+        split,
+        paste_open_after_split,
+    })
 }
 
 async fn write(
@@ -754,12 +853,17 @@ fn a_percentile_is_the_rank_it_claims_to_be() {
     );
 }
 
-/// The echoing program is the one the recogniser measurement needs, and the draining one is the
-/// one the latency measurement needs. Naming them apart keeps a change to one from moving the
-/// other.
+/// Both measurements need a root program that echoes, because the echo is what says the byte
+/// reached the application, and they need the terminal in raw mode with its own echo off, because
+/// otherwise the line discipline answers first and the figure is the kernel's rather than the
+/// host's. The recogniser measurement additionally needs the application to have enabled canonical
+/// bracketed paste, which is the only thing that makes the host track framing at all.
 #[test]
-fn each_measurement_uses_the_root_program_it_needs() {
-    assert!(ECHOES.contains("exec cat"));
+fn both_measurements_use_a_root_program_that_reports_what_it_received() {
+    for program in [ECHOES, ECHOES_BRACKETED] {
+        assert!(program.contains("stty raw -echo"), "{program}");
+        assert!(program.contains("exec cat"), "{program}");
+    }
     assert!(ECHOES_BRACKETED.contains("2004h"));
-    assert!(DRAINS.contains("/dev/null"));
+    assert!(!ECHOES.contains("2004h"));
 }

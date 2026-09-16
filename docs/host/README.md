@@ -205,16 +205,31 @@ everything else it had: it goes on watching, and its typed actions are unaffecte
 The table rests on the same fact `QUALIFIED_TERMINALS` rests on, and carries the same limit: each
 row is what that terminal's own documentation says it implements, and a `TERM` name is the client's
 claim about which terminal it is rather than a measurement of it. So the rows are conservative. A
-protocol a terminal implements only under a setting, or only by passing it through to something
-else, is not claimed, because a controller that advertised one and then sent another is exactly what
-section 8 refuses to allow.
+protocol a terminal implements only under a setting is not claimed, because the name does not say
+whether the setting is on: WezTerm's Kitty support is behind a configuration option that starts off,
+so `wezterm` claims `modifyOtherKeys` and nothing more. Nor is a protocol claimed for something that
+is not a terminal: what `tmux` forwards depends on its own extended-keys setting and on whatever is
+outside it, so it claims only the ordinary encoding. A controller that advertised a protocol and
+then sent another is exactly what section 8 refuses to allow.
+
+A controller that builds its own keys is declared for the flags this build's encoder actually
+produces, which is not all of them: alternate-key reporting asks for the shifted and base forms of a
+key beside the one that was pressed, and the encoder reports the key it was given. An application
+that asks for that flag is served by no controller here, and says so, rather than being sent an
+encoding one of them only advertises.
 
 The comparison is made again whenever the application changes the negotiation, which it can do at
 any moment and without telling anybody. Parsing the output is what tells the host, so an application
 that turns an enhanced protocol on takes the keys from a terminal that cannot send it, and one that
 turns it off leaves the ordinary encoding, which any declared terminal can send, so that terminal
 can acquire again. The release is the ordinary one — the epoch advances, the fence goes out, a paste
-the lease had open is closed — and the holder learns on its next write.
+the lease had open is closed — and the holder learns on its next write, which is `LEASE_LOST`.
+
+Such a release has no answer of its own to report in, and neither does a detach, so what it
+interrupted is carried instead: the bytes that were accepted and never arrived, and whether a paste
+the application was inside had to be closed. The next `input.acquire` reports them with its own, once.
+A paste is never completed under another actor's lease, and closing the framing does not undo the
+part of it the application already has.
 
 Three things that look like input are not: a focus event, a passive scrollback read and an attached
 window that is doing nothing all leave the lease exactly where it was. So does the host's own reply

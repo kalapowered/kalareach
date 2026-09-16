@@ -420,84 +420,101 @@ async fn a_takeover_is_immediate_and_the_previous_epoch_is_invalid_at_once() {
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
-/// KR-ACC-008: a local takeover ends the other lease, and the approval executes once.
+/// A prompt that can be answered twice, so a test can tell "answered once" from "cannot answer".
+///
+/// It reads one byte, reports what it did with it under a number, and then waits for another. A
+/// fixture that printed once and became `cat` could not report a second execution, so it could not
+/// tell a host that prevented one from a host that allowed it.
+const APPROVAL_PROMPT: &str = "stty raw -echo; printf 'kr-approve?'; i=1; \
+     while [ $i -le 4 ]; do answer=$(dd bs=1 count=1 2>/dev/null); \
+     printf 'kr-granted:%s:%s.' \"$i\" \"$answer\"; i=$((i+1)); done; exec cat";
+
+/// KR-ACC-008: a takeover ends the other lease, and the approval executes once.
 ///
 /// The prompt is the shape a plugin-style approval takes in a terminal: the application writes the
-/// question, reads exactly one answer, and reports what it did with it. Two controllers both try to
-/// answer. Only one keystroke can reach the application, so the approval happens once and under
-/// the actor that actually held the keys.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_local_takeover_ends_the_other_lease_and_the_approval_executes_once() {
-    let host = kr_ipc::testing::TempHost::create();
-    let config = configuration(
-        &host,
-        "stty raw -echo; printf 'kr-approve?'; answer=$(head -c 1); \
-         printf 'kr-granted:%s.' \"$answer\"; exec cat",
-    );
-    let session_id = config.session_id;
-    let mut session = Session::open(config).expect("opens");
-    session.launch().expect("launches");
-
-    let remote = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
-    let local = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
-    let held = session
-        .acquire_input(remote, connection(), None)
+/// question and reads one answer. Two controllers, on two connections, both try to answer it. The
+/// fixture can report as many executions as reach it, so one report is evidence rather than a
+/// property of the fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_ends_the_other_lease_and_the_approval_executes_once() {
+    let wired = wired(APPROVAL_PROMPT).await;
+    let mut first = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut second = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let held_by_first = attach_over(&mut first, &wired, Some("xterm-256color")).await;
+    let held_by_second = attach_over(&mut second, &wired, Some("xterm-256color")).await;
+    let first_lease = acquire_over(&mut first, &wired, held_by_first)
+        .await
         .expect("the first holder");
-    let remote_epoch = held.lease.epoch.get();
+    retained_within(&wired.runtime, b"kr-approve?", Duration::from_secs(10)).await;
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
-    retained_within(&runtime, b"kr-approve?", Duration::from_secs(10)).await;
+    // The second controller takes the keys while the prompt is waiting for an answer.
+    let second_lease = acquire_over(&mut second, &wired, held_by_second)
+        .await
+        .expect("the takeover");
+    assert_eq!(
+        second_lease.lease.holder.as_ref(),
+        Some(&held_by_second),
+        "the lease moved"
+    );
 
-    // The local controller takes the keys while the prompt is waiting for an answer.
-    let taken = {
-        let mut session = runtime.session();
-        session
-            .acquire_input(local, connection(), None)
-            .expect("the takeover")
+    // Both answer. The first one's lease has ended, so its answer is refused on the wire.
+    let refused = write_over(
+        &mut first,
+        &wired,
+        held_by_first,
+        first_lease.lease.epoch,
+        0,
+        b"y",
+    )
+    .await
+    .expect_err("the lease it held has ended");
+    assert_eq!(refused.code, ErrorCode::LeaseLost);
+    write_over(
+        &mut second,
+        &wired,
+        held_by_second,
+        second_lease.lease.epoch,
+        0,
+        b"n",
+    )
+    .await
+    .expect("the holder's answer reaches the application");
+
+    let seen = retained_within(&wired.runtime, b"kr-granted:1:", Duration::from_secs(10)).await;
+    // Given a moment in which a second execution could have been reported, it was not.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let seen = if contains(&seen, b"kr-granted:1:") {
+        retained(&wired.runtime.session())
+    } else {
+        seen
     };
-    assert_eq!(taken.lease.holder.as_ref(), Some(&local));
-
-    // The previous holder answers anyway. Its bytes go nowhere.
-    {
-        let mut session = runtime.session();
-        let refused = session
-            .write_input(remote, remote_epoch, 0, b"y", std::time::Instant::now())
-            .expect_err("the lease it held has ended");
-        assert_eq!(refused.to_protocol_error().code, ErrorCode::LeaseLost);
-    }
-    // The new holder answers.
-    {
-        let mut session = runtime.session();
-        session
-            .write_input(
-                local,
-                taken.lease.epoch.get(),
-                0,
-                b"n",
-                std::time::Instant::now(),
-            )
-            .expect("the holder's answer reaches the application");
-    }
-    runtime.flush_input();
-
-    let seen = retained_within(&runtime, b"kr-granted:", Duration::from_secs(10)).await;
     assert_eq!(
         count(&seen, b"kr-granted:"),
         1,
         "the approval executed exactly once: {}",
-        String::from_utf8_lossy(&seen)
+        String::from_utf8_lossy(&seen).escape_debug()
     );
     assert!(
-        contains(&seen, b"kr-granted:n."),
+        contains(&seen, b"kr-granted:1:n."),
         "and with the answer of the actor that held the keys: {}",
-        String::from_utf8_lossy(&seen)
+        String::from_utf8_lossy(&seen).escape_debug()
     );
     assert!(
-        !contains(&seen, b"kr-granted:y."),
-        "not with the answer of the one whose lease had ended"
+        !contains(&seen, b"kr-granted:2:"),
+        "the prompt is still waiting rather than having consumed both answers"
     );
 
-    runtime.close(ClosureReason::CloseRequested).1.release();
+    drop(first);
+    drop(second);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -579,6 +596,216 @@ fn a_caller_cannot_label_its_own_ingress() {
         "and the acquire entry says so outright: {}",
         acquire.summary
     );
+}
+
+/// KR-REQ-08.63: a caller that claims a paired-device ingress is refused, not believed.
+///
+/// The worker's own endpoint is the local operating-system path and constructs the ingress itself.
+/// A mutation the control daemon forwards carries an ingress the daemon verified, and the worker
+/// checks it: an actor labelled as a paired device is refused at this endpoint, so a network client
+/// cannot reach the lease by asserting that it is local.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_caller_claiming_a_network_ingress_is_refused_the_lease() {
+    let wired = wired("sleep 120").await;
+    let mut local = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let attachment_id = attach_over(&mut local, &wired, Some("xterm-256color")).await;
+
+    // A control daemon's own connection, proved for the generation this worker accepts.
+    let mut daemon = LocalClient::connect(&wired.endpoint, LocalClientKind::Controller, build())
+        .await
+        .expect("connects");
+    let identity = Arc::clone(&wired.controller);
+    let boot = wired.boot.clone();
+    daemon
+        .present_generation(move |nonce| {
+            identity
+                .generation_token(ControllerGeneration::new(1), &boot, nonce)
+                .map_err(kr_ipc::IpcError::from)
+        })
+        .await
+        .expect("the worker accepts the generation");
+
+    let params = kr_protocol::envelope::ParamsValue::from_typed(&InputAcquireParams {
+        session_id: wired.session_id,
+        attachment_id,
+        expected_epoch: Nullable::null(),
+    })
+    .expect("encodes");
+    let mutation = kr_protocol::envelope::MutationRequest {
+        request_id: kr_protocol::ids::RequestId::new(1),
+        method: Method::InputAcquire.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        target: wired.target(),
+        params,
+        grant_id: Nullable::null(),
+        expected: kr_protocol::envelope::ParamsValue::from_typed(&std::collections::BTreeMap::<
+            String,
+            u64,
+        >::new())
+        .expect("encodes"),
+        action_window_id: kr_protocol::ids::ActionWindowId::new("window-that-does-not-exist")
+            .expect("a window identifier"),
+        requested_ttl_ms: kr_protocol::limits::DEFAULT_MUTATION_TTL,
+    };
+    let claiming_a_device = kr_protocol::actor::ActorEnvelope {
+        actor_id: kr_protocol::ids::ActorId::new("device:elsewhere").expect("an actor"),
+        ingress: ActorIngress::PairedDevice,
+        device_id: Nullable::null(),
+        grant_id: Nullable::null(),
+        grant_revision: Nullable::null(),
+        controller_generation: ControllerGeneration::new(1),
+        connection_id: connection(),
+    };
+    let refused = daemon
+        .forward(
+            &mutation,
+            &claiming_a_device,
+            kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 5_000),
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("this endpoint serves the local ingress");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied);
+    assert!(
+        !wired.runtime.session().lease().holder.is_present(),
+        "and nothing was handed over on the strength of a label"
+    );
+
+    drop(local);
+    drop(daemon);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// KR-REQ-08.60, KR-REQ-23.36: the encoder check refuses over the wire, with its own code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_incompatible_controller_is_refused_the_lease_over_the_wire() {
+    // The application asks for all keys as escape codes before anybody attaches.
+    let wired = wired("stty raw -echo; printf '\\033[=8;1ukr-ready.'; exec cat").await;
+    retained_within(&wired.runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+
+    // GNU screen implements neither enhanced protocol.
+    let screen = attach_over(&mut client, &wired, Some("screen-256color")).await;
+    let refused = acquire_over(&mut client, &wired, screen)
+        .await
+        .expect_err("it cannot produce what the application reads");
+    assert_eq!(refused.code, ErrorCode::InputIncompatible);
+    assert!(
+        refused.message.contains("Kitty"),
+        "and the refusal names the encoding: {}",
+        refused.message
+    );
+    // It still observes, which is what the row leaves it.
+    let mut streams = CanonicalSet::new();
+    streams.insert(EventStream::Output);
+    client
+        .request(
+            Method::EventsSubscribe,
+            &EventsSubscribeParams {
+                session_id: wired.session_id,
+                attachment_id: screen,
+                streams,
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("and goes on watching the session it cannot type into");
+
+    // A terminal that does implement it takes the keys.
+    let kitty = attach_over(&mut client, &wired, Some("xterm-kitty")).await;
+    acquire_over(&mut client, &wired, kitty)
+        .await
+        .expect("a terminal that implements the protocol");
+
+    drop(client);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// KR-REQ-08.61, KR-REQ-08.64: a lease the host ends by itself reports what it interrupted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_the_host_ends_reports_its_interrupted_input_to_the_next_holder() {
+    let host = kr_ipc::testing::TempHost::create();
+    // The application enables bracketed paste and reads nothing, so what is written stops at the
+    // line discipline and the accounting has something to count.
+    let config = configuration(
+        &host,
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; sleep 120",
+    );
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let xterm = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let typed = attach(&mut session, &semantic(session_id));
+    let held = session
+        .acquire_input(xterm, connection(), None)
+        .expect("the keys");
+    let epoch = held.lease.epoch.get();
+    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+
+    {
+        let mut session = runtime.session();
+        // A paste is opened and a delimiter prefix is left half-arrived.
+        session
+            .write_input(xterm, epoch, 0, b"\x1b[200~half", std::time::Instant::now())
+            .expect("the start and part of the body");
+        session
+            .write_input(xterm, epoch, 1, b"\x1b[20", std::time::Instant::now())
+            .expect("four bytes of a delimiter");
+        assert!(session.paste_open());
+        // Now the application turns on a protocol this terminal cannot produce. Nobody asked for
+        // the release, so there is no answer for it to be reported in.
+        session.ingest_output(b"\x1b[=8;1u");
+        assert!(
+            !session.lease().holder.is_present(),
+            "the keys were taken from it"
+        );
+        let interrupted = session.interrupted_input();
+        assert!(
+            interrupted.bytes >= 4,
+            "the undelivered prefix is counted rather than dropped: {}",
+            interrupted.bytes
+        );
+        assert!(
+            interrupted.closed_open_paste,
+            "and the paste it had open is reported as closed"
+        );
+    }
+
+    // The next holder is told, once, and then it is nobody's any more.
+    let next = {
+        let mut session = runtime.session();
+        session
+            .acquire_input(typed, connection(), None)
+            .expect("a controller that can produce it")
+    };
+    assert!(
+        next.discarded_bytes.get() >= 4,
+        "the interruption reaches the next holder: {}",
+        next.discarded_bytes.get()
+    );
+    assert!(next.closed_open_paste);
+    assert_eq!(
+        runtime.session().interrupted_input(),
+        kr_worker::session::Interrupted::default(),
+        "reported once, not once per acquire"
+    );
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -763,49 +990,85 @@ async fn a_paste_open_when_the_mode_was_turned_off_is_still_closed_before_the_ne
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
-/// KR-REQ-08.64: an incomplete delimiter is discarded on source loss and the interruption reported.
+/// KR-REQ-08.64: an incomplete delimiter is discarded on source loss and the loss is reported.
+///
+/// Source loss here is the source going: the attachment that sent those bytes detaches. The
+/// application echoes what it receives, so the prefix's absence from the echo is evidence that it
+/// never arrived rather than evidence of an application that writes nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(
         &host,
-        "stty raw -echo; printf '\\033[?2004hkr-ready.'; sleep 120",
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec cat",
     );
     let session_id = config.session_id;
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
-    let first = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
-    let second = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let leaving = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let next = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
     let held = session
-        .acquire_input(first, connection(), None)
+        .acquire_input(leaving, connection(), None)
         .expect("the keys");
     let epoch = held.lease.epoch.get();
     let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
 
-    let taken = {
+    {
         let mut session = runtime.session();
+        // An ordinary byte, which the application echoes, and then four bytes of a delimiter,
+        // which it does not see.
+        session
+            .write_input(leaving, epoch, 0, b"kr-typed.", std::time::Instant::now())
+            .expect("ordinary bytes");
         let accepted = session
-            .write_input(first, epoch, 0, b"\x1b[20", std::time::Instant::now())
+            .write_input(leaving, epoch, 1, b"\x1b[20", std::time::Instant::now())
             .expect("the first four bytes of a delimiter");
         assert_eq!(accepted.held_prefix_bytes, 4);
-        session
-            .acquire_input(second, connection(), None)
-            .expect("the takeover")
-    };
-    assert!(
-        taken.discarded_bytes.get() >= 4,
-        "the undelivered prefix is counted as interrupted rather than forwarded: {}",
-        taken.discarded_bytes.get()
-    );
+    }
+    runtime.flush_input();
+    retained_within(&runtime, b"kr-typed.", Duration::from_secs(10)).await;
+
+    // The source goes.
+    {
+        let mut session = runtime.session();
+        session.detach(leaving).expect("detaches");
+        let interrupted = session.interrupted_input();
+        assert_eq!(
+            interrupted.bytes, 4,
+            "exactly the prefix that was never delivered, counted once"
+        );
+        assert!(
+            !interrupted.closed_open_paste,
+            "no paste was open, so none was closed"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
     {
         let session = runtime.session();
         let seen = retained(&session);
         assert!(
+            contains(&seen, b"kr-typed."),
+            "the application echoes what it receives, which is how this test can tell: {seen:?}"
+        );
+        assert!(
             !contains(&seen, b"\x1b[20"),
-            "and it never reached the application: {seen:?}"
+            "and the prefix never reached it: {seen:?}"
         );
     }
+
+    // And the next holder is told what was lost.
+    let acquired = {
+        let mut session = runtime.session();
+        session
+            .acquire_input(next, connection(), None)
+            .expect("the next holder")
+    };
+    assert_eq!(
+        acquired.discarded_bytes.get(),
+        4,
+        "reported to whoever takes the keys next"
+    );
 
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
@@ -944,7 +1207,7 @@ async fn nothing_journals_a_keystroke_and_reaching_the_terminal_is_not_an_effect
     assert_eq!(
         accepted.forwarded_bytes.get(),
         secret.len() as u64,
-        "every byte was forwarded to the terminal"
+        "the host accepted every byte and held none of them back as a delimiter prefix"
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1011,6 +1274,10 @@ struct Wired {
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
+    /// The control daemon's identity, for the one test that connects as a daemon.
+    controller: Arc<ControllerIdentity>,
+    /// The boot identity a generation token is signed over.
+    boot: kr_protocol::identity::BootIdentity,
 }
 
 impl Wired {
@@ -1048,6 +1315,7 @@ async fn wired(script: &str) -> Wired {
         .expect("a secret store");
     let controller = ControllerIdentity::initialise(store.store.as_ref(), environment_id)
         .expect("a controller identity");
+    let boot_identity = boot.clone();
 
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
@@ -1080,6 +1348,8 @@ async fn wired(script: &str) -> Wired {
         session_id,
         environment_id,
         endpoint,
+        controller: Arc::new(controller),
+        boot: boot_identity,
     }
 }
 
@@ -1095,10 +1365,82 @@ struct InventedInterrupt<'a> {
     action: &'a str,
 }
 
+/// Attaches a terminal declaring `profile` over `client`, and returns its identifier.
+async fn attach_over(
+    client: &mut LocalClient,
+    wired: &Wired,
+    profile: Option<&str>,
+) -> AttachmentId {
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &terminal(wired.session_id, profile),
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("attaches")
+        .to_typed()
+        .expect("decodes");
+    attached.attachment.attachment_id
+}
+
+/// Takes the input lease over `client`.
+async fn acquire_over(
+    client: &mut LocalClient,
+    wired: &Wired,
+    attachment_id: AttachmentId,
+) -> Result<kr_protocol::input::InputAcquireResult, kr_protocol::error::ProtocolError> {
+    client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &InputAcquireParams {
+                session_id: wired.session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+}
+
+/// Writes input over `client`.
+async fn write_over(
+    client: &mut LocalClient,
+    wired: &Wired,
+    attachment_id: AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+    sequence: u64,
+    bytes: &[u8],
+) -> Result<InputWriteResult, kr_protocol::error::ProtocolError> {
+    client
+        .request(
+            Method::InputWrite,
+            &InputWriteParams {
+                session_id: wired.session_id,
+                attachment_id,
+                epoch,
+                sequence: kr_protocol::ids::InputSequence::new(sequence),
+                bytes: Bytes::new(bytes.to_vec()),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+}
+
 /// KR-REQ-23.36: the input methods check the encoder, the lease epoch and the sequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() {
     let wired = wired("stty raw -echo; printf 'kr-ready.'; exec cat").await;
+    // Waited for, because until the root program has put the terminal into raw mode with the echo
+    // off the line discipline echoes input as well, and a byte that came back twice would be read
+    // as the host having written it twice.
+    retained_within(&wired.runtime, b"kr-ready.", Duration::from_secs(10)).await;
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
