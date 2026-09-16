@@ -23,13 +23,15 @@ use crate::session::{
 /// How many read batches may wait for ingestion before the read loop slows down.
 pub const READ_QUEUE_DEPTH: usize = 64;
 
-/// The most input the writer offers the pseudo-terminal in one write.
+/// The most input the writer offers the pseudo-terminal in one write, before any delimiter it has
+/// to finish.
 ///
 /// A whole batch in one call can wait for as long as the application takes to read it, and the
 /// fence cannot be looked at while it does. This bounds how much of an ended lease's input can
-/// still be in flight when a takeover succeeds. It is deliberately smaller than a terminal's own
-/// input queue, so a write the terminal has room for is a write that finishes: what the writer
-/// spends its time in is the wait below, where a takeover reaches it at once.
+/// still be in flight when a takeover succeeds, to this many bytes and at most one paste delimiter
+/// beyond them. It is deliberately smaller than a terminal's own input queue, so a write the
+/// terminal has room for is a write that finishes: what the writer spends its time in is the wait
+/// below, where a takeover reaches it at once.
 pub const WRITE_PIECE_BYTES: usize = 512;
 
 /// How long the writer waits for the terminal to have room before it looks at the fence again.
@@ -170,6 +172,107 @@ fn release(counter: &std::sync::atomic::AtomicUsize, bytes: usize) {
     );
 }
 
+/// What became of a batch the writer offered the terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    /// Every byte of it is with the application.
+    Complete,
+    /// The lease it belonged to ended, and the rest of it is not the application's to receive.
+    Abandoned,
+    /// The terminal takes nothing more.
+    Gone,
+}
+
+/// Hands one batch to the terminal a piece at a time, and says how far it got.
+///
+/// `stale` is the fence, asked before every piece; `wrote` is told what the application now has
+/// that it did not have before, which is what the write returned rather than what was offered.
+///
+/// A piece is at most [`WRITE_PIECE_BYTES`], so a takeover reaches a writer between pieces instead
+/// of behind a whole batch, and `room` is waited on before each one so that the waiting happens
+/// where the fence can still be looked at rather than inside a write. A piece never *ends* inside a
+/// paste delimiter: a terminal takes what it has room for, so a short write can stop in the middle
+/// of one, and the writer finishes those few bytes before it looks at the fence again. Half a
+/// delimiter is the one thing an abandoned batch cannot leave behind, because the next actor's
+/// first bytes would complete it and their paste would begin inside the previous actor's.
+fn write_batch(
+    writer: &mut impl std::io::Write,
+    bytes: &[u8],
+    transition: &crate::session::PasteTransition,
+    room: Option<&crate::pty::InputWaiter>,
+    stale: &mut impl FnMut() -> bool,
+    wrote: &mut impl FnMut(usize),
+) -> (usize, Delivery) {
+    let mut delivered = 0_usize;
+    while delivered < bytes.len() {
+        // The waiting happens here, before the write, so that a writer holding bytes an
+        // application is not reading is a writer this loop can still steer. A write that waited
+        // instead would hold those bytes inside a system call where the fence cannot be looked at.
+        // The fence is looked at after the wait as well as before it, because the wait is where a
+        // takeover arrives.
+        if let Some(waiter) = room {
+            match waiter.wait(WRITE_WAIT) {
+                crate::pty::Room::Ready => {}
+                crate::pty::Room::NotYet => {
+                    if stale() {
+                        return (delivered, Delivery::Abandoned);
+                    }
+                    continue;
+                }
+                crate::pty::Room::Gone => return (delivered, Delivery::Gone),
+            }
+        }
+        if stale() {
+            return (delivered, Delivery::Abandoned);
+        }
+        let offered = delivered.saturating_add(WRITE_PIECE_BYTES).min(bytes.len());
+        let offered = transition
+            .unfinished(offered)
+            .unwrap_or(offered)
+            .min(bytes.len());
+        match writer.write(&bytes[delivered..offered]) {
+            // A terminal that takes nothing and reports no error is one this writer cannot make
+            // progress on.
+            Ok(0) => return (delivered, Delivery::Gone),
+            Ok(written) => {
+                delivered += written;
+                wrote(written);
+                // The rest of a delimiter this write stopped inside of goes now, fence or no
+                // fence: its first bytes are already with the application.
+                while let Some(end) = transition.unfinished(delivered) {
+                    let end = end.min(bytes.len());
+                    match writer.write(&bytes[delivered..end]) {
+                        Ok(0) => return (delivered, Delivery::Gone),
+                        Ok(rest) => {
+                            delivered += rest;
+                            wrote(rest);
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            // A few bytes with nowhere to go yet. The terminal is waited on rather
+                            // than spun on, and this is the one place the writer waits for room it
+                            // has already committed to using.
+                            if let Some(waiter) = room
+                                && waiter.wait(WRITE_WAIT) == crate::pty::Room::Gone
+                            {
+                                return (delivered, Delivery::Gone);
+                            }
+                        }
+                        Err(_) => return (delivered, Delivery::Gone),
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return (delivered, Delivery::Gone),
+        }
+    }
+    (delivered, Delivery::Complete)
+}
+
 /// A running session and the tasks around it.
 #[derive(Debug)]
 pub struct SessionRuntime {
@@ -298,78 +401,27 @@ impl SessionRuntime {
                     continue;
                 }
                 let lease_epoch = epoch.unwrap_or_default();
-                // Written in pieces, with the fence looked at again before each one. A single
-                // write of a whole batch can block for as long as the application takes to read
-                // it, and a takeover that happened during it would otherwise be followed by the
-                // rest of the old lease's bytes. Each write is also allowed to be short: a terminal
-                // takes what it has room for, and what it took is what the application has, so the
-                // budget is released by that rather than by the piece the writer offered.
-                let mut delivered = 0_usize;
-                let mut abandoned = false;
-                let mut broken = false;
-                while delivered < bytes.len() {
-                    // The waiting happens *here*, before the write, so that a writer holding bytes
-                    // an application is not reading is a writer this loop can still steer. A write
-                    // that waited instead would hold those bytes inside a system call where the
-                    // fence cannot be looked at, and a takeover during one would be followed by the
-                    // rest of them. The fence is looked at after the wait as well as before it,
-                    // because the wait is where a takeover arrives.
-                    if let Some(waiter) = input_waiter.as_ref() {
-                        match waiter.wait(WRITE_WAIT) {
-                            crate::pty::Room::Ready => {}
-                            crate::pty::Room::NotYet => {
-                                if epoch.is_some_and(|epoch| {
-                                    epoch < writer_fence.load(Ordering::Acquire)
-                                }) {
-                                    abandoned = true;
-                                    break;
-                                }
-                                continue;
-                            }
-                            crate::pty::Room::Gone => {
-                                broken = true;
-                                break;
-                            }
+                // Written in pieces, with the fence looked at before each one, so that a
+                // takeover reaches this writer between pieces rather than behind a whole batch.
+                let (delivered, delivery) = write_batch(
+                    &mut writer,
+                    bytes,
+                    &transition,
+                    input_waiter.as_ref(),
+                    &mut || epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire)),
+                    &mut |written| {
+                        // Released only once the application has it. Until then it is owed.
+                        release(&writer_queued, written);
+                        // The lease's share only while these bytes are still the current lease's.
+                        // The epoch travels with the count, so a lease change that happened while
+                        // this write was in the terminal leaves nothing here to subtract from.
+                        if epoch.is_some() {
+                            writer_lease.release(lease_epoch, written);
                         }
-                    }
-                    if epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire)) {
-                        abandoned = true;
-                        break;
-                    }
-                    // A piece never stops inside a paste delimiter. Half of one reaching the
-                    // application is the one thing a takeover cannot leave behind: the next actor's
-                    // first bytes could complete it, and its paste would begin inside the previous
-                    // actor's.
-                    let end = delivered.saturating_add(WRITE_PIECE_BYTES).min(bytes.len());
-                    let end = transition.unfinished(end).unwrap_or(end).min(bytes.len());
-                    match std::io::Write::write(&mut writer, &bytes[delivered..end]) {
-                        // A terminal that takes nothing and reports no error is one this writer
-                        // cannot make progress on.
-                        Ok(0) => {
-                            broken = true;
-                            break;
-                        }
-                        Ok(written) => {
-                            delivered += written;
-                            // Released only once the application has it. Until then it is owed.
-                            release(&writer_queued, written);
-                            // The lease's share only while these bytes are still the current
-                            // lease's. The epoch travels with the count, so a lease change that
-                            // happened while this write was in the terminal leaves nothing here to
-                            // subtract from.
-                            if epoch.is_some() {
-                                writer_lease.release(lease_epoch, written);
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(_) => {
-                            broken = true;
-                            break;
-                        }
-                    }
-                }
+                    },
+                );
                 let _ = std::io::Write::flush(&mut writer);
-                if broken {
+                if delivery == Delivery::Gone {
                     break;
                 }
                 // What the application's framing is now is decided by the delimiters that reached
@@ -377,12 +429,11 @@ impl SessionRuntime {
                 if let Some(open) = transition.after(delivered) {
                     writer_paste_open.store(open, Ordering::Release);
                 }
-                if abandoned {
+                if delivery == Delivery::Abandoned {
                     // The rest of the batch belongs to a lease that has ended, so it is not
                     // written. What was delivered is what the application has, and the takeover
                     // reports the remainder as discarded.
                     release(&writer_queued, bytes.len().saturating_sub(delivered));
-                    continue;
                 }
             }
         });
@@ -788,4 +839,132 @@ pub fn start_or_record(
                 closure: None,
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Delivery, WRITE_PIECE_BYTES, write_batch};
+    use crate::input::{Delimiter, PASTE_START};
+    use crate::session::PasteTransition;
+
+    /// A terminal that takes a fixed amount per write, which is what a real one does when its
+    /// input queue is nearly full.
+    struct Fills {
+        taken: Vec<u8>,
+        per_write: usize,
+    }
+
+    impl std::io::Write for Fills {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let takes = bytes.len().min(self.per_write);
+            self.taken.extend_from_slice(&bytes[..takes]);
+            Ok(takes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A paste start that a write of `WRITE_PIECE_BYTES` stops in the middle of.
+    fn split_delimiter() -> (Vec<u8>, PasteTransition) {
+        let ordinary = WRITE_PIECE_BYTES - 2;
+        let mut bytes = vec![b'a'; ordinary];
+        bytes.extend_from_slice(PASTE_START);
+        bytes.extend_from_slice(&[b'b'; 4096]);
+        let end = u32::try_from(ordinary).expect("fits") + Delimiter::LEN;
+        (
+            bytes,
+            PasteTransition {
+                delimiters: vec![Delimiter { end, opens: true }],
+            },
+        )
+    }
+
+    #[test]
+    fn a_short_write_finishes_the_delimiter_it_stopped_inside_before_it_abandons() {
+        let (bytes, transition) = split_delimiter();
+        let mut terminal = Fills {
+            taken: Vec::new(),
+            per_write: WRITE_PIECE_BYTES,
+        };
+        // The lease ends while the first piece is with the terminal, which is the schedule a
+        // takeover produces.
+        let mut pieces = 0;
+        let mut written = 0_usize;
+        let (delivered, delivery) = write_batch(
+            &mut terminal,
+            &bytes,
+            &transition,
+            None,
+            &mut || {
+                pieces += 1;
+                pieces > 1
+            },
+            &mut |count| written += count,
+        );
+
+        assert_eq!(
+            delivery,
+            Delivery::Abandoned,
+            "the rest of the batch belongs to a lease that has ended"
+        );
+        assert_eq!(
+            delivered,
+            WRITE_PIECE_BYTES - 2 + PASTE_START.len(),
+            "and the rest of the delimiter the write stopped inside of went with it"
+        );
+        assert_eq!(
+            written, delivered,
+            "every byte the terminal took is accounted"
+        );
+        assert!(
+            terminal.taken.ends_with(PASTE_START),
+            "the application holds a whole paste start, not half of one"
+        );
+    }
+
+    #[test]
+    fn what_the_terminal_took_is_what_is_released_not_what_was_offered() {
+        let bytes = vec![b'a'; WRITE_PIECE_BYTES * 3];
+        let mut terminal = Fills {
+            taken: Vec::new(),
+            per_write: 100,
+        };
+        let mut written = 0_usize;
+        let (delivered, delivery) = write_batch(
+            &mut terminal,
+            &bytes,
+            &PasteTransition::default(),
+            None,
+            &mut || false,
+            &mut |count| written += count,
+        );
+
+        assert_eq!(delivery, Delivery::Complete);
+        assert_eq!(delivered, bytes.len());
+        assert_eq!(written, bytes.len());
+        assert_eq!(terminal.taken, bytes);
+    }
+
+    #[test]
+    fn a_terminal_that_takes_nothing_is_gone_rather_than_waited_on() {
+        let mut terminal = Fills {
+            taken: Vec::new(),
+            per_write: 0,
+        };
+        let mut written = 0_usize;
+        let (delivered, delivery) = write_batch(
+            &mut terminal,
+            b"kr",
+            &PasteTransition::default(),
+            None,
+            &mut || false,
+            &mut |count| written += count,
+        );
+
+        assert_eq!(delivery, Delivery::Gone);
+        assert_eq!(delivered, 0);
+        assert_eq!(written, 0);
+    }
 }
