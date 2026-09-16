@@ -23,10 +23,10 @@ use crate::session::{
 /// How many read batches may wait for ingestion before the read loop slows down.
 pub const READ_QUEUE_DEPTH: usize = 64;
 
-/// How much input the writer hands the pseudo-terminal in one write.
+/// The most input the writer offers the pseudo-terminal in one write.
 ///
 /// A whole batch in one call can block for as long as the application takes to read it, and the
-/// fence cannot be looked at while it does. A piece bounds how much of an ended lease's input can
+/// fence cannot be looked at while it does. This bounds how much of an ended lease's input can
 /// still be in flight when a takeover succeeds; four kibibytes is a comfortable multiple of a
 /// terminal's own input buffer, so an application that is reading pays nothing for it.
 pub const WRITE_PIECE_BYTES: usize = 4 * 1024;
@@ -189,24 +189,38 @@ impl SessionRuntime {
                 // Written in pieces, with the fence looked at again before each one. A single
                 // write of a whole batch can block for as long as the application takes to read
                 // it, and a takeover that happened during it would otherwise be followed by the
-                // rest of the old lease's bytes.
+                // rest of the old lease's bytes. Each write is also allowed to be short: a terminal
+                // takes what it has room for, and what it took is what the application has, so the
+                // budget is released by that rather than by the piece the writer offered.
                 let mut delivered = 0_usize;
                 let mut abandoned = false;
                 let mut broken = false;
-                for piece in bytes.chunks(WRITE_PIECE_BYTES) {
+                while delivered < bytes.len() {
                     if epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire)) {
                         abandoned = true;
                         break;
                     }
-                    if std::io::Write::write_all(&mut writer, piece).is_err() {
-                        broken = true;
-                        break;
-                    }
-                    delivered += piece.len();
-                    // Released only once the application has it. Until then it is still owed.
-                    release(&writer_queued, piece.len());
-                    if epoch.is_some() {
-                        release(&writer_lease, piece.len());
+                    let end = delivered.saturating_add(WRITE_PIECE_BYTES).min(bytes.len());
+                    match std::io::Write::write(&mut writer, &bytes[delivered..end]) {
+                        // A terminal that takes nothing and reports no error is one this writer
+                        // cannot make progress on.
+                        Ok(0) => {
+                            broken = true;
+                            break;
+                        }
+                        Ok(written) => {
+                            delivered += written;
+                            // Released only once the application has it. Until then it is owed.
+                            release(&writer_queued, written);
+                            if epoch.is_some() {
+                                release(&writer_lease, written);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => {
+                            broken = true;
+                            break;
+                        }
                     }
                 }
                 let _ = std::io::Write::flush(&mut writer);

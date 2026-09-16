@@ -558,11 +558,17 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_takeover_closes_a_delivered_paste_and_abandons_the_old_lease_bytes() {
     let host = kr_ipc::testing::TempHost::create();
-    // The application reads nothing for two seconds, so the writer is inside a batch when the
-    // takeover happens, and then reads everything, so what it was given can be looked at. Its echo
-    // is off, so the output is what the application received rather than what the terminal
-    // repeated back as it arrived.
-    let config = configuration(&host, "stty -echo; sleep 2; exec cat");
+    // The application sets the modes a full-screen application sets, then reads nothing for five
+    // seconds, so the writer is inside a batch when the takeover happens, and then reads
+    // everything, so what it was given can be looked at. Each mode earns its place: without the
+    // line discipline holding whole lines the terminal stops taking input rather than discarding
+    // it, which is what makes the writer wait; with the echo off the output is what the
+    // application received rather than what the terminal repeated back as it arrived; and
+    // bracketed paste is what makes the host track the framing at all.
+    let config = configuration(
+        &host,
+        "stty raw -echo; printf '\\033[?2004hkr-ready\\n'; sleep 5; exec cat",
+    );
     let session_id = config.session_id;
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
@@ -580,8 +586,19 @@ async fn a_takeover_closes_a_delivered_paste_and_abandons_the_old_lease_bytes() 
         .acquire_input(first, ConnectionId::new(kr_ipc::new_uuid()), None)
         .expect("takes the lease");
     let epoch = session.lease().epoch.get();
-    session.set_bracketed_paste(true);
     let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    // Nothing is written until the application has set those modes. Bracketed paste is the
+    // application's own, read from the canonical grid rather than asserted here, because that is
+    // where the framer reads it from in production.
+    let ready = retained_within(&runtime, b"kr-ready", Duration::from_secs(30)).await;
+    assert!(
+        ready.windows(8).any(|window| window == b"kr-ready"),
+        "the application is running and its terminal is in the mode this test needs"
+    );
+    assert!(
+        runtime.session().engine().bracketed_paste(),
+        "and it has turned bracketed paste on"
+    );
 
     // A paste that starts, a body far larger than the terminal will take while nothing is reading,
     // and the terminator behind it. The terminator is accepted, so the framer considers the paste
@@ -600,9 +617,27 @@ async fn a_takeover_closes_a_delivered_paste_and_abandons_the_old_lease_bytes() 
         runtime.flush_locked(&mut session);
     }
 
-    // Long enough for the writer to be inside the first batch and waiting for the application,
-    // which is the state the takeover has to be correct in.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The takeover has to happen while the writer is *inside* that batch: the terminal has taken
+    // the start of the paste and everything after it is waiting for an application that is not
+    // reading. A terminal takes a whole write or none of it, so the queue counter cannot show that
+    // the writer has begun; the notice the lease change left for it can. The writer clears that
+    // notice when it takes it, and it is queued ahead of the paste, so a cleared notice means the
+    // writer has moved on to the batch that opens the paste.
+    let notice = runtime.session().lease_change_queued();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while notice.load(std::sync::atomic::Ordering::Acquire) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the writer began the batch that opens the paste"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let queued = runtime.session().queued_lease_bytes();
+    assert!(
+        queued.load(std::sync::atomic::Ordering::Acquire) > 0,
+        "and is waiting inside it, because the application is not reading"
+    );
     let taken = {
         let mut session = runtime.session();
         let taken = session
@@ -642,12 +677,14 @@ async fn a_takeover_closes_a_delivered_paste_and_abandons_the_old_lease_bytes() 
         terminator < new_lease,
         "the paste was closed before the new lease's input reached the application"
     );
-    // And the rest of the old lease's batch never arrived: the writer abandoned it at the
-    // takeover rather than finishing it once the application started reading.
+    // And the rest of the old lease's batch never arrived: the writer abandoned it at the takeover
+    // rather than finishing it once the application started reading. The comparison is against
+    // what the batch actually held, not its length in bytes, because the line endings are not `a`.
+    let sent = start.iter().filter(|byte| **byte == b'a').count();
     let body = seen.iter().filter(|byte| **byte == b'a').count();
     assert!(
-        body < BODY,
-        "a partly written batch of an ended lease is abandoned, not completed: {body} of {BODY}"
+        body * 2 < sent,
+        "a partly written batch of an ended lease is abandoned, not completed: {body} of {sent}"
     );
     let runtime = std::sync::Arc::clone(&runtime);
     runtime.close(ClosureReason::CloseRequested).1.release();
