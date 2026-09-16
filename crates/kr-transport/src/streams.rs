@@ -127,6 +127,17 @@ impl DataStream {
         self.handle.is_revoked()
     }
 
+    /// Returns the send priority the connection is using for this stream.
+    ///
+    /// `None` once the stream is closed, or on the receiving half of a unidirectional stream,
+    /// which has nothing to send. What comes back is the priority the connection installed, so a
+    /// caller can see that the scheduler's decision reached the connection rather than only that
+    /// the scheduler made it.
+    #[must_use]
+    pub fn priority(&self) -> Option<i32> {
+        self.writer.as_ref().and_then(FrameWriter::priority)
+    }
+
     /// Writes one message, reserving queue space for it before it is handed to the connection.
     ///
     /// The message is encoded under the smaller of this stream kind's frame bound and the largest

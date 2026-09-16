@@ -74,6 +74,17 @@ impl FrameWriter {
         let _ = self.stream.set_priority(priority);
     }
 
+    /// Returns the send priority the connection is using for this stream, or `None` once the
+    /// stream is closed and has none.
+    ///
+    /// This reads what was installed rather than what was asked for, which is what makes the
+    /// scheduler's decision observable: a stream whose priority was never applied answers the
+    /// connection's default of zero.
+    #[must_use]
+    pub fn priority(&self) -> Option<i32> {
+        self.stream.priority().ok()
+    }
+
     /// Writes this stream's bounded header.
     ///
     /// # Errors
