@@ -226,6 +226,7 @@ async fn the_connection_uses_the_priority_each_kind_is_scheduled_at() {
     let directory = one_device(&client);
 
     let (installed, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+    let (control, host_control) = tokio::sync::oneshot::channel();
     let serving = tokio::spawn(async move {
         let connection = endpoint
             .accept()
@@ -248,6 +249,11 @@ async fn the_connection_uses_the_priority_each_kind_is_scheduled_at() {
         .expect("an admitted connection") else {
             panic!("a paired endpoint is authorised");
         };
+        // The connection's own control stream, which the handshake opened rather than the
+        // registry, and which the host keeps for the life of the connection.
+        if control.send(authorised.control_writer.priority()).is_err() {
+            return;
+        }
         let streams = registry(authorised.connection_id);
         // Each accepted stream is held for the life of the test, because a closed stream has no
         // priority left to report.
@@ -268,6 +274,25 @@ async fn the_connection_uses_the_priority_each_kind_is_scheduled_at() {
     let authorised = handshake::connect(&connection, &client.identity, &host.record)
         .await
         .expect("an authorised connection");
+
+    // The connection's own control stream first, on both sides of it. The handshake installs its
+    // priority itself, so nothing the registry does can stand in for this.
+    let control_priority = authorised.control_writer.priority();
+    assert_eq!(
+        control_priority,
+        Some(priority_of(StreamKind::Control)),
+        "the connection is not using the control stream's priority on the client's side"
+    );
+    let host_control_priority = tokio::time::timeout(DEADLINE, host_control)
+        .await
+        .expect("the host completed its handshake")
+        .expect("the host reported its control stream");
+    assert_eq!(
+        host_control_priority,
+        Some(priority_of(StreamKind::Control)),
+        "the connection is not using the control stream's priority on the host's side"
+    );
+
     let streams = registry(authorised.connection_id);
 
     let mut open = Vec::new();
