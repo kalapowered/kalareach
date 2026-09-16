@@ -1242,21 +1242,17 @@ impl Lexer {
 
     fn finish_pending(&mut self, kind: EventKind, out: &mut Vec<Event>) {
         let span = self.pending_span();
-        let bytes = core::mem::take(&mut self.pending);
+        // Copied out rather than moved out, so the buffer keeps the room it grew to and the next
+        // sequence of the stream costs no allocation to collect.
+        let bytes = SeqBytes::new(&self.pending);
+        self.pending.clear();
         let truncated = self.pending_truncated;
         let embedded = core::mem::take(&mut self.pending_controls);
         self.pending_len = 0;
         self.pending_truncated = false;
         self.state = State::Ground;
         let direct_safe = !truncated && kind.payload_is_direct_safe();
-        let mut event = self.build_with(
-            span,
-            SeqBytes::from_vec(bytes),
-            kind,
-            true,
-            direct_safe,
-            embedded,
-        );
+        let mut event = self.build_with(span, bytes, kind, true, direct_safe, embedded);
         // A prelude the parser could not keep whole is not a shorter sequence: the bytes it dropped
         // could have carried anything. That holds however the sequence ended, including the ones
         // that go on to collect a string body before they finish here.
