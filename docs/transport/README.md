@@ -547,3 +547,36 @@ control stream ends. Everything between an incoming QUIC connection and an autho
 stream — the handshake, the pairing surface, the keepalive, the window renewal and the revocation
 that follows a lost control stream — happens inside the call. A host that owns a qualified platform
 time adapter uses `register_with_clock` and supplies it.
+
+### How the control daemon keeps them
+
+`crates/kr-controller/src/net` is that host. It is one call at the end of the daemon's startup,
+after the reservations are recovered and the worker directory is rebuilt, because a device must not
+reach a daemon that does not yet know what it is running. An environment that selects no network
+makes no call and serves its local endpoint alone.
+
+| What the transport asks for | Where the daemon keeps it |
+| --- | --- |
+| `PairedDirectory` | `net::devices`, a durable table of device records keyed by endpoint identity. Revocation is a state of the record, not its absence, so a host can say a device *was* paired |
+| `principal_for` | the device principal derived from the identity the host assigned at pairing, so `(actor_id, action_id)` names one device's action |
+| `pairing_surface` | `net::pairing`, over `kr-pairing`'s own state machines. It is offered only while an owner signer is enrolled: a host with nobody to authorise a confirmation refuses an unpaired connection outright |
+| `serve` | `net::dispatch`, one authorised connection at a time |
+| `control_stream_lost` | the connection's registration is withdrawn, which is what stops its lease being renewed |
+
+**Admission atomic with registration.** The daemon reads the device record and writes the
+connection into its authority store in one critical section, taking the registry lock and then the
+connection table — the order a revocation takes. The store is the same one its local callers are
+registered in, so a revocation fences both ingresses through one table, and every read, every
+subscription batch and every dispatch checks it. Revoking a device writes the record's revocation
+and advances the authority revision inside that one critical section too, so no connection can be
+admitted between the record being withdrawn and the revision that fences the live ones.
+
+**Work that must complete.** A mutation's effect runs on its own task, and the release of what a
+connection owned at its worker runs on another, after the handler has been dropped.
+
+**One worker link per remote connection.** A worker's attachments, subscriptions and input lane
+belong to the connection that created them, so a device's attachment cannot share a connection
+with the daemon's own housekeeping. The daemon opens a link per remote connection and declares it
+a proxy before it presents a generation token: a proxy forwards its caller's admitted reads and
+mutations and announces nothing, and it never displaces the connection that holds the authority. A
+token for a higher generation fences the authority connection and every proxy of it together.

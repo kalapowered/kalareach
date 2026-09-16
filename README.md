@@ -14,12 +14,12 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-protocol` | Wire types, the method authority table, error codes and the JSON Schema generator |
 | `crates/kr-ipc` | Local typed-frame inter-process communication: directories, peer credentials, descriptors and identity proofs |
 | `crates/kr-worker` | The session worker: pseudo-terminal, canonical grid, lifecycle, attachments, input lease and receipt journal |
-| `crates/kr-controller` | The control daemon: registry, create admission, worker supervision and the local service |
+| `crates/kr-controller` | The control daemon: registry, create admission, worker supervision, the local service and the network |
 | `crates/kr-cli` | The `kr` command line and its terminal restoration guard |
 | `crates/kr-crypto` | Cryptography: a narrow libsodium wrapper, purpose-separated device keys, encrypted objects and secret storage |
 | `crates/kr-pairing` | Pairing: the short-code SPAKE2 and direct QR state machines, their budgets and their transcripts |
 | `crates/kr-transport` | Transport: iroh endpoints, the connection handshake, stream kinds, actor envelopes, action windows and dispatch leases |
-| `crates/kr-client` | The native client library: connections, typed calls, cursors, receipts and replaceable service clients |
+| `crates/kr-client` | The native client library: network and local connections, typed calls, cursors, receipts and replaceable service clients |
 | `crates/kr-plugin-sdk` | The plugin package contract: manifests, the WIT package, effect classes, the catalogue index and the package validator |
 | `crates/kr-term` | The terminal engine: the kr-vt/1 profile, sequence classes, canonical grid, query broker and snapshots |
 | `crates/kr-shell-integration` | The root-editor bridge contract: the handshake, the reader events, the fence and detach state machine and the cross-shell scenarios |

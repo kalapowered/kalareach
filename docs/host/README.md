@@ -8,11 +8,16 @@ does — restarting, being upgraded, crashing — may end it.
 kr  ──────────────┐
                   ├─▶ kr-controller ──spawn──▶ service manager ──▶ kr-worker ──▶ PTY ──▶ shell
 kr attach ────────┴─────────────────────────────────────────────▶ kr-worker
+
+paired device ──iroh──▶ kr-controller ──proxy──▶ kr-worker
 ```
 
 `kr attach` does not go through the control daemon. It reads a published descriptor, challenges the
 worker named in it, and attaches. That is what keeps attaching possible while the daemon is
 restarting.
+
+A paired device does go through it, because a worker has no network endpoint and the daemon is what
+authenticates a device. The network path is below.
 
 ## Directories
 
@@ -305,19 +310,66 @@ suspend-aware continuous clock (`kr_transport::clock`).
   daemon takes it at the moment it forwards, not when the request arrived, and the lease's own
   remaining time bounds the deadline the worker is given.
 
+## The network path
+
+The daemon joins the network once, at the end of its startup, when its environment selects one.
+`KR_NETWORK` turns it on and the variables in `crates/kr-controller/src/net/config.rs` select the
+relay map, the Pkarr publisher, the Pkarr resolver and the DNS origin, each on its own and none
+inherited. `KR_NETWORK_OWNER_KEY` names the enrolled owner signer; without one the host accepts no
+pairing, because there is nobody who could authorise a confirmation. A daemon that selects no
+network serves its local endpoint alone, which is a supported deployment rather than a degraded
+one.
+
+Its own network device keys are a separate key set from the environment's controller identity. The
+controller identity signs generation tokens to this host's workers; these are the keys a *device*
+authenticates, and conflating them would make a worker's view of its daemon and a device's view of
+its host the same secret. They live in the platform credential store, with the documented
+owner-only directory as the fallback, and are created once: a host that lost them is a host every
+paired device would refuse, because its endpoint identity is what an invitation pinned.
+
+What a device reaches, in order:
+
+1. **Unpaired**, it reaches the bounded `pair.*` surface and nothing else. The daemon drives
+   `kr-pairing`'s own state machines behind it; the owner ceremony that authorises an invitation and
+   approves a candidate is the platform's, and the daemon holds the challenge and the ledger that
+   makes it single use.
+2. **Paired**, it gets an authorised connection whose actor the daemon constructs: `paired_device`
+   ingress, the device, the grant and the revision it was validated at, the controller generation
+   that admitted the connection, and the connection's own identity.
+3. **Reads the daemon owns** — the host, the environment, the session list and one session's
+   metadata — are answered by the daemon.
+4. **Everything a session owns** is forwarded to the worker over a link the daemon opened for that
+   connection, under the verified envelope and the deadline the daemon accepted, through the same
+   serial barrier a local caller's mutation passes through. That link declares itself a proxy before
+   it presents a generation token, so a device's attachment, subscription and input lane belong to a
+   connection of their own without displacing the daemon's authority connection.
+
+Remote dispatch needs a live lease, and a lease is renewed only after the worker has acknowledged
+the authority revision in force. A worker starts having acknowledged nothing, so opening the first
+proxy link to it announces the revision over the authority connection; until the worker installs
+it, there is nothing to say it has fenced whatever the revision removed. Local input and stopping
+owned execution depend on none of this: neither is remote dispatch.
+
 ## What the host owes the transport
 
 Two contracts `docs/transport/README.md` names, and where they are kept:
 
 * **Admission and revocation.** The daemon validates the caller's record and registers the
   connection in one critical section, in one lock order that a revocation also takes, so nothing
-  can be admitted against authority that has already been replaced. Withdrawing a registration
-  fences that connection's reads. At a worker, binding a newer controller generation withdraws the
+  can be admitted against authority that has already been replaced. One authority store holds both
+  ingresses, so a revocation fences a paired device and a local caller through one table.
+  Withdrawing a registration fences that connection's reads, and its subscription: the relay checks
+  the registration before each batch it writes rather than after. Revoking a device writes the
+  record's revocation and advances the authority revision in one critical section, so no connection
+  can be admitted between the two; what it fences is that device's connections, because nobody
+  else's authority was withdrawn. At a worker, binding a newer controller generation withdraws the
   previous connection's registration, which stops the subscription it had already started; the
   connection stays open so its next request can say why it was refused.
 * **Work that must complete.** A mutation's effect runs on a task that outlives the connection, so
-  a durable commit is never left half done because the caller went away. The worker's own dispatch
-  path holds no await between the marker and the outcome, so it cannot be cancelled part way.
+  a durable commit is never left half done because the caller went away. So does the release of
+  what a remote connection owned at its worker, because the handler is dropped the moment the
+  control stream ends. The worker's own dispatch path holds no await between the marker and the
+  outcome, so it cannot be cancelled part way.
 
 ## Journals and the receipt contract
 
