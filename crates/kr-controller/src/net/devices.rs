@@ -50,6 +50,11 @@ pub struct DeviceRecord {
     pub paired_at_ms: TimestampMs,
     /// When the host revoked it, in UTC milliseconds, while it still holds a grant.
     pub revoked_at_ms: Option<TimestampMs>,
+    /// The invitation this pairing was committed from.
+    ///
+    /// A candidate asks about an invitation, and the answer has to be about that invitation: a
+    /// device that paired through one has no committed result to be told about another.
+    pub committed_invitation_id: kr_protocol::ids::InvitationId,
     /// When the host first found its grant to have run out, in UTC milliseconds.
     ///
     /// Recorded so the decision survives a restart and a wall clock stepped backwards. A grant
@@ -154,9 +159,41 @@ impl DeviceDirectory {
                      expired_at_ms INTEGER
                  );
                  CREATE INDEX IF NOT EXISTS network_devices_endpoint
-                     ON network_devices (endpoint_id);",
+                     ON network_devices (endpoint_id);
+                 CREATE TABLE IF NOT EXISTS network_actions (
+                     actor_id TEXT NOT NULL,
+                     action_id BLOB NOT NULL,
+                     session_id BLOB NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS network_clock (
+                     id INTEGER PRIMARY KEY NOT NULL CHECK (id = 0),
+                     observed_ms INTEGER NOT NULL
+                 );",
             )
-        })
+        })?;
+        // Forward-only, and applied to a table that already exists: `CREATE TABLE IF NOT EXISTS`
+        // leaves an older table exactly as it was, and every read below names these columns. A
+        // host upgraded in place would otherwise find its own paired devices unreadable.
+        for column in ["expired_at_ms INTEGER", "committed_invitation_id BLOB"] {
+            self.add_column(column)?;
+        }
+        Ok(())
+    }
+
+    /// Adds one column to the device table, unless it is already there.
+    ///
+    /// SQLite has no conditional `ADD COLUMN`, and a duplicate is the ordinary case on every start
+    /// after the first, so that one failure is the success case and anything else is not.
+    fn add_column(&self, definition: &str) -> Result<()> {
+        let statement = format!("ALTER TABLE network_devices ADD COLUMN {definition}");
+        let outcome = self.with(|connection| connection.execute(&statement, []));
+        match outcome {
+            Ok(_) => Ok(()),
+            Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn with<T>(&self, body: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
@@ -187,8 +224,8 @@ impl DeviceDirectory {
                     "INSERT INTO network_devices (
                          device_id, endpoint_id, device_key_revision, authorisation_key,
                          device_name, platform, grant_id, grant, paired_at_ms, revoked_at_ms,
-                         expired_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)",
+                         expired_at_ms, committed_invitation_id
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10)",
                     params![
                         record.device_id.get().as_bytes().as_slice(),
                         record.endpoint_id.as_bytes().as_slice(),
@@ -199,6 +236,7 @@ impl DeviceDirectory {
                         record.grant.grant_id.get().as_bytes().as_slice(),
                         grant,
                         i64::try_from(record.paired_at_ms.get()).unwrap_or(i64::MAX),
+                        record.committed_invitation_id.get().as_bytes().as_slice(),
                     ],
                 )
                 .map(|_| ())
@@ -217,7 +255,7 @@ impl DeviceDirectory {
                 .query_row(
                     "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
                             device_name, platform, grant, paired_at_ms, revoked_at_ms,
-                            expired_at_ms
+                            expired_at_ms, committed_invitation_id
                      FROM network_devices WHERE endpoint_id = ?1",
                     params![bytes],
                     |row| Ok(read_record(row)),
@@ -239,7 +277,7 @@ impl DeviceDirectory {
                 .query_row(
                     "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
                             device_name, platform, grant, paired_at_ms, revoked_at_ms,
-                            expired_at_ms
+                            expired_at_ms, committed_invitation_id
                      FROM network_devices WHERE device_id = ?1",
                     params![bytes],
                     |row| Ok(read_record(row)),
@@ -258,7 +296,8 @@ impl DeviceDirectory {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
-                        device_name, platform, grant, paired_at_ms, revoked_at_ms, expired_at_ms
+                        device_name, platform, grant, paired_at_ms, revoked_at_ms,
+                        expired_at_ms, committed_invitation_id
                  FROM network_devices ORDER BY paired_at_ms, device_id",
             )?;
             let rows = statement
@@ -289,6 +328,95 @@ impl DeviceDirectory {
             )
         })?;
         Ok(())
+    }
+
+    /// Records which session one remote action was dispatched to, before it is dispatched.
+    ///
+    /// A receipt lives in the journal of the session the action was performed on, and a device
+    /// that reconnects to ask for its own result has nothing left to say where that was. The route
+    /// is durable, so a reconnection, and a restart, can still find the receipt's owner. It is
+    /// written before the dispatch, because an action whose route was recorded afterwards would be
+    /// unfindable in exactly the case that needs it: the connection ended before the answer
+    /// arrived.
+    ///
+    /// The first route for an action stays. `(actor_id, action_id)` is one durable operation, and
+    /// a repeat submission of it is the same action on the same session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn record_action_route(
+        &self,
+        actor_id: &ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        session_id: kr_protocol::ids::SessionId,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO network_actions (actor_id, action_id, session_id, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (actor_id, action_id) DO NOTHING",
+                params![
+                    actor_id.as_str(),
+                    action_id.get().as_bytes().as_slice(),
+                    session_id.get().as_bytes().as_slice(),
+                    i64::try_from(now_ms.get()).unwrap_or(i64::MAX),
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Returns which session one actor's action was dispatched to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table cannot be read.
+    pub fn action_route(
+        &self,
+        actor_id: &ActorId,
+        action_id: kr_protocol::ids::ActionId,
+    ) -> Result<Option<kr_protocol::ids::SessionId>> {
+        let routed: Option<Vec<u8>> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT session_id FROM network_actions WHERE actor_id = ?1 AND action_id = ?2",
+                    params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+        })?;
+        routed
+            .map(|bytes| uuid(&bytes).map(kr_protocol::ids::SessionId::new))
+            .transpose()
+    }
+
+    /// Returns the current UTC millisecond, never earlier than the latest this host has seen.
+    ///
+    /// Every decision about a grant's lifetime is made against this rather than the wall clock
+    /// directly. A grant's expiry is a UTC moment, and a wall clock stepped backwards would put
+    /// that moment in the future again: a device whose grant ran out yesterday would be current
+    /// once more, which section 9 forbids. The highest moment this host has observed is durable,
+    /// so the answer never goes backwards, across a restart included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the mark cannot be read or written.
+    pub fn utc_at_least(&self, now_ms: TimestampMs) -> Result<TimestampMs> {
+        let now = i64::try_from(now_ms.get()).unwrap_or(i64::MAX);
+        let observed: i64 = self.with(|connection| {
+            connection.query_row(
+                "INSERT INTO network_clock (id, observed_ms) VALUES (0, ?1)
+                 ON CONFLICT (id) DO UPDATE SET observed_ms = MAX(observed_ms, ?1)
+                 RETURNING observed_ms",
+                params![now],
+                |row| row.get(0),
+            )
+        })?;
+        Ok(TimestampMs::new(
+            u64::try_from(observed).unwrap_or_else(|_| now_ms.get()),
+        ))
     }
 
     /// Marks one device as revoked, and reports whether this call was the one that did it.
@@ -340,6 +468,7 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
     let paired_at_ms: i64 = row.get(7).map_err(ControllerError::registry)?;
     let revoked_at_ms: Option<i64> = row.get(8).map_err(ControllerError::registry)?;
     let expired_at_ms: Option<i64> = row.get(9).map_err(ControllerError::registry)?;
+    let invitation: Vec<u8> = row.get(10).map_err(ControllerError::registry)?;
     Ok(DeviceRecord {
         device_id: DeviceId::new(uuid(&device_id)?),
         endpoint_id: EndpointKey::from_bytes(key(&endpoint_id)?),
@@ -357,6 +486,7 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
             .map(|at| TimestampMs::new(u64::try_from(at).unwrap_or_default())),
         expired_at_ms: expired_at_ms
             .map(|at| TimestampMs::new(u64::try_from(at).unwrap_or_default())),
+        committed_invitation_id: kr_protocol::ids::InvitationId::new(uuid(&invitation)?),
     })
 }
 
@@ -431,6 +561,9 @@ mod tests {
             paired_at_ms: TimestampMs::new(1_764_003_600_000),
             revoked_at_ms: None,
             expired_at_ms: None,
+            committed_invitation_id: kr_protocol::ids::InvitationId::new(Uuid::from_bytes(
+                [byte ^ 0x0f; 16],
+            )),
         }
     }
 

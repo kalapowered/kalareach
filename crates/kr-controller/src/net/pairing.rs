@@ -520,17 +520,20 @@ impl PairingHost {
     fn committed_status(
         &self,
         peer: &ConnectionPeer,
+        invitation_id: InvitationId,
     ) -> std::result::Result<PairStatusResult, ProtocolError> {
+        let unknown = || {
+            ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "this host is not offering that invitation",
+            )
+        };
         let record = self
             .devices
             .record_for_endpoint(peer.endpoint_id())
             .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "this host is not offering that invitation",
-                )
-            })?;
+            .filter(|record| record.committed_invitation_id == invitation_id)
+            .ok_or_else(unknown)?;
         Ok(PairStatusResult {
             status: PairStatus::Committed {
                 device_id: record.device_id,
@@ -554,7 +557,7 @@ impl PairingHost {
             // and a committed one leaves a device record behind. The record is keyed by the
             // endpoint identity this connection was authenticated as, so this answers the caller
             // about itself and about nothing else.
-            return self.committed_status(peer);
+            return self.committed_status(peer, params.invitation_id);
         }
         let invitation = open
             .as_mut()
@@ -621,6 +624,7 @@ fn device_record(commitment: &PairingCommitment) -> std::result::Result<DeviceRe
         paired_at_ms: commitment.committed_at_ms,
         revoked_at_ms: None,
         expired_at_ms: None,
+        committed_invitation_id: commitment.invitation_id,
     })
 }
 

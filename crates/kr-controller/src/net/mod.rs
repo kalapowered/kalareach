@@ -383,33 +383,46 @@ impl NetworkHost {
     /// Returns when this device's grant runs out, anchoring it the first time it is asked.
     ///
     /// One anchor per device, shared by every connection it makes, so the answer does not depend
-    /// on what the wall clock said at each connection. A grant already past its expiry is recorded
-    /// as expired, and that record is what a later run reads.
-    fn grant_deadline(&self, record: &DeviceRecord) -> Option<ContinuousInstant> {
+    /// on what the wall clock said at each connection.
+    ///
+    /// The lifetime is derived once, from a UTC moment that is never earlier than the latest this
+    /// host has recorded, and measured from a continuous instant sampled *before* that moment is
+    /// read: sampling the other way round would count the time between the two samples, and a
+    /// machine suspended there would wake with a longer grant than it went to sleep with. A grant
+    /// already past its expiry is recorded as expired instead, and that record is what every later
+    /// connection and every later run reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an observed expiry cannot be recorded. A grant that has run out and
+    /// cannot be written down is not served: the alternative is a device that keeps reconnecting
+    /// on a grant this host has already decided is over.
+    fn grant_deadline(&self, record: &DeviceRecord) -> Result<Option<ContinuousInstant>> {
         let mut held = self
             .grant_deadlines
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(anchored) = held.get(&record.device_id) {
-            return anchored.deadline;
+            return Ok(anchored.deadline);
         }
         let kr_protocol::grant::GrantExpiry::At { expires_at_ms } = record.grant.expiry else {
             held.insert(record.device_id, GrantDeadline { deadline: None });
-            return None;
+            return Ok(None);
         };
-        let now = kr_ipc::now_ms();
+        let anchor = self.clock.now();
+        let now = self.devices.utc_at_least(kr_ipc::now_ms())?;
         let remaining = expires_at_ms.get().saturating_sub(now.get());
         if remaining == 0 {
-            // Already run out. Recording it is what stops a wall clock stepped backwards from
-            // making the same grant look current on the next connection, or after a restart.
-            let _ = self.devices.record_expiry(record.device_id, now);
+            // Run out. Recording it is what stops a wall clock stepped backwards from making the
+            // same grant look current on the next connection, or after a restart.
+            self.devices.record_expiry(record.device_id, now)?;
+            return Err(ControllerError::PermissionDenied {
+                detail: "this device's grant has run out; pair again".to_owned(),
+            });
         }
-        let deadline = self
-            .clock
-            .now()
-            .checked_add(std::time::Duration::from_millis(remaining));
+        let deadline = anchor.checked_add(std::time::Duration::from_millis(remaining));
         held.insert(record.device_id, GrantDeadline { deadline });
-        deadline
+        Ok(deadline)
     }
 
     /// Serves one authorised connection until it ends.
@@ -432,9 +445,20 @@ impl NetworkHost {
         // Section 9 makes the accepted deadline the earliest of the window's expiry, receipt time
         // plus the requested lifetime and any applicable authority deadline. A grant that runs out
         // is exactly such a deadline, and it is this host's one anchor for that device.
-        let grant_deadline = self.grant_deadline(&device);
+        let grant_deadline = match self.grant_deadline(&device) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                let _ = session
+                    .control
+                    .send(&refusal(&error.to_protocol_error()))
+                    .await;
+                controller.deregister(connection_id).await;
+                return;
+            }
+        };
         let remote = Arc::new(RemoteConnection::new(
             Arc::clone(&controller),
+            Arc::clone(&self.devices),
             device,
             &session,
             notifications,

@@ -102,6 +102,9 @@ pub struct RemoteOutput {
 #[derive(Debug)]
 struct Authorisation {
     controller: Arc<Controller>,
+    /// Where an observed expiry is written, so the decision outlives this connection.
+    devices: Arc<super::devices::DeviceDirectory>,
+    device_id: DeviceId,
     connection_id: ConnectionId,
     /// When this connection's grant runs out, on the continuous clock.
     ///
@@ -119,6 +122,13 @@ impl Authorisation {
         self.grant_is_current() && self.controller.authorised(self.connection_id).await.is_ok()
     }
 
+    /// Returns whether this connection's grant has time left, and records it when it has not.
+    ///
+    /// The record is what makes the decision outlive this connection: the grant's expiry is a UTC
+    /// moment, and the next connection would read it against a wall clock that can be stepped
+    /// backwards. Section 9 does not let withdrawn authority come back, so the first observation
+    /// of an expiry is written down, against a UTC moment that never goes earlier than the latest
+    /// this host has recorded.
     fn grant_is_current(&self) -> bool {
         if self.expired.load(Ordering::Acquire) {
             return false;
@@ -129,8 +139,29 @@ impl Authorisation {
         if self.controller.clock.now() < deadline {
             return true;
         }
-        self.expired.store(true, Ordering::Release);
+        if !self.expired.swap(true, Ordering::AcqRel) {
+            self.record_expiry();
+        }
         false
+    }
+
+    /// Writes down that this device's grant has run out.
+    ///
+    /// A failure to write it cannot make this connection current again: it is fenced either way,
+    /// and the next connection re-derives the expiry from the grant it reads. What is lost is only
+    /// the defence against a wall clock stepped backwards, so the failure is reported rather than
+    /// dropped.
+    fn record_expiry(&self) {
+        let now = self
+            .devices
+            .utc_at_least(kr_ipc::now_ms())
+            .unwrap_or_else(|_| kr_ipc::now_ms());
+        if let Err(error) = self.devices.record_expiry(self.device_id, now) {
+            eprintln!(
+                "kr-controller: could not record that device {} has run out of grant: {error}",
+                self.device_id
+            );
+        }
     }
 }
 
@@ -208,6 +239,8 @@ impl RemoteOutput {
 /// What one authorised remote connection is serving.
 pub struct RemoteConnection {
     controller: Arc<Controller>,
+    /// This host's device directory, which also records where each action was dispatched.
+    devices: Arc<super::devices::DeviceDirectory>,
     /// The device this connection belongs to, as the record stood when it was admitted.
     device: DeviceRecord,
     actor: ConnectionActor,
@@ -240,6 +273,7 @@ impl RemoteConnection {
     #[must_use]
     pub fn new(
         controller: Arc<Controller>,
+        devices: Arc<super::devices::DeviceDirectory>,
         device: DeviceRecord,
         session: &AuthorisedSession,
         notifications: tokio::sync::mpsc::Sender<Relayed>,
@@ -248,11 +282,14 @@ impl RemoteConnection {
         let authority = Arc::new(Authorisation {
             grant_deadline,
             controller: Arc::clone(&controller),
+            device_id: device.device_id,
+            devices: Arc::clone(&devices),
             connection_id: session.connection_id,
             expired: AtomicBool::new(false),
         });
         Self {
             controller,
+            devices,
             device,
             actor: session.actor.clone(),
             connection_id: session.connection_id,
@@ -538,16 +575,21 @@ impl RemoteConnection {
     ) -> ControlFrame {
         // A read that names its session goes to that session's worker. `action.read` names an
         // action rather than a session, and an action's receipt lives in the journal of whichever
-        // session it was performed on, so it goes to the one this connection is already serving:
-        // that is where a device's own actions on this host were performed.
+        // session it was performed on, so the route this host recorded when it dispatched the
+        // action is what says where to ask.
         let proxy = match session_of(&request.params, entry) {
-            Ok(session_id) => self.proxy_for(session_id).await,
-            Err(_) if entry.method == Method::ActionRead => self.attached_proxy().await,
+            Ok(session_id) => self
+                .proxy_for(session_id)
+                .await
+                .map_err(|error| error.to_protocol_error()),
+            Err(_) if entry.method == Method::ActionRead => {
+                self.receipt_owner(request, entry).await
+            }
             Err(error) => return failure(request.request_id, error),
         };
         let proxy = match proxy {
             Ok(proxy) => proxy,
-            Err(error) => return failure(request.request_id, error.to_protocol_error()),
+            Err(error) => return failure(request.request_id, error),
         };
         let envelope = self.envelope(validated);
         match proxy.forward_read(request, &envelope).await {
@@ -583,6 +625,19 @@ impl RemoteConnection {
             Ok(proxy) => proxy,
             Err(error) => return failure(mutation.request_id, error.to_protocol_error()),
         };
+        // Where this action is going is written down before it goes. A receipt lives in the
+        // journal of the session the action was performed on, and a device whose connection ends
+        // before the answer arrives has nothing else left to say which session that was. An
+        // action whose route cannot be recorded is not dispatched: an unrecoverable result is
+        // worse than a refusal the device can retry under the same action identity.
+        if let Err(error) = self.devices.record_action_route(
+            &self.device.principal(),
+            mutation.action_id,
+            session_id,
+            kr_ipc::now_ms(),
+        ) {
+            return failure(mutation.request_id, error.to_protocol_error());
+        }
         let envelope = self.envelope(validated);
         let deadline = match self
             .controller
@@ -652,15 +707,37 @@ impl RemoteConnection {
     ///
     /// A device's receipts are in the journal of the session it acted on, and this connection acts
     /// on one session. A connection that has not attached to anything has no receipts to read.
-    async fn attached_proxy(&self) -> Result<Arc<WorkerProxy>> {
-        let held = self.proxy.lock().await;
-        match held.as_ref() {
-            Some(proxy) if proxy.is_open() => Ok(Arc::clone(proxy)),
-            Some(_) | None => Err(ControllerError::InvalidArgument(
-                "this connection is not serving a session, so it has no receipts to read"
-                    .to_owned(),
-            )),
-        }
+    /// Returns the link to the worker holding one action's receipt.
+    ///
+    /// The route is durable, so a device that lost its connection, or found this host restarted,
+    /// can still ask for its own result. Owning an action identifier is not authority: the grant
+    /// is checked again against the session the route names, because what the action was
+    /// dispatched under may since have been narrowed.
+    async fn receipt_owner(
+        &self,
+        request: &Request,
+        entry: &'static MethodEntry,
+    ) -> std::result::Result<Arc<WorkerProxy>, ProtocolError> {
+        let params: kr_protocol::receipt::ActionReadParams = request
+            .params
+            .to_typed()
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        let routed = self
+            .devices
+            .action_route(&self.device.principal(), params.action_id)
+            .map_err(|error| error.to_protocol_error())?;
+        let session_id = routed.ok_or_else(|| {
+            // The same answer the worker gives for a receipt it does not hold: an action nobody
+            // recorded is not an action this device can be told about.
+            ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                format!("no receipt for action {}", params.action_id),
+            )
+        })?;
+        self.check_grant(Some(session_id), entry, false)?;
+        self.proxy_for(session_id)
+            .await
+            .map_err(|error| error.to_protocol_error())
     }
 
     /// Ends this connection's worker link and detaches whatever it owned.
