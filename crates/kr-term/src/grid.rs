@@ -715,7 +715,7 @@ impl CanonicalGrid {
                 continue;
             }
             if let Some((start, base)) = cell {
-                self.print_cell(&text[start..base], &text[base..index]);
+                self.print_cell(&text[start..base], &text[base..index], false);
             } else if index > 0 {
                 // Whatever came before the first cell of this run has no width of its own, so it
                 // belongs to the cell the run before it ended on.
@@ -724,7 +724,9 @@ impl CanonicalGrid {
             cell = Some((index, index + scalar.len_utf8()));
         }
         match cell {
-            Some((start, base)) => self.print_cell(&text[start..base], &text[base..]),
+            // The last cell of the run is the one a mark in a later read joins, so this one is
+            // located whether or not any mark arrived with it.
+            Some((start, base)) => self.print_cell(&text[start..base], &text[base..], true),
             // Nothing here has a width of its own, so all of it belongs to the cell before.
             None => self.rejoin(text),
         }
@@ -750,10 +752,16 @@ impl CanonicalGrid {
     /// clusters what it is given by its own rules, which would split some of them off and drop
     /// them; and printing them separately is exactly what happens when they arrive in a later read,
     /// so doing it the same way here is what makes the two answers identical.
-    fn print_cell(&mut self, base: &str, marks: &str) {
-        let before = self.print_origin();
+    ///
+    /// Finding where the cell landed means reading it back, so it is done where the answer is used:
+    /// for a cell marks arrived with, and for the cell a run ends on, which is the one a mark in a
+    /// later read joins. A cell in the middle of a run with no marks of its own is joined by
+    /// nothing, because the cell after it finds itself before anything reads this.
+    fn print_cell(&mut self, base: &str, marks: &str, ends_the_run: bool) {
+        let locate = ends_the_run || !marks.is_empty();
+        let before = locate.then(|| self.print_origin());
         self.print_text(base);
-        self.tail = self.locate(base, before);
+        self.tail = before.and_then(|before| self.locate(base, before));
         if !marks.is_empty() {
             self.rejoin(marks);
         }
@@ -821,12 +829,32 @@ impl CanonicalGrid {
         })
     }
 
+    /// Hands `read` one cell of the active buffer: its text, its attributes and its width.
+    ///
+    /// Read where the cell is, because asking the library for a row of cells rewrites the row. It
+    /// holds a row compactly, as clustered text, wherever the compact form holds the row exactly,
+    /// and the only way to borrow a cell out of that form is to turn the whole row back into a
+    /// vector of cells; the row then stays a vector until something compacts it again. A session
+    /// printing into a screen reads a cell after every run it prints, so borrowing would rebuild
+    /// every row twice over: into cells where the run is placed, and back into clustered text
+    /// where the row scrolls off.
+    fn with_cell<T, F>(&mut self, col: usize, row: i64, read: F) -> Option<T>
+    where
+        F: FnOnce(&str, &CellAttributes, usize) -> T,
+    {
+        let screen = self.terminal.screen_mut();
+        let phys = screen.phys_row(row);
+        // The visible row is clamped to the screen's height, which is one past its last row, so a
+        // row below the screen answers with nothing rather than reaching past the rows there are.
+        if phys >= screen.scrollback_rows() {
+            return None;
+        }
+        row_cell(screen.line_mut(phys), col, read)
+    }
+
     /// The text of one cell of the active buffer.
     fn cell_text(&mut self, col: usize, row: i64) -> Option<String> {
-        self.terminal
-            .screen_mut()
-            .get_cell(col, row)
-            .map(|cell| cell.str().to_owned())
+        self.with_cell(col, row, |text, _, _| text.to_owned())
     }
 
     /// Adds combining marks to the cell the previous text run ended on.
@@ -866,12 +894,9 @@ impl CanonicalGrid {
             return;
         }
         let marks = &marks[..keep];
-        let Some((attributes, found)) = self
-            .terminal
-            .screen_mut()
-            .get_cell(tail.col, tail.row)
-            .map(|cell| (cell.attrs().clone(), cell.str().to_owned()))
-        else {
+        let Some((attributes, found)) = self.with_cell(tail.col, tail.row, |text, attrs, _| {
+            (attrs.clone(), text.to_owned())
+        }) else {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
             return;
         };
@@ -1970,6 +1995,37 @@ fn row_content_bytes(line: &wezterm_term::Line) -> u64 {
 /// A row carries a flag saying whether any of its cells is inside a link, and it is the row's flag
 /// rather than the cells', so a row built from cells that hold links does not have it set. Reading
 /// the cells is the answer that cannot be wrong.
+/// Hands `read` the cell at one column of a row, exactly as a vector of the row's cells holds it.
+///
+/// A row yields its cells without the columns a wide cell covers, whichever way the library is
+/// holding it. A vector of the row's cells has a cell in every column, and the columns a wide cell
+/// covers hold a blank carrying that cell's attributes, so a covered column answers with that
+/// blank. A column past the row's width has no cell at all and answers with nothing.
+fn row_cell<T, F>(line: &wezterm_term::Line, col: usize, read: F) -> Option<T>
+where
+    F: FnOnce(&str, &CellAttributes, usize) -> T,
+{
+    if col >= line.len() {
+        return None;
+    }
+    for cell in line.visible_cells() {
+        let index = cell.cell_index();
+        if index == col {
+            return Some(read(cell.str(), cell.attrs(), cell.width()));
+        }
+        if index > col {
+            break;
+        }
+        if col < index.saturating_add(cell.width().max(1)) {
+            return Some(read(BLANK_CELL_TEXT, cell.attrs(), 1));
+        }
+    }
+    None
+}
+
+/// What a blank cell holds, which is what a column a wide cell covers holds in a vector of cells.
+const BLANK_CELL_TEXT: &str = " ";
+
 fn count_row_links(
     line: &wezterm_term::Line,
     seen: &mut BTreeSet<*const Hyperlink>,

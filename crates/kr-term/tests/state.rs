@@ -1395,6 +1395,52 @@ fn a_mark_added_to_a_settled_cell_reaches_a_delta() {
     );
 }
 
+/// A mark joins the cell it belongs to when the run before it was cut at every cell.
+///
+/// A run that is not plain ASCII is drawn a cell at a time, because the profile's width model and
+/// the library's cluster reducer do not agree about every scalar. Each cell of such a run can take
+/// marks of its own, and the cell the run ends on is the one a mark in the next read joins.
+#[test]
+fn a_cut_run_joins_its_marks_to_the_right_cells() {
+    // Marks arriving with a cell in the middle of the run, and with the cell it ends on.
+    let mut together = engine();
+    together.feed("\u{4e2d}e\u{301}\u{6587}o\u{308}".as_bytes(), 0);
+    together.quiesce(0);
+    let view = viewport(&together);
+    let (snapshot, _) = together.snapshot(view, 0);
+    assert_eq!(
+        text_of(&snapshot.rows)[0],
+        "\u{4e2d}e\u{301}\u{6587}o\u{308}",
+        "each cell of the run keeps the marks that arrived with it"
+    );
+
+    // A mark arriving in the next read joins the cell the run ended on.
+    let mut apart = engine();
+    apart.feed("\u{4e2d}\u{6587}o".as_bytes(), 0);
+    apart.feed("\u{308}".as_bytes(), 0);
+    apart.quiesce(0);
+    let view = viewport(&apart);
+    let (snapshot, _) = apart.snapshot(view, 0);
+    assert_eq!(
+        text_of(&snapshot.rows)[0],
+        "\u{4e2d}\u{6587}o\u{308}",
+        "the cell the run ended on is the one a later mark joins"
+    );
+
+    // And when the run ends on a wide cell, which covers a column of its own.
+    let mut wide = engine();
+    wide.feed("a\u{4e2d}".as_bytes(), 0);
+    wide.feed("\u{301}".as_bytes(), 0);
+    wide.quiesce(0);
+    let view = viewport(&wide);
+    let (snapshot, _) = wide.snapshot(view, 0);
+    assert_eq!(
+        text_of(&snapshot.rows)[0],
+        "a\u{4e2d}\u{301}",
+        "a wide final cell takes the mark too"
+    );
+}
+
 /// A geometry change reflows the rows, so a mark cannot land on whatever moved into that cell.
 #[test]
 fn a_mark_after_a_resize_does_not_overwrite_another_cell() {
