@@ -6,6 +6,8 @@
 //! own, it is bounded, and popping an empty stack yields the session's current title rather than
 //! whatever the outer terminal had.
 
+use crate::layout::{HANDLE_BYTES, SAVED_TITLE_BYTES};
+
 /// Maximum depth of the virtual title stack, matching the bound xterm applies.
 pub const MAX_DEPTH: usize = 10;
 
@@ -23,10 +25,9 @@ pub const MAX_TITLE_BYTES: usize = 1024;
 /// keeps for it, and the stack at twice its depth in slots, which is the most its array rounds up
 /// to.
 pub const MAX_RESIDENT_BYTES: u64 = {
-    let handle = size_of::<String>() as u64;
     let title = 2 * MAX_TITLE_BYTES as u64;
-    let current = 2 * (handle + title);
-    let slots = 2 * MAX_DEPTH as u64 * size_of::<SavedTitle>() as u64;
+    let current = 2 * (HANDLE_BYTES + title);
+    let slots = 2 * MAX_DEPTH as u64 * SAVED_TITLE_BYTES;
     let saved = MAX_DEPTH as u64 * 2 * title;
     current + slots + saved
 };
@@ -218,11 +219,10 @@ impl TitleState {
     /// something it is still holding.
     #[must_use]
     pub fn resident_bytes(&self) -> u64 {
-        let handle = size_of::<String>() as u64;
-        let mut bytes = 2 * handle
+        let mut bytes = 2 * HANDLE_BYTES
             + self.current.icon.capacity() as u64
             + self.current.window.capacity() as u64;
-        bytes += (self.stack.capacity() * size_of::<SavedTitle>()) as u64;
+        bytes += self.stack.capacity() as u64 * SAVED_TITLE_BYTES;
         for entry in &self.stack {
             bytes += entry.icon.as_ref().map_or(0, |title| title.capacity()) as u64;
             bytes += entry.window.as_ref().map_or(0, |title| title.capacity()) as u64;

@@ -36,6 +36,10 @@ use crate::adapter::{AdaptContext, Adapted, adapt};
 use crate::budget::{CELL_OVERHEAD_BYTES, GridSize, SessionBudget};
 use crate::error::Result;
 use crate::event::{Event, EventKind};
+use crate::layout::{
+    ALERT_RECORD_BYTES, CELL_ATTRIBUTES_BYTES, CELL_BYTES, COLOR_ATTRIBUTE_BYTES, HANDLE_BYTES,
+    HYPERLINK_BYTES, ROW_RECORD_BYTES, TABLE_PAIR_BYTES, WORD_BYTES,
+};
 use crate::palette::Rgb;
 use crate::snapshot::{ActiveBuffer, Designations, SavedCursor};
 use crate::unicode::UnicodeModel;
@@ -160,7 +164,7 @@ impl AlertHandler for AlertCollector {
 pub const ALERT_LIST_BYTES: u64 =
     // Twice, because the list grows by appending and can be holding twice the alerts it has. Each
     // alert carries at most two strings, each cut to the bound.
-    (2 * MAX_ALERTS * (size_of::<GridAlert>() + 2 * MAX_ALERT_BYTES)) as u64;
+    2 * MAX_ALERTS as u64 * (ALERT_RECORD_BYTES + 2 * MAX_ALERT_BYTES as u64);
 
 /// What the rows of both screens come to, gathered as they are walked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1727,13 +1731,13 @@ fn link_object_bytes(link: &Hyperlink) -> u64 {
 /// The table keeps its entries in nodes that hold several of them and are allocated whole, so an
 /// entry is charged for the slot it takes, for the room beside it the node is holding empty, and
 /// for the pointer the node above keeps to it.
-pub const LINK_TABLE_ENTRY_BYTES: u64 = (2 * size_of::<String>() + 2 * size_of::<usize>()) as u64;
+pub const LINK_TABLE_ENTRY_BYTES: u64 = 2 * HANDLE_BYTES + 2 * WORD_BYTES;
 
 /// What the first node of the table of distinct hyperlink targets costs.
 ///
 /// A node holds several entries and is allocated whole, so the first target to arrive pays for a
 /// node that is almost all empty.
-pub const LINK_TABLE_NODE_BYTES: u64 = (11 * size_of::<String>() + 4 * size_of::<usize>()) as u64;
+pub const LINK_TABLE_NODE_BYTES: u64 = 11 * HANDLE_BYTES + 4 * WORD_BYTES;
 
 /// What the table of distinct hyperlink targets costs for `target`.
 ///
@@ -1769,7 +1773,10 @@ pub const HISTORY_ACCOUNT_MINIMUM_BYTES: u64 =
 /// A screen holds its rows in one array of row records, and the array is grown by doubling, so it
 /// can be holding room for twice the rows it has. An empty row is a record like any other: it
 /// occupies its slot, and a screen of them is not free.
-pub const ROW_SLOT_BYTES: u64 = 2 * size_of::<wezterm_term::Line>() as u64;
+///
+/// A row record is the one part of this model whose size is not the same on every supported host,
+/// so the figure is the largest of them and [`crate::layout`] says why.
+pub const ROW_SLOT_BYTES: u64 = 2 * ROW_RECORD_BYTES;
 
 /// What one row allocates for itself before anything is on it.
 ///
@@ -1779,15 +1786,15 @@ pub const ROW_SLOT_BYTES: u64 = 2 * size_of::<wezterm_term::Line>() as u64;
 /// reached through a pointer, so each costs a header of its own whatever it holds. An empty row is
 /// not free, which is the whole reason to count it.
 pub const ROW_STORAGE_BYTES: u64 =
-    (CLUSTERED_TEXT_CAPACITY + size_of::<Vec<usize>>() + FIXED_BITSET_HEADER_BYTES) as u64;
+    CLUSTERED_TEXT_CAPACITY + HANDLE_BYTES + FIXED_BITSET_HEADER_BYTES;
 
 /// The room the compact form of a row asks for when it is built.
-const CLUSTERED_TEXT_CAPACITY: usize = 80;
+const CLUSTERED_TEXT_CAPACITY: u64 = 80;
 
 /// What the bit-per-cell record of the wide cells costs before its bits.
 ///
 /// A vector of blocks and the length beside it, which is what the set is.
-const FIXED_BITSET_HEADER_BYTES: usize = size_of::<Vec<u32>>() + size_of::<usize>();
+const FIXED_BITSET_HEADER_BYTES: u64 = HANDLE_BYTES + WORD_BYTES;
 
 /// What the grid keeps for the titles it is told about.
 ///
@@ -1802,7 +1809,7 @@ pub const GRID_TITLE_BYTES: u64 =
 /// A cell holds its text in the cell itself while that text is shorter than a machine word and
 /// covers at most two columns. Past either of those the grid puts the text on the heap behind a
 /// header that holds the byte vector and the width the text was measured at.
-pub const CELL_TEXT_HEAP_BYTES: u64 = (size_of::<Vec<u8>>() + size_of::<usize>()) as u64;
+pub const CELL_TEXT_HEAP_BYTES: u64 = HANDLE_BYTES + WORD_BYTES;
 
 /// Whether a cell's text is too big to live inside the cell.
 fn cell_text_is_on_the_heap(text: &str, width: usize) -> bool {
@@ -1810,17 +1817,17 @@ fn cell_text_is_on_the_heap(text: &str, width: usize) -> bool {
 }
 
 /// What a string costs beyond the bytes it holds: the pointer, the length and the capacity.
-pub const STRING_HANDLE_BYTES: u64 = size_of::<String>() as u64;
+pub const STRING_HANDLE_BYTES: u64 = HANDLE_BYTES;
 
 /// What one link object costs before the bytes its strings hold.
 ///
 /// The counted handle every cell shares it through, and the object's own fields: the target's
 /// string handle, the parameter table's own handle and the flag beside them.
-const LINK_OBJECT_BYTES: u64 = (size_of::<Hyperlink>() + 2 * size_of::<usize>()) as u64;
+const LINK_OBJECT_BYTES: u64 = HYPERLINK_BYTES + 2 * WORD_BYTES;
 
 /// What one slot of a parameter table costs: the key and value handles it holds and the control
 /// byte the table keeps beside them.
-const TABLE_SLOT_BYTES: u64 = (size_of::<(String, String)>() + 1) as u64;
+const TABLE_SLOT_BYTES: u64 = TABLE_PAIR_BYTES + 1;
 
 /// What a parameter table keeps beyond its slots: the group of control bytes it reads past the
 /// end of them.
@@ -1833,9 +1840,9 @@ const TABLE_GROUP_BYTES: u64 = 16;
 /// any of them is more than the packed form on the cell can hold. Its fields are the three colour
 /// attributes, the link handle and the image list.
 pub const CELL_ATTRIBUTE_BYTES: u64 = {
-    let fields = 3 * size_of::<ColorAttribute>() + 4 * size_of::<usize>();
+    let fields = 3 * COLOR_ATTRIBUTE_BYTES + 4 * WORD_BYTES;
     // The allocation is aligned to a pointer, so what it occupies rounds up to a multiple of one.
-    (fields.next_multiple_of(size_of::<usize>())) as u64
+    fields.next_multiple_of(WORD_BYTES)
 };
 
 // A row is held either as a vector of cells or as a string with a run of attributes beside it,
@@ -1849,11 +1856,10 @@ pub const CELL_ATTRIBUTE_BYTES: u64 = {
 /// The vector of cells and the run of attributes beside the text, each at twice the cells it
 /// holds; the offset the compact form records for the cell, at twice the offsets it holds; and the
 /// bit that says whether the cell is two columns wide, charged as a byte.
-const CELL_STORAGE_BYTES: u64 = 2 * size_of::<wezterm_term::Cell>() as u64
-    + 2 * (size_of::<CellAttributes>() + size_of::<u16>()).next_multiple_of(size_of::<usize>())
-        as u64
-    + 2 * size_of::<usize>() as u64
-    + size_of::<u8>() as u64;
+const CELL_STORAGE_BYTES: u64 = 2 * CELL_BYTES
+    + 2 * (CELL_ATTRIBUTES_BYTES + size_of::<u16>() as u64).next_multiple_of(WORD_BYTES)
+    + 2 * WORD_BYTES
+    + 1;
 const _: () = assert!(CELL_OVERHEAD_BYTES >= CELL_STORAGE_BYTES);
 
 /// What a hash table with room for `room` entries costs.

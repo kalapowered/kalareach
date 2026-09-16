@@ -83,6 +83,7 @@ pub mod error;
 pub mod event;
 pub mod grid;
 pub mod lane;
+mod layout;
 pub mod lexer;
 pub mod modes;
 pub mod palette;

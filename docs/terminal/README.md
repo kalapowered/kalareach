@@ -590,7 +590,22 @@ refused with `RESOURCE_UNAVAILABLE`, naming the cells that were asked for, what 
 the budget. The reservation is the whole point of the rule: once a geometry is admitted, text
 arriving for its screens is never refused, because the room it needs is already held.
 
-One cell of one buffer, in reserved bytes on a 64-bit target:
+Every figure in the reservation is fixed. None of them is read out of the machine the build ran
+on, and the reason is that a footprint decides which geometries a session is given: a model built
+on `size_of` would admit a geometry on macOS and refuse it on Linux, and the fixture that records
+the boundary would only be true of the machine that generated it. A row record is the case that
+makes the point. The pinned grid library gives every row a lock for the application data a front
+end may attach to it, a `std::sync::Mutex` costs what each platform decides it costs, and a row
+comes to 144 bytes on macOS against 136 on Linux and Windows.
+
+So each figure below is the largest that record is on any supported host, and
+`crates/kr-term/src/layout.rs` asserts each one against the type the library really uses. A host
+whose records are smaller reserves the figure anyway, which is the safe direction: the session
+holds room it never needs and the budget stays one number. A host, a toolchain or a library
+revision whose record grew past its figure fails to build, rather than quietly reserving less than
+it allocates.
+
+One cell of one buffer, in reserved bytes:
 
 | Part | Bytes | Why |
 | --- | --- | --- |
@@ -917,7 +932,7 @@ interesting part.
 | `broker.json` | Every query and the exact reply bytes | KR-ACC-001, KR-REQ-08.05 |
 | `width.json` | CJK, combining marks, emoji at both margins, emoji modifiers, regional indicators, keycap sequences, delayed wrap, bottom-row scrolling | KR-REQ-08.39 |
 | `snapshot.json` | Snapshots mid-output and at alternate-screen transitions | KR-REQ-08.40 |
-| `admission.json` | The geometries the budget admits and refuses, and the footprint each one reserves | KR-REQ-08.71, KR-REQ-08.79 |
+| `admission.json` | The geometries the budget admits and refuses, and the footprint each one reserves, the same on every supported host | KR-REQ-08.71, KR-REQ-08.79 |
 | `profile.json` | What kr-vt/1 advertises, what it refuses, the identity bytes, and the library record | KR-REQ-08.10, KR-REQ-04.02, KR-REQ-04.24 |
 | `terminfo-xterm-256color.json` | The pinned database and the class of every advertised capability | KR-REQ-08.11, KR-REQ-08.35 |
 
@@ -940,6 +955,10 @@ After changing behaviour, regenerate the fixtures and commit them with the chang
 ```bash
 cargo run -p kr-term --bin kr-term-fixtures
 ```
+
+Regeneration gives the same bytes on every supported host, because every figure the admission
+fixture records is fixed rather than read from the machine. So the check above is a check on the
+code, not on where it ran.
 
 The KR-PERF-007 figure comes from an optimised build:
 
