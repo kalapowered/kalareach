@@ -10,6 +10,9 @@ pub enum ClientError {
     /// The transport failed.
     #[error("{0}")]
     Transport(#[from] kr_transport::TransportError),
+    /// The local socket or named pipe failed.
+    #[error("{0}")]
+    Ipc(#[from] kr_ipc::IpcError),
     /// The host answered with an error.
     #[error("{}: {}", .0.code.as_str(), .0.message)]
     Host(ProtocolError),
@@ -95,6 +98,7 @@ impl ClientError {
         match self {
             Self::Host(error) | Self::Refused { error, .. } => error.code,
             Self::Transport(error) => error.to_protocol_error().code,
+            Self::Ipc(error) => error.to_protocol_error().code,
             Self::Cbor(_) | Self::WrongEffect { .. } => ErrorCode::InvalidArgument,
             Self::UnsupportedVersion { .. } => ErrorCode::UnsupportedSchema,
             Self::TooManyOutstandingMutations { .. }
