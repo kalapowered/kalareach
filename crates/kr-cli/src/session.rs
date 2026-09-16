@@ -390,6 +390,11 @@ async fn drive(
                                     let Ok(size) = terminal.size() else {
                                         continue;
                                     };
+                                    if size.columns == 0 || size.rows == 0 {
+                                        // A terminal with no size is one the host would refuse
+                                        // anyway. Asking would swap one refusal for another.
+                                        continue;
+                                    }
                                     let request_id =
                                         kr_protocol::ids::RequestId::new(next_request);
                                     next_request += 1;
@@ -427,6 +432,43 @@ async fn drive(
                                     geometry_epoch = result.geometry.epoch;
                                     owns_geometry =
                                         result.geometry.owner.as_ref() == Some(&attachment_id);
+                                    // A report this terminal made because a resize was refused for
+                                    // a stale epoch answers with the epoch it should have quoted.
+                                    // The size it asked for is still the size the person is looking
+                                    // at, so it asks again, once, with what the answer said.
+                                    if owns_geometry
+                                        && let Ok(size) = terminal.size()
+                                        && size.columns > 0
+                                        && size.rows > 0
+                                    {
+                                        let dimensions = Dimensions::new(
+                                            u64::from(size.columns),
+                                            u64::from(size.rows),
+                                        );
+                                        if dimensions != result.geometry.dimensions {
+                                            let request_id =
+                                                kr_protocol::ids::RequestId::new(next_request);
+                                            next_request += 1;
+                                            let params =
+                                                kr_protocol::attachment::TerminalResizeParams {
+                                                    attachment_id,
+                                                    dimensions,
+                                                    expected_geometry_epoch: geometry_epoch,
+                                                };
+                                            if !send_geometry(
+                                                client,
+                                                descriptor,
+                                                request_id,
+                                                Method::TerminalResize,
+                                                &params,
+                                            )
+                                            .await
+                                            {
+                                                return AttachOutcome::Disconnected;
+                                            }
+                                            outstanding.insert(request_id, Outstanding::Resize);
+                                        }
+                                    }
                                 }
                             }
                             (

@@ -566,7 +566,7 @@ impl SessionRuntime {
                 // end a paste nothing else is going to end.
                 if fence != last_fence {
                     last_fence = fence;
-                    if writer_paste_open.swap(false, Ordering::AcqRel)
+                    if writer_paste_open.swap(0, Ordering::AcqRel) != 0
                         && !insist(
                             &mut writer,
                             crate::input::PASTE_END,
@@ -601,6 +601,7 @@ impl SessionRuntime {
                 let lease_epoch = epoch.unwrap_or_default();
                 // Written in pieces, with the fence looked at before each one, so that a
                 // takeover reaches this writer between pieces rather than behind a whole batch.
+                let mut delivered_so_far = 0_usize;
                 let (delivered, delivery) = write_batch(
                     &mut Terminal {
                         writer: &mut writer,
@@ -619,6 +620,23 @@ impl SessionRuntime {
                         if epoch.is_some() {
                             writer_lease.release(lease_epoch, written);
                         }
+                        // What the application's framing is, published as each piece reaches it
+                        // rather than once the batch is done. A batch is written in pieces with
+                        // waits between them, and a takeover that arrived in one of those gaps
+                        // would otherwise read framing from before the batch began and report that
+                        // no paste was interrupted when one was. The value names the lease, so a
+                        // later lease change cannot mistake this paste for its own.
+                        delivered_so_far = delivered_so_far.saturating_add(written);
+                        if let Some(open) = transition.after(delivered_so_far) {
+                            writer_paste_open.store(
+                                if open {
+                                    lease_epoch.saturating_add(1)
+                                } else {
+                                    0
+                                },
+                                Ordering::Release,
+                            );
+                        }
                     },
                 );
                 let _ = std::io::Write::flush(&mut writer);
@@ -626,9 +644,17 @@ impl SessionRuntime {
                     break;
                 }
                 // What the application's framing is now is decided by the delimiters that reached
-                // it, whether or not the rest of the batch did.
+                // it, whether or not the rest of the batch did. The callback above has published
+                // every piece already; this is the whole batch's answer, which is the same one.
                 if let Some(open) = transition.after(delivered) {
-                    writer_paste_open.store(open, Ordering::Release);
+                    writer_paste_open.store(
+                        if open {
+                            lease_epoch.saturating_add(1)
+                        } else {
+                            0
+                        },
+                        Ordering::Release,
+                    );
                 }
                 if delivery == Delivery::Abandoned {
                     // The rest of the batch belongs to a lease that has ended, so it is not

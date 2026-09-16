@@ -924,6 +924,97 @@ async fn a_transfer_that_moves_no_dimension_still_notifies_every_attachment() {
         .release();
 }
 
+/// KR-REQ-08.74: an actor with the transfer right selects another connection's terminal.
+///
+/// This is the phone-first, desk-later flow section 8 names: the size moves to a terminal the
+/// caller is not, without replacing the shell. What it still cannot do is give the size to an
+/// attachment the host never granted the geometry right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_selects_an_eligible_terminal_on_another_connection() {
+    let wired = wired("sleep 120", CANONICAL).await;
+    let mut desk = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut phone = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let desk_attachment = attach_over(&mut desk, &wired, CANONICAL, true).await;
+    let phone_attachment = attach_over(&mut phone, &wired, Dimensions::new(48, 16), true).await;
+    // A terminal the host granted no geometry right, on a third connection.
+    let mut watching = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut observer = terminal(wired.session_id, Dimensions::new(30, 10), false);
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    observer.requested = requested;
+    let watching_attachment: kr_protocol::attachment::SessionAttachResult = watching
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &observer,
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("attaches")
+        .to_typed()
+        .expect("decodes");
+    let watching_attachment = watching_attachment.attachment.attachment_id;
+
+    let epoch = wired.runtime.session().geometry().epoch;
+    // The desk selects the phone's terminal, which belongs to another connection entirely.
+    let transferred: GeometryResult = desk
+        .mutate(
+            Method::TerminalGeometryTransfer,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &TerminalGeometryTransferParams {
+                attachment_id: phone_attachment,
+                expected_geometry_epoch: epoch,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("transfers to another connection's terminal")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(transferred.geometry.owner.as_ref(), Some(&phone_attachment));
+    assert_eq!(transferred.geometry.dimensions, Dimensions::new(48, 16));
+    assert_eq!(transferred.geometry.epoch.get(), epoch.get() + 1);
+
+    // And an attachment the host granted no geometry right cannot be given the size, whoever asks.
+    let refused = desk
+        .mutate(
+            Method::TerminalGeometryTransfer,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &TerminalGeometryTransferParams {
+                attachment_id: watching_attachment,
+                expected_geometry_epoch: transferred.geometry.epoch,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("it holds no eligible claim");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        wired.runtime.session().geometry().owner.as_ref(),
+        Some(&phone_attachment),
+        "and the owner is where the transfer left it"
+    );
+    let _ = desk_attachment;
+
+    drop(desk);
+    drop(phone);
+    drop(watching);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
 /// KR-REQ-08.77: a window that changes presentation is told at once, not on the next byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_window_that_changed_presentation_is_told_while_the_application_is_idle() {

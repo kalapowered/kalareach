@@ -638,12 +638,15 @@ impl Display {
     /// state describes neither cursor, so the display says it needs a snapshot and draws nothing
     /// until it has one.
     ///
+    /// It also stays needed. A display that already needed a snapshot before this switch began
+    /// still needs one after it: beginning a switch is asking for the snapshot, not having it.
+    ///
     /// Returns the held output to draw, which is empty when a snapshot is needed instead.
     pub fn abandon_switch(&mut self, repaint_reached_the_screen: bool) -> Vec<Vec<u8>> {
         let Some(switch) = self.switching.take() else {
             return Vec::new();
         };
-        if switch.partial || repaint_reached_the_screen {
+        if switch.partial || repaint_reached_the_screen || self.needs_snapshot {
             // The screen holds part of a repaint and part of something else, so it describes no
             // cursor at all. What was held is abandoned with it, and where that reached is what a
             // replacement snapshot has to cover.

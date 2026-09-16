@@ -1615,11 +1615,15 @@ impl WorkerService {
                 )
             }
             Method::TerminalGeometryTransfer => {
-                let params: TerminalGeometryTransferParams = parse(&mutation.params)?;
-                Self::check_attachment(state, params.attachment_id)?;
+                // The target is not checked against this connection, and that is the point of the
+                // method. Section 8's phone-first, desk-later flow is one device selecting
+                // another's terminal, so an actor with the transfer right names any eligible
+                // attachment of this session. What it still cannot do is give the size to an
+                // attachment the host never granted the geometry right, which is the check below,
+                // or move it at an epoch it does not hold, which the session checks.
                 Self::check_capability(
                     session,
-                    params.attachment_id,
+                    Self::params_attachment(&mutation.params)?,
                     AttachmentCapability::Geometry,
                 )
             }
@@ -1699,6 +1703,12 @@ impl WorkerService {
                 attachment: attachment_id.to_string(),
             })
         }
+    }
+
+    /// Returns the attachment a transfer names, whether or not this connection created it.
+    fn params_attachment(params: &ParamsValue) -> Result<AttachmentId> {
+        let params: TerminalGeometryTransferParams = parse(params)?;
+        Ok(params.attachment_id)
     }
 
     /// Refuses an operation the attachment was not granted.

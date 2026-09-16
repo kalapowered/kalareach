@@ -318,7 +318,7 @@ impl AttachmentTable {
                 ));
             }
             (_, Some(dimensions)) => {
-                dimensions.validate()?;
+                admit(*dimensions)?;
                 Some(*dimensions)
             }
             (_, None) => None,
@@ -436,7 +436,7 @@ impl AttachmentTable {
         id: AttachmentId,
         dimensions: Dimensions,
     ) -> Result<TerminalPresentationMode> {
-        dimensions.validate()?;
+        admit(dimensions)?;
         let ordinal = *self.by_id.get(&id).ok_or_else(|| unknown(id))?;
         let canonical = self.dimensions;
         {
@@ -586,7 +586,7 @@ impl AttachmentTable {
         dimensions: Dimensions,
         expected_epoch: u64,
     ) -> Result<()> {
-        dimensions.validate()?;
+        admit(dimensions)?;
         if self.owner != Some(id) || self.epoch != expected_epoch {
             return Err(WorkerError::NotGeometryOwner);
         }
@@ -605,7 +605,7 @@ impl AttachmentTable {
         dimensions: Dimensions,
         expected_epoch: u64,
     ) -> Result<GeometryChange> {
-        dimensions.validate()?;
+        admit(dimensions)?;
         if self.owner != Some(id) || self.epoch != expected_epoch {
             return Err(WorkerError::NotGeometryOwner);
         }
@@ -668,6 +668,27 @@ impl AttachmentTable {
             state: self.geometry(),
             resize_required: self.dimensions != previous,
         }
+    }
+}
+
+/// Checks a geometry and names every constraint it violates.
+///
+/// Section 8 asks for the violated limits, and a request can break more than one at a time: too
+/// many columns and, with them, too many cells. One violation is reported as the dimension failure
+/// it is; several are reported together, because telling somebody about the first and leaving them
+/// to discover the rest one refusal at a time is not telling them.
+fn admit(dimensions: Dimensions) -> Result<()> {
+    let violations = dimensions.violations();
+    match violations.len() {
+        0 => Ok(()),
+        1 => Err(WorkerError::Dimensions(violations[0])),
+        _ => Err(WorkerError::InvalidArgument(
+            violations
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        )),
     }
 }
 

@@ -158,7 +158,7 @@ pub struct Session {
     queued_lease_bytes: Arc<crate::runtime::LeaseBytes>,
     /// Whether the application is inside a bracketed paste, as the writer has actually delivered
     /// it. The framer says what the accepted stream means; this says what arrived.
-    delivered_paste_open: Arc<std::sync::atomic::AtomicBool>,
+    delivered_paste_open: Arc<std::sync::atomic::AtomicU64>,
     /// The boundary the writer and a lease change share, described at [`Session::input_gate`].
     input_gate: Arc<std::sync::Mutex<()>>,
     /// Set by the writer on its way out, when the terminal will take nothing more.
@@ -247,7 +247,7 @@ impl Session {
             input_gate: Arc::new(std::sync::Mutex::new(())),
             terminal_gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             input_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            delivered_paste_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            delivered_paste_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             lease_change_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
         })
@@ -551,7 +551,7 @@ impl Session {
 
     /// Returns the writer's record of whether the application is inside a bracketed paste.
     #[must_use]
-    pub fn delivered_paste_open(&self) -> Arc<std::sync::atomic::AtomicBool> {
+    pub fn delivered_paste_open(&self) -> Arc<std::sync::atomic::AtomicU64> {
         Arc::clone(&self.delivered_paste_open)
     }
 
@@ -674,7 +674,7 @@ impl Session {
         // it had open is closed first, so the application is not left inside a bracketed paste
         // whose source has gone.
         let held = self.lease.holder() == Some(attachment_id);
-        let wrote = self.lease.wrote_anything();
+        let ending_epoch = self.lease.epoch();
         let discarded_queue = self.lease.release_attachment(attachment_id);
         if held {
             let framing = self.framer.close_for_takeover();
@@ -689,7 +689,7 @@ impl Session {
                 .saturating_add(left)
                 .saturating_add(framing.discarded_prefix.len() as u64);
             self.interrupted.closed_open_paste |=
-                framing.terminator.is_some() || self.delivered_paste_is_ours(wrote);
+                framing.terminator.is_some() || self.delivered_paste_is_ours(ending_epoch);
         } else {
             self.note_lease_holder();
         }
@@ -892,7 +892,7 @@ impl Session {
         // sees a paste finished under a different actor.
         let framing = self.framer.close_for_takeover();
         // Read before the lease moves: it is the ending lease's answer, not the new one's.
-        let ending_lease_wrote = self.lease.wrote_anything();
+        let ending_epoch = self.lease.epoch();
         let discarded_queue = self.lease.acquire(attachment_id, connection_id);
         // The lease ends and what it left behind is counted in one step, on the boundary the writer
         // takes for every write: no byte of this lease's can be written after it, and none was
@@ -906,7 +906,7 @@ impl Session {
         // when one is open at the application: the writer keeps the second, because a terminator
         // the framer accepted may have been queued behind a writer that never wrote it.
         let mut closed_open_paste =
-            framing.terminator.is_some() || self.delivered_paste_is_ours(ending_lease_wrote);
+            framing.terminator.is_some() || self.delivered_paste_is_ours(ending_epoch);
         // Plus whatever a lease the host ended by itself left behind. It had no answer of its own
         // to be reported in, so it is reported here, once, and then it is nobody's any more.
         let carried = std::mem::take(&mut self.interrupted);
@@ -933,7 +933,7 @@ impl Session {
         attachment_id: AttachmentId,
         epoch: u64,
     ) -> Result<InputLeaseState> {
-        let wrote = self.lease.wrote_anything();
+        let ending_epoch = self.lease.epoch();
         let discarded_queue = self
             .lease
             .release(attachment_id, epoch)
@@ -956,7 +956,7 @@ impl Session {
             .saturating_add(left)
             .saturating_add(framing.discarded_prefix.len() as u64);
         self.interrupted.closed_open_paste |=
-            framing.terminator.is_some() || self.delivered_paste_is_ours(wrote);
+            framing.terminator.is_some() || self.delivered_paste_is_ours(ending_epoch);
         self.pump_replies();
         Ok(self.lease.to_wire())
     }
@@ -1266,7 +1266,7 @@ impl Session {
         if self.attachments.supplies_encoding(holder, required) {
             return false;
         }
-        let wrote = self.lease.wrote_anything();
+        let ending_epoch = self.lease.epoch();
         let discarded_queue = self.lease.release_attachment(holder);
         let framing = self.framer.close_for_takeover();
         let left = self.end_lease();
@@ -1279,7 +1279,7 @@ impl Session {
             .saturating_add(left)
             .saturating_add(framing.discarded_prefix.len() as u64);
         self.interrupted.closed_open_paste |=
-            framing.terminator.is_some() || self.delivered_paste_is_ours(wrote);
+            framing.terminator.is_some() || self.delivered_paste_is_ours(ending_epoch);
         self.pump_replies();
         true
     }
@@ -1288,15 +1288,15 @@ impl Session {
     ///
     /// The writer keeps this latch because a terminator the framer accepted may have been queued
     /// behind a writer that never wrote it, and it clears the latch when it writes the correction.
-    /// Between a lease change and the writer acting on it the latch is still set, so a second lease
-    /// change in that window would report the same closure again. A lease that wrote nothing cannot
-    /// have opened a paste, and that is what tells the two apart: the paste belongs to whoever
-    /// wrote into it, and that actor has already been told.
-    fn delivered_paste_is_ours(&self, ending_lease_wrote: bool) -> bool {
-        ending_lease_wrote
-            && self
-                .delivered_paste_open
-                .load(std::sync::atomic::Ordering::Acquire)
+    /// Between a lease change and the writer acting on it the latch is still set, so something has
+    /// to say whose paste it is or a second lease change in that window would report the same
+    /// closure again. What says it is the latch itself: it names the lease that wrote into the
+    /// paste, as one more than that lease's epoch, and zero for no paste at all.
+    fn delivered_paste_is_ours(&self, ending_epoch: u64) -> bool {
+        let open_for = self
+            .delivered_paste_open
+            .load(std::sync::atomic::Ordering::Acquire);
+        open_for != 0 && open_for == ending_epoch.saturating_add(1)
     }
 
     /// Returns what a lease the host ended by itself left behind and nobody has been told about.

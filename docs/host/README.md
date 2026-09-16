@@ -218,6 +218,13 @@ key beside the one that was pressed, and the encoder reports the key it was give
 that asks for that flag is served by no controller here, and says so, rather than being sent an
 encoding one of them only advertises.
 
+One limit of that encoder is worth stating rather than implying. The Kitty keyboard protocol
+identifies a key by the code point of its unshifted form, so a client that reports a shifted
+character has to say which key produced it; one that does not is refused that form rather than
+served a guess at its layout. What the encoder cannot detect is a character a *lock* transformed -
+a capital produced by Caps Lock reports no modifier at all - so a client that has a layout supplies
+the base key whether or not it thinks a modifier was held.
+
 The comparison is made again whenever the application changes the negotiation, which it can do at
 any moment and without telling anybody. Parsing the output is what tells the host, so an application
 that turns an enhanced protocol on takes the keys from a terminal that cannot send it, and one that

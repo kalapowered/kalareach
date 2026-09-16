@@ -423,11 +423,11 @@ fn legacy_character(character: char, modifiers: Modifiers, modify_other_keys: u8
         // it: an application can then tell Control-I from Tab.
         return modify_other_keys_report(u32::from(character), modifiers);
     }
-    // Level two reports every chord, which is what makes it level two; level one reports the ones
-    // the ordinary encoding has no spelling for. Shift on its own is in neither, because the
-    // character the layout produced already carries it.
+    // Level two reports every chord, which is what makes it level two: an application can then
+    // tell Shift-C from a capital C somebody's layout produced on its own, and Shift-Space from a
+    // space. Level one reports the chords the ordinary encoding has no spelling for at all.
     let reported = if modify_other_keys >= 2 {
-        modifiers.control || modifiers.alt
+        !modifiers.is_empty()
     } else {
         modify_other_keys > 0 && (modifiers.control || (modifiers.alt && modifiers.shift))
     };
@@ -576,9 +576,10 @@ fn kitty(event: KeyEvent, flags: u8) -> Result<Vec<u8>, Unsupported> {
     // The protocol is an extension of the ordinary encoding rather than a replacement for it, and
     // it changes only what the flags in force ask it to change. A shell running under an
     // application that asked for event types and nothing else still expects Control-C to be one
-    // byte.
-    if kind == KeyEventKind::Press && !event.modifiers.superkey && !all_as_escapes {
-        let keeps_its_spelling = match event.key {
+    // byte and F3 to be the sequence it has always been.
+    let keeps_its_spelling = !all_as_escapes
+        && !event.modifiers.superkey
+        && match event.key {
             // Disambiguation exists for exactly this: Escape on its own, so an application can
             // tell it from the start of a sequence.
             Key::Escape => !disambiguates,
@@ -589,21 +590,31 @@ fn kitty(event: KeyEvent, flags: u8) -> Result<Vec<u8>, Unsupported> {
             // These three keep their bytes unmodified and are reported once anything is held,
             // which is what lets an application tell Shift-Enter from Enter.
             Key::Enter | Key::Tab | Key::Backspace => !disambiguates || event.modifiers.is_empty(),
-            // A functional key with nothing held is the same sequence in both encodings. A
-            // modified one is not: this protocol numbers several of them differently from the
-            // ordinary encoding, and F3's ordinary form with a modifier is also a valid
-            // cursor-position report.
-            _ => event.modifiers.is_empty(),
+            // A functional key keeps its ordinary sequence until the application asks for the
+            // protocol's own table, which numbers several of them differently - and gives F3 a
+            // number at all, where its ordinary modified form is also a valid cursor-position
+            // report.
+            _ => !disambiguates,
         };
-        if keeps_its_spelling {
-            return legacy(
-                event,
+    if keeps_its_spelling {
+        return match kind {
+            // A key the stream spells the ordinary way has no release event: the protocol reports
+            // those only for the keys it sends as escape codes, so a release here is not a bare
+            // report but nothing at all. An empty answer is the caller's instruction to send
+            // nothing, which is what a terminal in this mode does.
+            KeyEventKind::Release => Ok(Vec::new()),
+            // And a repeat is the press again, because that is what this stream can say.
+            KeyEventKind::Press | KeyEventKind::Repeat => legacy(
+                KeyEvent {
+                    kind: KeyEventKind::Press,
+                    ..event
+                },
                 KeyboardEncoding::Legacy {
                     application_cursor_keys: false,
                 },
                 0,
-            );
-        }
+            ),
+        };
     }
 
     let code = kitty_code(event)?;
@@ -620,7 +631,14 @@ fn kitty(event: KeyEvent, flags: u8) -> Result<Vec<u8>, Unsupported> {
         return Ok(format!("\x1b[{code};{modifiers}:{event_type}{suffix}").into_bytes());
     }
     if event.modifiers.is_empty() {
-        return Ok(format!("\x1b[{code}{suffix}").into_bytes());
+        // A key whose suffix is a letter needs no number: `CSI A` is the canonical spelling and
+        // the parameter's default is the only value it could have. One that ends in a tilde does
+        // need it, because the number is which key it is.
+        return Ok(if suffix == '~' || suffix == 'u' {
+            format!("\x1b[{code}{suffix}").into_bytes()
+        } else {
+            format!("\x1b[{suffix}").into_bytes()
+        });
     }
     Ok(format!("\x1b[{code};{modifiers}{suffix}").into_bytes())
 }
@@ -1060,6 +1078,105 @@ mod tests {
         );
     }
 
+    /// KR-REQ-08.59: the protocol's own table, once the application asks to disambiguate.
+    #[test]
+    fn a_functional_key_takes_the_protocols_table_only_when_it_was_asked_for() {
+        let events_only = KeyboardEncoding::Kitty {
+            flags: KeyboardEncoding::KITTY_EVENT_TYPES,
+        };
+        let disambiguate = KeyboardEncoding::Kitty {
+            flags: KeyboardEncoding::KITTY_DISAMBIGUATE,
+        };
+        // Without disambiguation the ordinary sequences stand, modified ones included.
+        assert_eq!(
+            key(KeyEvent::press(Key::Function(1)), events_only).expect("encodes"),
+            b"\x1bOP"
+        );
+        assert_eq!(
+            key(KeyEvent::press(Key::Function(3)), events_only).expect("encodes"),
+            b"\x1bOR"
+        );
+        assert_eq!(
+            key(KeyEvent::press(Key::Arrow(Arrow::Up)), events_only).expect("encodes"),
+            b"\x1b[A"
+        );
+        // With it, the protocol's own table: a letter suffix needs no number, a tilde suffix is
+        // the number, and F3 has one where the ordinary encoding gave it a letter that is also a
+        // cursor-position report.
+        assert_eq!(
+            key(KeyEvent::press(Key::Function(1)), disambiguate).expect("encodes"),
+            b"\x1b[P"
+        );
+        assert_eq!(
+            key(KeyEvent::press(Key::Function(3)), disambiguate).expect("encodes"),
+            b"\x1b[13~"
+        );
+        assert_eq!(
+            key(KeyEvent::press(Key::Arrow(Arrow::Up)), disambiguate).expect("encodes"),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            key(KeyEvent::press(Key::Home), disambiguate).expect("encodes"),
+            b"\x1b[H"
+        );
+        assert_eq!(
+            key(KeyEvent::press(Key::Delete), disambiguate).expect("encodes"),
+            b"\x1b[3~"
+        );
+    }
+
+    /// KR-REQ-08.59: a key the stream spells the ordinary way has no release event.
+    #[test]
+    fn a_release_of_a_key_sent_as_text_is_nothing_rather_than_a_bare_report() {
+        let with_events = KeyboardEncoding::Kitty {
+            flags: KeyboardEncoding::KITTY_DISAMBIGUATE | KeyboardEncoding::KITTY_EVENT_TYPES,
+        };
+        let all_escapes = KeyboardEncoding::Kitty {
+            flags: KeyboardEncoding::KITTY_DISAMBIGUATE
+                | KeyboardEncoding::KITTY_EVENT_TYPES
+                | KeyboardEncoding::KITTY_ALL_AS_ESCAPES,
+        };
+        // The protocol reports an event type only for the keys it sends as escape codes, so a
+        // release of one it sends as text is nothing at all rather than a report with no key in it.
+        for key_pressed in [Key::Char('a'), Key::Enter, Key::Tab, Key::Backspace] {
+            let release = KeyEvent {
+                key: key_pressed,
+                base: None,
+                modifiers: Modifiers::NONE,
+                kind: KeyEventKind::Release,
+            };
+            assert!(
+                key(release, with_events).expect("encodes").is_empty(),
+                "{key_pressed:?}"
+            );
+            // And a repeat of one is the press again, which is what this stream can say.
+            let repeat = KeyEvent {
+                kind: KeyEventKind::Repeat,
+                ..release
+            };
+            assert_eq!(
+                key(repeat, with_events).expect("encodes"),
+                key(
+                    KeyEvent {
+                        kind: KeyEventKind::Press,
+                        ..release
+                    },
+                    with_events
+                )
+                .expect("encodes"),
+                "{key_pressed:?}"
+            );
+        }
+        // Once the application asks for every key as an escape code, they are reported.
+        let release = KeyEvent {
+            key: Key::Enter,
+            base: None,
+            modifiers: Modifiers::NONE,
+            kind: KeyEventKind::Release,
+        };
+        assert_eq!(key(release, all_escapes).expect("encodes"), b"\x1b[13;1:3u");
+    }
+
     /// KR-REQ-08.59: a modified key the ordinary encoding spells ambiguously is disambiguated.
     #[test]
     fn a_modified_special_or_functional_key_takes_the_protocols_own_form() {
@@ -1495,11 +1612,28 @@ mod tests {
             key(KeyEvent::with(Key::Char('c'), alt), level_two).expect("encodes"),
             b"\x1b[27;3;99~"
         );
-        // Shift on its own is in neither level: the character the layout produced already carries
-        // it, and reporting it would tell the application about a key that was not pressed.
+        // Shift on its own is reported at level two and not at level one, which is what lets an
+        // application tell Shift-C from a capital C somebody's layout produced on its own.
         assert_eq!(
             key(KeyEvent::from_key('c', 'C', Modifiers::shift()), level_two).expect("encodes"),
+            b"\x1b[27;2;67~"
+        );
+        let level_one = KeyboardEncoding::ModifyOtherKeys {
+            level: 1,
+            application_cursor_keys: false,
+        };
+        assert_eq!(
+            key(KeyEvent::from_key('c', 'C', Modifiers::shift()), level_one).expect("encodes"),
             b"C"
+        );
+        // And Shift-Space, which the ordinary encoding cannot tell from a space at all.
+        assert_eq!(
+            key(
+                KeyEvent::with(Key::Char(' '), Modifiers::shift()),
+                level_two
+            )
+            .expect("encodes"),
+            b"\x1b[27;2;32~"
         );
         // Back-tab has one spelling and no room for a second modifier on it.
         assert_eq!(
