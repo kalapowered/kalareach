@@ -33,6 +33,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `docs/transport/` | The transport reference |
 | `docs/plugins/` | The plugin reference |
 | `docs/terminal/` | The terminal reference |
+| `docs/releases/` | How the generated packages are released, and how a consumer pins one |
 
 Rust is canonical. The JSON Schema in `packages/protocol/schema/` and `packages/plugin-sdk/schema/`
 comes from the Rust types, and the TypeScript types come from those schemas. Every step has a check

@@ -1,0 +1,133 @@
+name: package-release
+
+# Publishes the generated TypeScript packages for one commit.
+#
+# A tag of the form `packages/v<version>+<short commit>` is the whole trigger: the tag names the
+# commit, `scripts/release-packages.sh` refuses to pack anything else, and the release that appears
+# carries the two archives and the digests a consumer pins them by. The last step fetches what the
+# release serves and checks it against those digests, so a URL published here is a URL that resolves
+# to the archive it names.
+on:
+  push:
+    tags:
+      - 'packages/v*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: pack and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      - name: Install Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+
+      # rust-toolchain.toml pins the exact toolchain; the generators are built with it.
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Pack the packages
+        run: bash scripts/release-packages.sh --output "$RUNNER_TEMP/packages" --tag "$GITHUB_REF_NAME"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          packages="$RUNNER_TEMP/packages"
+          base="${{ github.server_url }}/${{ github.repository }}/releases/download/$GITHUB_REF_NAME"
+
+          {
+            echo "The generated TypeScript packages, packed from commit $GITHUB_SHA."
+            echo
+            echo 'A consumer pins an archive by its URL and the integrity below, and its lockfile'
+            echo 'then carries both:'
+            echo
+            for archive in "$packages"/*.tgz; do
+              echo "- $base/$(basename "$archive")"
+            done
+            echo
+            echo 'Verify a downloaded archive against the sums:'
+            echo
+            echo "    grep -v '^#' SHA512SUMS | sha512sum -c -"
+            echo
+            echo 'SHA512SUMS:'
+            echo
+            sed 's/^/    /' "$packages/SHA512SUMS"
+            echo
+            echo 'The procedure, and what a consumer does with a release, are in'
+            echo 'docs/releases/packages.md.'
+          } >"$RUNNER_TEMP/notes.md"
+
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "Packages $GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "$packages"/*.tgz "$packages/SHA512SUMS"
+
+          cat "$RUNNER_TEMP/notes.md" >>"$GITHUB_STEP_SUMMARY"
+
+      # What the release serves is what a consumer installs, so it is fetched back by the published
+      # URL and held to the digests that were packed. A URL that does not resolve, an asset that
+      # arrived truncated and a sums file that does not match all fail here.
+      - name: Check what the release serves
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          packages="$RUNNER_TEMP/packages"
+          served="$RUNNER_TEMP/served"
+          base="${{ github.server_url }}/${{ github.repository }}/releases/download/$GITHUB_REF_NAME"
+          mkdir -p "$served"
+
+          for published in "$packages"/*.tgz "$packages/SHA512SUMS"; do
+            name="$(basename "$published")"
+            curl --fail --silent --show-error --location \
+              --retry 5 --retry-delay 3 --retry-all-errors \
+              --output "$served/$name" "$base/$name"
+          done
+
+          cmp "$packages/SHA512SUMS" "$served/SHA512SUMS"
+          (cd "$served" && grep -v '^#' SHA512SUMS | sha512sum -c -)
+
+          # GitHub's own record of each asset, so the URLs in the notes are the URLs it serves.
+          gh release view "$GITHUB_REF_NAME" --json assets \
+            --jq '.assets[] | "\(.name) \(.url)"' >"$RUNNER_TEMP/assets.txt"
+
+          while read -r name url; do
+            if [ "$url" != "$base/$name" ]; then
+              echo "The release serves $name at $url, not at $base/$name." >&2
+              exit 1
+            fi
+          done <"$RUNNER_TEMP/assets.txt"
