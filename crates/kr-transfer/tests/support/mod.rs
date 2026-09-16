@@ -107,6 +107,7 @@ impl Harness {
                     chunk,
                     bytes: payload,
                 },
+                None,
             )
             .map(|_| ())
     }
@@ -122,6 +123,16 @@ impl Harness {
 
     /// Verifies and publishes an upload.
     pub fn finish(&self, transfer_id: TransferId, bytes: &[u8]) -> Result<UploadFinishResult> {
+        self.finish_as(transfer_id, bytes, None)
+    }
+
+    /// Verifies and publishes an upload under one action.
+    pub fn finish_as(
+        &self,
+        transfer_id: TransferId,
+        bytes: &[u8],
+        action: Option<&kr_transfer::service::Action>,
+    ) -> Result<UploadFinishResult> {
         self.service.upload_finish(
             &self.actor,
             &UploadFinishParams {
@@ -129,6 +140,40 @@ impl Harness {
                 declared_byte_len: U64::new(bytes.len() as u64),
                 declared_digest: digest(bytes),
             },
+            action,
+        )
+    }
+
+    /// Sends one chunk under one action.
+    pub fn send_as(
+        &self,
+        transfer_id: TransferId,
+        bytes: &[u8],
+        index: u64,
+        action: Option<&kr_transfer::service::Action>,
+    ) -> Result<kr_protocol::transfer::UploadChunkResult> {
+        let (chunk, payload) = chunk_of(bytes, index);
+        self.service.upload_chunk(
+            &self.actor,
+            &UploadChunkParams {
+                transfer_id,
+                chunk,
+                bytes: payload,
+            },
+            action,
+        )
+    }
+
+    /// Cancels an upload under one action.
+    pub fn cancel_as(
+        &self,
+        transfer_id: TransferId,
+        action: Option<&kr_transfer::service::Action>,
+    ) -> Result<kr_protocol::transfer::UploadCancelResult> {
+        self.service.upload_cancel(
+            &self.actor,
+            &kr_protocol::transfer::UploadCancelParams { transfer_id },
+            action,
         )
     }
 

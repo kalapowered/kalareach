@@ -108,6 +108,7 @@ fn the_environments_staged_total_is_a_ceiling_a_cancellation_frees() {
             &UploadCancelParams {
                 transfer_id: first.transfer_id,
             },
+            None,
         )
         .expect("cancels the first");
     harness
@@ -229,6 +230,7 @@ fn a_chunk_that_does_not_match_its_digest_is_refused_without_ending_the_upload()
                 chunk,
                 bytes: Bytes::new(vec![9; bytes.len()]),
             },
+            None,
         )
         .expect_err("refuses the chunk");
     assert_eq!(refusal.code(), ErrorCode::AttachmentIntegrity);
@@ -272,6 +274,7 @@ fn a_matching_duplicate_is_acknowledged_and_a_conflicting_one_invalidates_the_up
                 chunk,
                 bytes: payload.clone(),
             },
+            None,
         )
         .expect("accepts the chunk");
     assert!(!first.duplicate);
@@ -284,6 +287,7 @@ fn a_matching_duplicate_is_acknowledged_and_a_conflicting_one_invalidates_the_up
                 chunk,
                 bytes: payload,
             },
+            None,
         )
         .expect("acknowledges the duplicate");
     assert!(again.duplicate, "a matching duplicate is acknowledged");
@@ -302,6 +306,7 @@ fn a_matching_duplicate_is_acknowledged_and_a_conflicting_one_invalidates_the_up
                 chunk: conflicting,
                 bytes: conflicting_bytes,
             },
+            None,
         )
         .expect_err("refuses the conflicting duplicate");
     assert_eq!(refusal.code(), ErrorCode::AttachmentIntegrity);
@@ -349,6 +354,7 @@ fn a_chunk_of_the_wrong_length_or_index_is_refused() {
                 },
                 bytes: short,
             },
+            None,
         )
         .expect_err("refuses the wrong length");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
@@ -365,6 +371,7 @@ fn a_chunk_of_the_wrong_length_or_index_is_refused() {
                 },
                 bytes: payload,
             },
+            None,
         )
         .expect_err("refuses an index the layout does not have");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
@@ -396,6 +403,7 @@ fn finish_verifies_the_whole_file_before_it_publishes() {
                 declared_byte_len: U64::new(bytes.len() as u64),
                 declared_digest: Digest256::from_bytes([3; 32]),
             },
+            None,
         )
         .expect_err("refuses a changed declaration");
     assert_eq!(changed.code(), ErrorCode::SourceChanged);
@@ -616,14 +624,18 @@ fn the_transfer_methods_return_opaque_identifiers_and_never_a_client_path() {
         .expect("reserves the upload");
     let chunked = harness
         .service
-        .upload_chunk(&harness.actor, &{
-            let (chunk, payload) = chunk_of(&bytes, 0);
-            UploadChunkParams {
-                transfer_id: begun.transfer_id,
-                chunk,
-                bytes: payload,
-            }
-        })
+        .upload_chunk(
+            &harness.actor,
+            &{
+                let (chunk, payload) = chunk_of(&bytes, 0);
+                UploadChunkParams {
+                    transfer_id: begun.transfer_id,
+                    chunk,
+                    bytes: payload,
+                }
+            },
+            None,
+        )
         .expect("accepts the chunk");
     let status = harness
         .service
@@ -682,6 +694,7 @@ fn the_transfer_methods_return_opaque_identifiers_and_never_a_client_path() {
             &UploadCancelParams {
                 transfer_id: spare.transfer_id,
             },
+            None,
         )
         .expect("cancels it");
 
@@ -732,6 +745,7 @@ fn the_transfer_methods_return_opaque_identifiers_and_never_a_client_path() {
             &UploadCancelParams {
                 transfer_id: begun.transfer_id,
             },
+            None,
         )
         .expect_err("a published attachment is not cancelled");
     assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
@@ -1173,6 +1187,7 @@ fn a_restart_mid_publish_resolves_by_identifier_without_losing_the_completed_fil
                     chunk,
                     bytes: payload,
                 },
+                None,
             )
             .expect("accepts the chunk");
         staged_path = std::fs::read_dir(service.staging().incomplete().display_path())
@@ -1270,6 +1285,7 @@ fn a_replaced_or_missing_payload_is_never_published() {
                 chunk,
                 bytes: payload,
             },
+            None,
         )
         .expect("accepts the chunk");
     let staged = std::fs::read_dir(service.staging().incomplete().display_path())
@@ -1343,6 +1359,7 @@ fn a_payload_a_closed_upload_left_behind_is_removed_by_recovery() {
                 UploadState::Cancelled,
                 None,
                 kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+                None,
             )
             .expect("closes the row");
     }
@@ -1392,6 +1409,7 @@ fn interrupt_publish(
             None,
             None,
             kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+            None,
         )
         .expect("records the verification");
 }
@@ -1467,6 +1485,7 @@ fn a_sweep_during_an_unresolved_publication_leaves_no_charged_bytes() {
                     chunk,
                     bytes: payload,
                 },
+                None,
             )
             .expect("accepts the chunk");
         let staged = std::fs::read_dir(service.staging().incomplete().display_path())
@@ -1570,6 +1589,7 @@ fn a_cancellation_during_a_publication_releases_the_payload_and_the_bytes() {
                     chunk,
                     bytes: payload,
                 },
+                None,
             )
             .expect("accepts the chunk");
         let staged = std::fs::read_dir(service.staging().incomplete().display_path())
@@ -1586,7 +1606,7 @@ fn a_cancellation_during_a_publication_releases_the_payload_and_the_bytes() {
         .expect("a replacement service");
 
     let cancelled = service
-        .upload_cancel(&actor, &UploadCancelParams { transfer_id })
+        .upload_cancel(&actor, &UploadCancelParams { transfer_id }, None)
         .expect("cancels the publishing transfer");
 
     assert_eq!(cancelled.state, UploadState::Cancelled);
@@ -1834,4 +1854,174 @@ fn a_draft_too_large_to_send_is_refused_before_it_is_written() {
         .expect("reads the draft");
     assert_eq!(unchanged.revision, draft.revision);
     assert_eq!(unchanged.text, "short enough");
+}
+
+/// Builds the action two concurrent copies of one request share.
+fn action(harness: &Harness, method: &str, payload: &[u8]) -> kr_transfer::service::Action {
+    kr_transfer::service::Action {
+        actor_id: harness.actor.clone(),
+        action_id: kr_ipc::new_uuid(),
+        method: method.to_owned(),
+        payload_digest: digest(payload),
+    }
+}
+
+/// KR-REQ-14.07, KR-REQ-24.09: two concurrent copies of one `upload.chunk` are arbitrated where
+/// the chunk is written, so they answer the same and only one row is written.
+#[test]
+fn two_concurrent_copies_of_one_chunk_action_answer_the_same() {
+    let harness = Harness::create();
+    let bytes = pattern(4096);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "notes.bin")
+        .expect("reserves the upload");
+    let action = action(&harness, "upload.chunk", &bytes);
+
+    let outcomes: Vec<_> = std::thread::scope(|threads| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let harness = &harness;
+                let action = &action;
+                let bytes = bytes.as_slice();
+                threads.spawn(move || harness.send_as(begun.transfer_id, bytes, 0, Some(action)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("the thread did not panic"))
+            .collect()
+    });
+
+    let answers: Vec<_> = outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("both copies of one action are answered"))
+        .collect();
+    assert_eq!(
+        answers[0], answers[1],
+        "one action, one answer: {answers:?}"
+    );
+    let status = harness
+        .service
+        .upload_status(
+            &harness.actor,
+            &UploadStatusParams {
+                transfer_id: begun.transfer_id,
+            },
+        )
+        .expect("reads the status");
+    assert_eq!(
+        status.received_byte_len,
+        U64::new(bytes.len() as u64),
+        "the bytes are counted once"
+    );
+    let bitmap = ChunkBitmap::decode(&status.received_chunks, status.layout.chunk_count.get())
+        .expect("a bitmap for this layout");
+    assert!(bitmap.is_complete());
+}
+
+/// KR-REQ-14.07, KR-REQ-24.09: two concurrent copies of one `upload.finish` publish one file and
+/// name the same handle.
+#[test]
+fn two_concurrent_copies_of_one_finish_action_publish_once() {
+    let harness = Harness::create();
+    let bytes = pattern(4096);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "notes.bin")
+        .expect("reserves the upload");
+    harness
+        .send_all(begun.transfer_id, &bytes)
+        .expect("sends every chunk");
+    let action = action(&harness, "upload.finish", &bytes);
+
+    let outcomes: Vec<_> = std::thread::scope(|threads| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let harness = &harness;
+                let action = &action;
+                let bytes = bytes.as_slice();
+                threads.spawn(move || harness.finish_as(begun.transfer_id, bytes, Some(action)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("the thread did not panic"))
+            .collect()
+    });
+
+    let answers: Vec<_> = outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("both copies of one action are answered"))
+        .collect();
+    assert_eq!(
+        answers[0].handle, answers[1].handle,
+        "both copies name the same attachment"
+    );
+    assert_eq!(answers[0].handle.content_digest, digest(&bytes));
+    assert_eq!(
+        std::fs::read_dir(harness.service.staging().complete().display_path())
+            .expect("reads the completed area")
+            .count(),
+        1,
+        "one action published one file"
+    );
+    assert_eq!(
+        std::fs::read_dir(harness.service.staging().incomplete().display_path())
+            .expect("reads the incomplete area")
+            .count(),
+        0
+    );
+}
+
+/// KR-REQ-14.07, KR-REQ-24.09: two concurrent copies of one `upload.cancel` release the
+/// reservation once and report the same released length.
+#[test]
+fn two_concurrent_copies_of_one_cancel_action_release_once() {
+    let harness = Harness::create();
+    let bytes = pattern(8192);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "notes.bin")
+        .expect("reserves the upload");
+    harness
+        .send(begun.transfer_id, &bytes, 0)
+        .expect("sends a chunk");
+    let action = action(&harness, "upload.cancel", &bytes);
+
+    let outcomes: Vec<_> = std::thread::scope(|threads| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let harness = &harness;
+                let action = &action;
+                threads.spawn(move || harness.cancel_as(begun.transfer_id, Some(action)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("the thread did not panic"))
+            .collect()
+    });
+
+    let answers: Vec<_> = outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("both copies of one action are answered"))
+        .collect();
+    assert_eq!(
+        answers[0], answers[1],
+        "one action, one answer: {answers:?}"
+    );
+    assert_eq!(
+        answers[0].released_byte_len,
+        U64::new(bytes.len() as u64),
+        "the reservation is reported released once, not twice"
+    );
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        0,
+        "and the bytes are released exactly once"
+    );
+    assert_eq!(
+        std::fs::read_dir(harness.service.staging().incomplete().display_path())
+            .expect("reads the incomplete area")
+            .count(),
+        0
+    );
 }

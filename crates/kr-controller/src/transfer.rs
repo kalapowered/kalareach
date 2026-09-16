@@ -432,13 +432,19 @@ impl TransferModule {
                     Method::UploadBegin => {
                         encode(&service.upload_begin(&actor, &typed(&params)?, Some(&performed))?)
                     }
-                    Method::UploadChunk => encode(&service.upload_chunk(&actor, &typed(&params)?)?),
-                    Method::UploadFinish => {
-                        encode(&service.upload_finish(&actor, &typed(&params)?)?)
+                    Method::UploadChunk => {
+                        encode(&service.upload_chunk(&actor, &typed(&params)?, Some(&performed))?)
                     }
-                    Method::UploadCancel => {
-                        encode(&service.upload_cancel(&actor, &typed(&params)?)?)
-                    }
+                    Method::UploadFinish => encode(&service.upload_finish(
+                        &actor,
+                        &typed(&params)?,
+                        Some(&performed),
+                    )?),
+                    Method::UploadCancel => encode(&service.upload_cancel(
+                        &actor,
+                        &typed(&params)?,
+                        Some(&performed),
+                    )?),
                     Method::DraftCreate => {
                         encode(&service.draft_create(&actor, &typed(&params)?, Some(&performed))?)
                     }

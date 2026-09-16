@@ -315,8 +315,12 @@ pub struct RetainedAction {
     pub method: String,
     /// The digest of the payload it was performed with.
     pub payload_digest: Digest256,
-    /// The canonically encoded result.
-    pub result: Vec<u8>,
+    /// The canonically encoded result, where the effect produces one in the same transaction.
+    ///
+    /// A publication is two commits, and the claim belongs to the first of them: there is no
+    /// handle to record yet. Such a claim carries no result, which is what makes a repeat of it
+    /// `OUTCOME_UNKNOWN` until the second commit fills it in.
+    pub result: Option<Vec<u8>>,
     /// When it was recorded.
     pub recorded_at_ms: TimestampMs,
 }
@@ -869,12 +873,17 @@ impl Store {
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the write fails.
     pub fn record_chunk(
-        &self,
+        &mut self,
         transfer_id: TransferId,
         chunk: ChunkDescriptor,
         at_ms: TimestampMs,
-    ) -> Result<()> {
-        self.connection
+        action: Option<&RetainedAction>,
+    ) -> Result<ActionOutcome> {
+        let transaction = self.begin()?;
+        if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
+            return Ok(ActionOutcome::AlreadyPerformed);
+        }
+        transaction
             .execute(
                 "INSERT OR REPLACE INTO chunks (transfer_id, idx, byte_len, digest, written_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -887,7 +896,8 @@ impl Store {
                 ],
             )
             .map_err(TransferError::store)?;
-        Ok(())
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(ActionOutcome::Committed)
     }
 
     /// Returns one recorded chunk.
@@ -942,8 +952,12 @@ impl Store {
         state: UploadState,
         reason: Option<&str>,
         at_ms: TimestampMs,
-    ) -> Result<()> {
+        action: Option<&RetainedAction>,
+    ) -> Result<ActionOutcome> {
         let transaction = self.begin()?;
+        if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
+            return Ok(ActionOutcome::AlreadyPerformed);
+        }
         transaction
             .execute(
                 "UPDATE uploads
@@ -958,7 +972,8 @@ impl Store {
             &transfer_id.to_string(),
             at_ms,
         )?;
-        transaction.commit().map_err(TransferError::store)
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(ActionOutcome::Committed)
     }
 
     /// Moves an upload out of `from` to a terminal state, only while it is still in `from`.
@@ -1065,8 +1080,12 @@ impl Store {
         preview: Option<&[u8]>,
         preview_unavailable: Option<&str>,
         at_ms: TimestampMs,
-    ) -> Result<()> {
+        action: Option<&RetainedAction>,
+    ) -> Result<ActionOutcome> {
         let transaction = self.begin()?;
+        if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
+            return Ok(ActionOutcome::AlreadyPerformed);
+        }
         transaction
             .execute(
                 "UPDATE uploads
@@ -1090,7 +1109,8 @@ impl Store {
             &transfer_id.to_string(),
             at_ms,
         )?;
-        transaction.commit().map_err(TransferError::store)
+        transaction.commit().map_err(TransferError::store)?;
+        Ok(ActionOutcome::Committed)
     }
 
     /// Records the published handle, after the payload file has been moved.
@@ -1976,6 +1996,30 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Fills in the result of an action that was claimed without one.
+    ///
+    /// The claim happens in the transaction that makes the effect durable; for a two-commit effect
+    /// the result exists only after the second. Nothing replaces a result that is already there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn complete_action(
+        &self,
+        actor_id: &ActorId,
+        action_id: Uuid,
+        result: &[u8],
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE actions SET result = ?3
+                 WHERE actor_id = ?1 AND action_id = ?2 AND result IS NULL",
+                params![actor_id.as_str(), uuid_sql(action_id), result],
+            )
+            .map_err(TransferError::store)?;
+        Ok(())
+    }
+
     /// Removes de-duplication records older than the protocol's retention.
     ///
     /// # Errors
@@ -2494,6 +2538,7 @@ mod tests {
                 UploadState::Cancelled,
                 None,
                 TimestampMs::new(2000),
+                None,
             )
             .expect("writes");
         // Closing the row does not release the bytes; removing the payload does.
@@ -2520,6 +2565,7 @@ mod tests {
                 None,
                 None,
                 TimestampMs::new(2000),
+                None,
             )
             .expect("writes");
         store
@@ -2571,6 +2617,7 @@ mod tests {
                         digest: Digest256::from_bytes([index as u8; 32]),
                     },
                     TimestampMs::new(1000 + index),
+                    None,
                 )
                 .expect("writes");
         }
@@ -2607,6 +2654,7 @@ mod tests {
                 UploadState::Invalidated,
                 Some("a conflicting duplicate"),
                 TimestampMs::new(2000),
+                None,
             )
             .expect("writes");
         let events = store.events_after(0, 100).expect("reads");
@@ -2651,6 +2699,7 @@ mod tests {
                 UploadState::Invalidated,
                 Some("chunk 3 arrived twice with different digests"),
                 TimestampMs::new(2000),
+                None,
             )
             .expect("writes");
         let row = store.upload(transfer(1)).expect("reads").expect("exists");

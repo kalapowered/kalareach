@@ -101,6 +101,7 @@ fn partial_uploads_quotas_environments_links_and_concurrent_changes() {
             &kr_protocol::transfer::UploadCancelParams {
                 transfer_id: fits.transfer_id,
             },
+            None,
         )
         .expect("cancels the reservation");
     let freed = harness
@@ -113,6 +114,7 @@ fn partial_uploads_quotas_environments_links_and_concurrent_changes() {
             &kr_protocol::transfer::UploadCancelParams {
                 transfer_id: freed.transfer_id,
             },
+            None,
         )
         .expect("releases it again");
     harness.set_limits(Limits::default());

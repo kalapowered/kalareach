@@ -150,7 +150,22 @@ impl Action {
             action_id: self.action_id,
             method: self.method.clone(),
             payload_digest: self.payload_digest,
-            result,
+            result: Some(result),
+            recorded_at_ms,
+        }
+    }
+
+    /// Builds the row this action is claimed as, for an effect whose result comes later.
+    ///
+    /// A publication is two commits and the claim belongs to the first, so there is no handle to
+    /// record with it. The result is filled in when the second commits.
+    fn claimed(&self, recorded_at_ms: TimestampMs) -> RetainedAction {
+        RetainedAction {
+            actor_id: self.actor_id.clone(),
+            action_id: self.action_id,
+            method: self.method.clone(),
+            payload_digest: self.payload_digest,
+            result: None,
             recorded_at_ms,
         }
     }
@@ -523,6 +538,7 @@ impl TransferService {
         &self,
         actor: &ActorId,
         params: &UploadChunkParams,
+        action: Option<&Action>,
     ) -> Result<UploadChunkResult> {
         let index = params.chunk.index.get();
         let now = self.clock.now_ms();
@@ -571,34 +587,57 @@ impl TransferService {
                     UploadState::Invalidated,
                     Some(&reason),
                     now,
+                    None,
                 )?;
                 drop(store);
                 self.discard_payloads(&row)?;
                 return Err(TransferError::integrity(reason));
             }
         }
-        if !duplicate {
-            let offset = layout.offset_of(index).unwrap_or_default();
-            let mut file = self.open_incomplete(&row)?;
-            write_at(&mut file, offset, params.bytes.as_slice())?;
-            // The journal row follows the bytes. A row with no bytes behind it would let the
-            // verification trust a hole.
-            store.record_chunk(params.transfer_id, params.chunk, now)?;
-        }
-        let chunks = store.chunks(params.transfer_id)?;
+        // The result is built before the transaction that commits it, because the transaction
+        // carries the action this call is performed under: two copies of one action must not
+        // commit two rows and then answer differently.
+        let recorded = store.chunks(params.transfer_id)?;
         let mut bitmap = ChunkBitmap::empty(layout.chunk_count.get());
         let mut received = 0_u64;
-        for chunk in &chunks {
+        for chunk in &recorded {
             bitmap.insert(chunk.index.get());
             received = received.saturating_add(chunk.byte_len.get());
         }
-        Ok(UploadChunkResult {
+        if !duplicate {
+            bitmap.insert(index);
+            received = received.saturating_add(expected_len);
+        }
+        let result = UploadChunkResult {
             transfer_id: params.transfer_id,
             index: params.chunk.index,
             duplicate,
             received_chunks: bitmap.encode(),
             received_byte_len: U64::new(received),
-        })
+        };
+        let retained = match action {
+            Some(action) => Some(action.retained(
+                kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
+                now,
+            )),
+            None => None,
+        };
+        if !duplicate {
+            let offset = layout.offset_of(index).unwrap_or_default();
+            let mut file = self.open_incomplete(&row)?;
+            write_at(&mut file, offset, params.bytes.as_slice())?;
+        }
+        // The journal row follows the bytes. A row with no bytes behind it would let the
+        // verification trust a hole. The action is claimed in the same transaction as the row, so
+        // a second copy of this action finds it claimed and answers from the record rather than
+        // computing its own answer.
+        match store.record_chunk(params.transfer_id, params.chunk, now, retained.as_ref())? {
+            ActionOutcome::Committed => Ok(result),
+            ActionOutcome::AlreadyPerformed => {
+                drop(store);
+                self.retained_result(action)
+            }
+        }
     }
 
     /// Verifies the whole file and publishes the attachment handle.
@@ -621,6 +660,7 @@ impl TransferService {
         &self,
         actor: &ActorId,
         params: &UploadFinishParams,
+        action: Option<&Action>,
     ) -> Result<UploadFinishResult> {
         let now = self.clock.now_ms();
         // A published upload is answered before anything is read. This is the retry after a lost
@@ -758,13 +798,20 @@ impl TransferService {
         // The intent is durable before the file moves, and it carries the identity of the object
         // that was verified, so an interrupted publish is resolved from the record rather than
         // guessed at.
-        store.begin_publish(
+        // The action is claimed in the same transaction as the intent, which is the commit that
+        // makes this publication this action's. It is claimed without a result, because the handle
+        // does not exist until the second commit; the result is filled in below. A second copy of
+        // this action finds the claim and resolves the same publication rather than starting
+        // another one.
+        let claim = action.map(|action| action.claimed(now));
+        let claim_outcome = store.begin_publish(
             row.transfer_id,
             digest,
             payload_identity,
             encoded_preview.as_deref(),
             preview_unavailable.as_deref(),
             now,
+            claim.as_ref(),
         )?;
         drop(store);
         drop(file);
@@ -789,11 +836,33 @@ impl TransferService {
                     .to_owned(),
             });
         }
-        Ok(UploadFinishResult {
+        let result = UploadFinishResult {
             handle: handle_of(&row)?,
-            already_published: false,
-            preview_unavailable: Nullable(preview_unavailable),
-        })
+            // True when another copy of this action recorded the publication and this call
+            // resolved it rather than starting it.
+            already_published: claim_outcome == ActionOutcome::AlreadyPerformed,
+            preview_unavailable: Nullable(preview_unavailable.clone()),
+        };
+        if claim_outcome == ActionOutcome::AlreadyPerformed {
+            // Another copy of this action owns the publication. This call resolved it, which is
+            // what makes the handle exist either way, and the answer both callers get is the one
+            // that was retained. Until that copy has filled it in there is nothing to prefer, so
+            // this call answers with what it found.
+            return match self.retained_result(action) {
+                Ok(retained) => Ok(retained),
+                Err(_) => Ok(result),
+            };
+        }
+        // The claim above carried no result, because the handle did not exist yet. It does now, so
+        // the record is completed with it: a later repeat of this action is answered with this
+        // handle rather than with `OUTCOME_UNKNOWN`. Nothing replaces a result already recorded,
+        // so the copy that lost the claim does not overwrite the winner's answer.
+        if let Some(action) = action {
+            let encoded = kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?;
+            self.locked()?
+                .complete_action(&action.actor_id, action.action_id, &encoded)?;
+        }
+        Ok(result)
     }
 
     /// Completes, or invalidates, one publication whose intent is already durable.
@@ -942,6 +1011,7 @@ impl TransferService {
         &self,
         actor: &ActorId,
         params: &UploadCancelParams,
+        action: Option<&Action>,
     ) -> Result<UploadCancelResult> {
         let now = self.clock.now_ms();
         // Before the journal's lock, and held across the removal: a cancellation and a publish
@@ -959,27 +1029,58 @@ impl TransferService {
                 });
             }
             // Cancelling something already closed is the same answer twice, which is what a
-            // repeated cancellation has to be.
+            // repeated cancellation has to be. When this call carries an action that closed it,
+            // the answer is the one that action recorded: a copy of the winning cancellation must
+            // not be told that it released nothing.
             UploadState::Cancelled | UploadState::Invalidated | UploadState::Expired => {
-                return Ok(UploadCancelResult {
+                let closed = UploadCancelResult {
                     transfer_id: row.transfer_id,
                     state: row.state,
                     released_byte_len: U64::ZERO,
-                });
+                };
+                drop(store);
+                drop(payloads);
+                return match self.retained_result(action) {
+                    Ok(retained) => Ok(retained),
+                    Err(conflict @ TransferError::IdConflict { .. }) => Err(conflict),
+                    Err(_) => Ok(closed),
+                };
             }
             UploadState::Receiving | UploadState::Publishing => {}
         }
-        store.close_upload(row.transfer_id, UploadState::Cancelled, None, now)?;
+        // Built before the transaction that commits it, so the action carried in that transaction
+        // retains exactly what this call answers with.
+        let result = UploadCancelResult {
+            transfer_id: row.transfer_id,
+            state: UploadState::Cancelled,
+            released_byte_len: U64::new(row.reserved_byte_len),
+        };
+        let retained = match action {
+            Some(action) => Some(action.retained(
+                kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
+                now,
+            )),
+            None => None,
+        };
+        let outcome = store.close_upload(
+            row.transfer_id,
+            UploadState::Cancelled,
+            None,
+            now,
+            retained.as_ref(),
+        )?;
         drop(store);
+        if outcome == ActionOutcome::AlreadyPerformed {
+            // Another copy of this action closed it. That copy owns the payload removal and the
+            // answer both callers get.
+            drop(payloads);
+            return self.retained_result(action);
+        }
         // Both names, because a cancellation can arrive on an upload whose publish had already
         // moved the file. The reservation is released only once the payload is gone.
         self.discard_payloads(&row)?;
         drop(payloads);
-        Ok(UploadCancelResult {
-            transfer_id: row.transfer_id,
-            state: UploadState::Cancelled,
-            released_byte_len: U64::new(row.reserved_byte_len),
-        })
+        Ok(result)
     }
 
     /// Returns one published attachment's handle, for the principal that owns it.
@@ -1912,6 +2013,8 @@ impl TransferService {
                 UploadState::Expired,
                 Some("this upload was unfinished for longer than its expiry"),
                 now,
+                // An expiry is the host's own decision, not the caller's action.
+                None,
             )?;
             // The row is marked for cleanup and its bytes stay charged. The next recovery or sweep
             // removes the payload and releases them; this call does not, because it holds the
