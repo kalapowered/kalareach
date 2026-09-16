@@ -45,6 +45,14 @@ pub enum WorkerError {
     /// The caller does not hold the input lease at the epoch it claimed.
     #[error("the input lease has moved on")]
     LeaseLost,
+    /// The caller cannot supply the keyboard encoding the application has negotiated.
+    #[error("the application negotiated {required}, and {offered}")]
+    InputIncompatible {
+        /// What the application expects its keys in.
+        required: String,
+        /// What this attachment can send.
+        offered: String,
+    },
     /// The presentation this attachment needs is not one this host can serve.
     #[error("{detail}")]
     PresentationUnsupported {
@@ -128,6 +136,7 @@ impl WorkerError {
             Self::Dimensions(_) | Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::UnknownAttachment { .. } => ErrorCode::AmbiguousAttachment,
             Self::LeaseLost => ErrorCode::LeaseLost,
+            Self::InputIncompatible { .. } => ErrorCode::InputIncompatible,
             Self::PresentationUnsupported { .. } => ErrorCode::UnsupportedCapability,
             Self::NotGeometryOwner => ErrorCode::GeometryNotOwner,
             Self::SessionClosed => ErrorCode::SessionClosed,

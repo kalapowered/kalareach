@@ -491,6 +491,24 @@ impl AttachmentTable {
         }
     }
 
+    /// Returns whether this attachment's keys follow whatever the application negotiates.
+    ///
+    /// A semantic attachment builds its keys from the logical key and its modifiers through the
+    /// shared encoder, so it can produce whichever protocol is in force. A terminal attachment
+    /// sends what its terminal sends, so it follows the negotiation only when the host may put its
+    /// terminal into it, which is what declaring the terminal allows. An attachment that declared
+    /// nothing, which is what `--no-probe` chooses, keeps whatever encoding its terminal already
+    /// had, and section 8 does not let it hold the lease over an application expecting another.
+    #[must_use]
+    pub fn keys_follow_the_negotiation(&self, id: AttachmentId) -> bool {
+        self.by_id
+            .get(&id)
+            .and_then(|ordinal| self.attachments.get(ordinal))
+            .is_some_and(|attachment| {
+                attachment.mode != AttachMode::Terminal || attachment.terminal_profile_id.is_some()
+            })
+    }
+
     /// Returns an attachment's own physical dimensions, when it has reported them.
     ///
     /// The outer `Option` says whether the attachment exists; the inner one says whether it has

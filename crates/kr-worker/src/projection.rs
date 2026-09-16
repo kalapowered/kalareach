@@ -231,6 +231,24 @@ impl TerminalEngine {
         self.collect(&outcome, gate, now_ms)
     }
 
+    /// Returns what the application has negotiated for its keys, when that is not the plain one.
+    ///
+    /// `None` means an ordinary terminal's own encoding, which every attachment can send. Anything
+    /// else is a protocol the terminal has to have been put into: a controller whose terminal was
+    /// never put into it sends the plain encoding, and the application reads it as different keys.
+    #[must_use]
+    pub fn negotiated_keyboard(&self) -> Option<String> {
+        let modes = self.engine.modes();
+        let level = modes.modify_other_keys();
+        match (modes.kitty_flags(), level) {
+            (Some(flags), _) if flags != 0 => {
+                Some(format!("the Kitty keyboard protocol with flags {flags}"))
+            }
+            (_, level) if level != 0 => Some(format!("modifyOtherKeys level {level}")),
+            _ => None,
+        }
+    }
+
     /// Returns whether the application has bracketed paste on, as the canonical parser has it.
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
