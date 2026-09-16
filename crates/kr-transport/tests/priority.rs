@@ -7,6 +7,10 @@
 //! a shared runner, on a loaded laptop and in an unoptimised build, which is what a property of
 //! the design should do.
 //!
+//! There is one deadline in the file, and it decides nothing about the property: it turns a host
+//! or a peer that has stopped answering into a named failure rather than a job that runs until CI
+//! kills it. It is twenty seconds against work that takes a fifth of a second.
+//!
 //! The mechanism has two halves and both are observable.
 //!
 //! The first is admission. Every data-stream write is charged against the whole send budget the
@@ -23,6 +27,7 @@ mod support;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use kr_cbor::CanonicalValue;
 use kr_protocol::envelope::ParamsValue;
@@ -49,6 +54,13 @@ const CHUNK_BYTES: usize = 256 * 1024;
 /// How many chunks the host has to have taken before the keystrokes begin, so what they are
 /// measured against is a transfer at steady state rather than one that is still opening.
 const CHUNKS_BEFORE: usize = 4;
+
+/// How long the test waits for a peer that should have answered by now.
+///
+/// A liveness bound rather than a measurement: the work inside it takes a fifth of a second, and
+/// nothing about the property depends on how long it took. Without it a peer that stopped
+/// answering leaves the test waiting rather than failing.
+const DEADLINE: Duration = Duration::from_secs(20);
 
 /// Wraps raw bytes as the byte string a frame carries.
 fn payload(bytes: &[u8]) -> ParamsValue {
@@ -266,10 +278,10 @@ async fn every_keystroke_is_answered_while_a_transfer_runs() {
         }
     });
 
-    for _ in 0..CHUNKS_BEFORE {
-        chunk_arrived
-            .recv()
+    for chunk in 0..CHUNKS_BEFORE {
+        tokio::time::timeout(DEADLINE, chunk_arrived.recv())
             .await
+            .unwrap_or_else(|_| panic!("chunk {chunk} of the transfer never reached the host"))
             .expect("the transfer reached the host");
     }
 
@@ -280,9 +292,9 @@ async fn every_keystroke_is_answered_while_a_transfer_runs() {
             .write_message(&payload(bytes.as_bytes()))
             .await
             .expect("the keystroke was admitted and sent");
-        let echoed = input
-            .read_message::<ParamsValue>()
+        let echoed = tokio::time::timeout(DEADLINE, input.read_message::<ParamsValue>())
             .await
+            .unwrap_or_else(|_| panic!("keystroke {keystroke} was never answered"))
             .expect("an echo")
             .expect("the stream did not end");
         assert_eq!(

@@ -261,9 +261,16 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
     let mut loaded = round_trips(&mut input, SAMPLES).await;
     let mut lateness = probe.stop();
     let during = chunks.load(Ordering::Relaxed) - before;
+    bulk.abort();
+    // Before the percentile, which has no answer for an empty set. A harness that recorded no
+    // lateness knows nothing about its conditions, and that is a defect in the harness rather
+    // than a figure about the product.
+    assert!(
+        !lateness.is_empty(),
+        "the harness recorded no runtime lateness, so its conditions are unknown"
+    );
     let loaded_p95 = percentile(&mut loaded, 0.95);
     let scheduling_p95 = percentile(&mut lateness, 0.95);
-    bulk.abort();
 
     let added = loaded_p95.saturating_sub(baseline_p95);
     let host = Host::read();
@@ -297,10 +304,6 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
     assert!(
         during > 0,
         "the transfer moved nothing while the round trips ran, so they were not measured under one"
-    );
-    assert!(
-        !lateness.is_empty(),
-        "the harness recorded no runtime lateness, so its conditions are unknown"
     );
 
     let shortfalls = host.shortfalls(WORKER_THREADS, scheduling_p95, MAX_SCHEDULING_DELAY);
