@@ -6,10 +6,10 @@ name: package-release
 # commit, `scripts/release-packages.sh` refuses to pack anything else, and the release that appears
 # carries the two archives and the digests a consumer pins them by.
 #
-# The release is assembled as a draft, and it is published only once the asset set on GitHub's side
-# matches what was packed. After that the job fetches every asset back by the URL GitHub serves it
-# at, checks it against those digests, and writes those URLs into the release notes, so the notes
-# name URLs that were fetched rather than URLs that were assumed.
+# The release is assembled as a draft and published only once GitHub's record of every asset, down
+# to its own sha256 of the bytes it stored, matches what was packed. After that the job fetches each
+# asset back from the URL GitHub serves it at, holds it to the packed sha512, writes those URLs into
+# the notes, and confirms the published release cannot be replaced.
 on:
   push:
     tags:
@@ -70,6 +70,19 @@ jobs:
           set -euo pipefail
           packages="$RUNNER_TEMP/packages"
 
+          # One tag is one release, and a release is never assembled twice. A draft left behind by
+          # an upload that failed is named here rather than joined by a second one.
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | \"\(.id) draft=\(.draft)\"" \
+            >"$RUNNER_TEMP/existing"
+
+          if [ -s "$RUNNER_TEMP/existing" ]; then
+            echo "$GITHUB_REF_NAME already has a release:" >&2
+            cat "$RUNNER_TEMP/existing" >&2
+            echo 'Delete it before assembling another, or tag the corrected commit instead.' >&2
+            exit 1
+          fi
+
           # The part of the notes that does not depend on where the assets end up. The last step
           # rebuilds the notes around it with the URLs GitHub reports.
           {
@@ -107,24 +120,28 @@ jobs:
             --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id" >"$RUNNER_TEMP/release-id"
 
           if [ "$(wc -l <"$RUNNER_TEMP/release-id")" -ne 1 ]; then
-            echo "$GITHUB_REF_NAME matches $(wc -l <"$RUNNER_TEMP/release-id") releases:" >&2
+            echo "$GITHUB_REF_NAME now matches these releases:" >&2
             cat "$RUNNER_TEMP/release-id" >&2
             exit 1
           fi
 
           release="$(cat "$RUNNER_TEMP/release-id")"
 
-          # The asset set is checked while nothing can install it: every archive that was packed, at
-          # the length it was packed at, and nothing else attached.
+          # The asset set is held to what was packed while nothing can install it: every archive, at
+          # its length, with GitHub's own sha256 of the bytes it stored, and nothing else attached.
           for file in "$packages"/*; do
-            printf '%s %s\n' "$(basename "$file")" "$(wc -c <"$file" | tr -d ' ')"
+            printf '%s %s sha256:%s\n' \
+              "$(basename "$file")" \
+              "$(wc -c <"$file" | tr -d ' ')" \
+              "$(sha256sum "$file" | cut -d' ' -f1)"
           done | sort >"$RUNNER_TEMP/packed-assets"
 
           gh api "repos/$GITHUB_REPOSITORY/releases/$release" \
-            --jq '.assets[] | "\(.name) \(.size)"' | sort >"$RUNNER_TEMP/uploaded-assets"
+            --jq '.assets[] | "\(.name) \(.size) \(.digest)"' | sort >"$RUNNER_TEMP/stored-assets"
 
-          if ! diff "$RUNNER_TEMP/packed-assets" "$RUNNER_TEMP/uploaded-assets"; then
+          if ! diff "$RUNNER_TEMP/packed-assets" "$RUNNER_TEMP/stored-assets"; then
             echo 'The release holds something other than what was packed; it stays a draft.' >&2
+            echo 'A digest of null means the repository has immutable releases turned off.' >&2
             exit 1
           fi
 
@@ -171,3 +188,20 @@ jobs:
           gh release edit "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
 
           cat "$RUNNER_TEMP/notes.md" >>"$GITHUB_STEP_SUMMARY"
+
+      # What a consumer pins is a URL and a digest, so the release behind them has to be one that
+      # nobody can point somewhere else. This is the repository's immutable-releases setting, which
+      # this token cannot read directly but which every published release reports.
+      - name: Confirm the release cannot be replaced
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          immutable="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.immutable')"
+
+          if [ "$immutable" != "true" ]; then
+            echo "$GITHUB_REF_NAME was published as a release whose assets can be replaced." >&2
+            echo 'Turn on immutable releases for this repository, then release the next commit.' >&2
+            exit 1
+          fi

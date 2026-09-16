@@ -37,10 +37,12 @@ git tag "packages/v0.2.0+${commit:0:12}" "$commit"
 git push origin "packages/v0.2.0+${commit:0:12}"
 ```
 
-`.github/workflows/package-release.yml` runs on a tag matching `packages/v*`, packs the archives
-with `scripts/release-packages.sh`, attaches them and `SHA512SUMS` to a draft release, publishes it
-once GitHub's record of the asset set matches what was packed, then fetches every asset back by the
-URL GitHub serves it at, holds it to the packed digests, and writes those URLs into the notes.
+`.github/workflows/package-release.yml` runs on a tag matching `packages/v*`. It packs the archives
+with `scripts/release-packages.sh`, refuses to go on if that tag already has a release or a draft,
+attaches the archives and `SHA512SUMS` to a draft, and publishes the draft only once GitHub's record
+of every asset, down to its own sha256 of the bytes it stored, matches what was packed. Then it
+fetches each asset back from the URL GitHub serves it at, holds it to the packed sha512, writes
+those URLs into the notes, and confirms the published release cannot be replaced.
 
 The script is what makes the release that commit's output rather than a working tree's:
 
@@ -49,11 +51,14 @@ The script is what makes the release that commit's output rather than a working 
 - it asks each generator whether the committed schema, TypeScript types, WIT package and
   conformance vectors are still what it produces, so an archive never carries output that has
   drifted from the Rust types it came from;
-- it refuses a `pack-gzip-level` setting, which would change the bytes, and an `ignore-scripts`
-  setting, which would skip the step that generates most of what the protocol package publishes;
-- it packs each archive twice and compares the two, and then asks each archive what it contains:
-  every path the manifest publishes, a manifest naming that package and version, and a provenance
-  file naming this commit;
+- it packs from a fresh checkout of the commit, because a working tree also holds files Git ignores
+  and pnpm packs what is inside a published directory whether Git ignores it or not;
+- it refuses a configured `pack-gzip-level`, which changes the compressed bytes,
+  `ignore-scripts`, which would skip the step that generates most of what the protocol package
+  publishes, and `skip-manifest-obfuscation`, which changes the manifest written into the archive;
+- it packs each archive twice and compares the two, then asks each archive what it contains: a file
+  under every path the manifest publishes, the file behind every entry point it declares, a manifest
+  naming that package and version, and a provenance file naming this commit;
 - it names each archive after the commit and writes `SHA512SUMS` beside them, and nothing reaches
   the output directory until all of that has passed.
 
@@ -65,12 +70,15 @@ bash scripts/release-packages.sh --output /tmp/kalareach-packages
 
 It needs the pinned Rust toolchain for the generators, and pnpm for the install and the pack.
 
-A published archive is never replaced. Enable the repository's immutable-releases setting so that
-GitHub holds to that rather than a convention holding to it: a URL a consumer pinned then keeps
-resolving to the bytes its lockfile recorded, whoever has write access. A mistake is corrected by a
-new commit and a new tag, and the earlier release stays where it is. Re-running the workflow for a
-tag whose release exists fails at creation, and pushing a tag that is already on the remote produces
-no event at all.
+A published archive is never replaced. Turn on the repository's immutable-releases setting before
+cutting the first release, so that GitHub holds to that rather than a convention holding to it: a URL
+a consumer pinned then keeps resolving to the bytes its lockfile recorded, whoever has write access.
+The setting is what also gives each asset the sha256 GitHub reports, which the workflow compares
+before it publishes anything, and the workflow's last step fails when a release it published turns
+out to be replaceable. Immutability is about replacement and not about availability: a whole release
+can still be deleted, which is why a mistake is corrected by a new commit and a new tag while the
+earlier release stays where it is. Pushing a tag that is already on the remote produces no event at
+all, and a run whose upload failed leaves a draft: delete that draft before tagging again.
 
 ## How a consumer pins a release
 
@@ -134,13 +142,12 @@ its own name.
 ## Reproducing a release
 
 The archive layout is pnpm's: members in a fixed order under a fixed timestamp, with fixed
-permissions and no machine identity. So the bytes are a function of the commit, the Node and pnpm
-versions and the pack settings, and nothing else that the script allows to vary: it refuses a
-configured `pack-gzip-level`, and it packs each archive twice and compares the two, which is a
-repeatability check on the environment the release is packed in rather than a proof about other
-environments.
+permissions and no machine identity. The bytes are therefore a function of the commit, the Node and
+pnpm versions and the three pack settings the script refuses a configured value for. The double pack
+inside one run catches something that varies from moment to moment; it says nothing about another
+machine, which is what the pinned versions and the refused settings are for.
 
-To reproduce a release, use a clean checkout at its commit, the pnpm version in the root
+To reproduce a release, use a fresh checkout of its commit, the pnpm version in the root
 `package.json`'s `packageManager` field, and the Node version the release workflow installs. Where
 the digests differ, compare the two archives member by member before concluding anything about the
 release: the record of what a release published is the `SHA512SUMS` attached to it, which is what a

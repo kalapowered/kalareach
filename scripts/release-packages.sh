@@ -4,15 +4,14 @@
 # `@kalareach/protocol` and `@kalareach/plugin-sdk` come from the Rust types in this repository, and
 # the website and the plugin catalogue consume them as immutable releases pinned by URL and
 # integrity. A release is therefore exactly one commit's output, and this script is what makes that
-# true: it refuses a working tree that is not clean, holds every generated artefact the two packages
-# ship to the canonical Rust source before it packs anything, asks each archive what it contains,
-# names it after the commit it came from, and writes the digests a consumer pins and verifies
-# against.
+# true: it holds every generated artefact the two packages ship to the canonical Rust source, packs
+# from a fresh checkout of the commit rather than from the working tree, asks each archive what it
+# contains, names it after the commit, and writes the digests a consumer pins and verifies against.
 #
-# The archive format belongs to pnpm: members in a fixed order under a fixed timestamp, compressed
-# at pnpm's own level. The bytes are therefore a function of the commit, the Node and pnpm versions
-# and the pack settings, so the script refuses a setting that would change them and packs each
-# archive twice to check that nothing else in the environment reached the bytes.
+# The archive format belongs to pnpm: members in a fixed order under a fixed timestamp, with fixed
+# permissions and no machine identity. The bytes are a function of the commit, the Node and pnpm
+# versions and three pnpm settings, so the script refuses a configured value for any of the three
+# and packs each archive twice to catch anything that varies within one run.
 #
 #   bash scripts/release-packages.sh                                  # writes dist/packages
 #   bash scripts/release-packages.sh --output /tmp/kalareach-packages
@@ -27,6 +26,18 @@ cd "$root"
 
 # The packages a release carries. One tag names one version, so both of these hold the same one.
 packages=(packages/protocol packages/plugin-sdk)
+
+# The pnpm settings a release's bytes depend on, as "<setting>|<the value a release is packed
+# under>|<what another value changes>". `pack-gzip-level` reaches zlib directly. `ignore-scripts`
+# decides whether the step that generates the declarations, the conformance vectors and the
+# provenance file of the protocol package runs at all, and a pack that skipped it is a smaller
+# archive that still packs and still equals a second pack of itself.
+# `skip-manifest-obfuscation` decides which manifest is written into the archive.
+settings=(
+  "pack-gzip-level|undefined|the compressed bytes"
+  "ignore-scripts|false|whether most of what the protocol package publishes is generated at all"
+  "skip-manifest-obfuscation|false|the manifest written into the archive"
+)
 
 output="$root/dist/packages"
 tag=""
@@ -51,9 +62,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-# A release names the commit it was packed from, so it has to be that commit and nothing else. The
-# generated files the archives carry are not committed, which is why this asks about tracked files
-# and untracked ones but not about ignored ones.
+# A release names the commit it was packed from, so what it carries has to be committed. The
+# generated files the archives pick up are not, which is why this asks about tracked files and
+# untracked ones but not about ignored ones; the pack itself runs in a fresh checkout further down,
+# so a file that exists only here cannot reach an archive either way.
 dirty="$(git status --porcelain --untracked-files=all)"
 if [ -n "$dirty" ]; then
   echo "This tree is not clean, so a release packed from it would not be this commit:" >&2
@@ -64,26 +76,16 @@ fi
 commit="$(git rev-parse HEAD)"
 short="${commit:0:12}"
 
-# Two pnpm settings decide what a release is, and neither belongs to one machine.
-#
-# `pack-gzip-level` changes the compressed bytes, so a release packed under a configured level could
-# not be reproduced by anyone without that same configuration. `ignore-scripts` makes packing skip
-# the step that generates the declarations, the conformance vectors and the provenance file the
-# protocol package publishes: the result is a smaller archive that still packs, still equals a
-# second pack of itself, and is missing most of what a consumer installs.
-level="$(pnpm config get pack-gzip-level)"
-if [ "$level" != "undefined" ]; then
-  echo "This environment sets pack-gzip-level to $level." >&2
-  echo "A release is packed at pnpm's own level, because the archive bytes depend on it." >&2
-  exit 1
-fi
+for entry in "${settings[@]}"; do
+  IFS='|' read -r key allowed changes <<<"$entry"
+  configured="$(pnpm config get "$key")"
 
-scripted="$(pnpm config get ignore-scripts)"
-if [ "$scripted" != "undefined" ] && [ "$scripted" != "false" ]; then
-  echo "This environment sets ignore-scripts to $scripted." >&2
-  echo "Packing would then skip the step that generates most of what the protocol package ships." >&2
-  exit 1
-fi
+  if [ "$configured" != "undefined" ] && [ "$configured" != "$allowed" ]; then
+    echo "This environment sets $key to $configured, which changes $changes." >&2
+    echo "A release is packed under pnpm's own $key, so this one is not publishable." >&2
+    exit 1
+  fi
+done
 
 # Prints "<package name> <version> <archive base name>" for one package directory. pnpm names an
 # archive after the package, so the name is read from the manifest rather than spelled out here.
@@ -100,21 +102,6 @@ manifest() {
     process.stdout.write(
       `${found.name} ${found.version} ${found.name.replace(/^@/, "").replace(/\//g, "-")}\n`
     )
-  ' "$1"
-}
-
-# Prints the paths one package publishes, one per line, from its manifest's `files` list.
-published() {
-  # shellcheck disable=SC2016  # the ${} below are JavaScript template placeholders.
-  node -e '
-    const { readFileSync } = require("node:fs")
-    const directory = process.argv[1]
-    const found = JSON.parse(readFileSync(`${directory}/package.json`, "utf8"))
-    if (!Array.isArray(found.files) || found.files.length === 0) {
-      process.stderr.write(`${directory}/package.json publishes no files list\n`)
-      process.exit(1)
-    }
-    process.stdout.write(`${found.files.join("\n")}\n`)
   ' "$1"
 }
 
@@ -171,53 +158,90 @@ read_digest() {
   sri="sha512-$found_encoded"
 }
 
-# Asks one archive what it contains: every path the manifest publishes has to be in it, the manifest
-# inside has to name that package and version, and a provenance file, where the package has one, has
-# to name this commit. This is what catches an archive packed without the step that generates most
-# of its contents, which is otherwise a well-formed archive of the wrong thing.
+# Asks one archive what it contains, rather than trusting that packing went well: a file under every
+# path the manifest publishes, the file behind every entry point it declares, a manifest naming that
+# package and version, and a provenance file, where the package has one, naming this commit. An
+# archive packed without the step that generates most of its contents is otherwise a well-formed
+# archive of the wrong thing.
 verify_archive() {
-  local archive="$1" directory="$2" expected_name="$3" expected_version="$4"
-  local unpacked entries entry prefix
+  local archive="$1" directory="$2" expected_name="$3" expected_version="$4" unpacked
 
   unpacked="$staging/unpacked"
   rm -rf "$unpacked"
   mkdir -p "$unpacked"
   tar -xzf "$archive" -C "$unpacked"
 
-  entries="$(published "$directory")"
-
-  while IFS= read -r entry; do
-    prefix="${entry%%\**}"
-    if [ ! -e "$unpacked/package/$prefix" ]; then
-      echo "$(basename "$archive") carries no $entry, which $directory publishes. It carries:" >&2
-      (cd "$unpacked/package" && ls -A) >&2
-      exit 1
-    fi
-  done <<<"$entries"
-
   # shellcheck disable=SC2016  # the ${} below are JavaScript template placeholders.
   node -e '
-    const { existsSync, readFileSync } = require("node:fs")
-    const [directory, expectedName, expectedVersion, commit] = process.argv.slice(1)
-    const read = (file) => JSON.parse(readFileSync(`${directory}/${file}`, "utf8"))
-    const problems = []
+    const { readdirSync, readFileSync, statSync } = require("node:fs")
+    const [directory, label, expectedName, expectedVersion, commit] = process.argv.slice(1)
 
-    const found = read("package.json")
+    const carried = readdirSync(directory, { recursive: true })
+      .filter((entry) => statSync(`${directory}/${entry}`).isFile())
+      .map((entry) => entry.split("\\").join("/"))
+
+    const problems = []
+    const bare = (path) => path.replace(/^\.\//, "")
+    const found = JSON.parse(readFileSync(`${directory}/package.json`, "utf8"))
+
     if (found.name !== expectedName) {
-      problems.push(`it contains ${found.name}, not ${expectedName}`)
+      problems.push(`${label} contains ${found.name}, not ${expectedName}`)
     }
     if (found.version !== expectedVersion) {
-      problems.push(`it contains version ${found.version}, not ${expectedVersion}`)
+      problems.push(`${label} contains version ${found.version}, not ${expectedVersion}`)
     }
 
-    if (existsSync(`${directory}/provenance.json`)) {
-      const provenance = read("provenance.json")
+    // Each published path has to hold a file. A directory on its own says nothing: an empty `types`
+    // directory and a `types` directory with the declarations in it both exist.
+    for (const published of Array.isArray(found.files) ? found.files : []) {
+      const prefix = bare(published).split("*")[0].replace(/\/+$/, "")
+      const holds = carried.some((entry) => entry === prefix || entry.startsWith(`${prefix}/`))
+
+      if (!holds) {
+        problems.push(`${label} carries no file under ${published}, which it publishes`)
+      }
+    }
+
+    // What the package points at is what a consumer resolves: its main, its declarations and every
+    // target in its exports map, with a pattern satisfied by anything that matches it.
+    const targets = new Set()
+    const collect = (value) => {
+      if (typeof value === "string") targets.add(value)
+      else if (value !== null && typeof value === "object") Object.values(value).forEach(collect)
+    }
+
+    collect(found.main)
+    collect(found.types)
+    collect(found.exports)
+
+    for (const target of targets) {
+      const path = bare(target)
+
+      if (path.includes("*")) {
+        const pattern = new RegExp(
+          `^${path
+            .split("*")
+            .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+            .join(".+")}$`
+        )
+
+        if (!carried.some((entry) => pattern.test(entry))) {
+          problems.push(`${label} carries nothing matching ${target}, which it exports`)
+        }
+      } else if (!carried.includes(path)) {
+        problems.push(`${label} carries no ${target}, which it exports`)
+      }
+    }
+
+    if (carried.includes("provenance.json")) {
+      const provenance = JSON.parse(readFileSync(`${directory}/provenance.json`, "utf8"))
+
       if (provenance.core_commit !== commit) {
-        problems.push(`it was packed from ${provenance.core_commit}, not from ${commit}`)
+        problems.push(`${label} was packed from ${provenance.core_commit}, not from ${commit}`)
       }
       if (provenance.package !== expectedName || provenance.version !== expectedVersion) {
         problems.push(
-          `its provenance names ${provenance.package} ${provenance.version}, ` +
+          `${label} names ${provenance.package} ${provenance.version} as its provenance, ` +
             `not ${expectedName} ${expectedVersion}`
         )
       }
@@ -225,9 +249,10 @@ verify_archive() {
 
     if (problems.length > 0) {
       process.stderr.write(`${problems.join("\n")}\n`)
+      process.stderr.write(`It carries:\n${carried.sort().join("\n")}\n`)
       process.exit(1)
     }
-  ' "$unpacked/package" "$expected_name" "$expected_version" "$commit"
+  ' "$unpacked/package" "$(basename "$archive")" "$expected_name" "$expected_version" "$commit"
 
   rm -rf "$unpacked"
 }
@@ -259,12 +284,17 @@ if [ -n "$tag" ] && [ "$tag" != "$expected_tag" ]; then
 fi
 
 # Existing files are never removed and never uploaded by accident: an output directory holding two
-# commits' archives is the mistake this refuses.
-if [ -e "$output" ] && [ -n "$(ls -A "$output")" ]; then
-  echo "$output already holds files:" >&2
-  ls -A "$output" >&2
-  echo "Empty it or choose another directory." >&2
-  exit 1
+# commits' archives is the mistake this refuses. The listing is taken first, so a directory that
+# cannot be read ends the run instead of passing for an empty one.
+if [ -e "$output" ]; then
+  existing="$(ls -A "$output")"
+
+  if [ -n "$existing" ]; then
+    echo "$output already holds files:" >&2
+    echo "$existing" >&2
+    echo "Empty it or choose another directory." >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "$output"
@@ -273,6 +303,7 @@ output="$(cd "$output" && pwd)"
 staging="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-release.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 mkdir -p "$staging/assets"
+checkout="$staging/checkout"
 
 echo "kalareach package release"
 echo "  commit: $commit"
@@ -297,6 +328,15 @@ cargo run --locked -p kr-plugin-sdk --bin kr-plugin-sdk-gen -- --check
 pnpm -r generate:check
 echo
 
+# Packing happens in a checkout of nothing but this commit. A working tree also holds files Git
+# ignores, and pnpm packs what is inside a published directory whether Git ignores it or not, so a
+# stray file here would otherwise travel inside a release.
+echo "checking out $short to pack from"
+git clone --quiet --shared --no-checkout "$root" "$checkout"
+git -C "$checkout" checkout --quiet --detach "$commit"
+pnpm -C "$checkout" install --frozen-lockfile
+echo
+
 assets=()
 integrities=()
 sums=()
@@ -308,8 +348,8 @@ for package in "${packages[@]}"; do
 
   echo "packing $name $version"
   mkdir -p "$staging/first" "$staging/second"
-  pnpm -C "$package" pack --pack-destination "$staging/first" >/dev/null
-  pnpm -C "$package" pack --pack-destination "$staging/second" >/dev/null
+  pnpm -C "$checkout/$package" pack --pack-destination "$staging/first" >/dev/null
+  pnpm -C "$checkout/$package" pack --pack-destination "$staging/second" >/dev/null
 
   for attempt in first second; do
     if [ ! -f "$staging/$attempt/$packed" ]; then
@@ -324,16 +364,16 @@ for package in "${packages[@]}"; do
   first_sri="$sri"
   read_digest "$staging/second/$packed"
 
-  # Two archives packed from one commit in one environment are one archive. When they are not,
-  # something outside the commit reached the bytes, and the digests published here would describe
-  # one run rather than the release.
+  # Two archives packed from one commit in one run are one archive. When they are not, something
+  # that varies from moment to moment reached the bytes, and the digests published here would
+  # describe one pack rather than the release.
   if [ "$hex" != "$first_hex" ]; then
     echo "Packing $name twice produced two different archives ($first_hex and $hex)." >&2
     echo "A release has to be reproducible from its commit, so this is not publishable." >&2
     exit 1
   fi
 
-  verify_archive "$staging/first/$packed" "$package" "$name" "$version"
+  verify_archive "$staging/first/$packed" "$checkout/$package" "$name" "$version"
 
   mv "$staging/first/$packed" "$staging/assets/$asset"
   rm -rf "$staging/first" "$staging/second"
