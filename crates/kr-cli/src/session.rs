@@ -120,12 +120,17 @@ pub async fn run(
         match terminal.probe() {
             Ok(probe) => probe,
             Err(error) => {
-                let _ = terminal.restore(&saved, &crate::terminal::KeyboardState::EMPTY);
+                // Nothing has begun forwarding, so the outer terminal's own keyboard negotiation is
+                // not this attachment's to clear.
+                let _ = terminal.restore(&saved, None);
                 guard.release();
                 return Err(error);
             }
         }
     };
+    // The guard is told whatever was read, including nothing, because being told at all is what
+    // says this attachment is about to begin forwarding and that the keyboard protocols the session
+    // may set are therefore its to clear.
     guard.learn_keyboard(&probe.keyboard);
     let keyboard = probe.keyboard;
 
@@ -203,7 +208,7 @@ pub async fn run(
 
     // The terminal comes back here on every path out of the loop, and the guard is released only
     // once it has.
-    terminal.restore(&raw_replaced, &keyboard)?;
+    terminal.restore(&raw_replaced, Some(&keyboard))?;
     guard.release();
     Ok((outcome, descriptor.session_id))
 }

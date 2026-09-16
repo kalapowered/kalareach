@@ -55,7 +55,7 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// keyboard protocols are in [`KEYBOARD_RESET_SEQUENCES`] and are only ever sent together with what
 /// replaces them, because clearing one this attachment never changed would take away something the
 /// person set up for themselves.
-pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
+pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
 
 /// The sequences that clear the keyboard protocols a session may have negotiated, in both buffers.
 ///
@@ -65,9 +65,9 @@ pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004
 /// buffer through `?1049` saves and restores the cursor, so the primary screen is not disturbed by
 /// the visit.
 ///
-/// They are sent only when what the terminal had is known and is about to be put back. A cleanup
-/// that ran before the outer terminal was ever asked leaves them alone: the attachment had not
-/// begun forwarding, so nothing it did could have changed them.
+/// They are sent only by a cleanup that follows an attachment which began forwarding, because only
+/// then could the session have changed them. A cleanup that runs before that leaves them alone:
+/// nothing that had happened could have touched them.
 pub const KEYBOARD_RESET_SEQUENCES: &[u8] =
     b"\x1b[<65535u\x1b[>4;0m\x1b[?1049h\x1b[<65535u\x1b[>4;0m\x1b[?1049l\x1b[<65535u\x1b[>4;0m";
 
@@ -145,13 +145,12 @@ impl KeyboardState {
 
     /// Returns the sequences that clear the session's keyboard protocols and put these back.
     ///
-    /// Empty when nothing was ever read from the terminal, because then nothing here is known to
-    /// have changed and clearing would take away what the person set up for themselves.
+    /// The clearing happens whatever was read, because a session that has been forwarding can have
+    /// set these modes whether or not the outer terminal ever said what it had. What was read comes
+    /// back after it; a terminal that answered nothing gets nothing back, which is the cost of
+    /// never asking it.
     #[must_use]
     pub fn cleanup_sequences(&self) -> Vec<u8> {
-        if !self.is_known() {
-            return Vec::new();
-        }
         let mut out = Vec::from(KEYBOARD_RESET_SEQUENCES);
         out.extend_from_slice(&self.restore_sequences());
         out
@@ -393,14 +392,15 @@ mod unix {
 
         /// Restores saved modes and undoes the modes an application may have left enabled.
         ///
-        /// `keyboard` is what this terminal had negotiated before the attachment began. It is
-        /// written after the clearing sequences, so what a person set up for themselves comes back
-        /// rather than being taken away with what the session left.
+        /// `keyboard` is present once the attachment has begun forwarding, and carries whatever the
+        /// outer terminal said it had negotiated. Its presence is what says the keyboard protocols
+        /// need clearing at all: a cleanup that runs before forwarding began passes `None` and
+        /// leaves them alone, because nothing that had happened could have changed them.
         ///
         /// # Errors
         ///
         /// Returns an error when the modes cannot be set.
-        pub fn restore(&self, saved: &Termios, keyboard: &KeyboardState) -> Result<()> {
+        pub fn restore(&self, saved: &Termios, keyboard: Option<&KeyboardState>) -> Result<()> {
             use std::io::Write as _;
 
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Flush, saved).map_err(
@@ -408,7 +408,9 @@ mod unix {
             )?;
             let mut handle = &self.handle;
             let _ = handle.write_all(RESET_SEQUENCES);
-            let _ = handle.write_all(&keyboard.cleanup_sequences());
+            if let Some(keyboard) = keyboard {
+                let _ = handle.write_all(&keyboard.cleanup_sequences());
+            }
             let _ = handle.flush();
             Ok(())
         }
@@ -762,7 +764,7 @@ mod tests {
     #[test]
     fn the_reset_sequences_turn_off_the_modes_an_application_may_have_left() {
         let text = String::from_utf8_lossy(RESET_SEQUENCES);
-        for sequence in ["?1000l", "?1006l", "?2004l", "?25h"] {
+        for sequence in ["?1049l", "?1000l", "?1006l", "?2004l", "?25h"] {
             assert!(text.contains(sequence), "{sequence} is undone");
         }
         // The keyboard protocols are not among them, because clearing one this attachment never
@@ -796,8 +798,18 @@ mod tests {
             "and what it had comes back last: {cleanup:?}"
         );
 
-        // A terminal that was never asked: nothing is cleared, because nothing is known to have
-        // changed and the person's own negotiation is not this attachment's to undo.
-        assert!(KeyboardState::EMPTY.cleanup_sequences().is_empty());
+        // A terminal that was never asked, cleaned up after an attachment that had been
+        // forwarding: the session's own modes are still cleared, because it could have set them,
+        // and nothing comes back, which is what never asking costs.
+        let unknown =
+            String::from_utf8_lossy(&KeyboardState::EMPTY.cleanup_sequences()).into_owned();
+        assert!(
+            unknown.contains("\u{1b}[<65535u"),
+            "the session's modes are cleared"
+        );
+        assert!(
+            !unknown.contains("\u{1b}[="),
+            "and nothing is put back: {unknown:?}"
+        );
     }
 }

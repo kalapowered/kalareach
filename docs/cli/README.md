@@ -100,9 +100,13 @@ answers and is the first input the attachment forwards.
 
 Both paths out put everything back: the mode words, the control characters, the sequences that undo
 what an application may have left enabled, and then the keyboard protocols the terminal had chosen
-for itself. `--no-probe` asks the terminal nothing at all, which is what makes it the choice for a
-terminal that does not answer; with nothing read there is nothing to put back, and the clearing
-stands.
+for itself. A cleanup that runs before the attachment began forwarding, because the handshake failed
+or the process was killed during it, leaves those protocols alone: nothing that had happened could
+have changed them.
+
+`--no-probe` asks the terminal nothing at all, which is what makes it the choice for a terminal that
+does not answer. The session's own keyboard modes are still cleared when the attachment ends, since
+the session could have set them, but nothing comes back afterwards: that is what never asking costs.
 
 * A clean exit restores the terminal and sends the guard a byte, and the guard leaves without
   acting.

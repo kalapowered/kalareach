@@ -184,14 +184,16 @@ mod console {
         /// # Errors
         ///
         /// Returns an error when the modes cannot be set.
-        pub fn restore(&self, saved: &SavedModes, keyboard: &KeyboardState) -> Result<()> {
+        pub fn restore(&self, saved: &SavedModes, keyboard: Option<&KeyboardState>) -> Result<()> {
             use std::io::Write as _;
 
             set_console_mode(&self.input, saved.input)?;
             set_console_mode(&self.output, saved.output)?;
             let mut handle = &self.output;
             let _ = handle.write_all(RESET_SEQUENCES);
-            let _ = handle.write_all(&keyboard.cleanup_sequences());
+            if let Some(keyboard) = keyboard {
+                let _ = handle.write_all(&keyboard.cleanup_sequences());
+            }
             let _ = handle.flush();
             Ok(())
         }

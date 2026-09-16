@@ -65,7 +65,7 @@ fn main() -> ExitCode {
     // What the attach process has to say, until it says it is done or it is gone. It sends the
     // keyboard protocols this terminal had once it has read them, which it cannot do before this
     // guard is holding the terminal's modes, and then either the release byte or nothing at all.
-    let mut keyboard = KeyboardState::EMPTY;
+    let mut keyboard = None;
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
     let mut input = std::io::stdin();
@@ -82,7 +82,7 @@ fn main() -> ExitCode {
                         .and_then(|rest| std::str::from_utf8(rest).ok())
                         .and_then(|text| KeyboardState::decode(text).ok())
                     {
-                        keyboard = state;
+                        keyboard = Some(state);
                     }
                     line.clear();
                 }
@@ -93,7 +93,7 @@ fn main() -> ExitCode {
         }
     }
 
-    if restore(&saved, &keyboard) {
+    if restore(&saved, keyboard.as_ref()) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -101,7 +101,7 @@ fn main() -> ExitCode {
 }
 
 #[cfg(unix)]
-fn restore(saved: &SavedModes, keyboard: &KeyboardState) -> bool {
+fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>) -> bool {
     use rustix::termios::OptionalActions;
 
     let terminal = std::io::stdout();
@@ -119,7 +119,9 @@ fn restore(saved: &SavedModes, keyboard: &KeyboardState) -> bool {
                 // guard that acts because that process was killed restores the same state a normal
                 // exit would have. A guard that was never told leaves the keyboard protocols
                 // alone: nothing it is cleaning up had begun to change them.
-                let _ = handle.write_all(&keyboard.cleanup_sequences());
+                if let Some(keyboard) = keyboard {
+                    let _ = handle.write_all(&keyboard.cleanup_sequences());
+                }
                 let _ = handle.flush();
                 return true;
             }
@@ -133,7 +135,7 @@ fn restore(saved: &SavedModes, keyboard: &KeyboardState) -> bool {
 }
 
 #[cfg(not(unix))]
-fn restore(saved: &SavedModes, keyboard: &KeyboardState) -> bool {
+fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>) -> bool {
     let Ok(terminal) = kr_cli::terminal::ControllingTerminal::open() else {
         return false;
     };
