@@ -25,6 +25,7 @@ import {
 import { base64UrlToBytes, jsonToU64, jsonToUuid } from './json.js'
 import { DIGEST_BYTES, NONCE_BYTES, fixedBytes, gatewayOrigin } from './service.js'
 import type {
+  PushDeliveryAck,
   PushDeliveryRequest,
   PushRequest,
   PushInstallationBinding,
@@ -32,6 +33,8 @@ import type {
   PushRatePolicy,
   PushRegistrationAnswerPayload,
   PushSenderBinding,
+  PushSenderRecord,
+  PushSuppression,
   PushSenderRenewalPayload,
   PushSenderRevocationPayload
 } from './generated/protocol.js'
@@ -44,6 +47,18 @@ export type PushUrgency = PushPlatformHints['urgency']
 
 /** A push platform, as the gateway builds a payload for it. */
 export type PushPlatform = PushInstallationBinding['platform']
+
+/** What became of one delivery request. */
+export type PushDeliveryState = PushDeliveryAck['state']
+
+/** Why a notification was suppressed, when it was. */
+export type PushSuppressionReason = PushSuppression['reason']
+
+/** Whether a bound token is still usable. */
+export type PushTokenState = PushInstallationBinding['state']
+
+/** Whether a sender authorisation still stands. */
+export type PushSenderState = PushSenderRecord['state']
 
 /** The domain a registration answer's signature covers. */
 export const PUSH_REGISTRATION_ANSWER_DOMAIN = 'kr-push-registration/1'
