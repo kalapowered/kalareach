@@ -972,6 +972,7 @@ export interface KalaReachProtocol {
   root_eof_detach_params?: RootEofDetachParams
   root_eof_detach_result?: RootEofDetachResult
   sealed_envelope?: SealedEnvelope
+  semantic_continuation?: SemanticContinuation
   service_request_signature?: ServiceRequestSignature
   session_attach_params?: SessionAttachParams
   session_attach_result?: SessionAttachResult
@@ -6015,6 +6016,34 @@ export interface RootEofDetachResult {
    * The state after the detach. The fence is invalidated before this answer is sent.
    */
   state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
+}
+/**
+ * Where a reader continues a semantic snapshot that stopped short.
+ *
+ * It is present exactly when something was left out. A snapshot with no continuation is the whole
+ * tree; one with a continuation is a part, and the fields say what to ask for next.
+ */
+export interface SemanticContinuation {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_node: string
+  /**
+   * Which limit stopped this part.
+   */
+  limit: 'bytes' | 'depth' | 'nodes'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  limit_value: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  nodes: string
 }
 /**
  * One signed service request.

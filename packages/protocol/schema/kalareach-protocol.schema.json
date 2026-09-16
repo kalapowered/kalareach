@@ -9564,6 +9564,60 @@
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },
+    "SemanticContinuation": {
+      "additionalProperties": false,
+      "description": "Where a reader continues a semantic snapshot that stopped short.\n\nIt is present exactly when something was left out. A snapshot with no continuation is the whole\ntree; one with a continuation is a part, and the fields say what to ask for next.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "How many encoded bytes this part carried."
+        },
+        "from_node": {
+          "$ref": "#/$defs/U64",
+          "description": "The node the next part starts at, counted over the producer's own walk order."
+        },
+        "limit": {
+          "$ref": "#/$defs/SemanticLimit",
+          "description": "Which limit stopped this part."
+        },
+        "limit_value": {
+          "$ref": "#/$defs/U64",
+          "description": "The value of that limit, so a reader does not have to hold this build's constants."
+        },
+        "nodes": {
+          "$ref": "#/$defs/U64",
+          "description": "How many nodes this part carried."
+        }
+      },
+      "required": [
+        "limit",
+        "limit_value",
+        "from_node",
+        "nodes",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "SemanticLimit": {
+      "description": "Which limit stopped a semantic snapshot.",
+      "oneOf": [
+        {
+          "const": "bytes",
+          "description": "The total encoded size.",
+          "type": "string"
+        },
+        {
+          "const": "depth",
+          "description": "The tree depth.",
+          "type": "string"
+        },
+        {
+          "const": "nodes",
+          "description": "The node count.",
+          "type": "string"
+        }
+      ]
+    },
     "SensitiveAction": {
       "description": "What a sensitive action is being confirmed for.",
       "oneOf": [
@@ -11687,6 +11741,9 @@
     },
     "sealed_envelope": {
       "$ref": "#/$defs/SealedEnvelope"
+    },
+    "semantic_continuation": {
+      "$ref": "#/$defs/SemanticContinuation"
     },
     "service_request_signature": {
       "$ref": "#/$defs/ServiceRequestSignature"

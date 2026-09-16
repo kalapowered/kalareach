@@ -49,6 +49,7 @@
 //! | [`input`] | The single input lease and the input method group |
 //! | [`root`] | The trusted root integration: the editor fence, its events and the launch transaction |
 //! | [`recovery`] | Subscriptions, snapshots, history pages and resynchronisation |
+//! | [`semantic`] | The semantic snapshot's bounds and the continuation that stands where they stop |
 //! | [`hostinfo`] | Host and environment reads, and read-only diagnostics |
 //! | [`worker`] | Worker descriptors, the startup rendezvous, the verify challenge and the generation token |
 //! | [`schema`] | Deterministic JSON Schema and method-table generation |
@@ -114,6 +115,7 @@ pub mod rights;
 pub mod root;
 pub mod scalars;
 pub mod schema;
+pub mod semantic;
 pub mod service;
 pub mod session;
 pub mod vectors;

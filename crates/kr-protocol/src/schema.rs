@@ -64,6 +64,7 @@ use crate::root::{
     RootEditorFenceResult, RootEditorLeaveParams, RootEditorLeaveResult, RootEofDetachParams,
     RootEofDetachResult, ShellLaunchParams, ShellLaunchResult,
 };
+use crate::semantic::SemanticContinuation;
 use crate::service::ServiceRequestSignature;
 use crate::session::{
     ClosureRecord, SessionCloseParams, SessionCloseResult, SessionCreateParams,
@@ -202,6 +203,7 @@ pub fn protocol_schema() -> Value {
         "root_eof_detach_params" => RootEofDetachParams,
         "root_eof_detach_result" => RootEofDetachResult,
         "sealed_envelope" => SealedEnvelope,
+        "semantic_continuation" => SemanticContinuation,
         "service_request_signature" => ServiceRequestSignature,
         "session_attach_params" => SessionAttachParams,
         "session_attach_result" => SessionAttachResult,
