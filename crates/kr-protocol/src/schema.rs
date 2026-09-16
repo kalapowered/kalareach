@@ -29,11 +29,17 @@ use crate::pairing::{
     OwnerConfirmationProof, OwnerConfirmationRequest, PairFinishRequest, PairStatus, ProposedGrant,
     RevocationAcknowledgement, RevocationRequest, SignedClientBundle, SignedHostBundle,
 };
+use crate::push::{
+    PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest, PushInstallationBinding,
+    PushRegistrationAnswer, PushRegistrationChallenge, PushSenderRecord, PushSenderRenewal,
+    PushSenderRevocation,
+};
 use crate::receipt::{Receipt, ReceiptResponse};
 use crate::relay::{
     RelayConsumptionAck, RelayConsumptionReport, RelayLeaseAck, RelayLeaseRequest,
     SignedRelayConsumptionReceipt, SignedRelayInstanceRegistration,
 };
+use crate::service::ServiceRequestSignature;
 
 /// The generated JSON Schema bundle.
 pub const SCHEMA_FILE_NAME: &str = "kalareach-protocol.schema.json";
@@ -87,6 +93,15 @@ pub fn protocol_schema() -> Value {
         "policy_authority" => PolicyAuthority,
         "proposed_grant" => ProposedGrant,
         "protocol_error" => ProtocolError,
+        "push_delivery_ack" => PushDeliveryAck,
+        "push_delivery_credential" => PushDeliveryCredential,
+        "push_delivery_request" => PushDeliveryRequest,
+        "push_installation_binding" => PushInstallationBinding,
+        "push_registration_answer" => PushRegistrationAnswer,
+        "push_registration_challenge" => PushRegistrationChallenge,
+        "push_sender_record" => PushSenderRecord,
+        "push_sender_renewal" => PushSenderRenewal,
+        "push_sender_revocation" => PushSenderRevocation,
         "receipt" => Receipt,
         "receipt_response" => ReceiptResponse,
         "relay_consumption_ack" => RelayConsumptionAck,
@@ -100,6 +115,7 @@ pub fn protocol_schema() -> Value {
         "revocation_acknowledgement" => RevocationAcknowledgement,
         "revocation_request" => RevocationRequest,
         "sealed_envelope" => SealedEnvelope,
+        "service_request_signature" => ServiceRequestSignature,
         "session_ref" => SessionRef,
         "signed_archive_manifest" => SignedArchiveManifest,
         "signed_client_bundle" => SignedClientBundle,
@@ -165,6 +181,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "capability_id" => ids::CapabilityId,
         "capability_revision" => ids::CapabilityRevision,
         "causal_root_id" => ids::CausalRootId,
+        "collapse_id" => ids::CollapseId,
         "change_set_id" => ids::ChangeSetId,
         "change_set_version" => ids::ChangeSetVersion,
         "clock_epoch" => ids::ClockEpoch,
@@ -188,12 +205,16 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "installation_id" => ids::InstallationId,
         "invitation_id" => ids::InvitationId,
         "machine_id" => ids::MachineId,
+        "notification_id" => ids::NotificationId,
         "organisation_id" => ids::OrganisationId,
         "pairing_sequence" => ids::PairingSequence,
         "payer_authorisation_id" => ids::PayerAuthorisationId,
         "plugin_id" => ids::PluginId,
         "policy_key_revision" => ids::PolicyKeyRevision,
         "project_repository_id" => ids::ProjectRepositoryId,
+        "push_registration_id" => ids::PushRegistrationId,
+        "push_sender_record_id" => ids::PushSenderRecordId,
+        "push_sender_revision" => ids::PushSenderRevision,
         "question_id" => ids::QuestionId,
         "question_revision" => ids::QuestionRevision,
         "relay_instance_id" => ids::RelayInstanceId,

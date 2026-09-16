@@ -395,6 +395,20 @@ uuid_id!(
     OrganisationId,
     "One organisation whose signed policy a host has opted into."
 );
+uuid_id!(
+    /// One attempt to bind a push token to an installation. 128 random bits.
+    ///
+    /// It names the attempt, not the token: a challenge answered for one attempt says nothing
+    /// about another, so a pending registration cannot be completed with the answer to an earlier
+    /// one.
+    PushRegistrationId,
+    "One attempt to bind a push token to an installation. 128 random bits."
+);
+uuid_id!(
+    /// One installation's authorisation of one paired host to send it notifications.
+    PushSenderRecordId,
+    "One installation's authorisation of one paired host to send it notifications."
+);
 
 counter_id!(
     /// The session epoch. Fixed at 1 in version 1 of the protocol.
@@ -464,6 +478,14 @@ counter_id!(
     PolicyKeyRevision,
     "The revision of an organisation's policy-signing key, advanced on every rotation."
 );
+counter_id!(
+    /// The revision of one push sender record. Only the gateway advances it.
+    ///
+    /// Every renewal advances it, so a captured renewal cannot be replayed to reinstate a
+    /// credential that a later renewal or a revocation has already replaced.
+    PushSenderRevision,
+    "The revision of one push sender record, advanced by the gateway on every renewal."
+);
 
 counter_id!(
     /// The backup generation an archive belongs to. Only its producer advances it.
@@ -511,6 +533,22 @@ counter_id!(
     "The host clock epoch, advanced when wall-clock trust changes."
 );
 
+opaque_id!(
+    /// One notification, as the host that produced it names it.
+    ///
+    /// The gateway deduplicates by this value and never reads it. It is opaque on purpose: a
+    /// provider, and anyone who sees the payload in transit, learns nothing from it.
+    NotificationId,
+    "One notification, named by the host that produced it. Opaque to the gateway and the provider."
+);
+opaque_id!(
+    /// The group a notification replaces others in on the device.
+    ///
+    /// It reveals no project or session name: it is a correlation label the host chooses, and it
+    /// reaches the provider in plaintext, which is exactly why it carries nothing.
+    CollapseId,
+    "The group a notification replaces others in on the device. It reveals no project or session name."
+);
 opaque_id!(
     /// Binds the operating-system user, boot identity and login-session generation.
     ///

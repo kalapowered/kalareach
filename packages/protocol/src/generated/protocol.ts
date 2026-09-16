@@ -238,6 +238,10 @@ export type ChangeSetVersion = string
  */
 export type ClockEpoch = string
 /**
+ * The group a notification replaces others in on the device. It reveals no project or session name.
+ */
+export type CollapseId = string
+/**
  * One owner-confirmation challenge: single use and bound to one action digest.
  */
 export type ConfirmationId = string
@@ -302,6 +306,10 @@ export type InvitationId = string
  */
 export type MachineId = string
 /**
+ * One notification, named by the host that produced it. Opaque to the gateway and the provider.
+ */
+export type NotificationId = string
+/**
  * One organisation whose signed policy a host has opted into.
  */
 export type OrganisationId = string
@@ -325,6 +333,18 @@ export type PolicyKeyRevision = string
  * One environment-bound source repository.
  */
 export type ProjectRepositoryId = string
+/**
+ * One attempt to bind a push token to an installation. 128 random bits.
+ */
+export type PushRegistrationId = string
+/**
+ * One installation's authorisation of one paired host to send it notifications.
+ */
+export type PushSenderRecordId = string
+/**
+ * The revision of one push sender record, advanced by the gateway on every renewal.
+ */
+export type PushSenderRevision = string
 /**
  * The exact version of a question that a person answers.
  */
@@ -583,6 +603,7 @@ export interface KalaReachProtocol {
     change_set_id?: ChangeSetId
     change_set_version?: ChangeSetVersion
     clock_epoch?: ClockEpoch
+    collapse_id?: CollapseId
     confirmation_id?: ConfirmationId
     connection_id?: ConnectionId
     controller_generation?: ControllerGeneration
@@ -603,12 +624,16 @@ export interface KalaReachProtocol {
     installation_id?: InstallationId
     invitation_id?: InvitationId
     machine_id?: MachineId
+    notification_id?: NotificationId
     organisation_id?: OrganisationId
     pairing_sequence?: PairingSequence
     payer_authorisation_id?: PayerAuthorisationId
     plugin_id?: PluginId
     policy_key_revision?: PolicyKeyRevision
     project_repository_id?: ProjectRepositoryId
+    push_registration_id?: PushRegistrationId
+    push_sender_record_id?: PushSenderRecordId
+    push_sender_revision?: PushSenderRevision
     question_id?: QuestionId
     question_revision?: QuestionRevision
     raw_bytes?: Bytes
@@ -648,6 +673,15 @@ export interface KalaReachProtocol {
   policy_authority?: PolicyAuthority
   proposed_grant?: ProposedGrant
   protocol_error?: ProtocolError
+  push_delivery_ack?: PushDeliveryAck
+  push_delivery_credential?: PushDeliveryCredential
+  push_delivery_request?: PushDeliveryRequest
+  push_installation_binding?: PushInstallationBinding
+  push_registration_answer?: PushRegistrationAnswer
+  push_registration_challenge?: PushRegistrationChallenge
+  push_sender_record?: PushSenderRecord
+  push_sender_renewal?: PushSenderRenewal
+  push_sender_revocation?: PushSenderRevocation
   receipt?: Receipt1
   receipt_response?: ReceiptResponse
   recovery_bundle?: RecoveryBundle
@@ -661,6 +695,7 @@ export interface KalaReachProtocol {
   revocation_acknowledgement?: RevocationAcknowledgement
   revocation_request?: RevocationRequest
   sealed_envelope?: SealedEnvelope
+  service_request_signature?: ServiceRequestSignature
   session_ref?: SessionRef
   signed_archive_manifest?: SignedArchiveManifest
   signed_client_bundle?: SignedClientBundle
@@ -2351,6 +2386,424 @@ export interface HistoryScope1 {
   named_questions: QuestionId[]
 }
 /**
+ * The gateway's answer to one delivery request.
+ */
+export interface PushDeliveryAck {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  decided_at_ms: string
+  /**
+   * The notification this answers.
+   */
+  notification_id: string
+  /**
+   * What became of it.
+   */
+  state: 'queued' | 'collapsed' | 'duplicate' | 'token_disabled' | 'expired'
+  /**
+   * What was suppressed, when anything was.
+   */
+  suppression: PushSuppression | null
+}
+/**
+ * What the gateway suppressed, so the host can record it.
+ *
+ * The host retains every request it made and reports suppression locally, which is what keeps a
+ * suppressed notification from becoming a lost decision: the pending work is still on the host and
+ * still visible there.
+ */
+export interface PushSuppression {
+  /**
+   * The attention update this collapsed into.
+   */
+  collapsed_into: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  next_update_at_ms: string
+  /**
+   * Which allowance was spent.
+   */
+  reason: 'burst' | 'sustained'
+  /**
+   * How many notifications have collapsed into the current update, including this one.
+   */
+  suppressed_count: string
+}
+/**
+ * The bearer a host presents to deliver, and what it is bound to.
+ *
+ * It is returned to the installation once, at issue and at each renewal, and the installation
+ * passes it to the host through the paired encrypted channel. It grants delivery to one
+ * destination and nothing else: it is not a session, it reads nothing and it cannot be presented
+ * to any other method.
+ *
+ * The gateway stores [`PushDeliveryCredential::secret_digest`], never the secret. A copy of the
+ * database is therefore not a set of working credentials.
+ */
+export interface PushDeliveryCredential {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The gateway that issued it.
+   */
+  gateway_origin: string
+  /**
+   * The destination installation.
+   */
+  installation_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * The revision of the record it was issued against.
+   */
+  revision: string
+  /**
+   * The bearer itself. It reaches a log or a debug rendering as a redaction.
+   */
+  secret: string
+  /**
+   * The authorisation it delivers under.
+   */
+  sender_record_id: string
+}
+/**
+ * One notification, as a host hands it to the gateway.
+ *
+ * The host writes the underlying event first and then sends this, so a notification that is never
+ * delivered has already been recorded somewhere the person can find it. Nothing here is plaintext
+ * that describes the work: the identifier is opaque, the collapse label names no project, the
+ * alert comes from a closed vocabulary, and the preview is sealed to the device.
+ *
+ * Larger detail does not belong here. Section 16 bounds the preview plaintext to
+ * [`MAX_PREVIEW_PLAINTEXT_BYTES`] and the complete provider payload to
+ * [`MAX_PROVIDER_PAYLOAD_BYTES`], and says to move the excess into a referenced encrypted object
+ * rather than trusting an expansion ratio.
+ */
+export interface PushDeliveryRequest {
+  /**
+   * The group this replaces others in on the device.
+   */
+  collapse_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  hints: PushPlatformHints
+  /**
+   * The notification's identity. The gateway deduplicates by it and never reads it.
+   */
+  notification_id: string
+  /**
+   * The sealed preview envelope, or null when the destination has previews disabled.
+   *
+   * The bytes are a [`crate::mailbox::SealedEnvelope`] whose payload type is a notification
+   * preview. The gateway forwards them; it holds no key that opens them.
+   */
+  preview: Bytes | null
+  /**
+   * The authorisation this is delivered under.
+   */
+  sender_record_id: string
+}
+/**
+ * What to ask each platform for.
+ */
+export interface PushPlatformHints {
+  /**
+   * Which generic alert to show.
+   */
+  alert:
+    | 'session_needs_attention'
+    | 'approval_waiting'
+    | 'question_waiting'
+    | 'work_complete'
+    | 'host_unreachable'
+    | 'attention_update'
+  /**
+   * How urgently to deliver.
+   */
+  urgency: 'attention' | 'deferred'
+}
+/**
+ * The canonical active binding of one provider token to one installation.
+ *
+ * There is exactly one of these per token digest. That is what stops an installation from
+ * registering the same token under a second identity to start its rate history again: a second
+ * identity for one token is not an additional binding, it is a replacement, and a replacement has
+ * to pass its own challenge.
+ */
+export interface PushInstallationBinding {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  bound_at_ms: string
+  /**
+   * The gateway holding it.
+   */
+  gateway_origin: string
+  /**
+   * The installation the token delivers to.
+   */
+  installation_id: string
+  /**
+   * The public key that installation authenticates with.
+   */
+  installation_key: string
+  /**
+   * The platform the token belongs to.
+   */
+  platform: 'android' | 'ios'
+  /**
+   * The attempt whose answer established it.
+   */
+  registration_id: string
+  /**
+   * Whether the provider still delivers to the token.
+   */
+  state: 'active' | 'disabled'
+  /**
+   * The token, as the gateway records it.
+   */
+  token_digest: string
+}
+/**
+ * The receiver's answer to a challenge, signed by the proposed installation key.
+ *
+ * The receiver answers only for its own locally pending registration and its own public key. It
+ * does not sign a challenge that names an attempt it did not start, or an installation identifier
+ * that is not the one its key derives, so a challenge aimed at a token in the hope of a reply gets
+ * none.
+ */
+export interface PushRegistrationAnswer {
+  /**
+   * The public half of the key that answered. Its SHA-256 names the installation.
+   */
+  installation_key: string
+  payload: PushRegistrationAnswerPayload
+  /**
+   * The signature over [`PushRegistrationAnswerPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the receiver states.
+ */
+export interface PushRegistrationAnswerPayload {
+  /**
+   * The value that arrived through the provider.
+   */
+  challenge: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The gateway that issued the challenge.
+   */
+  gateway_origin: string
+  /**
+   * The installation the answering key names.
+   */
+  installation_id: string
+  /**
+   * The platform the token belongs to.
+   */
+  platform: 'android' | 'ios'
+  /**
+   * The attempt being answered.
+   */
+  registration_id: string
+  /**
+   * The token the challenge was sent to.
+   */
+  token_digest: string
+}
+/**
+ * The challenge the gateway sends through the provider to a proposed token.
+ *
+ * It goes to the token, not to the caller. That is the whole point: an authenticated HTTP request
+ * proves the caller holds an installation key, and nothing more. Sending a random value to the
+ * token and requiring it back signed proves that the installation which holds the key is also the
+ * one the provider delivers that token to. Until that returns, the registration stays pending and
+ * no sender credential is issued.
+ *
+ * The challenge is single use. An answer consumes it, and a second answer, whether the same one
+ * replayed or another arriving at the same moment, finds nothing pending to answer.
+ */
+export interface PushRegistrationChallenge {
+  /**
+   * The single-use random value the receiver returns.
+   */
+  challenge: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The gateway that issued it.
+   */
+  gateway_origin: string
+  /**
+   * The installation the pending registration is for.
+   */
+  installation_id: string
+  /**
+   * The platform the token belongs to.
+   */
+  platform: 'android' | 'ios'
+  /**
+   * This attempt, so an answer cannot complete a different one.
+   */
+  registration_id: string
+  /**
+   * The token the challenge was sent to.
+   */
+  token_digest: string
+}
+/**
+ * One installation's authorisation of one host, as the gateway holds it.
+ *
+ * The authorisation and the credential have different lifetimes on purpose. The authorisation is
+ * the installation's decision and lasts until the installation revokes it. The credential is a
+ * bearer token that a host keeps on disk, so it expires in thirty days and is renewed by proving
+ * possession of the key the installation named. An offline host that comes back after its
+ * credential expired still renews, because what it proves has not lapsed.
+ */
+export interface PushSenderRecord {
+  binding: PushSenderBinding
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  credential_expires_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * The gateway's revision, advanced on every renewal.
+   */
+  revision: string
+  /**
+   * Whether the authorisation still stands.
+   */
+  state: 'active' | 'revoked'
+}
+/**
+ * What the installation authorised, and what a renewal may not change.
+ */
+export interface PushSenderBinding {
+  /**
+   * The gateway holding the authorisation.
+   */
+  gateway_origin: string
+  /**
+   * The host's iroh endpoint identity, so the installation knows which peer it authorised.
+   */
+  host_endpoint_key: string
+  /**
+   * The host's Ed25519 signing key. Renewal and revocation are proven with it.
+   */
+  host_signing_key: string
+  /**
+   * The destination installation.
+   */
+  installation_id: string
+  rate_policy: PushRatePolicy
+  /**
+   * This authorisation.
+   */
+  sender_record_id: string
+}
+/**
+ * What that destination may receive.
+ */
+export interface PushRatePolicy {
+  /**
+   * How many notifications may arrive in a burst.
+   */
+  burst: string
+  /**
+   * How often excess collapses into one attention update.
+   */
+  collapse_window_ms: string
+  /**
+   * How many may arrive in one hour.
+   */
+  sustained_per_hour: string
+}
+/**
+ * A host's proof that it still holds the key the installation authorised.
+ */
+export interface PushSenderRenewal {
+  payload: PushSenderRenewalPayload
+  /**
+   * The host signing key's signature over [`PushSenderRenewalPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the host states.
+ */
+export interface PushSenderRenewalPayload {
+  /**
+   * The single-use value the gateway handed out for this renewal.
+   */
+  gateway_nonce: string
+  /**
+   * The gateway that issued the nonce.
+   */
+  gateway_origin: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  requested_at_ms: string
+  /**
+   * The authorisation being renewed.
+   */
+  sender_record_id: string
+}
+/**
+ * A host's statement that an authorisation is finished.
+ */
+export interface PushSenderRevocation {
+  payload: PushSenderRevocationPayload
+  /**
+   * The host signing key's signature over [`PushSenderRevocationPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the host states.
+ */
+export interface PushSenderRevocationPayload {
+  /**
+   * The single-use value the gateway handed out for this revocation.
+   */
+  gateway_nonce: string
+  /**
+   * The gateway that issued the nonce.
+   */
+  gateway_origin: string
+  /**
+   * Why the authorisation is ending.
+   */
+  reason: 'unpaired' | 'host_key_replaced' | 'installation_key_replaced'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  requested_at_ms: string
+  /**
+   * The authorisation being revoked.
+   */
+  sender_record_id: string
+}
+/**
  * One action receipt.
  *
  * The de-duplication key is `(actor_id, action_id)`. An exact duplicate returns the stored
@@ -2518,7 +2971,7 @@ export interface RecoveryKit {
    */
   seed: string
   /**
-   * The seed checksum, so a mistyped kit fails before it is used.
+   * An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   seed_checksum: string
   /**
@@ -2919,7 +3372,7 @@ export interface RevocationRequest {
  */
 export interface SealedEnvelope {
   /**
-   * The `crypto_box_easy` output over the canonical plaintext.
+   * An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   ciphertext: string
   /**
@@ -2954,6 +3407,180 @@ export interface EnvelopeRouting {
    * Quota accounting measures the complete stored ciphertext rather than this figure.
    */
   size_bucket_bytes: string
+}
+/**
+ * One signed service request.
+ *
+ * It authenticates a request; it authorises nothing by itself. What the caller may do with the
+ * method it names is the service's decision, made from the installation record and the records
+ * that method reads.
+ */
+export interface ServiceRequestSignature {
+  payload: ServiceRequestPayload
+  /**
+   * The Ed25519 public key of that signer.
+   */
+  public_key: string
+  /**
+   * The signature over [`ServiceRequestPayload::signing_input`].
+   */
+  signature: string
+  /**
+   * Which key signed it, and therefore which domain the signature is checked under.
+   */
+  signer: 'installation' | 'host'
+}
+/**
+ * What was signed.
+ */
+export interface ServiceRequestPayload {
+  /**
+   * The SHA-256 of the canonical request body.
+   */
+  body_digest: string
+  /**
+   * The origin the request was addressed to.
+   */
+  gateway_origin: string
+  /**
+   * The method being called.
+   */
+  method:
+    | 'host.info'
+    | 'environment.list'
+    | 'environment.capabilities'
+    | 'host.doctor'
+    | 'pair.invite'
+    | 'pair.redeem'
+    | 'pair.finish'
+    | 'pair.confirm'
+    | 'pair.cancel'
+    | 'pair.status'
+    | 'device.list'
+    | 'device.revoke'
+    | 'device.preview_key.update'
+    | 'catalogue.list'
+    | 'catalogue.add'
+    | 'catalogue.sync'
+    | 'catalogue.pin'
+    | 'catalogue.remove'
+    | 'plugin.list'
+    | 'plugin.install'
+    | 'plugin.remove'
+    | 'plugin.pin'
+    | 'plugin.enable'
+    | 'plugin.disable'
+    | 'plugin.grant'
+    | 'plugin.capabilities'
+    | 'plugin.action.invoke'
+    | 'question.create'
+    | 'question.read_own'
+    | 'question.cancel_own'
+    | 'alert.create'
+    | 'question.read'
+    | 'question.answer'
+    | 'question.cancel'
+    | 'agent_tools.install'
+    | 'agent_tools.status'
+    | 'agent_tools.remove'
+    | 'session.list'
+    | 'session.create'
+    | 'session.read'
+    | 'session.close'
+    | 'session.describe'
+    | 'session.rename'
+    | 'session.attach'
+    | 'session.detach'
+    | 'attachment.configure'
+    | 'attachment.viewport'
+    | 'terminal.resize'
+    | 'terminal.geometry.transfer'
+    | 'terminal.palette.set'
+    | 'input.acquire'
+    | 'input.release'
+    | 'input.interrupt'
+    | 'input.write'
+    | 'root.editor.enter'
+    | 'root.editor.leave'
+    | 'root.editor.fence'
+    | 'root.eof.detach'
+    | 'root.command.accepted'
+    | 'shell.launch'
+    | 'agent.capabilities'
+    | 'agent.snapshot'
+    | 'agent.commands'
+    | 'agent.prompt.submit'
+    | 'agent.prompt.queue'
+    | 'agent.turn.steer'
+    | 'agent.turn.cancel'
+    | 'agent.approval.respond'
+    | 'draft.create'
+    | 'draft.update'
+    | 'agent.draft.add_attachment'
+    | 'upload.begin'
+    | 'upload.status'
+    | 'upload.chunk'
+    | 'upload.finish'
+    | 'upload.cancel'
+    | 'download.begin'
+    | 'download.chunk'
+    | 'project.list'
+    | 'project.read'
+    | 'project.init'
+    | 'project.clone'
+    | 'project.adopt'
+    | 'project.operation.cancel'
+    | 'workspace.list'
+    | 'workspace.create'
+    | 'workspace.read'
+    | 'workspace.remove'
+    | 'diff.read'
+    | 'diff.apply'
+    | 'diff.revert'
+    | 'changeset.capture'
+    | 'changeset.read'
+    | 'changeset.materialize'
+    | 'review.read'
+    | 'review.acknowledge'
+    | 'attention.read'
+    | 'attention.acknowledge'
+    | 'visit.acknowledge'
+    | 'action.cancel'
+    | 'owner.confirmation.request'
+    | 'owner.confirmation.complete'
+    | 'events.subscribe'
+    | 'events.snapshot'
+    | 'history.page'
+    | 'action.read'
+    | 'grant.create'
+    | 'grant.revoke'
+    | 'grant.list'
+    | 'push.installation.register'
+    | 'push.sender.issue'
+    | 'push.sender.renew'
+    | 'push.sender.revoke'
+    | 'mailbox.read'
+    | 'authority.sync'
+    | 'sync.compare_exchange'
+    | 'backup.manifest'
+    | 'voice.start'
+    | 'voice.stop'
+    | 'voice.grant'
+    | 'voice.delegate'
+    | 'voice.context'
+    | 'workflow.install'
+    | 'workflow.enable'
+    | 'workflow.pause'
+    | 'workflow.run'
+    | 'workflow.read'
+  /**
+   * A fresh 32-byte nonce, from the caller's random generator.
+   */
+  nonce: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  signed_at_ms: string
 }
 /**
  * A session and the epoch it was addressed in.

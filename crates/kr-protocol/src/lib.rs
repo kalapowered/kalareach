@@ -36,6 +36,8 @@
 //! | [`hello`] | Version negotiation and the `kr-connect/1` proof transcript |
 //! | [`pairing`] | Pairing contexts, bundles, transcripts, QR payloads and owner confirmation |
 //! | [`mailbox`] | Stored mailbox envelopes and their size buckets |
+//! | [`service`] | The credential every managed-service method authenticates with |
+//! | [`push`] | Push registration, sender authorisation and delivery |
 //! | [`archive`] | Backup key wraps, manifests, descriptors and recovery material |
 //! | [`account`] | Membership leases and the organisation policy-signing authority chain |
 //! | [`digest`] | The mutation payload digest |
@@ -89,8 +91,10 @@ pub mod limits;
 pub mod mailbox;
 pub mod method;
 pub mod pairing;
+pub mod push;
 pub mod receipt;
 pub mod relay;
 pub mod rights;
 pub mod scalars;
 pub mod schema;
+pub mod service;
