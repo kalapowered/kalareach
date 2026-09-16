@@ -396,6 +396,24 @@ uuid_id!(
     "One organisation whose signed policy a host has opted into."
 );
 uuid_id!(
+    /// One notification, as the host that produced it names it. 128 random bits.
+    ///
+    /// The gateway deduplicates by this value and never reads it. It is 128 opaque bits rather than
+    /// text because it travels to a provider in the clear: a text identifier could carry a project
+    /// or session name, and this cannot.
+    NotificationId,
+    "One notification, named by the host that produced it. 128 random bits, opaque to the gateway and the provider."
+);
+uuid_id!(
+    /// The group a notification replaces others in on the device.
+    ///
+    /// A host derives it from its own secret and whatever it wants to group by, so two notifications
+    /// about one thing collapse into one. Like the notification identifier it is 128 opaque bits,
+    /// because it reaches the provider in plaintext and must reveal no project or session name.
+    CollapseId,
+    "The group a notification replaces others in on the device. 128 opaque bits revealing no project or session name."
+);
+uuid_id!(
     /// One attempt to bind a push token to an installation. 128 random bits.
     ///
     /// It names the attempt, not the token: a challenge answered for one attempt says nothing
@@ -533,22 +551,6 @@ counter_id!(
     "The host clock epoch, advanced when wall-clock trust changes."
 );
 
-opaque_id!(
-    /// One notification, as the host that produced it names it.
-    ///
-    /// The gateway deduplicates by this value and never reads it. It is opaque on purpose: a
-    /// provider, and anyone who sees the payload in transit, learns nothing from it.
-    NotificationId,
-    "One notification, named by the host that produced it. Opaque to the gateway and the provider."
-);
-opaque_id!(
-    /// The group a notification replaces others in on the device.
-    ///
-    /// It reveals no project or session name: it is a correlation label the host chooses, and it
-    /// reaches the provider in plaintext, which is exactly why it carries nothing.
-    CollapseId,
-    "The group a notification replaces others in on the device. It reveals no project or session name."
-);
 opaque_id!(
     /// Binds the operating-system user, boot identity and login-session generation.
     ///

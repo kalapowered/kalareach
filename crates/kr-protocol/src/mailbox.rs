@@ -150,6 +150,13 @@ pub struct SealedEnvelope {
     pub ciphertext: Bytes,
 }
 
+/// Bytes `crypto_box_easy` adds to the plaintext it seals.
+///
+/// A sealed envelope's ciphertext is therefore exactly its declared size bucket plus this, which is
+/// what lets a service check that a ciphertext it cannot read was padded to a bucket before it was
+/// sealed.
+pub const SEAL_OVERHEAD_BYTES: u64 = 16;
+
 /// How long a replay identifier is retained past its envelope's expiry, in milliseconds.
 pub const REPLAY_ID_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 

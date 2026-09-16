@@ -27,7 +27,7 @@
   ],
   "cases": [
     {
-      "cbor_hex": "82766b722d707573682d726567697374726174696f6e2f31a768706c6174666f726d63696f73696368616c6c656e6765582061616161616161616161616161616161616161616161616161616161616161616c746f6b656e5f6469676573745820a3423661f3ffa0e3d22e0cb8ebd29f7268f05cca1da0447718e2ebf0b1fc1f806d657870697265735f61745f6d731b0000019b76df3be06e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f6f696e7374616c6c6174696f6e5f69645002d449a31fbb267c8f352e9968a79e3e6f726567697374726174696f6e5f6964502e749a03c1584d62a0196f3bd784215c",
+      "cbor_hex": "82766b722d707573682d726567697374726174696f6e2f31a768706c6174666f726d63696f73696368616c6c656e6765582061616161616161616161616161616161616161616161616161616161616161616c746f6b656e5f6469676573745820be5b8ab118614d5e4d23d06e2590b23763ac2f5862db241b1d784586d1ccaa646d657870697265735f61745f6d731b0000019b76df3be06e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f6f696e7374616c6c6174696f6e5f69645002d449a31fbb267c8f352e9968a79e3e6f726567697374726174696f6e5f6964502e749a03c1584d62a0196f3bd784215c",
       "description": "The answer a receiver returns for the challenge sent to its token, signed by the proposed installation key.",
       "domain": "kr-push-registration/1",
       "id": "registration_answer",
@@ -40,11 +40,11 @@
           "installation_id": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
           "platform": "ios",
           "registration_id": "2e749a03-c158-4d62-a019-6f3bd784215c",
-          "token_digest": "o0I2YfP_oOPSLgy469KfcmjwXModoER3GOLr8LH8H4A"
+          "token_digest": "vluKsRhhTV5NI9BuJZCyN2OsL1hi2yQbHXhFhtHMqmQ"
         },
         "signature": "XFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXA"
       },
-      "sha256": "43c26b6933487af18b5be409395971be2df319276e9da30f84d2fb20148aafde",
+      "sha256": "98ec970f3a1620d368d565a0a0f8606055583c61838ea50ef35e2ed6eae1df81",
       "value": {
         "array": [
           {
@@ -67,7 +67,7 @@
               [
                 "token_digest",
                 {
-                  "bytes": "a3423661f3ffa0e3d22e0cb8ebd29f7268f05cca1da0447718e2ebf0b1fc1f80"
+                  "bytes": "be5b8ab118614d5e4d23d06e2590b23763ac2f5862db241b1d784586d1ccaa64"
                 }
               ],
               [
@@ -294,22 +294,32 @@
       }
     },
     {
-      "cbor_hex": "82726b722d707573682d64656c69766572792f31a66568696e7473a265616c65727470617070726f76616c5f77616974696e6767757267656e637969617474656e74696f6e67707265766965775860abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab6b636f6c6c617073655f69646863386231663061346d657870697265735f61745f6d731b0000019b76e863a06f6e6f74696669636174696f6e5f696470306633613963376535316432346230387073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
-      "description": "One notification with a sealed preview. The digest is what the delivery credential's request signature covers as its body.",
+      "cbor_hex": "82726b722d707573682d64656c69766572792f31a66568696e7473a265616c65727470617070726f76616c5f77616974696e6767757267656e637969617474656e74696f6e6770726576696577a3656e6f6e6365581893939393939393939393939393939393939393939393939367726f7574696e67a56b656e76656c6f70655f6964508a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a6d657870697265735f61745f6d731b0000019b76e863a06d73656e6465725f6b65795f69645820929292929292929292929292929292929292929292929292929292929292929270726563697069656e745f6b65795f6964582091919191919191919191919191919191919191919191919191919191919191917173697a655f6275636b65745f62797465731904006a63697068657274657874590410abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab6b636f6c6c617073655f696450c8b1f0a41d274e538b6f029a7745d1306d657870697265735f61745f6d731b0000019b76e863a06f6e6f74696669636174696f6e5f6964500f3a9c7e51d24b08a6143e85cb609f227073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
+      "description": "One notification with a sealed preview. The digest is how the gateway recognises a request it has already handled.",
       "domain": "kr-push-delivery/1",
       "id": "delivery_request",
       "json": {
-        "collapse_id": "c8b1f0a4",
+        "collapse_id": "c8b1f0a4-1d27-4e53-8b6f-029a7745d130",
         "expires_at_ms": "1767226500000",
         "hints": {
           "alert": "approval_waiting",
           "urgency": "attention"
         },
-        "notification_id": "0f3a9c7e51d24b08",
-        "preview": "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6ur",
+        "notification_id": "0f3a9c7e-51d2-4b08-a614-3e85cb609f22",
+        "preview": {
+          "ciphertext": "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s",
+          "nonce": "k5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OT",
+          "routing": {
+            "envelope_id": "8a8a8a8a-8a8a-8a8a-8a8a-8a8a8a8a8a8a",
+            "expires_at_ms": "1767226500000",
+            "recipient_key_id": "kZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZE",
+            "sender_key_id": "kpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpI",
+            "size_bucket_bytes": "1024"
+          }
+        },
         "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
       },
-      "sha256": "85ec9fd057e88ef4f021f9e84a2bc5906c4459812bae00b5b0a686b9578085e1",
+      "sha256": "af9aa2e00414c771cc2223c3d1ef3561e01fd7626da8e86d9fc72763ff9aebf0",
       "value": {
         "array": [
           {
@@ -339,13 +349,63 @@
               [
                 "preview",
                 {
-                  "bytes": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+                  "map": [
+                    [
+                      "nonce",
+                      {
+                        "bytes": "939393939393939393939393939393939393939393939393"
+                      }
+                    ],
+                    [
+                      "routing",
+                      {
+                        "map": [
+                          [
+                            "envelope_id",
+                            {
+                              "bytes": "8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a"
+                            }
+                          ],
+                          [
+                            "expires_at_ms",
+                            {
+                              "int": "1767226500000"
+                            }
+                          ],
+                          [
+                            "sender_key_id",
+                            {
+                              "bytes": "9292929292929292929292929292929292929292929292929292929292929292"
+                            }
+                          ],
+                          [
+                            "recipient_key_id",
+                            {
+                              "bytes": "9191919191919191919191919191919191919191919191919191919191919191"
+                            }
+                          ],
+                          [
+                            "size_bucket_bytes",
+                            {
+                              "int": "1024"
+                            }
+                          ]
+                        ]
+                      }
+                    ],
+                    [
+                      "ciphertext",
+                      {
+                        "bytes": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+                      }
+                    ]
+                  ]
                 }
               ],
               [
                 "collapse_id",
                 {
-                  "text": "c8b1f0a4"
+                  "bytes": "c8b1f0a41d274e538b6f029a7745d130"
                 }
               ],
               [
@@ -357,7 +417,7 @@
               [
                 "notification_id",
                 {
-                  "text": "0f3a9c7e51d24b08"
+                  "bytes": "0f3a9c7e51d24b08a6143e85cb609f22"
                 }
               ],
               [
@@ -372,22 +432,22 @@
       }
     },
     {
-      "cbor_hex": "82726b722d707573682d64656c69766572792f31a66568696e7473a265616c65727470617070726f76616c5f77616974696e6767757267656e637969617474656e74696f6e6770726576696577f66b636f6c6c617073655f69646863386231663061346d657870697265735f61745f6d731b0000019b76e863a06f6e6f74696669636174696f6e5f696470306633613963376535316432346230387073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
+      "cbor_hex": "82726b722d707573682d64656c69766572792f31a66568696e7473a265616c65727470617070726f76616c5f77616974696e6767757267656e637969617474656e74696f6e6770726576696577f66b636f6c6c617073655f696450c8b1f0a41d274e538b6f029a7745d1306d657870697265735f61745f6d731b0000019b76e863a06f6e6f74696669636174696f6e5f6964500f3a9c7e51d24b08a6143e85cb609f227073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
       "description": "The same notification with previews disabled on the device. The generic alert still reaches the lock screen.",
       "domain": "kr-push-delivery/1",
       "id": "delivery_request_without_preview",
       "json": {
-        "collapse_id": "c8b1f0a4",
+        "collapse_id": "c8b1f0a4-1d27-4e53-8b6f-029a7745d130",
         "expires_at_ms": "1767226500000",
         "hints": {
           "alert": "approval_waiting",
           "urgency": "attention"
         },
-        "notification_id": "0f3a9c7e51d24b08",
+        "notification_id": "0f3a9c7e-51d2-4b08-a614-3e85cb609f22",
         "preview": null,
         "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
       },
-      "sha256": "ab18940e33bc209701d22c4922d0fb16458409939d80ec6b09eda8fe0d40dd80",
+      "sha256": "103d721a842295166c86812b04431827227ea6b312e8a3628f3f91a2d5854a61",
       "value": {
         "array": [
           {
@@ -423,7 +483,7 @@
               [
                 "collapse_id",
                 {
-                  "text": "c8b1f0a4"
+                  "bytes": "c8b1f0a41d274e538b6f029a7745d130"
                 }
               ],
               [
@@ -435,13 +495,611 @@
               [
                 "notification_id",
                 {
-                  "text": "0f3a9c7e51d24b08"
+                  "bytes": "0f3a9c7e51d24b08a6143e85cb609f22"
                 }
               ],
               [
                 "sender_record_id",
                 {
                   "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82716b722d707573682d726571756573742f31a175696e7374616c6c6174696f6e5f7265676973746572a16772657175657374a16770726f706f7365a16870726f706f73616ca468706c6174666f726d63696f736f726567697374726174696f6e5f6964502e749a03c1584d62a0196f3bd784215c70696e7374616c6c6174696f6e5f6b65795820111111111111111111111111111111111111111111111111111111111111111172726567697374726174696f6e5f746f6b656e782a665a396b2d746573742d726567697374726174696f6e2d746f6b656e3a4150413931624578616d706c65",
+      "description": "The body of the request that proposes a token. The service-request signature covers its digest.",
+      "domain": "kr-push-request/1",
+      "id": "body_registration_propose",
+      "json": {
+        "installation_register": {
+          "request": {
+            "propose": {
+              "proposal": {
+                "installation_key": "ERERERERERERERERERERERERERERERERERERERERERE",
+                "platform": "ios",
+                "registration_id": "2e749a03-c158-4d62-a019-6f3bd784215c",
+                "registration_token": "fZ9k-test-registration-token:APA91bExample"
+              }
+            }
+          }
+        }
+      },
+      "sha256": "feed3b42408b6c8156da9281a64e6638c58915be4dc0070c3bf6b92626f1ce3c",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-request/1"
+          },
+          {
+            "map": [
+              [
+                "installation_register",
+                {
+                  "map": [
+                    [
+                      "request",
+                      {
+                        "map": [
+                          [
+                            "propose",
+                            {
+                              "map": [
+                                [
+                                  "proposal",
+                                  {
+                                    "map": [
+                                      [
+                                        "platform",
+                                        {
+                                          "text": "ios"
+                                        }
+                                      ],
+                                      [
+                                        "registration_id",
+                                        {
+                                          "bytes": "2e749a03c1584d62a0196f3bd784215c"
+                                        }
+                                      ],
+                                      [
+                                        "installation_key",
+                                        {
+                                          "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
+                                        }
+                                      ],
+                                      [
+                                        "registration_token",
+                                        {
+                                          "text": "fZ9k-test-registration-token:APA91bExample"
+                                        }
+                                      ]
+                                    ]
+                                  }
+                                ]
+                              ]
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82716b722d707573682d726571756573742f31a175696e7374616c6c6174696f6e5f7265676973746572a16772657175657374a166616e73776572a166616e73776572a3677061796c6f6164a768706c6174666f726d63696f73696368616c6c656e6765582061616161616161616161616161616161616161616161616161616161616161616c746f6b656e5f6469676573745820be5b8ab118614d5e4d23d06e2590b23763ac2f5862db241b1d784586d1ccaa646d657870697265735f61745f6d731b0000019b76df3be06e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f6f696e7374616c6c6174696f6e5f69645002d449a31fbb267c8f352e9968a79e3e6f726567697374726174696f6e5f6964502e749a03c1584d62a0196f3bd784215c697369676e617475726558405c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c70696e7374616c6c6174696f6e5f6b657958201111111111111111111111111111111111111111111111111111111111111111",
+      "description": "The body of the request that presents the answered challenge.",
+      "domain": "kr-push-request/1",
+      "id": "body_registration_answer",
+      "json": {
+        "installation_register": {
+          "request": {
+            "answer": {
+              "answer": {
+                "installation_key": "ERERERERERERERERERERERERERERERERERERERERERE",
+                "payload": {
+                  "challenge": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE",
+                  "expires_at_ms": "1767225900000",
+                  "gateway_origin": "https://reach.kala.to",
+                  "installation_id": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+                  "platform": "ios",
+                  "registration_id": "2e749a03-c158-4d62-a019-6f3bd784215c",
+                  "token_digest": "vluKsRhhTV5NI9BuJZCyN2OsL1hi2yQbHXhFhtHMqmQ"
+                },
+                "signature": "XFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXA"
+              }
+            }
+          }
+        }
+      },
+      "sha256": "fcacffa0abdb35446e99e002ba1ceea11d97f1163228a961690f2fd8f03f2f0e",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-request/1"
+          },
+          {
+            "map": [
+              [
+                "installation_register",
+                {
+                  "map": [
+                    [
+                      "request",
+                      {
+                        "map": [
+                          [
+                            "answer",
+                            {
+                              "map": [
+                                [
+                                  "answer",
+                                  {
+                                    "map": [
+                                      [
+                                        "payload",
+                                        {
+                                          "map": [
+                                            [
+                                              "platform",
+                                              {
+                                                "text": "ios"
+                                              }
+                                            ],
+                                            [
+                                              "challenge",
+                                              {
+                                                "bytes": "6161616161616161616161616161616161616161616161616161616161616161"
+                                              }
+                                            ],
+                                            [
+                                              "token_digest",
+                                              {
+                                                "bytes": "be5b8ab118614d5e4d23d06e2590b23763ac2f5862db241b1d784586d1ccaa64"
+                                              }
+                                            ],
+                                            [
+                                              "expires_at_ms",
+                                              {
+                                                "int": "1767225900000"
+                                              }
+                                            ],
+                                            [
+                                              "gateway_origin",
+                                              {
+                                                "text": "https://reach.kala.to"
+                                              }
+                                            ],
+                                            [
+                                              "installation_id",
+                                              {
+                                                "bytes": "02d449a31fbb267c8f352e9968a79e3e"
+                                              }
+                                            ],
+                                            [
+                                              "registration_id",
+                                              {
+                                                "bytes": "2e749a03c1584d62a0196f3bd784215c"
+                                              }
+                                            ]
+                                          ]
+                                        }
+                                      ],
+                                      [
+                                        "signature",
+                                        {
+                                          "bytes": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+                                        }
+                                      ],
+                                      [
+                                        "installation_key",
+                                        {
+                                          "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
+                                        }
+                                      ]
+                                    ]
+                                  }
+                                ]
+                              ]
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82716b722d707573682d726571756573742f31a16c73656e6465725f6973737565a16772657175657374a370686f73745f7369676e696e675f6b6579582022222222222222222222222222222222222222222222222222222222222222227073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b471686f73745f656e64706f696e745f6b657958203333333333333333333333333333333333333333333333333333333333333333",
+      "description": "The body of the request that authorises one paired host.",
+      "domain": "kr-push-request/1",
+      "id": "body_sender_issue",
+      "json": {
+        "sender_issue": {
+          "request": {
+            "host_endpoint_key": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM",
+            "host_signing_key": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+            "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+          }
+        }
+      },
+      "sha256": "476993dffea4e14a3f66fd4c663a4183586760d1db627196db7529a6063e927d",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-request/1"
+          },
+          {
+            "map": [
+              [
+                "sender_issue",
+                {
+                  "map": [
+                    [
+                      "request",
+                      {
+                        "map": [
+                          [
+                            "host_signing_key",
+                            {
+                              "bytes": "2222222222222222222222222222222222222222222222222222222222222222"
+                            }
+                          ],
+                          [
+                            "sender_record_id",
+                            {
+                              "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                            }
+                          ],
+                          [
+                            "host_endpoint_key",
+                            {
+                              "bytes": "3333333333333333333333333333333333333333333333333333333333333333"
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82716b722d707573682d726571756573742f31a16c73656e6465725f72656e6577a16772657175657374a168636f6d706c657465a16772656e6577616ca2677061796c6f6164a46d676174657761795f6e6f6e6365582071717171717171717171717171717171717171717171717171717171717171716e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f6f7265717565737465645f61745f6d731b0000019bed4cec007073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4697369676e617475726558405d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d",
+      "description": "The body of the request that presents a renewal proof.",
+      "domain": "kr-push-request/1",
+      "id": "body_sender_renew",
+      "json": {
+        "sender_renew": {
+          "request": {
+            "complete": {
+              "renewal": {
+                "payload": {
+                  "gateway_nonce": "cXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXE",
+                  "gateway_origin": "https://reach.kala.to",
+                  "requested_at_ms": "1769212800000",
+                  "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+                },
+                "signature": "XV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXQ"
+              }
+            }
+          }
+        }
+      },
+      "sha256": "e020828b1b85cea50203b81fae1df8d94b932867b673b77f8c6d9383aa4fd3f1",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-request/1"
+          },
+          {
+            "map": [
+              [
+                "sender_renew",
+                {
+                  "map": [
+                    [
+                      "request",
+                      {
+                        "map": [
+                          [
+                            "complete",
+                            {
+                              "map": [
+                                [
+                                  "renewal",
+                                  {
+                                    "map": [
+                                      [
+                                        "payload",
+                                        {
+                                          "map": [
+                                            [
+                                              "gateway_nonce",
+                                              {
+                                                "bytes": "7171717171717171717171717171717171717171717171717171717171717171"
+                                              }
+                                            ],
+                                            [
+                                              "gateway_origin",
+                                              {
+                                                "text": "https://reach.kala.to"
+                                              }
+                                            ],
+                                            [
+                                              "requested_at_ms",
+                                              {
+                                                "int": "1769212800000"
+                                              }
+                                            ],
+                                            [
+                                              "sender_record_id",
+                                              {
+                                                "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                                              }
+                                            ]
+                                          ]
+                                        }
+                                      ],
+                                      [
+                                        "signature",
+                                        {
+                                          "bytes": "5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d"
+                                        }
+                                      ]
+                                    ]
+                                  }
+                                ]
+                              ]
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82716b722d707573682d726571756573742f31a16d73656e6465725f7265766f6b65a16772657175657374a168636f6d706c657465a16a7265766f636174696f6ea2677061796c6f6164a566726561736f6e68756e7061697265646d676174657761795f6e6f6e6365582072727272727272727272727272727272727272727272727272727272727272726e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f6f7265717565737465645f61745f6d731b0000019b7c0104007073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4697369676e617475726558405e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e",
+      "description": "The body of the request that ends an authorisation.",
+      "domain": "kr-push-request/1",
+      "id": "body_sender_revoke",
+      "json": {
+        "sender_revoke": {
+          "request": {
+            "complete": {
+              "revocation": {
+                "payload": {
+                  "gateway_nonce": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI",
+                  "gateway_origin": "https://reach.kala.to",
+                  "reason": "unpaired",
+                  "requested_at_ms": "1767312000000",
+                  "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+                },
+                "signature": "Xl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXg"
+              }
+            }
+          }
+        }
+      },
+      "sha256": "8fef6cd4293e0b64357fa0626dc35c2fc381622c47fe6424516a973156ce3781",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-request/1"
+          },
+          {
+            "map": [
+              [
+                "sender_revoke",
+                {
+                  "map": [
+                    [
+                      "request",
+                      {
+                        "map": [
+                          [
+                            "complete",
+                            {
+                              "map": [
+                                [
+                                  "revocation",
+                                  {
+                                    "map": [
+                                      [
+                                        "payload",
+                                        {
+                                          "map": [
+                                            [
+                                              "reason",
+                                              {
+                                                "text": "unpaired"
+                                              }
+                                            ],
+                                            [
+                                              "gateway_nonce",
+                                              {
+                                                "bytes": "7272727272727272727272727272727272727272727272727272727272727272"
+                                              }
+                                            ],
+                                            [
+                                              "gateway_origin",
+                                              {
+                                                "text": "https://reach.kala.to"
+                                              }
+                                            ],
+                                            [
+                                              "requested_at_ms",
+                                              {
+                                                "int": "1767312000000"
+                                              }
+                                            ],
+                                            [
+                                              "sender_record_id",
+                                              {
+                                                "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                                              }
+                                            ]
+                                          ]
+                                        }
+                                      ],
+                                      [
+                                        "signature",
+                                        {
+                                          "bytes": "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+                                        }
+                                      ]
+                                    ]
+                                  }
+                                ]
+                              ]
+                            }
+                          ]
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82746b722d736572766963652d726571756573742f31a5656e6f6e636558204343434343434343434343434343434343434343434343434343434343434343666d6574686f64781a707573682e696e7374616c6c6174696f6e2e72656769737465726b626f64795f6469676573745820feed3b42408b6c8156da9281a64e6638c58915be4dc0070c3bf6b92626f1ce3c6c7369676e65645f61745f6d731b0000019b76daa8006e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f",
+      "description": "The whole request: the body above, its digest inside a service-request signature, under the method the body names.",
+      "domain": "kr-service-request/1",
+      "id": "signed_registration_propose",
+      "json": {
+        "payload": {
+          "body_digest": "_u07QkCLbIFW2pKBpk5mOMWJFb5NwAcMO_a5Jibxzjw",
+          "gateway_origin": "https://reach.kala.to",
+          "method": "push.installation.register",
+          "nonce": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M",
+          "signed_at_ms": "1767225600000"
+        },
+        "public_key": "ERERERERERERERERERERERERERERERERERERERERERE",
+        "signature": "X19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fX19fXw",
+        "signer": "installation"
+      },
+      "sha256": "efc68a8e74e4c75da66c2e28b6ca45b1ac5b3222bbc6a5a1322683cf737edb0b",
+      "value": {
+        "array": [
+          {
+            "text": "kr-service-request/1"
+          },
+          {
+            "map": [
+              [
+                "nonce",
+                {
+                  "bytes": "4343434343434343434343434343434343434343434343434343434343434343"
+                }
+              ],
+              [
+                "method",
+                {
+                  "text": "push.installation.register"
+                }
+              ],
+              [
+                "body_digest",
+                {
+                  "bytes": "feed3b42408b6c8156da9281a64e6638c58915be4dc0070c3bf6b92626f1ce3c"
+                }
+              ],
+              [
+                "signed_at_ms",
+                {
+                  "int": "1767225600000"
+                }
+              ],
+              [
+                "gateway_origin",
+                {
+                  "text": "https://reach.kala.to"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "8278196b722d736572766963652d726571756573742f312f686f7374a5656e6f6e636558204444444444444444444444444444444444444444444444444444444444444444666d6574686f6471707573682e73656e6465722e72656e65776b626f64795f6469676573745820e020828b1b85cea50203b81fae1df8d94b932867b673b77f8c6d9383aa4fd3f16c7369676e65645f61745f6d731b0000019b7c0104006e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f",
+      "description": "The host-proven renewal request, signed under the host domain the body's signer names.",
+      "domain": "kr-service-request/1/host",
+      "id": "signed_sender_renew",
+      "json": {
+        "payload": {
+          "body_digest": "4CCCixuFzqUCA7gfrh342UuTKGe2c7d_jG2Tg6pP0_E",
+          "gateway_origin": "https://reach.kala.to",
+          "method": "push.sender.renew",
+          "nonce": "REREREREREREREREREREREREREREREREREREREREREQ",
+          "signed_at_ms": "1767312000000"
+        },
+        "public_key": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "signature": "YGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYA",
+        "signer": "host"
+      },
+      "sha256": "8d6d7955b62192c4200db162cebe9329618ee129509bdbfd2a8b5b2fcbc41ee4",
+      "value": {
+        "array": [
+          {
+            "text": "kr-service-request/1/host"
+          },
+          {
+            "map": [
+              [
+                "nonce",
+                {
+                  "bytes": "4444444444444444444444444444444444444444444444444444444444444444"
+                }
+              ],
+              [
+                "method",
+                {
+                  "text": "push.sender.renew"
+                }
+              ],
+              [
+                "body_digest",
+                {
+                  "bytes": "e020828b1b85cea50203b81fae1df8d94b932867b673b77f8c6d9383aa4fd3f1"
+                }
+              ],
+              [
+                "signed_at_ms",
+                {
+                  "int": "1767312000000"
+                }
+              ],
+              [
+                "gateway_origin",
+                {
+                  "text": "https://reach.kala.to"
                 }
               ]
             ]
@@ -492,7 +1150,7 @@
       "platform": "ios",
       "registration_id": "2e749a03-c158-4d62-a019-6f3bd784215c",
       "state": "active",
-      "token_digest": "o0I2YfP_oOPSLgy469KfcmjwXModoER3GOLr8LH8H4A"
+      "token_digest": "vluKsRhhTV5NI9BuJZCyN2OsL1hi2yQbHXhFhtHMqmQ"
     },
     "sender_record": {
       "binding": {
@@ -513,10 +1171,37 @@
       "state": "active"
     }
   },
+  "request_methods": [
+    {
+      "body": "body_registration_propose",
+      "method": "push.installation.register",
+      "signer": "installation"
+    },
+    {
+      "body": "body_registration_answer",
+      "method": "push.installation.register",
+      "signer": "installation"
+    },
+    {
+      "body": "body_sender_issue",
+      "method": "push.sender.issue",
+      "signer": "installation"
+    },
+    {
+      "body": "body_sender_renew",
+      "method": "push.sender.renew",
+      "signer": "host"
+    },
+    {
+      "body": "body_sender_revoke",
+      "method": "push.sender.revoke",
+      "signer": "host"
+    }
+  ],
   "token": {
-    "derivation": "SHA-256 of CBOR([\"kr-push-token/1\", platform, token]). The platform is inside the digest, so one token registered on two platforms is two destinations.",
+    "derivation": "SHA-256 of CBOR([\"kr-push-token/1\", token]). The platform is not in it: receiving the challenge proves the token reaches this device and nothing about the label beside it, so a digest that included the label would let one device hold two destinations.",
     "platform": "ios",
     "registration_token": "fZ9k-test-registration-token:APA91bExample",
-    "token_digest": "o0I2YfP_oOPSLgy469KfcmjwXModoER3GOLr8LH8H4A"
+    "token_digest": "vluKsRhhTV5NI9BuJZCyN2OsL1hi2yQbHXhFhtHMqmQ"
   }
 }

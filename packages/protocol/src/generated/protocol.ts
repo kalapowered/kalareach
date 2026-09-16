@@ -238,7 +238,7 @@ export type ChangeSetVersion = string
  */
 export type ClockEpoch = string
 /**
- * The group a notification replaces others in on the device. It reveals no project or session name.
+ * The group a notification replaces others in on the device. 128 opaque bits revealing no project or session name.
  */
 export type CollapseId = string
 /**
@@ -306,7 +306,7 @@ export type InvitationId = string
  */
 export type MachineId = string
 /**
- * One notification, named by the host that produced it. Opaque to the gateway and the provider.
+ * One notification, named by the host that produced it. 128 random bits, opaque to the gateway and the provider.
  */
 export type NotificationId = string
 /**
@@ -539,6 +539,77 @@ export type PairStatus =
       }
     }
 /**
+ * Every body a signed push method carries.
+ *
+ * One type, so there is one rule for what a service-request signature covers: the signature's
+ * `body_digest` is [`PushRequest::digest`], and the method it names is [`PushRequest::method`]. A
+ * body built for one method therefore cannot be presented under another, because the signature
+ * covers both the body and the method and a verifier checks that they agree.
+ *
+ * Delivery is not here. It carries the bearer credential the host was issued rather than a
+ * signature, so it has no body digest to cover.
+ */
+export type PushRequest =
+  | {
+      installation_register: {
+        /**
+         * The proposal or the answer.
+         */
+        request:
+          | {
+              propose: {
+                proposal: PushRegistrationProposal
+              }
+            }
+          | {
+              answer: {
+                answer: PushRegistrationAnswer1
+              }
+            }
+      }
+    }
+  | {
+      sender_issue: {
+        request: PushSenderIssueRequest
+      }
+    }
+  | {
+      sender_renew: {
+        /**
+         * The nonce request or the proof.
+         */
+        request:
+          | {
+              begin: {
+                request: PushSenderNonceRequest
+              }
+            }
+          | {
+              complete: {
+                renewal: PushSenderRenewal
+              }
+            }
+      }
+    }
+  | {
+      sender_revoke: {
+        /**
+         * The nonce request or the statement.
+         */
+        request:
+          | {
+              begin: {
+                request: PushSenderNonceRequest1
+              }
+            }
+          | {
+              complete: {
+                revocation: PushSenderRevocation
+              }
+            }
+      }
+    }
+/**
  * What the payer's client sends to a relay's control endpoint.
  */
 export type RelayLeaseRequest =
@@ -679,9 +750,10 @@ export interface KalaReachProtocol {
   push_installation_binding?: PushInstallationBinding
   push_registration_answer?: PushRegistrationAnswer
   push_registration_challenge?: PushRegistrationChallenge
+  push_request?: PushRequest
   push_sender_record?: PushSenderRecord
-  push_sender_renewal?: PushSenderRenewal
-  push_sender_revocation?: PushSenderRevocation
+  push_sender_renewal?: PushSenderRenewal1
+  push_sender_revocation?: PushSenderRevocation1
   receipt?: Receipt1
   receipt_response?: ReceiptResponse
   recovery_bundle?: RecoveryBundle
@@ -2400,7 +2472,7 @@ export interface PushDeliveryAck {
   /**
    * What became of it.
    */
-  state: 'queued' | 'collapsed' | 'duplicate' | 'token_disabled' | 'expired'
+  state: 'queued' | 'retrying' | 'collapsed' | 'duplicate' | 'token_disabled' | 'expired'
   /**
    * What was suppressed, when anything was.
    */
@@ -2434,10 +2506,13 @@ export interface PushSuppression {
 /**
  * The bearer a host presents to deliver, and what it is bound to.
  *
- * It is returned to the installation once, at issue and at each renewal, and the installation
- * passes it to the host through the paired encrypted channel. It grants delivery to one
- * destination and nothing else: it is not a session, it reads nothing and it cannot be presented
- * to any other method.
+ * At issue it goes to the installation, which passes it to the host through the paired encrypted
+ * channel: the installation is the one authorising, so the first credential travels the way the
+ * authorisation does. At renewal it goes straight to the host, in the answer to the renewal the
+ * host itself proved, which is what makes renewal work while the phone is asleep or unreachable.
+ *
+ * It grants delivery to one destination and nothing else: it is not a session, it reads nothing,
+ * and it cannot be presented to any other method.
  *
  * The gateway stores [`PushDeliveryCredential::secret_digest`], never the secret. A copy of the
  * database is therefore not a set of working credentials.
@@ -2500,12 +2575,15 @@ export interface PushDeliveryRequest {
    */
   notification_id: string
   /**
-   * The sealed preview envelope, or null when the destination has previews disabled.
+   * The sealed preview, or null when the destination has previews disabled.
    *
-   * The bytes are a [`crate::mailbox::SealedEnvelope`] whose payload type is a notification
-   * preview. The gateway forwards them; it holds no key that opens them.
+   * It is a [`SealedEnvelope`], not opaque bytes, so the gateway can check the shape of what it
+   * is forwarding without holding a key that opens it: that the envelope expires when the
+   * notification does, and that its ciphertext is a padded plaintext of a notification-sized
+   * bucket rather than an arbitrary payload. [`PushDeliveryRequest::preview_is_well_formed`] is
+   * that check.
    */
-  preview: Bytes | null
+  preview: SealedEnvelope | null
   /**
    * The authorisation this is delivered under.
    */
@@ -2531,12 +2609,57 @@ export interface PushPlatformHints {
   urgency: 'attention' | 'deferred'
 }
 /**
+ * One envelope sealed for one recipient.
+ */
+export interface SealedEnvelope {
+  /**
+   * The `crypto_box_easy` output over the canonical plaintext.
+   */
+  ciphertext: string
+  /**
+   * The fresh 24-byte nonce, from libsodium's random generator.
+   */
+  nonce: string
+  routing: EnvelopeRouting
+}
+/**
+ * The routing record the service sees.
+ */
+export interface EnvelopeRouting {
+  /**
+   * The envelope identity the service indexes by.
+   */
+  envelope_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The recipient the service delivers to.
+   */
+  recipient_key_id: string
+  /**
+   * The sender, so a recipient can select a paired sender key before attempting to open.
+   */
+  sender_key_id: string
+  /**
+   * The declared size bucket, in bytes: the length of the padded plaintext that was encrypted.
+   *
+   * Quota accounting measures the complete stored ciphertext rather than this figure.
+   */
+  size_bucket_bytes: string
+}
+/**
  * The canonical active binding of one provider token to one installation.
  *
  * There is exactly one of these per token digest. That is what stops an installation from
  * registering the same token under a second identity to start its rate history again: a second
  * identity for one token is not an additional binding, it is a replacement, and a replacement has
- * to pass its own challenge.
+ * to pass its own challenge. The rate history stays with the digest through that replacement, so
+ * the alias gains nothing.
+ *
+ * The token itself is not here. The gateway keeps it where it keeps its own secrets, because it
+ * needs the token to deliver; what travels in a record is the digest.
  */
 export interface PushInstallationBinding {
   /**
@@ -2667,6 +2790,146 @@ export interface PushRegistrationChallenge {
   token_digest: string
 }
 /**
+ * The token and the identity proposed for it.
+ */
+export interface PushRegistrationProposal {
+  /**
+   * The public key the installation will authenticate with. Its SHA-256 names the installation.
+   */
+  installation_key: string
+  /**
+   * The platform whose payload the gateway should build for this token.
+   *
+   * It is a claim, not a proof: receiving the challenge says the token reaches this device and
+   * nothing about the label beside it. The gateway records it as delivery metadata and never
+   * indexes by it.
+   */
+  platform: 'android' | 'ios'
+  /**
+   * This attempt. A retry carrying the same value is the same attempt.
+   */
+  registration_id: string
+  /**
+   * The provider token being proposed.
+   */
+  registration_token: string
+}
+/**
+ * The receiver's answer.
+ */
+export interface PushRegistrationAnswer1 {
+  /**
+   * The public half of the key that answered. Its SHA-256 names the installation.
+   */
+  installation_key: string
+  payload: PushRegistrationAnswerPayload
+  /**
+   * The signature over [`PushRegistrationAnswerPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * The host being authorised.
+ */
+export interface PushSenderIssueRequest {
+  /**
+   * The host's iroh endpoint identity.
+   */
+  host_endpoint_key: string
+  /**
+   * The host's Ed25519 signing key, which will prove its renewals and its revocation.
+   */
+  host_signing_key: string
+  /**
+   * The authorisation being created. A retry carrying the same value is the same authorisation.
+   */
+  sender_record_id: string
+}
+/**
+ * The authorisation being renewed.
+ */
+export interface PushSenderNonceRequest {
+  /**
+   * The authorisation the host is about to renew or revoke.
+   */
+  sender_record_id: string
+}
+/**
+ * The host's proof.
+ */
+export interface PushSenderRenewal {
+  payload: PushSenderRenewalPayload
+  /**
+   * The host signing key's signature over [`PushSenderRenewalPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the host states.
+ */
+export interface PushSenderRenewalPayload {
+  /**
+   * The single-use value the gateway handed out for this renewal.
+   */
+  gateway_nonce: string
+  /**
+   * The gateway that issued the nonce.
+   */
+  gateway_origin: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  requested_at_ms: string
+  /**
+   * The authorisation being renewed.
+   */
+  sender_record_id: string
+}
+/**
+ * The authorisation being revoked.
+ */
+export interface PushSenderNonceRequest1 {
+  /**
+   * The authorisation the host is about to renew or revoke.
+   */
+  sender_record_id: string
+}
+/**
+ * The host's statement.
+ */
+export interface PushSenderRevocation {
+  payload: PushSenderRevocationPayload
+  /**
+   * The host signing key's signature over [`PushSenderRevocationPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the host states.
+ */
+export interface PushSenderRevocationPayload {
+  /**
+   * The single-use value the gateway handed out for this revocation.
+   */
+  gateway_nonce: string
+  /**
+   * The gateway that issued the nonce.
+   */
+  gateway_origin: string
+  /**
+   * Why the authorisation is ending.
+   */
+  reason: 'unpaired' | 'host_key_replaced' | 'installation_key_replaced'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  requested_at_ms: string
+  /**
+   * The authorisation being revoked.
+   */
+  sender_record_id: string
+}
+/**
  * One installation's authorisation of one host, as the gateway holds it.
  *
  * The authorisation and the credential have different lifetimes on purpose. The authorisation is
@@ -2740,7 +3003,7 @@ export interface PushRatePolicy {
 /**
  * A host's proof that it still holds the key the installation authorised.
  */
-export interface PushSenderRenewal {
+export interface PushSenderRenewal1 {
   payload: PushSenderRenewalPayload
   /**
    * The host signing key's signature over [`PushSenderRenewalPayload::signing_input`].
@@ -2748,60 +3011,14 @@ export interface PushSenderRenewal {
   signature: string
 }
 /**
- * What the host states.
- */
-export interface PushSenderRenewalPayload {
-  /**
-   * The single-use value the gateway handed out for this renewal.
-   */
-  gateway_nonce: string
-  /**
-   * The gateway that issued the nonce.
-   */
-  gateway_origin: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  requested_at_ms: string
-  /**
-   * The authorisation being renewed.
-   */
-  sender_record_id: string
-}
-/**
  * A host's statement that an authorisation is finished.
  */
-export interface PushSenderRevocation {
+export interface PushSenderRevocation1 {
   payload: PushSenderRevocationPayload
   /**
    * The host signing key's signature over [`PushSenderRevocationPayload::signing_input`].
    */
   signature: string
-}
-/**
- * What the host states.
- */
-export interface PushSenderRevocationPayload {
-  /**
-   * The single-use value the gateway handed out for this revocation.
-   */
-  gateway_nonce: string
-  /**
-   * The gateway that issued the nonce.
-   */
-  gateway_origin: string
-  /**
-   * Why the authorisation is ending.
-   */
-  reason: 'unpaired' | 'host_key_replaced' | 'installation_key_replaced'
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  requested_at_ms: string
-  /**
-   * The authorisation being revoked.
-   */
-  sender_record_id: string
 }
 /**
  * One action receipt.
@@ -2971,7 +3188,7 @@ export interface RecoveryKit {
    */
   seed: string
   /**
-   * An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   * The seed checksum, so a mistyped kit fails before it is used.
    */
   seed_checksum: string
   /**
@@ -3366,47 +3583,6 @@ export interface RevocationRequest {
           device_ids: DeviceId[]
         }
       }
-}
-/**
- * One envelope sealed for one recipient.
- */
-export interface SealedEnvelope {
-  /**
-   * An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
-   */
-  ciphertext: string
-  /**
-   * The fresh 24-byte nonce, from libsodium's random generator.
-   */
-  nonce: string
-  routing: EnvelopeRouting
-}
-/**
- * The routing record the service sees.
- */
-export interface EnvelopeRouting {
-  /**
-   * The envelope identity the service indexes by.
-   */
-  envelope_id: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  expires_at_ms: string
-  /**
-   * The recipient the service delivers to.
-   */
-  recipient_key_id: string
-  /**
-   * The sender, so a recipient can select a paired sender key before attempting to open.
-   */
-  sender_key_id: string
-  /**
-   * The declared size bucket, in bytes: the length of the padded plaintext that was encrypted.
-   *
-   * Quota accounting measures the complete stored ciphertext rather than this figure.
-   */
-  size_bucket_bytes: string
 }
 /**
  * One signed service request.

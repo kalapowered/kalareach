@@ -29,7 +29,7 @@ const packageDirectory = dirname(dirname(fileURLToPath(import.meta.url)))
 const repositoryRoot = join(packageDirectory, '..', '..')
 
 /** The vector directories for the types and the codec this package publishes. */
-const FIXTURES = ['accounts', 'cbor', 'crypto', 'pairing', 'protocol']
+const FIXTURES = ['accounts', 'cbor', 'crypto', 'pairing', 'protocol', 'push', 'service']
 
 function git (...args) {
   return execFileSync('git', ['-C', repositoryRoot, ...args], { encoding: 'utf8' }).trim()

@@ -177,5 +177,52 @@
     "public_key": "ERERERERERERERERERERERERERERERERERERERERERE"
   },
   "name": "requests",
-  "note": "Values use the same description grammar as fixtures/cbor. cbor_hex is the canonical KR-CBOR-1 encoding of CBOR([domain, payload]), the bytes a signature or a digest covers; sha256 is its digest. json is the managed HTTP representation of the whole record, signature included. The signatures and secrets in json are fixed test bytes, not verifiable material: signature vectors need a signing implementation and live with the cryptography fixtures."
+  "note": "Values use the same description grammar as fixtures/cbor. cbor_hex is the canonical KR-CBOR-1 encoding of CBOR([domain, payload]), the bytes a signature or a digest covers; sha256 is its digest. json is the managed HTTP representation of the whole record, signature included. The signatures and secrets in json are fixed test bytes, not verifiable material: signature vectors need a signing implementation and live with the cryptography fixtures.",
+  "origins": {
+    "accepted": [
+      "https://reach.kala.to",
+      "https://reach.kala.to:8443",
+      "https://ns1.reach.kala.to",
+      "https://192.0.2.10",
+      "https://[2001:db8::1]",
+      "https://[2001:db8::1]:8443",
+      "http://localhost",
+      "http://localhost:8787",
+      "http://127.0.0.1:8787",
+      "http://[::1]:8787"
+    ],
+    "description": "Every origin a gateway accepts, and every spelling it refuses. One address has one spelling, because two spellings of one service are two signing inputs for one request.",
+    "refused": [
+      "https://reach.kala.to/",
+      "https://reach.kala.to/api",
+      "https://reach.kala.to?x=1",
+      "https://reach.kala.to#x",
+      "https://REACH.kala.to",
+      "https://user@reach.kala.to",
+      "https://reach.kala.to:443",
+      "https://reach.kala.to:08443",
+      "https://reach.kala.to:0",
+      "https://reach.kala.to:99999",
+      "https://reach.kala.to:http",
+      "https://reach.kala.to.",
+      "https://reach..kala.to",
+      "https://-reach.kala.to",
+      "https://reach.kala.to-",
+      "https://192.0.2.001",
+      "https://0xc0000201",
+      "https://2001:db8::1",
+      "https://[2001:0db8::1]",
+      "https://[0:0:0:0:0:0:0:1]",
+      "https://[::ffff:192.0.2.1]",
+      "https://[::1]junk",
+      "https://[2001:db8::1",
+      "https://[:::]",
+      "https://",
+      "http://reach.kala.to",
+      "http://[2001:db8::1]",
+      "http://localhost:80",
+      "reach.kala.to",
+      "ftp://reach.kala.to"
+    ]
+  }
 }

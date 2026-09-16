@@ -20,6 +20,13 @@
 import { encodeCanonical } from './cbor/encode.js'
 import { krArray, krBytes, krInt, krMap, krText, type CanonicalValue } from './cbor/value.js'
 import { base64UrlToBytes, jsonToU64, uuidToJson } from './json.js'
+import {
+  HTTP_DEFAULT_PORT,
+  HTTPS_DEFAULT_PORT,
+  OriginError,
+  isLoopbackAuthority,
+  validateAuthority
+} from './origin.js'
 import type { ServiceRequestPayload, ServiceRequestSignature } from './generated/protocol.js'
 
 /** A method name, as the registry spells it. */
@@ -109,10 +116,10 @@ export function fixedBytes (what: string, value: unknown, width: number): Uint8A
 /**
  * An origin exactly as `kr_protocol::service::GatewayOrigin` admits one.
  *
- * Scheme, host and optional port, with no path, query, fragment, credentials or trailing slash, and
- * a lower-case host. Plain HTTP is admitted only for a loopback host, which is what a development
- * deployment serves on. Two spellings of one address would otherwise be two signing inputs for one
- * service, and a verifier comparing text would refuse a request its caller addressed correctly.
+ * The grammar is the shared one in `./origin.js`: a scheme, a canonically spelled host, an optional
+ * non-default port, and nothing else. The one difference from a rendezvous origin is the scheme:
+ * `http://` is admitted for a loopback host, which is what a development deployment serves on, and
+ * refused for anything else.
  */
 export function gatewayOrigin (what: string, value: unknown): string {
   if (typeof value !== 'string' || value === '') {
@@ -122,55 +129,25 @@ export function gatewayOrigin (what: string, value: unknown): string {
     refuse(`${what} is at most ${String(MAX_GATEWAY_ORIGIN_LEN)} bytes`)
   }
 
-  const secure = value.startsWith('https://')
-  const plain = value.startsWith('http://')
-  if (!secure && !plain) {
+  let authority: string
+  let defaultPort: number
+  if (value.startsWith('https://')) {
+    authority = value.slice('https://'.length)
+    defaultPort = HTTPS_DEFAULT_PORT
+  } else if (value.startsWith('http://')) {
+    authority = value.slice('http://'.length)
+    if (!isLoopbackAuthority(authority)) {
+      refuse('only a loopback gateway origin may use http')
+    }
+    defaultPort = HTTP_DEFAULT_PORT
+  } else {
     refuse(`${what} names its scheme`)
   }
-  const authority = value.slice(secure ? 'https://'.length : 'http://'.length)
-  if (authority === '') {
-    refuse(`${what} names a host`)
-  }
-  if (authority.includes('/') || authority.includes('?') || authority.includes('#')) {
-    refuse(`${what} carries no path, query or fragment`)
-  }
-  if (authority.includes('@')) {
-    refuse(`${what} carries no credentials`)
-  }
 
-  // A bracketed address literal holds colons of its own, so the port is what follows the closing
-  // bracket rather than what follows the last colon.
-  let host: string
-  let port: string | null
-  if (authority.startsWith('[')) {
-    const end = authority.indexOf(']')
-    if (end < 0) {
-      refuse(`${what} closes its address literal`)
-    }
-    host = authority.slice(0, end + 1)
-    const rest = authority.slice(end + 1)
-    port = rest === '' ? null : rest.startsWith(':') ? rest.slice(1) : refuse(`${what} has a numeric port`)
-  } else {
-    const separator = authority.lastIndexOf(':')
-    host = separator < 0 ? authority : authority.slice(0, separator)
-    port = separator < 0 ? null : authority.slice(separator + 1)
-  }
-  if (host === '') {
-    refuse(`${what} names a host`)
-  }
-  if (host.startsWith('[')) {
-    const literal = host.endsWith(']') ? host.slice(1, -1) : ''
-    if (literal === '' || !/^[0-9a-fA-F:.]+$/.test(literal)) {
-      refuse(`${what} carries an address literal in brackets`)
-    }
-  } else if (!/^[a-z0-9.-]+$/.test(host)) {
-    refuse(`${what} has a lower-case host and carries no escapes`)
-  }
-  if (port !== null && !/^[0-9]{1,5}$/.test(port)) {
-    refuse(`${what} has a numeric port`)
-  }
-  if (plain && host !== 'localhost' && host !== '127.0.0.1' && host !== '[::1]') {
-    refuse(`${what} uses http only for a loopback host`)
+  try {
+    validateAuthority(authority, defaultPort)
+  } catch (error) {
+    refuse(error instanceof OriginError ? error.message : `${what} is an origin`)
   }
   return value
 }
@@ -250,15 +227,31 @@ export function serviceRequestSigningInput (
   )
 }
 
-/** True when `nowMs` is inside the freshness window either side of the signing time. */
-export function isFreshAt (payload: ServiceRequestPayload, nowMs: number): boolean {
-  const signed = Number(jsonToU64(payload.signed_at_ms))
-  return Math.abs(nowMs - signed) <= SERVICE_REQUEST_FRESHNESS_MS
+/**
+ * True when `nowMs` is inside the freshness window either side of the signing time.
+ *
+ * The arithmetic is in `bigint`, because a signing time is an unsigned 64-bit counter and a
+ * `number` cannot hold every one of them exactly. A comparison that rounded would admit a signature
+ * the host refuses, or refuse one it admits.
+ */
+export function isFreshAt (payload: ServiceRequestPayload, nowMs: number | bigint): boolean {
+  const signed = jsonToU64(payload.signed_at_ms)
+  const now = BigInt(nowMs)
+  const distance = now >= signed ? now - signed : signed - now
+  return distance <= BigInt(SERVICE_REQUEST_FRESHNESS_MS)
 }
 
-/** The instant a nonce may be forgotten: the signing time plus twice the window. */
-export function nonceRetainedUntilMs (signedAtMs: number): number {
-  return signedAtMs + 2 * SERVICE_REQUEST_FRESHNESS_MS
+/**
+ * The instant a nonce may be forgotten: the signing time plus twice the window.
+ *
+ * It saturates at the largest unsigned 64-bit value, as the host does, so a signature dated at the
+ * end of time does not wrap round to a nonce that may be forgotten at once.
+ */
+export function nonceRetainedUntilMs (signedAtMs: number | bigint): bigint {
+  const signed = BigInt(signedAtMs)
+  const retained = signed + BigInt(2 * SERVICE_REQUEST_FRESHNESS_MS)
+  const ceiling = (1n << 64n) - 1n
+  return retained > ceiling ? ceiling : retained
 }
 
 /**

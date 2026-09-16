@@ -48,7 +48,12 @@ import {
   installationId,
   isFreshAt,
   nonceRetainedUntilMs,
+  previewIsWellFormed,
   providerPayloadWithinPolicy,
+  pushRequestDigest,
+  pushRequestMethod,
+  pushRequestSigner,
+  pushRequestSigningInput,
   registrationAnswerSigningInput,
   renewalOpensAtMs,
   senderBindingDigest,
@@ -61,6 +66,7 @@ import {
   type PushDeliveryRequest,
   type PushInstallationBinding,
   type PushRegistrationAnswer,
+  type PushRequest,
   type PushSenderBinding,
   type PushSenderRecord,
   type PushSenderRenewal,
@@ -84,6 +90,7 @@ interface VectorCase {
 interface ServiceFixture {
   freshness_ms: string
   installation_identity: { public_key: string, installation_id: string }
+  origins: { accepted: string[], refused: string[] }
   cases: VectorCase[]
 }
 
@@ -91,6 +98,7 @@ interface PushFixture {
   limits: Record<string, string>
   token: { platform: 'android' | 'ios', registration_token: string, token_digest: string }
   alerts: Array<{ alert: string, text: string }>
+  request_methods: Array<{ body: string, method: string, signer: string }>
   records: {
     installation_binding: PushInstallationBinding
     sender_record: PushSenderRecord
@@ -188,7 +196,9 @@ describe('the service credential', () => {
     expect(isFreshAt(installation.payload, signed + SERVICE_REQUEST_FRESHNESS_MS + 1)).toBe(false)
     expect(isFreshAt(installation.payload, signed - SERVICE_REQUEST_FRESHNESS_MS - 1)).toBe(false)
     // A nonce outlives the whole window a forward-dated signature could still be presented in.
-    expect(nonceRetainedUntilMs(signed)).toBe(signed + 2 * SERVICE_REQUEST_FRESHNESS_MS)
+    expect(nonceRetainedUntilMs(signed)).toBe(BigInt(signed + 2 * SERVICE_REQUEST_FRESHNESS_MS))
+    // It saturates rather than wrapping at the end of the counter's range.
+    expect(nonceRetainedUntilMs((1n << 64n) - 1n)).toBe((1n << 64n) - 1n)
   })
 
   it('refuses a payload the host would refuse', () => {
@@ -228,6 +238,25 @@ describe('the service credential', () => {
     ).toThrow(ServiceSchemaError)
   })
 
+  /** KR-REQ-16.05: one origin, spelled one way, in both languages. */
+  it('agrees with the host about which origins are origins', () => {
+    const installation = findCase(services.cases, 'installation_request')
+      .json as ServiceRequestSignature
+
+    for (const origin of services.origins.accepted) {
+      expect(
+        () => serviceRequestSigningInput({ ...installation.payload, gateway_origin: origin }, 'installation'),
+        `a published accepted origin is refused: ${origin}`
+      ).not.toThrow()
+    }
+    for (const origin of services.origins.refused) {
+      expect(
+        () => serviceRequestSigningInput({ ...installation.payload, gateway_origin: origin }, 'installation'),
+        `a published refused origin is accepted: ${origin}`
+      ).toThrow(ServiceSchemaError)
+    }
+  })
+
   it('names every managed-service method and no other', () => {
     expect([...SERVICE_METHODS].sort()).toEqual(
       [
@@ -256,14 +285,17 @@ describe('push registration', () => {
     expect(entry.domain).toBe(PUSH_REGISTRATION_ANSWER_DOMAIN)
   })
 
-  /** KR-REQ-16.07: a token is recorded by a platform-separated digest, never in the clear. */
-  it('digests a token with its platform inside', async () => {
-    const digest = await tokenDigest(push.token.platform, push.token.registration_token)
+  /** KR-REQ-16.07: a token is one destination, recorded by a digest and never in the clear. */
+  it('digests a token and nothing about the caller', async () => {
+    const digest = await tokenDigest(push.token.registration_token)
     expect(bytesToHex(digest)).toBe(bytesToHex(base64UrlToBytes(push.token.token_digest)))
 
-    const other = await tokenDigest('android', push.token.registration_token)
-    const ios = await tokenDigest('ios', push.token.registration_token)
-    expect(bytesToHex(other)).not.toBe(bytesToHex(ios))
+    // The label beside a token changes nothing, so one device cannot hold two rate histories by
+    // registering once as Android and once as iOS.
+    expect(bytesToHex(await tokenDigest(push.token.registration_token))).toBe(bytesToHex(digest))
+    expect(bytesToHex(await tokenDigest(`${push.token.registration_token}x`))).not.toBe(
+      bytesToHex(digest)
+    )
   })
 
   it('refuses an answer that changes what the challenge asked', () => {
@@ -314,9 +346,11 @@ describe('sender authorisation', () => {
     expect(entry.domain).toBe(PUSH_SENDER_RENEWAL_DOMAIN)
 
     const record = push.records.sender_record
-    const expires = Number(record.credential_expires_at_ms)
-    expect(renewalOpensAtMs(expires)).toBe(expires - SENDER_RENEWAL_WINDOW_MS)
-    expect(Number(renewal.payload.requested_at_ms)).toBe(renewalOpensAtMs(expires))
+    const expires = BigInt(record.credential_expires_at_ms)
+    expect(renewalOpensAtMs(expires)).toBe(expires - BigInt(SENDER_RENEWAL_WINDOW_MS))
+    expect(BigInt(renewal.payload.requested_at_ms)).toBe(renewalOpensAtMs(expires))
+    // An expiry inside the window opens renewal now rather than at a negative instant.
+    expect(renewalOpensAtMs(1_000)).toBe(0n)
   })
 
   /** KR-REQ-16.10: a revocation names why, and a revoked record never renews. */
@@ -346,7 +380,7 @@ describe('sender authorisation', () => {
 
 describe('delivery', () => {
   /** KR-REQ-16.01, KR-REQ-16.03: one request shape for both platforms. */
-  it('digests the delivery request a credential signature covers', async () => {
+  it('digests the delivery request the gateway deduplicates by', async () => {
     const request = findCase(push.cases, 'delivery_request').json as PushDeliveryRequest
     const entry = assertVector(
       push.cases,
@@ -364,6 +398,58 @@ describe('delivery', () => {
       deliveryRequestSigningInput(withoutPreview)
     )
     expect(withoutPreview.preview).toBeNull()
+
+    // A preview is a sealed envelope, padded to a notification bucket. The gateway can check that
+    // much about a ciphertext it cannot read, and refuses anything else.
+    expect(previewIsWellFormed(request)).toBe(true)
+    expect(previewIsWellFormed(withoutPreview)).toBe(true)
+    const preview = request.preview as NonNullable<PushDeliveryRequest['preview']>
+    expect(
+      previewIsWellFormed({
+        ...request,
+        preview: { ...preview, routing: { ...preview.routing, expires_at_ms: '99999999999' } }
+      })
+    ).toBe(false)
+    expect(
+      previewIsWellFormed({
+        ...request,
+        preview: { ...preview, routing: { ...preview.routing, size_bucket_bytes: '1500' } }
+      })
+    ).toBe(false)
+  })
+
+  /** KR-REQ-16.05, KR-REQ-16.09: one body digest, under the method its signature names. */
+  it('digests each request body the way the signature covers it', async () => {
+    for (const entry of push.request_methods) {
+      const body = findCase(push.cases, entry.body).json as PushRequest
+      const bytes = pushRequestSigningInput(body)
+      assertVector(push.cases, entry.body, bytes)
+      expect(pushRequestMethod(body)).toBe(entry.method)
+      expect(pushRequestSigner(body)).toBe(entry.signer)
+
+      const digest = await pushRequestDigest(body)
+      expect(bytesToHex(digest)).toBe(findCase(push.cases, entry.body).sha256)
+    }
+
+    // The signature over a body carries that body's digest and names that body's method, so a body
+    // built for one method cannot be presented under another.
+    for (const [caseId, bodyId] of [
+      ['signed_registration_propose', 'body_registration_propose'],
+      ['signed_sender_renew', 'body_sender_renew']
+    ] as const) {
+      const signed = findCase(push.cases, caseId).json as ServiceRequestSignature
+      const body = findCase(push.cases, bodyId).json as PushRequest
+      assertVector(
+        push.cases,
+        caseId,
+        serviceRequestSigningInput(signed.payload, signed.signer)
+      )
+      expect(bytesToHex(base64UrlToBytes(signed.payload.body_digest))).toBe(
+        bytesToHex(await pushRequestDigest(body))
+      )
+      expect(signed.payload.method).toBe(pushRequestMethod(body))
+      expect(signed.signer).toBe(pushRequestSigner(body))
+    }
   })
 
   /** KR-REQ-16.16: nothing a sender supplies reaches a lock screen as text. */
@@ -379,6 +465,14 @@ describe('delivery', () => {
     ])
     expect(() =>
       deliveryRequestSigningInput({ ...request, body: 'rm -rf /' } as never)
+    ).toThrow(PushSchemaError)
+
+    // The two identifiers are 128 opaque bits, so neither can carry a project or session name.
+    expect(() =>
+      deliveryRequestSigningInput({ ...request, collapse_id: 'acme-payments:deploy' } as never)
+    ).toThrow(PushSchemaError)
+    expect(() =>
+      deliveryRequestSigningInput({ ...request, notification_id: 'rm -rf /' } as never)
     ).toThrow(PushSchemaError)
 
     // Every alert's text comes from the protocol, and names no session, project or command.
@@ -406,7 +500,8 @@ describe('delivery', () => {
       collapse_window_ms: String(PUSH_COLLAPSE_WINDOW_MS)
     })
     expect(push.records.sender_record.binding.rate_policy).toEqual(FREE_RATE_POLICY)
-    expect(providerPayloadWithinPolicy(MAX_PROVIDER_PAYLOAD_BYTES)).toBe(true)
-    expect(providerPayloadWithinPolicy(MAX_PROVIDER_PAYLOAD_BYTES + 1)).toBe(false)
+    // Section 16 says below 3,500 bytes, so 3,500 is one too many.
+    expect(providerPayloadWithinPolicy(MAX_PROVIDER_PAYLOAD_BYTES - 1)).toBe(true)
+    expect(providerPayloadWithinPolicy(MAX_PROVIDER_PAYLOAD_BYTES)).toBe(false)
   })
 })

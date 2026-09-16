@@ -31,8 +31,8 @@ use crate::pairing::{
 };
 use crate::push::{
     PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest, PushInstallationBinding,
-    PushRegistrationAnswer, PushRegistrationChallenge, PushSenderRecord, PushSenderRenewal,
-    PushSenderRevocation,
+    PushRegistrationAnswer, PushRegistrationChallenge, PushRequest, PushSenderRecord,
+    PushSenderRenewal, PushSenderRevocation,
 };
 use crate::receipt::{Receipt, ReceiptResponse};
 use crate::relay::{
@@ -99,6 +99,7 @@ pub fn protocol_schema() -> Value {
         "push_installation_binding" => PushInstallationBinding,
         "push_registration_answer" => PushRegistrationAnswer,
         "push_registration_challenge" => PushRegistrationChallenge,
+        "push_request" => PushRequest,
         "push_sender_record" => PushSenderRecord,
         "push_sender_renewal" => PushSenderRenewal,
         "push_sender_revocation" => PushSenderRevocation,

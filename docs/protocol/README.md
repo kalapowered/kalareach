@@ -498,9 +498,16 @@ the first check and `nonce_retained_until_ms` says how long the second one has t
 `InstallationId` is the first sixteen bytes of the SHA-256 of the device authorisation public key,
 written in hyphenated form. It is derived rather than asserted: a caller that presents a key and a
 signature has already proved which installation it is, so nothing in a request body says who the
-caller is. A service records the key it first saw against that identifier and refuses a later request
-carrying a different one, which makes replacing an installation key a deliberate step rather than a
-side effect of asking.
+caller is. An identifier is 128 bits, so it names a key rather than standing in for one: a service
+records the whole key it first saw, looks it up by the identifier, and compares against the key. A
+later request carrying a different key is refused, which makes replacing an installation key a
+deliberate step rather than a side effect of asking.
+
+An origin is an origin, so `GatewayOrigin` uses the grammar `RendezvousOrigin` already fixes: a
+scheme, a canonically spelled host, an optional non-default port, and nothing else. The one
+difference is that plain HTTP is admitted for a loopback host, which is what a development
+deployment serves on. `fixtures/service/requests.json` publishes every origin both languages accept
+and every spelling both refuse, and each language's tests run the whole list.
 
 ## Push objects
 
@@ -519,11 +526,22 @@ would activate a token nobody proved receipt of; without the origin it would ans
 deployment's challenge; without the registration identifier it would complete whichever attempt
 happened to be pending.
 
-A token is recorded as `SHA-256(CBOR(["kr-push-token/1", platform, token]))` rather than in the
-clear, because a registration token is a delivery capability. The platform is inside the digest, so
-one token registered on two platforms is two destinations. There is exactly one canonical active
-binding per token digest, which is what stops an installation registering the same token under a
-second identity to start its rate history again.
+A token is indexed by `SHA-256(CBOR(["kr-push-token/1", token]))`. Nothing about the caller is in
+that digest, the platform label least of all: receiving the challenge proves the token reaches this
+device and proves nothing about the label beside it, so a digest that included the label would let
+one device register one token twice and start its rate history again. There is exactly one canonical
+active binding per token digest, and the rate history stays with the digest through a key
+replacement.
+
+The gateway does hold the token itself, because FCM needs it to deliver and to retry and no hash
+recovers one. It lives with the gateway's own secrets; the records that travel carry the digest.
+
+A signed request's body is a `PushRequest`: one type for the four signed methods, so there is one
+rule for what a service-request signature covers. `PushRequest::digest` is the `body_digest` the
+signature carries and `PushRequest::method` is the method it must name, which is what stops a body
+built for one method being presented under another. Delivery is not one of them: it carries the
+bearer credential the host was issued, and its digest is how the gateway recognises a request it has
+already handled.
 
 **Authorisation.** `PushSenderBinding` holds everything one authorisation fixes for its lifetime:
 the destination installation, the host's endpoint and signing keys, the gateway and the rate policy.
@@ -539,27 +557,41 @@ authorisation behind it did not. A revoked record renews never. The gateway stor
 bearer under `kr-push-credential/1`, never the bearer, so a copy of the database is not a set of
 working credentials.
 
-**Delivery.** A `PushDeliveryRequest` carries an opaque notification identifier, a collapse label
-that names no project, an expiry, the sealed preview and a choice from a closed alert vocabulary. It
-carries no field for sender-supplied text at all, which is how section 16's "the plaintext alert is
-generic" is enforced: `PushAlert::generic_text` is where the words come from, so command text and
-approval arguments cannot reach a lock screen by mistake or by a host that decided to. Previews may
-be disabled on the device, in which case `preview` is null and the generic alert still arrives.
+**Delivery.** A `PushDeliveryRequest` carries a notification identifier, a collapse label, an
+expiry, the sealed preview and a choice from a closed alert vocabulary. There is no field for text a
+sender supplies, and each of the other fields is shaped so it cannot become one:
 
-The size bound is measured rather than estimated. The preview plaintext stays under 1,800 bytes and
-the complete provider payload under 3,500 after encryption and base64;
-`provider_payload_within_policy` takes the length of the request the gateway is about to send,
-because that is the only figure a provider sees. Larger detail belongs in a referenced encrypted
-object.
+- the notification and collapse identifiers are 128 opaque bits, not text, so neither can carry a
+  project or session name;
+- the alert is one of six values whose words live in `PushAlert::generic_text`, which is how section
+  16's "the plaintext alert is generic" is enforced rather than asked for;
+- the preview is a `SealedEnvelope` rather than arbitrary bytes, and
+  `PushDeliveryRequest::preview_is_well_formed` checks the three things a gateway can check about a
+  ciphertext it cannot read: that the envelope expires when the notification does, that its declared
+  size bucket is a notification bucket, and that its ciphertext is exactly that bucket plus the
+  seal's overhead.
+
+What that does not prove is that the plaintext inside was encrypted correctly, which only the
+destination can tell. A host that seals nonsense to its own paired device has harmed no one else.
+
+Previews may be disabled on the device, in which case `preview` is null and the generic alert still
+arrives.
+
+The size bounds are enforced where each can be. 1,800 bytes is a plaintext bound, so the host checks
+it while it still has the plaintext and moves anything larger into a referenced encrypted object; a
+gateway holds no key that opens a preview and does not pretend to check it. 3,500 bytes is the
+complete provider payload after encryption and base64, so the gateway measures the request it is
+about to send. Both bounds are exclusive where section 16 words them that way.
 
 Delivery is answered with a `PushDeliveryAck`. `queued` means the provider accepted it for delivery
 and nothing more: it does not mean displayed, read or executed, and review state comes from host
 events and client acknowledgements instead. The other states are an acknowledgement that something
-else happened, and each is a fact the host needs: a duplicate notification identifier, a destination
-over its rate policy whose notification collapsed into an attention update, a token the provider
-rejected and the gateway disabled, or a notification that expired first. A suppressed notification is
-reported back with what it collapsed into and when the next update may be sent, so the host can
-record the suppression locally and keep the pending decision visible.
+else happened, and each is a fact the host needs: a transient provider failure the gateway is still
+retrying, a duplicate notification identifier, a destination over its rate policy whose notification
+collapsed into an attention update, a token the provider rejected and the gateway disabled, or a
+notification that expired first. A suppressed notification is reported back with what it collapsed
+into and when the next update may be sent, so the host can record the suppression locally and keep
+the pending decision visible.
 
 ## Fixtures
 

@@ -19,21 +19,27 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::ids::{
-    CollapseId, NotificationId, PushRegistrationId, PushSenderRecordId, PushSenderRevision,
+    CollapseId, EnvelopeId, NotificationId, PushRegistrationId, PushSenderRecordId,
+    PushSenderRevision,
+};
+use crate::mailbox::{
+    EnvelopeRouting, SEAL_OVERHEAD_BYTES, SealedEnvelope, notification_size_bucket,
 };
 use crate::method::Method;
 use crate::push::{
     DELIVERY_CREDENTIAL_LIFETIME_MS, FREE_PUSH_BURST, FREE_PUSH_PER_HOUR,
     MAX_PREVIEW_PLAINTEXT_BYTES, MAX_PROVIDER_PAYLOAD_BYTES, PUSH_COLLAPSE_WINDOW_MS, PushAlert,
     PushDeliveryRequest, PushInstallationBinding, PushPlatform, PushPlatformHints, PushRatePolicy,
-    PushRegistrationAnswer, PushRegistrationChallenge, PushRevocationReason, PushSenderBinding,
-    PushSenderRecord, PushSenderRenewal, PushSenderRenewalPayload, PushSenderRevocation,
-    PushSenderRevocationPayload, PushSenderState, PushTokenState,
-    REGISTRATION_CHALLENGE_LIFETIME_MS, SENDER_RENEWAL_WINDOW_MS, token_digest,
+    PushRegistrationAnswer, PushRegistrationChallenge, PushRegistrationProposal,
+    PushRegistrationRequest, PushRequest, PushRevocationReason, PushSenderBinding,
+    PushSenderIssueRequest, PushSenderRecord, PushSenderRenewRequest, PushSenderRenewal,
+    PushSenderRenewalPayload, PushSenderRevocation, PushSenderRevocationPayload,
+    PushSenderRevokeRequest, PushSenderState, PushTokenState, REGISTRATION_CHALLENGE_LIFETIME_MS,
+    RegistrationToken, SENDER_RENEWAL_WINDOW_MS, token_digest,
 };
 use crate::scalars::{
-    AuthorisationKey, Bytes, EndpointKey, Nonce256, Nullable, SecretBytes32, Signature64,
-    TimestampMs, U64, Uuid,
+    AuthorisationKey, Bytes, EndpointKey, KeyId, Nonce192, Nonce256, Nullable, SecretBytes32,
+    Signature64, TimestampMs, U64, Uuid,
 };
 use crate::service::{
     GatewayOrigin, SERVICE_REQUEST_FRESHNESS_MS, ServiceRequestPayload, ServiceRequestSignature,
@@ -56,6 +62,54 @@ const HOST_ENDPOINT_KEY: [u8; 32] = [0x33; 32];
 const REGISTRATION_TOKEN: &str = "fZ9k-test-registration-token:APA91bExample";
 /// A fixed instant, 2026-01-01T00:00:00Z in UTC milliseconds.
 const NOW_MS: u64 = 1_767_225_600_000;
+
+/// Origins a gateway accepts. Both languages must accept every one.
+const ACCEPTED_ORIGINS: &[&str] = &[
+    "https://reach.kala.to",
+    "https://reach.kala.to:8443",
+    "https://ns1.reach.kala.to",
+    "https://192.0.2.10",
+    "https://[2001:db8::1]",
+    "https://[2001:db8::1]:8443",
+    "http://localhost",
+    "http://localhost:8787",
+    "http://127.0.0.1:8787",
+    "http://[::1]:8787",
+];
+
+/// Origins a gateway refuses. Both languages must refuse every one.
+const REFUSED_ORIGINS: &[&str] = &[
+    "https://reach.kala.to/",
+    "https://reach.kala.to/api",
+    "https://reach.kala.to?x=1",
+    "https://reach.kala.to#x",
+    "https://REACH.kala.to",
+    "https://user@reach.kala.to",
+    "https://reach.kala.to:443",
+    "https://reach.kala.to:08443",
+    "https://reach.kala.to:0",
+    "https://reach.kala.to:99999",
+    "https://reach.kala.to:http",
+    "https://reach.kala.to.",
+    "https://reach..kala.to",
+    "https://-reach.kala.to",
+    "https://reach.kala.to-",
+    "https://192.0.2.001",
+    "https://0xc0000201",
+    "https://2001:db8::1",
+    "https://[2001:0db8::1]",
+    "https://[0:0:0:0:0:0:0:1]",
+    "https://[::ffff:192.0.2.1]",
+    "https://[::1]junk",
+    "https://[2001:db8::1",
+    "https://[:::]",
+    "https://",
+    "http://reach.kala.to",
+    "http://[2001:db8::1]",
+    "http://localhost:80",
+    "reach.kala.to",
+    "ftp://reach.kala.to",
+];
 
 fn origin() -> GatewayOrigin {
     GatewayOrigin::new("https://reach.kala.to").expect("the production gateway origin")
@@ -202,6 +256,11 @@ fn service_requests() -> Value {
             "installation_id": installation_id(&key).to_string(),
             "derivation": "The first sixteen bytes of the SHA-256 of the device authorisation public key, written in hyphenated form."
         },
+        "origins": {
+            "description": "Every origin a gateway accepts, and every spelling it refuses. One address has one spelling, because two spellings of one service are two signing inputs for one request.",
+            "accepted": ACCEPTED_ORIGINS,
+            "refused": REFUSED_ORIGINS
+        },
         "cases": [
             case(
                 "installation_request",
@@ -238,7 +297,8 @@ fn service_requests() -> Value {
 fn push() -> Value {
     let key = AuthorisationKey::from_bytes(INSTALLATION_KEY);
     let installation = installation_id(&key);
-    let digest = token_digest(PushPlatform::Ios, REGISTRATION_TOKEN);
+    let token = RegistrationToken::new(REGISTRATION_TOKEN).expect("a registration token");
+    let digest = token_digest(&token);
 
     let challenge = PushRegistrationChallenge {
         challenge: Nonce256::from_bytes([0x61; 32]),
@@ -313,20 +373,101 @@ fn push() -> Value {
         signature: Signature64::from_bytes([0x5e; 64]),
     };
 
+    let expires_at_ms = TimestampMs::new(NOW_MS + 900_000);
+    let bucket = notification_size_bucket(600);
+    let preview = SealedEnvelope {
+        routing: EnvelopeRouting {
+            envelope_id: EnvelopeId::new(Uuid::from_bytes([0x8a; 16])),
+            recipient_key_id: KeyId::from_bytes([0x91; 32]),
+            sender_key_id: KeyId::from_bytes([0x92; 32]),
+            expires_at_ms,
+            size_bucket_bytes: U64::new(bucket),
+        },
+        nonce: Nonce192::from_bytes([0x93; 24]),
+        ciphertext: Bytes::new(vec![
+            0xab;
+            usize::try_from(bucket + SEAL_OVERHEAD_BYTES)
+                .expect("a notification bucket fits in memory")
+        ]),
+    };
     let delivery = PushDeliveryRequest {
-        collapse_id: CollapseId::new("c8b1f0a4").expect("a collapse label"),
-        expires_at_ms: TimestampMs::new(NOW_MS + 900_000),
+        collapse_id: CollapseId::new(Uuid::from_bytes([
+            0xc8, 0xb1, 0xf0, 0xa4, 0x1d, 0x27, 0x4e, 0x53, 0x8b, 0x6f, 0x02, 0x9a, 0x77, 0x45,
+            0xd1, 0x30,
+        ])),
+        expires_at_ms,
         hints: PushPlatformHints {
             alert: PushAlert::ApprovalWaiting,
             urgency: crate::push::PushUrgency::Attention,
         },
-        notification_id: NotificationId::new("0f3a9c7e51d24b08").expect("a notification"),
-        preview: Nullable::some(Bytes::new(vec![0xab; 96])),
+        notification_id: NotificationId::new(Uuid::from_bytes([
+            0x0f, 0x3a, 0x9c, 0x7e, 0x51, 0xd2, 0x4b, 0x08, 0xa6, 0x14, 0x3e, 0x85, 0xcb, 0x60,
+            0x9f, 0x22,
+        ])),
+        preview: Nullable::some(preview),
         sender_record_id: sender_record_id(),
     };
     let without_preview = PushDeliveryRequest {
         preview: Nullable::null(),
         ..delivery.clone()
+    };
+
+    let propose = PushRequest::InstallationRegister {
+        request: PushRegistrationRequest::Propose {
+            proposal: PushRegistrationProposal {
+                installation_key: key,
+                platform: PushPlatform::Ios,
+                registration_id: registration_id(),
+                registration_token: token.clone(),
+            },
+        },
+    };
+    let answer_body = PushRequest::InstallationRegister {
+        request: PushRegistrationRequest::Answer {
+            answer: answer.clone(),
+        },
+    };
+    let issue_body = PushRequest::SenderIssue {
+        request: PushSenderIssueRequest {
+            host_endpoint_key: EndpointKey::from_bytes(HOST_ENDPOINT_KEY),
+            host_signing_key: AuthorisationKey::from_bytes(HOST_SIGNING_KEY),
+            sender_record_id: sender_record_id(),
+        },
+    };
+    let renew_body = PushRequest::SenderRenew {
+        request: PushSenderRenewRequest::Complete {
+            renewal: renewal.clone(),
+        },
+    };
+    let revoke_body = PushRequest::SenderRevoke {
+        request: PushSenderRevokeRequest::Complete {
+            revocation: revocation.clone(),
+        },
+    };
+
+    let signed_propose = ServiceRequestSignature {
+        payload: ServiceRequestPayload {
+            body_digest: propose.digest().expect("a body digest"),
+            gateway_origin: origin(),
+            method: propose.method(),
+            nonce: Nonce256::from_bytes([0x43; 32]),
+            signed_at_ms: TimestampMs::new(NOW_MS),
+        },
+        signer: propose.signer(),
+        public_key: key,
+        signature: Signature64::from_bytes([0x5f; 64]),
+    };
+    let signed_renew = ServiceRequestSignature {
+        payload: ServiceRequestPayload {
+            body_digest: renew_body.digest().expect("a body digest"),
+            gateway_origin: origin(),
+            method: renew_body.method(),
+            nonce: Nonce256::from_bytes([0x44; 32]),
+            signed_at_ms: TimestampMs::new(NOW_MS + 86_400_000),
+        },
+        signer: renew_body.signer(),
+        public_key: AuthorisationKey::from_bytes(HOST_SIGNING_KEY),
+        signature: Signature64::from_bytes([0x60; 64]),
     };
 
     json!({
@@ -347,8 +488,15 @@ fn push() -> Value {
             "platform": PushPlatform::Ios.as_str(),
             "registration_token": REGISTRATION_TOKEN,
             "token_digest": serde_json::to_value(digest).expect("a digest"),
-            "derivation": "SHA-256 of CBOR([\"kr-push-token/1\", platform, token]). The platform is inside the digest, so one token registered on two platforms is two destinations."
+            "derivation": "SHA-256 of CBOR([\"kr-push-token/1\", token]). The platform is not in it: receiving the challenge proves the token reaches this device and nothing about the label beside it, so a digest that included the label would let one device hold two destinations."
         },
+        "request_methods": [
+            { "body": "body_registration_propose", "method": propose.method().as_str(), "signer": propose.signer().as_str() },
+            { "body": "body_registration_answer", "method": answer_body.method().as_str(), "signer": answer_body.signer().as_str() },
+            { "body": "body_sender_issue", "method": issue_body.method().as_str(), "signer": issue_body.signer().as_str() },
+            { "body": "body_sender_renew", "method": renew_body.method().as_str(), "signer": renew_body.signer().as_str() },
+            { "body": "body_sender_revoke", "method": revoke_body.method().as_str(), "signer": revoke_body.signer().as_str() }
+        ],
         "alerts": PushAlert::ALL
             .iter()
             .map(|alert| json!({ "alert": alert.as_str(), "text": alert.generic_text() }))
@@ -390,7 +538,7 @@ fn push() -> Value {
             ),
             case(
                 "delivery_request",
-                "One notification with a sealed preview. The digest is what the delivery credential's request signature covers as its body.",
+                "One notification with a sealed preview. The digest is how the gateway recognises a request it has already handled.",
                 crate::push::PUSH_DELIVERY_DOMAIN,
                 &delivery,
                 &delivery.signing_input().expect("a delivery signing input"),
@@ -401,6 +549,55 @@ fn push() -> Value {
                 crate::push::PUSH_DELIVERY_DOMAIN,
                 &without_preview,
                 &without_preview.signing_input().expect("a delivery signing input"),
+            ),
+            case(
+                "body_registration_propose",
+                "The body of the request that proposes a token. The service-request signature covers its digest.",
+                crate::push::PUSH_REQUEST_DOMAIN,
+                &propose,
+                &propose.signing_input().expect("a body signing input"),
+            ),
+            case(
+                "body_registration_answer",
+                "The body of the request that presents the answered challenge.",
+                crate::push::PUSH_REQUEST_DOMAIN,
+                &answer_body,
+                &answer_body.signing_input().expect("a body signing input"),
+            ),
+            case(
+                "body_sender_issue",
+                "The body of the request that authorises one paired host.",
+                crate::push::PUSH_REQUEST_DOMAIN,
+                &issue_body,
+                &issue_body.signing_input().expect("a body signing input"),
+            ),
+            case(
+                "body_sender_renew",
+                "The body of the request that presents a renewal proof.",
+                crate::push::PUSH_REQUEST_DOMAIN,
+                &renew_body,
+                &renew_body.signing_input().expect("a body signing input"),
+            ),
+            case(
+                "body_sender_revoke",
+                "The body of the request that ends an authorisation.",
+                crate::push::PUSH_REQUEST_DOMAIN,
+                &revoke_body,
+                &revoke_body.signing_input().expect("a body signing input"),
+            ),
+            case(
+                "signed_registration_propose",
+                "The whole request: the body above, its digest inside a service-request signature, under the method the body names.",
+                crate::service::SERVICE_REQUEST_DOMAIN,
+                &signed_propose,
+                &signed_propose.signing_input().expect("a request signing input"),
+            ),
+            case(
+                "signed_sender_renew",
+                "The host-proven renewal request, signed under the host domain the body's signer names.",
+                crate::service::SERVICE_REQUEST_HOST_DOMAIN,
+                &signed_renew,
+                &signed_renew.signing_input().expect("a request signing input"),
             ),
         ],
         "rate_policy": serde_json::to_value(PushRatePolicy::FREE).expect("a policy"),
@@ -423,6 +620,23 @@ mod tests {
             .join(relative);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
+
+    /// KR-REQ-16.05: the origin lists are the verdicts this crate actually gives.
+    #[test]
+    fn the_published_origin_lists_are_what_the_host_decides() {
+        for accepted in ACCEPTED_ORIGINS {
+            assert!(
+                GatewayOrigin::new(*accepted).is_ok(),
+                "a published accepted origin is refused: {accepted}"
+            );
+        }
+        for refused in REFUSED_ORIGINS {
+            assert!(
+                GatewayOrigin::new(*refused).is_err(),
+                "a published refused origin is accepted: {refused}"
+            );
+        }
     }
 
     /// KR-REQ-16.05, KR-REQ-16.08: the committed vectors are what this crate produces.

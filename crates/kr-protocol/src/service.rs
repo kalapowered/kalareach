@@ -50,10 +50,13 @@
 //! [`installation_id`] derives the [`InstallationId`] from the device authorisation key that signs.
 //! It is the first 16 bytes of the key's SHA-256, written in the hyphenated form `ids` defines, so
 //! the identifier is not a claim: a caller that presents a key and a signature has already proved
-//! which installation it is, and two installations cannot share an identifier without sharing a
-//! key. A service stores the key it first saw against that identifier and refuses a later request
-//! carrying a different key, which is what makes replacing an installation key a deliberate step
-//! rather than a side effect of asking.
+//! which installation it is.
+//!
+//! An identifier is 128 bits, so it names a key rather than proving one. A service therefore keeps
+//! the whole key it first saw against that identifier and compares against the key, not the
+//! identifier, on every later request: a different key under the same identifier is refused rather
+//! than admitted, which is what makes replacing an installation key a deliberate step rather than a
+//! side effect of asking.
 
 use kr_cbor::{CborError, sha256, signing_value};
 use schemars::JsonSchema;
@@ -61,6 +64,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::InstallationId;
 use crate::method::{Method, MethodGroup};
+use crate::pairing::{HTTP_DEFAULT_PORT, HTTPS_DEFAULT_PORT, split_authority, validate_authority};
 use crate::scalars::{AuthorisationKey, Digest256, Nonce256, Signature64, TimestampMs, Uuid};
 
 /// The domain an installation's service-request signature covers.
@@ -143,13 +147,14 @@ impl std::error::Error for GatewayOriginError {}
 impl GatewayOrigin {
     /// Validates and wraps an origin.
     ///
-    /// An origin is a scheme, a host and an optional port, and nothing else: no path, no query, no
-    /// fragment, no credentials and no trailing slash. Two spellings of one address would otherwise
-    /// produce two different signing inputs for the same service, and a verifier comparing text
-    /// would refuse a request its own caller addressed correctly.
+    /// The grammar is the one `pairing` already fixes for a rendezvous origin, because an origin is
+    /// an origin: a scheme, a canonically spelled host, an optional non-default port, and nothing
+    /// else. Two spellings of one address would otherwise be two signing inputs for one service, and
+    /// a verifier comparing text would refuse a request its own caller addressed correctly.
     ///
-    /// `http://` is admitted only for a loopback host, which is what a development deployment
-    /// serves on. Any other plain-HTTP origin is refused here rather than at the point of use.
+    /// The one difference is the scheme. `http://` is admitted for a loopback host, which is what a
+    /// development deployment serves on; any other plain-HTTP origin is refused here rather than at
+    /// the point of use.
     ///
     /// # Errors
     ///
@@ -162,21 +167,24 @@ impl GatewayOrigin {
         if value.len() > MAX_GATEWAY_ORIGIN_LEN {
             return Err(GatewayOriginError("a gateway origin is at most 128 bytes"));
         }
-        let secure = value.strip_prefix("https://");
-        let plain = value.strip_prefix("http://");
-        let authority = match (secure, plain) {
-            (Some(authority), _) => authority,
-            (None, Some(authority)) if is_loopback_authority(authority) => authority,
-            (None, Some(_)) => {
-                return Err(GatewayOriginError(
-                    "only a loopback gateway origin may use http",
-                ));
+        let (authority, default_port) = match (
+            value.strip_prefix("https://"),
+            value.strip_prefix("http://"),
+        ) {
+            (Some(authority), _) => (authority, HTTPS_DEFAULT_PORT),
+            (None, Some(authority)) => {
+                if !is_loopback_authority(authority) {
+                    return Err(GatewayOriginError(
+                        "only a loopback gateway origin may use http",
+                    ));
+                }
+                (authority, HTTP_DEFAULT_PORT)
             }
             (None, None) => {
                 return Err(GatewayOriginError("a gateway origin names its scheme"));
             }
         };
-        validate_authority(authority)?;
+        validate_authority(authority, default_port).map_err(GatewayOriginError)?;
         Ok(Self(value))
     }
 
@@ -227,76 +235,17 @@ impl JsonSchema for GatewayOrigin {
     }
 }
 
-/// Splits an authority into its host and its optional port.
-///
-/// A bracketed address literal holds colons of its own, so the port is whatever follows the closing
-/// bracket rather than whatever follows the last colon.
-fn split_authority(authority: &str) -> (&str, Option<&str>) {
-    if authority.starts_with('[') {
-        return match authority.find(']') {
-            Some(end) => {
-                let (host, rest) = authority.split_at(end + 1);
-                (host, rest.strip_prefix(':'))
-            }
-            None => (authority, None),
-        };
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (authority, None),
-    }
-}
-
 /// True when `authority` names a loopback host, with or without a port.
+///
+/// A loopback origin is the only one plain HTTP is admitted for. The three spellings are the ones a
+/// development deployment actually serves on; anything else is a service reachable from elsewhere,
+/// and a request to it belongs on HTTPS.
 fn is_loopback_authority(authority: &str) -> bool {
-    let (host, _) = split_authority(authority);
-    host == "localhost" || host == "127.0.0.1" || host == "[::1]"
-}
-
-/// Checks the host and optional port of an origin.
-fn validate_authority(authority: &str) -> Result<(), GatewayOriginError> {
-    if authority.is_empty() {
-        return Err(GatewayOriginError("a gateway origin names a host"));
+    match split_authority(authority) {
+        Ok((host, _, true)) => host == "::1",
+        Ok((host, _, false)) => host == "localhost" || host == "127.0.0.1",
+        Err(_) => false,
     }
-    if authority.contains('/') || authority.contains('?') || authority.contains('#') {
-        return Err(GatewayOriginError(
-            "a gateway origin carries no path, query or fragment",
-        ));
-    }
-    if authority.contains('@') {
-        return Err(GatewayOriginError(
-            "a gateway origin carries no credentials",
-        ));
-    }
-    let (host, port) = split_authority(authority);
-    if host.is_empty() {
-        return Err(GatewayOriginError("a gateway origin names a host"));
-    }
-    let literal = host
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'));
-    let permitted = match literal {
-        Some(address) => {
-            !address.is_empty()
-                && address
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte == b'.')
-        }
-        None => host.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
-        }),
-    };
-    if !permitted {
-        return Err(GatewayOriginError(
-            "a gateway origin's host is lower-case and carries no escapes",
-        ));
-    }
-    if let Some(port) = port
-        && (port.is_empty() || port.len() > 5 || !port.bytes().all(|byte| byte.is_ascii_digit()))
-    {
-        return Err(GatewayOriginError("a gateway origin's port is a number"));
-    }
-    Ok(())
 }
 
 /// What a service-request signature covers, and exactly what it covers.
@@ -391,8 +340,12 @@ impl ServiceRequestSignature {
 ///
 /// The first 16 bytes of the key's SHA-256, in the hyphenated form [`crate::ids`] writes an
 /// identifier in. It is self-certifying: a caller that signs with the key has proved which
-/// installation it is, so the identifier is derived rather than asserted and a caller cannot
-/// choose one. Two installations share an identifier only by sharing a key.
+/// installation it is, so the identifier is derived rather than asserted and a caller cannot choose
+/// one.
+///
+/// It names a key; it does not stand in for one. A 128-bit value is short enough that a service
+/// compares the whole key it recorded against the key presented, and treats the identifier as the
+/// index it looks that key up by.
 #[must_use]
 pub fn installation_id(key: &AuthorisationKey) -> InstallationId {
     let digest = sha256(key.as_bytes());
@@ -498,25 +451,49 @@ mod tests {
 
     #[test]
     fn an_origin_is_a_scheme_a_host_and_a_port() {
-        assert!(GatewayOrigin::new("https://reach.kala.to").is_ok());
-        assert!(GatewayOrigin::new("https://reach.kala.to:8443").is_ok());
-        assert!(GatewayOrigin::new("http://127.0.0.1:8787").is_ok());
-        assert!(GatewayOrigin::new("http://localhost:8787").is_ok());
-        assert!(GatewayOrigin::new("https://[::1]:8787").is_ok());
-        assert!(GatewayOrigin::new("http://[::1]:8787").is_ok());
-        assert!(GatewayOrigin::new("https://[2001:db8::1]").is_ok());
+        for origin in [
+            "https://reach.kala.to",
+            "https://reach.kala.to:8443",
+            "http://127.0.0.1:8787",
+            "http://localhost:8787",
+            "http://localhost",
+            "https://[::1]:8787",
+            "http://[::1]:8787",
+            "https://[2001:db8::1]",
+        ] {
+            assert!(GatewayOrigin::new(origin).is_ok(), "{origin}");
+        }
 
-        // A second spelling of one address is a second signing input.
-        assert!(GatewayOrigin::new("https://reach.kala.to/").is_err());
-        assert!(GatewayOrigin::new("https://REACH.kala.to").is_err());
-        assert!(GatewayOrigin::new("https://reach.kala.to/api").is_err());
-        assert!(GatewayOrigin::new("https://user@reach.kala.to").is_err());
-        assert!(GatewayOrigin::new("http://reach.kala.to").is_err());
-        assert!(GatewayOrigin::new("reach.kala.to").is_err());
-        assert!(GatewayOrigin::new("https://").is_err());
-        assert!(GatewayOrigin::new("https://reach.kala.to:http").is_err());
-        assert!(GatewayOrigin::new("http://[2001:db8::1]").is_err());
-        assert!(GatewayOrigin::new("https://[2001:db8::1").is_err());
+        // Every one of these is a second spelling of an origin, or not an origin at all. One
+        // service with two spellings is one request with two signing inputs.
+        for origin in [
+            "https://reach.kala.to/",
+            "https://REACH.kala.to",
+            "https://reach.kala.to/api",
+            "https://reach.kala.to?x=1",
+            "https://user@reach.kala.to",
+            "http://reach.kala.to",
+            "http://[2001:db8::1]",
+            "reach.kala.to",
+            "https://",
+            "https://reach.kala.to:http",
+            "https://reach.kala.to:443",
+            "https://reach.kala.to:08443",
+            "https://reach.kala.to:0",
+            "https://reach.kala.to:99999",
+            "http://localhost:80",
+            "https://[::1]junk",
+            "http://[::1]junk",
+            "https://[:::]",
+            "https://[2001:db8::1",
+            "https://[0:0:0:0:0:0:0:1]",
+            "https://reach.kala.to.",
+            "https://192.0.2.001",
+            "https://2001:db8::1",
+        ] {
+            assert!(GatewayOrigin::new(origin).is_err(), "{origin}");
+        }
+
         assert!(GatewayOrigin::new("x".repeat(MAX_GATEWAY_ORIGIN_LEN + 1)).is_err());
     }
 }

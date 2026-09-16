@@ -285,76 +285,78 @@ fn validate_rendezvous_origin(value: &str) -> Result<(), PairingTextError> {
     let Some(authority) = value.strip_prefix("https://") else {
         return Err(PairingTextError("a rendezvous origin starts with https://"));
     };
+    validate_authority(authority, HTTPS_DEFAULT_PORT).map_err(PairingTextError)
+}
+
+/// The port an `https://` origin omits.
+pub(crate) const HTTPS_DEFAULT_PORT: u16 = 443;
+
+/// The port an `http://` origin omits.
+pub(crate) const HTTP_DEFAULT_PORT: u16 = 80;
+
+/// Validates the `host[:port]` half of an origin.
+///
+/// One address has one spelling here. A port that repeats the scheme's default, a leading zero, an
+/// uppercase host or a non-canonical address literal would each give one service two origins, and
+/// two origins are two different signing inputs for the same request.
+pub(crate) fn validate_authority(authority: &str, default_port: u16) -> Result<(), &'static str> {
     if authority.is_empty() || authority.len() > 255 {
-        return Err(PairingTextError("a rendezvous origin has a host"));
+        return Err("an origin has a host");
     }
     if authority.bytes().any(|byte| !(b'!'..=b'~').contains(&byte)) {
-        return Err(PairingTextError(
-            "a rendezvous origin is printable ASCII without spaces",
-        ));
+        return Err("an origin is printable ASCII without spaces");
     }
     if authority.contains('/')
         || authority.contains('?')
         || authority.contains('#')
         || authority.contains('@')
     {
-        return Err(PairingTextError(
-            "a rendezvous origin carries no path, query, fragment or user information",
-        ));
+        return Err("an origin carries no path, query, fragment or user information");
     }
 
     let (host, port, bracketed) = split_authority(authority)?;
     if let Some(port) = port {
-        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(PairingTextError("a rendezvous origin port is decimal"));
-        }
-        if port.len() > 1 && port.starts_with('0') {
-            return Err(PairingTextError(
-                "a rendezvous origin port has no leading zero",
-            ));
-        }
-        match port.parse::<u16>() {
-            Ok(443) => {
-                return Err(PairingTextError(
-                    "a canonical https origin omits the default port 443",
-                ));
-            }
-            Ok(0) => return Err(PairingTextError("a rendezvous origin port is not zero")),
-            Ok(_) => {}
-            Err(_) => {
-                return Err(PairingTextError(
-                    "a rendezvous origin port is a 16-bit port",
-                ));
-            }
-        }
+        validate_origin_port(port, default_port)?;
     }
     validate_origin_host(host, bracketed)
+}
+
+/// Validates the port of an origin, given the port its scheme omits.
+pub(crate) fn validate_origin_port(port: &str, default_port: u16) -> Result<(), &'static str> {
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("an origin port is decimal");
+    }
+    if port.len() > 1 && port.starts_with('0') {
+        return Err("an origin port has no leading zero");
+    }
+    match port.parse::<u16>() {
+        Ok(0) => Err("an origin port is not zero"),
+        Ok(value) if value == default_port => Err("a canonical origin omits its default port"),
+        Ok(_) => Ok(()),
+        Err(_) => Err("an origin port is a 16-bit port"),
+    }
 }
 
 /// Splits `host[:port]`, keeping an IPv6 literal inside its brackets.
 ///
 /// The third element says whether the host arrived bracketed, so an unbracketed IPv6 literal is
 /// rejected rather than read as a host and a port.
-fn split_authority(authority: &str) -> Result<(&str, Option<&str>, bool), PairingTextError> {
+pub(crate) fn split_authority(authority: &str) -> Result<(&str, Option<&str>, bool), &'static str> {
     if let Some(rest) = authority.strip_prefix('[') {
         let Some(end) = rest.find(']') else {
-            return Err(PairingTextError("an IPv6 origin closes its bracket"));
+            return Err("an IPv6 origin closes its bracket");
         };
         let host = &rest[..end];
         return match &rest[end + 1..] {
             "" => Ok((host, None, true)),
             tail => match tail.strip_prefix(':') {
                 Some(port) => Ok((host, Some(port), true)),
-                None => Err(PairingTextError(
-                    "an IPv6 origin has nothing but a port after its bracket",
-                )),
+                None => Err("an IPv6 origin has nothing but a port after its bracket"),
             },
         };
     }
     if authority.contains('[') || authority.contains(']') {
-        return Err(PairingTextError(
-            "only an IPv6 literal uses brackets, and it starts with one",
-        ));
+        return Err("only an IPv6 literal uses brackets, and it starts with one");
     }
     Ok(match authority.rsplit_once(':') {
         Some((host, port)) => (host, Some(port), false),
@@ -363,9 +365,9 @@ fn split_authority(authority: &str) -> Result<(&str, Option<&str>, bool), Pairin
 }
 
 /// Validates the host half of an origin: a bracketed IPv6 literal, or lower-case DNS labels.
-fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), PairingTextError> {
+pub(crate) fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), &'static str> {
     if host.is_empty() {
-        return Err(PairingTextError("a rendezvous origin has a host"));
+        return Err("an origin has a host");
     }
     if bracketed {
         // One address has many spellings. The canonical one is what the standard library writes,
@@ -373,11 +375,9 @@ fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), PairingTextEr
         // transcript for the same service.
         let parsed: std::net::Ipv6Addr = host
             .parse()
-            .map_err(|_| PairingTextError("a bracketed origin host is an IPv6 literal"))?;
+            .map_err(|_| "a bracketed origin host is an IPv6 literal")?;
         if parsed.to_string() != host {
-            return Err(PairingTextError(
-                "an IPv6 origin uses the canonical spelling of its address",
-            ));
+            return Err("an IPv6 origin uses the canonical spelling of its address");
         }
         if parsed.to_ipv4_mapped().is_some()
             || (parsed.to_ipv4().is_some() && !parsed.is_loopback() && !parsed.is_unspecified())
@@ -385,19 +385,17 @@ fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), PairingTextEr
             // An IPv4-mapped or IPv4-compatible address is one host with two spellings, and URL
             // parsers do not agree on which to write. An IPv4 service is named by its IPv4
             // literal. The loopback and unspecified addresses are not IPv4 addresses in disguise.
-            return Err(PairingTextError(
+            return Err(
                 "an IPv4 address is written as an IPv4 origin, not as a mapped IPv6 literal",
-            ));
+            );
         }
         return Ok(());
     }
     if host.contains(':') {
-        return Err(PairingTextError("an IPv6 origin host is bracketed"));
+        return Err("an IPv6 origin host is bracketed");
     }
     if host.ends_with('.') {
-        return Err(PairingTextError(
-            "a rendezvous origin host has no trailing dot",
-        ));
+        return Err("an origin host has no trailing dot");
     }
     // An IPv4 literal is a host as well, and it too has one canonical spelling.
     if host
@@ -406,11 +404,9 @@ fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), PairingTextEr
     {
         let parsed: std::net::Ipv4Addr = host
             .parse()
-            .map_err(|_| PairingTextError("a numeric origin host is an IPv4 literal"))?;
+            .map_err(|_| "a numeric origin host is an IPv4 literal")?;
         if parsed.to_string() != host {
-            return Err(PairingTextError(
-                "an IPv4 origin uses the canonical spelling of its address",
-            ));
+            return Err("an IPv4 origin uses the canonical spelling of its address");
         }
         return Ok(());
     }
@@ -421,28 +417,22 @@ fn validate_origin_host(host: &str, bracketed: bool) -> Result<(), PairingTextEr
     if last.starts_with(|character: char| character.is_ascii_digit())
         || !last.bytes().any(|byte| byte.is_ascii_lowercase())
     {
-        return Err(PairingTextError(
-            "a rendezvous origin host ends in a name, not a number",
-        ));
+        return Err("an origin host ends in a name, not a number");
     }
     for label in host.split('.') {
         if label.is_empty() || label.len() > 63 {
-            return Err(PairingTextError(
-                "a rendezvous origin host label is 1 to 63 characters",
-            ));
+            return Err("an origin host label is 1 to 63 characters");
         }
         if label.starts_with('-') || label.ends_with('-') {
-            return Err(PairingTextError(
-                "a rendezvous origin host label does not start or end with a hyphen",
-            ));
+            return Err("an origin host label does not start or end with a hyphen");
         }
         if !label
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         {
-            return Err(PairingTextError(
-                "a rendezvous origin host is lower-case ASCII; encode an international name as A-label punycode",
-            ));
+            return Err(
+                "an origin host is lower-case ASCII; encode an international name as A-label punycode",
+            );
         }
     }
     Ok(())
