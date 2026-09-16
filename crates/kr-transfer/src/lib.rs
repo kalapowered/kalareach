@@ -26,6 +26,10 @@
 //! | [`clock`] | The clock expiries are measured on |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 //!
+//! On Windows one more module, private to this crate, owns the access-control list of the
+//! service's own directories: the list they are created with, and the check that reads it back
+//! from an opened handle. It is the only code here that leaves safe Rust.
+//!
 //! ## What a handle is, and is not
 //!
 //! `upload.finish` returns an [`kr_protocol::transfer::AttachmentHandle`]: an opaque,
@@ -61,8 +65,22 @@ pub mod service;
 pub mod staging;
 pub mod store;
 
+/// The access-control list of this service's own directories.
+///
+/// Windows has no mode bits, so an owner-only directory is one whose list says so. Building that
+/// list and reading one back are calls into `advapi32`, which is why this module is allowed to
+/// leave safe Rust and nothing else in the crate is.
+#[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "an owner-only access-control list, and reading one back from an opened handle, are \
+              calls into advapi32; this is the only module in this crate that leaves safe Rust"
+)]
+mod windows;
+
 pub use crate::authority::{
-    AuthorisedDirectory, AuthorisedFile, Escape, ObjectIdentity, ObjectPolicy, RelativeName,
+    AuthorisedDirectory, AuthorisedFile, Escape, ObjectIdentity, ObjectPolicy, Privacy,
+    RelativeName,
 };
 pub use crate::clock::{Clock, ManualClock, SystemClock};
 pub use crate::download::{DownloadWriter, publish_transfer};

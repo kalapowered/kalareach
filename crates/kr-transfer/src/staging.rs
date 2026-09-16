@@ -20,6 +20,12 @@
 //! one entry for the object's owner and one inherit-only entry that becomes an owner entry on
 //! everything created beneath it, so inheritance from the profile above cannot widen it.
 //!
+//! Creating it that way is half the rule. The other half is that the rules are checked on the
+//! handle every time the area is opened, on both platforms: the owner and the mode on Unix, the
+//! owner and every entry of the list on Windows. A directory that already existed with wider
+//! access is refused rather than adopted, because nothing says this host is the one that created
+//! it.
+//!
 //! The random name is not a secret and nothing depends on it staying unknown. It is there so two
 //! installations, or an installation and a restored backup, never collide on a payload name, and
 //! so a path guessed from a transfer identifier alone names nothing.
@@ -29,7 +35,7 @@ use std::path::Path;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::ids::{EnvironmentId, TransferId};
 
-use crate::authority::{AuthorisedDirectory, RelativeName};
+use crate::authority::{AuthorisedDirectory, Privacy, RelativeName};
 use crate::error::{Result, TransferError};
 
 /// The directory, under the environment's state directory, that the transfer service owns.
@@ -104,7 +110,14 @@ impl StagingArea {
         let root = Self::root_of(paths);
         kr_ipc::paths::create_private_tree(paths.state_root(), &root)
             .map_err(TransferError::staging)?;
-        AuthorisedDirectory::open_root(paths.environment_id(), &root).map_err(TransferError::from)
+        let root = AuthorisedDirectory::open_root(paths.environment_id(), &root)
+            .map_err(TransferError::from)?;
+        // The tree above this directory belongs to the installation rather than to this service,
+        // so it is checked rather than created here: an owner other than this user, or access for
+        // an account that does not already hold the machine, is a refusal.
+        root.check_privacy(Privacy::OwnerOnly)
+            .map_err(TransferError::from)?;
+        Ok(root)
     }
 
     /// Returns a random staging-directory name.
@@ -200,128 +213,44 @@ fn subdirectory(staging: &AuthorisedDirectory, name: &str) -> Result<AuthorisedD
         .map_err(TransferError::from)
 }
 
-/// Creates the private staging directory itself.
+/// Creates the private staging directory itself, and checks what it carries.
 ///
-/// On Unix the ordinary owner-only create does everything: 0700 on the directory and 0600 on every
-/// payload beneath it. On Windows the directory carries an explicit protected access-control list.
-#[cfg(not(windows))]
+/// A directory that already exists is the ordinary case on every start after the first, and it is
+/// also the case this cannot take on trust: nothing says this host created it. So the rules are
+/// checked on the handle that was just opened, every time, rather than assumed from the create.
 fn create_private_staging_directory(
+    root: &AuthorisedDirectory,
+    name: &RelativeName,
+) -> Result<AuthorisedDirectory> {
+    let staging = build_private_staging_directory(root, name)?;
+    staging
+        .check_privacy(Privacy::Boundary)
+        .map_err(TransferError::from)?;
+    Ok(staging)
+}
+
+/// On Unix the ordinary owner-only create does everything: 0700 on the directory and 0600 on every
+/// payload beneath it.
+#[cfg(not(windows))]
+fn build_private_staging_directory(
     root: &AuthorisedDirectory,
     name: &RelativeName,
 ) -> Result<AuthorisedDirectory> {
     root.create_subdirectory(name).map_err(TransferError::from)
 }
 
+/// On Windows the directory carries an explicit protected access-control list.
 #[cfg(windows)]
-fn create_private_staging_directory(
+fn build_private_staging_directory(
     root: &AuthorisedDirectory,
     name: &RelativeName,
 ) -> Result<AuthorisedDirectory> {
-    // The access-control list is applied at creation, by absolute path, because that is the one
-    // call Windows offers for it. It happens once, at startup, inside the environment's own state
-    // directory; every access after it is relative to the handle this returns.
+    // The list is applied at creation, by absolute path, because that is the one call Windows
+    // offers for it. It happens once, at startup, inside the environment's own state directory;
+    // every access after it is relative to the handle this returns.
     let path = root.host_path(name);
-    windows::create_owner_only_directory(&path)?;
+    crate::windows::create_owner_only_directory(&path)?;
     root.subdirectory(name).map_err(TransferError::from)
-}
-
-#[cfg(windows)]
-mod windows {
-    //! The one place in this crate that leaves safe Rust.
-    //!
-    //! Windows has no mode bits. An owner-only directory is a directory whose access-control list
-    //! is *protected*, so nothing is inherited into it from the user profile above, and whose only
-    //! entries name the object's owner. Building that list means asking `advapi32` to parse the
-    //! descriptor and handing the result to `CreateDirectoryW`.
-
-    use std::path::Path;
-
-    use crate::error::{Result, TransferError};
-
-    /// The object's owner only, with inheritance blocked and children covered.
-    ///
-    /// `D:P` makes the list protected, so no inherited entry from the user profile widens it.
-    /// `(A;;GA;;;OW)` grants everything to OWNER RIGHTS, which resolves to whoever owns the object:
-    /// the process that created the directory, which is this user. `(A;OICIIO;GA;;;CO)` is
-    /// inherit-only and names CREATOR OWNER, the placeholder that becomes the owner's own entry on
-    /// each file and directory created beneath, so a payload file is owner-only without a second
-    /// call per file.
-    const OWNER_ONLY_DESCRIPTOR: &str = "D:P(A;;GA;;;OW)(A;OICIIO;GA;;;CO)";
-
-    pub(super) fn create_owner_only_directory(path: &Path) -> Result<()> {
-        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, LocalFree};
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-        };
-        use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-
-        let wide_path = wide(path.as_os_str());
-        let wide_descriptor = wide_str(OWNER_ONLY_DESCRIPTOR);
-        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // SAFETY: both pointers are null-terminated wide buffers this function owns for the whole
-        // call, `descriptor` is a live out parameter, and the size parameter is optional.
-        #[expect(
-            unsafe_code,
-            reason = "an owner-only access-control list comes from advapi32; nothing else in this \
-                      crate leaves safe Rust"
-        )]
-        let parsed = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                wide_descriptor.as_ptr(),
-                SDDL_REVISION_1,
-                &raw mut descriptor,
-                std::ptr::null_mut(),
-            )
-        };
-        if parsed == 0 {
-            return Err(TransferError::staging(format!(
-                "the staging directory's access-control list could not be built: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
-            lpSecurityDescriptor: descriptor,
-            bInheritHandle: 0,
-        };
-        // SAFETY: `wide_path` is a null-terminated wide buffer this function owns, and
-        // `attributes` points at a descriptor that stays live until it is freed below.
-        #[expect(
-            unsafe_code,
-            reason = "creating a directory with an explicit access-control list is one call into \
-                      kernel32"
-        )]
-        let created = unsafe { CreateDirectoryW(wide_path.as_ptr(), &raw const attributes) };
-        let failure = (created == 0).then(std::io::Error::last_os_error);
-        // SAFETY: `descriptor` was allocated by the conversion above and is freed exactly once.
-        #[expect(
-            unsafe_code,
-            reason = "the descriptor advapi32 allocated is released with the function it documents"
-        )]
-        unsafe {
-            LocalFree(descriptor.cast());
-        }
-        match failure {
-            None => Ok(()),
-            // An existing staging directory is the ordinary case on every start after the first.
-            Some(error) if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) => Ok(()),
-            Some(error) => Err(TransferError::staging(format!(
-                "the staging directory {} could not be created: {error}",
-                path.display()
-            ))),
-        }
-    }
-
-    fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt as _;
-
-        text.encode_wide().chain(std::iter::once(0)).collect()
-    }
-
-    fn wide_str(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain(std::iter::once(0)).collect()
-    }
 }
 
 /// The name a transfer's payload is stored under.
@@ -380,6 +309,27 @@ impl StorageName {
     #[must_use]
     pub fn extension(&self) -> Option<&str> {
         self.extension.as_deref()
+    }
+
+    /// Returns the transfer a storage name belongs to, or `None` when the name is not one.
+    ///
+    /// Every payload name in the three staging areas is thirty-two hexadecimal characters plus an
+    /// optional suffix, so a reconciliation pass can ask the journal about a name it found rather
+    /// than guessing whether it is one of this service's.
+    #[must_use]
+    pub fn transfer_of(name: &str) -> Option<TransferId> {
+        let stem = name.split('.').next().unwrap_or(name);
+        if stem.len() != 32 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut bytes = [0_u8; 16];
+        for (slot, pair) in bytes.iter_mut().zip(stem.as_bytes().chunks(2)) {
+            let text = std::str::from_utf8(pair).ok()?;
+            *slot = u8::from_str_radix(text, 16).ok()?;
+        }
+        Some(TransferId::new(kr_protocol::scalars::Uuid::from_bytes(
+            bytes,
+        )))
     }
 }
 

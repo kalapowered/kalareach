@@ -126,6 +126,12 @@ pub enum Escape {
         /// The component that is a link.
         component: String,
     },
+    /// The operation accepts only a name with nothing to resolve above it.
+    #[error("{name} is not a single component, and this operation resolves nothing above one")]
+    NotSingleComponent {
+        /// The name that was given.
+        name: String,
+    },
     /// The name does not exist beneath the authorised directory.
     ///
     /// Reported the same way an unauthorised name is, so a caller cannot learn from the refusal
@@ -234,11 +240,33 @@ impl RelativeName {
     pub fn components(&self) -> Vec<&str> {
         self.text.split('/').collect()
     }
+
+    /// Returns true when the name is one component, with nothing to resolve above it.
+    ///
+    /// A one-component name is the strongest form this module offers: the open is a single
+    /// directory-relative operation that nothing above it can redirect, and there is no
+    /// intermediate resolution for a concurrent rename to interfere with. Every name this host
+    /// gives its own payloads is one.
+    #[must_use]
+    pub fn is_single_component(&self) -> bool {
+        !self.text.contains('/')
+    }
 }
 
 impl std::fmt::Display for RelativeName {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.text)
+    }
+}
+
+/// Refuses a name with anything to resolve above it.
+fn single_component(name: &RelativeName) -> Result<(), Escape> {
+    if name.is_single_component() {
+        Ok(())
+    } else {
+        Err(Escape::NotSingleComponent {
+            name: name.as_str().to_owned(),
+        })
     }
 }
 
@@ -526,6 +554,23 @@ impl AuthorisedDirectory {
         }
     }
 
+    /// Checks that this directory's access rules still meet the policy.
+    ///
+    /// The rules are read from the opened handle rather than from the path, so what is checked is
+    /// the directory this authority holds and not whatever the name resolves to now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Escape::WrongKind`] when the rules do not meet the policy, and
+    /// [`Escape::Unopenable`] when they cannot be read.
+    pub fn check_privacy(&self, privacy: Privacy) -> Result<(), Escape> {
+        owner_only(
+            &self.directory,
+            &self.display.display().to_string(),
+            privacy,
+        )
+    }
+
     /// Opens a subdirectory as an authority of its own, following no link.
     ///
     /// # Errors
@@ -571,7 +616,9 @@ impl AuthorisedDirectory {
                 }
             }
             let child = open_directory(&self.directory, &prefix)?;
-            owner_only(&child, &prefix)?;
+            // A directory beneath a boundary inherits the boundary's owner entry on Windows by
+            // design, so what is checked here is the accounts its list names.
+            owner_only(&child, &prefix, Privacy::OwnerOnly)?;
             display.push(component);
         }
         let directory = open_directory(&self.directory, name.as_str())?;
@@ -593,7 +640,9 @@ impl AuthorisedDirectory {
         options.read(true).follow(FollowSymlinks::No);
         no_wait(&mut options);
         let file = open_object(&self.directory, name.as_str(), &options)?;
-        AuthorisedFile::adopt(self.environment_id, file, name.as_str(), policy)
+        let opened = AuthorisedFile::adopt(self.environment_id, file, name.as_str(), policy)?;
+        self.confirm_reachable(name, opened.identity())?;
+        Ok(opened)
     }
 
     /// Creates a descendant exclusively, refusing every link on the way.
@@ -615,12 +664,14 @@ impl AuthorisedDirectory {
         no_wait(&mut options);
         owner_only_file(&mut options);
         let file = open_object(&self.directory, name.as_str(), &options)?;
-        AuthorisedFile::adopt(
+        let opened = AuthorisedFile::adopt(
             self.environment_id,
             file,
             name.as_str(),
             ObjectPolicy::HostOwnedFile,
-        )
+        )?;
+        self.confirm_reachable(name, opened.identity())?;
+        Ok(opened)
     }
 
     /// Opens a descendant this host created, for reading and writing.
@@ -634,12 +685,14 @@ impl AuthorisedDirectory {
         options.read(true).write(true).follow(FollowSymlinks::No);
         no_wait(&mut options);
         let file = open_object(&self.directory, name.as_str(), &options)?;
-        AuthorisedFile::adopt(
+        let opened = AuthorisedFile::adopt(
             self.environment_id,
             file,
             name.as_str(),
             ObjectPolicy::HostOwnedFile,
-        )
+        )?;
+        self.confirm_reachable(name, opened.identity())?;
+        Ok(opened)
     }
 
     /// Reports what kind of object a descendant is, without following a link to find out.
@@ -708,10 +761,49 @@ impl AuthorisedDirectory {
     ) -> Result<(), Escape> {
         // Two environments are never one filesystem authority, even when they share a disk.
         destination.check_environment(self.environment_id)?;
-        self.check_prefixes(name, name.components().len() - 1)?;
-        destination.check_prefixes(destination_name, destination_name.components().len() - 1)?;
+        // Both names are one component, so the rename is a single operation relative to the two
+        // authorised handles with nothing resolved above either. A multi-component name would put
+        // two resolutions before the rename and a window between them, which is the one thing a
+        // mutation across two directories must not have.
+        single_component(name)?;
+        single_component(destination_name)?;
+        check_component(name.as_str())?;
+        check_component(destination_name.as_str())?;
         self.directory
             .rename(
+                name.as_str(),
+                &destination.directory,
+                destination_name.as_str(),
+            )
+            .map_err(|error| Escape::Unopenable {
+                component: destination_name.as_str().to_owned(),
+                detail: error.to_string(),
+            })
+    }
+
+    /// Links a descendant of this directory to a name in `destination` that must not exist.
+    ///
+    /// The one portable atomic no-replace publish. A link fails when the destination name is
+    /// taken, on every platform, so a file that appeared between a check and a publish is never
+    /// overwritten. Both names are one component for the same reason a rename's are.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Escape::WrongEnvironment`] for two environments, the first rule either name
+    /// breaks, or the link failure, which includes the destination already existing.
+    pub fn link_into(
+        &self,
+        name: &RelativeName,
+        destination: &Self,
+        destination_name: &RelativeName,
+    ) -> Result<(), Escape> {
+        destination.check_environment(self.environment_id)?;
+        single_component(name)?;
+        single_component(destination_name)?;
+        check_component(name.as_str())?;
+        check_component(destination_name.as_str())?;
+        self.directory
+            .hard_link(
                 name.as_str(),
                 &destination.directory,
                 destination_name.as_str(),
@@ -768,6 +860,47 @@ impl AuthorisedDirectory {
             path.push(component);
         }
         path
+    }
+
+    /// Confirms that the object just opened is the one this authority reaches by that name.
+    ///
+    /// The open itself carries the platform's beneath-root boundary, which on Linux is one
+    /// `openat2(RESOLVE_BENEATH)` and closes the question outright. On the other platforms the
+    /// resolution is component-wise inside `cap_std`, and a directory relocated *during* it is a
+    /// window this module cannot enter. So the name is resolved a second time and the object
+    /// compared: two independent resolutions agreeing is what turns an undetected escape into a
+    /// refusal. A one-component name needs no resolution above it and the second look is a
+    /// formality; a multi-component name is where this earns its keep.
+    ///
+    /// What remains: a relocation undone between the two resolutions is not detectable from here,
+    /// which is the same class of residual as another writer to an authorised file.
+    fn confirm_reachable(
+        &self,
+        name: &RelativeName,
+        identity: ObjectIdentity,
+    ) -> Result<(), Escape> {
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        no_wait(&mut options);
+        let again = open_object(&self.directory, name.as_str(), &options)?;
+        let metadata = again.metadata().map_err(|error| Escape::Unopenable {
+            component: name.as_str().to_owned(),
+            detail: error.to_string(),
+        })?;
+        let found = ObjectIdentity {
+            device: metadata.dev(),
+            file_id: metadata.ino(),
+        };
+        if found == identity {
+            Ok(())
+        } else {
+            Err(Escape::IdentityChanged {
+                detail: format!(
+                    "{} resolved to {identity} and then to {found}, so this authority does not                      reach one object by that name",
+                    name.as_str()
+                ),
+            })
+        }
     }
 
     /// Opens the first `depth` prefixes of a name, each against this directory's own handle.
@@ -925,6 +1058,21 @@ impl AuthorisedFile {
     }
 }
 
+/// How strictly a directory's access rules are checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Privacy {
+    /// Only this user may reach the directory.
+    OwnerOnly,
+    /// Only this user may reach it, and nothing above it can widen it later.
+    ///
+    /// This is the check for the directory that is the boundary of the service's own storage. On
+    /// Unix it is the same check: a directory's mode is its own, and the directory above it cannot
+    /// change it. On Windows a list can be inherited, so a boundary is additionally required to
+    /// hold a protected list, which is what stops the user profile above from propagating an entry
+    /// into it.
+    Boundary,
+}
+
 fn directory_identity(directory: &Dir, what: &Path) -> Result<ObjectIdentity, Escape> {
     let metadata = directory
         .dir_metadata()
@@ -1010,9 +1158,12 @@ fn refuse_reparse_file(_file: &File, _path: &str) -> Result<(), Escape> {
     Ok(())
 }
 
-/// Checks that a directory this host created belongs to this user and is owner-only.
+/// Checks that a directory belongs to this user and is owner-only.
+///
+/// The policy is the same for both strictnesses here: a Unix directory's mode belongs to the
+/// directory, and the one above it cannot widen it.
 #[cfg(unix)]
-fn owner_only(directory: &Dir, path: &str) -> Result<(), Escape> {
+fn owner_only(directory: &Dir, path: &str, _privacy: Privacy) -> Result<(), Escape> {
     use cap_std::fs::MetadataExt as _;
 
     let metadata = directory
@@ -1038,11 +1189,29 @@ fn owner_only(directory: &Dir, path: &str) -> Result<(), Escape> {
     Ok(())
 }
 
-/// Windows has no mode bits. The staging root carries a protected access-control list, and
-/// checking that list is part of the Windows qualification pass rather than of this open.
+/// Checks the access-control list of a directory on Windows, which is where its access rules live.
+///
+/// The list is read from the handle that was opened, so an existing directory is checked rather
+/// than adopted. A list that names any account except the directory's owner, the local system and
+/// the administrators group is refused; so is one whose entries this host cannot evaluate. A
+/// boundary additionally has to hold a protected list.
 #[cfg(not(unix))]
-fn owner_only(_directory: &Dir, _path: &str) -> Result<(), Escape> {
-    Ok(())
+fn owner_only(directory: &Dir, path: &str, privacy: Privacy) -> Result<(), Escape> {
+    use std::os::windows::io::AsHandle as _;
+
+    let outcome = crate::windows::check_access_list(
+        directory.as_handle(),
+        path,
+        matches!(privacy, Privacy::Boundary),
+    );
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(crate::windows::Refusal::Policy(detail)) => Err(Escape::WrongKind { detail }),
+        Err(crate::windows::Refusal::Unreadable(detail)) => Err(Escape::Unopenable {
+            component: path.to_owned(),
+            detail,
+        }),
+    }
 }
 
 #[cfg(unix)]

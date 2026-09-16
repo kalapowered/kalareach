@@ -23,6 +23,9 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# The filesystem clone a snapshot takes where the platform offers one: `clonefile` on Apple and the
+# `FICLONE` ioctl on Linux, both as safe wrappers.
+rustix = { workspace = true, features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 # The reparse-point attribute of an opened object, which `cap-std` exposes only through this trait.
@@ -30,14 +33,17 @@ cap-primitives = "=4.0.3"
 windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 
 [dev-dependencies]
+# The tests read a file identity the way the service does, through an opened directory.
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 serde_json.workspace = true
 tempfile.workspace = true
 
 # The workspace forbids unsafe code, which a crate that creates a Windows directory with an
-# owner-only access-control list cannot honour: the descriptor comes from `advapi32`. This crate
-# denies it instead and allows it in exactly one module, `staging::windows`, which owns those
-# calls. Nothing else in this crate may relax the rule.
+# owner-only access-control list, and reads one back to check it, cannot honour: both come from
+# `advapi32`. This crate denies it instead and allows it in exactly one module, `windows`, which
+# owns those calls. Nothing else in this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
