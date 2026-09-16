@@ -487,6 +487,9 @@ pub enum ControlFrame {
     VerifyProof(crate::worker::WorkerVerifyProof),
     /// A worker's challenge to a controller that wants to speak for a generation.
     GenerationChallenge(crate::worker::GenerationChallenge),
+    /// What one of the control daemon's connections to a worker is for, declared before it
+    /// presents a generation token.
+    ControllerRole(crate::local::ControllerConnectionRole),
     /// A controller's signed generation token.
     GenerationToken(Box<crate::worker::ControllerGenerationToken>),
     /// The worker's acceptance of a generation.
@@ -497,6 +500,8 @@ pub enum ControlFrame {
     AuthorityRevisionAck(crate::worker::AuthorityRevisionAck),
     /// A mutation the control daemon admitted, passed to the worker that owns its subject.
     Forwarded(Box<crate::local::ForwardedMutation>),
+    /// A read the control daemon admitted for a caller it authenticated elsewhere.
+    ForwardedRead(Box<crate::local::ForwardedRequest>),
     /// A proxy's confirmation that a caller has received an action's acceptance.
     ///
     /// A close is accepted before anything is signalled, because the requester is often a command

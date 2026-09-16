@@ -2073,6 +2073,19 @@
         },
         {
           "additionalProperties": false,
+          "description": "What one of the control daemon's connections to a worker is for, declared before it\npresents a generation token.",
+          "properties": {
+            "controller_role": {
+              "$ref": "#/$defs/ControllerConnectionRole"
+            }
+          },
+          "required": [
+            "controller_role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "A controller's signed generation token.",
           "properties": {
             "generation_token": {
@@ -2138,6 +2151,19 @@
         },
         {
           "additionalProperties": false,
+          "description": "A read the control daemon admitted for a caller it authenticated elsewhere.",
+          "properties": {
+            "forwarded_read": {
+              "$ref": "#/$defs/ForwardedRequest"
+            }
+          },
+          "required": [
+            "forwarded_read"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "A proxy's confirmation that a caller has received an action's acceptance.\n\nA close is accepted before anything is signalled, because the requester is often a command\ninside the process group the closure will stop. When the acceptance travels through a proxy,\nthe worker learns it has arrived here rather than assuming its own write was the end of the\njourney.",
           "properties": {
             "acceptance_delivered": {
@@ -2148,6 +2174,21 @@
             "acceptance_delivered"
           ],
           "type": "object"
+        }
+      ]
+    },
+    "ControllerConnectionRole": {
+      "description": "What one of the control daemon's connections to a worker is for.\n\nA daemon needs more than one connection to a worker, because a worker's attachments,\nsubscriptions and input lane belong to the connection that created them: a device's attachment\ncannot share a connection with the daemon's own housekeeping. Only one of those connections\ncarries the environment's authority, and a connection says which it is *before* it presents a\ngeneration token, so the worker never has to guess and a proxy never displaces the authority.\n\nIt confers nothing on its own. Every one of these connections still proves which generation it\nspeaks for, and only the holder of the environment's signing key can produce that proof.",
+      "oneOf": [
+        {
+          "const": "authority",
+          "description": "The connection that speaks for the environment's authority. It announces authority\nrevisions, and presenting a generation on it fences whatever held that authority before.",
+          "type": "string"
+        },
+        {
+          "const": "proxy",
+          "description": "A connection the daemon opened on behalf of one caller it authenticated elsewhere.\n\nIt forwards that caller's admitted reads and mutations and owns their attachment, and it\nannounces nothing. A replacement generation fences it along with the authority itself.",
+          "type": "string"
         }
       ]
     },
@@ -4321,6 +4362,25 @@
         "mutation",
         "actor",
         "accepted_deadline_boot_ms"
+      ],
+      "type": "object"
+    },
+    "ForwardedRequest": {
+      "additionalProperties": false,
+      "description": "A read the host admitted for a caller, passed to the component that owns its subject.\n\nA read needs forwarding for the same reason a mutation does, and for one reason more. The\nsubject is the worker's, and the daemon owns admission; but a read is also *attributed*: the\nde-duplication key of a retained receipt is the verified actor and the action together, so a\nread that asks about an action has to ask as the caller rather than as the proxy. A plain\nrequest carries no actor, and serving one on the proxy's own principal would answer about the\nproxy's actions instead of the caller's.\n\nWhat travels beside the request is the actor the host verified, including the ingress it\narrived on. The worker checks the method against *that* ingress, so a method the registry keeps\nto private IPC stays unreachable for a paired device even though the frame arrived on a socket.",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/ActorEnvelope",
+          "description": "The actor the host verified, with the ingress it arrived on."
+        },
+        "request": {
+          "$ref": "#/$defs/Request",
+          "description": "The caller's request, exactly as it arrived at the host."
+        }
+      },
+      "required": [
+        "request",
+        "actor"
       ],
       "type": "object"
     },
@@ -13216,6 +13276,9 @@
     "control_frame": {
       "$ref": "#/$defs/ControlFrame"
     },
+    "controller_connection_role": {
+      "$ref": "#/$defs/ControllerConnectionRole"
+    },
     "controller_generation_token": {
       "$ref": "#/$defs/ControllerGenerationToken"
     },
@@ -13275,6 +13338,9 @@
     },
     "forwarded_mutation": {
       "$ref": "#/$defs/ForwardedMutation"
+    },
+    "forwarded_request": {
+      "$ref": "#/$defs/ForwardedRequest"
     },
     "generation_accepted": {
       "$ref": "#/$defs/GenerationAccepted"

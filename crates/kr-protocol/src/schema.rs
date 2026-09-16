@@ -36,7 +36,9 @@ use crate::input::{
     InputAcquireParams, InputAcquireResult, InputInterruptParams, InputLeaseResult,
     InputLeaseState, InputReleaseParams, InputWriteParams, InputWriteResult,
 };
-use crate::local::{ForwardedMutation, LocalHello, LocalHelloAck};
+use crate::local::{
+    ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalHello, LocalHelloAck,
+};
 use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
 use crate::method::{Method, REGISTRY};
 use crate::pairing::{
@@ -138,6 +140,7 @@ pub fn protocol_schema() -> Value {
         "closure_record" => ClosureRecord,
         "connect_reply" => ConnectReply,
         "control_frame" => ControlFrame,
+        "controller_connection_role" => ControllerConnectionRole,
         "controller_generation_token" => ControllerGenerationToken,
         "direct_challenge" => DirectChallenge,
         "direct_redeem_proof" => DirectRedeemProof,
@@ -148,6 +151,7 @@ pub fn protocol_schema() -> Value {
         "events_subscribe_params" => EventsSubscribeParams,
         "events_subscribe_result" => EventsSubscribeResult,
         "forwarded_mutation" => ForwardedMutation,
+        "forwarded_request" => ForwardedRequest,
         "generation_accepted" => GenerationAccepted,
         "generation_challenge" => GenerationChallenge,
         "generation_checkpoint" => GenerationCheckpoint,

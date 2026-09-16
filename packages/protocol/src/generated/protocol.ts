@@ -147,6 +147,9 @@ export type ControlFrame =
       generation_challenge: GenerationChallenge
     }
   | {
+      controller_role: ControllerConnectionRole
+    }
+  | {
       generation_token: ControllerGenerationToken
     }
   | {
@@ -160,6 +163,9 @@ export type ControlFrame =
     }
   | {
       forwarded: ForwardedMutation
+    }
+  | {
+      forwarded_read: ForwardedRequest
     }
   | {
       acceptance_delivered: ActionId
@@ -184,6 +190,19 @@ export type ControlEvent =
       action_window_renewed: ActionWindow
     }
   | 'keepalive'
+/**
+ * What one of the control daemon's connections to a worker is for.
+ *
+ * A daemon needs more than one connection to a worker, because a worker's attachments,
+ * subscriptions and input lane belong to the connection that created them: a device's attachment
+ * cannot share a connection with the daemon's own housekeeping. Only one of those connections
+ * carries the environment's authority, and a connection says which it is *before* it presents a
+ * generation token, so the worker never has to guess and a proxy never displaces the authority.
+ *
+ * It confers nothing on its own. Every one of these connections still proves which generation it
+ * speaks for, and only the holder of the environment's signing key can produce that proof.
+ */
+export type ControllerConnectionRole = 'authority' | 'proxy'
 /**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
@@ -882,6 +901,7 @@ export interface KalaReachProtocol {
   closure_record?: ClosureRecord
   connect_reply?: ConnectReply
   control_frame?: ControlFrame
+  controller_connection_role?: ControllerConnectionRole
   controller_generation_token?: ControllerGenerationToken
   direct_challenge?: DirectChallenge
   direct_redeem_proof?: DirectRedeemProof
@@ -902,6 +922,7 @@ export interface KalaReachProtocol {
   events_subscribe_params?: EventsSubscribeParams
   events_subscribe_result?: EventsSubscribeResult
   forwarded_mutation?: ForwardedMutation
+  forwarded_request?: ForwardedRequest
   generation_accepted?: GenerationAccepted
   generation_challenge?: GenerationChallenge
   generation_checkpoint?: GenerationCheckpoint
@@ -3230,6 +3251,81 @@ export interface MutationRequest1 {
    */
   requested_ttl_ms: string
   target: ActionTarget
+}
+/**
+ * A read the host admitted for a caller, passed to the component that owns its subject.
+ *
+ * A read needs forwarding for the same reason a mutation does, and for one reason more. The
+ * subject is the worker's, and the daemon owns admission; but a read is also *attributed*: the
+ * de-duplication key of a retained receipt is the verified actor and the action together, so a
+ * read that asks about an action has to ask as the caller rather than as the proxy. A plain
+ * request carries no actor, and serving one on the proxy's own principal would answer about the
+ * proxy's actions instead of the caller's.
+ *
+ * What travels beside the request is the actor the host verified, including the ingress it
+ * arrived on. The worker checks the method against *that* ingress, so a method the registry keeps
+ * to private IPC stays unreachable for a paired device even though the frame arrived on a socket.
+ */
+export interface ForwardedRequest {
+  actor: ActorEnvelope2
+  request: Request1
+}
+/**
+ * The actor the host verified, with the ingress it arrived on.
+ */
+export interface ActorEnvelope2 {
+  /**
+   * The stable host-issued principal for this actor.
+   */
+  actor_id: string
+  /**
+   * The connection the request arrived on. Closing the control stream revokes every associated
+   * data stream.
+   */
+  connection_id: string
+  /**
+   * The controller generation that admitted the connection. Remote dispatch is fenced when this
+   * generation is replaced.
+   */
+  controller_generation: string
+  /**
+   * The paired device, when the ingress is a device.
+   */
+  device_id: DeviceId | null
+  /**
+   * The grant the request is being checked against, when one applies.
+   */
+  grant_id: GrantId | null
+  /**
+   * The authority revision the grant was validated at.
+   */
+  grant_revision: AuthorityRevision | null
+  /**
+   * Where the request entered the host.
+   */
+  ingress:
+    'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
+}
+/**
+ * A read request.
+ */
+export interface Request1 {
+  /**
+   * The method name. A name that is not in the registry is denied.
+   */
+  method: string
+  /**
+   * The method version. Schemas are closed for the negotiated version.
+   */
+  method_version: number
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  params: unknown
+  /**
+   * Correlates the response. Unique for the lifetime of one connection.
+   */
+  request_id: string
 }
 /**
  * The host challenge a direct redemption starts from. Single use, and it expires with the

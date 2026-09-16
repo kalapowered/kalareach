@@ -803,12 +803,14 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         | ControlFrame::WorkerFailed(_)
         | ControlFrame::VerifyChallenge(_)
         | ControlFrame::VerifyProof(_)
+        | ControlFrame::ControllerRole(_)
         | ControlFrame::GenerationChallenge(_)
         | ControlFrame::GenerationToken(_)
         | ControlFrame::GenerationAccepted(_)
         | ControlFrame::AuthorityRevision(_)
         | ControlFrame::AuthorityRevisionAck(_)
         | ControlFrame::Forwarded(_)
+        | ControlFrame::ForwardedRead(_)
         | ControlFrame::AcceptanceDelivered(_) => return false,
     }
     true
