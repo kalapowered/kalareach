@@ -160,7 +160,7 @@ impl Controller {
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
         let clock = Arc::new(SystemContinuousClock::new());
         let authority_revision = registry.authority_revision()?;
-        let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths)?);
+        let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
         let controller = Arc::new(Self {
             registry: Mutex::new(registry),
             directory: Mutex::new(Directory::default()),
@@ -1169,7 +1169,7 @@ impl Controller {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         let (mut reader, mut writer) = split(connection, kind);
         let outcome = self
-            .serve_client(&mut reader, &mut writer, connection_id, &peer)
+            .serve_client(&mut reader, &mut writer, connection_id, &peer, kind)
             .await;
         // A connection that ends takes its windows and its registration with it. A window that
         // outlived its connection could first-admit a request through a connection that no longer
@@ -1185,6 +1185,7 @@ impl Controller {
         writer: &mut kr_ipc::framed::FrameWriter,
         connection_id: ConnectionId,
         peer: &PeerIdentity,
+        kind: StreamKind,
     ) -> Result<()> {
         let actor_id = ActorId::new(format!("local:{}", peer.uid))
             .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal"));
@@ -1261,6 +1262,24 @@ impl Controller {
                             format!("this host speaks protocol {PROTOCOL_VERSION}"),
                         )
                     }
+                }
+                ControlFrame::Request(request)
+                    if negotiated && !crate::transfer::carries(kind, request.method.method()) =>
+                {
+                    error_reply(
+                        request.request_id,
+                        ErrorCode::PermissionDenied,
+                        crate::transfer::WRONG_ENDPOINT,
+                    )
+                }
+                ControlFrame::Mutation(mutation)
+                    if negotiated && !crate::transfer::carries(kind, mutation.method.method()) =>
+                {
+                    error_reply(
+                        mutation.request_id,
+                        ErrorCode::PermissionDenied,
+                        crate::transfer::WRONG_ENDPOINT,
+                    )
                 }
                 ControlFrame::Request(request) if negotiated => {
                     match self.authorised(connection_id).await {
@@ -1409,6 +1428,26 @@ impl Controller {
         accepted: AcceptedDeadline,
     ) -> ControlFrame {
         if crate::transfer::TransferModule::serves(method) {
+            // The admission is checked once more, here, because everything between it and this
+            // point can wait: for this task to be scheduled, for the store's lock, for a blocking
+            // thread. An action whose accepted deadline passed while it queued does not go on to
+            // write, and neither does one whose connection lost its authority in the meantime.
+            if self.clock.now() >= accepted.deadline {
+                return respond(
+                    mutation.request_id,
+                    Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it                                  could run"
+                            .to_owned(),
+                    }),
+                );
+            }
+            if let Err(error) = self.authorised(connection_id).await {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
+            }
             return self.transfer.write_frame(actor_id, mutation, method).await;
         }
         let outcome = match method {

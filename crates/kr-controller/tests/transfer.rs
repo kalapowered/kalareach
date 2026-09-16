@@ -49,11 +49,28 @@ impl WorkerSupervisor for RefusingSupervisor {
 }
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
+    temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     chunks: kr_ipc::paths::Endpoint,
+    clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    chunk_task: tokio::task::JoinHandle<()>,
+}
+
+impl Host {
+    /// Ends this daemon the way its process ending would end it, and returns the environment.
+    ///
+    /// Both endpoints are released before this returns: the tasks that hold the listeners are
+    /// stopped and awaited, so a replacement daemon binding the same addresses finds them free.
+    async fn stop(self) -> kr_ipc::testing::TempHost {
+        self.clients.abort();
+        self.chunk_task.abort();
+        let _ = self.clients.await;
+        let _ = self.chunk_task.await;
+        drop(self.controller);
+        self.temp
+    }
 }
 
 fn build() -> BuildId {
@@ -61,7 +78,11 @@ fn build() -> BuildId {
 }
 
 async fn host() -> Host {
-    let temp = kr_ipc::testing::TempHost::create();
+    host_on(kr_ipc::testing::TempHost::create()).await
+}
+
+/// Starts a daemon on an environment that may already hold a transfer journal.
+async fn host_on(temp: kr_ipc::testing::TempHost) -> Host {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let secrets = environment.secrets_dir();
@@ -86,14 +107,24 @@ async fn host() -> Host {
     .expect("the daemon starts");
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+    let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+    // The attachment-chunk endpoint belongs to whoever runs the daemon, exactly as the control
+    // endpoint does, so these tests bind it and own the task that serves it.
+    let chunk_listener = kr_controller::transfer::bind_chunk_endpoint(&environment)
+        .expect("binds the attachment-chunk endpoint");
+    let chunk_task = tokio::spawn(kr_controller::transfer::serve_chunks(
+        Arc::downgrade(&controller),
+        chunk_listener,
+    ));
     let chunks = chunk_endpoint(&environment).expect("an addressable chunk endpoint");
     Host {
-        _temp: temp,
+        temp,
         controller,
         environment_id,
         endpoint,
         chunks,
+        clients,
+        chunk_task,
     }
 }
 
@@ -675,4 +706,317 @@ fn failure(outcome: std::result::Result<ParamsValue, ProtocolError>) -> Protocol
         Ok(value) => panic!("expected a refusal, got {value:?}"),
         Err(error) => error,
     }
+}
+
+/// KR-REQ-23.41: the admission a transfer mutation runs under is checked again at dispatch, so an
+/// action whose accepted deadline has passed writes nothing.
+///
+/// The deadline is the earliest of the window's expiry and the lifetime the caller asked for, so a
+/// caller that asks for no lifetime at all is admitted by the envelope check and then refused by
+/// the barrier in front of the write. That is the ordering under test: the envelope accepted it,
+/// and the last check before the effect did not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_action_whose_admitted_deadline_passed_is_refused_before_it_writes() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let bytes = pattern(64);
+    let mut mutation = control
+        .compose(
+            Method::UploadBegin,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &begin_params(&host, &bytes, "notes.bin"),
+        )
+        .await
+        .expect("composes the mutation");
+    mutation.requested_ttl_ms = kr_protocol::scalars::DurationMs::new(0);
+
+    let refusal = failure(
+        control
+            .repeat(&mutation)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(
+        refusal.message.contains("deadline"),
+        "the refusal says what ran out: {}",
+        refusal.message
+    );
+    // Nothing was reserved: the environment has no staged bytes at all.
+    assert_eq!(
+        host.controller
+            .transfer()
+            .service()
+            .staged_byte_len()
+            .expect("reads the staged total"),
+        0
+    );
+}
+
+/// KR-REQ-23.41: a mutation whose envelope names a different session from the transfer it acts on
+/// is refused, whoever owns the transfer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mutation_that_names_another_session_than_its_transfer_is_refused() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let mut chunks = channel(&host).await;
+    let bytes = pattern(64);
+    let session = SessionId::new(kr_ipc::new_uuid());
+    let elsewhere = SessionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::some(session),
+        session_epoch: Nullable::some(SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let mut params = begin_params(&host, &bytes, "notes.bin");
+    params.session_id = Nullable::some(session);
+    let begun: UploadBeginResult = typed(
+        &control
+            .mutate(
+                Method::UploadBegin,
+                ActionId::new(kr_ipc::new_uuid()),
+                target.clone(),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("upload.begin succeeds"),
+    );
+    let (chunk, payload) = chunk_of(&bytes, 0);
+    chunks
+        .send_chunk(&target, begun.transfer_id, chunk, payload)
+        .await
+        .expect("the chunk is accepted under the session that owns the transfer");
+
+    // The same transfer, named by a request whose envelope points at another session.
+    let refusal = failure(
+        control
+            .mutate(
+                Method::UploadFinish,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget {
+                    session_id: Nullable::some(elsewhere),
+                    ..target.clone()
+                },
+                &UploadFinishParams {
+                    transfer_id: begun.transfer_id,
+                    declared_byte_len: U64::new(bytes.len() as u64),
+                    declared_digest: digest(&bytes),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refusal.code, ErrorCode::InvalidArgument);
+    assert!(
+        refusal.message.contains("session"),
+        "the refusal names the disagreement: {}",
+        refusal.message
+    );
+
+    // The transfer is untouched, and the same call under its own session publishes it.
+    let finished: UploadFinishResult = typed(
+        &control
+            .mutate(
+                Method::UploadFinish,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &UploadFinishParams {
+                    transfer_id: begun.transfer_id,
+                    declared_byte_len: U64::new(bytes.len() as u64),
+                    declared_digest: digest(&bytes),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("upload.finish succeeds under the session that owns it"),
+    );
+    assert_eq!(finished.handle.content_digest, digest(&bytes));
+    assert_eq!(finished.handle.session_id, Nullable::some(session));
+}
+
+/// KR-REQ-14.12, KR-REQ-24.09: a daemon that ends mid-upload leaves a transfer its replacement
+/// resumes from the verified chunk bitmap, under the same identifier.
+///
+/// The daemon is ended the way its process ending would end it: both endpoints are released, the
+/// controller is dropped with its journal connection, and a replacement opens the same environment
+/// and binds the same addresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_daemon_resumes_an_upload_from_its_bitmap() {
+    let first = host().await;
+    // Two chunks, of which exactly one arrives before the daemon ends.
+    let bytes = pattern(UPLOAD_CHUNK_LEN + 4096);
+    let transfer_id: TransferId;
+    let temp = {
+        let mut control = client(&first).await;
+        let mut chunks = channel(&first).await;
+        let begun: UploadBeginResult = typed(
+            &control
+                .mutate(
+                    Method::UploadBegin,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(first.environment_id),
+                    &begin_params(&first, &bytes, "notes.bin"),
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("upload.begin succeeds"),
+        );
+        transfer_id = begun.transfer_id;
+        assert_eq!(begun.layout.chunk_count, U64::new(2));
+        let (chunk, payload) = chunk_of(&bytes, 0);
+        chunks
+            .send_chunk(
+                &ActionTarget::environment(first.environment_id),
+                transfer_id,
+                chunk,
+                payload,
+            )
+            .await
+            .expect("the first chunk is accepted");
+        drop(control);
+        drop(chunks);
+        first.stop().await
+    };
+
+    let second = host_on(temp).await;
+    let mut control = client(&second).await;
+    let mut chunks = channel(&second).await;
+
+    let status: UploadStatusResult = typed(
+        &control
+            .request(Method::UploadStatus, &UploadStatusParams { transfer_id })
+            .await
+            .expect("the call reaches the replacement daemon")
+            .expect("upload.status succeeds"),
+    );
+    assert_eq!(status.state, UploadState::Receiving);
+    let bitmap = ChunkBitmap::decode(&status.received_chunks, status.layout.chunk_count.get())
+        .expect("a bitmap for this layout");
+    assert_eq!(
+        bitmap.missing(),
+        vec![1],
+        "the chunk that arrived is recorded and the other one is not"
+    );
+
+    for index in bitmap.missing() {
+        let (chunk, payload) = chunk_of(&bytes, index);
+        chunks
+            .send_chunk(
+                &ActionTarget::environment(second.environment_id),
+                transfer_id,
+                chunk,
+                payload,
+            )
+            .await
+            .expect("the remaining chunk is accepted by the replacement");
+    }
+
+    let finished: UploadFinishResult = typed(
+        &control
+            .mutate(
+                Method::UploadFinish,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(second.environment_id),
+                &UploadFinishParams {
+                    transfer_id,
+                    declared_byte_len: U64::new(bytes.len() as u64),
+                    declared_digest: digest(&bytes),
+                },
+            )
+            .await
+            .expect("the call reaches the replacement daemon")
+            .expect("upload.finish succeeds"),
+    );
+    assert_eq!(finished.handle.transfer_id, transfer_id);
+    assert_eq!(finished.handle.content_digest, digest(&bytes));
+    assert_eq!(finished.handle.byte_len, U64::new(bytes.len() as u64));
+}
+
+/// KR-REQ-14.07: each endpoint carries the methods its frame bound is for, and nothing else.
+///
+/// The attachment endpoint exists because a 1 MiB chunk does not fit a control frame. Letting it
+/// carry ordinary requests as well would make it a second admission with a larger bound, so the
+/// two endpoints carry disjoint sets of methods and say so when a caller uses the wrong one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_endpoint_carries_only_the_methods_its_frame_bound_is_for() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let bytes = pattern(64);
+    let begun: UploadBeginResult = typed(
+        &control
+            .mutate(
+                Method::UploadBegin,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &begin_params(&host, &bytes, "notes.bin"),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("upload.begin succeeds"),
+    );
+
+    // A chunk on the control endpoint is refused, small enough to fit the frame or not.
+    let (chunk, payload) = chunk_of(&bytes, 0);
+    let refusal = failure(
+        control
+            .mutate(
+                Method::UploadChunk,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &kr_protocol::transfer::UploadChunkParams {
+                    transfer_id: begun.transfer_id,
+                    chunk,
+                    bytes: payload,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(
+        refusal.message.contains("attachment-chunk endpoint"),
+        "the refusal names the endpoint that carries it: {}",
+        refusal.message
+    );
+
+    // And an ordinary request on the attachment endpoint is refused there.
+    let mut wrong = LocalClient::connect(&host.chunks, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the attachment-chunk endpoint");
+    let refusal = failure(
+        wrong
+            .request(
+                Method::UploadStatus,
+                &UploadStatusParams {
+                    transfer_id: begun.transfer_id,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(refusal.message.contains("control endpoint"));
+
+    // The upload itself is untouched by either refusal: no chunk arrived and it is still receiving.
+    let status: UploadStatusResult = typed(
+        &control
+            .request(
+                Method::UploadStatus,
+                &UploadStatusParams {
+                    transfer_id: begun.transfer_id,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("upload.status succeeds"),
+    );
+    assert_eq!(status.state, UploadState::Receiving);
+    let bitmap = ChunkBitmap::decode(&status.received_chunks, status.layout.chunk_count.get())
+        .expect("a bitmap for this layout");
+    assert_eq!(bitmap.missing(), vec![0]);
 }

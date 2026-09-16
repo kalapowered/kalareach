@@ -24,6 +24,11 @@
 //!
 //! The daemon also gives the service the two things it cannot know for itself: which sessions its
 //! retention still covers, and when to sweep.
+//!
+//! The attachment-chunk endpoint is bound and served by whoever runs the daemon, the same way the
+//! control endpoint is. That is deliberate: a listener has to be released before the next daemon
+//! binds the same address, and only the owner of the task that holds it can release it at a known
+//! moment. A task this module spawned and abandoned could not be.
 
 use std::sync::{Arc, Weak};
 
@@ -35,7 +40,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::ids::{ActorId, RequestId, SessionId};
 use kr_protocol::method::{Method, MethodGroup};
-use kr_transfer::service::{Action, RetainedOutcome, SessionRetention};
+use kr_transfer::service::{Action, RetainedOutcome, SessionRetention, Subject};
 use kr_transfer::{Sweep, TransferService};
 
 use crate::error::{ControllerError, Result};
@@ -65,12 +70,34 @@ const EVERY_PHASE: &[LaunchPhase] = &[
 /// What a transfer call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
+/// What a caller is told when it used the wrong endpoint for a method.
+pub const WRONG_ENDPOINT: &str = "this endpoint does not carry that method: attachment chunks travel on the attachment-chunk \
+     endpoint and everything else on the control endpoint";
+
+/// Returns whether one kind of stream carries a method.
+///
+/// The frame bound is what makes the attachment endpoint exist, and it is the only thing that
+/// differs about it. Without a policy the larger bound would also admit an oversized ordinary
+/// request, which the control endpoint would have refused: two endpoints with two different
+/// admissions rather than one admission at two frame sizes. So each endpoint carries exactly the
+/// methods its bound is for.
+#[must_use]
+pub fn carries(kind: StreamKind, method: Option<Method>) -> bool {
+    let chunks = matches!(
+        method,
+        Some(Method::UploadChunk) | Some(Method::DownloadChunk)
+    );
+    match kind {
+        StreamKind::AttachmentChunks => chunks,
+        _ => !chunks,
+    }
+}
+
 /// The transfer service, as the daemon holds it.
 ///
-/// The module owns the tasks that serve the attachment-chunk endpoint and run the expiry sweep, and
-/// ends them when it is dropped. The daemon owns the module, so its endpoint is released at the
-/// same moment its singleton lock is: a listener that outlived the daemon would keep an address
-/// bound that nothing is serving, and the next daemon would find it occupied.
+/// The module owns the expiry sweep and ends it when it is dropped. It does not own the
+/// attachment-chunk endpoint: that listener belongs to the caller that bound it, because releasing
+/// an address is something the holder of the task has to do and a dropped module cannot.
 #[derive(Debug)]
 pub struct TransferModule {
     service: Arc<TransferService>,
@@ -95,18 +122,24 @@ impl TransferModule {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store or the staging area cannot
     /// be prepared.
-    pub fn open(paths: &kr_ipc::paths::EnvironmentPaths) -> Result<Self> {
-        let service =
-            TransferService::open(paths).map_err(|error| ControllerError::RegistryUnavailable {
-                detail: error.to_string(),
-            })?;
-        // A publication interrupted between its two commits is resolved before anything is served,
-        // so a handle never names a file this daemon has not found.
-        service
-            .recover()
-            .map_err(|error| ControllerError::RegistryUnavailable {
-                detail: error.to_string(),
-            })?;
+    pub async fn open(paths: &kr_ipc::paths::EnvironmentPaths) -> Result<Self> {
+        // Opening the store migrates it, and recovery reads whole payloads back. Both are storage
+        // work, so they run on a blocking task rather than on the daemon's reactor.
+        let paths = paths.clone();
+        let service = tokio::task::spawn_blocking(move || {
+            let service = TransferService::open(&paths)?;
+            // A publication interrupted between its two commits is resolved before anything is
+            // served, so a handle never names a file this daemon has not found.
+            service.recover()?;
+            Ok::<_, kr_transfer::TransferError>(service)
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the transfer service could not be opened".to_owned(),
+        })?
+        .map_err(|error| ControllerError::RegistryUnavailable {
+            detail: error.to_string(),
+        })?;
         Ok(Self {
             service: Arc::new(service),
             tasks: std::sync::Mutex::new(Vec::new()),
@@ -241,10 +274,58 @@ impl TransferModule {
         mutation: &MutationRequest,
         method: Method,
     ) -> ControlFrame {
-        frame(
-            mutation.request_id,
-            self.write(actor_id, mutation, method).await,
-        )
+        let outcome = match self.check_stored_subject(actor_id, mutation, method).await {
+            Ok(()) => self.write(actor_id, mutation, method).await,
+            Err(error) => Err(error),
+        };
+        frame(mutation.request_id, outcome)
+    }
+
+    /// Checks that a mutation's envelope names the subject its stored object belongs to.
+    ///
+    /// An action target cannot carry a transfer, so the parameters name the transfer or the draft
+    /// and the envelope names the session. Neither proves the other, which leaves a request able to
+    /// address session A while acting on an object that belongs to session B: the receipt would
+    /// name a session the effect never touched. Ownership does not catch it, because both are the
+    /// same principal's. The stored subject is the authority, and this is where the two are
+    /// compared.
+    async fn check_stored_subject(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Answer<()> {
+        let Some(subject) = subject_of(&mutation.params, method)? else {
+            // `upload.begin` and `draft.create` allocate their subject, so there is nothing stored
+            // to compare with; `check_subject` compares their parameters instead.
+            return Ok(());
+        };
+        let service = Arc::clone(&self.service);
+        let actor = actor_id.clone();
+        let stored = blocking(move || Ok(service.stored_subject(&actor, subject)?)).await?;
+        if stored.environment_id != mutation.target.environment_id {
+            return Err(ProtocolError::new(
+                ErrorCode::EnvironmentUnavailable,
+                "this object belongs to another environment",
+            ));
+        }
+        if mutation.target.session_id.0.is_some()
+            && mutation.target.session_id.0 != stored.session_id
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "the request's target and the object it acts on name different sessions",
+            ));
+        }
+        if mutation.target.application_instance_id.0.is_some()
+            && mutation.target.application_instance_id.0 != stored.application_instance_id
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "the request's target and the object it acts on name different applications",
+            ));
+        }
+        Ok(())
     }
 
     /// Serves one transfer read.
@@ -458,38 +539,48 @@ impl Controller {
 ///
 /// Returns [`ControllerError::Ipc`] when the endpoint cannot be bound.
 pub fn serve(controller: &Arc<Controller>) -> Result<()> {
-    let endpoint = kr_transfer::chunks::chunk_endpoint(controller.paths()).map_err(|error| {
-        ControllerError::NotConfigured(format!(
-            "the attachment-chunk endpoint cannot be addressed: {error}"
-        ))
-    })?;
-    let listener = Listener::bind(&endpoint)?;
-    let chunks = Arc::downgrade(controller);
     let sweeps = Arc::downgrade(controller);
-    let started = vec![
-        tokio::spawn(async move {
-            serve_chunks(chunks, listener).await;
-        }),
-        tokio::spawn(async move {
-            sweep_forever(sweeps).await;
-        }),
-    ];
+    let started = tokio::spawn(async move {
+        sweep_forever(sweeps).await;
+    });
     let mut tasks = controller.transfer().tasks.lock().map_err(|_| {
         ControllerError::NotConfigured(
             "the transfer service's task list was left poisoned by an earlier failure".to_owned(),
         )
     })?;
-    for task in started {
-        tasks.push(task);
-    }
+    tasks.push(started);
     Ok(())
+}
+
+/// Binds the environment's attachment-chunk endpoint.
+///
+/// The caller owns the listener and the task that serves it, so it can release the address at a
+/// moment it decides: an in-process restart binds the same endpoint again, and a bind that finds a
+/// live listener there is refused rather than silently sharing it.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::NotConfigured`] when the endpoint cannot be addressed, or the bind
+/// failure when the address is taken.
+pub fn bind_chunk_endpoint(paths: &kr_ipc::paths::EnvironmentPaths) -> Result<Listener> {
+    let endpoint = kr_transfer::chunks::chunk_endpoint(paths).map_err(|error| {
+        ControllerError::NotConfigured(format!(
+            "the attachment-chunk endpoint cannot be addressed: {error}"
+        ))
+    })?;
+    Ok(Listener::bind(&endpoint)?)
 }
 
 /// Accepts attachment-chunk connections until the daemon goes.
 ///
 /// An accept that fails ends the loop, as it does on the control endpoint: a listener that cannot
 /// accept has nothing left to serve, and spinning on it would hide that.
-async fn serve_chunks(controller: Weak<Controller>, listener: Listener) {
+/// Serves the attachment-chunk endpoint until the listener fails or this task is stopped.
+///
+/// The reference to the daemon is weak so that serving an endpoint does not keep a daemon alive.
+/// The listener belongs to this task, which means the address is released when whoever spawned it
+/// stops it and not before.
+pub async fn serve_chunks(controller: Weak<Controller>, listener: Listener) {
     loop {
         let Ok((connection, peer)) = listener.accept().await else {
             return;
@@ -550,6 +641,33 @@ fn parse<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue
     params
         .to_typed()
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+}
+
+/// Returns the stored object a transfer mutation acts on, where it names one.
+fn subject_of(params: &ParamsValue, method: Method) -> Answer<Option<Subject>> {
+    Ok(match method {
+        Method::UploadChunk => {
+            let params: kr_protocol::transfer::UploadChunkParams = typed(params)?;
+            Some(Subject::Transfer(params.transfer_id))
+        }
+        Method::UploadFinish => {
+            let params: kr_protocol::transfer::UploadFinishParams = typed(params)?;
+            Some(Subject::Transfer(params.transfer_id))
+        }
+        Method::UploadCancel => {
+            let params: kr_protocol::transfer::UploadCancelParams = typed(params)?;
+            Some(Subject::Transfer(params.transfer_id))
+        }
+        Method::DraftUpdate => {
+            let params: kr_protocol::transfer::DraftUpdateParams = typed(params)?;
+            Some(Subject::Draft(params.draft_id))
+        }
+        Method::AgentDraftAddAttachment => {
+            let params: kr_protocol::transfer::AgentDraftAddAttachmentParams = typed(params)?;
+            Some(Subject::Draft(params.draft_id))
+        }
+        _ => None,
+    })
 }
 
 fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Answer<T> {

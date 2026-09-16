@@ -119,6 +119,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
 
     let rendezvous = Listener::bind(&environment.rendezvous_endpoint()?)?;
     let clients = Listener::bind(&environment.controller_endpoint()?)?;
+    // A 1 MiB attachment chunk does not fit a control frame, so transfer chunks have their own
+    // endpoint, framed at the attachment bound and served by the same admission path.
+    let chunks = kr_controller::transfer::bind_chunk_endpoint(&environment)?;
     println!(
         "kr-controller: environment {environment_id} generation {}",
         controller.generation()
@@ -127,9 +130,14 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let rendezvous_task =
         tokio::spawn(std::sync::Arc::clone(&controller).serve_rendezvous(rendezvous));
     let client_task = tokio::spawn(std::sync::Arc::clone(&controller).serve_clients(clients));
+    let chunk_task = tokio::spawn(kr_controller::transfer::serve_chunks(
+        std::sync::Arc::downgrade(&controller),
+        chunks,
+    ));
     tokio::select! {
         result = rendezvous_task => result??,
         result = client_task => result??,
+        result = chunk_task => result?,
         result = tokio::signal::ctrl_c() => result?,
     }
     Ok(())
