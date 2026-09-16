@@ -1,0 +1,43 @@
+[package]
+name = "kr-transfer"
+description = "The KalaReach transfer service: uploads, verified downloads, handle-based filesystem authority and bounded previews"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+image.workspace = true
+kr-cbor.workspace = true
+kr-ipc.workspace = true
+kr-protocol.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
+
+[dev-dependencies]
+kr-ipc = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+
+# The workspace forbids unsafe code, which a crate that creates a Windows directory with an
+# owner-only access-control list cannot honour: the descriptor comes from `advapi32`. This crate
+# denies it instead and allows it in exactly one module, `staging::windows`, which owns those
+# calls. Nothing else in this crate may relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
