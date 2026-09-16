@@ -278,7 +278,7 @@ impl SessionRuntime {
                         epoch,
                         bytes,
                         paste,
-                    } => (Some(*epoch), bytes.as_slice(), *paste),
+                    } => (Some(*epoch), bytes.as_slice(), paste.clone()),
                     InputBatch::Reply { bytes } => {
                         (None, bytes.as_slice(), PasteTransition::default())
                     }
@@ -333,7 +333,12 @@ impl SessionRuntime {
                         abandoned = true;
                         break;
                     }
+                    // A piece never stops inside a paste delimiter. Half of one reaching the
+                    // application is the one thing a takeover cannot leave behind: the next actor's
+                    // first bytes could complete it, and its paste would begin inside the previous
+                    // actor's.
                     let end = delivered.saturating_add(WRITE_PIECE_BYTES).min(bytes.len());
+                    let end = transition.unfinished(end).unwrap_or(end).min(bytes.len());
                     match std::io::Write::write(&mut writer, &bytes[delivered..end]) {
                         // A terminal that takes nothing and reports no error is one this writer
                         // cannot make progress on.

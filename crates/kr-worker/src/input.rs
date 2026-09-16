@@ -60,13 +60,32 @@ pub struct FramingOutcome {
     pub paste_started: bool,
     /// True when this push completed a paste end delimiter.
     pub paste_ended: bool,
-    /// The offset in `forward` just past the first delimiter this push completed.
+    /// Where every delimiter this push completed sits in `forward`, in order.
     ///
     /// A writer that delivers only part of a batch needs to know which delimiters went with the
-    /// part it delivered, and a boolean cannot say that.
-    pub first_delimiter_end: Option<usize>,
-    /// The offset in `forward` just past the last delimiter this push completed.
-    pub last_delimiter_end: Option<usize>,
+    /// part it delivered, and whether it stopped in the middle of one. Booleans about the batch as
+    /// a whole cannot say either.
+    pub delimiters: Vec<Delimiter>,
+}
+
+/// One paste delimiter, and where it ends in the bytes being forwarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Delimiter {
+    /// The offset just past its last byte.
+    pub end: u32,
+    /// True for a paste start, false for a paste end.
+    pub opens: bool,
+}
+
+impl Delimiter {
+    /// The length of every delimiter this recogniser knows, in bytes.
+    pub const LEN: u32 = PASTE_START.len() as u32;
+
+    /// Returns the offset of its first byte.
+    #[must_use]
+    pub const fn start(self) -> u32 {
+        self.end.saturating_sub(Self::LEN)
+    }
 }
 
 impl Default for PasteFramer {
@@ -133,8 +152,7 @@ impl PasteFramer {
         let mut forward: Vec<u8> = Vec::with_capacity(pending.len());
         let mut paste_started = false;
         let mut paste_ended = false;
-        let mut first_delimiter_end = None;
-        let mut last_delimiter_end = None;
+        let mut delimiters: Vec<Delimiter> = Vec::new();
         let mut index = 0;
 
         while index < pending.len() {
@@ -151,8 +169,10 @@ impl PasteFramer {
                         paste_ended = true;
                     }
                     forward.extend_from_slice(delimiter);
-                    first_delimiter_end.get_or_insert(forward.len());
-                    last_delimiter_end = Some(forward.len());
+                    delimiters.push(Delimiter {
+                        end: u32::try_from(forward.len()).unwrap_or(u32::MAX),
+                        opens: delimiter == PASTE_START,
+                    });
                     index += delimiter.len();
                     continue;
                 }
@@ -182,8 +202,15 @@ impl PasteFramer {
             paste_ended,
             // The offsets are into what is forwarded, so an expired prefix that went in front of it
             // moves them along with it.
-            first_delimiter_end: first_delimiter_end.map(|end| end + prefix),
-            last_delimiter_end: last_delimiter_end.map(|end| end + prefix),
+            delimiters: delimiters
+                .into_iter()
+                .map(|delimiter| Delimiter {
+                    end: delimiter
+                        .end
+                        .saturating_add(u32::try_from(prefix).unwrap_or(u32::MAX)),
+                    opens: delimiter.opens,
+                })
+                .collect(),
         }
     }
 
@@ -434,6 +461,46 @@ impl InputLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_delimiter_is_reported_with_where_it_sits() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        // Ordinary bytes, a whole paste, more ordinary bytes, and a second whole paste.
+        let outcome = framer.push(
+            b"ab\x1b[200~xy\x1b[201~cd\x1b[200~z\x1b[201~",
+            Instant::now(),
+        );
+        let ends: Vec<_> = outcome
+            .delimiters
+            .iter()
+            .map(|delimiter| (delimiter.end, delimiter.opens))
+            .collect();
+        assert_eq!(ends, vec![(8, true), (16, false), (24, true), (31, false)]);
+        assert_eq!(
+            outcome.delimiters[0].start(),
+            2,
+            "and where each one begins"
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_expired_moves_the_offsets_along_with_it() {
+        let mut framer = PasteFramer::new();
+        framer.set_bracketed_paste(true);
+        let start = Instant::now();
+        // A lone escape is held, and its deadline passes before the next bytes arrive.
+        let held = framer.push(b"\x1b", start);
+        assert_eq!(held.held, 1);
+        let outcome = framer.push(b"\x1b[200~", start + RECOGNISER_DEADLINE);
+        assert_eq!(outcome.forward, b"\x1b\x1b[200~".to_vec());
+        assert_eq!(
+            outcome.delimiters.first().map(|delimiter| delimiter.end),
+            Some(7),
+            "the delimiter ends where it ends in what is forwarded"
+        );
+    }
+
     use kr_protocol::scalars::Uuid;
 
     fn attachment(byte: u8) -> AttachmentId {

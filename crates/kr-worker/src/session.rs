@@ -792,10 +792,7 @@ impl Session {
             // did not. Whether a start is among them is the separate question the writer asks when
             // it has delivered only part of the batch.
             let paste = PasteTransition {
-                first_delimiter_end: outcome.first_delimiter_end,
-                last_delimiter_end: outcome.last_delimiter_end,
-                open_after: (outcome.paste_started || outcome.paste_ended)
-                    .then(|| self.framer.paste_open()),
+                delimiters: outcome.delimiters.clone(),
             };
             self.queue_input(InputBatch::Lease {
                 epoch,
@@ -1588,36 +1585,45 @@ impl InputBatch {
 /// drops or abandons never happened as far as the application is concerned, however the framer read
 /// it.
 ///
-/// The fields are what the writer needs to answer one question: what the framing is at the point
-/// where delivery stopped. When every delimiter arrived the answer is exact; when none did, nothing
-/// changed; and in between, where one frame carried a paste whose end was in the half that never
-/// arrived, the answer is the conservative one, because an application left inside a paste reads
-/// the next actor's keystrokes as pasted text and a spare terminator outside one is ignored.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Where every paste delimiter these bytes carry sits inside them.
+///
+/// This is what the writer needs to answer two questions about a batch it delivered only part of:
+/// what the application's framing is at the point where delivery stopped, and whether it stopped
+/// inside a delimiter. Both need positions; neither can be answered by a summary of the batch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PasteTransition {
-    /// The offset just past the first delimiter these bytes complete.
-    pub first_delimiter_end: Option<usize>,
-    /// The offset just past the last one.
-    pub last_delimiter_end: Option<usize>,
-    /// What the application's framing is after all of the bytes reach it, when they change it.
-    pub open_after: Option<bool>,
+    /// The delimiters, in the order they appear.
+    pub delimiters: Vec<crate::input::Delimiter>,
 }
 
 impl PasteTransition {
     /// Returns the application's framing once `delivered` bytes of the batch have reached it.
     ///
-    /// `None` means these bytes decided nothing and whatever was true before still is.
+    /// `None` means these bytes decided nothing and whatever was true before still is. A delimiter
+    /// that is only partly delivered decides nothing either; the writer finishes it first, which is
+    /// what makes this exact rather than a guess.
     #[must_use]
     pub fn after(&self, delivered: usize) -> Option<bool> {
-        let first = self.first_delimiter_end?;
-        if delivered < first {
-            return None;
-        }
-        let last = self.last_delimiter_end?;
-        if delivered >= last {
-            return self.open_after;
-        }
-        Some(true)
+        let delivered = u32::try_from(delivered).unwrap_or(u32::MAX);
+        self.delimiters
+            .iter()
+            .rev()
+            .find(|delimiter| delimiter.end <= delivered)
+            .map(|delimiter| delimiter.opens)
+    }
+
+    /// Returns where a delimiter that `delivered` stopped inside of ends.
+    ///
+    /// A delimiter half of which reached the application is the one thing a takeover cannot leave
+    /// behind: the next actor's first bytes could complete it, and its paste would begin inside the
+    /// previous actor's. The writer finishes those few bytes before it abandons the rest.
+    #[must_use]
+    pub fn unfinished(&self, delivered: usize) -> Option<usize> {
+        let delivered = u32::try_from(delivered).unwrap_or(u32::MAX);
+        self.delimiters
+            .iter()
+            .find(|delimiter| delimiter.start() < delivered && delivered < delimiter.end)
+            .map(|delimiter| delimiter.end as usize)
     }
 }
 
