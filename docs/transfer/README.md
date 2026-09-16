@@ -53,7 +53,8 @@ them; nothing in the protocol depends on the defaults.
 | unfinished upload | 24 hours | `UNFINISHED_UPLOAD_LIFETIME` |
 | unused attachment | 7 days | `UNUSED_ATTACHMENT_LIFETIME` |
 | download snapshot | 24 hours | `DOWNLOAD_SNAPSHOT_LIFETIME` |
-| one reply | 768 KiB encoded | `MAX_TRANSFER_RESULT_BYTES`, checked before a mutation commits |
+| one reply | 768 KiB encoded | `MAX_TRANSFER_RESULT_BYTES`, checked on every draft method before it commits |
+| one insertion detail | 4096 characters | `MAX_INSERTION_DETAIL_LEN`, on the evidence or the reason an adapter reports |
 
 A submitted attachment follows its session's retention instead of the seven-day window, which is why
 submission is recorded rather than inferred from age. The host tells the service which sessions its
@@ -337,10 +338,11 @@ never verified, detection is not enough and it stages its own copy.
 
 Handle-based resolution removes the race between checking a path and using it, because there is no
 path to re-resolve: the boundary is a descriptor. What it does not remove is what happens *inside*
-one resolution of a multi-component name. A component replaced with a symbolic link between the
-prefix pass and the open of the object beneath it can be traversed; the destination is still beneath
-the authorised directory, because every open carries that boundary, so it is a link followed inside
-the tree rather than an escape.
+one resolution of a multi-component name. Something that moves a component while a read is
+resolving it can make that read reach an object the caller did not name; what the boundary
+guarantees is that whatever it reaches is beneath the authorised directory, and what the identity
+check then guarantees is that a handle recorded earlier is refused if it is not the same object.
+The open itself is not atomic with respect to the tree it walks, and no read here claims to be.
 
 Every operation that *changes* what a directory holds takes a single component, so nothing above it
 is resolved at all: a create, a write, a removal, a rename and a link each name one entry in the
@@ -395,10 +397,16 @@ time would pass it. What the comparison rules out is every change that leaves a 
 chunk digests then rule out is a snapshot changed after it was taken.
 
 That is why the metadata comparison is not the end of it. The copy's digest is compared with a
-second read of the source: equal digests mean the copy is byte-for-byte a state the source actually
-held, whatever its modification time says, and a difference is `SOURCE_CHANGED`. A rewrite that put
-the original bytes back between the two reads is the one case both checks pass, and there the copy
-is the original revision anyway.
+second, bounded read of the source, and a difference is `SOURCE_CHANGED`. Equal digests exclude
+every change that left the source different from the copy at the verification read, which is what
+makes an ordinary concurrent rewrite fail rather than serve.
+
+What two uncoordinated reads cannot exclude is a writer that reproduces the same interleaving in
+both of them: the first half of one revision and the second half of another, twice. A copy is not an
+atomic snapshot and this document does not claim it is. Where the platform offers a clone, the
+`cloned_snapshot` path has the property outright; where it does not, a caller that needs it has to
+coordinate with the writer or copy the file itself. The one thing the host never does is serve bytes
+it has not checked.
 
 Either way the staged file is read back through its own handle and its digests computed from what is
 actually on disk, so a snapshot never serves bytes nothing checked, and the chunks it serves come
@@ -492,8 +500,16 @@ limit is set on the decoder *and* the decode is refused in advance on a charge t
 declared pixels at sixteen bytes each. Sixteen is the worst case among the four formats compiled in
 here, a PNG decoded to sixteen-bit RGBA and an animated WebP holding its output, its frame and its
 canvas at once, so an image whose charge fits the budget cannot make these decoders exceed it. The
-charge belongs to the pins in the manifest and is re-derived when they move. An image inside the
-pixel limit whose charge is above the budget publishes as a file: in practice the budget is the
+charge belongs to the pins in the manifest and is re-derived when they move.
+
+It bounds the *pixel* buffers, which is what image dimensions decide. It does not bound every
+structure a codec can allocate from its own metadata: the pinned lossless WebP decoder derives a
+Huffman group count from a sixteen-bit field, and a small file can ask for tables far larger than
+its pixels. There the library's own allocation limit, which it documents as advisory, is the only
+bound, and this is recorded as a dependency risk against the pin rather than presented as enforced.
+
+An image inside the pixel limit whose charge is above the budget publishes as a file: in practice
+the budget is the
 binding limit, at sixteen megapixels rather than forty.
 
 The dimensions that are charged are the ones that get allocated, which is not always the ones a
@@ -508,10 +524,11 @@ that was supposed to read a header.
 The third is a bound the specification does not state and a result cannot do without: a reply travels
 in one frame, and a draft's reply carries one preview per bound attachment. So an encoded thumbnail
 is at most 48 KiB, and an image whose thumbnail does not fit is re-encoded at 320, 192 and then 96
-pixels until it does. The smallest of those is small enough that its raw pixels fit the budget
-whatever they are, so the ladder always ends. The dimensions are also re-checked on the decoded
-image rather than trusted from the header, because a GIF's logical screen is not always its first
-frame's size.
+pixels until it does. A ninety-six-pixel thumbnail of ordinary content is a few kilobytes, so the
+ladder ends there in practice; an image whose thumbnail still does not fit publishes with no preview,
+which is the same answer as any other refusal and is what the `ThumbnailTooLarge` refusal is for.
+The dimensions are also re-checked on the decoded image rather than trusted from the header, because
+a GIF's logical screen is not always its first frame's size.
 
 The format comes from the bytes. A declared media type is a claim and an extension is metadata, so
 the crate's own sniffing decides which decoder runs. The dimensions are read from the header before
