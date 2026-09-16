@@ -340,8 +340,8 @@ impl WorkerService {
                     )
                 });
                 // The write answers to the withdrawal as well as to the socket. A peer that has
-                // stopped reading would otherwise hold this reply — and with it this connection's
-                // authority — for as long as it stayed away.
+                // stopped reading would otherwise hold this reply, and with it this connection's
+                // authority, for as long as it stayed away.
                 let written = write_unless_withdrawn(&writer, &reply, &withdrawn).await;
                 if let Some((action_id, delivery)) = armed {
                     if written && state.client_kind == LocalClientKind::Controller {
@@ -2208,7 +2208,7 @@ struct Registration {
 /// A stored notification permit is answered by exactly one waiter, and a connection has more than
 /// one place that has to react: the loop waiting for the next frame, and a write that is waiting
 /// for a peer which has stopped reading. This is a latch instead. It is set once, it is never
-/// cleared, and every waiter — present and future — observes it.
+/// cleared, and every waiter, present and future, observes it.
 #[derive(Debug, Default)]
 struct Withdrawal {
     withdrawn: std::sync::atomic::AtomicBool,
@@ -2254,8 +2254,8 @@ pub const MAX_OUTPUT_EVENT_BYTES: usize = 256 * 1024;
 /// Writes one frame unless the connection's registration is withdrawn first.
 ///
 /// Returns whether the frame reached the peer. A peer that has stopped reading blocks a write for
-/// as long as it likes, and everything this connection still holds — its authority, its
-/// attachments, its subscription — would be held with it. The withdrawal ends the wait instead, and
+/// as long as it likes, and everything this connection still holds (its authority, its
+/// attachments, its subscription) would be held with it. The withdrawal ends the wait instead, and
 /// the caller treats an abandoned write as a connection that has finished.
 async fn write_unless_withdrawn(
     writer: &Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,

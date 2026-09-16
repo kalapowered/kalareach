@@ -92,8 +92,8 @@ impl Attachment {
     /// * **The stream.** The engine reports when the output stops being something a physical
     ///   terminal can be handed at all, and `carryable` is that answer.
     /// * **The screen it was given.** A terminal continues the stream from the screen the host drew
-    ///   it. A restoration that could not carry the state the application is about to address —
-    ///   a pending wrap, a saved cursor of the other buffer, the virtual title stack — leaves that
+    ///   it. A restoration that could not carry the state the application is about to address (a
+    ///   pending wrap, a saved cursor of the other buffer, the virtual title stack) leaves that
     ///   terminal disagreeing with the canonical grid, and the next byte lands in the wrong place.
     ///   Such an attachment keeps a projection, where the host paints the screen.
     ///

@@ -83,8 +83,8 @@ A broken connection must not leave a terminal in raw mode, and the restoration h
 attach process being killed — which no in-process handler can do, because `SIGKILL` runs no handler.
 
 So the saved state lives in another process. Before the terminal is touched, `kr attach` asks the
-terminal which keyboard protocols it has negotiated — the Kitty protocol's flags and xterm's
-`modifyOtherKeys` level, neither of which termios describes — then starts `kr-attach-guard` and
+terminal which keyboard protocols it has negotiated (the Kitty protocol's flags and xterm's
+`modifyOtherKeys` level, neither of which termios describes), then starts `kr-attach-guard` and
 gives it one end of a pipe, its own handle on the terminal, the terminal's complete mode state and
 those answers.
 

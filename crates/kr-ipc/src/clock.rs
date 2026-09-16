@@ -30,8 +30,8 @@
 //! the order of the two readings decides whether the conversion can *add* time. Read the
 //! destination clock first and the source clock second: everything that happens between the two
 //! readings then shortens the result, because the remainder is measured from a later moment and
-//! anchored at an earlier one. Read them the other way round and a pause between them — a lock, a
-//! scheduler, a busy machine — is added to the deadline. [`remaining_of`] and
+//! anchored at an earlier one. Read them the other way round and a pause between them (a lock, a
+//! scheduler, a busy machine) is added to the deadline. [`remaining_of`] and
 //! [`transferred_deadline`] are the two halves of that subtraction, and each says which reading it
 //! expects to be the later one.
 

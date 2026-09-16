@@ -671,8 +671,8 @@ async fn a_close_that_reuses_an_earlier_action_identifier_conflicts_rather_than_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn withdrawal_completes_while_the_peer_has_stopped_reading() {
     // The case the transport's contract is about: a peer that stops reading. Its socket fills, the
-    // worker's write for it waits, and everything that connection still holds — its subscription,
-    // its attachments, its authority — would wait with it. Withdrawal has to end all of that
+    // worker's write for it waits, and everything that connection still holds (its subscription,
+    // its attachments, its authority) would wait with it. Withdrawal has to end all of that
     // without asking that peer for anything.
     let host = host_producing(1, "while true; do printf 'line\\n'; sleep 1; done").await;
     let mut first = controller_client(&host, 1).await;

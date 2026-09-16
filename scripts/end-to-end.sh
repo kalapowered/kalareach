@@ -25,6 +25,41 @@ echo "  commit: $(git rev-parse HEAD)"
 echo "  host: $(uname -sr) $(uname -m)"
 echo "  taken at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo
+# Nothing this script started may outlive it. A worker is deliberately not a child of whatever
+# created it, which is what makes a session survive a control daemon's restart, so a suite that
+# failed to close a session leaves a worker running until the machine is restarted. The processes
+# running before this script are recorded, and anything of ours that is running afterwards and was
+# not is a leak this script fails on rather than leaves behind.
+host_processes() {
+  # Matched by executable name rather than by command line, so a build or a test runner that
+  # merely names a crate is not mistaken for a host process, and neither is another checkout's.
+  pgrep -u "$(id -u)" -x 'kr-worker|kr-controller' 2>/dev/null | sort || true
+}
+
+check_no_survivors() {
+  local before="$1" deadline survivors
+  # Closure is a sequence (a grace period, a forced stop and a drain), so a worker that is on its
+  # way out is given time to finish going rather than reported as a leak.
+  deadline=$(( $(date +%s) + 60 ))
+  while :; do
+    survivors="$(comm -13 <(printf '%s\n' "$before") <(host_processes))"
+    if [ -z "$survivors" ]; then
+      echo "no worker or daemon this script started is still running"
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      break
+    fi
+    sleep 1
+  done
+  echo "FAILED: these processes outlived the script"
+  # shellcheck disable=SC2086
+  ps -o pid=,command= -p $(printf '%s' "$survivors" | tr '\n' ' ') || true
+  return 1
+}
+
+before_processes="$(host_processes)"
+
 
 # Each entry is "crate:test-binary  what it demonstrates".
 suites=(
@@ -61,6 +96,11 @@ for entry in "${suites[@]}"; do
     failed=1
   fi
 done
+
+echo
+if ! check_no_survivors "$before_processes"; then
+  failed=1
+fi
 
 echo
 if [ "$failed" -ne 0 ]; then

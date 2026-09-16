@@ -270,6 +270,8 @@ async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
         resident < RESIDENT_BOUND_KIB,
         "idle resident memory is under {RESIDENT_BOUND_KIB} KiB: {resident} KiB"
     );
+    drop(views);
+    close_all(&host, &sessions).await;
     let _ = host.controller;
     let _ = host.worker;
 }
@@ -311,7 +313,71 @@ async fn attach_to_a_usable_screen() {
         worst < ATTACH_BOUND,
         "the slowest attach reached a usable screen within {ATTACH_BOUND:?}: {worst:?}"
     );
+    close_all(&host, std::slice::from_ref(&created)).await;
     let _ = host.controller;
+}
+
+/// Closes every session this measurement created and waits for its worker to end.
+///
+/// A worker is deliberately not this process's child: a measurement that simply exited would leave
+/// one running per session it made, for as long as the machine stayed up. Every session a run
+/// creates is therefore closed by that run, and the wait is for the worker process itself rather
+/// than for the acceptance, because an acceptance is not an exit.
+async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
+    let mut client = LocalClient::connect(
+        &host
+            .temp
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint"),
+        LocalClientKind::Cli,
+        build(),
+    )
+    .await
+    .expect("connects to the daemon");
+    let mut workers = Vec::new();
+    for created in sessions {
+        if let Some(root) = created.session.root_process.as_ref()
+            && let Ok(shell) = u32::try_from(root.pid.get())
+            && let Some(worker) = parent_of(shell)
+        {
+            workers.push(worker);
+        }
+        let _ = client
+            .mutate(
+                Method::SessionClose,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget {
+                    environment_id: host.environment_id,
+                    session_id: Nullable::some(created.session.session_id),
+                    session_epoch: Nullable::some(SessionEpoch::V1),
+                    application_instance_id: Nullable::null(),
+                    agent_binding_revision: Nullable::null(),
+                },
+                &kr_protocol::session::SessionCloseParams {
+                    session_id: created.session.session_id,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon");
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        workers.retain(|pid| running(*pid));
+        if workers.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("every worker this measurement started has ended: {workers:?} are still running");
+}
+
+/// Returns whether a process is still running.
+fn running(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "pid=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|listing| !String::from_utf8_lossy(&listing.stdout).trim().is_empty())
 }
 
 /// Returns a process's parent, which for a session's root shell is its worker.
