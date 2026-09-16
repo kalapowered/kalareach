@@ -39,10 +39,15 @@ pub struct Console {
     console: Arc<handle::PseudoConsole>,
     /// The end this host writes input into. It answers rather than waits.
     input: Mutex<Option<OwnedHandle>>,
-    /// The end this host reads output from. It is overlapped.
-    output: Arc<OwnedHandle>,
-    /// The event a started read is signalled on. The reader reads through it and the waiter waits
-    /// on it, which is how one can wait for what the other started.
+    /// The end this host reads output from, and the event a read of it is signalled on. They are
+    /// taken together, once, by the one reader this terminal has.
+    ///
+    /// One reader, for the same reason there is one writer, and for one more: two readers sharing
+    /// an event is a read that can be told another read has finished, and a reader that believed
+    /// that while its own read was still with the operating system would free the memory that read
+    /// is writing into.
+    output: Mutex<Option<(Arc<OwnedHandle>, OwnedHandle)>>,
+    /// A view of that event for the waiter, which waits for what the reader started.
     event: OwnedHandle,
     size: Mutex<PtySize>,
 }
@@ -60,6 +65,7 @@ impl std::fmt::Debug for Console {
 /// Returns the operating system's failure when a pipe or the console cannot be created.
 pub fn open(size: PtySize) -> std::io::Result<(Console, Slave)> {
     let pipes = handle::pipes()?;
+    let event = handle::event()?;
     let console = Arc::new(handle::PseudoConsole::new(
         size,
         &pipes.console_input,
@@ -76,8 +82,8 @@ pub fn open(size: PtySize) -> std::io::Result<(Console, Slave)> {
         Console {
             console,
             input: Mutex::new(Some(pipes.input)),
-            output: Arc::new(pipes.output),
-            event: handle::event()?,
+            output: Mutex::new(Some((Arc::new(pipes.output), event.try_clone()?))),
+            event,
             size: Mutex::new(size),
         },
         slave,
@@ -107,10 +113,13 @@ impl MasterPty for Console {
     }
 
     fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, anyhow::Error> {
-        Ok(Box::new(Reader::over(
-            Arc::clone(&self.output),
-            self.event.try_clone()?,
-        )))
+        let (handle, event) = self
+            .output
+            .lock()
+            .expect("the terminal's output is not poisoned")
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("the terminal's reader has already been taken"))?;
+        Ok(Box::new(Reader::over(handle, event)))
     }
 
     fn take_writer(&self) -> Result<Box<dyn Write + Send>, anyhow::Error> {
