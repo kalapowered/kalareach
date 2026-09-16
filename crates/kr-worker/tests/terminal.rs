@@ -197,29 +197,111 @@ async fn attached(
     (client, presentation, attached.attachment.attachment_id)
 }
 
-/// Collects each output payload the worker sends this client for `window`, one per notification.
+/// Collects a projected client's stream: the raw bytes it was sent, its screen and its rows.
 ///
-/// A direct attachment receives spans of the raw stream; a projection receives whole repaints of
-/// the canonical screen. Which one a client is being served is visible in the payloads themselves,
-/// which is why these are kept apart rather than run together.
-async fn collect_payloads(client: &mut LocalClient, window: Duration) -> Vec<Vec<u8>> {
+/// A projected attachment is sent the canonical grid as state rather than bytes, so all three are
+/// returned: the bytes prove that none were sent, and the state and the rows are what it is drawn
+/// from.
+async fn collect_projection(
+    client: &mut LocalClient,
+    window: Duration,
+) -> (
+    Vec<u8>,
+    Option<kr_protocol::projection::ProjectionSnapshot>,
+    Vec<kr_protocol::projection::ProjectedRow>,
+) {
     let deadline = tokio::time::Instant::now() + window;
-    let mut seen = Vec::new();
+    let mut bytes = Vec::new();
+    let mut header = None;
+    let mut rows: Vec<kr_protocol::projection::ProjectedRow> = Vec::new();
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline - tokio::time::Instant::now();
         let Ok(Ok(frame)) = tokio::time::timeout(remaining, client.recv()).await else {
             break;
         };
-        if let ControlFrame::Notification(notification) = frame
-            && notification.event_type.as_str() == "session.output"
-            && let Ok(event) = notification
-                .payload
-                .to_typed::<kr_protocol::recovery::OutputEvent>()
-        {
-            seen.push(event.bytes.as_slice().to_vec());
+        let ControlFrame::Notification(notification) = frame else {
+            continue;
+        };
+        match notification.event_type.as_str() {
+            "session.output" => {
+                if let Ok(event) = notification
+                    .payload
+                    .to_typed::<kr_protocol::recovery::OutputEvent>()
+                {
+                    bytes.extend_from_slice(event.bytes.as_slice());
+                }
+            }
+            "session.projection.snapshot" => {
+                if let Ok(snapshot) = notification
+                    .payload
+                    .to_typed::<kr_protocol::projection::ProjectionSnapshot>()
+                {
+                    header = Some(snapshot);
+                }
+            }
+            "session.projection.rows" => {
+                if let Ok(page) = notification
+                    .payload
+                    .to_typed::<kr_protocol::projection::ProjectionRowPage>()
+                    && page.buffer == kr_protocol::projection::ProjectedBuffer::Primary
+                {
+                    rows.extend(page.rows);
+                }
+            }
+            "session.projection.delta" => {
+                if let Ok(delta) = notification
+                    .payload
+                    .to_typed::<kr_protocol::projection::ProjectionDelta>()
+                {
+                    rows.extend(delta.rows);
+                }
+            }
+            _ => {}
         }
     }
-    seen
+    (bytes, header, rows)
+}
+
+/// Collects a projection until one of its rows carries `marker`, and then for `window` longer.
+///
+/// The same two halves as [`collect_until`], for a terminal that is sent rows rather than bytes:
+/// whether the screen arrives at all is a liveness wait a loaded host can take its time over, and
+/// what arrives beside it is what the window is for.
+async fn collect_projection_until(
+    client: &mut LocalClient,
+    marker: &str,
+    window: Duration,
+) -> (
+    Vec<u8>,
+    Option<kr_protocol::projection::ProjectionSnapshot>,
+    Vec<kr_protocol::projection::ProjectedRow>,
+) {
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    let mut bytes = Vec::new();
+    let mut header = None;
+    let mut rows: Vec<kr_protocol::projection::ProjectedRow> = Vec::new();
+    let carries = |rows: &[kr_protocol::projection::ProjectedRow], marker: &str| {
+        rows.iter()
+            .any(|row| row.runs.iter().any(|run| run.text.contains(marker)))
+    };
+    while !carries(&rows, marker) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {:?} for {marker:?} to reach this terminal as a projected row",
+            started.elapsed()
+        );
+        let (more_bytes, more_header, more_rows) =
+            collect_projection(client, Duration::from_secs(1)).await;
+        bytes.extend_from_slice(&more_bytes);
+        header = more_header.or(header);
+        rows.extend(more_rows);
+    }
+    let (more_bytes, more_header, more_rows) = collect_projection(client, window).await;
+    bytes.extend_from_slice(&more_bytes);
+    header = more_header.or(header);
+    rows.extend(more_rows);
+    (bytes, header, rows)
 }
 
 /// Collects payloads until one of them carries `marker`, and then for `window` longer.
@@ -416,19 +498,39 @@ async fn a_terminal_of_another_size_is_projected_rather_than_sent_the_raw_stream
         Some(TerminalPresentationMode::Viewport),
         "a terminal that is not the session's size is shown a projection"
     );
-    let seen = collect_until(&mut client, b"first", Duration::from_secs(2)).await;
-    let text = String::from_utf8_lossy(&seen).into_owned();
-    assert!(text.contains("first"), "the screen is drawn: {text:?}");
-    // A projection places every row itself, which is what makes it independent of this terminal's
-    // width. The absolute cursor address is how it does that.
+    let (bytes, header, rows) =
+        collect_projection_until(&mut client, "first", Duration::from_secs(3)).await;
     assert!(
-        text.contains("\u{1b}[1;1H"),
-        "the rows are placed rather than wrapped: {text:?}"
+        bytes.is_empty(),
+        "no byte stream that assumes the session's width is sent: {:?}",
+        String::from_utf8_lossy(&bytes)
     );
-    // Nothing is placed past the twelve rows this terminal has.
+    let header = header.expect("the state of the canonical screen");
+    assert_eq!(
+        header.dimensions,
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        "the grid it is shown is the session's own"
+    );
+    assert_eq!(
+        (header.viewport.columns.get(), header.viewport.rows.get()),
+        (40, 12),
+        "and the window is this terminal's own size"
+    );
+    let drawn: Vec<String> = rows
+        .iter()
+        .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+        .collect();
     assert!(
-        !text.contains("\u{1b}[13;1H"),
-        "no row is placed outside the viewport: {text:?}"
+        drawn.iter().any(|row| row.contains("first")),
+        "the screen reaches it as canonical rows: {drawn:?}"
+    );
+    // Every cell carries the canonical column it occupies, which is what makes the projection
+    // independent of this terminal's width: the client places each run itself.
+    assert!(
+        rows.iter()
+            .flat_map(|row| row.runs.iter())
+            .all(|run| run.column.get() + run.cells.get() <= CANONICAL.0),
+        "and every run sits inside the canonical grid"
     );
 }
 
@@ -485,24 +587,31 @@ async fn a_screen_a_restoration_cannot_carry_is_never_continued_as_a_raw_stream(
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (mut client, _, _) = attached(&host, Dimensions::new(4, 5)).await;
 
-    let payloads = collect_payloads_until(&mut client, b"X", Duration::from_secs(4)).await;
-    let text: Vec<String> = payloads
-        .iter()
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-        .collect();
-    let carrying = text
-        .iter()
-        .filter(|payload| payload.contains('X'))
-        .collect::<Vec<_>>();
+    let (bytes, header, rows) =
+        collect_projection_until(&mut client, "X", Duration::from_secs(4)).await;
     assert!(
-        !carrying.is_empty(),
-        "the attachment was shown the character the application printed: {text:?}"
+        !bytes.contains(&b'X'),
+        "the character never arrives as a span of the raw stream: {:?}",
+        String::from_utf8_lossy(&bytes)
     );
-    for payload in carrying {
-        assert!(
-            payload.contains("abcd") && payload.contains("\u{1b}["),
-            "the character arrives inside a repaint of the canonical screen rather than as a span \
-             of the raw stream: {payload:?}"
-        );
-    }
+    let header = header.expect("the state of the canonical screen");
+    assert!(
+        header.cursor.pending_wrap
+            || rows
+                .iter()
+                .any(|row| row.runs.iter().any(|run| run.text.contains('X'))),
+        "the attachment holds the canonical screen, pending wrap and all"
+    );
+    let drawn: Vec<String> = rows
+        .iter()
+        .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+        .collect();
+    assert!(
+        drawn.iter().any(|row| row.contains('X')),
+        "the character the application printed reaches it as a canonical cell: {drawn:?}"
+    );
+    assert!(
+        drawn.iter().any(|row| row.contains("abcd")),
+        "on a screen that still holds what was there before it: {drawn:?}"
+    );
 }

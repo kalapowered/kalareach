@@ -5,6 +5,19 @@
 //! thing that would be held is a real socket with a real kernel buffer behind it. This one attaches
 //! two clients over the worker's own endpoint, stops reading on one of them, and checks that the
 //! other keeps receiving and that the session keeps running.
+//!
+//! # What this asserts, and what it deliberately does not
+//!
+//! The requirement is about **order**, not about speed: while one client is not reading, the
+//! session keeps running and another client keeps receiving. So the progress is watched as it
+//! happens rather than sampled after a fixed window, because how fast a host with four processors
+//! delivers a burst in a debug build is not what section 9 promises.
+//!
+//! The reading client can itself fall behind on a slow host, and then the same rule applies to it:
+//! it is told to resynchronise. That is the bound working, not a failure, so the test names what
+//! ended its stream — a resynchronisation, a closed connection or a panic — instead of asserting
+//! only that something did. A client that was never told anything is the failure, and that is what
+//! these assertions distinguish.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -120,32 +133,51 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     let slow = attached(&endpoint, environment_id, session_id).await;
     let quick = attached(&endpoint, environment_id, session_id).await;
 
-    // One of them reads as fast as it can.
+    // One of them reads as fast as it can, and says what ended its stream.
     let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = Arc::clone(&received);
     let draining = tokio::spawn(async move {
         let mut quick = quick;
-        while let Ok(message) = quick.recv().await {
-            if let ControlFrame::Notification(notification) = message {
-                match notification.event_type.as_str() {
-                    "session.output" => {
-                        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        loop {
+            match quick.recv().await {
+                Ok(ControlFrame::Notification(notification)) => {
+                    match notification.event_type.as_str() {
+                        "session.output" => {
+                            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        "session.resync" => {
+                            let reason = notification
+                                .payload
+                                .to_typed::<kr_protocol::recovery::ResyncRequired>()
+                                .map(|marker| marker.reason);
+                            return Drained::Resynchronised(reason.ok());
+                        }
+                        _ => {}
                     }
-                    "session.resync" => return false,
-                    _ => {}
                 }
+                Ok(_) => {}
+                Err(error) => return Drained::Closed(error.to_string()),
             }
         }
-        true
     });
 
-    // The other does not read at all for long enough to fall further behind than its bound allows.
-    // Its socket fills, the worker's queue for it fills behind that, and it is told to
-    // resynchronise. Nothing is read from it until then, which is the whole point.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // The other does not read at all for long enough to fall further behind than its bound allows:
+    // its socket fills, the worker's queue for it fills behind that, and it is told to
+    // resynchronise. Nothing is read from it until the end of this test, which is the whole point.
+    //
+    // The client that *is* reading is watched through that same window, so what is asserted is the
+    // order of the two things rather than how quickly either of them happens. Three separate
+    // arrivals rather than one, because one could have been queued before the other client stopped.
+    let advances = progress(&received, Duration::from_secs(10)).await;
+    let counted = received.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        advances >= 3,
+        "the client that kept reading went on receiving while the other was not reading: \
+         {advances} arrivals and {counted} batches in ten seconds, on {}",
+        finished(&draining)
+    );
 
-    // The session is still running, and the client that kept reading is still receiving: the one
-    // that stopped reading held nothing up.
+    // The session is still running: the one that stopped reading held nothing up.
     assert_eq!(
         runtime.state(),
         SessionState::Live,
@@ -196,7 +228,68 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         "waited {:?} for the client that stopped reading to be told to resynchronise",
         started.elapsed()
     );
-    draining.abort();
+
+    // And what became of the client that kept reading, named rather than inferred. It may have
+    // fallen behind too on a host that delivers more slowly than it reads, and then the same rule
+    // applies to it and its own queue is the reason. What it must never be is a client whose
+    // connection ended without a word, or a reader that panicked.
+    if draining.is_finished() {
+        match draining.await {
+            Ok(Drained::Resynchronised(reason)) => assert_eq!(
+                reason,
+                Some(kr_protocol::recovery::ResyncReason::SendQueueFull),
+                "the client that kept reading was resynchronised for its own queue, after \
+                 receiving {} batches",
+                received.load(std::sync::atomic::Ordering::Relaxed)
+            ),
+            Ok(Drained::Closed(detail)) => panic!(
+                "the client that kept reading lost its connection without being told to \
+                 resynchronise: {detail}"
+            ),
+            Err(error) => panic!("the client that kept reading stopped on a panic: {error}"),
+        }
+    } else {
+        draining.abort();
+    }
+}
+
+/// What ended the reading client's stream.
+#[derive(Debug)]
+enum Drained {
+    /// It was told to resynchronise, with the reason the marker carried.
+    Resynchronised(Option<kr_protocol::recovery::ResyncReason>),
+    /// Its connection ended.
+    Closed(String),
+}
+
+/// Describes a reader that has already finished, for a failure message.
+fn finished(handle: &tokio::task::JoinHandle<Drained>) -> &'static str {
+    if handle.is_finished() {
+        "a stream that had already ended"
+    } else {
+        "a stream that was still open"
+    }
+}
+
+/// Counts how many times `counter` advances over `window`, waiting the whole of it.
+///
+/// The window is waited out rather than cut short at the first good news, because the other client
+/// has to be left unread for long enough to fall behind. Counting advances through the same window
+/// is what makes this an assertion about order: while one client was not reading, another was
+/// receiving.
+async fn progress(counter: &Arc<std::sync::atomic::AtomicUsize>, window: Duration) -> usize {
+    let deadline = Instant::now() + window;
+    let mut seen = counter.load(std::sync::atomic::Ordering::Relaxed);
+    let mut advances = 0;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let now = counter.load(std::sync::atomic::Ordering::Relaxed);
+        if now > seen {
+            advances += 1;
+            seen = now;
+        }
+    }
+    advances
 }
 
 /// How long a wait for something to arrive is given.

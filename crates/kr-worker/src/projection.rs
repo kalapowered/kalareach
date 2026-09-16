@@ -34,6 +34,7 @@
 //! there is no moment at which it could be handed the middle of an escape sequence.
 
 use kr_protocol::ids::{AttachmentId, InputLeaseEpoch};
+use kr_protocol::projection::ProjectionResetReason;
 use kr_protocol::session::Dimensions;
 use kr_term::budget::GridSize;
 use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
@@ -180,6 +181,17 @@ impl TerminalEngine {
     #[must_use]
     pub fn output_cursor(&self) -> u64 {
         self.engine.output_cursor()
+    }
+
+    /// Returns the output cursor of a parser-ground boundary, when the parser is on one.
+    ///
+    /// This is where live byte forwarding may begin, and it is the only place it may: anywhere else
+    /// is inside an incomplete UTF-8 scalar or an incomplete control sequence, and a physical
+    /// terminal handed the middle of one draws something nobody wrote. The same cursor is what a
+    /// snapshot taken here names, so the screen and the byte stream meet exactly.
+    #[must_use]
+    pub fn ground_boundary(&self) -> Option<u64> {
+        self.engine.ground_boundary()
     }
 
     /// Returns whether a direct attachment can still be handed the raw stream.
@@ -344,6 +356,120 @@ impl TerminalEngine {
             render(&operations, viewport, keyboard, scope),
             settled,
         )
+    }
+
+    /// Records where this session's initial palette came from.
+    ///
+    /// Section 8 fixes the palette at creation and forbids succession from changing it, so this is
+    /// called once, before the session has produced anything. After that the palette is the
+    /// session's own: a second attachment whose terminal has different colours is shown these.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidArgument`] once the session has produced output, because a
+    /// palette chosen then would be a change to a screen somebody is already looking at rather
+    /// than the provenance of the one it started with.
+    pub fn set_initial_palette(&mut self, choice: crate::snapshot::PaletteChoice) -> Result<()> {
+        if self.engine.output_cursor() > 0 {
+            return Err(WorkerError::InvalidArgument(
+                "the session's palette is fixed at creation and this session has already produced \
+                 output"
+                    .to_owned(),
+            ));
+        }
+        self.engine.adopt_palette(choice.palette());
+        Ok(())
+    }
+
+    /// Where the session's palette came from.
+    #[must_use]
+    pub fn palette_source(&self) -> kr_term::palette::PaletteSource {
+        self.engine.palette().source()
+    }
+
+    /// Which buffer the canonical grid is showing.
+    #[must_use]
+    pub fn active_buffer(&self) -> kr_term::snapshot::ActiveBuffer {
+        if self.engine.grid().alternate_active() {
+            kr_term::snapshot::ActiveBuffer::Alternate
+        } else {
+            kr_term::snapshot::ActiveBuffer::Primary
+        }
+    }
+
+    /// The window a client of these dimensions is looking at, anchored at the visible page.
+    ///
+    /// The top row is read from the grid rather than guessed at, because eviction and scrolling
+    /// both move it and a client holding rows by their identifiers has to be told which of them
+    /// the page now holds.
+    #[must_use]
+    pub fn anchored_viewport(&self, dimensions: Dimensions) -> Viewport {
+        let mut viewport = self.viewport_for(dimensions);
+        viewport.top_row = self.engine.grid().visible_top_row();
+        viewport
+    }
+
+    /// Builds the events that install the canonical screen on a projected client.
+    ///
+    /// Taking a snapshot settles the screen, which releases whatever the engine was holding back.
+    /// Those bytes belong to every direct attachment, so they come back with the update rather
+    /// than disappearing inside one subscriber's snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the engine's state cannot be spelled on the wire.
+    pub fn projection_install(
+        &mut self,
+        dimensions: Dimensions,
+        reason: ProjectionResetReason,
+        gate: LaneGate,
+        now_ms: u64,
+    ) -> Result<(crate::snapshot::Update, Filtered)> {
+        let viewport = self.viewport_for(dimensions);
+        let (mut snapshot, settled) = self.engine.snapshot(viewport, now_ms);
+        let settled = self.collect(&settled, gate, now_ms);
+        let mut viewport = viewport;
+        viewport.top_row = self.engine.grid().visible_top_row();
+        snapshot.viewport = viewport;
+        let update = crate::snapshot::install(&snapshot, viewport, reason)?;
+        Ok((update, settled))
+    }
+
+    /// Builds what one client is owed, given the screen it already holds.
+    ///
+    /// The answer is a bounded update, nothing at all, or a fresh screen with the reason it is one:
+    /// a base this engine can no longer continue from, or a change larger than one bounded update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the engine's state cannot be spelled on the wire.
+    pub fn projection_advance(
+        &self,
+        held: crate::snapshot::Held,
+        dimensions: Dimensions,
+    ) -> Result<crate::snapshot::Owed> {
+        let Ok(delta) = self.engine.delta(held.base.cursor, held.base.generation) else {
+            // The base is outside the engine's replay window, or the projection was reset since
+            // then. Either way there is nothing to continue from.
+            return Ok(crate::snapshot::Owed::Snapshot(
+                ProjectionResetReason::ReplayGap,
+            ));
+        };
+        let (oldest, _) = self.engine.grid().stable_range();
+        crate::snapshot::advance(
+            &delta,
+            self.active_buffer(),
+            self.anchored_viewport(dimensions),
+            oldest,
+            oldest > 0,
+            Some(held.viewport),
+        )
+    }
+
+    /// The generation every projection update currently names.
+    #[must_use]
+    pub const fn projection_generation(&self) -> u64 {
+        self.engine.projection_generation()
     }
 
     fn collect(&mut self, outcome: &FeedOutcome, gate: LaneGate, now_ms: u64) -> Filtered {
@@ -555,5 +681,180 @@ mod tests {
         let viewport = engine.viewport_for(dimensions(200, 60));
         assert_eq!(viewport.cols, 80);
         assert_eq!(viewport.rows, 24);
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::snapshot::{Base, Held, Owed, PaletteChoice};
+    use kr_protocol::scalars::U64;
+
+    fn dimensions(columns: u64, rows: u64) -> Dimensions {
+        Dimensions {
+            columns: U64::new(columns),
+            rows: U64::new(rows),
+        }
+    }
+
+    fn engine() -> TerminalEngine {
+        TerminalEngine::new(dimensions(80, 24)).expect("a canonical grid")
+    }
+
+    /// KR-REQ-08.80 and KR-REQ-08.83: a base outside the replay window asks for a fresh screen.
+    #[test]
+    fn a_base_outside_the_bounded_replay_window_asks_for_a_fresh_snapshot() {
+        let mut engine = engine();
+        let (update, _) = engine
+            .projection_install(
+                dimensions(40, 10),
+                ProjectionResetReason::Attached,
+                LaneGate::default(),
+                0,
+            )
+            .expect("a snapshot");
+        let held = Held {
+            base: update.base,
+            viewport: engine.anchored_viewport(dimensions(40, 10)),
+        };
+        // One batch later the client can still be continued from.
+        let mut cursor = engine.output_cursor();
+        let batch = b"a\r\n";
+        engine.feed(cursor, batch, LaneGate::default(), 0);
+        cursor += batch.len() as u64;
+        assert!(
+            matches!(
+                engine
+                    .projection_advance(held, dimensions(40, 10))
+                    .expect("an answer"),
+                Owed::Update(_)
+            ),
+            "a base inside the window is continued from"
+        );
+        // Far enough past it that the checkpoint the client named has left the window. The window
+        // is bounded, which is the whole point: a client that has fallen further behind than this
+        // is told to start again rather than being reasoned about.
+        for _ in 0..200 {
+            engine.feed(cursor, batch, LaneGate::default(), 0);
+            cursor += batch.len() as u64;
+        }
+        assert_eq!(
+            engine
+                .projection_advance(held, dimensions(40, 10))
+                .expect("an answer"),
+            Owed::Snapshot(ProjectionResetReason::ReplayGap),
+            "and a base past the window is a gap, which discards what the client holds"
+        );
+    }
+
+    /// KR-REQ-08.44: the palette's provenance is fixed at creation and reported afterwards.
+    #[test]
+    fn the_palette_source_is_chosen_at_creation_and_refused_afterwards() {
+        let mut engine = engine();
+        assert_eq!(
+            engine.palette_source(),
+            kr_term::palette::PaletteSource::ProfileDefault
+        );
+        engine
+            .set_initial_palette(PaletteChoice::LightPreset)
+            .expect("a session that has produced nothing");
+        assert_eq!(
+            engine.palette_source(),
+            kr_term::palette::PaletteSource::LightPreset
+        );
+        engine.feed(0, b"output", LaneGate::default(), 0);
+        let refused = engine
+            .set_initial_palette(PaletteChoice::DarkPreset)
+            .expect_err("a session that has produced output");
+        assert!(
+            matches!(refused, WorkerError::InvalidArgument(_)),
+            "changing it later would be a change to a screen somebody is looking at: {refused:?}"
+        );
+        assert_eq!(
+            engine.palette_source(),
+            kr_term::palette::PaletteSource::LightPreset,
+            "and the refusal changed nothing"
+        );
+    }
+
+    /// KR-REQ-08.79: a geometry whose state would not fit the session budget is refused first.
+    #[test]
+    fn a_geometry_that_does_not_fit_the_session_budget_is_refused_before_it_is_allocated() {
+        let mut engine = engine();
+        // Inside every one of section 8's three independent limits — 61 columns, 1,002 rows and
+        // 61,122 cells — and outside what both screen buffers and their scrollback may hold. The
+        // two are different refusals and this is the second one.
+        let refused = engine
+            .resize(dimensions(61, 1_002), 0)
+            .expect_err("a grid whose state does not fit the session budget");
+        assert!(
+            matches!(refused, WorkerError::ResourceUnavailable { .. }),
+            "the refusal is this session's capacity rather than the caller's mistake: {refused:?}"
+        );
+        assert!(
+            matches!(
+                engine.resize(dimensions(2_048, 1_024), 0),
+                Err(WorkerError::InvalidArgument(_))
+            ),
+            "and a geometry outside the cell count is the caller's mistake, which is a different              refusal"
+        );
+        assert_eq!(
+            engine.canonical(),
+            dimensions(80, 24),
+            "and nothing moved: the grid is the size it was"
+        );
+    }
+
+    /// KR-REQ-08.83: nothing is sent for a screen that has not changed.
+    #[test]
+    fn a_screen_that_has_not_changed_produces_no_update() {
+        let mut engine = engine();
+        let (update, _) = engine
+            .projection_install(
+                dimensions(40, 10),
+                ProjectionResetReason::Attached,
+                LaneGate::default(),
+                0,
+            )
+            .expect("a snapshot");
+        let held = Held {
+            base: update.base,
+            viewport: engine.anchored_viewport(dimensions(40, 10)),
+        };
+        assert_eq!(
+            engine
+                .projection_advance(held, dimensions(40, 10))
+                .expect("an answer"),
+            Owed::Nothing,
+            "a quiet stream is not an update"
+        );
+    }
+
+    /// KR-REQ-08.83: a base from another generation is not a base this engine can continue from.
+    #[test]
+    fn a_base_from_another_generation_asks_for_a_fresh_snapshot() {
+        let mut engine = engine();
+        let (update, _) = engine
+            .projection_install(
+                dimensions(40, 10),
+                ProjectionResetReason::Attached,
+                LaneGate::default(),
+                0,
+            )
+            .expect("a snapshot");
+        let stale = Held {
+            base: Base {
+                cursor: update.base.cursor,
+                generation: update.base.generation.saturating_sub(1),
+            },
+            viewport: engine.anchored_viewport(dimensions(40, 10)),
+        };
+        assert_eq!(
+            engine
+                .projection_advance(stale, dimensions(40, 10))
+                .expect("an answer"),
+            Owed::Snapshot(ProjectionResetReason::ReplayGap),
+            "the same cursor in another generation is another screen"
+        );
     }
 }

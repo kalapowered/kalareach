@@ -49,6 +49,13 @@ pub struct Attachment {
     /// application will address keeps the attachment on a projection instead, where the host paints
     /// the canonical screen rather than trusting the terminal to already match it.
     pub restoration_continues: bool,
+    /// Whether this attachment is waiting for a parser-ground boundary before it may forward.
+    ///
+    /// It starts false: an attachment that has been given nothing is not waiting for anything, and
+    /// the host settles the answer before it serves the attachment anything at all. Forwarding may
+    /// only *begin* at a boundary, so this is about the moment the transition would happen rather
+    /// than about the attachment, and it is cleared the moment a boundary arrives.
+    pub forwarding_held: bool,
 }
 
 impl Attachment {
@@ -96,6 +103,9 @@ impl Attachment {
     ///   pending wrap, a saved cursor of the other buffer, the virtual title stack) leaves that
     ///   terminal disagreeing with the canonical grid, and the next byte lands in the wrong place.
     ///   Such an attachment keeps a projection, where the host paints the screen.
+    /// * **Where the parser stands.** Forwarding may only *begin* at a parser-ground boundary, so
+    ///   an attachment waiting for one is held in a projection until it arrives. This is the one
+    ///   condition that is about a moment rather than about the attachment.
     ///
     /// Everything else displays a clipped viewport of the canonical grid; nothing is reflowed.
     fn presentation(
@@ -110,6 +120,7 @@ impl Attachment {
             Some(own)
                 if carryable
                     && self.restoration_continues
+                    && !self.forwarding_held
                     && own == geometry
                     && self
                         .terminal_profile_id
@@ -345,6 +356,7 @@ impl AttachmentTable {
             granted,
             attached_at_ms: now,
             restoration_continues: true,
+            forwarding_held: false,
         };
         let eligible = attachment.is_eligible();
         self.attachments.insert(ordinal, attachment);
@@ -488,6 +500,22 @@ impl AttachmentTable {
         if let Some(attachment) = self.attachments.get_mut(ordinal) {
             attachment.restoration_continues = continues;
         }
+    }
+
+    /// Records whether one attachment is being held out of live byte forwarding.
+    ///
+    /// Returns whether this changed the answer, so a caller can resynchronise the attachments whose
+    /// presentation moved and leave the others alone.
+    pub fn hold_forwarding(&mut self, id: AttachmentId, held: bool) -> bool {
+        let Some(ordinal) = self.by_id.get(&id) else {
+            return false;
+        };
+        let Some(attachment) = self.attachments.get_mut(ordinal) else {
+            return false;
+        };
+        let changed = attachment.forwarding_held != held;
+        attachment.forwarding_held = held;
+        changed
     }
 
     /// Returns whether a restoration for this attachment may change its keyboard protocols.

@@ -181,13 +181,6 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn count(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
-        .windows(needle.len())
-        .filter(|window| *window == needle)
-        .count()
-}
-
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-01.13, KR-REQ-08.67, KR-REQ-08.68: the first eligible claim owns, and a view never does.
 // ---------------------------------------------------------------------------------------------
@@ -759,9 +752,12 @@ async fn a_keyboard_takeover_leaves_the_size_exactly_where_it_was() {
 /// KR-REQ-08.75: a terminal of the session's size shares the stream; another size is clipped.
 ///
 /// Two canonical rows are written, each with its own marker at the left and another beyond the
-/// narrow window's right edge. A clipped window shows the left of each row and neither of the far
-/// markers - not on its own row, and not anywhere else, which is what distinguishes clipping from
-/// reflowing the row onto the next one.
+/// narrow window's right edge. A terminal of the session's own size receives the session's own
+/// bytes. A terminal of any other size is projected: it is sent the canonical rows, each cell at
+/// the canonical column it occupies, and it draws the window it has room for. What that proves here
+/// is the absence of reflow - a reflowed row would have moved the far marker to a column inside the
+/// narrow window, on a following row - and the clip itself is the projected renderer's, which its
+/// own corpus in fixtures/terminal/projection.json holds to the same rule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_not_reflowed() {
     // Column 1 holds a near marker, column 60 a far one, on each of two rows. The session is 80
@@ -843,7 +839,8 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
 
     let direct = collect_until(&mut same, b"kr-far-two", Duration::from_secs(3)).await;
     let also_direct = collect_until(&mut also_same, b"kr-far-two", Duration::from_secs(3)).await;
-    let clipped = collect_until(&mut narrow, b"kr-near-two", Duration::from_secs(3)).await;
+    // The same wait for the terminal of another size, which is served rows rather than bytes.
+    let projected = collect_rows_until(&mut narrow, "kr-near-two", Duration::from_secs(3)).await;
 
     // Equal size means the same filtered live byte stream, to both of them.
     assert!(
@@ -856,22 +853,52 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
         "and two of them receive the same bytes, which is what sharing the stream means"
     );
 
-    // The clipped window shows the left of each row and nothing beyond its own right edge. A row
-    // that had been reflowed would have put the far marker on a following row, where it would
-    // still be somewhere in this repaint.
+    // Every marker the projected client was sent, with the canonical column it sits in and the
+    // canonical row it belongs to.
+    let mut placed: Vec<(&str, u64, u64)> = Vec::new();
+    for (row, column, text) in &projected {
+        for marker in ["kr-near-one", "kr-far-one", "kr-near-two", "kr-far-two"] {
+            if let Some(at) = text.find(marker) {
+                let at = u64::try_from(text[..at].chars().count()).expect("a column");
+                placed.push((marker, *row, column + at));
+            }
+        }
+    }
+    let of = |marker: &str| -> Vec<(u64, u64)> {
+        placed
+            .iter()
+            .filter(|(name, _, _)| *name == marker)
+            .map(|(_, row, column)| (*row, *column))
+            .collect()
+    };
+    let near_one = of("kr-near-one");
+    let near_two = of("kr-near-two");
     assert!(
-        contains(&clipped, b"kr-near-one") && contains(&clipped, b"kr-near-two"),
-        "each row's left-hand side is drawn: {}",
-        String::from_utf8_lossy(&clipped).escape_debug()
+        !near_one.is_empty() && !near_two.is_empty(),
+        "each row's left-hand side reaches the projected client: {placed:?}"
     );
-    for far in [&b"kr-far-one"[..], &b"kr-far-two"[..]] {
-        assert_eq!(
-            count(&clipped, far),
-            0,
-            "what is outside the window is dropped rather than moved: {} appears in {}",
-            String::from_utf8_lossy(far),
-            String::from_utf8_lossy(&clipped).escape_debug()
-        );
+    assert!(
+        near_one
+            .iter()
+            .chain(near_two.iter())
+            .all(|(_, column)| *column < 40),
+        "and inside the window it is looking at: {placed:?}"
+    );
+    // The far markers are sent, because the client holds the canonical grid and can pan. What
+    // matters is where they are: at their own canonical columns, outside the window, on the same
+    // row as the near marker they were written with. A reflowed row would have put one of them
+    // inside the window on the row below.
+    for (far, near) in [("kr-far-one", near_one), ("kr-far-two", near_two)] {
+        for (row, column) in of(far) {
+            assert!(
+                column >= 40,
+                "{far} is outside the window rather than moved into it: {placed:?}"
+            );
+            assert!(
+                near.iter().any(|(same, _)| *same == row),
+                "{far} is on the row it was written on rather than reflowed onto another:                  {placed:?}"
+            );
+        }
     }
     // And the canonical grid did not change for either of them.
     assert_eq!(wired.runtime.session().geometry().dimensions, CANONICAL);
@@ -1582,6 +1609,69 @@ async fn resynchronised(client: &mut LocalClient, within: Duration) -> bool {
         }
     }
     false
+}
+
+/// Collects the canonical rows a projected client is sent, as (row, column, text) for each run.
+///
+/// A projected attachment is sent the canonical grid as state rather than bytes, so what it
+/// received is read as rows and runs. The column is the canonical one, which is what makes the
+/// absence of reflow visible.
+async fn collect_rows(client: &mut LocalClient, window: Duration) -> Vec<(u64, u64, String)> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut seen = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let Ok(Ok(frame)) = tokio::time::timeout(remaining, client.recv()).await else {
+            break;
+        };
+        let kr_protocol::envelope::ControlFrame::Notification(notification) = frame else {
+            continue;
+        };
+        let rows = match notification.event_type.as_str() {
+            "session.projection.rows" => notification
+                .payload
+                .to_typed::<kr_protocol::projection::ProjectionRowPage>()
+                .map(|page| page.rows)
+                .unwrap_or_default(),
+            "session.projection.delta" => notification
+                .payload
+                .to_typed::<kr_protocol::projection::ProjectionDelta>()
+                .map(|delta| delta.rows)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for row in rows {
+            for run in row.runs {
+                seen.push((row.row.get(), run.column.get(), run.text));
+            }
+        }
+    }
+    seen
+}
+
+/// Collects projected rows until one of them carries `marker`, and then for `window` longer.
+///
+/// The rows are the answer to the same question [`collect_until`] answers for a terminal that is
+/// sent bytes: whether the thing arrives at all is a liveness wait a loaded host can take its time
+/// over, and what arrives beside it is what the window is for.
+async fn collect_rows_until(
+    client: &mut LocalClient,
+    marker: &str,
+    window: Duration,
+) -> Vec<(u64, u64, String)> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    let mut seen: Vec<(u64, u64, String)> = Vec::new();
+    while !seen.iter().any(|(_, _, text)| text.contains(marker)) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {:?} for {marker:?} to reach this terminal: {seen:?}",
+            started.elapsed()
+        );
+        seen.extend(collect_rows(client, Duration::from_secs(1)).await);
+    }
+    seen.extend(collect_rows(client, window).await);
+    seen
 }
 
 /// Collects everything this client is sent for `window`.

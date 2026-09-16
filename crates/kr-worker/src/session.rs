@@ -28,6 +28,7 @@ use kr_protocol::ids::{
     AttachmentId, ConnectionId, EnvironmentId, SessionEpoch, SessionId, StreamCursor,
 };
 use kr_protocol::input::{InputAcquireResult, InputLeaseState};
+use kr_protocol::projection::ProjectionResetReason;
 use kr_protocol::recovery::{EventsSnapshotResult, HistoryPageResult, ResyncReason};
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 use kr_protocol::session::{
@@ -121,6 +122,21 @@ pub struct Interrupted {
     pub closed_open_paste: bool,
 }
 
+/// The screen one attachment joins on.
+///
+/// Exactly one of the two halves is present, and which one depends on how that attachment is
+/// served: `bytes` for a terminal the session's own size that can take the stream, `projection`
+/// for a client that holds the canonical grid as state and draws it itself.
+#[derive(Clone, Debug, Default)]
+pub struct Joined {
+    /// The cursor the screen was taken at. Live output continues from here.
+    pub cursor: u64,
+    /// The bytes that put a terminal into the session's state.
+    pub bytes: Vec<u8>,
+    /// The events that install the canonical screen on a projected client.
+    pub projection: Vec<kr_protocol::projection::ProjectionEvent>,
+}
+
 /// One live session.
 pub struct Session {
     config: SessionConfig,
@@ -160,6 +176,22 @@ pub struct Session {
     /// buffer alone. It is recorded per attachment because every repaint asks the same question
     /// and the caller is not there to be asked again.
     content_scopes: std::collections::BTreeMap<AttachmentId, crate::render::Scope>,
+    /// The attachments the host would serve directly and is holding in projected mode.
+    ///
+    /// Section 8: a transition into live byte forwarding must use a parser-ground boundary with no
+    /// incomplete UTF-8 scalar and no incomplete control sequence, and if none is available within
+    /// 250 ms the attachment stays projected until one is. Output does not stop for the handoff, so
+    /// the wait is recorded here and the attachment is served a projection meanwhile. It never
+    /// starts forwarding the middle of an escape sequence.
+    forwarding_held:
+        std::collections::BTreeMap<AttachmentId, kr_term::snapshot::LiveForwardingHandoff>,
+    /// The screen each projected attachment holds, so its next update continues from it.
+    ///
+    /// Section 8 forbids redrawing ordinary output after every batch. A projected attachment is
+    /// therefore installed once and then sent one bounded update per batch, and this is what makes
+    /// that possible: an update names the base it continues from, and the base is what the client
+    /// was last actually sent.
+    projections: crate::snapshot::Bases,
     /// The host's own answers that have been queued for the application and not yet written.
     ///
     /// The response lane bounds what it holds; this bounds what has left the lane. Counting only
@@ -276,6 +308,8 @@ impl Session {
             content_scopes: std::collections::BTreeMap::new(),
             engine,
             restoration_losses: crate::render::Carried::default(),
+            forwarding_held: std::collections::BTreeMap::new(),
+            projections: crate::snapshot::Bases::new(),
             queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             queued_lease_bytes: Arc::new(crate::runtime::LeaseBytes::new()),
             input_gate: Arc::new(std::sync::Mutex::new(())),
@@ -629,13 +663,7 @@ impl Session {
     /// session.
     pub fn restoration(&mut self, attachment_id: AttachmentId) -> Result<(u64, Vec<u8>)> {
         let scope = self.content_scope(attachment_id);
-        let dimensions = self
-            .attachments
-            .own_dimensions(attachment_id)
-            .ok_or_else(|| WorkerError::UnknownAttachment {
-                attachment: attachment_id.to_string(),
-            })?
-            .unwrap_or_else(|| self.attachments.geometry().dimensions);
+        let dimensions = self.attachment_dimensions(attachment_id)?;
         let gate = self.lane_gate();
         let keyboard = self.attachments.keyboard_control(attachment_id);
         let (cursor, restoration, settled) =
@@ -669,6 +697,98 @@ impl Session {
             .get(&attachment_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Returns the screen one attachment joins on, in the form that attachment is served in.
+    ///
+    /// The two forms are not interchangeable. An attachment whose own terminal is the session's
+    /// size and can take the stream is handed bytes, because its screen *is* a terminal and the
+    /// restoration has to put that terminal into the session's state before live output resumes. A
+    /// projected attachment is handed the canonical grid as state and draws it itself, which is
+    /// what lets a terminal of another size show the session without being sent bytes that assume
+    /// it is the session's size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::UnknownAttachment`] when the identifier names no attachment of this
+    /// session.
+    pub fn join(&mut self, attachment_id: AttachmentId) -> Result<Joined> {
+        let dimensions = self.attachment_dimensions(attachment_id)?;
+        // Whether this attachment may be handed the stream at all is settled first. A screen and a
+        // byte cursor have to name the same boundary, so an attachment joining while the parser is
+        // mid-sequence is served a projection and moves to forwarding when a boundary arrives.
+        self.settle_forwarding(kr_ipc::now_ms().get());
+        if self.presentation_of(attachment_id) != crate::output::Presentation::Projected {
+            let (cursor, bytes) = self.restoration(attachment_id)?;
+            return Ok(Joined {
+                cursor,
+                bytes,
+                projection: Vec::new(),
+            });
+        }
+        // The screen is settled first, and whatever that released is delivered to the attachments
+        // that were already watching. Settling inside the snapshot instead would let one client's
+        // snapshot swallow a character that was owed to another.
+        self.deliver(crate::projection::Filtered::default());
+        let gate = self.lane_gate();
+        let now = kr_ipc::now_ms().get();
+        let (update, settled) = self.engine.projection_install(
+            dimensions,
+            ProjectionResetReason::Attached,
+            gate,
+            now,
+        )?;
+        debug_assert!(
+            settled.direct.is_empty() && settled.effects.is_empty(),
+            "the screen is settled before this snapshot is taken"
+        );
+        // It can still return replies the response lane released in the moment between, and those
+        // are the application's rather than this subscriber's screen.
+        self.queue_replies(settled.replies);
+        // The base is recorded last, so it is the screen this client is about to be sent rather
+        // than one an earlier subscription of the same attachment was left holding.
+        self.projections.record(
+            attachment_id,
+            crate::snapshot::Held {
+                base: update.base,
+                viewport: self.engine.anchored_viewport(dimensions),
+            },
+        );
+        Ok(Joined {
+            cursor: update.base.cursor,
+            bytes: Vec::new(),
+            projection: update.events,
+        })
+    }
+
+    /// Returns one attachment's own dimensions, falling back to the session's canonical geometry.
+    fn attachment_dimensions(&self, attachment_id: AttachmentId) -> Result<Dimensions> {
+        Ok(self
+            .attachments
+            .own_dimensions(attachment_id)
+            .ok_or_else(|| WorkerError::UnknownAttachment {
+                attachment: attachment_id.to_string(),
+            })?
+            .unwrap_or_else(|| self.attachments.geometry().dimensions))
+    }
+
+    /// Records where this session's initial palette came from.
+    ///
+    /// Section 8 fixes the palette at creation and forbids succession from changing it, so this is
+    /// called once, before the session has produced anything. Every snapshot then carries the
+    /// provenance, so a client can say where the colours it is drawing came from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error once the session has produced output.
+    pub fn set_initial_palette(&mut self, choice: crate::snapshot::PaletteChoice) -> Result<()> {
+        self.engine.set_initial_palette(choice)
+    }
+
+    /// Where the session's palette came from.
+    #[must_use]
+    pub fn palette_source(&self) -> kr_term::palette::PaletteSource {
+        self.engine.palette_source()
     }
 
     /// Records what a rendered restoration could not carry.
@@ -721,7 +841,7 @@ impl Session {
     ) -> Result<SessionAttachResult> {
         self.require_running()?;
         let previous = self.attachments.geometry();
-        let (attachment, change) =
+        let (mut attachment, change) =
             self.attachments
                 .attach(params, granted, attachment_id, kr_ipc::now_ms())?;
 
@@ -735,6 +855,19 @@ impl Session {
             let _ = self.attachments.detach(attachment_id);
             self.attachments.restore_geometry(&previous);
             return Err(error);
+        }
+        // Whether this attachment may forward depends on where the parser stands, which is a fact
+        // about this moment rather than about the attachment. It is settled here so the answer the
+        // attach reports is the answer the session will act on, rather than one that changes
+        // between the attach and the subscription.
+        self.settle_forwarding(kr_ipc::now_ms().get());
+        if let Some(settled) = self
+            .attachments
+            .summaries()
+            .into_iter()
+            .find(|summary| summary.attachment_id == attachment_id)
+        {
+            attachment = settled;
         }
         Ok(SessionAttachResult {
             attachment,
@@ -775,6 +908,7 @@ impl Session {
         }
         self.pump_replies();
         self.hub.detached(attachment_id);
+        self.projections.forget(attachment_id);
         let previous = self.attachments.geometry();
         let change = self.attachments.detach(attachment_id)?;
         if change.resize_required
@@ -1291,7 +1425,7 @@ impl Session {
         Ok(self.hub.subscribe(attachment_id, limit, presentation))
     }
 
-    /// Returns how one attachment is served: the raw stream, or a rendering of the screen.
+    /// Returns how one attachment is served: the raw stream, or the canonical grid as state.
     fn presentation_of(&mut self, attachment_id: AttachmentId) -> crate::output::Presentation {
         self.attachments
             .set_carryable(self.engine.direct_is_carryable());
@@ -1305,6 +1439,62 @@ impl Session {
         } else {
             crate::output::Presentation::Direct
         }
+    }
+
+    /// Decides which attachments may begin live byte forwarding right now.
+    ///
+    /// An attachment that is already forwarding is left alone: it is mid-stream and the rule is
+    /// about *starting*. One the host would serve directly and that is not forwarding yet may only
+    /// start where the parser stands on ground, because starting anywhere else would hand a
+    /// physical terminal the middle of an escape sequence. Until a boundary arrives it is held, and
+    /// section 8's 250 ms is the point at which the answer becomes "stay projected" rather than
+    /// "wait": waiting longer would not make the stream safer, it would only delay the screen.
+    fn settle_forwarding(&mut self, now_ms: u64) {
+        self.attachments
+            .set_carryable(self.engine.direct_is_carryable());
+        let projected: std::collections::BTreeSet<AttachmentId> = self
+            .attachments
+            .projected()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let boundary = self.engine.ground_boundary();
+        for summary in self.attachments.summaries() {
+            let id = summary.attachment_id;
+            if projected.contains(&id) && !self.forwarding_held.contains_key(&id) {
+                // The host is not serving this one directly at all, for a reason of its own: its
+                // size, its profile, its stream or the screen it was given. There is no handoff.
+                continue;
+            }
+            if self.hub.presentation_of(id) == Some(crate::output::Presentation::Direct) {
+                // Already forwarding. The boundary rule is about the moment forwarding begins.
+                self.forwarding_held.remove(&id);
+                self.attachments.hold_forwarding(id, false);
+                continue;
+            }
+            if boundary.is_some() {
+                self.forwarding_held.remove(&id);
+                self.attachments.hold_forwarding(id, false);
+                continue;
+            }
+            let handoff = self
+                .forwarding_held
+                .entry(id)
+                .or_insert_with(|| kr_term::snapshot::LiveForwardingHandoff::start(now_ms));
+            if handoff.poll(now_ms, None) == kr_term::snapshot::HandoffOutcome::StayProjected {
+                // The window passed with the parser still mid-sequence. The attachment stays
+                // projected, and the next boundary is what moves it, so the wait begins again
+                // rather than being abandoned.
+                *handoff = kr_term::snapshot::LiveForwardingHandoff::start(now_ms);
+            }
+            self.attachments.hold_forwarding(id, true);
+        }
+    }
+
+    /// Returns whether one attachment is being held out of live byte forwarding.
+    #[must_use]
+    pub fn forwarding_held(&self, attachment_id: AttachmentId) -> bool {
+        self.forwarding_held.contains_key(&attachment_id)
     }
 
     /// Records output from the terminal, interprets it and delivers what each attachment may see.
@@ -1502,6 +1692,89 @@ impl Session {
         }
     }
 
+    /// Sends one projected attachment what it is owed: a bounded update, or a fresh screen.
+    ///
+    /// The update is bounded because that is what section 8 requires of ordinary output: a
+    /// projected attachment is not redrawn after every batch. A client that holds a screen this
+    /// engine can still continue from is sent the rows that changed; one that holds nothing, or
+    /// whose base has fallen outside the replay window, or whose change is larger than one bounded
+    /// update, is installed again from a snapshot.
+    ///
+    /// Returns whether the subscriber was told to resynchronise.
+    fn publish_projection(
+        &mut self,
+        attachment_id: AttachmentId,
+        dimensions: Dimensions,
+        reset: Option<ProjectionResetReason>,
+        oldest: u64,
+    ) -> bool {
+        let held = self.projections.held(attachment_id);
+        let owed = match held {
+            Some(held) if reset.is_none() => {
+                self.engine.projection_advance(held, dimensions).unwrap_or(
+                    crate::snapshot::Owed::Snapshot(ProjectionResetReason::ReplayGap),
+                )
+            }
+            // The engine said what replaced the screen, so the client is told that rather than
+            // being left to infer it. An attachment holding nothing is being installed for the
+            // first time.
+            _ => crate::snapshot::Owed::Snapshot(reset.unwrap_or(ProjectionResetReason::Attached)),
+        };
+        let update = match owed {
+            crate::snapshot::Owed::Nothing => return false,
+            crate::snapshot::Owed::Update(update) => update,
+            crate::snapshot::Owed::Snapshot(reason) => {
+                let gate = self.lane_gate();
+                let now = kr_ipc::now_ms().get();
+                match self
+                    .engine
+                    .projection_install(dimensions, reason, gate, now)
+                {
+                    Ok((update, settled)) => {
+                        // Taking a snapshot settles the screen. It changes no display state here,
+                        // because the screen was settled before this loop began, but it can still
+                        // release replies the response lane held in the moment between, and those
+                        // are the application's.
+                        self.queue_replies(settled.replies);
+                        update
+                    }
+                    Err(_) => {
+                        // The engine's state cannot be spelled on the wire, which this engine
+                        // cannot produce. The client is told to install a fresh screen rather than
+                        // being left holding one that no longer matches.
+                        self.projections.forget(attachment_id);
+                        self.hub.require_resync(
+                            attachment_id,
+                            ResyncReason::ProjectionReset,
+                            self.history.next_cursor(),
+                            oldest,
+                        );
+                        return true;
+                    }
+                }
+            }
+        };
+        let held = crate::snapshot::Held {
+            base: update.base,
+            viewport: self.engine.anchored_viewport(dimensions),
+        };
+        for event in update.events {
+            let cost = crate::snapshot::event_bytes(&event);
+            let cursor = event.cursor();
+            if self
+                .hub
+                .publish_projection(attachment_id, cursor, event, cost, oldest)
+            {
+                // Its queue filled part way through. What it has is not a screen, so the base goes
+                // with it and the fresh snapshot it asks for starts again.
+                self.projections.forget(attachment_id);
+                return true;
+            }
+        }
+        self.projections.record(attachment_id, held);
+        false
+    }
+
     /// Delivers one interpreted batch to the attachments and the application.
     ///
     /// The order this runs in is the contract:
@@ -1518,9 +1791,11 @@ impl Session {
     ///    because each is looking at its own window.
     fn deliver(&mut self, mut filtered: crate::projection::Filtered) -> Vec<AttachmentId> {
         // The engine's answer is recorded first, so a summary and a delivery cannot disagree about
-        // how an attachment is being served.
+        // how an attachment is being served. Which of them may *begin* forwarding is settled with
+        // it, because that answer depends on where the parser stands and not only on a size.
         self.attachments
             .set_carryable(self.engine.direct_is_carryable());
+        self.settle_forwarding(kr_ipc::now_ms().get());
         let projected = self.attachments.projected();
         if !projected.is_empty() {
             // Taking a snapshot settles the screen, which releases whatever the engine was holding
@@ -1552,6 +1827,11 @@ impl Session {
                 crate::output::Presentation::Direct
             };
             if self.hub.set_presentation(attachment_id, presentation) {
+                // What it holds is not what it is about to be served, so the base goes with the
+                // change: an attachment that has become direct is handed bytes, and one that has
+                // become projected is installed from a snapshot rather than continued from a
+                // screen it was drawn in another form.
+                self.projections.forget(attachment_id);
                 self.hub
                     .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
                 resynchronised.push(attachment_id);
@@ -1560,8 +1840,25 @@ impl Session {
         // A projection reset, or a span the engine cleared that this host could no longer produce,
         // means no client's screen continues from the one it holds. Both are answered the same
         // way: install a fresh screen rather than drawing on top of one with a hole in it.
-        if filtered.projection_reset || filtered.lost {
+        //
+        // A projected attachment is installed again *in band*, in this same call: the projection
+        // protocol has a reset of its own, and a client that has been sent one followed by a fresh
+        // snapshot needs no round trip to ask for what it has already been given. Forgetting its
+        // base is what makes the loop below install rather than continue. A direct attachment has
+        // no such event, so it is told to resynchronise and asks for a new screen itself.
+        let reset_reason = if filtered.projection_reset {
+            Some(ProjectionResetReason::BufferSwitch)
+        } else if filtered.lost {
+            Some(ProjectionResetReason::ReplayGap)
+        } else {
+            None
+        };
+        if reset_reason.is_some() {
             for attachment_id in self.hub.subscribers() {
+                if projecting.contains(&attachment_id) {
+                    self.projections.forget(attachment_id);
+                    continue;
+                }
                 self.hub
                     .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
                 resynchronised.push(attachment_id);
@@ -1601,28 +1898,14 @@ impl Session {
         }
 
         for (attachment_id, dimensions) in projected {
-            let gate = self.lane_gate();
-            let keyboard = self.attachments.keyboard_control(attachment_id);
-            let scope = self.content_scope(attachment_id);
-            let (cursor, restoration, settled) =
-                self.engine
-                    .restoration(dimensions, gate, kr_ipc::now_ms().get(), keyboard, scope);
-            self.note_restoration(attachment_id, &restoration);
-            let shared = Arc::new(restoration.bytes);
-            if self
-                .hub
-                .publish_screen(attachment_id, cursor, &shared, oldest)
-            {
+            if self.hub.is_resynchronising(attachment_id) {
+                // It has been told to install a fresh screen and is not being sent updates in the
+                // meantime. Building one for it would spend the work and then throw it away.
+                continue;
+            }
+            if self.publish_projection(attachment_id, dimensions, reset_reason, oldest) {
                 resynchronised.push(attachment_id);
             }
-            // The screen was settled before this loop began, so this snapshot changes no display
-            // state. It can still return replies the response lane released in the moment between,
-            // and those are the application's, not this subscriber's repaint.
-            debug_assert!(
-                settled.direct.is_empty() && settled.effects.is_empty(),
-                "the screen is settled once, before any snapshot is taken"
-            );
-            self.queue_replies(settled.replies);
         }
         resynchronised.sort_unstable();
         resynchronised.dedup();

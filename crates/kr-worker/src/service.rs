@@ -63,6 +63,8 @@ use kr_transport::clock::{ContinuousClock, ContinuousInstant, SystemContinuousCl
 use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
 use crate::error::{Result, WorkerError};
+use kr_protocol::projection::ProjectionEvent;
+
 use crate::output::OutputDelivery;
 use crate::runtime::SessionRuntime;
 use crate::session::Session;
@@ -486,6 +488,41 @@ impl WorkerService {
                                 return;
                             }
                         }
+                        // A projected attachment is installed from state and draws it itself; one
+                        // whose destination is a terminal of the session's own size is installed
+                        // from bytes. Exactly one of the two is present.
+                        for event in &joined.projection {
+                            let event_type = event.event_type();
+                            let frame = match event {
+                                ProjectionEvent::Reset(reset) => {
+                                    notification(&stream_id, sequence, event_type, reset)
+                                }
+                                ProjectionEvent::Snapshot(header) => {
+                                    notification(&stream_id, sequence, event_type, header)
+                                }
+                                ProjectionEvent::Rows(page) => {
+                                    notification(&stream_id, sequence, event_type, page)
+                                }
+                                ProjectionEvent::Delta(delta) => {
+                                    notification(&stream_id, sequence, event_type, delta)
+                                }
+                            };
+                            let Some(frame) = frame else {
+                                continue;
+                            };
+                            sequence += 1;
+                            if !write_frame(
+                                &delivery_writable,
+                                &sender,
+                                &frame,
+                                &delivery_withdrawn,
+                                true,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                        }
                         if !send_screen(
                             &delivery_writable,
                             &sender,
@@ -538,6 +575,39 @@ impl WorkerService {
                                     &mut sequence,
                                     cursor,
                                     &bytes,
+                                )
+                                .await
+                            }
+                            // A projection event is state, not a span of the stream: its cursor
+                            // says which screen it describes and the client applies it to the one
+                            // it holds. The event names the type it is published under, so there
+                            // is one place that decides that rather than one per variant.
+                            OutputDelivery::Projection { event, .. } => {
+                                let event_type = event.event_type();
+                                let frame = match event.as_ref() {
+                                    ProjectionEvent::Reset(reset) => {
+                                        notification(&stream_id, sequence, event_type, reset)
+                                    }
+                                    ProjectionEvent::Snapshot(header) => {
+                                        notification(&stream_id, sequence, event_type, header)
+                                    }
+                                    ProjectionEvent::Rows(page) => {
+                                        notification(&stream_id, sequence, event_type, page)
+                                    }
+                                    ProjectionEvent::Delta(delta) => {
+                                        notification(&stream_id, sequence, event_type, delta)
+                                    }
+                                };
+                                let Some(frame) = frame else {
+                                    continue;
+                                };
+                                sequence += 1;
+                                write_frame(
+                                    &delivery_writable,
+                                    &sender,
+                                    &frame,
+                                    &delivery_withdrawn,
+                                    true,
                                 )
                                 .await
                             }
@@ -2329,7 +2399,7 @@ impl WorkerService {
         // nothing arrives twice or goes missing at the handover. Its order matters for one more
         // reason: what that screen could not carry decides how this attachment is served, so the
         // queue is started in the presentation the screen it was actually given supports.
-        let (cursor, bytes) = session.restoration(params.attachment_id)?;
+        let joined = session.join(params.attachment_id)?;
         let stream = session.subscribe(params.attachment_id)?;
         let oldest = session.snapshot().oldest_retained_cursor.get();
         // A client whose position has fallen out of the retained window is told so. The screen it
@@ -2341,7 +2411,13 @@ impl WorkerService {
         });
         drop(session);
         state.subscribed = Some((params.attachment_id, stream));
-        state.restoration = Some(JoinedScreen { cursor, bytes, gap });
+        let cursor = joined.cursor;
+        state.restoration = Some(JoinedScreen {
+            cursor,
+            bytes: joined.bytes,
+            projection: joined.projection,
+            gap,
+        });
         encode(&EventsSubscribeResult {
             stream_id: state.stream_id.clone(),
             from_cursor: U64::new(cursor),
@@ -2726,8 +2802,13 @@ impl WorkerService {
 pub struct JoinedScreen {
     /// The cursor the screen was taken at. Live output continues from here.
     pub cursor: u64,
-    /// The bytes that draw it.
+    /// The bytes that draw it, for an attachment whose destination is a terminal of this size.
     pub bytes: Vec<u8>,
+    /// The events that install it, for a projected attachment.
+    ///
+    /// A projected attachment holds the canonical grid as state and draws it itself, so it is sent
+    /// the snapshot and its row pages rather than a rendering somebody else made for it.
+    pub projection: Vec<kr_protocol::projection::ProjectionEvent>,
     /// The part of the stream that is no longer readable, when the client had fallen behind it.
     pub gap: Option<kr_protocol::recovery::HistoryGap>,
 }

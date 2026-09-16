@@ -43,6 +43,19 @@ pub enum OutputDelivery {
         /// The bytes that draw it.
         bytes: Arc<Vec<u8>>,
     },
+    /// One projection event: a reset, a snapshot, one of its row pages, or a bounded update.
+    ///
+    /// A projected attachment receives these instead of a rendering of the whole screen. Its cost
+    /// against the subscriber's bound is measured when it is built, because the queue is bounded in
+    /// bytes and an event is not bytes until something encodes it.
+    Projection {
+        /// The cursor the event describes.
+        cursor: u64,
+        /// The event.
+        event: Box<kr_protocol::projection::ProjectionEvent>,
+        /// What it costs this subscriber's queue.
+        bytes: usize,
+    },
     /// The subscriber must discard its partial state and install a fresh snapshot.
     Resync(ResyncRequired),
     /// The attachment was detached. Nothing more will arrive on this stream.
@@ -55,6 +68,7 @@ impl OutputDelivery {
     pub fn len(&self) -> usize {
         match self {
             Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
+            Self::Projection { bytes, .. } => *bytes,
             Self::Resync(_) | Self::Detached => 0,
         }
     }
@@ -186,6 +200,17 @@ impl OutputHub {
         changed
     }
 
+    /// Returns how one subscriber is currently being served.
+    ///
+    /// `None` for an attachment with no subscription, which is one that has not joined yet and is
+    /// therefore not forwarding anything.
+    #[must_use]
+    pub fn presentation_of(&self, attachment_id: AttachmentId) -> Option<Presentation> {
+        self.subscribers
+            .get(&attachment_id)
+            .map(|subscriber| subscriber.presentation)
+    }
+
     /// Returns every attachment currently subscribed.
     #[must_use]
     pub fn subscribers(&self) -> Vec<AttachmentId> {
@@ -311,6 +336,58 @@ impl OutputHub {
         oldest_retained_cursor: u64,
     ) -> bool {
         self.deliver_one(attachment_id, cursor, bytes, oldest_retained_cursor, true)
+    }
+
+    /// Delivers one projection event to one subscriber.
+    ///
+    /// A projected attachment is served state rather than bytes, and the state is computed for its
+    /// own window, so it is delivered to it alone. Returns whether the subscriber was told to
+    /// resynchronise, which happens for the same reason as any other delivery: its queue is full,
+    /// and the read loop does not wait for it.
+    pub fn publish_projection(
+        &mut self,
+        attachment_id: AttachmentId,
+        cursor: u64,
+        event: kr_protocol::projection::ProjectionEvent,
+        cost: usize,
+        oldest_retained_cursor: u64,
+    ) -> bool {
+        let Some(subscriber) = self.subscribers.get_mut(&attachment_id) else {
+            return false;
+        };
+        if subscriber.resynchronising {
+            return false;
+        }
+        let queued = subscriber.queued.load(Ordering::Acquire);
+        if queued.saturating_add(cost) > subscriber.limit {
+            subscriber.resynchronising = true;
+            let marker = ResyncRequired {
+                reason: ResyncReason::SendQueueFull,
+                cursor: U64::new(cursor),
+                oldest_retained_cursor: U64::new(oldest_retained_cursor),
+            };
+            if subscriber
+                .sender
+                .send(OutputDelivery::Resync(marker))
+                .is_err()
+            {
+                self.subscribers.remove(&attachment_id);
+            }
+            return true;
+        }
+        subscriber.queued.fetch_add(cost, Ordering::AcqRel);
+        if subscriber
+            .sender
+            .send(OutputDelivery::Projection {
+                cursor,
+                event: Box::new(event),
+                bytes: cost,
+            })
+            .is_err()
+        {
+            self.subscribers.remove(&attachment_id);
+        }
+        false
     }
 
     fn deliver_one(

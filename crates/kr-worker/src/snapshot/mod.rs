@@ -1,0 +1,672 @@
+//! The projection producer: snapshots, bounded row pages, deltas and explicit resets.
+//!
+//! A projected attachment used to be sent a rendering of the whole screen after every batch of
+//! output. Section 8 forbids exactly that — ordinary output is not redrawn after every batch — and
+//! the answer is this module. A client is installed once, from a snapshot, and then receives one
+//! bounded update per batch: the rows that changed and the state that changed with them.
+//!
+//! # What a client holds, and why it is two numbers
+//!
+//! [`Base`] is an output cursor *and* a projection generation. The cursor alone is not a position
+//! in a screen's history: a projection reset can happen without a byte arriving, so the same
+//! cursor can name two different screens. An update that does not match both is not applied; the
+//! client is reset and installed again, which is cheaper than reasoning about what it might have
+//! missed.
+//!
+//! # Every bound
+//!
+//! | What | Bound | Where it comes from |
+//! | --- | --- | --- |
+//! | Rows in one page | [`MAX_PROJECTION_PAGE_ROWS`] | Section 8's history-page limit |
+//! | Encoded bytes in one page | [`MAX_PROJECTION_PAGE_BYTES`] | The same |
+//! | Rows in one delta | One page's worth | Past it the update is a repaint, and a snapshot is sent |
+//! | Replay window | The engine's checkpoint window | A base outside it is a gap |
+//!
+//! A row that alone exceeds the byte bound is not dropped and not silently shortened: its runs are
+//! cut and the row is marked truncated, which is the explicit projection degradation section 8
+//! asks for.
+
+pub mod wire;
+
+use std::collections::BTreeMap;
+
+use kr_protocol::ids::AttachmentId;
+use kr_protocol::projection::{
+    MAX_PROJECTION_PAGE_BYTES, MAX_PROJECTION_PAGE_ROWS, ProjectedBuffer, ProjectedRow,
+    ProjectionDelta, ProjectionEvent, ProjectionReset, ProjectionResetReason, ProjectionRowPage,
+    ProjectionSnapshot,
+};
+use kr_protocol::scalars::{Nullable, U64};
+use kr_term::palette::{Palette, PaletteSource, Rgb};
+use kr_term::snapshot::{ActiveBuffer, Delta, Snapshot, Viewport};
+
+use crate::error::Result;
+
+/// Where a session's initial palette comes from.
+///
+/// Section 8 fixes the palette at creation and forbids succession from changing it. The choice is
+/// therefore made once, before the session has produced anything, and the provenance travels with
+/// every snapshot so a client can say where the colours it is drawing came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaletteChoice {
+    /// The profile's own palette, for a session no client stated a preference for.
+    #[default]
+    ProfileDefault,
+    /// The light preset, for a no-probe or invisible creation.
+    LightPreset,
+    /// The dark preset, for a no-probe or invisible creation.
+    DarkPreset,
+    /// The foreground and background a client shared during its bounded probe.
+    Shared {
+        /// The default foreground.
+        foreground: Rgb,
+        /// The default background.
+        background: Rgb,
+    },
+}
+
+impl PaletteChoice {
+    /// The palette this choice starts a session with.
+    #[must_use]
+    pub fn palette(self) -> Palette {
+        match self {
+            Self::ProfileDefault => Palette::new(PaletteSource::ProfileDefault),
+            Self::LightPreset => Palette::new(PaletteSource::LightPreset),
+            Self::DarkPreset => Palette::new(PaletteSource::DarkPreset),
+            Self::Shared {
+                foreground,
+                background,
+            } => Palette::from_client_preference(foreground, background),
+        }
+    }
+}
+
+/// What one client's screen is: a cursor in the output stream and the generation it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Base {
+    /// The output cursor the client's screen describes.
+    pub cursor: u64,
+    /// The projection generation it belongs to.
+    pub generation: u64,
+}
+
+/// What one client was last sent: the base, and the window it was drawn for.
+///
+/// The window is part of it because a scroll moves which rows the window holds without changing
+/// one of them. A client that was last sent one window and is now looking at another has to be
+/// told, and a client whose window has not moved and whose rows have not changed needs no message
+/// at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// The base the next update continues from.
+    pub base: Base,
+    /// The window that base was built for.
+    pub viewport: Viewport,
+}
+
+/// What every projected attachment holds.
+///
+/// It is recorded only once the events that establish it have been queued for that client, so the
+/// next update continues from a screen the client has actually been sent.
+#[derive(Debug, Default)]
+pub struct Bases {
+    held: BTreeMap<AttachmentId, Held>,
+}
+
+impl Bases {
+    /// An empty set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What this attachment holds, when it holds anything.
+    #[must_use]
+    pub fn held(&self, attachment_id: AttachmentId) -> Option<Held> {
+        self.held.get(&attachment_id).copied()
+    }
+
+    /// Records what an attachment now holds.
+    pub fn record(&mut self, attachment_id: AttachmentId, held: Held) {
+        self.held.insert(attachment_id, held);
+    }
+
+    /// Forgets an attachment, which has detached or moved out of projected mode.
+    pub fn forget(&mut self, attachment_id: AttachmentId) {
+        self.held.remove(&attachment_id);
+    }
+
+    /// Forgets every attachment, which a projection reset does to all of them at once.
+    pub fn forget_all(&mut self) {
+        self.held.clear();
+    }
+
+    /// How many attachments hold a base.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether no attachment holds a base.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+}
+
+/// The events one attachment is owed, and the base it holds once they have been sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Update {
+    /// The events, in the order they must be delivered.
+    pub events: Vec<ProjectionEvent>,
+    /// The base the client holds after applying them.
+    pub base: Base,
+}
+
+impl Update {
+    /// Whether this update carries nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+/// Builds the events that install `snapshot` on a client showing `viewport`.
+///
+/// The order is the contract: the reset discards whatever the client was showing, the header
+/// carries everything a screen is apart from its rows, and the pages carry the rows. The last page
+/// clears `more`, and a client that has not seen that page does not yet hold a whole screen.
+///
+/// # Errors
+///
+/// Returns an error when a row's stable identifier is not a forward count, which this engine
+/// cannot produce.
+pub fn install(
+    snapshot: &Snapshot,
+    viewport: Viewport,
+    reason: ProjectionResetReason,
+) -> Result<Update> {
+    let generation = snapshot.projection_generation;
+    let cursor = snapshot.output_cursor;
+    let oldest = wire::row_id(snapshot.oldest_retained_row)?;
+    let mut events = vec![
+        ProjectionEvent::Reset(ProjectionReset {
+            projection_generation: U64::new(generation),
+            cursor: U64::new(cursor),
+            reason,
+        }),
+        ProjectionEvent::Snapshot(Box::new(ProjectionSnapshot {
+            projection_generation: U64::new(generation),
+            output_cursor: U64::new(cursor),
+            active_buffer: wire::buffer(snapshot.active_buffer),
+            dimensions: kr_protocol::session::Dimensions::new(
+                u64::from(snapshot.dimensions.cols),
+                u64::from(snapshot.dimensions.rows),
+            ),
+            viewport: wire::viewport(viewport)?,
+            cursor: wire::cursor(snapshot.cursor),
+            saved_cursors: wire::saved_cursors(&snapshot.saved_cursors),
+            margins: wire::margins(snapshot.margins),
+            rendition: wire::rendition(snapshot.rendition),
+            tab_stops: snapshot
+                .tab_stops
+                .iter()
+                .map(|at| wire::cells(*at))
+                .collect(),
+            charsets: wire::charsets(&snapshot.charsets),
+            modes: snapshot
+                .modes
+                .iter()
+                .map(|entry| wire::mode(*entry))
+                .collect(),
+            keypad_application: snapshot.keypad_application,
+            keyboard: wire::keyboard(&snapshot.keyboard),
+            title: wire::title(&snapshot.title),
+            title_stack: snapshot.title_stack.iter().map(wire::saved_title).collect(),
+            hyperlink: Nullable(snapshot.hyperlink.clone()),
+            palette: wire::palette(&snapshot.palette),
+            oldest_retained_row: oldest,
+            evicted: snapshot.evicted,
+        })),
+    ];
+
+    // The buffer that is not showing is paged first, so a client that switches to it later already
+    // has what the shell left behind. Its identity is named rather than implied: "the other one" is
+    // not a fact a client can act on after a buffer switch.
+    let inactive_buffer = match snapshot.active_buffer {
+        ActiveBuffer::Primary => ProjectedBuffer::Alternate,
+        ActiveBuffer::Alternate => ProjectedBuffer::Primary,
+    };
+    let mut pages = Vec::new();
+    for (buffer, rows) in [
+        (inactive_buffer, &snapshot.inactive_rows),
+        (wire::buffer(snapshot.active_buffer), &snapshot.rows),
+    ] {
+        for page in paginate(wire::rows(rows)?) {
+            pages.push(ProjectionRowPage {
+                projection_generation: U64::new(generation),
+                output_cursor: U64::new(cursor),
+                buffer,
+                rows: page,
+                oldest_retained_row: oldest,
+                evicted: snapshot.evicted,
+                more: true,
+            });
+        }
+    }
+    // A snapshot of an empty session still has to complete, or a client would wait for a page that
+    // is never coming. The active buffer's page is therefore always present, even with no rows.
+    if pages.is_empty() {
+        pages.push(ProjectionRowPage {
+            projection_generation: U64::new(generation),
+            output_cursor: U64::new(cursor),
+            buffer: wire::buffer(snapshot.active_buffer),
+            rows: Vec::new(),
+            oldest_retained_row: oldest,
+            evicted: snapshot.evicted,
+            more: true,
+        });
+    }
+    if let Some(last) = pages.last_mut() {
+        last.more = false;
+    }
+    events.extend(pages.into_iter().map(ProjectionEvent::Rows));
+    Ok(Update {
+        events,
+        base: Base { cursor, generation },
+    })
+}
+
+/// What one client is owed right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Owed {
+    /// Nothing has changed since the base, so nothing is sent.
+    ///
+    /// The read loop settles the screen whenever the stream goes quiet, and a screen that has not
+    /// changed is not an update. Sending one anyway would put a message on every subscriber's queue
+    /// for every quiet moment of the session.
+    Nothing,
+    /// A bounded update.
+    Update(Update),
+    /// A fresh screen, for the named reason.
+    Snapshot(ProjectionResetReason),
+}
+
+/// Builds the bounded update that continues from `delta`.
+///
+/// # Errors
+///
+/// Returns an error when a row's stable identifier is not a forward count.
+pub fn advance(
+    delta: &Delta,
+    buffer: ActiveBuffer,
+    viewport: Viewport,
+    oldest_retained_row: i64,
+    evicted: bool,
+    held_viewport: Option<Viewport>,
+) -> Result<Owed> {
+    let mut rows = wire::rows(&delta.rows)?;
+    if !fits_one_page(&rows) {
+        // More rows changed than one page carries. That is a repaint rather than an update, and a
+        // repaint is a snapshot: it pages, and a client that applied a delta this size would have
+        // to hold the whole thing in one message first.
+        return Ok(Owed::Snapshot(ProjectionResetReason::Repaint));
+    }
+    if carries_nothing(delta, viewport, held_viewport) {
+        return Ok(Owed::Nothing);
+    }
+    for row in &mut rows {
+        truncate_row(row);
+    }
+    let generation = delta.projection_generation;
+    Ok(Owed::Update(Update {
+        events: vec![ProjectionEvent::Delta(Box::new(ProjectionDelta {
+            base_cursor: U64::new(delta.base_cursor),
+            next_cursor: U64::new(delta.next_cursor),
+            projection_generation: U64::new(generation),
+            buffer: wire::buffer(buffer),
+            viewport: wire::viewport(viewport)?,
+            rows,
+            cursor: wire::cursor(delta.cursor),
+            modes: delta.modes.iter().map(|entry| wire::mode(*entry)).collect(),
+            margins: Nullable(delta.margins.map(wire::margins)),
+            rendition: Nullable(delta.rendition.map(wire::rendition)),
+            tab_stops: Nullable(
+                delta
+                    .tab_stops
+                    .as_ref()
+                    .map(|stops| stops.iter().map(|at| wire::cells(*at)).collect()),
+            ),
+            charsets: Nullable(delta.charsets.as_ref().map(wire::charsets)),
+            hyperlinks: wire::hyperlinks(&delta.hyperlinks)?,
+            hyperlink: Nullable(delta.hyperlink.as_ref().map(|uri| {
+                kr_protocol::projection::HyperlinkChange {
+                    uri: Nullable(uri.clone()),
+                }
+            })),
+            title: Nullable(delta.title.as_ref().map(wire::title)),
+            title_stack: Nullable(
+                delta
+                    .title_stack
+                    .as_ref()
+                    .map(|stack| stack.iter().map(wire::saved_title).collect()),
+            ),
+            keyboard: Nullable(delta.keyboard.as_ref().map(wire::keyboard)),
+            palette: Nullable(delta.palette.as_ref().map(wire::palette)),
+            dimensions: Nullable(delta.dimensions.map(|size| {
+                kr_protocol::session::Dimensions::new(u64::from(size.cols), u64::from(size.rows))
+            })),
+            saved_cursors: Nullable(delta.saved_cursors.as_ref().map(wire::saved_cursors)),
+            oldest_retained_row: wire::row_id(oldest_retained_row)?,
+            evicted,
+        }))],
+        base: Base {
+            cursor: delta.next_cursor,
+            generation,
+        },
+    }))
+}
+
+/// Whether a delta would change nothing a client is holding.
+///
+/// The cursor is not part of the question when the delta stands where the client already does:
+/// nothing can have moved the cursor without a byte, a mode or a row, and every one of those is
+/// checked here.
+fn carries_nothing(delta: &Delta, viewport: Viewport, held: Option<Viewport>) -> bool {
+    delta.next_cursor == delta.base_cursor
+        && delta.rows.is_empty()
+        && delta.modes.is_empty()
+        && delta.hyperlinks.is_empty()
+        && delta.margins.is_none()
+        && delta.rendition.is_none()
+        && delta.tab_stops.is_none()
+        && delta.charsets.is_none()
+        && delta.title.is_none()
+        && delta.title_stack.is_none()
+        && delta.keyboard.is_none()
+        && delta.palette.is_none()
+        && delta.dimensions.is_none()
+        && delta.saved_cursors.is_none()
+        && delta.hyperlink.is_none()
+        && held == Some(viewport)
+}
+
+/// Builds the reset one attachment receives when its screen is no longer continuous.
+#[must_use]
+pub fn reset(generation: u64, cursor: u64, reason: ProjectionResetReason) -> ProjectionEvent {
+    ProjectionEvent::Reset(ProjectionReset {
+        projection_generation: U64::new(generation),
+        cursor: U64::new(cursor),
+        reason,
+    })
+}
+
+/// What one event costs a subscriber's send queue.
+///
+/// The queue is bounded in bytes and an event is not bytes until something encodes it, so the cost
+/// is measured here rather than guessed at by the hub. It counts the rows the way a page bound
+/// counts them and adds a fixed envelope for the state around them, which is what the header and
+/// the delta carry whatever their rows are.
+#[must_use]
+pub fn event_bytes(event: &ProjectionEvent) -> usize {
+    /// What a header costs before its rows: the modes, the palette, the tab stops and the rest.
+    const HEADER_ENVELOPE: usize = 4 * 1024;
+    /// What a delta or a reset costs before its rows.
+    const UPDATE_ENVELOPE: usize = 512;
+    let rows = |rows: &[ProjectedRow]| -> usize {
+        rows.iter()
+            .fold(0_u64, |total, row| {
+                total.saturating_add(wire::row_bytes(row))
+            })
+            .try_into()
+            .unwrap_or(usize::MAX)
+    };
+    match event {
+        ProjectionEvent::Reset(_) => UPDATE_ENVELOPE,
+        ProjectionEvent::Snapshot(_) => HEADER_ENVELOPE,
+        ProjectionEvent::Rows(page) => UPDATE_ENVELOPE.saturating_add(rows(&page.rows)),
+        ProjectionEvent::Delta(delta) => UPDATE_ENVELOPE.saturating_add(rows(&delta.rows)),
+    }
+}
+
+/// Whether these rows fit one page under both bounds.
+fn fits_one_page(rows: &[ProjectedRow]) -> bool {
+    if rows.len() as u64 > MAX_PROJECTION_PAGE_ROWS {
+        return false;
+    }
+    let total: u64 = rows.iter().fold(0_u64, |total, row| {
+        total.saturating_add(wire::row_bytes(row))
+    });
+    total <= MAX_PROJECTION_PAGE_BYTES
+}
+
+/// Splits rows into pages, each inside both bounds.
+///
+/// A row larger than a whole page is still representable: it is cut to the bound and marked
+/// truncated, because a reader that could never get past it would never see the rows after it.
+fn paginate(rows: Vec<ProjectedRow>) -> Vec<Vec<ProjectedRow>> {
+    let mut pages: Vec<Vec<ProjectedRow>> = Vec::new();
+    let mut page: Vec<ProjectedRow> = Vec::new();
+    let mut bytes = 0_u64;
+    for mut row in rows {
+        truncate_row(&mut row);
+        let cost = wire::row_bytes(&row);
+        let full = page.len() as u64 >= MAX_PROJECTION_PAGE_ROWS
+            || bytes.saturating_add(cost) > MAX_PROJECTION_PAGE_BYTES;
+        if full && !page.is_empty() {
+            pages.push(core::mem::take(&mut page));
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(cost);
+        page.push(row);
+    }
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    pages
+}
+
+/// Cuts one row's runs to the page bound, marking it truncated when anything was left out.
+fn truncate_row(row: &mut ProjectedRow) {
+    if wire::row_bytes(row) <= MAX_PROJECTION_PAGE_BYTES {
+        return;
+    }
+    let mut kept: Vec<kr_protocol::projection::CellRun> = Vec::new();
+    let mut bytes = wire::row_bytes(&ProjectedRow {
+        row: row.row,
+        soft_wrapped: row.soft_wrapped,
+        truncated: true,
+        runs: Vec::new(),
+    });
+    for run in core::mem::take(&mut row.runs) {
+        let cost = wire::row_bytes(&ProjectedRow {
+            row: row.row,
+            soft_wrapped: row.soft_wrapped,
+            truncated: true,
+            runs: vec![run.clone()],
+        });
+        if bytes.saturating_add(cost) > MAX_PROJECTION_PAGE_BYTES {
+            row.truncated = true;
+            break;
+        }
+        bytes = bytes.saturating_add(cost);
+        kept.push(run);
+    }
+    row.runs = kept;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::projection::{CellRendition, CellRun};
+
+    fn row(id: u64, text: &str) -> ProjectedRow {
+        ProjectedRow {
+            row: U64::new(id),
+            soft_wrapped: false,
+            truncated: false,
+            runs: vec![CellRun {
+                column: U64::ZERO,
+                cells: U64::new(text.chars().count() as u64),
+                text: text.to_owned(),
+                rendition: CellRendition::PLAIN,
+                hyperlink: Nullable::null(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_page_holds_at_most_the_row_bound() {
+        let rows: Vec<ProjectedRow> = (0..2_500).map(|id| row(id, "x")).collect();
+        let pages = paginate(rows);
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0].len(), MAX_PROJECTION_PAGE_ROWS as usize);
+        assert_eq!(pages[1].len(), MAX_PROJECTION_PAGE_ROWS as usize);
+        assert_eq!(pages[2].len(), 500);
+    }
+
+    #[test]
+    fn a_page_holds_at_most_the_byte_bound() {
+        let wide = "y".repeat(200 * 1024);
+        let rows: Vec<ProjectedRow> = (0..12).map(|id| row(id, &wide)).collect();
+        let pages = paginate(rows);
+        assert!(
+            pages.len() > 1,
+            "twelve rows of 200 KiB do not fit one page"
+        );
+        for page in &pages {
+            let total: u64 = page.iter().map(wire::row_bytes).sum();
+            assert!(
+                total <= MAX_PROJECTION_PAGE_BYTES,
+                "a page stayed inside the byte bound"
+            );
+        }
+    }
+
+    #[test]
+    fn one_row_larger_than_a_page_is_degraded_explicitly_rather_than_dropped() {
+        let enormous = "z".repeat(2 * MAX_PROJECTION_PAGE_BYTES as usize);
+        let pages = paginate(vec![row(7, &enormous)]);
+        assert_eq!(pages.len(), 1);
+        let row = &pages[0][0];
+        assert!(row.truncated, "the row says it is not all of the row");
+        assert!(
+            row.runs.is_empty(),
+            "the run that could not fit was left out"
+        );
+        assert_eq!(row.row.get(), 7, "and it is still the row it was");
+    }
+
+    #[test]
+    fn a_base_is_a_cursor_and_a_generation_together() {
+        let mut bases = Bases::new();
+        let id = AttachmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+        assert!(bases.held(id).is_none());
+        let window = Viewport {
+            top_row: 0,
+            rows: 4,
+            left_col: 0,
+            cols: 8,
+        };
+        bases.record(
+            id,
+            Held {
+                base: Base {
+                    cursor: 12,
+                    generation: 4,
+                },
+                viewport: window,
+            },
+        );
+        assert_eq!(
+            bases.held(id).map(|held| held.base),
+            Some(Base {
+                cursor: 12,
+                generation: 4
+            })
+        );
+        assert_eq!(bases.held(id).map(|held| held.viewport), Some(window));
+        bases.forget_all();
+        assert!(bases.is_empty());
+    }
+
+    /// KR-REQ-08.83: a change larger than one bounded update is a repaint, and pages.
+    #[test]
+    fn a_change_larger_than_one_bounded_update_asks_for_a_snapshot() {
+        let rows: Vec<kr_term::grid::GridRow> = (0..=MAX_PROJECTION_PAGE_ROWS)
+            .map(|id| kr_term::grid::GridRow {
+                stable_id: i64::try_from(id).expect("a row"),
+                soft_wrapped: false,
+                truncated: false,
+                runs: Vec::new(),
+            })
+            .collect();
+        let window = Viewport {
+            top_row: 0,
+            rows: 4,
+            left_col: 0,
+            cols: 8,
+        };
+        let delta = Delta {
+            base_cursor: 0,
+            next_cursor: 1,
+            projection_generation: 1,
+            rows,
+            cursor: kr_term::snapshot::CursorState {
+                col: 0,
+                row: 0,
+                visible: true,
+                style: 1,
+                pending_wrap: false,
+            },
+            modes: Vec::new(),
+            margins: None,
+            rendition: None,
+            tab_stops: None,
+            charsets: None,
+            hyperlinks: Vec::new(),
+            title: None,
+            keyboard: None,
+            palette: None,
+            dimensions: None,
+            title_stack: None,
+            saved_cursors: None,
+            hyperlink: None,
+        };
+        assert_eq!(
+            advance(
+                &delta,
+                ActiveBuffer::Primary,
+                window,
+                0,
+                false,
+                Some(window)
+            )
+            .expect("an answer"),
+            Owed::Snapshot(ProjectionResetReason::Repaint),
+            "one message larger than a page bound is not an update"
+        );
+    }
+
+    #[test]
+    fn a_palette_choice_records_where_the_colours_came_from() {
+        assert_eq!(
+            PaletteChoice::ProfileDefault.palette().source(),
+            PaletteSource::ProfileDefault
+        );
+        assert_eq!(
+            PaletteChoice::DarkPreset.palette().source(),
+            PaletteSource::DarkPreset
+        );
+        let shared = PaletteChoice::Shared {
+            foreground: Rgb::new(1, 2, 3),
+            background: Rgb::new(4, 5, 6),
+        }
+        .palette();
+        assert_eq!(shared.source(), PaletteSource::ClientPreference);
+        assert_eq!(
+            shared.dynamic(kr_term::palette::DynamicColour::Foreground),
+            Rgb::new(1, 2, 3)
+        );
+    }
+}

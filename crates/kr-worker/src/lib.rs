@@ -20,6 +20,7 @@
 //! | [`pty`] | The pseudo-terminal, created before the root shell, and the shell it runs |
 //! | [`questions`] | The question ledger: what an agent asks, and what a person answers |
 //! | [`session`] | The session: lifecycle, the serial order every change shares, and closure |
+//! | [`snapshot`] | The projection a client holds: snapshots, bounded row pages, deltas and resets |
 //! | [`runtime`] | The reader, the writer, the recogniser timer, the supervision and the closure sequence |
 //! | [`service`] | The private endpoint: the handshake, the challenge and the method dispatch |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
@@ -41,5 +42,6 @@ pub mod render;
 pub mod runtime;
 pub mod service;
 pub mod session;
+pub mod snapshot;
 
 pub use crate::error::{Result, WorkerError};

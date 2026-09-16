@@ -981,25 +981,46 @@ async fn attach_samples(
         ) {
             return Vec::new();
         }
-        // The screen itself. This is what the person sees, and it is where the clock stops.
+        // The screen itself. This is what the person sees, and it is where the clock stops. The
+        // two presentations reach it by different routes: a terminal of the session's own size is
+        // sent the bytes that put it into the session's state, and a projected client is sent the
+        // canonical grid as state and draws it itself, which is complete when the last row page of
+        // its snapshot arrives.
         let screen = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let Ok(frame) = client.recv().await else {
                     return false;
                 };
-                if let kr_protocol::envelope::ControlFrame::Notification(notification) = frame
-                    && notification.event_type.as_str() == "session.output"
-                    && let Ok(event) = notification
-                        .payload
-                        .to_typed::<kr_protocol::recovery::OutputEvent>()
-                {
-                    // A screen a terminal can draw, not merely a frame that arrived: the payload
-                    // decodes and it places the cursor, which every restoration ends by doing.
-                    return event
-                        .bytes
-                        .as_slice()
-                        .windows(4)
-                        .any(|window| window == b"\x1b[?25" || window.starts_with(b"\x1b["));
+                let kr_protocol::envelope::ControlFrame::Notification(notification) = frame else {
+                    continue;
+                };
+                match notification.event_type.as_str() {
+                    "session.output" => {
+                        if let Ok(event) = notification
+                            .payload
+                            .to_typed::<kr_protocol::recovery::OutputEvent>()
+                        {
+                            // A screen a terminal can draw, not merely a frame that arrived: the
+                            // payload decodes and it places the cursor, which every restoration
+                            // ends by doing.
+                            return event.bytes.as_slice().windows(4).any(|window| {
+                                window == b"\x1b[?25" || window.starts_with(b"\x1b[")
+                            });
+                        }
+                    }
+                    "session.projection.rows" => {
+                        if let Ok(page) = notification
+                            .payload
+                            .to_typed::<kr_protocol::projection::ProjectionRowPage>()
+                            && !page.more
+                        {
+                            // The whole screen has arrived. A client that had only some of it would
+                            // be mixing an incomplete repaint with live output, which section 8
+                            // forbids, so this is the moment it becomes usable.
+                            return true;
+                        }
+                    }
+                    _ => {}
                 }
             }
         })
