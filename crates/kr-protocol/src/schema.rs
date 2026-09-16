@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 
 use crate::actor::ActorEnvelope;
 use crate::archive::{ArchiveDescriptor, RecoveryBundle, RecoveryKit, SignedArchiveManifest};
+use crate::account::{MembershipLease, PolicyAuthority};
 use crate::attachment::{
     AttachmentConfigureParams, AttachmentSummary, AttachmentViewportParams,
     AttachmentViewportResult, GeometryResult, GeometryState, SessionAttachParams,
@@ -140,10 +141,12 @@ pub fn protocol_schema() -> Value {
         "input_write_result" => InputWriteResult,
         "local_hello" => LocalHello,
         "local_hello_ack" => LocalHelloAck,
+        "membership_lease" => MembershipLease,
         "method_entry" => MethodEntry,
         "mutation_request" => MutationRequest,
         "notification" => Notification,
         "output_event" => OutputEvent,
+        "policy_authority" => PolicyAuthority,
         "owner_confirmation_proof" => OwnerConfirmationProof,
         "owner_confirmation_request" => OwnerConfirmationRequest,
         "pair_finish_request" => PairFinishRequest,
@@ -277,6 +280,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "pairing_sequence" => ids::PairingSequence,
         "payer_authorisation_id" => ids::PayerAuthorisationId,
         "plugin_id" => ids::PluginId,
+        "policy_key_revision" => ids::PolicyKeyRevision,
         "project_repository_id" => ids::ProjectRepositoryId,
         "question_id" => ids::QuestionId,
         "question_revision" => ids::QuestionRevision,

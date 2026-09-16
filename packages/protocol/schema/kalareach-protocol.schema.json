@@ -4044,6 +4044,73 @@
       ],
       "type": "object"
     },
+    "MembershipLease": {
+      "additionalProperties": false,
+      "description": "A signed statement that one account held one role in one organisation.",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/MembershipLeasePayload",
+          "description": "What the organisation states."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The policy-signing key's signature over [`MembershipLeasePayload::signing_input`]."
+        }
+      },
+      "required": [
+        "payload",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "MembershipLeasePayload": {
+      "additionalProperties": false,
+      "description": "What a membership lease states, and exactly what its signature covers.",
+      "properties": {
+        "account_id": {
+          "$ref": "#/$defs/AccountId",
+          "description": "The account it names as a member."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it stops being usable, at most [`MEMBERSHIP_LEASE_MAX_LIFETIME_MS`] later."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the authority signed it, in UTC milliseconds."
+        },
+        "key_revision": {
+          "$ref": "#/$defs/PolicyKeyRevision",
+          "description": "The policy-key revision that signed it."
+        },
+        "maximum_grants": {
+          "description": "The most the role may carry. A host intersects this with its own policy.",
+          "items": {
+            "$ref": "#/$defs/ActionRight"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation the lease speaks for."
+        },
+        "role": {
+          "$ref": "#/$defs/TeamRole",
+          "description": "The role that account held when the lease was signed."
+        }
+      },
+      "required": [
+        "organisation_id",
+        "account_id",
+        "role",
+        "maximum_grants",
+        "issued_at_ms",
+        "expires_at_ms",
+        "key_revision"
+      ],
+      "type": "object"
+    },
     "MeteringRole": {
       "description": "A forwarding boundary inside one relay instance.\n\nA payload crosses two boundaries at a relay: it is read from the sending connection and it is\nwritten to the receiving one. They are not the same event. A payload counted as it arrives may\nstill be fenced by a revocation, dropped for a full queue or lost to a closing connection before\nit is delivered, so which boundary counts decides what the payer pays for.",
       "oneOf": [
@@ -5627,6 +5694,146 @@
       "description": "A plugin identifier from its manifest.",
       "maxLength": 256,
       "minLength": 1,
+      "type": "string"
+    },
+    "PolicyAuthority": {
+      "additionalProperties": false,
+      "description": "An organisation's policy-signing authority as it is published.",
+      "properties": {
+        "chain": {
+          "description": "Every revision in order, starting at the first.",
+          "items": {
+            "$ref": "#/$defs/PolicyAuthorityLink"
+          },
+          "type": "array"
+        },
+        "head": {
+          "$ref": "#/$defs/PolicyAuthorityHead",
+          "description": "Which revision signs now, signed by that revision."
+        },
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation the chain belongs to."
+        }
+      },
+      "required": [
+        "organisation_id",
+        "chain",
+        "head"
+      ],
+      "type": "object"
+    },
+    "PolicyAuthorityHead": {
+      "additionalProperties": false,
+      "description": "The signed statement of which revision is signing right now.\n\nIt expires, so a captured statement stops being usable, and a host that has accepted a later\nrevision refuses one naming an earlier revision. A retained private key of a retired revision\ncan still sign statements naming that revision, which is why rotation destroys it.",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/PolicyAuthorityHeadPayload",
+          "description": "What the authority states."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The signature of the revision the statement names, over\n[`PolicyAuthorityHeadPayload::signing_input`]."
+        }
+      },
+      "required": [
+        "payload",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "PolicyAuthorityHeadPayload": {
+      "additionalProperties": false,
+      "description": "Which revision signs right now, and exactly what its signature covers.",
+      "properties": {
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it stops, at most [`POLICY_AUTHORITY_HEAD_MAX_LIFETIME_MS`] later."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the authority made the statement, in UTC milliseconds."
+        },
+        "key_revision": {
+          "$ref": "#/$defs/PolicyKeyRevision",
+          "description": "The last revision of the chain, which signs leases now."
+        },
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation this statement belongs to."
+        }
+      },
+      "required": [
+        "organisation_id",
+        "key_revision",
+        "issued_at_ms",
+        "expires_at_ms"
+      ],
+      "type": "object"
+    },
+    "PolicyAuthorityLink": {
+      "additionalProperties": false,
+      "description": "One step in an organisation's policy-signing authority chain.\n\nThe first revision signs itself and names no predecessor, which is what a host pins. Every\nlater revision is signed by the revision it names, so a host that pinned the first can follow\nthe chain to the key signing now, and a link cannot be re-parented under a revision it was not\nissued against.\n\nA link carries no expiry, because when a revision stops signing is not known when it is issued.\nIts successor's `not_before_ms` is when it stopped.",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/PolicyAuthorityLinkPayload",
+          "description": "What this revision states."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The predecessor's signature over [`PolicyAuthorityLinkPayload::signing_input`], or this\nrevision's own at the first revision."
+        }
+      },
+      "required": [
+        "payload",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "PolicyAuthorityLinkPayload": {
+      "additionalProperties": false,
+      "description": "One revision of an organisation's policy-signing key, and exactly what its signature covers.",
+      "properties": {
+        "key_revision": {
+          "$ref": "#/$defs/PolicyKeyRevision",
+          "description": "The revision this link establishes."
+        },
+        "not_before_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When this revision took over signing, in UTC milliseconds."
+        },
+        "organisation_id": {
+          "$ref": "#/$defs/OrganisationId",
+          "description": "The organisation whose chain this link belongs to."
+        },
+        "previous_key_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PolicyKeyRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The revision whose key signed it, or null at the first revision, which signs itself."
+        },
+        "public_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The Ed25519 public key of this revision."
+        }
+      },
+      "required": [
+        "organisation_id",
+        "key_revision",
+        "previous_key_revision",
+        "public_key",
+        "not_before_ms"
+      ],
+      "type": "object"
+    },
+    "PolicyKeyRevision": {
+      "description": "The revision of an organisation's policy-signing key, advanced on every rotation.",
+      "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
     "Presentation": {
@@ -8307,6 +8514,31 @@
       ],
       "type": "object"
     },
+    "TeamRole": {
+      "description": "An organisation role, from the least to the most authority.\n\nA role is a label for a grant ceiling. A host authorises from the grants a lease names, never\nfrom the label: [`TeamRole::maximum_grants`] is the most a role may ever carry, and a lease may\nname less.",
+      "oneOf": [
+        {
+          "const": "viewer",
+          "description": "Watch a shared session.",
+          "type": "string"
+        },
+        {
+          "const": "reviewer",
+          "description": "Watch a shared session and read the diffs and files it selects.",
+          "type": "string"
+        },
+        {
+          "const": "controller",
+          "description": "Take part in a session: input and answers as well as reading.",
+          "type": "string"
+        },
+        {
+          "const": "owner",
+          "description": "Everything a controller may do, plus sharing and closing a session.",
+          "type": "string"
+        }
+      ]
+    },
     "TerminalGeometryTransferParams": {
       "additionalProperties": false,
       "description": "Parameters of `terminal.geometry.transfer`.\n\nThis is the deliberate \"use this terminal's size\" action. Ordinary attach and input takeover\nnever move size ownership.",
@@ -8990,6 +9222,9 @@
         "plugin_id": {
           "$ref": "#/$defs/PluginId"
         },
+        "policy_key_revision": {
+          "$ref": "#/$defs/PolicyKeyRevision"
+        },
         "project_repository_id": {
           "$ref": "#/$defs/ProjectRepositoryId"
         },
@@ -9107,6 +9342,9 @@
     "local_hello_ack": {
       "$ref": "#/$defs/LocalHelloAck"
     },
+    "membership_lease": {
+      "$ref": "#/$defs/MembershipLease"
+    },
     "method_entry": {
       "$ref": "#/$defs/MethodEntry"
     },
@@ -9130,6 +9368,9 @@
     },
     "pair_status": {
       "$ref": "#/$defs/PairStatus"
+    },
+    "policy_authority": {
+      "$ref": "#/$defs/PolicyAuthority"
     },
     "proposed_grant": {
       "$ref": "#/$defs/ProposedGrant"

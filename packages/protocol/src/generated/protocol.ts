@@ -399,6 +399,10 @@ export type PayerAuthorisationId = string
  */
 export type PluginId = string
 /**
+ * The revision of an organisation's policy-signing key, advanced on every rotation.
+ */
+export type PolicyKeyRevision = string
+/**
  * One environment-bound source repository.
  */
 export type ProjectRepositoryId = string
@@ -706,6 +710,7 @@ export interface KalaReachProtocol {
     pairing_sequence?: PairingSequence
     payer_authorisation_id?: PayerAuthorisationId
     plugin_id?: PluginId
+    policy_key_revision?: PolicyKeyRevision
     project_repository_id?: ProjectRepositoryId
     question_id?: QuestionId
     question_revision?: QuestionRevision
@@ -745,6 +750,7 @@ export interface KalaReachProtocol {
   input_write_result?: InputWriteResult
   local_hello?: LocalHello
   local_hello_ack?: LocalHelloAck
+  membership_lease?: MembershipLease
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
   notification?: Notification
@@ -753,6 +759,7 @@ export interface KalaReachProtocol {
   owner_confirmation_request?: OwnerConfirmationRequest1
   pair_finish_request?: PairFinishRequest
   pair_status?: PairStatus
+  policy_authority?: PolicyAuthority
   proposed_grant?: ProposedGrant
   protocol_error?: ProtocolError
   receipt?: Receipt3
@@ -3440,6 +3447,49 @@ export interface InputWriteResult {
   sequence: string
 }
 /**
+ * A signed statement that one account held one role in one organisation.
+ */
+export interface MembershipLease {
+  payload: MembershipLeasePayload
+  /**
+   * The policy-signing key's signature over [`MembershipLeasePayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the organisation states.
+ */
+export interface MembershipLeasePayload {
+  /**
+   * The account it names as a member.
+   */
+  account_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * The policy-key revision that signed it.
+   */
+  key_revision: string
+  /**
+   * The most the role may carry. A host intersects this with its own policy.
+   */
+  maximum_grants: ActionRight[]
+  /**
+   * The organisation the lease speaks for.
+   */
+  organisation_id: string
+  /**
+   * The role that account held when the lease was signed.
+   */
+  role: 'viewer' | 'reviewer' | 'controller' | 'owner'
+}
+/**
  * One exhaustive authority entry.
  */
 export interface MethodEntry {
@@ -3947,6 +3997,96 @@ export interface PairFinishRequest {
    * The transcript both devices confirmed.
    */
   transcript: string
+}
+/**
+ * An organisation's policy-signing authority as it is published.
+ */
+export interface PolicyAuthority {
+  /**
+   * Every revision in order, starting at the first.
+   */
+  chain: PolicyAuthorityLink[]
+  head: PolicyAuthorityHead
+  /**
+   * The organisation the chain belongs to.
+   */
+  organisation_id: string
+}
+/**
+ * One step in an organisation's policy-signing authority chain.
+ *
+ * The first revision signs itself and names no predecessor, which is what a host pins. Every
+ * later revision is signed by the revision it names, so a host that pinned the first can follow
+ * the chain to the key signing now, and a link cannot be re-parented under a revision it was not
+ * issued against.
+ *
+ * A link carries no expiry, because when a revision stops signing is not known when it is issued.
+ * Its successor's `not_before_ms` is when it stopped.
+ */
+export interface PolicyAuthorityLink {
+  payload: PolicyAuthorityLinkPayload
+  /**
+   * The predecessor's signature over [`PolicyAuthorityLinkPayload::signing_input`], or this
+   * revision's own at the first revision.
+   */
+  signature: string
+}
+/**
+ * What this revision states.
+ */
+export interface PolicyAuthorityLinkPayload {
+  /**
+   * The revision this link establishes.
+   */
+  key_revision: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  not_before_ms: string
+  /**
+   * The organisation whose chain this link belongs to.
+   */
+  organisation_id: string
+  /**
+   * The revision whose key signed it, or null at the first revision, which signs itself.
+   */
+  previous_key_revision: PolicyKeyRevision | null
+  /**
+   * The Ed25519 public key of this revision.
+   */
+  public_key: string
+}
+/**
+ * Which revision signs now, signed by that revision.
+ */
+export interface PolicyAuthorityHead {
+  payload: PolicyAuthorityHeadPayload
+  /**
+   * The signature of the revision the statement names, over
+   * [`PolicyAuthorityHeadPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the authority states.
+ */
+export interface PolicyAuthorityHeadPayload {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * The revision of an organisation's policy-signing key, advanced on every rotation.
+   */
+  key_revision: string
+  /**
+   * The organisation this statement belongs to.
+   */
+  organisation_id: string
 }
 /**
  * The rights an invitation proposes, before the host issues a grant.
