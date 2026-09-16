@@ -53,7 +53,6 @@ use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::SecretStore;
 use kr_pairing::confirm::HostEnrolment;
 use kr_pairing::host::HostIdentity;
-use kr_protocol::envelope::Notification;
 use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision};
 use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::{AuthorisationKey, EndpointKey};
@@ -71,7 +70,7 @@ use config::NetworkSettings;
 use devices::{DeviceDirectory, DeviceRecord};
 use dispatch::RemoteConnection;
 use pairing::{HostPairingClock, PairingHost};
-use proxy::{RELAY_DEPTH, WorkerProxy};
+use proxy::{RELAY_DEPTH, RelayBudget, Relayed, WorkerProxy};
 
 /// The scope this host's own network device keys are stored under.
 ///
@@ -84,6 +83,13 @@ use proxy::{RELAY_DEPTH, WorkerProxy};
 pub fn device_key_scope(environment_id: kr_protocol::ids::EnvironmentId) -> String {
     format!("{environment_id}/network-device")
 }
+
+/// How long the daemon waits for one worker to install an authority revision.
+///
+/// A worker holds its dispatch barrier for the length of one effect, so an announcement can
+/// legitimately wait. What it must not do is wait for ever: a paused session would otherwise hold
+/// up a device attaching to a different one.
+pub const ACKNOWLEDGEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The environment variable naming the signer every pairing confirmation must carry.
 pub const OWNER_KEY: &str = "KR_NETWORK_OWNER_KEY";
@@ -261,6 +267,13 @@ pub struct NetworkHost {
     devices: Arc<DeviceDirectory>,
     pairing: Option<Arc<PairingHost>>,
     endpoint: kr_transport::config::EndpointConfig,
+    /// Every authorised connection this host is serving.
+    ///
+    /// A revocation needs them: withdrawing a registration stops the next request, and a device
+    /// whose record has gone must also lose the write boundary it is holding and whatever it owns
+    /// at its worker. Nothing else needs them, which is why they are recorded here rather than in
+    /// the daemon's own authority store.
+    live: std::sync::Mutex<std::collections::BTreeMap<ConnectionId, Arc<RemoteConnection>>>,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -374,56 +387,99 @@ impl NetworkHost {
             &session,
             notifications,
         ));
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(connection_id, Arc::clone(&remote));
+        // The guard is what releases this connection, and it does it from a destructor because
+        // this future is *cancelled* rather than finished the moment the control stream ends: the
+        // transport races the handler against the stream and against the connection, so the end of
+        // the loop below is not a place cleanup can live.
+        let _guard = ConnectionGuard {
+            host: Arc::clone(&self),
+            controller: Arc::clone(&controller),
+            remote: Arc::clone(&remote),
+            connection_id,
+        };
         // The relay is its own task, because a subscription delivers whenever the session produces
         // output and the request loop below is usually waiting for the device rather than for the
-        // worker. It checks the registration before each batch it writes, which is what stops a
-        // fenced connection from being served a subscription it had already started.
-        let relay = tokio::spawn(relay_loop(
-            relayed,
-            session.control.sender(),
-            Arc::clone(&controller),
-            connection_id,
-        ));
-        while let Some(frame) = session.control.recv().await {
-            let Some(answer) = remote.answer(frame).await else {
-                break;
-            };
-            if session.control.send(&answer).await.is_err() {
-                break;
+        // worker. It checks the registration and the grant before each batch it writes, which is
+        // what stops a fenced connection from being served a subscription it had already started.
+        let mut relay = tokio::spawn(relay_loop(relayed, Arc::clone(&remote)));
+        loop {
+            tokio::select! {
+                frame = session.control.recv() => {
+                    let Some(frame) = frame else { break };
+                    let Some(answer) = remote.answer(frame).await else {
+                        break;
+                    };
+                    if !remote.output().send(&answer).await {
+                        break;
+                    }
+                }
+                // The relay stopping ends this connection. It stops when its link to the worker
+                // went, when the authority behind it was withdrawn, or when the device fell far
+                // enough behind that holding more of the session's output for it would have become
+                // the worker's problem. Either way the subscription is gone, and section 8 has the
+                // device reconnect and restore its state from the cursor it holds rather than go
+                // on against a stream that has stopped without saying so.
+                _ = &mut relay => break,
             }
         }
         relay.abort();
-        // Releasing what this connection owned at the worker must complete, and this future is
-        // cancelled the moment the control stream ends, so it belongs to a task that outlives it.
-        let released = Arc::clone(&remote);
-        tokio::spawn(async move {
-            released.release().await;
-            controller.deregister(connection_id).await;
-        });
     }
 
     /// Revokes one device and fences whatever it was doing.
+    ///
+    /// The order is the contract. The live fence goes first, because it is the only step that
+    /// cannot fail and the only one whose absence would leave a revoked device being served: the
+    /// registration is withdrawn, the connection's write boundary is closed, and what it owned at
+    /// its worker is released. Only then is the record written and the revision advanced, both
+    /// inside the same critical section, so nothing can be admitted between a withdrawn record and
+    /// the revision that fences the connections already admitted. A failure after the fence is
+    /// reported with the fence standing rather than silently leaving it undone.
     async fn revoke_device(&self, device_id: DeviceId) -> Result<RevocationStatus> {
         let controller = self.daemon()?;
         let revision = {
             let mut registry = controller.registry.lock().await;
-            // The record and the revision in one critical section. A connection admitted between
-            // the two would either read a withdrawn record as current or survive the revision that
-            // fences the ones already admitted.
-            self.devices.revoke(device_id, kr_ipc::now_ms())?;
-            registry.advance_authority_revision()?;
-            let revision = registry.authority_revision()?;
+            let revoked = kr_transport::listener::device_principal(&device_id);
             // The connections this fences are this device's. Nobody else's authority was
             // withdrawn, and a local terminal losing its connection because a phone was revoked
             // would be a fence on the wrong thing.
-            let revoked = kr_transport::listener::device_principal(&device_id);
             let mut admitted = controller.admitted.lock().await;
             admitted.retain(|_, connection| connection.actor_id != revoked);
             drop(admitted);
-            revision
+            self.withdraw_device(device_id);
+            self.devices.revoke(device_id, kr_ipc::now_ms())?;
+            registry.advance_authority_revision()?;
+            registry.authority_revision()?
         };
         controller.leases.revoke(revision);
         controller.announce_authority_revision().await
+    }
+
+    /// Withdraws every live connection of one device.
+    ///
+    /// Withdrawing the registration stops the next request; this stops the writes and releases
+    /// what the connection owned at its worker, which is what a revoked device's attachment and
+    /// input lease would otherwise keep holding.
+    fn withdraw_device(&self, device_id: DeviceId) {
+        let withdrawn: Vec<Arc<RemoteConnection>> = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|remote| remote.device_id() == device_id)
+            .map(Arc::clone)
+            .collect();
+        for remote in withdrawn {
+            remote.output().withdraw();
+            // Releasing the worker link waits for a socket, so it belongs to a task rather than to
+            // the critical section a revocation is holding.
+            tokio::spawn(async move {
+                remote.release().await;
+            });
+        }
     }
 
     fn daemon(&self) -> Result<Arc<Controller>> {
@@ -435,27 +491,54 @@ impl NetworkHost {
 
 /// Relays one connection's subscribed notifications, while it is still authorised to receive them.
 async fn relay_loop(
-    mut relayed: tokio::sync::mpsc::Receiver<Notification>,
-    sender: kr_transport::listener::ControlSender,
-    controller: Arc<Controller>,
-    connection_id: ConnectionId,
+    mut relayed: tokio::sync::mpsc::Receiver<Relayed>,
+    remote: Arc<RemoteConnection>,
 ) {
-    while let Some(notification) = relayed.recv().await {
+    while let Some(item) = relayed.recv().await {
         // Before it is served, not after. A revocation that landed while this batch was waiting
         // has already withdrawn the registration, and section 9's dispatch barrier does not cover
-        // a subscription that was already running.
-        if controller.authorised(connection_id).await.is_err() {
+        // a subscription that was already running. The grant is checked here too, because a grant
+        // that ran out mid-subscription is an authority that has gone just as surely.
+        let authorised = remote.is_authorised().await && remote.grant_is_current();
+        let frame = kr_protocol::envelope::ControlFrame::Notification(item.notification.clone());
+        item.release();
+        if !authorised {
             return;
         }
-        if sender
-            .send(&kr_protocol::envelope::ControlFrame::Notification(
-                notification,
-            ))
-            .await
-            .is_err()
-        {
+        if !remote.output().send(&frame).await {
             return;
         }
+    }
+}
+
+/// Releases one connection when its handler goes, however it went.
+///
+/// The transport races a handler against the control stream and against the connection, so the
+/// handler's future is dropped rather than finished in the ordinary case. A destructor is the one
+/// place that runs either way.
+struct ConnectionGuard {
+    host: Arc<NetworkHost>,
+    controller: Arc<Controller>,
+    remote: Arc<RemoteConnection>,
+    connection_id: ConnectionId,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.host
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.connection_id);
+        let remote = Arc::clone(&self.remote);
+        let controller = Arc::clone(&self.controller);
+        let connection_id = self.connection_id;
+        // Releasing the worker link and withdrawing the registration both have to complete, and
+        // neither can run in a destructor, so they run on a task that outlives the connection.
+        tokio::spawn(async move {
+            remote.release().await;
+            controller.deregister(connection_id).await;
+        });
     }
 }
 
@@ -513,6 +596,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         devices,
         pairing,
         endpoint: setup.settings.endpoint.clone(),
+        live: std::sync::Mutex::new(std::collections::BTreeMap::new()),
     });
     let mut config = ListenerConfig::new(
         setup.settings.endpoint,
@@ -560,7 +644,8 @@ impl Controller {
     pub(crate) async fn open_proxy(
         self: &Arc<Self>,
         session_id: kr_protocol::ids::SessionId,
-        notifications: tokio::sync::mpsc::Sender<Notification>,
+        notifications: tokio::sync::mpsc::Sender<Relayed>,
+        budget: Arc<RelayBudget>,
     ) -> Result<Arc<WorkerProxy>> {
         // A worker that has started answering since the last attempt rejoins the directory here,
         // so a device can attach to a session the daemon had not reached at startup.
@@ -576,14 +661,86 @@ impl Controller {
             .ok_or_else(|| ControllerError::UnknownSession {
                 session: session_id.to_string(),
             })?;
-        let proxy = WorkerProxy::open(self, &worker, notifications).await?;
+        let proxy = WorkerProxy::open(self, &worker, notifications, budget).await?;
         // A dispatch lease is renewed only after the worker has acknowledged the authority
-        // revision in force, and a worker starts having acknowledged nothing. Announcing it here,
-        // over the authority connection rather than this proxy, is what makes the first remote
-        // dispatch to a fresh worker possible: until the worker installs the revision, there is
-        // nothing to say it has fenced whatever the revision removed.
-        self.announce_authority_revision().await?;
+        // revision in force, and a worker starts having acknowledged nothing. Asking *this* worker
+        // for its acknowledgement is what makes the first remote dispatch to it possible; asking
+        // every worker would make one paused session everybody's wait.
+        let _ = self.acknowledge_worker_revision(session_id).await;
         Ok(proxy)
+    }
+
+    /// Asks one worker to install this environment's authority revision.
+    ///
+    /// A revocation is complete for a worker once that worker has acknowledged the revision that
+    /// removed the authority, or is confirmed ended; and a dispatch lease is renewed only after
+    /// that acknowledgement. This is the one-worker form of both: it announces over the authority
+    /// connection, records what the worker installed, and lifts the lease's fence under the same
+    /// binding the announcement travelled on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written, or when the worker is not in
+    /// the directory.
+    pub(crate) async fn acknowledge_worker_revision(
+        self: &Arc<Self>,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Result<()> {
+        let revision = self.registry.lock().await.authority_revision()?;
+        let worker = self
+            .directory
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| ControllerError::UnknownSession {
+                session: session_id.to_string(),
+            })?;
+        // The binding is taken before the announcement travels, so an acknowledgement that arrives
+        // over a control path this daemon has already given up on lifts nothing.
+        let binding = self.leases.binding(session_id);
+        let answered = {
+            let mut held = self.worker_client(&worker).await?;
+            let client = held.as_mut().expect("the connection is open");
+            let answered = tokio::time::timeout(
+                ACKNOWLEDGEMENT_TIMEOUT,
+                client.announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
+                    environment_id: self.paths().environment_id(),
+                    revision,
+                }),
+            )
+            .await;
+            match answered {
+                Ok(Ok(ack)) => Some(ack),
+                // A worker that did not answer, or that could not be reached, has not installed
+                // the revision. Renewal stops for it until it does.
+                Ok(Err(_)) | Err(_) => {
+                    *held = None;
+                    self.leases.stop_renewal(session_id, binding);
+                    None
+                }
+            }
+        };
+        match answered {
+            Some(ack) if ack.revision.get() >= revision.get() => {
+                self.registry
+                    .lock()
+                    .await
+                    .record_acknowledged_revision(session_id, ack.revision)?;
+                self.leases.acknowledge(session_id, binding, ack.revision);
+                Ok(())
+            }
+            _ => {
+                // A worker that is confirmed gone answers the question a different way: it can no
+                // longer act under anything.
+                if self.reconcile(session_id).await?.is_some() {
+                    self.leases.worker_ended(session_id);
+                }
+                Err(ControllerError::supervision(
+                    "this session's worker has not installed the environment's authority revision",
+                ))
+            }
+        }
     }
 
     /// Returns the deadline a forwarded mutation carries, bounded by the dispatch lease.
@@ -599,12 +756,22 @@ impl Controller {
     /// Returns an error when no lease can be taken, or when the accepted deadline has already
     /// passed: a spent deadline is never forwarded as though it had time left.
     pub(crate) async fn forwarded_deadline(
-        &self,
+        self: &Arc<Self>,
         session_id: kr_protocol::ids::SessionId,
         actor: &kr_protocol::actor::ActorEnvelope,
         accepted: AcceptedDeadline,
     ) -> Result<kr_protocol::scalars::U64> {
-        let lease: Option<ContinuousInstant> = self.dispatch_lease(session_id, actor).await?;
+        let lease: Option<ContinuousInstant> = match self.dispatch_lease(session_id, actor).await {
+            Ok(lease) => lease,
+            // A worker that has not installed the revision in force has no lease to renew. Asking
+            // it once, here, is what lets a dispatch to a worker this daemon has not spoken to
+            // about authority succeed rather than fail on a condition the daemon itself can meet.
+            Err(refused) => {
+                self.acknowledge_worker_revision(session_id).await?;
+                let _ = refused;
+                self.dispatch_lease(session_id, actor).await?
+            }
+        };
         crate::service::remaining_deadline(
             &*self.shared_clock,
             &*self.clock,

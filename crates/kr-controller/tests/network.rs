@@ -61,7 +61,7 @@ use kr_protocol::preauth::{
 };
 use kr_protocol::recovery::{EventStream, EventsSubscribeResult, OutputEvent};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, U64};
+use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, U64, Uuid};
 use kr_protocol::session::{
     Presentation, SessionCloseParams, SessionCreateParams, SessionCreateResult, SessionReadParams,
     SessionReadResult, SessionState, ShellMode,
@@ -356,11 +356,20 @@ fn owner_context() -> OwnerContext {
 /// daemon decides for itself. What the daemon owns is the challenge, the ledger that makes it
 /// single use, and the record the approval commits.
 async fn pair(daemon: &RunningDaemon, device: &Device, owner: &DeviceKeys) -> DeviceRecord {
+    pair_with(daemon, device, owner, proposal()).await
+}
+
+/// Runs a complete direct pairing under an exact proposed grant.
+async fn pair_with(
+    daemon: &RunningDaemon,
+    device: &Device,
+    owner: &DeviceKeys,
+    proposal: ProposedGrant,
+) -> DeviceRecord {
     let pairing = daemon.network.pairing().expect("this host accepts pairing");
     let owner_context = owner_context();
     // One proposal, used for the challenge and for the invitation. The owner approves an exact
     // proposal, digest and all, so a second one built a millisecond later is a different thing.
-    let proposal = proposal();
     let rights: BTreeSet<ActionRight> = proposal.actions.iter().copied().collect();
 
     // The owner authorises the invitation, naming the rights it proposes.
@@ -382,7 +391,10 @@ async fn pair(daemon: &RunningDaemon, device: &Device, owner: &DeviceKeys) -> De
         .issue_direct(
             proposal.clone(),
             GrantKind::SessionInvitation,
-            &owner_context,
+            daemon
+                .network
+                .network_config()
+                .expect("the host's selected configuration"),
             &pairing.approval(&owner_context, &request, &proof),
         )
         .expect("an invitation");
@@ -880,14 +892,17 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
         .await
         .expect("the revocation is recorded");
 
+    // The fence is not a recorded state the next request happens to notice: withdrawing the
+    // registration takes the connection's write boundary with it and ends the connection, so there
+    // is no further read and no further dispatch on it at all.
     let refused = session
         .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
         .await
         .expect_err("a revoked device is refused");
     assert_eq!(
         refused.code(),
-        ErrorCode::PermissionDenied,
-        "the fence is on the dispatch path, not merely recorded"
+        ErrorCode::ResourceUnavailable,
+        "the connection a revoked device held is ended rather than answered"
     );
 
     // And it cannot come back: its record is withdrawn, so a fresh connection is not authorised.
@@ -1224,6 +1239,246 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
     );
 
     drop(attached_locally);
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// A grant that sees one session and may type in it, and claims nothing else.
+fn viewer_proposal(session_selector: SessionSelector) -> ProposedGrant {
+    ProposedGrant {
+        parent_grant_id: Nullable::null(),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector,
+        actions: [ActionRight::SessionView, ActionRight::TerminalInput]
+            .into_iter()
+            .collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: true,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(
+                kr_ipc::now_ms().get().saturating_add(24 * 60 * 60 * 1000),
+            ),
+        },
+        organisation: Nullable::null(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_devices_grant_bounds_what_it_can_reach() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let worker_endpoint = kr_ipc::paths::Endpoint::from_path(
+        created
+            .endpoint
+            .as_ref()
+            .cloned()
+            .expect("a live session names its worker"),
+    )
+    .expect("a worker endpoint");
+
+    // A local attachment, which the remote device must not be able to reach.
+    let mut attached_locally =
+        LocalClient::connect(&worker_endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("the local client reaches the worker");
+    let local_attachment: SessionAttachResult = attached_locally
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget {
+                environment_id: host.environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Semantic,
+                claim_geometry: false,
+                dimensions: Nullable::null(),
+                terminal_profile_id: Nullable::null(),
+                requested: [AttachmentCapability::ObserveTerminal]
+                    .into_iter()
+                    .collect(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the local attachment is admitted")
+        .to_typed()
+        .expect("an attachment");
+
+    let device = Device::create(&loopback()).await;
+    let record = pair_with(
+        &daemon,
+        &device,
+        &owner,
+        viewer_proposal(SessionSelector::Any),
+    )
+    .await;
+    let session = connect(&daemon, &device, &record).await;
+
+    // The grant carries no terminal.geometry, so a request that *claims* geometry is refused
+    // before it reaches the worker. The condition on that right is the request's own.
+    let claimed = session
+        .mutate(
+            Method::SessionAttach,
+            ActionTarget {
+                environment_id: host.environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            None,
+            &ParamsValue::empty(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: true,
+                dimensions: Nullable::some(kr_protocol::session::Dimensions {
+                    rows: kr_protocol::scalars::U64::new(40),
+                    columns: kr_protocol::scalars::U64::new(120),
+                }),
+                terminal_profile_id: Nullable::null(),
+                requested: [
+                    AttachmentCapability::ObserveTerminal,
+                    AttachmentCapability::Geometry,
+                ]
+                .into_iter()
+                .collect(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("a grant with no geometry right claims no geometry");
+    assert_eq!(claimed.code(), ErrorCode::PermissionDenied);
+
+    // Retained history is not something this host can narrow to a grant's lower bound, so it is
+    // refused rather than served in full.
+    let history = session
+        .history_page(&kr_protocol::recovery::HistoryPageParams {
+            session_id,
+            from_cursor: U64::ZERO,
+            max_bytes: U64::new(4_096),
+        })
+        .await
+        .expect_err("retained history is refused");
+    assert_eq!(history.code(), ErrorCode::PermissionDenied);
+
+    // An attachment identifier is not permission: the device may detach its own and nothing else.
+    let (attachment_id, _subscribed) = attach(&session, host.environment_id, session_id).await;
+    let stolen = session
+        .mutate(
+            Method::SessionDetach,
+            ActionTarget {
+                environment_id: host.environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            None,
+            &ParamsValue::empty(),
+            &kr_protocol::attachment::SessionDetachParams {
+                attachment_id: local_attachment.attachment.attachment_id,
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("a device detaches its own attachment and nothing else");
+    assert_eq!(
+        stolen.code(),
+        ErrorCode::AmbiguousAttachment,
+        "the refusal names the attachment rather than the session: {stolen}"
+    );
+    assert!(
+        session
+            .mutate(
+                Method::SessionDetach,
+                ActionTarget {
+                    environment_id: host.environment_id,
+                    session_id: Nullable::some(session_id),
+                    session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                    application_instance_id: Nullable::null(),
+                    agent_binding_revision: Nullable::null(),
+                },
+                None,
+                &ParamsValue::empty(),
+                &kr_protocol::attachment::SessionDetachParams { attachment_id },
+                DurationMs::new(120_000),
+            )
+            .await
+            .is_ok(),
+        "and its own it may detach"
+    );
+
+    session.close();
+    drop(attached_locally);
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listing_names_only_the_sessions_a_grant_admits() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+
+    // A grant for a session that is not this one. A listing names no session, so nothing about the
+    // request says which sessions it may see; the answer is what has to be narrowed.
+    let elsewhere = SessionSelector::These {
+        session_ids: [SessionId::new(Uuid::from_bytes([0xab; 16]))]
+            .into_iter()
+            .collect(),
+    };
+    let device = Device::create(&loopback()).await;
+    let record = pair_with(&daemon, &device, &owner, viewer_proposal(elsewhere)).await;
+    let session = connect(&daemon, &device, &record).await;
+
+    let listed: kr_protocol::session::SessionListResult = session
+        .read(
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: true,
+            },
+        )
+        .await
+        .expect("the listing is served");
+    assert!(
+        listed.sessions.is_empty(),
+        "a device is told about the sessions its grant admits and no others: {:?}",
+        listed
+            .sessions
+            .iter()
+            .map(|summary| summary.session_id)
+            .collect::<Vec<_>>()
+    );
+    // And a session it names directly is refused rather than narrowed away.
+    let refused = session
+        .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect_err("a session outside the grant is refused");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+
+    session.close();
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }

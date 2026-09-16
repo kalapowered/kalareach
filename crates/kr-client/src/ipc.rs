@@ -161,18 +161,24 @@ impl ControlTransport for IpcTransport {
             if self.has_closed() {
                 return Ok(None);
             }
-            let mut held = self.reader.lock().await;
-            let reader = held.as_mut().ok_or(ClientError::ConnectionEnded)?;
+            // The read half is taken out for the duration of the read and put back afterwards.
+            // That is what makes a cancelled read close the socket: the reader lives in this
+            // future while it waits, so dropping the future drops it. Leaving it in the slot would
+            // mean a session that was closed while its reader was parked kept the socket, and the
+            // worker's attachment with it, for as long as anything held the session.
+            let Some(mut reader) = self.reader.lock().await.take() else {
+                return Err(ClientError::ConnectionEnded);
+            };
             // A local frame reader reports the end of the stream as a failure rather than as an
             // absent message, because every local exchange has a next frame until the peer goes
             // away. To a session the two are one thing: the connection ended.
             let frame = reader.read_message::<ControlFrame>().await;
             match frame {
-                Ok(frame) if !self.has_closed() => Ok(Some(frame)),
-                Ok(_) | Err(_) => {
-                    held.take();
-                    Ok(None)
+                Ok(frame) if !self.has_closed() => {
+                    *self.reader.lock().await = Some(reader);
+                    Ok(Some(frame))
                 }
+                Ok(_) | Err(_) => Ok(None),
             }
         })
     }
@@ -186,14 +192,23 @@ impl ControlTransport for IpcTransport {
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         // Whichever half nothing is using is released here. A call that is in flight holds the
-        // other one and releases it when it sees the flag, and the socket closes once both are
-        // gone.
+        // other one: a read holds it inside its own future, so cancelling that future drops it,
+        // and a write releases it when it sees the flag. The socket closes once both are gone.
         if let Ok(mut held) = self.writer.try_lock() {
             held.take();
         }
         if let Ok(mut held) = self.reader.try_lock() {
             held.take();
         }
+    }
+}
+
+impl Drop for IpcTransport {
+    fn drop(&mut self) {
+        // Both halves go with the transport, whether or not anything called `close`. A socket that
+        // outlived its transport would keep whatever it is attached to on the host alive with it.
+        self.writer.get_mut().take();
+        self.reader.get_mut().take();
     }
 }
 

@@ -47,6 +47,71 @@ pub const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 /// behind ends its connection; the alternative is holding the worker's own delivery task.
 pub const RELAY_DEPTH: usize = 256;
 
+/// How many queued *bytes* the relay holds for one remote connection.
+///
+/// A count of notifications is not a bound on memory: one output notification can carry a large
+/// batch, so 256 of them would be far more than section 9's 8 MiB send queue per peer. This is
+/// that bound, charged before a notification is queued and released once it has been written or
+/// discarded.
+pub const RELAY_QUEUED_BYTES: usize = kr_protocol::limits::MAX_SEND_QUEUE_BYTES;
+
+/// One notification on its way to a remote connection, and what it is charged.
+#[derive(Debug)]
+pub struct Relayed {
+    /// The notification.
+    pub notification: Notification,
+    /// What it was charged against the connection's queue.
+    charged: usize,
+    budget: Arc<RelayBudget>,
+}
+
+impl Relayed {
+    /// Releases this notification's charge, once it has been written or discarded.
+    pub fn release(&self) {
+        self.budget.release(self.charged);
+    }
+}
+
+/// What one remote connection has queued and not yet had written.
+#[derive(Debug)]
+pub struct RelayBudget {
+    queued: std::sync::atomic::AtomicUsize,
+    ceiling: usize,
+}
+
+impl RelayBudget {
+    /// Creates a budget with the connection's ceiling.
+    #[must_use]
+    pub const fn new(ceiling: usize) -> Self {
+        Self {
+            queued: std::sync::atomic::AtomicUsize::new(0),
+            ceiling,
+        }
+    }
+
+    /// Charges `bytes`, or refuses when the connection is already holding its ceiling.
+    fn charge(&self, bytes: usize) -> bool {
+        let mut held = self.queued.load(Ordering::Acquire);
+        loop {
+            let next = held.saturating_add(bytes);
+            if next > self.ceiling {
+                return false;
+            }
+            match self
+                .queued
+                .compare_exchange_weak(held, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(current) => held = current,
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        self.queued.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
+
 /// One remote connection's link to one worker.
 #[derive(Debug)]
 pub struct WorkerProxy {
@@ -81,7 +146,8 @@ impl WorkerProxy {
     pub async fn open(
         controller: &Arc<Controller>,
         worker: &KnownWorker,
-        notifications: tokio::sync::mpsc::Sender<Notification>,
+        notifications: tokio::sync::mpsc::Sender<Relayed>,
+        budget: Arc<RelayBudget>,
     ) -> Result<Arc<Self>> {
         let mut client = LocalClient::connect(
             &worker.endpoint,
@@ -119,7 +185,12 @@ impl WorkerProxy {
         let (reader, writer, _acknowledgement) = client.into_halves();
         let waiters: Arc<std::sync::Mutex<Waiters>> =
             Arc::new(std::sync::Mutex::new(Waiters::default()));
-        let reader = tokio::spawn(read_loop(reader, Arc::clone(&waiters), notifications));
+        let reader = tokio::spawn(read_loop(
+            reader,
+            Arc::clone(&waiters),
+            notifications,
+            budget,
+        ));
         Ok(Arc::new(Self {
             session_id: worker.descriptor.session_id,
             writer: Mutex::new(writer),
@@ -127,6 +198,15 @@ impl WorkerProxy {
             reader,
             next_request: AtomicU64::new(1),
         }))
+    }
+
+    /// Returns true while this link can still carry a call.
+    ///
+    /// A link whose reader has stopped is not a link a caller may reuse: its subscription is gone
+    /// and its attachment at the worker went with the socket.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        !self.waiters().ended
     }
 
     /// Returns the session this link serves.
@@ -219,15 +299,22 @@ impl WorkerProxy {
             waiters.pending.insert(request_id, sender);
             receiver
         };
-        if let Err(error) = self.writer.lock().await.write_message(frame).await {
-            self.waiters().pending.remove(&request_id);
-            return Err(error.into());
-        }
-        match tokio::time::timeout(CALL_TIMEOUT, receiver).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(ControllerError::supervision(
+        // The whole exchange is bounded, not only the wait for the answer. A worker that is not
+        // reading its socket can block the write itself, and a timeout that started afterwards
+        // would never start at all.
+        let exchange = async {
+            self.writer.lock().await.write_message(frame).await?;
+            Ok::<_, ControllerError>(receiver.await)
+        };
+        match tokio::time::timeout(CALL_TIMEOUT, exchange).await {
+            Ok(Ok(Ok(response))) => Ok(response),
+            Ok(Ok(Err(_))) => Err(ControllerError::supervision(
                 "this session's proxy link ended before the worker answered",
             )),
+            Ok(Err(error)) => {
+                self.waiters().pending.remove(&request_id);
+                Err(error)
+            }
             Err(_) => {
                 self.waiters().pending.remove(&request_id);
                 Err(ControllerError::supervision(
@@ -258,7 +345,8 @@ impl Drop for WorkerProxy {
 async fn read_loop(
     mut reader: kr_ipc::framed::FrameReader,
     waiters: Arc<std::sync::Mutex<Waiters>>,
-    notifications: tokio::sync::mpsc::Sender<Notification>,
+    notifications: tokio::sync::mpsc::Sender<Relayed>,
+    budget: Arc<RelayBudget>,
 ) {
     loop {
         let frame: ControlFrame = match reader.read_message().await {
@@ -277,9 +365,25 @@ async fn read_loop(
                 }
             }
             // A subscription this link started. It goes to the relay, which is what decides
-            // whether the remote connection may still be served it.
+            // whether the remote connection may still be served it. A connection that is not
+            // keeping up is told rather than waited for: the link ends, which takes its
+            // subscription and its attachment with it, and the device reconnects and resubscribes
+            // from the cursor it holds. Holding the worker's delivery task instead would make one
+            // slow device everybody's problem.
             ControlFrame::Notification(notification) => {
-                if notifications.try_send(notification).is_err() {
+                let charged = kr_cbor::to_canonical_value(&notification)
+                    .map(|value| kr_cbor::encoded_len(&value))
+                    .unwrap_or(usize::MAX);
+                if !budget.charge(charged) {
+                    break;
+                }
+                let relayed = Relayed {
+                    notification,
+                    charged,
+                    budget: Arc::clone(&budget),
+                };
+                if let Err(refused) = notifications.try_send(relayed) {
+                    refused.into_inner().release();
                     break;
                 }
             }

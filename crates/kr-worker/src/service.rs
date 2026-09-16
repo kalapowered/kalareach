@@ -638,16 +638,13 @@ impl WorkerService {
                 Some(self.acknowledge_revision(state, &notice))
             }
             ControlFrame::Request(request) => {
-                let actor_id = state.actor_id.clone();
-                Some(self.request(state, &request, &actor_id, ActorIngress::LocalIpc))
+                let caller = Caller::local(state.actor_id.clone());
+                Some(self.request(state, &request, &caller))
             }
-            ControlFrame::Mutation(mutation) => Some(self.mutation(
-                state,
-                &mutation,
-                state.actor_id.clone(),
-                ActorIngress::LocalIpc,
-                Freshness::Window,
-            )),
+            ControlFrame::Mutation(mutation) => {
+                let caller = Caller::local(state.actor_id.clone());
+                Some(self.mutation(state, &mutation, &caller, Freshness::Window))
+            }
             ControlFrame::Forwarded(forwarded) => Some(self.forwarded(state, &forwarded)),
             ControlFrame::ForwardedRead(forwarded) => Some(self.forwarded_read(state, &forwarded)),
             _ => Some(failure(
@@ -1142,8 +1139,7 @@ impl WorkerService {
         &self,
         state: &mut ConnectionState,
         request: &Request,
-        actor_id: &ActorId,
-        ingress: ActorIngress,
+        caller: &Caller,
     ) -> ControlFrame {
         if !state.negotiated {
             return failure(request.request_id, &not_negotiated());
@@ -1154,7 +1150,7 @@ impl WorkerService {
         let Some(method) = request.method.method() else {
             return failure(request.request_id, &unlisted());
         };
-        if Self::entry(method, request.method_version, ingress).is_none() {
+        if Self::entry(method, request.method_version, caller.ingress).is_none() {
             return failure(request.request_id, &unlisted());
         }
         let outcome = match method {
@@ -1162,7 +1158,7 @@ impl WorkerService {
             Method::EventsSnapshot => self.events_snapshot(&request.params),
             Method::HistoryPage => self.history_page(state, &request.params),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params),
-            Method::ActionRead => self.action_read(actor_id, &request.params),
+            Method::ActionRead => self.action_read(&caller.actor_id, &request.params),
             Method::InputWrite => self.input_write(state, &request.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
@@ -1199,8 +1195,7 @@ impl WorkerService {
         &self,
         state: &mut ConnectionState,
         mutation: &MutationRequest,
-        actor_id: ActorId,
-        ingress: ActorIngress,
+        caller: &Caller,
         freshness: Freshness,
     ) -> ControlFrame {
         if !state.negotiated {
@@ -1212,10 +1207,10 @@ impl WorkerService {
         let Some(method) = mutation.method.method() else {
             return failure(mutation.request_id, &unlisted());
         };
-        let Some(entry) = Self::entry(method, mutation.method_version, ingress) else {
+        let Some(entry) = Self::entry(method, mutation.method_version, caller.ingress) else {
             return failure(mutation.request_id, &unlisted());
         };
-        match self.receipted(state, mutation, method, entry, actor_id, freshness) {
+        match self.receipted(state, mutation, method, entry, caller, freshness) {
             Ok(value) => ControlFrame::Response(Response {
                 request_id: mutation.request_id,
                 outcome: Outcome::Ok(value),
@@ -1294,8 +1289,7 @@ impl WorkerService {
         self.mutation(
             state,
             &forwarded.mutation,
-            forwarded.actor.actor_id.clone(),
-            forwarded.actor.ingress,
+            &Caller::forwarded(&forwarded.actor),
             Freshness::Vouched(deadline),
         )
     }
@@ -1347,8 +1341,7 @@ impl WorkerService {
         self.request(
             state,
             &forwarded.request,
-            &forwarded.actor.actor_id,
-            forwarded.actor.ingress,
+            &Caller::forwarded(&forwarded.actor),
         )
     }
 
@@ -1358,9 +1351,10 @@ impl WorkerService {
         mutation: &MutationRequest,
         method: Method,
         entry: &'static kr_protocol::authority::MethodEntry,
-        actor_id: ActorId,
+        caller: &Caller,
         freshness: Freshness,
     ) -> Result<ParamsValue> {
+        let actor_id = caller.actor_id.clone();
         // Everything from here to the recorded outcome happens inside the barrier. The authority
         // this request was admitted under cannot change underneath it, and two mutations cannot
         // interleave their checks with each other's effects.
@@ -1369,6 +1363,13 @@ impl WorkerService {
             .lock()
             .expect("the dispatch barrier is not poisoned");
         self.check_authority(state)?;
+        // Inside the barrier, and before anything durable: an action the daemon validated under an
+        // authority revision this worker has since installed past is an action whose authority has
+        // been withdrawn. The daemon takes its lease before it forwards, but a request can arrive
+        // after the revision it was validated under was replaced, and the barrier is where that has
+        // to be caught: a revocation is complete for a worker when the worker has stopped being
+        // able to act under what it removed.
+        self.check_validated_revision(caller)?;
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
 
@@ -1401,7 +1402,7 @@ impl WorkerService {
         // The envelope is checked before anything durable happens: the target this worker will
         // act on, the grant the caller claims, the preconditions the subject must still satisfy
         // and the freshness window that admits a first request.
-        self.check_envelope(mutation, entry)?;
+        self.check_envelope(mutation, entry, caller)?;
         // The deadline lives on the continuous clock. That is what admission, revalidation and
         // expiry all read, so a wall clock that moves cannot lengthen or shorten an action's life.
         let now = self.clock.now();
@@ -1513,7 +1514,7 @@ impl WorkerService {
             }
         }
 
-        let outcome = self.apply(&mut session, state, mutation, method);
+        let outcome = self.apply(&mut session, state, mutation, method, caller);
         let now = kr_ipc::now_ms();
         match (&outcome, session.journal_mut()) {
             (Ok((value, _)), Some(journal)) => {
@@ -1618,6 +1619,7 @@ impl WorkerService {
         &self,
         mutation: &MutationRequest,
         entry: &'static kr_protocol::authority::MethodEntry,
+        caller: &Caller,
     ) -> Result<()> {
         use kr_protocol::authority::ResourceSelectorKind;
 
@@ -1668,15 +1670,52 @@ impl WorkerService {
                 "this endpoint serves the session itself, not an application instance".to_owned(),
             ));
         }
-        // A local caller's authority is the operating-system caller the listener authenticated.
-        // Section 23 leaves the grant null for exactly that reason, and a grant identifier
-        // presented here would be a claim the worker cannot check.
-        if mutation.grant_id.as_ref().is_some() {
-            return Err(WorkerError::InvalidArgument(
-                "a local caller acts under its authenticated operating-system identity, not a \
-                 grant"
-                    .to_owned(),
-            ));
+        // What a caller may say about its grant depends on how it reached the host. A local
+        // caller's authority is the operating-system caller the listener authenticated, so section
+        // 23 leaves its grant null and an identifier presented here would be a claim the worker
+        // cannot check. A forwarded caller does act under a grant, and the daemon has already
+        // checked which: the request may name it, and it may name no other.
+        match mutation.grant_id.as_ref() {
+            None => {}
+            Some(_) if !caller.is_remote() => {
+                return Err(WorkerError::InvalidArgument(
+                    "a local caller acts under its authenticated operating-system identity, not a \
+                     grant"
+                        .to_owned(),
+                ));
+            }
+            Some(named) if caller.grant_id.as_ref() != Some(named) => {
+                return Err(WorkerError::InvalidArgument(
+                    "this request names a grant the host did not check it against".to_owned(),
+                ));
+            }
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Refuses an action validated under an authority revision this worker has installed past.
+    ///
+    /// A local caller has no revision to compare: its authority is the operating-system identity
+    /// the socket authenticated, and nothing about an authority revision withdraws that. A
+    /// forwarded caller's authority is a grant the daemon checked at a revision, and this worker
+    /// installing a later one is exactly the event that withdraws it.
+    fn check_validated_revision(&self, caller: &Caller) -> Result<()> {
+        let Some(validated) = caller.validated_revision else {
+            return Ok(());
+        };
+        let acknowledged = self
+            .authority
+            .lock()
+            .expect("the authority lock is not poisoned")
+            .acknowledged_revision;
+        if acknowledged.is_some_and(|held| held.get() > validated.get()) {
+            return Err(WorkerError::GenerationFenced {
+                detail: format!(
+                    "this action was admitted under authority revision {validated}, and this \
+                     worker holds a later one"
+                ),
+            });
         }
         Ok(())
     }
@@ -2080,6 +2119,7 @@ impl WorkerService {
         state: &mut ConnectionState,
         mutation: &MutationRequest,
         method: Method,
+        caller: &Caller,
     ) -> Result<(ParamsValue, AfterEffect)> {
         let params = &mutation.params;
         match method {
@@ -2096,6 +2136,14 @@ impl WorkerService {
             }
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(params)?;
+                // Whose attachment a caller may detach depends on how it reached the host. Every
+                // local caller is the same authenticated operating-system user, and detaching from
+                // another window is something a person does on purpose. A forwarded caller is a
+                // different actor, and an attachment identifier is not permission: it detaches
+                // what its own connection created and nothing else.
+                if caller.is_remote() {
+                    Self::check_attachment(state, params.attachment_id)?;
+                }
                 let outcome = session.detach(params.attachment_id);
                 // Detaching releases the lease, which moves the input fence, and can produce the
                 // terminator of a paste the attachment had open. Both are published here, *before*
@@ -2197,8 +2245,11 @@ impl WorkerService {
                             detail: "this session retains no receipts, so none can be cancelled"
                                 .to_owned(),
                         })?;
+                // The action is the caller's own. The journal is keyed by the verified actor and
+                // the action together, so a caller the daemon forwarded cancels its own action and
+                // cannot reach one belonging to whoever ran the proxy.
                 let receipt =
-                    journal.cancel(state.actor_id.clone(), params.action_id, kr_ipc::now_ms())?;
+                    journal.cancel(caller.actor_id.clone(), params.action_id, kr_ipc::now_ms())?;
                 Ok((
                     encode(&kr_protocol::receipt::ActionCancelResult { receipt })?,
                     AfterEffect::None,
@@ -2225,6 +2276,57 @@ pub struct JoinedScreen {
     pub bytes: Vec<u8>,
     /// The part of the stream that is no longer readable, when the client had fallen behind it.
     pub gap: Option<kr_protocol::recovery::HistoryGap>,
+}
+
+/// Who one request is served as.
+///
+/// A local caller is the operating-system identity the socket authenticated. A forwarded caller is
+/// whoever the control daemon authenticated somewhere else, and the daemon vouches for four things
+/// this worker cannot establish for itself: the principal, the ingress the request entered the host
+/// by, the grant it was checked against and the authority revision it was checked at.
+#[derive(Clone, Debug)]
+pub struct Caller {
+    /// The principal the request is attributed to.
+    pub actor_id: ActorId,
+    /// Where the request entered the host.
+    pub ingress: ActorIngress,
+    /// The grant the daemon checked it against, when one applies.
+    pub grant_id: Nullable<kr_protocol::ids::GrantId>,
+    /// The authority revision the daemon validated that grant at.
+    ///
+    /// A forwarded request carries one; a local caller does not, because its authority is the
+    /// operating-system identity the socket authenticated rather than a grant.
+    pub validated_revision: Option<kr_protocol::ids::AuthorityRevision>,
+}
+
+impl Caller {
+    /// Returns the caller of a request that arrived on this connection's own socket.
+    #[must_use]
+    pub fn local(actor_id: ActorId) -> Self {
+        Self {
+            actor_id,
+            ingress: ActorIngress::LocalIpc,
+            grant_id: Nullable::null(),
+            validated_revision: None,
+        }
+    }
+
+    /// Returns the caller the control daemon vouched for.
+    #[must_use]
+    pub fn forwarded(actor: &ActorEnvelope) -> Self {
+        Self {
+            actor_id: actor.actor_id.clone(),
+            ingress: actor.ingress,
+            grant_id: actor.grant_id,
+            validated_revision: actor.grant_revision.as_ref().copied(),
+        }
+    }
+
+    /// Returns true when this caller reached the host over a network transport.
+    #[must_use]
+    pub const fn is_remote(&self) -> bool {
+        self.ingress.is_remote()
+    }
 }
 
 /// What decides whether a mutation may be admitted for the first time.
