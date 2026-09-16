@@ -131,8 +131,10 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
     // exercised the policy and must not pass as though it had. A case for the other platform is
     // skipped by name, which is a stated exclusion rather than a silent one.
     let mut missing = Vec::new();
+    let mut skipped_objects = Vec::new();
     for entry in &fixture.tree {
         if !applies(&entry.platforms) {
+            skipped_objects.push(entry.path.clone());
             continue;
         }
         if let Err(reason) = build(&inside, entry) {
@@ -180,7 +182,12 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
     );
     // The other platform's cases are named, so the qualification run there can see which ones it
     // is responsible for rather than inferring them from a quiet pass here.
-    println!("{} skipped on {}: {skipped:?}", skipped.len(), platform());
+    println!(
+        "{}: {} lookups skipped {skipped:?}, {} objects skipped {skipped_objects:?}",
+        platform(),
+        skipped.len(),
+        skipped_objects.len()
+    );
     // Nothing beneath the authority ever reached the tree outside it.
     assert_eq!(
         std::fs::read_to_string(outside.join("secret.txt")).expect("the outside file is intact"),
@@ -232,32 +239,62 @@ fn a_handle_keeps_its_object_and_a_replaced_path_does_not_extend_the_grant() {
     let recorded = authority.identity();
     let name = RelativeName::parse("notes.txt").expect("a valid relative name");
 
-    // The tree is renamed away and an unrelated one takes its name.
-    std::fs::rename(&original, root.path().join("moved")).expect("renames the tree");
-    std::fs::create_dir(&original).expect("creates a different tree");
-    std::fs::write(original.join("notes.txt"), b"an unrelated tree").expect("writes a file");
+    // What the platform does with an authorised directory whose path is taken away differs, and
+    // both answers are the guarantee: the handle keeps its object either way.
+    #[cfg(unix)]
+    {
+        // The tree is renamed away and an unrelated one takes its name.
+        std::fs::rename(&original, root.path().join("moved")).expect("renames the tree");
+        std::fs::create_dir(&original).expect("creates a different tree");
+        std::fs::write(original.join("notes.txt"), b"an unrelated tree").expect("writes a file");
+    }
+    #[cfg(windows)]
+    {
+        // A directory handle here is opened without delete sharing, so the platform refuses to
+        // move the directory at all while this authority holds it. Error 32 is the sharing
+        // violation.
+        let refusal = std::fs::rename(&original, root.path().join("moved"))
+            .expect_err("an authorised directory cannot be moved while it is held");
+        assert_eq!(
+            refusal.raw_os_error(),
+            Some(32),
+            "the refusal is a sharing violation, not something else: {refusal}"
+        );
+    }
 
     // The open handle still names what it opened.
     authority.revalidate().expect("the handle is unchanged");
-    let mut file = authority
-        .open_read(&name, ObjectPolicy::ReadableFile)
-        .expect("opens the recorded tree's own file");
-    let mut contents = String::new();
-    {
-        use std::io::Read as _;
-        file.handle_mut()
-            .read_to_string(&mut contents)
-            .expect("reads the file");
-    }
-    assert_eq!(contents, "the recorded tree");
+    assert_eq!(read_through(&authority, &name), "the recorded tree");
 
-    // A scope reopened from the recorded path finds a different object and is refused.
+    // A scope reopened from the recorded path finds a different object and is refused. The
+    // authority is released first, because the directory cannot move on Windows while it is held.
+    drop(authority);
+    #[cfg(windows)]
+    {
+        std::fs::rename(&original, root.path().join("moved")).expect("renames the released tree");
+        std::fs::create_dir(&original).expect("creates a different tree");
+        std::fs::write(original.join("notes.txt"), b"an unrelated tree").expect("writes a file");
+    }
     let reopened =
         AuthorisedDirectory::open_root(environment(), &original).expect("opens the new tree");
     assert!(matches!(
         reopened.check_identity(recorded),
         Err(Escape::IdentityChanged { .. })
     ));
+}
+
+/// Reads one file through an authority, which is the only way a test is allowed to reach it.
+fn read_through(authority: &AuthorisedDirectory, name: &RelativeName) -> String {
+    use std::io::Read as _;
+
+    let mut file = authority
+        .open_read(name, ObjectPolicy::ReadableFile)
+        .expect("opens the file the authority names");
+    let mut contents = String::new();
+    file.handle_mut()
+        .read_to_string(&mut contents)
+        .expect("reads the file");
+    contents
 }
 
 /// KR-REQ-14.05: a directory moved out of the authorised tree during a lookup takes the rest of
@@ -435,4 +472,93 @@ fn reparse_point(entry: &Entry, root: &Path, path: &Path) -> Result<(), String> 
 #[cfg(not(windows))]
 fn reparse_point(_entry: &Entry, _root: &Path, _path: &Path) -> Result<(), String> {
     Err("this platform has no reparse points".to_owned())
+}
+
+/// KR-REQ-14.05: a component replaced with a link *while* lookups are running never resolves
+/// outside the authorised tree.
+///
+/// The case the between-two-lookups test cannot reach is the replacement that lands inside one
+/// resolution. This runs the replacement in a loop beside the lookups and asserts what has to hold
+/// whatever the interleaving was: every lookup that succeeded read the authorised tree's own file,
+/// and every one that did not was refused.
+#[cfg(unix)]
+#[test]
+fn a_component_swapped_under_running_lookups_never_resolves_outside() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let inside = root.path().join("authorised");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(inside.join("src")).expect("creates the authorised tree");
+    std::fs::create_dir_all(&outside).expect("creates the tree outside it");
+    std::fs::write(inside.join("src/notes.txt"), b"inside").expect("writes the source");
+    std::fs::write(outside.join("notes.txt"), b"outside").expect("writes the decoy");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), &inside).expect("opens the authority");
+    let name = RelativeName::parse("src/notes.txt").expect("a valid relative name");
+    let stop = AtomicBool::new(false);
+    let swaps = AtomicUsize::new(0);
+
+    std::thread::scope(|threads| {
+        let swapper = threads.spawn(|| {
+            let real = inside.join("src");
+            let parked = inside.join(".parked");
+            while !stop.load(Ordering::Relaxed) {
+                // The real directory is parked and a link to the tree outside takes its name.
+                std::fs::rename(&real, &parked).expect("parks the real directory");
+                std::os::unix::fs::symlink(&outside, &real).expect("links to the outside tree");
+                // And then back again.
+                std::fs::remove_file(&real).expect("removes the link");
+                std::fs::rename(&parked, &real).expect("restores the real directory");
+                swaps.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let mut opened = 0_usize;
+        let mut refused = 0_usize;
+        for _ in 0..400 {
+            match authority.open_read(&name, ObjectPolicy::ReadableFile) {
+                Ok(mut file) => {
+                    use std::io::Read as _;
+                    let mut contents = String::new();
+                    file.handle_mut()
+                        .read_to_string(&mut contents)
+                        .expect("reads what was opened");
+                    assert_eq!(
+                        contents, "inside",
+                        "a lookup resolved to the tree outside the authority"
+                    );
+                    opened += 1;
+                }
+                Err(escape) => {
+                    assert!(
+                        matches!(
+                            escape,
+                            Escape::Link { .. }
+                                | Escape::NotFound { .. }
+                                | Escape::Unopenable { .. }
+                                | Escape::WrongKind { .. }
+                                | Escape::IdentityChanged { .. }
+                        ),
+                        "the refusal names what it found: {escape:?}"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().expect("the swapper did not panic");
+        assert_eq!(opened + refused, 400);
+        println!(
+            "{opened} lookups resolved, {refused} were refused, over {} swaps",
+            swaps.load(Ordering::Relaxed)
+        );
+    });
+
+    // The file outside the authority is exactly as it was.
+    assert_eq!(
+        std::fs::read_to_string(outside.join("notes.txt")).expect("the outside file is intact"),
+        "outside"
+    );
 }

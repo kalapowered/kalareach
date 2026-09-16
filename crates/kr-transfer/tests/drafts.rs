@@ -664,3 +664,92 @@ fn a_read_grant_is_narrow_and_expires() {
         .expect_err("refuses an expired grant");
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
 }
+
+/// KR-REQ-11.49: a declared external destination is recorded with the binding and disclosed by the
+/// draft, and one that is declared without being named is refused.
+#[test]
+fn a_declared_external_destination_is_recorded_and_disclosed() {
+    let harness = Harness::create();
+    let bytes = pattern(512);
+    let handle = harness.publish(&bytes, "image/png", "shot.png");
+    let draft = draft(&harness);
+    let mut declared = contribution(&handle, InsertionMethod::TypedSubmission);
+    declared.external_destination = Nullable::some("amp-service:media-uploads".to_owned());
+
+    let bound = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: draft.draft_id,
+                transfer_id: handle.transfer_id,
+                expected_revision: draft.revision,
+                contribution: declared.clone(),
+            },
+            None,
+        )
+        .expect("binds the attachment");
+    assert_eq!(
+        bound.attachment.external_destination,
+        Nullable::some("amp-service:media-uploads".to_owned()),
+        "the destination the operation declared is disclosed on the binding"
+    );
+
+    // The disclosure is a row, not a value that lived only in the reply: a client that reads the
+    // draft later still learns where the bytes go.
+    let reread = harness
+        .service
+        .draft(&harness.actor, draft.draft_id)
+        .expect("reads the draft back");
+    assert_eq!(
+        reread.attachments[0].external_destination,
+        Nullable::some("amp-service:media-uploads".to_owned())
+    );
+
+    // A destination declared without being named is refused, because an unnamed destination
+    // discloses nothing.
+    let second = harness.publish(&bytes, "image/png", "second.png");
+    let mut blank = contribution(&second, InsertionMethod::TypedSubmission);
+    blank.external_destination = Nullable::some("   ".to_owned());
+    let refusal = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: draft.draft_id,
+                transfer_id: second.transfer_id,
+                expected_revision: reread.revision,
+                contribution: blank.clone(),
+            },
+            None,
+        )
+        .expect_err("refuses an unnamed destination");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+
+    // So is one longer than a person reads.
+    let mut long = contribution(&second, InsertionMethod::TypedSubmission);
+    long.external_destination =
+        Nullable::some("d".repeat(kr_protocol::transfer::MAX_EXTERNAL_DESTINATION_LEN + 1));
+    let refusal = harness
+        .service
+        .draft_add_attachment(
+            &harness.actor,
+            &AgentDraftAddAttachmentParams {
+                draft_id: draft.draft_id,
+                transfer_id: second.transfer_id,
+                expected_revision: reread.revision,
+                contribution: long,
+            },
+            None,
+        )
+        .expect_err("refuses an unbounded destination");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+
+    // The refusals changed nothing: the draft still holds exactly the one binding that was made.
+    let after = harness
+        .service
+        .draft(&harness.actor, draft.draft_id)
+        .expect("reads the draft back");
+    assert_eq!(after.attachments.len(), 1);
+    assert_eq!(after.revision, reread.revision);
+}

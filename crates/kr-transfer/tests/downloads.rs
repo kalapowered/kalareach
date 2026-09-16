@@ -141,7 +141,13 @@ fn a_writable_source_is_staged_rather_than_trusted() {
             },
         )
         .expect("stages the snapshot");
-    assert_eq!(begun.immutability, DownloadImmutability::StagedSnapshot);
+    // Which mechanism produced it depends on the filesystem: a clone where one is available, a
+    // bounded copy where it is not. Either way the host holds its own bytes.
+    assert!(
+        begun.immutability.is_staged(),
+        "a writable source is never read in place: {:?}",
+        begun.immutability
+    );
     assert_eq!(begun.content_digest, digest(&bytes));
     assert_eq!(
         harness.service.staged_byte_len().expect("reads the total"),
@@ -536,17 +542,18 @@ fn revoking_read_authority_stops_further_bytes() {
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
 }
 
-/// KR-REQ-14.16: an attachment whose retention ended stops serving bytes to an open transfer.
+/// KR-REQ-14.16: an attachment whose retention ended stops serving bytes to an open transfer, at
+/// the deadline rather than at the next sweep.
 #[test]
 fn an_expired_attachment_stops_serving_an_open_transfer() {
     let harness = Harness::create();
     let bytes = pattern(1024);
     let handle = harness.publish(&bytes, "application/octet-stream", "notes.bin");
-    // The clock is moved to the attachment's own expiry before the transfer is opened, so the
-    // snapshot is the fresher of the two and the attachment is what runs out.
+    // One millisecond before the attachment's own deadline, so the transfer this opens outlives
+    // the attachment rather than the other way round.
     harness
         .clock
-        .set(support::START_MS + kr_protocol::transfer::UNUSED_ATTACHMENT_LIFETIME.get());
+        .set(support::START_MS + kr_protocol::transfer::UNUSED_ATTACHMENT_LIFETIME.get() - 1);
     let begun = harness
         .service
         .download_begin(
@@ -571,11 +578,10 @@ fn an_expired_attachment_stops_serving_an_open_transfer() {
             },
         )
         .expect("reads a chunk while the attachment holds");
-    let sweep = harness
-        .service
-        .sweep(&RetainEverything)
-        .expect("runs a sweep");
-    assert_eq!(sweep.expired_attachments, 1);
+
+    // The attachment's own deadline passes. No sweep has run, and it stops serving anyway: the
+    // sweep is a schedule, not the policy.
+    harness.clock.advance(1);
     let refusal = harness
         .service
         .download_chunk(
@@ -585,8 +591,114 @@ fn an_expired_attachment_stops_serving_an_open_transfer() {
                 index: U64::new(0),
             },
         )
-        .expect_err("refuses after the attachment expired");
+        .expect_err("refuses once the attachment's retention has ended");
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    // And the sweep, when it does run, agrees.
+    let sweep = harness
+        .service
+        .sweep(&RetainEverything)
+        .expect("runs a sweep");
+    assert_eq!(sweep.expired_attachments, 1);
+}
+
+/// KR-REQ-14.16: another principal cannot open a download over an attachment it does not own.
+#[test]
+fn another_principal_cannot_download_an_attachment() {
+    let harness = Harness::create();
+    let bytes = pattern(512);
+    let handle = harness.publish(&bytes, "application/octet-stream", "notes.bin");
+    let other = kr_protocol::ids::ActorId::new("local:someone-else").expect("a valid principal");
+    let refused = harness
+        .service
+        .download_begin(
+            &other,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Attachment {
+                    transfer_id: handle.transfer_id,
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect_err("refuses another principal's attachment");
+    let unknown = harness
+        .service
+        .download_begin(
+            &other,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Attachment {
+                    transfer_id: TransferId::new(Uuid::from_bytes([99; 16])),
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect_err("refuses an identifier that names nothing");
+    assert_eq!(
+        refused.code(),
+        unknown.code(),
+        "the refusal is never a signal that the identifier exists"
+    );
+    assert_eq!(
+        refused.to_string(),
+        format!("no transfer {}", handle.transfer_id)
+    );
+}
+
+/// KR-REQ-14.16: another principal cannot read or release a transfer it did not open.
+#[test]
+fn another_principal_cannot_read_or_release_a_transfer() {
+    let harness = Harness::create();
+    let bytes = pattern(512);
+    let handle = harness.publish(&bytes, "application/octet-stream", "notes.bin");
+    let begun = harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Attachment {
+                    transfer_id: handle.transfer_id,
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect("opens the source");
+    let other = kr_protocol::ids::ActorId::new("local:someone-else").expect("a valid principal");
+    let refused = harness
+        .service
+        .download_chunk(
+            &other,
+            &DownloadChunkParams {
+                transfer_id: begun.transfer_id,
+                index: U64::new(0),
+            },
+        )
+        .expect_err("refuses another principal");
+    assert_eq!(
+        refused.to_string(),
+        format!("no transfer {}", begun.transfer_id)
+    );
+    assert!(
+        harness
+            .service
+            .download_release(&other, begun.transfer_id)
+            .is_err()
+    );
+    // Its own principal still reaches it.
+    harness
+        .service
+        .download_chunk(
+            &harness.actor,
+            &DownloadChunkParams {
+                transfer_id: begun.transfer_id,
+                index: U64::new(0),
+            },
+        )
+        .expect("reads the chunk");
 }
 
 /// KR-REQ-14.16: the client verifies every chunk, the total size and the whole-file digest, writes
@@ -875,5 +987,405 @@ fn an_upload_stays_outside_repositories_and_is_reached_through_a_narrow_grant() 
     assert!(
         bound.attachment.read_grant.as_ref().is_none(),
         "a typed submission is given no path at all"
+    );
+}
+
+/// KR-REQ-14.08: two threads that stage snapshots at the environment's ceiling admit exactly one,
+/// and the bytes the ceiling accounts for are the ones that were staged.
+#[test]
+fn two_threads_that_stage_snapshots_at_the_ceiling_admit_exactly_one() {
+    let harness = Harness::create();
+    let tree = source_tree();
+    let bytes = pattern(8192);
+    std::fs::write(tree.path().join("one.bin"), &bytes).expect("writes the first source");
+    std::fs::write(tree.path().join("two.bin"), &bytes).expect("writes the second source");
+    let scope = harness
+        .service
+        .register_scope("a review tree", tree.path())
+        .expect("registers the scope");
+    // Room for exactly one snapshot of this size.
+    harness.set_limits(Limits {
+        max_file_len: 8192,
+        max_staged_len: 8192,
+        max_concurrent_transfers: 8,
+    });
+
+    let outcomes: Vec<_> = std::thread::scope(|scope_threads| {
+        let handles: Vec<_> = ["one.bin", "two.bin"]
+            .into_iter()
+            .map(|path| {
+                let harness = &harness;
+                scope_threads.spawn(move || {
+                    harness.service.download_begin(
+                        &harness.actor,
+                        &DownloadBeginParams {
+                            environment_id: harness.environment_id(),
+                            resume_transfer_id: Nullable::null(),
+                            source: Nullable::some(DownloadSource::Scope {
+                                scope_id: scope,
+                                relative_path: path.to_owned(),
+                            }),
+                            device_id: Nullable::null(),
+                        },
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("the thread did not panic"))
+            .collect()
+    });
+
+    let admitted: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok())
+        .collect();
+    let refused: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err())
+        .collect();
+    assert_eq!(admitted.len(), 1, "exactly one snapshot is admitted");
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].code(), ErrorCode::QuotaExceeded);
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        bytes.len() as u64,
+        "the accounted bytes are the one snapshot, not both"
+    );
+    // And the refusal left no payload of its own behind.
+    assert_eq!(
+        std::fs::read_dir(harness.service.staging().snapshots().display_path())
+            .expect("reads the snapshot area")
+            .count(),
+        1
+    );
+}
+
+/// KR-REQ-14.16: a cleanup that fails keeps the snapshot's bytes charged and its row marked, and a
+/// later pass removes the payload and releases them.
+///
+/// The fault is a staging area this host cannot write to, which is the shape every removal failure
+/// takes: the row says the payload is this environment's to remove, and until it is gone the bytes
+/// stay charged rather than being forgotten.
+#[cfg(unix)]
+#[test]
+fn a_cleanup_that_fails_keeps_the_bytes_charged_until_a_later_pass_succeeds() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let harness = Harness::create();
+    let tree = source_tree();
+    let bytes = pattern(4096);
+    std::fs::write(tree.path().join("notes.bin"), &bytes).expect("writes the source");
+    let scope = harness
+        .service
+        .register_scope("a review tree", tree.path())
+        .expect("registers the scope");
+    let begun = harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Scope {
+                    scope_id: scope,
+                    relative_path: "notes.bin".to_owned(),
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect("stages the snapshot");
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        bytes.len() as u64
+    );
+    let area = harness
+        .service
+        .staging()
+        .snapshots()
+        .display_path()
+        .to_path_buf();
+    std::fs::set_permissions(&area, std::fs::Permissions::from_mode(0o500))
+        .expect("makes the area unwritable");
+
+    let refusal = harness
+        .service
+        .download_release(&harness.actor, begun.transfer_id)
+        .expect_err("the removal cannot succeed");
+    // The caller did nothing wrong: this is the host's own storage failing, and it says so.
+    assert_eq!(refusal.code(), ErrorCode::StorageUnavailable);
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        bytes.len() as u64,
+        "the bytes stay charged while the payload is still there"
+    );
+    assert_eq!(
+        std::fs::read_dir(&area).expect("reads the area").count(),
+        1,
+        "and the payload is still there"
+    );
+
+    std::fs::set_permissions(&area, std::fs::Permissions::from_mode(0o700))
+        .expect("restores the area");
+    let sweep = harness
+        .service
+        .sweep(&RetainEverything)
+        .expect("the next pass runs");
+
+    assert_eq!(sweep.removed_payloads, 1);
+    assert_eq!(sweep.unremovable_payloads, 0);
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        0,
+        "the bytes are released only once the payload is gone"
+    );
+    assert_eq!(std::fs::read_dir(&area).expect("reads the area").count(), 0);
+}
+
+/// KR-REQ-14.16: registering the same tree again does not revive a transfer whose scope was
+/// revoked.
+#[test]
+fn a_revoked_scope_is_not_revived_by_registering_the_same_tree_again() {
+    let harness = Harness::create();
+    let tree = source_tree();
+    let bytes = pattern(4096);
+    std::fs::write(tree.path().join("notes.bin"), &bytes).expect("writes the source");
+    let scope = harness
+        .service
+        .register_scope("a review tree", tree.path())
+        .expect("registers the scope");
+    let begun = harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Scope {
+                    scope_id: scope,
+                    relative_path: "notes.bin".to_owned(),
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect("stages the snapshot");
+    harness
+        .service
+        .revoke_scope(scope)
+        .expect("revokes the scope");
+
+    // A second registration of the same tree is a new grant with its own identity. The transfer
+    // was opened under the first one, and that one is gone.
+    let second = harness
+        .service
+        .register_scope("the same tree again", tree.path())
+        .expect("registers the tree again");
+    assert_ne!(second, scope, "a registration is not a name for a tree");
+
+    let transfer_id = begun.transfer_id;
+    let refusal = harness
+        .service
+        .download_chunk(
+            &harness.actor,
+            &DownloadChunkParams {
+                transfer_id,
+                index: U64::new(0),
+            },
+        )
+        .expect_err("the revoked transfer stays refused");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    let refusal = harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::some(transfer_id),
+                source: Nullable::null(),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect_err("and resuming it is refused too");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+}
+
+/// KR-REQ-14.16: a publication that fails verification names nothing in the destination and leaves
+/// no partial file behind it.
+#[test]
+fn a_failed_publication_leaves_the_destination_directory_as_it_was() {
+    let harness = Harness::create();
+    let bytes = pattern(4096);
+    let handle = harness.publish(&bytes, "application/octet-stream", "notes.bin");
+    let begun = harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Attachment {
+                    transfer_id: handle.transfer_id,
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect("opens the source");
+    let destination = source_tree();
+    let authority = AuthorisedDirectory::open_root(harness.environment_id(), destination.path())
+        .expect("opens the destination");
+    // The placement declares a digest the bytes do not have, which is what a client sees when the
+    // transfer it was told about is not the transfer it received.
+    let placement = DownloadPlacement {
+        transfer_id: begun.transfer_id,
+        destination_name: "notes.bin".to_owned(),
+        byte_len: begun.byte_len,
+        content_digest: digest(&pattern(4095)),
+        allow_overwrite: false,
+    };
+    let mut writer = DownloadWriter::open(&authority, &placement).expect("opens the writer");
+    for index in 0..begun.layout.chunk_count.get() {
+        let chunk = harness
+            .service
+            .download_chunk(
+                &harness.actor,
+                &DownloadChunkParams {
+                    transfer_id: begun.transfer_id,
+                    index: U64::new(index),
+                },
+            )
+            .expect("reads a chunk");
+        writer
+            .write_chunk(&chunk.chunk, chunk.bytes.as_slice())
+            .expect("every chunk verifies against its own digest");
+    }
+
+    let refusal = writer.publish().expect_err("the whole file does not match");
+
+    assert_eq!(refusal.code(), ErrorCode::AttachmentIntegrity);
+    assert!(
+        !destination.path().join("notes.bin").exists(),
+        "nothing was named in the destination"
+    );
+    assert_eq!(
+        std::fs::read_dir(destination.path())
+            .expect("reads the destination")
+            .count(),
+        0,
+        "and no partial file was left in it"
+    );
+}
+
+/// KR-ACC-019, KR-REQ-14.15: a source rewritten while snapshots are being taken of it yields a
+/// snapshot of one revision or a refusal, and never a mixture of two.
+///
+/// Each revision is published over the source by an atomic rename, so at every instant the path
+/// names exactly one of them. The snapshots are taken while that is happening, and each one has to
+/// be a whole revision: the bytes it serves are compared with the digest of the revision it claims.
+#[test]
+fn a_source_rewritten_while_snapshots_are_taken_never_yields_a_mixture() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let harness = Harness::create();
+    let tree = source_tree();
+    let first = pattern(512 * 1024);
+    let second = pattern(512 * 1024 + 1);
+    let source = tree.path().join("notes.bin");
+    std::fs::write(&source, &first).expect("writes the first revision");
+    let scope = harness
+        .service
+        .register_scope("a review tree", tree.path())
+        .expect("registers the scope");
+    let digests = [digest(&first), digest(&second)];
+    let stop = AtomicBool::new(false);
+
+    std::thread::scope(|threads| {
+        let writer = threads.spawn(|| {
+            let mut turn = 0_usize;
+            while !stop.load(Ordering::Relaxed) {
+                let bytes: &[u8] = if turn.is_multiple_of(2) {
+                    &second
+                } else {
+                    &first
+                };
+                let staged = tree.path().join("notes.next");
+                std::fs::write(&staged, bytes).expect("writes the next revision");
+                std::fs::rename(&staged, &source).expect("publishes it over the source");
+                turn += 1;
+            }
+        });
+
+        for _ in 0..12 {
+            let begun = match harness.service.download_begin(
+                &harness.actor,
+                &DownloadBeginParams {
+                    environment_id: harness.environment_id(),
+                    resume_transfer_id: Nullable::null(),
+                    source: Nullable::some(DownloadSource::Scope {
+                        scope_id: scope,
+                        relative_path: "notes.bin".to_owned(),
+                    }),
+                    device_id: Nullable::null(),
+                },
+            ) {
+                Ok(begun) => begun,
+                // A refusal is an acceptable answer: the source moved and the host said so.
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error.code(),
+                            ErrorCode::SourceChanged
+                                | ErrorCode::AttachmentIntegrity
+                                | ErrorCode::PermissionDenied
+                                | ErrorCode::StorageUnavailable
+                        ),
+                        "the refusal names what happened: {error}"
+                    );
+                    continue;
+                }
+            };
+            assert!(
+                digests.contains(&begun.content_digest),
+                "the snapshot is one whole revision of the source, not a mixture of two"
+            );
+            let mut served = Vec::new();
+            for index in 0..begun.layout.chunk_count.get() {
+                let chunk = harness
+                    .service
+                    .download_chunk(
+                        &harness.actor,
+                        &DownloadChunkParams {
+                            transfer_id: begun.transfer_id,
+                            index: U64::new(index),
+                        },
+                    )
+                    .expect("the snapshot serves its own bytes");
+                served.extend_from_slice(chunk.bytes.as_slice());
+            }
+            assert_eq!(
+                digest(&served),
+                begun.content_digest,
+                "and the bytes it serves are the revision it named"
+            );
+            harness
+                .service
+                .download_release(&harness.actor, begun.transfer_id)
+                .expect("releases the snapshot");
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("the writer did not panic");
+    });
+
+    // Every snapshot was released, so nothing is charged and nothing is left staged.
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        0
+    );
+    assert_eq!(
+        std::fs::read_dir(harness.service.staging().snapshots().display_path())
+            .expect("reads the snapshot area")
+            .count(),
+        0
     );
 }

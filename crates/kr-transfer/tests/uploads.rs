@@ -1397,29 +1397,20 @@ fn interrupt_publish(
 }
 
 /// Returns a file's stable filesystem identity.
+///
+/// Read the way the service reads it: through an opened directory, which is the only form Windows
+/// answers a file identity for.
 fn identity_of(path: &std::path::Path) -> kr_transfer::ObjectIdentity {
-    let metadata = std::fs::metadata(path).expect("the file exists");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        kr_transfer::ObjectIdentity {
-            device: metadata.dev(),
-            file_id: metadata.ino(),
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        kr_transfer::ObjectIdentity {
-            device: u64::from(
-                metadata
-                    .volume_serial_number()
-                    .expect("an identity from an opened file"),
-            ),
-            file_id: metadata
-                .file_index()
-                .expect("an identity from an opened file"),
-        }
+    use cap_fs_ext::MetadataExt as _;
+
+    let parent = path.parent().expect("the payload has a parent");
+    let name = path.file_name().expect("the payload has a name");
+    let directory = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())
+        .expect("opens the directory the payload is in");
+    let metadata = directory.metadata(name).expect("the file exists");
+    kr_transfer::ObjectIdentity {
+        device: metadata.dev(),
+        file_id: metadata.ino(),
     }
 }
 
@@ -1435,4 +1426,280 @@ fn contribution(
         external_destination: Nullable::null(),
         model_media_capability: false,
     }
+}
+
+/// KR-REQ-14.11: an expiry sweep that runs while a publication is unresolved closes exactly one of
+/// them, and whichever wins leaves no bytes charged and no payload behind.
+#[test]
+fn a_sweep_during_an_unresolved_publication_leaves_no_charged_bytes() {
+    let host = kr_ipc::testing::TempHost::create();
+    let bytes = pattern(1024);
+    let actor = kr_protocol::ids::ActorId::new("local:transfer-test").expect("a valid principal");
+    let expected = digest(&bytes);
+    let transfer_id: TransferId;
+    let payload_identity: kr_transfer::ObjectIdentity;
+    {
+        let clock = Arc::new(ManualClock::new(support::START_MS));
+        let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
+            .expect("a transfer service");
+        let begun = service
+            .upload_begin(
+                &actor,
+                &UploadBeginParams {
+                    environment_id: host.environment_id(),
+                    session_id: Nullable::null(),
+                    device_id: Nullable::null(),
+                    declared_byte_len: U64::new(bytes.len() as u64),
+                    declared_digest: expected,
+                    declared_media_type: "application/octet-stream".to_owned(),
+                    original_file_name: "notes.bin".to_owned(),
+                },
+                None,
+            )
+            .expect("reserves the upload");
+        transfer_id = begun.transfer_id;
+        let (chunk, payload) = chunk_of(&bytes, 0);
+        service
+            .upload_chunk(
+                &actor,
+                &UploadChunkParams {
+                    transfer_id,
+                    chunk,
+                    bytes: payload,
+                },
+            )
+            .expect("accepts the chunk");
+        let staged = std::fs::read_dir(service.staging().incomplete().display_path())
+            .expect("reads the incomplete area")
+            .next()
+            .expect("one staged payload")
+            .expect("a directory entry")
+            .path();
+        payload_identity = identity_of(&staged);
+    }
+    // The publish is durable and unresolved, and the clock then passes the twenty-four-hour
+    // window, so the sweep and the publication both have a claim on this row.
+    interrupt_publish(&host, transfer_id, expected, payload_identity);
+    let clock = Arc::new(ManualClock::new(
+        support::START_MS + kr_protocol::transfer::UNFINISHED_UPLOAD_LIFETIME.get() + 1,
+    ));
+    let service = TransferService::with_clock(&host.environment(), Arc::clone(&clock) as Arc<_>)
+        .expect("a replacement service");
+
+    let sweep = service
+        .sweep(&RetainEverything)
+        .expect("the sweep runs against a publishing row");
+    let recovery = service.recover().expect("recovery runs after it");
+
+    let status = service
+        .upload_status(&actor, &UploadStatusParams { transfer_id })
+        .expect("reads the status");
+    assert!(
+        matches!(status.state, UploadState::Published | UploadState::Expired),
+        "the row is closed one way or the other, and was {:?}",
+        status.state
+    );
+    assert_eq!(
+        sweep.expired_uploads + recovery.completed_publications,
+        1,
+        "exactly one of the two closed it"
+    );
+    if status.state == UploadState::Expired {
+        assert_eq!(
+            service.staged_byte_len().expect("reads the total"),
+            0,
+            "an expired upload charges nothing"
+        );
+        assert_eq!(
+            std::fs::read_dir(service.staging().incomplete().display_path())
+                .expect("reads the incomplete area")
+                .count()
+                + std::fs::read_dir(service.staging().complete().display_path())
+                    .expect("reads the completed area")
+                    .count(),
+            0,
+            "and leaves no payload behind"
+        );
+    } else {
+        assert_eq!(
+            service
+                .attachment_handle(&actor, transfer_id)
+                .expect("a published attachment has a handle")
+                .content_digest,
+            expected
+        );
+    }
+}
+
+/// KR-REQ-14.11: a cancellation that arrives on a transfer whose publish is already durable
+/// releases the reservation and removes the payload under both of its names.
+#[test]
+fn a_cancellation_during_a_publication_releases_the_payload_and_the_bytes() {
+    let host = kr_ipc::testing::TempHost::create();
+    let bytes = pattern(2048);
+    let actor = kr_protocol::ids::ActorId::new("local:transfer-test").expect("a valid principal");
+    let expected = digest(&bytes);
+    let transfer_id: TransferId;
+    let payload_identity: kr_transfer::ObjectIdentity;
+    {
+        let clock = Arc::new(ManualClock::new(support::START_MS));
+        let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
+            .expect("a transfer service");
+        let begun = service
+            .upload_begin(
+                &actor,
+                &UploadBeginParams {
+                    environment_id: host.environment_id(),
+                    session_id: Nullable::null(),
+                    device_id: Nullable::null(),
+                    declared_byte_len: U64::new(bytes.len() as u64),
+                    declared_digest: expected,
+                    declared_media_type: "application/octet-stream".to_owned(),
+                    original_file_name: "notes.bin".to_owned(),
+                },
+                None,
+            )
+            .expect("reserves the upload");
+        transfer_id = begun.transfer_id;
+        let (chunk, payload) = chunk_of(&bytes, 0);
+        service
+            .upload_chunk(
+                &actor,
+                &UploadChunkParams {
+                    transfer_id,
+                    chunk,
+                    bytes: payload,
+                },
+            )
+            .expect("accepts the chunk");
+        let staged = std::fs::read_dir(service.staging().incomplete().display_path())
+            .expect("reads the incomplete area")
+            .next()
+            .expect("one staged payload")
+            .expect("a directory entry")
+            .path();
+        payload_identity = identity_of(&staged);
+    }
+    interrupt_publish(&host, transfer_id, expected, payload_identity);
+    let clock = Arc::new(ManualClock::new(support::START_MS + 10));
+    let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
+        .expect("a replacement service");
+
+    let cancelled = service
+        .upload_cancel(&actor, &UploadCancelParams { transfer_id })
+        .expect("cancels the publishing transfer");
+
+    assert_eq!(cancelled.state, UploadState::Cancelled);
+    assert_eq!(cancelled.released_byte_len, U64::new(bytes.len() as u64));
+    assert_eq!(
+        service.staged_byte_len().expect("reads the total"),
+        0,
+        "a cancellation releases the bytes it charged"
+    );
+    for area in [
+        service.staging().incomplete().display_path(),
+        service.staging().complete().display_path(),
+    ] {
+        assert_eq!(
+            std::fs::read_dir(area)
+                .expect("reads a staging area")
+                .count(),
+            0,
+            "neither name holds a payload afterwards"
+        );
+    }
+    // And the recovery that follows finds nothing to resolve, because the row is closed.
+    assert_eq!(
+        service.recover().expect("recovers"),
+        kr_transfer::Recovery::default()
+    );
+}
+
+/// KR-REQ-14.08: two threads that reserve at the environment's ceiling admit exactly one of them,
+/// and the ceiling is never exceeded.
+#[test]
+fn two_threads_that_reserve_at_the_ceiling_admit_exactly_one() {
+    let harness = Harness::create();
+    let bytes = pattern(4096);
+    // Room for exactly one of the two reservations.
+    harness.set_limits(Limits {
+        max_file_len: 4096,
+        max_staged_len: 4096,
+        max_concurrent_transfers: 8,
+    });
+
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    harness
+                        .begin(&bytes, "application/octet-stream", "notes.bin")
+                        .map(|begun| begun.transfer_id)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("the thread did not panic"))
+            .collect()
+    });
+
+    let admitted: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok())
+        .collect();
+    let refused: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err())
+        .collect();
+    assert_eq!(admitted.len(), 1, "exactly one reservation is admitted");
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].code(), ErrorCode::QuotaExceeded);
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        4096,
+        "the charged total is the one reservation, not both"
+    );
+}
+
+/// KR-REQ-24.09: a published payload replaced underneath the host is never served to a download.
+#[test]
+fn a_replaced_payload_is_never_served_to_a_download() {
+    let harness = Harness::create();
+    let bytes = pattern(4096);
+    let handle = harness.publish(&bytes, "application/octet-stream", "notes.bin");
+    let published = std::fs::read_dir(harness.service.staging().complete().display_path())
+        .expect("reads the completed area")
+        .next()
+        .expect("one published payload")
+        .expect("a directory entry")
+        .path();
+
+    // A different object of the same length takes the same name, which is what an interfering
+    // process that ran as this user could do.
+    let replacement = published.with_extension("replacement");
+    std::fs::write(&replacement, pattern(4096)).expect("writes the replacement");
+    std::fs::rename(&replacement, &published).expect("replaces the payload");
+
+    let refusal = harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &kr_protocol::transfer::DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(kr_protocol::transfer::DownloadSource::Attachment {
+                    transfer_id: handle.transfer_id,
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect_err("refuses to serve a replaced payload");
+    assert!(
+        matches!(
+            refusal.code(),
+            ErrorCode::SourceChanged | ErrorCode::AttachmentIntegrity | ErrorCode::PermissionDenied
+        ),
+        "the refusal names the change rather than serving the bytes: {refusal}"
+    );
 }
