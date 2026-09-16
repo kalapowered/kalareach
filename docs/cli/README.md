@@ -86,9 +86,8 @@ Losing the keys part way through is a different thing and ends the attachment. A
 turn on a keyboard protocol the outer terminal does not implement, and the host then takes the keys
 rather than let it send an encoding that means other keys; the next keystroke is refused with
 `LEASE_LOST`, and the command exits with the refused-request code (8) after putting the terminal
-back.
-Attaching again gives a terminal that watches, and the keys come back when the application leaves
-that protocol.
+back. Nothing reacquires them by itself: attaching again while that protocol is in force gives a
+terminal that watches, and attaching once the application has left it gives one that can type.
 
 What the host sends is not always every byte the application wrote. The session's canonical grid
 answers the application's queries itself and routes a bell, a clipboard write or a notification to
