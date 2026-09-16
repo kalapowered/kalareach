@@ -1448,6 +1448,19 @@ impl CanonicalGrid {
         (oldest, oldest.saturating_add(rows))
     }
 
+    /// The stable identifier of the first row of the visible page.
+    ///
+    /// A client holding rows by their stable identifiers needs to be told which of them the page
+    /// now holds, because a scroll moves that window without changing a single row: every row
+    /// keeps its identifier and its content, and only which identifiers are on screen has moved.
+    /// Walking the visible rows to read the first one's identifier would cost the whole page to
+    /// learn one number, so it is worked out from the range the screen holds.
+    #[must_use]
+    pub fn visible_top_row(&self) -> i64 {
+        let (_, end) = self.stable_range();
+        end.saturating_sub(i64::from(self.size.rows))
+    }
+
     /// The visible rows of the active buffer.
     #[must_use]
     pub fn visible_rows(&self) -> Vec<GridRow> {
