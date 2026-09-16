@@ -412,6 +412,11 @@ async fn round_trips(
 #[test]
 fn a_reading_that_failed_leaves_its_spans_unverified_and_the_next_recovers() {
     let mut stolen = StolenTime::start();
+    // `start` reads the host, so the boundary is cleared first and the sequence below is the
+    // whole of what this checks. Without that, the readings here would be compared with the
+    // machine's own counters and the first assertion would be about this host rather than about
+    // these rules.
+    assert_eq!(stolen.advance(None), None);
     // A first reading establishes a boundary and answers nothing: there is no span yet.
     assert_eq!(stolen.advance(Some(StolenSample::new(0, 1_000))), None);
     // One span, a tenth of it taken.
