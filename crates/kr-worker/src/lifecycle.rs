@@ -15,16 +15,31 @@
 //! | Question | What answers it | What is left on a clock |
 //! | --- | --- | --- |
 //! | has the root shell ended? | the signal the kernel sends a parent when a child of it does | a sweep, in case a signal is lost; the whole answer where no such signal exists |
-//! | what does this session own? | input the session accepted and output it produced, because a process starts from one or the other | the same sweep, for a process that started from neither |
-//! | is the desktop still there? | nothing this host can subscribe to | the same sweep |
+//! | what does this session own? | input the session accepted and output it produced, which is where a new process usually comes from | the same sweep, for everything that comes from neither |
+//! | is the desktop still there? | nothing this host can subscribe to | the same sweep. The reading is this worker's own environment, so a check ten times a second answered from the same values each time |
 //!
-//! The cost is stated rather than hidden. A process that starts and ends between two observations
-//! is not recorded, so it is not in the closure record's list of what was stopped; the record
-//! already never claims every application was discovered, and the coverage flag says which boundary
-//! produced it. What the event sources change is *when* that window is narrow: a session that is
-//! running something is observed within [`OBSERVE_INTERVAL`] of the input or the output that started
-//! the process, and the window is only [`IDLE_SWEEP_INTERVAL`] wide while nothing at all is
-//! happening.
+//! The limits of the middle row are worth being exact about, because traffic is a *hint* rather
+//! than a proof and the observation it asks for is a sample rather than a record of what happened.
+//!
+//! * Traffic is not the only way a process starts. An application that is already running can
+//!   start and collect children on its own timer, on a filesystem event, or on something that
+//!   arrived over a network, and print nothing while it does. Between two sweeps a session with a
+//!   quiet application can do a great deal that nothing here sees.
+//! * Even a process the session's own input started can be missed. Input is marked as it is queued
+//!   for the terminal, so an observation can happen before the application has read those bytes; a
+//!   process it then starts and finishes before anything else is marked is in no reading at all.
+//! * So silence here is not evidence of idleness. Section 7 says as much where it matters: idle
+//!   means a verified idle shell with no pending request and no active owned work, not merely
+//!   absent output. Nothing in this module is that verification.
+//!
+//! What this is, then, is the best-effort accounting the ownership boundary already gives (§7). A
+//! process that starts and ends between two observations is not recorded, so it is not in the
+//! closure record's list of what was stopped; the record never claims every application was
+//! discovered, and the coverage flag says which boundary produced it. What the event sources change
+//! is *when* the window is narrow: a session that is visibly running something is observed within
+//! [`OBSERVE_INTERVAL`], and the window is [`IDLE_SWEEP_INTERVAL`] wide when nothing is reaching the
+//! terminal in either direction. Closure does not rest on any of it: it observes the boundary again
+//! as it asks the processes to stop, as it forces what is left, and as it writes the record.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -367,6 +382,21 @@ mod tests {
         assert!(!activity.take(), "and taking it clears it");
     }
 
+    /// Waits until the supervision asks for an observation, and says when that was.
+    ///
+    /// Other wakes are not failures and there is no bound on how many of them there are: a child
+    /// of this process ending is one, a timer that came back a moment before its deadline is
+    /// another, and on a host with no child signal the fallback is a third. What the supervision
+    /// promises is that the observation itself happens, and that it happens on the cadence rather
+    /// than the moment a mark is made.
+    async fn observation(supervision: &mut Supervision) -> Instant {
+        loop {
+            if supervision.next().await == Wake::Ownership {
+                return Instant::now();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn output_wakes_the_supervision_and_the_wake_observes() {
         let activity = Activity::new();
@@ -379,11 +409,10 @@ mod tests {
             noted.note();
         });
 
-        // Far inside the sweep, so a wake here is the mark rather than the clock.
-        let wake = tokio::time::timeout(IDLE_SWEEP_INTERVAL / 2, supervision.next())
+        // Far inside the sweep, so what ends this is the mark rather than the clock.
+        tokio::time::timeout(IDLE_SWEEP_INTERVAL / 2, observation(&mut supervision))
             .await
-            .expect("the mark wakes the supervision");
-        assert_eq!(wake, Wake::Ownership);
+            .expect("the mark reaches the supervision and it observes");
     }
 
     #[tokio::test]
@@ -393,20 +422,14 @@ mod tests {
         let mut supervision = Supervision::begin(Arc::clone(&activity), started);
         activity.note();
 
-        let mut wake = supervision.next().await;
-        let waited = started.elapsed();
-        // A timer is allowed to come back a fraction before the deadline it was given, and the
-        // observation is due on the clock rather than on the timer, so the wake that finds it is
-        // sometimes the one after. What must not happen is an observation the moment the mark was
-        // made.
-        if wake == Wake::Session {
-            wake = supervision.next().await;
-        }
+        let observed = tokio::time::timeout(IDLE_SWEEP_INTERVAL / 2, observation(&mut supervision))
+            .await
+            .expect("the mark is observed");
 
-        assert_eq!(wake, Wake::Ownership, "the mark is observed");
+        let waited = observed.saturating_duration_since(started);
         assert!(
-            waited >= OBSERVE_INTERVAL / 2,
-            "and the cadence was waited out rather than the mark acted on at once: {waited:?}"
+            waited >= OBSERVE_INTERVAL,
+            "the cadence was waited out rather than the mark acted on at once: {waited:?}"
         );
     }
 }

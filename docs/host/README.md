@@ -351,18 +351,25 @@ So every wait in a worker is on something that happens rather than on a clock.
 | the application's output | the terminal's own descriptor, which reports output and a hangup alike | a one-minute safety net, for a platform that reports neither |
 | room for the application's input | the same descriptor | nothing; a write with no room waits on it |
 | the root shell's exit | the child signal the kernel sends the worker | a thirty-second sweep, in case a signal is lost. Windows reports a process ending on its handle rather than by a signal, so there a hundred-millisecond check is the whole answer |
-| the processes the session owns | input the session accepted and output it produced, because a new process comes from one or the other | the same sweep, for a process that started from neither |
+| the processes the session owns | input the session accepted and output it produced, which is where a new process usually comes from | the same sweep, for everything that comes from neither |
 | the login a desktop-bound session is tied to | nothing this host can subscribe to | the same sweep |
 | a held paste prefix | its own deadline, which exists only while a prefix is held | nothing |
 | an attached view | the frames its connection carries | one keepalive per connection every ten seconds, which section 23 requires of a local connection |
 
-The sweep is a window rather than a guarantee, and it is worth saying what that costs. A process
-that starts and ends between two observations of the ownership boundary is not in the closure
-record's list of what was stopped. The record never claims every application was discovered, and the
-coverage flag says which boundary produced it. The session's own traffic is what keeps that
-window narrow when it matters: a session that is running something is observed within a second of
-the input or the output that started the process, and the window is only as wide as the sweep while
-nothing at all is happening.
+The sweep is a window rather than a guarantee, and it is worth saying exactly what that costs. A
+process that starts and ends between two observations of the ownership boundary is not in the
+closure record's list of what was stopped. The record never claims every application was discovered,
+and the coverage flag says which boundary produced it.
+
+The session's own traffic keeps that window narrow when the session is visibly doing something, and
+it is a hint rather than a proof. An application that is already running can start and collect
+children on its own timer, on a filesystem event or on something that arrived over a network, and
+print nothing while it does; and input is marked as it is queued for the terminal, so a process the
+application starts after reading it, and finishes before anything else is marked, is in no reading
+at all. Silence here is therefore not evidence of idleness: idle means a verified idle shell with no
+pending request and no active owned work, which is a different question asked elsewhere. What a
+closure rests on instead is the boundary observed again as the processes are asked to stop, as
+whatever is left is forced, and as the record is written.
 
 ## Closure
 
