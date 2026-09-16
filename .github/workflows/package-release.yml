@@ -4,9 +4,12 @@ name: package-release
 #
 # A tag of the form `packages/v<version>+<short commit>` is the whole trigger: the tag names the
 # commit, `scripts/release-packages.sh` refuses to pack anything else, and the release that appears
-# carries the two archives and the digests a consumer pins them by. The last step fetches what the
-# release serves and checks it against those digests, so a URL published here is a URL that resolves
-# to the archive it names.
+# carries the two archives and the digests a consumer pins them by.
+#
+# The release is assembled as a draft, and it is published only once the asset set on GitHub's side
+# matches what was packed. After that the job fetches every asset back by the URL GitHub serves it
+# at, checks it against those digests, and writes those URLs into the release notes, so the notes
+# name URLs that were fetched rather than URLs that were assumed.
 on:
   push:
     tags:
@@ -66,17 +69,10 @@ jobs:
         run: |
           set -euo pipefail
           packages="$RUNNER_TEMP/packages"
-          base="${{ github.server_url }}/${{ github.repository }}/releases/download/$GITHUB_REF_NAME"
 
+          # The part of the notes that does not depend on where the assets end up. The last step
+          # rebuilds the notes around it with the URLs GitHub reports.
           {
-            echo "The generated TypeScript packages, packed from commit $GITHUB_SHA."
-            echo
-            echo 'A consumer pins an archive by its URL and the integrity below, and its lockfile'
-            echo 'then carries both:'
-            echo
-            for archive in "$packages"/*.tgz; do
-              echo "- $base/$(basename "$archive")"
-            done
             echo
             echo 'Verify a downloaded archive against the sums:'
             echo
@@ -88,46 +84,90 @@ jobs:
             echo
             echo 'The procedure, and what a consumer does with a release, are in'
             echo 'docs/releases/packages.md.'
-          } >"$RUNNER_TEMP/notes.md"
+          } >"$RUNNER_TEMP/notes-tail.md"
+
+          {
+            echo "The generated TypeScript packages, packed from commit $GITHUB_SHA."
+            echo
+            echo 'A consumer pins an archive by its URL and the integrity below, and its lockfile'
+            echo 'then carries both.'
+            cat "$RUNNER_TEMP/notes-tail.md"
+          } >"$RUNNER_TEMP/notes-draft.md"
 
           gh release create "$GITHUB_REF_NAME" \
+            --draft \
             --verify-tag \
             --title "Packages $GITHUB_REF_NAME" \
-            --notes-file "$RUNNER_TEMP/notes.md" \
+            --notes-file "$RUNNER_TEMP/notes-draft.md" \
             "$packages"/*.tgz "$packages/SHA512SUMS"
 
-          cat "$RUNNER_TEMP/notes.md" >>"$GITHUB_STEP_SUMMARY"
+          # A draft is not in the listing everyone sees, so it is found through the listing that
+          # includes drafts for a caller with write access.
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id" >"$RUNNER_TEMP/release-id"
 
-      # What the release serves is what a consumer installs, so it is fetched back by the published
-      # URL and held to the digests that were packed. A URL that does not resolve, an asset that
-      # arrived truncated and a sums file that does not match all fail here.
-      - name: Check what the release serves
+          if [ "$(wc -l <"$RUNNER_TEMP/release-id")" -ne 1 ]; then
+            echo "$GITHUB_REF_NAME matches $(wc -l <"$RUNNER_TEMP/release-id") releases:" >&2
+            cat "$RUNNER_TEMP/release-id" >&2
+            exit 1
+          fi
+
+          release="$(cat "$RUNNER_TEMP/release-id")"
+
+          # The asset set is checked while nothing can install it: every archive that was packed, at
+          # the length it was packed at, and nothing else attached.
+          for file in "$packages"/*; do
+            printf '%s %s\n' "$(basename "$file")" "$(wc -c <"$file" | tr -d ' ')"
+          done | sort >"$RUNNER_TEMP/packed-assets"
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release" \
+            --jq '.assets[] | "\(.name) \(.size)"' | sort >"$RUNNER_TEMP/uploaded-assets"
+
+          if ! diff "$RUNNER_TEMP/packed-assets" "$RUNNER_TEMP/uploaded-assets"; then
+            echo 'The release holds something other than what was packed; it stays a draft.' >&2
+            exit 1
+          fi
+
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release" \
+            -F draft=false --jq '.html_url'
+
+      - name: Check what the release serves, and name those URLs in the notes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           packages="$RUNNER_TEMP/packages"
           served="$RUNNER_TEMP/served"
-          base="${{ github.server_url }}/${{ github.repository }}/releases/download/$GITHUB_REF_NAME"
           mkdir -p "$served"
 
-          for published in "$packages"/*.tgz "$packages/SHA512SUMS"; do
-            name="$(basename "$published")"
+          # GitHub's own record of where each asset is served, rather than a URL built here: it
+          # percent-encodes parts of a tag, and what a consumer pins has to be what resolves.
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.assets[] | "\(.name) \(.browser_download_url)"' >"$RUNNER_TEMP/served-assets"
+
+          while read -r name url; do
             curl --fail --silent --show-error --location \
               --retry 5 --retry-delay 3 --retry-all-errors \
-              --output "$served/$name" "$base/$name"
-          done
+              --output "$served/$name" "$url"
+          done <"$RUNNER_TEMP/served-assets"
 
           cmp "$packages/SHA512SUMS" "$served/SHA512SUMS"
           (cd "$served" && grep -v '^#' SHA512SUMS | sha512sum -c -)
 
-          # GitHub's own record of each asset, so the URLs in the notes are the URLs it serves.
-          gh release view "$GITHUB_REF_NAME" --json assets \
-            --jq '.assets[] | "\(.name) \(.url)"' >"$RUNNER_TEMP/assets.txt"
+          {
+            echo "The generated TypeScript packages, packed from commit $GITHUB_SHA."
+            echo
+            echo 'A consumer pins an archive by its URL and the integrity below, and its lockfile'
+            echo 'then carries both:'
+            echo
+            while read -r name url; do
+              case "$name" in
+                *.tgz) echo "- $url" ;;
+              esac
+            done <"$RUNNER_TEMP/served-assets"
+            cat "$RUNNER_TEMP/notes-tail.md"
+          } >"$RUNNER_TEMP/notes.md"
 
-          while read -r name url; do
-            if [ "$url" != "$base/$name" ]; then
-              echo "The release serves $name at $url, not at $base/$name." >&2
-              exit 1
-            fi
-          done <"$RUNNER_TEMP/assets.txt"
+          gh release edit "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+
+          cat "$RUNNER_TEMP/notes.md" >>"$GITHUB_STEP_SUMMARY"
