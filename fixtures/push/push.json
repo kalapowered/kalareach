@@ -1,0 +1,522 @@
+{
+  "alerts": [
+    {
+      "alert": "session_needs_attention",
+      "text": "A KalaReach session needs attention."
+    },
+    {
+      "alert": "approval_waiting",
+      "text": "A KalaReach session is waiting for an approval."
+    },
+    {
+      "alert": "question_waiting",
+      "text": "A KalaReach session is waiting for an answer."
+    },
+    {
+      "alert": "work_complete",
+      "text": "A KalaReach session has work to review."
+    },
+    {
+      "alert": "host_unreachable",
+      "text": "A KalaReach host stopped responding."
+    },
+    {
+      "alert": "attention_update",
+      "text": "Several KalaReach sessions need attention."
+    }
+  ],
+  "cases": [
+    {
+      "cbor_hex": "82766b722d707573682d726567697374726174696f6e2f31a768706c6174666f726d63696f73696368616c6c656e6765582061616161616161616161616161616161616161616161616161616161616161616c746f6b656e5f6469676573745820a3423661f3ffa0e3d22e0cb8ebd29f7268f05cca1da0447718e2ebf0b1fc1f806d657870697265735f61745f6d731b0000019b76df3be06e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f6f696e7374616c6c6174696f6e5f69645002d449a31fbb267c8f352e9968a79e3e6f726567697374726174696f6e5f6964502e749a03c1584d62a0196f3bd784215c",
+      "description": "The answer a receiver returns for the challenge sent to its token, signed by the proposed installation key.",
+      "domain": "kr-push-registration/1",
+      "id": "registration_answer",
+      "json": {
+        "installation_key": "ERERERERERERERERERERERERERERERERERERERERERE",
+        "payload": {
+          "challenge": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE",
+          "expires_at_ms": "1767225900000",
+          "gateway_origin": "https://reach.kala.to",
+          "installation_id": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+          "platform": "ios",
+          "registration_id": "2e749a03-c158-4d62-a019-6f3bd784215c",
+          "token_digest": "o0I2YfP_oOPSLgy469KfcmjwXModoER3GOLr8LH8H4A"
+        },
+        "signature": "XFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXA"
+      },
+      "sha256": "43c26b6933487af18b5be409395971be2df319276e9da30f84d2fb20148aafde",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-registration/1"
+          },
+          {
+            "map": [
+              [
+                "platform",
+                {
+                  "text": "ios"
+                }
+              ],
+              [
+                "challenge",
+                {
+                  "bytes": "6161616161616161616161616161616161616161616161616161616161616161"
+                }
+              ],
+              [
+                "token_digest",
+                {
+                  "bytes": "a3423661f3ffa0e3d22e0cb8ebd29f7268f05cca1da0447718e2ebf0b1fc1f80"
+                }
+              ],
+              [
+                "expires_at_ms",
+                {
+                  "int": "1767225900000"
+                }
+              ],
+              [
+                "gateway_origin",
+                {
+                  "text": "https://reach.kala.to"
+                }
+              ],
+              [
+                "installation_id",
+                {
+                  "bytes": "02d449a31fbb267c8f352e9968a79e3e"
+                }
+              ],
+              [
+                "registration_id",
+                {
+                  "bytes": "2e749a03c1584d62a0196f3bd784215c"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82706b722d707573682d73656e6465722f31a66b726174655f706f6c696379a36562757273741472636f6c6c617073655f77696e646f775f6d731a000493e0727375737461696e65645f7065725f686f7572183c6e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f6f696e7374616c6c6174696f6e5f69645002d449a31fbb267c8f352e9968a79e3e70686f73745f7369676e696e675f6b6579582022222222222222222222222222222222222222222222222222222222222222227073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b471686f73745f656e64706f696e745f6b657958203333333333333333333333333333333333333333333333333333333333333333",
+      "description": "What one sender authorisation fixes for its lifetime. A renewal that changes any of it produces a different digest.",
+      "domain": "kr-push-sender/1",
+      "id": "sender_binding",
+      "json": {
+        "gateway_origin": "https://reach.kala.to",
+        "host_endpoint_key": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM",
+        "host_signing_key": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "installation_id": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+        "rate_policy": {
+          "burst": "20",
+          "collapse_window_ms": "300000",
+          "sustained_per_hour": "60"
+        },
+        "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+      },
+      "sha256": "7c537b47750edb81e06c4852ba6dcd6fe65bde7a0fd4f22340423caeda9f5400",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-sender/1"
+          },
+          {
+            "map": [
+              [
+                "rate_policy",
+                {
+                  "map": [
+                    [
+                      "burst",
+                      {
+                        "int": "20"
+                      }
+                    ],
+                    [
+                      "collapse_window_ms",
+                      {
+                        "int": "300000"
+                      }
+                    ],
+                    [
+                      "sustained_per_hour",
+                      {
+                        "int": "60"
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "gateway_origin",
+                {
+                  "text": "https://reach.kala.to"
+                }
+              ],
+              [
+                "installation_id",
+                {
+                  "bytes": "02d449a31fbb267c8f352e9968a79e3e"
+                }
+              ],
+              [
+                "host_signing_key",
+                {
+                  "bytes": "2222222222222222222222222222222222222222222222222222222222222222"
+                }
+              ],
+              [
+                "sender_record_id",
+                {
+                  "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                }
+              ],
+              [
+                "host_endpoint_key",
+                {
+                  "bytes": "3333333333333333333333333333333333333333333333333333333333333333"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "8278186b722d707573682d73656e6465722d72656e6577616c2f31a46d676174657761795f6e6f6e6365582071717171717171717171717171717171717171717171717171717171717171716e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f6f7265717565737465645f61745f6d731b0000019bed4cec007073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
+      "description": "A host proving it still holds the key the installation named, over a nonce the gateway issued.",
+      "domain": "kr-push-sender-renewal/1",
+      "id": "sender_renewal",
+      "json": {
+        "payload": {
+          "gateway_nonce": "cXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXE",
+          "gateway_origin": "https://reach.kala.to",
+          "requested_at_ms": "1769212800000",
+          "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+        },
+        "signature": "XV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXQ"
+      },
+      "sha256": "fbcbfe060302383e3c418669a4cbd45a7010981aefbc0b2b92c46ddffecb3f47",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-sender-renewal/1"
+          },
+          {
+            "map": [
+              [
+                "gateway_nonce",
+                {
+                  "bytes": "7171717171717171717171717171717171717171717171717171717171717171"
+                }
+              ],
+              [
+                "gateway_origin",
+                {
+                  "text": "https://reach.kala.to"
+                }
+              ],
+              [
+                "requested_at_ms",
+                {
+                  "int": "1769212800000"
+                }
+              ],
+              [
+                "sender_record_id",
+                {
+                  "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82781b6b722d707573682d73656e6465722d7265766f636174696f6e2f31a566726561736f6e68756e7061697265646d676174657761795f6e6f6e6365582072727272727272727272727272727272727272727272727272727272727272726e676174657761795f6f726967696e7568747470733a2f2f72656163682e6b616c612e746f6f7265717565737465645f61745f6d731b0000019b7c0104007073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
+      "description": "A host ending an authorisation after unpairing. A revoked record never renews.",
+      "domain": "kr-push-sender-revocation/1",
+      "id": "sender_revocation",
+      "json": {
+        "payload": {
+          "gateway_nonce": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI",
+          "gateway_origin": "https://reach.kala.to",
+          "reason": "unpaired",
+          "requested_at_ms": "1767312000000",
+          "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+        },
+        "signature": "Xl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXg"
+      },
+      "sha256": "e094da4afba40b8a1b4f9fb4254e212cd8c1caab04a5f9cd83634556e2c25c71",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-sender-revocation/1"
+          },
+          {
+            "map": [
+              [
+                "reason",
+                {
+                  "text": "unpaired"
+                }
+              ],
+              [
+                "gateway_nonce",
+                {
+                  "bytes": "7272727272727272727272727272727272727272727272727272727272727272"
+                }
+              ],
+              [
+                "gateway_origin",
+                {
+                  "text": "https://reach.kala.to"
+                }
+              ],
+              [
+                "requested_at_ms",
+                {
+                  "int": "1767312000000"
+                }
+              ],
+              [
+                "sender_record_id",
+                {
+                  "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82726b722d707573682d64656c69766572792f31a66568696e7473a265616c65727470617070726f76616c5f77616974696e6767757267656e637969617474656e74696f6e67707265766965775860abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab6b636f6c6c617073655f69646863386231663061346d657870697265735f61745f6d731b0000019b76e863a06f6e6f74696669636174696f6e5f696470306633613963376535316432346230387073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
+      "description": "One notification with a sealed preview. The digest is what the delivery credential's request signature covers as its body.",
+      "domain": "kr-push-delivery/1",
+      "id": "delivery_request",
+      "json": {
+        "collapse_id": "c8b1f0a4",
+        "expires_at_ms": "1767226500000",
+        "hints": {
+          "alert": "approval_waiting",
+          "urgency": "attention"
+        },
+        "notification_id": "0f3a9c7e51d24b08",
+        "preview": "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6ur",
+        "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+      },
+      "sha256": "85ec9fd057e88ef4f021f9e84a2bc5906c4459812bae00b5b0a686b9578085e1",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-delivery/1"
+          },
+          {
+            "map": [
+              [
+                "hints",
+                {
+                  "map": [
+                    [
+                      "alert",
+                      {
+                        "text": "approval_waiting"
+                      }
+                    ],
+                    [
+                      "urgency",
+                      {
+                        "text": "attention"
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "preview",
+                {
+                  "bytes": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+                }
+              ],
+              [
+                "collapse_id",
+                {
+                  "text": "c8b1f0a4"
+                }
+              ],
+              [
+                "expires_at_ms",
+                {
+                  "int": "1767226500000"
+                }
+              ],
+              [
+                "notification_id",
+                {
+                  "text": "0f3a9c7e51d24b08"
+                }
+              ],
+              [
+                "sender_record_id",
+                {
+                  "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "cbor_hex": "82726b722d707573682d64656c69766572792f31a66568696e7473a265616c65727470617070726f76616c5f77616974696e6767757267656e637969617474656e74696f6e6770726576696577f66b636f6c6c617073655f69646863386231663061346d657870697265735f61745f6d731b0000019b76e863a06f6e6f74696669636174696f6e5f696470306633613963376535316432346230387073656e6465725f7265636f72645f6964505b1f2c8d416a470e9c3d0a7e551288b4",
+      "description": "The same notification with previews disabled on the device. The generic alert still reaches the lock screen.",
+      "domain": "kr-push-delivery/1",
+      "id": "delivery_request_without_preview",
+      "json": {
+        "collapse_id": "c8b1f0a4",
+        "expires_at_ms": "1767226500000",
+        "hints": {
+          "alert": "approval_waiting",
+          "urgency": "attention"
+        },
+        "notification_id": "0f3a9c7e51d24b08",
+        "preview": null,
+        "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+      },
+      "sha256": "ab18940e33bc209701d22c4922d0fb16458409939d80ec6b09eda8fe0d40dd80",
+      "value": {
+        "array": [
+          {
+            "text": "kr-push-delivery/1"
+          },
+          {
+            "map": [
+              [
+                "hints",
+                {
+                  "map": [
+                    [
+                      "alert",
+                      {
+                        "text": "approval_waiting"
+                      }
+                    ],
+                    [
+                      "urgency",
+                      {
+                        "text": "attention"
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "preview",
+                {
+                  "null": null
+                }
+              ],
+              [
+                "collapse_id",
+                {
+                  "text": "c8b1f0a4"
+                }
+              ],
+              [
+                "expires_at_ms",
+                {
+                  "int": "1767226500000"
+                }
+              ],
+              [
+                "notification_id",
+                {
+                  "text": "0f3a9c7e51d24b08"
+                }
+              ],
+              [
+                "sender_record_id",
+                {
+                  "bytes": "5b1f2c8d416a470e9c3d0a7e551288b4"
+                }
+              ]
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "description": "Push registration, sender authorisation and delivery: the exact bytes each signature and digest covers.",
+  "limits": {
+    "collapse_window_ms": "300000",
+    "delivery_credential_lifetime_ms": "2592000000",
+    "free_burst": "20",
+    "free_per_hour": "60",
+    "max_preview_plaintext_bytes": "1800",
+    "max_provider_payload_bytes": "3500",
+    "registration_challenge_lifetime_ms": "300000",
+    "sender_renewal_window_ms": "604800000"
+  },
+  "name": "push",
+  "note": "Values use the same description grammar as fixtures/cbor. cbor_hex is the canonical KR-CBOR-1 encoding of CBOR([domain, payload]), the bytes a signature or a digest covers; sha256 is its digest. json is the managed HTTP representation of the whole record, signature included. The signatures and secrets in json are fixed test bytes, not verifiable material: signature vectors need a signing implementation and live with the cryptography fixtures.",
+  "rate_policy": {
+    "burst": "20",
+    "collapse_window_ms": "300000",
+    "sustained_per_hour": "60"
+  },
+  "rate_policy_fields": {
+    "burst": "20",
+    "collapse_window_ms": "300000",
+    "sustained_per_hour": "60"
+  },
+  "records": {
+    "credential_digest": "nKPo26EvfWDflHgFFpHWig-FcZtZFAHK9klZZJQEepE",
+    "delivery_credential": {
+      "expires_at_ms": "1769817600000",
+      "gateway_origin": "https://reach.kala.to",
+      "installation_id": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+      "issued_at_ms": "1767225600000",
+      "revision": "1",
+      "secret": "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3c",
+      "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+    },
+    "installation_binding": {
+      "bound_at_ms": "1767225601200",
+      "gateway_origin": "https://reach.kala.to",
+      "installation_id": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+      "installation_key": "ERERERERERERERERERERERERERERERERERERERERERE",
+      "platform": "ios",
+      "registration_id": "2e749a03-c158-4d62-a019-6f3bd784215c",
+      "state": "active",
+      "token_digest": "o0I2YfP_oOPSLgy469KfcmjwXModoER3GOLr8LH8H4A"
+    },
+    "sender_record": {
+      "binding": {
+        "gateway_origin": "https://reach.kala.to",
+        "host_endpoint_key": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM",
+        "host_signing_key": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "installation_id": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+        "rate_policy": {
+          "burst": "20",
+          "collapse_window_ms": "300000",
+          "sustained_per_hour": "60"
+        },
+        "sender_record_id": "5b1f2c8d-416a-470e-9c3d-0a7e551288b4"
+      },
+      "credential_expires_at_ms": "1769817600000",
+      "issued_at_ms": "1767225600000",
+      "revision": "1",
+      "state": "active"
+    }
+  },
+  "token": {
+    "derivation": "SHA-256 of CBOR([\"kr-push-token/1\", platform, token]). The platform is inside the digest, so one token registered on two platforms is two destinations.",
+    "platform": "ios",
+    "registration_token": "fZ9k-test-registration-token:APA91bExample",
+    "token_digest": "o0I2YfP_oOPSLgy469KfcmjwXModoER3GOLr8LH8H4A"
+  }
+}

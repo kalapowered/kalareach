@@ -43,6 +43,7 @@
 //! | [`digest`] | The mutation payload digest |
 //! | [`limits`] | Protocol defaults |
 //! | [`schema`] | Deterministic JSON Schema and method-table generation |
+//! | [`vectors`] | The cross-language vectors under `fixtures/service` and `fixtures/push` |
 //!
 //! # What this crate does not do
 //!
@@ -98,3 +99,4 @@ pub mod rights;
 pub mod scalars;
 pub mod schema;
 pub mod service;
+pub mod vectors;
