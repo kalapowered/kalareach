@@ -19,18 +19,25 @@
 //! cargo test --release -p kr-transport --test perf -- --nocapture --test-threads=1
 //! ```
 //!
-//! Both are timed, so both print the conditions section 27 states beside their figures: the build,
-//! the operating system and architecture, the processors, the memory, the load average and how
-//! late the runtime was woken while the measurement ran. KR-PERF-005 is asserted where those
-//! conditions hold and recorded with its shortfall where they do not, because its figure is a
-//! difference of two percentiles on the same host and noise enters it twice: a host that cannot
-//! give the measurement a processor produces a number about contention, and asserting the target
-//! against it would fail runs that say nothing about the product. `tests/priority.rs` holds the
-//! property behind the figure, with no clock in it, and that one is asserted everywhere.
+//! Both are timed, so both print what section 27 asks to be recorded beside a figure: the build,
+//! the operating system and architecture, the processors, the memory, the load average, how much
+//! of the measurement the hypervisor took from this guest, and how late a thread of its own was
+//! woken while the measurement ran. `tests/support/conditions.rs` says which of those is a
+//! condition and which is evidence, and why.
 //!
-//! KR-PERF-006 is asserted on every optimised run. Two seconds against a handshake and one
-//! screen-sized frame on loopback is three orders of magnitude of room, so no amount of scheduling
-//! noise reaches it, and a reconnect that does take two seconds is a defect however busy the host.
+//! KR-PERF-005 is asserted where the host can be shown to meet section 27's conditions, and
+//! recorded with the shortfall named where it cannot. Its figure is a difference of two
+//! percentiles on the same host, so noise enters it twice and does not cancel: on a host the
+//! hypervisor kept taking the processor from, the difference is about contention rather than about
+//! this application. Lateness alone never suppresses it, because the application under test can
+//! cause lateness and a regression must not be able to switch off the check that would catch it.
+//! `tests/priority.rs` holds the property behind the figure, with nothing timed in it, and that
+//! one is asserted everywhere.
+//!
+//! KR-PERF-006 is asserted on every run, unoptimised builds included. It has held on every host
+//! this has run on, by three orders of magnitude, and a reconnect that does take two seconds is a
+//! defect however busy the host was. What it measures is the transport's share alone: a
+//! screen-sized frame arriving, not a screen rendered from it.
 //!
 //! One thing both assert whatever the host: the transfer was running while KR-PERF-005 measured,
 //! and the snapshot arrived whole. A harness that measured an idle connection, or read an empty
@@ -52,7 +59,7 @@ use kr_transport::handshake::{self, Admitted, PairedDirectory};
 use kr_transport::scheduler::{SendLimits, StreamBudget};
 use kr_transport::streams::StreamRegistry;
 use std::sync::Arc;
-use support::conditions::{Host, SchedulingProbe};
+use support::conditions::{Host, SchedulingProbe, StolenTime};
 use support::{OneDevice, Side, direct_addr, epochs, ledger, paired_pair, windows};
 
 /// One input round trip, and the payload it carried.
@@ -77,27 +84,15 @@ fn bytes_of(value: &ParamsValue) -> &[u8] {
 /// How many round trips each measurement takes.
 const SAMPLES: usize = 200;
 
-/// Worker threads the harness's own runtime occupies.
-///
-/// It runs the client, the host and the transfer in one process, so a host with only the reference
-/// four processors has none left for the measurement itself. The conditions check says so.
-const WORKER_THREADS: usize = 4;
-
 /// The added delay KR-PERF-005 allows.
 const ADDED_LIMIT: Duration = Duration::from_millis(25);
 
-/// How often the harness asks the runtime to wake it while it measures.
+/// How often the harness's own thread asks to be woken while it measures.
 ///
-/// Well above the runtime's timer granularity, so what comes back is lateness rather than
-/// rounding.
+/// Well above a platform's sleep granularity, so what comes back is lateness rather than
+/// rounding. What it records is evidence beside the figure and no part of the conditions check;
+/// `tests/support/conditions.rs` says why.
 const PROBE_INTERVAL: Duration = Duration::from_millis(5);
-
-/// How late the runtime may be woken and the figure still be about application scheduling.
-///
-/// A fifth of the target. Above that the host's own scheduling is a material part of any
-/// difference the measurement finds, so the difference is no longer evidence about this
-/// application.
-const MAX_SCHEDULING_DELAY: Duration = Duration::from_millis(5);
 
 /// The time KR-PERF-006 allows before usable state has arrived.
 const USABLE_LIMIT: Duration = Duration::from_secs(2);
@@ -228,6 +223,11 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         .await
         .expect("an input stream");
 
+    // Both phases, and the guest's stolen time across both, because a host that was taken away
+    // from during either one produced neither figure under section 27's conditions.
+    let stolen = StolenTime::start();
+    let probe = SchedulingProbe::start(PROBE_INTERVAL);
+
     let mut baseline = round_trips(&mut input, SAMPLES).await;
     let baseline_p95 = percentile(&mut baseline, 0.95);
 
@@ -257,17 +257,15 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let before = chunks.load(Ordering::Relaxed);
-    let probe = SchedulingProbe::start(PROBE_INTERVAL);
     let mut loaded = round_trips(&mut input, SAMPLES).await;
-    let mut lateness = probe.stop();
     let during = chunks.load(Ordering::Relaxed) - before;
+    let stolen_share = stolen.share();
+    let mut lateness = probe.stop();
     bulk.abort();
-    // Before the percentile, which has no answer for an empty set. A harness that recorded no
-    // lateness knows nothing about its conditions, and that is a defect in the harness rather
-    // than a figure about the product.
+    // Before the percentile, which has no answer for an empty set.
     assert!(
         !lateness.is_empty(),
-        "the harness recorded no runtime lateness, so its conditions are unknown"
+        "the harness recorded no scheduling evidence beside its figure"
     );
     let loaded_p95 = percentile(&mut loaded, 0.95);
     let scheduling_p95 = percentile(&mut lateness, 0.95);
@@ -279,9 +277,16 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         println!("{line}");
     }
     println!(
-        "  runtime woken     {:.3} ms late at p95, over {} asks",
+        "  woken late        {:.3} ms at p95, over {} asks, as evidence beside the figure",
         scheduling_p95.as_secs_f64() * 1000.0,
         lateness.len()
+    );
+    println!(
+        "  taken by the host {}",
+        stolen_share.map_or_else(
+            || "not accounted for here, so unverified".to_owned(),
+            |share| format!("{:.2}% of the measurement", share * 100.0)
+        )
     );
     println!("  samples           {SAMPLES} round trips");
     println!("  transfer          {during} chunks of 512 KiB while they ran");
@@ -306,7 +311,7 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         "the transfer moved nothing while the round trips ran, so they were not measured under one"
     );
 
-    let shortfalls = host.shortfalls(WORKER_THREADS, scheduling_p95, MAX_SCHEDULING_DELAY);
+    let shortfalls = host.shortfalls(stolen_share);
     if shortfalls.is_empty() {
         println!("  conditions        section 27's are met, so the target is asserted here");
         assert!(
@@ -320,6 +325,9 @@ async fn remote_input_stays_responsive_under_a_bulk_transfer() {
         println!(
             "  conditions        not met, so the figure above is recorded and the target is not \
              asserted here"
+        );
+        println!(
+            "  the target's evidence is the reference-host run in the release acceptance record"
         );
     }
 
