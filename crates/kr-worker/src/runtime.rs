@@ -42,11 +42,12 @@ pub const WRITE_PIECE_BYTES: usize = 512;
 /// nothing, so this is long.
 pub const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How long the writer keeps offering a correction the application must have before it gives up.
+/// How long the writer keeps offering bytes the application must have where it cannot ask a waiter.
 ///
-/// A terminal that has taken nothing at all for this long is one whose application has stopped
-/// reading for longer than a paste can sensibly stay open, and a writer that waited for ever there
-/// would never write anything again.
+/// It applies only to a terminal that answers a write with "no room" and has no descriptor to wait
+/// on, which is a combination no backend in the repertoire has: where there is a waiter, the
+/// terminal itself says when it has gone, and that is the bound. This is what stands in for that
+/// answer when nothing can be asked for one.
 pub const INSIST_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long the writer waits for the terminal to have room before it looks at the fence again.
