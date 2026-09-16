@@ -77,6 +77,15 @@ jobs:
       - name: Terminal output handling
         run: cargo test --locked --release -p kr-term --test perf -- --nocapture
 
+      # KR-PERF-005 and KR-PERF-006 are timed targets, so their figures come from an optimised
+      # build too. The harness prints the measurement conditions section 27 states beside each
+      # figure and asserts the scheduling target where those conditions hold; a runner that cannot
+      # meet them records the figure and names the shortfall instead. The property behind the
+      # figure is asserted on every run, in the test step above. Serially, because the two
+      # measurements would otherwise time each other.
+      - name: Transport scheduling and reconnect
+        run: cargo test --locked --release -p kr-transport --test perf -- --nocapture --test-threads=1
+
   typescript:
     name: typescript
     runs-on: ubuntu-24.04

@@ -412,6 +412,73 @@ reports `pending` per worker until each affected worker has acknowledged the rev
 confirmed ended. Cutting a network path or waiting for a lease timer is not completion, because a
 paused worker could already be inside a dispatch transition.
 
+## Performance targets
+
+Section 27 sets two targets for the transport. Both are measured over a real connection on
+loopback, which is the floor rather than a claim about any network: what they show is that the
+application's own scheduling and handshake are not where the delay comes from.
+
+| Requirement | What is measured | Target |
+| --- | --- | --- |
+| KR-PERF-005 | What application scheduling adds above the measured path round trip while a transfer runs | under 25 ms p95 |
+| KR-PERF-006 | The transport's share of a reconnect: connecting, the handshake, one stream and a 120x40 screen | under two seconds |
+
+`crates/kr-transport/tests/perf.rs` is the harness. Run it optimised and serially, because the two
+measurements would otherwise time each other:
+
+```bash
+cargo test --release -p kr-transport --test perf -- --nocapture --test-threads=1
+```
+
+### The conditions a figure is taken under
+
+Section 27 measures against a reference host: at least four processors and 8 GiB of memory, with
+the operating system and architecture recorded beside the figure, and the host idle apart from the
+measurement. The harness prints every one of those, and measures the one that cannot be looked up.
+"Idle" is not a property a process can read, and a shared virtual machine's own load is invisible
+from inside it, so what the harness records instead is how late the runtime was woken while the
+measurement ran: a task that asks for five milliseconds and is given forty says the host had
+nothing to spare. Each run also prints the load average where the platform reports one, as evidence
+rather than as a condition, because a one-minute average still carries the build that just
+finished.
+
+KR-PERF-005 is asserted where every condition held, and recorded with the shortfall named where one
+did not. The reason is in the shape of the figure: it is a difference between two percentiles taken
+on the same host, so noise enters it twice and does not cancel. On a host that cannot give the
+measurement a processor the difference is about contention rather than about this application, and
+asserting the target against such a number would fail runs that say nothing about the product. A
+shared CI runner is one of those hosts. Four processors are the whole of what section 27 asks a
+reference host for, and this harness needs them for its own runtime, because it runs the client,
+the host and the transfer in one process. A run there prints its figure, names what was missing and
+asserts nothing about the number; the evidence for the target is the reference-host run in the
+release record.
+
+KR-PERF-006 is asserted on every optimised run. Two seconds against a handshake and one
+screen-sized frame is three orders of magnitude of room, so no amount of scheduling noise reaches
+it, and a reconnect that does take two seconds is a defect however busy the host was.
+
+What both runs assert whatever the host: that the transfer was moving while KR-PERF-005 took its
+loaded measurement, and that the snapshot arrived whole. Without those a harness could pass by
+measuring an idle connection twice.
+
+### The property behind the figure
+
+`crates/kr-transport/tests/priority.rs` holds what KR-PERF-005 is about, with no clock in it, so it
+is asserted on every run: optimised or not, shared runner or reference host. Two things, one for
+each half of the mechanism above.
+
+At the connection's own default limits, a transfer holding every byte its ceiling allows still
+leaves the control reserve: one more transfer frame is refused, and a keystroke the size of the
+whole reserve is admitted. That is the admission half, and it is exact arithmetic rather than a
+timing.
+
+Over a real connection, with a transfer that never ends running through it, every keystroke is
+answered and each echo carries the keystroke that was sent, while the transfer keeps taking chunks
+at the far end. Both sides make progress, which a connection whose transfer had taken the link
+could not do. The transfer is drained rather than left unread, because a receiver that stops
+reading fills the connection's flow-control window, which no stream priority reaches past, and that
+is the case named at the end of the streams section rather than this one.
+
 ## Wiring a host
 
 ### What the host owes

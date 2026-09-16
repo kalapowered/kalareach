@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub mod conditions;
+
 use std::sync::Arc;
 
 use iroh::{Endpoint, EndpointAddr};
