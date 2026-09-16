@@ -127,19 +127,46 @@ async fn create(host: &Host) -> Result<SessionCreateResult, String> {
             value: "/usr/bin:/bin".to_owned(),
         }],
     };
-    client
-        .mutate(
-            Method::SessionCreate,
-            ActionId::new(kr_ipc::new_uuid()),
-            ActionTarget::environment(host.environment_id),
-            &params,
-        )
-        .await
-        .map_err(|error| format!("the create call: {error}"))?
-        .map_err(|error| format!("the create failed: {error}"))?
-        .to_typed()
-        .map_err(|error| format!("the create result: {error}"))
+    // The identifier is decided before the call and kept. A create whose answer never arrives has
+    // still happened, so asking again with the same identifier is how the measurement learns what
+    // it owns rather than leaving a session nobody will close; the daemon answers a repeat with the
+    // outcome it recorded the first time.
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let mut failure = String::new();
+    for attempt in 0..CREATE_ATTEMPTS {
+        if attempt > 0 {
+            client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .map_err(|error| format!("connect to the daemon: {error}"))?;
+        }
+        match client
+            .mutate(
+                Method::SessionCreate,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+        {
+            Ok(Ok(value)) => {
+                return value
+                    .to_typed()
+                    .map_err(|error| format!("the create result: {error}"));
+            }
+            // The daemon answered and refused. Nothing was created, so there is nothing to own.
+            Ok(Err(error)) => return Err(format!("the create failed: {error}")),
+            // The answer was lost. Whether the session exists is exactly what asking again settles.
+            Err(error) => failure = format!("the create call: {error}"),
+        }
+    }
+    Err(failure)
 }
+
+/// How many times a measurement asks for the same create before it gives up.
+///
+/// The identifier does not change between them, so this is one create being asked about rather
+/// than several being made.
+const CREATE_ATTEMPTS: usize = 3;
 
 /// Returns the resident size of a process, in kibibytes.
 ///
