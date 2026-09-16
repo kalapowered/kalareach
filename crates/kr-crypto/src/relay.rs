@@ -39,7 +39,7 @@ use crate::error::{CryptoError, Result};
 use crate::secret::Secret;
 use crate::sign::{SigningTranscript, sign, verify};
 use crate::sodium;
-use crate::store::{check_owner_only, set_mode, sync_directory, write_owner_only};
+use crate::store::{check_owner_only, sync_directory, write_owner_only};
 
 /// The file the relay instance key is kept in, inside the directory the caller names.
 const INSTANCE_KEY_FILE: &str = "instance.key";
@@ -183,22 +183,34 @@ impl RelayInstanceKeyPair {
 /// ask the operating system who this process is.
 #[cfg(unix)]
 fn open_private_directory(directory: &Path) -> Result<u32> {
-    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 
     if directory.is_symlink() {
         return Err(CryptoError::SecretStore {
             message: format!("{} is a symbolic link", directory.display()),
         });
     }
-    if directory.exists() {
-        check_owner_only(directory)?;
-    } else {
-        std::fs::create_dir_all(directory).map_err(|error| CryptoError::SecretStore {
-            message: format!("create {}: {error}", directory.display()),
+    // Created owner-only from the start, rather than created and then narrowed: between the two
+    // there would be a moment when the directory the key is about to be written into was readable,
+    // and another initialiser looking at that moment would refuse a directory that was about to be
+    // fine. A directory that is already there is validated, never repaired.
+    if let Some(parent) = directory.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| CryptoError::SecretStore {
+            message: format!("create {}: {error}", parent.display()),
         })?;
-        set_mode(directory, 0o700)?;
-        check_owner_only(directory)?;
     }
+    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(CryptoError::SecretStore {
+                message: format!("create {}: {error}", directory.display()),
+            });
+        }
+    }
+    check_owner_only(directory)?;
     Ok(std::fs::metadata(directory)
         .map_err(|error| CryptoError::SecretStore {
             message: format!("stat {}: {error}", directory.display()),
@@ -231,7 +243,10 @@ fn read_seed(path: &Path, owner: u32) -> Result<Option<Secret<RELAY_SEED_LEN>>> 
 
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc_o_nofollow())
+        // The link is refused by the kernel rather than by a check afterwards, and the open does
+        // not wait: a named pipe left in the key's place would otherwise block the relay's start
+        // until somebody opened the other end of it.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -290,21 +305,6 @@ fn read_seed(path: &Path, _owner: u32) -> Result<Option<Secret<RELAY_SEED_LEN>>>
             path.display()
         ),
     })
-}
-
-/// `O_NOFOLLOW`, without taking a dependency on a libc binding for one constant.
-#[cfg(unix)]
-const fn libc_o_nofollow() -> i32 {
-    // The value is fixed by each platform's ABI. Linux and the BSDs, including macOS, are the
-    // systems a relay runs on.
-    #[cfg(target_os = "linux")]
-    {
-        0o400_000
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x0100
-    }
 }
 
 /// Writes the seed to a staging file, flushes it, and publishes it without replacing a key.
@@ -628,6 +628,35 @@ mod tests {
         // A key the rest of the machine can read is a key the rest of the machine can sign with,
         // and the receipts it signs would still verify. The relay stops rather than pretending.
         assert!(RelayInstanceKeyPair::open(&directory).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_in_the_key_s_place_does_not_hold_the_relay_open() {
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let directory = key_directory(&parent);
+        RelayInstanceKeyPair::open(&directory).expect("a first start");
+
+        let path = directory.join(INSTANCE_KEY_FILE);
+        std::fs::remove_file(&path).expect("the original key");
+        let name = std::ffi::CString::new(path.to_str().expect("a path")).expect("a C string");
+        // A pipe nobody is writing to: opened without `O_NONBLOCK` this would wait for a writer
+        // that never comes, and the relay would hang at start rather than refusing.
+        assert_eq!(unsafe_mkfifo(&name), 0, "a named pipe");
+
+        assert!(RelayInstanceKeyPair::open(&directory).is_err());
+    }
+
+    /// `mkfifo`, for the one test that needs one.
+    #[cfg(unix)]
+    fn unsafe_mkfifo(path: &std::ffi::CStr) -> i32 {
+        // The crate forbids `unsafe` outside `sodium`, so the pipe is made by the shell rather
+        // than by a libc call from here.
+        std::process::Command::new("mkfifo")
+            .arg(path.to_str().expect("a path"))
+            .status()
+            .map(|status| i32::from(!status.success()))
+            .unwrap_or(1)
     }
 
     #[cfg(unix)]

@@ -2809,6 +2809,7 @@ dependencies = [
  "keyring",
  "kr-cbor",
  "kr-protocol",
+ "libc",
  "libsodium-sys-stable",
  "serde",
  "serde_json",

@@ -17,6 +17,7 @@ hkdf.workspace = true
 hmac.workspace = true
 keyring.workspace = true
 kr-cbor.workspace = true
+libc.workspace = true
 kr-protocol.workspace = true
 libsodium-sys-stable.workspace = true
 serde_json.workspace = true

@@ -142,6 +142,56 @@ pub fn generated_files(repository_root: &Path) -> Result<Vec<(&'static str, Stri
     ])
 }
 
+/// The key one relay object names, and the signing input its own fields produce.
+///
+/// Every relay object states the key it is to be verified under, so a vector is only worth
+/// publishing if that key is the one signing it and if the bytes signed are the ones the object
+/// itself produces. Both come from the typed object rather than from the document around it.
+fn relay_object_authority(
+    domain: &str,
+    json: Value,
+    id: &str,
+    source: &str,
+) -> Result<([u8; 32], Vec<u8>)> {
+    use kr_protocol::relay::{
+        RELAY_INSTANCE_DOMAIN, RELAY_LEASE_DOMAIN, RELAY_RECEIPT_DOMAIN, RELAY_REVOKE_DOMAIN,
+        RelayConsumptionReceipt, RelayInstanceRegistration, RelayLease, RelayLeaseRevocation,
+    };
+
+    let malformed = |error: serde_json::Error| CryptoError::SecretStore {
+        message: format!("case {id} in {source} does not parse: {error}"),
+    };
+
+    match domain {
+        RELAY_LEASE_DOMAIN => {
+            let object: RelayLease = serde_json::from_value(json).map_err(malformed)?;
+            Ok((*object.issuer_key.as_bytes(), object.signing_input()?))
+        }
+        RELAY_REVOKE_DOMAIN => {
+            let object: RelayLeaseRevocation = serde_json::from_value(json).map_err(malformed)?;
+            Ok((*object.issuer_key.as_bytes(), object.signing_input()?))
+        }
+        RELAY_RECEIPT_DOMAIN => {
+            // A receipt names no key: it is verified under the instance the registry holds for the
+            // identity inside it, so the vector's own instance key is the authority here.
+            let object: RelayConsumptionReceipt =
+                serde_json::from_value(json).map_err(malformed)?;
+            Ok((RELAY_RECEIPT_AUTHORITY, object.signing_input()?))
+        }
+        RELAY_INSTANCE_DOMAIN => {
+            let object: RelayInstanceRegistration =
+                serde_json::from_value(json).map_err(malformed)?;
+            Ok((*object.instance_key.as_bytes(), object.signing_input()?))
+        }
+        other => Err(CryptoError::SecretStore {
+            message: format!("case {id} in {source} signs under an unknown domain {other}"),
+        }),
+    }
+}
+
+/// Stands for "whichever instance key the registry holds", which a receipt does not carry.
+const RELAY_RECEIPT_AUTHORITY: [u8; 32] = [0; 32];
+
 /// The relay tier's signatures over the objects in `fixtures/relay/`.
 ///
 /// Two keys and four documents. The service admission key signs leases and revocations; the relay
@@ -192,29 +242,44 @@ fn relay_signatures(repository_root: &Path) -> Result<Value> {
             let message = decode_hex(hex)?;
             let transcript = SigningTranscript::from_canonical_bytes(domain, message.clone())?;
 
-            // The object names the key it is to be verified under. If that is not the key signing
-            // it here, the vector would publish a signature that authorises nothing, so the seeds
-            // and the relay fixtures are held to each other rather than drifting apart quietly.
-            let named = case.get("json").and_then(|json| {
-                json.get("issuer_key")
-                    .or_else(|| json.get("instance_key"))
-                    .and_then(Value::as_str)
-            });
-            if let Some(named) = named {
-                let admission_public = admission.public();
-                let expected = match domain {
-                    RELAY_LEASE_DOMAIN | RELAY_REVOKE_DOMAIN => admission_public.as_bytes(),
-                    _ => instance.public().as_bytes(),
-                };
-                if kr_protocol::scalars::to_base64url(expected) != named {
-                    return Err(CryptoError::SecretStore {
-                        message: format!(
-                            "case {id} in {source} names a key the vectors do not sign with; \
-                             regenerate fixtures/relay with {}",
-                            kr_protocol::scalars::to_base64url(expected)
-                        ),
-                    });
-                }
+            // The object is rebuilt from the representation the fixture publishes, its signing
+            // input is derived again from that typed object, and the result must be the bytes
+            // about to be signed. Reading a key out of the JSON and leaving it there would check
+            // one document and sign another: a fixture whose canonical bytes named a different
+            // issuer would pass, and the published signature would authorise nothing.
+            let json = case
+                .get("json")
+                .cloned()
+                .ok_or_else(|| CryptoError::SecretStore {
+                    message: format!("case {id} in {source} publishes no representation"),
+                })?;
+            let (named, rebuilt) = relay_object_authority(domain, json, id, source)?;
+            if rebuilt != message {
+                return Err(CryptoError::SecretStore {
+                    message: format!(
+                        "case {id} in {source} signs bytes its own representation does not produce"
+                    ),
+                });
+            }
+            let admission_public = admission.public();
+            let expected = match domain {
+                RELAY_LEASE_DOMAIN | RELAY_REVOKE_DOMAIN => *admission_public.as_bytes(),
+                _ => *instance.public().as_bytes(),
+            };
+            let expected = if named == RELAY_RECEIPT_AUTHORITY {
+                // A receipt names no key, so there is nothing to disagree with.
+                named
+            } else {
+                expected
+            };
+            if named != expected {
+                return Err(CryptoError::SecretStore {
+                    message: format!(
+                        "case {id} in {source} names a key the vectors do not sign with; \
+                         regenerate fixtures/relay with {}",
+                        kr_protocol::scalars::to_base64url(&expected)
+                    ),
+                });
             }
 
             let (signer, signature) = match domain {
