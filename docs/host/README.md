@@ -344,11 +344,41 @@ What a device reaches, in order:
    it presents a generation token, so a device's attachment, subscription and input lane belong to a
    connection of their own without displacing the daemon's authority connection.
 
+What the grant decides, for every request:
+
+* **Expiry.** A grant that has run out is refused, and once it has been found expired it stays
+  expired, so a wall clock stepped backwards revives nothing. What remains of its lifetime is also
+  an authority deadline: an action admitted a moment before the expiry cannot dispatch after it.
+* **Selectors.** The environment and the session the request names have to be ones the grant
+  admits. A listing names no session, so the *answer* is narrowed instead: a device is told about
+  the sessions its grant admits and no others.
+* **Rights.** Every right the method requires unconditionally, and every conditional one whose
+  condition this request meets — a `session.attach` that claims geometry needs `terminal.geometry`,
+  whether or not the worker would have given it the capability. A condition the daemon cannot
+  decide is treated as holding, so the right is asked for rather than skipped.
+* **History.** Retained history is not served to a device at all: its scope is the grant's lower
+  bound, that bound is a moment in time and a history page is a byte range, and a host that cannot
+  narrow content to a grant refuses it rather than serving more than the grant allows. The
+  session's live screen and the stream that follows it are served when the grant includes them.
+
+What the subject decides stays the subject's. Resource ownership is the clearest case: a device
+detaches the attachment its own connection created and nothing else, and the worker enforces that
+inside its own dispatch barrier where the attachment cannot move. A local caller keeps its
+cross-window detach, because every local caller is the same authenticated operating-system user.
+
 Remote dispatch needs a live lease, and a lease is renewed only after the worker has acknowledged
-the authority revision in force. A worker starts having acknowledged nothing, so opening the first
-proxy link to it announces the revision over the authority connection; until the worker installs
-it, there is nothing to say it has fenced whatever the revision removed. Local input and stopping
-owned execution depend on none of this: neither is remote dispatch.
+the authority revision in force. A worker starts having acknowledged nothing, so the daemon asks
+*that* worker for its acknowledgement when it opens a proxy link to it and again if a dispatch
+finds no lease; asking every worker would make one paused session everybody's wait. The envelope
+carries the revision the grant was checked at, and the worker refuses inside its barrier an action
+validated under a revision it has since installed past. Local input and stopping owned execution
+depend on none of this: neither is remote dispatch.
+
+A device that falls behind is told rather than waited for. What the daemon holds for one device is
+bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that
+bound loses its link, which takes its subscription and its attachment with it, and section 8 has it
+reconnect and resume from the cursor it holds. Holding the worker's own delivery task instead would
+make one slow device everybody's problem.
 
 ## What the host owes the transport
 
@@ -358,11 +388,15 @@ Two contracts `docs/transport/README.md` names, and where they are kept:
   connection in one critical section, in one lock order that a revocation also takes, so nothing
   can be admitted against authority that has already been replaced. One authority store holds both
   ingresses, so a revocation fences a paired device and a local caller through one table.
-  Withdrawing a registration fences that connection's reads, and its subscription: the relay checks
-  the registration before each batch it writes rather than after. Revoking a device writes the
-  record's revocation and advances the authority revision in one critical section, so no connection
-  can be admitted between the two; what it fences is that device's connections, because nobody
-  else's authority was withdrawn. At a worker, binding a newer controller generation withdraws the
+  Withdrawing a registration fences that connection's reads, its dispatches and its subscription.
+  Every frame a network connection sends is decided and written behind one turn, and a withdrawal
+  sets that turn's latch before it closes the connection, so no write begins after the authority
+  behind it went; the withdrawal itself never waits for a peer. Revoking a device withdraws its
+  registrations and releases what its connections owned at their workers *before* it writes
+  anything, because the fence is the step that cannot fail; the record's revocation and the
+  authority revision then move in one critical section, so no connection can be admitted between
+  the two. What it fences is that device's connections, because nobody else's authority was
+  withdrawn. At a worker, binding a newer controller generation withdraws the
   previous connection's registration, which stops the subscription it had already started; the
   connection stays open so its next request can say why it was refused.
 * **Work that must complete.** A mutation's effect runs on a task that outlives the connection, so
