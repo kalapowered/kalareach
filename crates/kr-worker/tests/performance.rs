@@ -424,31 +424,34 @@ fn total<T: std::iter::Sum>(
         .sum()
 }
 
-/// Returns the one-, five- and fifteen-minute load averages, or says why it could not read them.
+/// Returns the one-, five- and fifteen-minute load averages, or says it could not read them.
 ///
-/// A resource figure is about a machine under conditions. The script around this measurement
-/// records the load either side of the whole command, setup and cleanup included; this reads it at
-/// the two edges of the processor window itself, which is the interval the figure is an average
-/// over.
-fn load_average() -> Result<String, String> {
-    if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
-        return Ok(text
-            .split_whitespace()
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" "));
-    }
-    let output = std::process::Command::new("sysctl")
-        .args(["-n", "vm.loadavg"])
-        .output()
-        .map_err(|error| format!("read the load average: {error}"))?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim().trim_matches(|c| c == '{' || c == '}');
+/// A resource figure is about a machine under conditions. The script around this measurement records
+/// the load either side of the whole command, setup and cleanup included; this reads it at the two
+/// edges of the processor window itself, which is the interval the figure is an average over. It is
+/// a condition rather than a reading the figure is made of, so a host that will not report it says
+/// so among the conditions instead of losing the measurement.
+fn load_average() -> String {
+    let reading = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| first_three(&text))
+        .or_else(|| {
+            let output = std::process::Command::new("sysctl")
+                .args(["-n", "vm.loadavg"])
+                .output()
+                .ok()?;
+            first_three(&String::from_utf8_lossy(&output.stdout))
+        });
+    reading.unwrap_or_else(|| "unread".to_owned())
+}
+
+/// Returns the first three numbers of a load-average reading, in whichever form the host printed it.
+fn first_three(text: &str) -> Option<String> {
+    let text = text
+        .trim()
+        .trim_matches(|character| character == '{' || character == '}');
     let reading: Vec<&str> = text.split_whitespace().take(3).collect();
-    if reading.len() < 3 {
-        return Err("the host reports its load average".to_owned());
-    }
-    Ok(reading.join(" "))
+    (reading.len() == 3).then(|| reading.join(" "))
 }
 
 /// What the idle measurement established.
@@ -538,11 +541,11 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     let daemon = std::process::id();
 
     let started = Instant::now();
-    let entering = load_average()?;
+    let entering = load_average();
     let before = each(&workers, daemon, processor_seconds)?;
     tokio::time::sleep(IDLE_WINDOW).await;
     let after = each(&workers, daemon, processor_seconds)?;
-    let leaving = load_average()?;
+    let leaving = load_average();
     let elapsed = started.elapsed().as_secs_f64();
     // Per process, because a total that missed its bound does not say what spent the time. A
     // reading that went backwards is an identifier that is no longer the process it was, and a
