@@ -31,6 +31,9 @@ workspace = true
 [dependencies.hex]
 workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 # The workspace forbids unsafe code, which a crate that calls a C library cannot honour. This
 # crate denies it instead and allows it in exactly one module, `sodium`, which owns every call
 # into libsodium. Nothing else in the tree may relax the workspace rule.

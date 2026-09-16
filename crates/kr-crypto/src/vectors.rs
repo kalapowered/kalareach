@@ -44,6 +44,9 @@ pub const ENVELOPES_FILE_NAME: &str = "envelopes.json";
 /// The key derivation vectors.
 pub const KDF_FILE_NAME: &str = "kdf.json";
 
+/// The relay signature vectors.
+pub const RELAY_FILE_NAME: &str = "relay.json";
+
 /// The test authorisation seed of the host side.
 const HOST_AUTHORISATION_SEED: [u8; 32] = [0xa1; 32];
 /// The test authorisation seed of the client side.
@@ -58,6 +61,10 @@ const ENVELOPE_NONCE: [u8; 24] = [0xc5; 24];
 const KEY_WRAP_NONCE: [u8; 24] = [0xc6; 24];
 /// The test recovery seed.
 const RECOVERY_SEED: [u8; 32] = [0xd7; 32];
+/// The test seed of a relay instance key.
+const RELAY_INSTANCE_SEED: [u8; 32] = [0xf1; 32];
+/// The test seed of the service admission key that signs relay leases.
+const SERVICE_ADMISSION_SEED: [u8; 32] = [0xf2; 32];
 /// The test object key of the key wrap vector.
 const OBJECT_KEY: [u8; 32] = [0xe8; 32];
 
@@ -131,7 +138,107 @@ pub fn generated_files(repository_root: &Path) -> Result<Vec<(&'static str, Stri
         (SIGNATURES_FILE_NAME, render(&signatures(repository_root)?)),
         (ENVELOPES_FILE_NAME, render(&envelopes()?)),
         (KDF_FILE_NAME, render(&derivations()?)),
+        (RELAY_FILE_NAME, render(&relay_signatures(repository_root)?)),
     ])
+}
+
+/// The relay tier's signatures over the objects in `fixtures/relay/`.
+///
+/// Two keys and four documents. The service admission key signs leases and revocations; the relay
+/// instance key signs receipts and its own registration. A verifier in any language can take the
+/// signing input the relay fixtures already publish, the public key here, and the signature, and
+/// check all three agree — which is the whole of what a relay does before it forwards a payload,
+/// and the whole of what the service does before it records a receipt.
+fn relay_signatures(repository_root: &Path) -> Result<Value> {
+    use kr_protocol::relay::{
+        RELAY_INSTANCE_DOMAIN, RELAY_LEASE_DOMAIN, RELAY_RECEIPT_DOMAIN, RELAY_REVOKE_DOMAIN,
+    };
+
+    let instance = crate::relay::RelayInstanceKeyPair::from_seed_bytes(&RELAY_INSTANCE_SEED)?;
+    let admission =
+        crate::relay::ServiceAdmissionKeyPair::from_seed_bytes(&SERVICE_ADMISSION_SEED)?;
+
+    let mut cases = Vec::new();
+    for (file, source) in [
+        ("fixtures/relay/leases.json", "relay/leases"),
+        ("fixtures/relay/receipts.json", "relay/receipts"),
+        ("fixtures/relay/instances.json", "relay/instances"),
+    ] {
+        let document = read_fixture(repository_root, file)?;
+        let listed = document
+            .get("cases")
+            .and_then(Value::as_array)
+            .ok_or_else(|| CryptoError::SecretStore {
+                message: format!("{source} has no cases array"),
+            })?;
+        for case in listed {
+            let id =
+                case.get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| CryptoError::SecretStore {
+                        message: format!("a case in {source} has no identifier"),
+                    })?;
+            let domain = case.get("domain").and_then(Value::as_str).ok_or_else(|| {
+                CryptoError::SecretStore {
+                    message: format!("case {id} in {source} names no domain"),
+                }
+            })?;
+            let hex = case
+                .get("signing_input_hex")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CryptoError::SecretStore {
+                    message: format!("case {id} in {source} has no signing input"),
+                })?;
+            let message = decode_hex(hex)?;
+            let transcript = SigningTranscript::from_canonical_bytes(domain, message.clone())?;
+
+            let (signer, signature) = match domain {
+                RELAY_LEASE_DOMAIN | RELAY_REVOKE_DOMAIN => (
+                    "service_admission",
+                    crate::sign::sign(admission.inner(), &transcript)?,
+                ),
+                RELAY_RECEIPT_DOMAIN | RELAY_INSTANCE_DOMAIN => {
+                    ("relay_instance", instance.sign_transcript(&transcript)?)
+                }
+                other => {
+                    return Err(CryptoError::SecretStore {
+                        message: format!(
+                            "case {id} in {source} signs under an unknown domain {other}"
+                        ),
+                    });
+                }
+            };
+
+            cases.push(json!({
+                "id": format!("{source}:{id}"),
+                "description": case.get("description").and_then(Value::as_str).unwrap_or_default(),
+                "domain": domain,
+                "signer": signer,
+                "message_hex": hex,
+                "message_sha256": hex::encode(kr_cbor::sha256(&message)),
+                "signature_hex": hex::encode(signature.as_bytes()),
+            }));
+        }
+    }
+
+    Ok(json!({
+        "name": "relay",
+        "description": "Ed25519 signatures over the relay objects in fixtures/relay, by the two keys section 17 puts around a relay.",
+        "note": "message_hex is the signing input the relay fixtures publish: CBOR([domain, object]). A verifier checks the signature against the named signer's public key and those exact bytes; it never re-encodes the object from its JSON representation to obtain them.",
+        "signers": {
+            "relay_instance": {
+                "description": "The key one relay instance signs receipts and its own registration with. Generated on the host; this seed is test material.",
+                "seed_hex": hex::encode(RELAY_INSTANCE_SEED),
+                "public_key_hex": hex::encode(instance.public().as_bytes()),
+            },
+            "service_admission": {
+                "description": "The key the managed service signs leases and revocations with, and which a relay pins.",
+                "seed_hex": hex::encode(SERVICE_ADMISSION_SEED),
+                "public_key_hex": hex::encode(admission.public().as_bytes()),
+            },
+        },
+        "cases": cases,
+    }))
 }
 
 fn render(value: &Value) -> String {

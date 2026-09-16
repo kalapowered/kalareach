@@ -21,7 +21,8 @@
 //!   allocates a buffer.
 //! * **Purpose separation.** [`keys`] gives the four device key purposes four types that cannot be
 //!   converted into each other, and keeps their private material out of reach of code outside this
-//!   crate.
+//!   crate. [`relay`] does the same for the relay tier's two keys, which belong to a host and to
+//!   the service rather than to a device.
 //! * **Zeroising secrets.** [`secret::Secret`] and [`secret::SecretVec`] zeroise on drop and
 //!   redact themselves in debug output.
 //! * **Nonces the caller cannot repeat.** Every sealing function generates its own nonce from
@@ -41,6 +42,7 @@
 //! | [`aead`] | The XChaCha20-Poly1305 AEAD the pairing bundle exchange uses |
 //! | [`stream`] | `secretstream` in 1 MiB records, with the final record required |
 //! | [`kdf`] | HKDF-SHA256, HMAC-SHA256 and the `KRRECOV1` recovery derivations |
+//! | [`relay`] | The relay instance key, and the service admission key a relay pins |
 //! | [`store`] | Platform secret storage and the documented Unix fallback |
 //! | [`connect`] | The `kr-connect/1` mutual proof |
 //! | [`envelope`] | Mailbox envelopes |
@@ -98,6 +100,7 @@ pub mod envelope;
 mod error;
 pub mod kdf;
 pub mod keys;
+pub mod relay;
 pub mod sealed;
 pub mod secret;
 pub mod sign;

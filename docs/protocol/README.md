@@ -504,6 +504,7 @@ ordering cases test what they claim to test.
 | `relay/receipts.json` | Two consumption receipts of one reservation, showing the cumulative count |
 | `relay/instances.json` | A relay instance registration and an announced key rotation |
 | `relay/envelopes.json` | The install, revoke, report and registration messages that carry them |
+| `crypto/relay.json` | Ed25519 signatures over those objects, by the relay instance key and the service admission key |
 | `accounts/leases.json` | The signing input of every account authority object, with the role ceilings and lifetimes |
 
 An invalid case names its rule with the same string in both languages, for example
@@ -517,6 +518,11 @@ the managed HTTP representation. Each one catches a different mistake, and a cha
 fails the vector in whichever of the four it actually altered. Both languages also rebuild the
 object from `json` alone and check that it signs the same bytes, because that is the path the
 managed service takes with a receipt that arrives over HTTPS.
+
+The relay's signature vectors are in `fixtures/crypto/relay.json`, because they need a signing
+implementation: `kr-crypto` holds the relay instance key and the service admission key as purposes
+of their own, and the TypeScript suite verifies what it produced with the Node runtime, which
+shares no code with libsodium.
 
 These fixtures cover bytes, digests and signing input. Signature vectors need a signing
 implementation, which lives with the cryptography crate rather than here; that crate consumes

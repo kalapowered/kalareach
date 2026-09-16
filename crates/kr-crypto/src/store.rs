@@ -398,7 +398,7 @@ pub const FILE_FALLBACK_SUPPORTED: bool = cfg!(all(
 /// An existing directory is validated before its mode is changed, so this never relaxes or
 /// tightens something that belongs to another account, and the mode it sets is the mode of the
 /// directory it believes it is writing to.
-fn prepare_private_directory(directory: &Path) -> Result<()> {
+pub(crate) fn prepare_private_directory(directory: &Path) -> Result<()> {
     // Every component is checked before anything is created. `create_dir_all` on
     // `parent/link/new` would otherwise create `new` through the link and only then be rejected.
     reject_ancestor_links(directory)?;
@@ -418,7 +418,7 @@ fn prepare_private_directory(directory: &Path) -> Result<()> {
 ///
 /// A component that does not exist yet is not a link, so this is meaningful before the directory
 /// is created as well as after.
-fn reject_ancestor_links(path: &Path) -> Result<()> {
+pub(crate) fn reject_ancestor_links(path: &Path) -> Result<()> {
     let mut component = Some(path);
     while let Some(current) = component {
         if current.is_symlink() {
@@ -453,7 +453,7 @@ static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 /// Creates `path` exclusively with mode 0600, writes `secret` and flushes it to the device.
 #[cfg(unix)]
-fn write_owner_only(path: &Path, secret: &[u8]) -> Result<()> {
+pub(crate) fn write_owner_only(path: &Path, secret: &[u8]) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -473,7 +473,7 @@ fn write_owner_only(path: &Path, secret: &[u8]) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_owner_only(path: &Path, _secret: &[u8]) -> Result<()> {
+pub(crate) fn write_owner_only(path: &Path, _secret: &[u8]) -> Result<()> {
     Err(CryptoError::SecretStore {
         message: format!(
             "{}: the file fallback store is only available on Unix",
@@ -484,7 +484,7 @@ fn write_owner_only(path: &Path, _secret: &[u8]) -> Result<()> {
 
 /// Flushes a directory entry to the device.
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> Result<()> {
+pub(crate) fn sync_directory(directory: &Path) -> Result<()> {
     std::fs::File::open(directory)
         .and_then(|handle| handle.sync_all())
         .map_err(|error| CryptoError::SecretStore {
@@ -493,7 +493,7 @@ fn sync_directory(directory: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> Result<()> {
+pub(crate) fn sync_directory(_directory: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -504,7 +504,7 @@ fn sync_directory(_directory: &Path) -> Result<()> {
 /// owners differ. That answers the question without calling `getuid`, which would mean an `unsafe`
 /// call outside the one module allowed to make them.
 #[cfg(unix)]
-fn check_owner_only(directory: &Path) -> Result<()> {
+pub(crate) fn check_owner_only(directory: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -542,12 +542,12 @@ fn check_owner_only(directory: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn check_owner_only(_directory: &Path) -> Result<()> {
+pub(crate) fn check_owner_only(_directory: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> Result<()> {
+pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
@@ -558,7 +558,7 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
+pub(crate) fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Err(CryptoError::SecretStore {
         message: "the file fallback store is only available on Unix".to_owned(),
     })

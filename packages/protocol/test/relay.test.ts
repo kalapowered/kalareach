@@ -7,7 +7,10 @@
  * the relay signed, and issues leases the relay will accept.
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, createPublicKey, verify } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -39,6 +42,8 @@ import {
   parseValue,
   type FixtureCase
 } from './fixtures.js'
+
+const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
 const leases = loadFixture('relay', 'leases.json')
 const receipts = loadFixture('relay', 'receipts.json')
@@ -302,6 +307,64 @@ describe('the envelopes that carry them', () => {
           'signing_input_hex'
         ]
       )
+    }
+  })
+})
+
+describe('the signatures over them', () => {
+  const vectors = JSON.parse(
+    readFileSync(join(repositoryRoot, 'fixtures', 'crypto', 'relay.json'), 'utf8')
+  ) as {
+    signers: Record<string, { public_key_hex: string }>
+    cases: Array<{
+      id: string
+      domain: string
+      signer: string
+      message_hex: string
+      signature_hex: string
+    }>
+  }
+
+  /** Verifies Ed25519 with the Node runtime, which shares no code with libsodium. */
+  function verifies (publicKeyHex: string, messageHex: string, signatureHex: string): boolean {
+    // A raw 32-byte Ed25519 public key, as a JWK, because Node's `createPublicKey` takes one.
+    const key = createPublicKey({
+      key: {
+        kty: 'OKP',
+        crv: 'Ed25519',
+        x: Buffer.from(hexToBytes(publicKeyHex)).toString('base64url')
+      },
+      format: 'jwk'
+    })
+    return verify(null, Buffer.from(hexToBytes(messageHex)), key, Buffer.from(hexToBytes(signatureHex)))
+  }
+
+  it.each(vectors.cases.map((entry) => [entry.id, entry] as const))(
+    '%s verifies under the key its signer names',
+    (_id, entry) => {
+      const signer = vectors.signers[entry.signer]
+      if (signer === undefined) throw new Error(`no signer ${entry.signer}`)
+
+      expect(verifies(signer.public_key_hex, entry.message_hex, entry.signature_hex)).toBe(true)
+
+      // The other key does not answer for it. Two authorities, not two spellings of one.
+      const other = Object.entries(vectors.signers).find(([name]) => name !== entry.signer)
+      if (other === undefined) throw new Error('two signers')
+      expect(verifies(other[1].public_key_hex, entry.message_hex, entry.signature_hex)).toBe(false)
+    }
+  )
+
+  it('signs the bytes the relay fixtures publish, not a re-encoding of them', () => {
+    // Every signed message is the signing input one of the relay vectors already states, so a
+    // verifier that rebuilt the object from its JSON and signed that would produce other bytes.
+    const published = new Set(
+      [leases, receipts, instances].flatMap((document) =>
+        (document.cases ?? []).map((entry) => entry['signing_input_hex'] as string)
+      )
+    )
+
+    for (const entry of vectors.cases) {
+      expect(published.has(entry.message_hex), entry.id).toBe(true)
     }
   })
 })
