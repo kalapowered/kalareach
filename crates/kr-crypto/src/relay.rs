@@ -89,7 +89,14 @@ impl RelayInstanceKeyPair {
     /// right for a directory under somebody's home and wrong here: a service directory is named by
     /// the unit file and sits under paths the distribution links as it pleases. What is checked is
     /// what this key's safety actually rests on — the directory and the file are not themselves
-    /// links, and neither is readable by anyone but its owner.
+    /// links, neither is readable by anyone but its owner, and the file is opened without following
+    /// a link and then checked through that open handle, so what is checked is what is read.
+    ///
+    /// That leaves one thing the caller owes: **every ancestor of `directory` is under the control
+    /// of accounts this host already trusts.** A directory named under `/var/lib` on a machine
+    /// whose operator installs the unit satisfies it; a directory under a path an unprivileged
+    /// account can replace does not, and no check inside this function can make up the difference,
+    /// because such an account could redirect the path between any two calls.
     ///
     /// # Errors
     ///
