@@ -59,7 +59,7 @@ mod console {
     use std::fs::File;
 
     use crate::error::{CliError, Result};
-    use crate::terminal::{RESET_SEQUENCES, TerminalSize};
+    use crate::terminal::{KeyboardState, RESET_SEQUENCES, TerminalSize};
 
     /// A handle on this process's console.
     ///
@@ -178,18 +178,36 @@ mod console {
 
         /// Restores saved modes and undoes the modes an application may have left enabled.
         ///
+        /// `keyboard` is what this console had negotiated before the attachment began, written
+        /// after the clearing sequences.
+        ///
         /// # Errors
         ///
         /// Returns an error when the modes cannot be set.
-        pub fn restore(&self, saved: &SavedModes) -> Result<()> {
+        pub fn restore(&self, saved: &SavedModes, keyboard: &KeyboardState) -> Result<()> {
             use std::io::Write as _;
 
             set_console_mode(&self.input, saved.input)?;
             set_console_mode(&self.output, saved.output)?;
             let mut handle = &self.output;
             let _ = handle.write_all(RESET_SEQUENCES);
+            let _ = handle.write_all(&keyboard.restore_sequences());
             let _ = handle.flush();
             Ok(())
+        }
+
+        /// Asks the console which keyboard protocols it has negotiated.
+        ///
+        /// The console host answers neither query: the Kitty protocol and `modifyOtherKeys` are
+        /// terminal protocols, and the Windows console mode has no equivalent to read. An
+        /// attachment here therefore has nothing to put back, and the clearing in
+        /// [`RESET_SEQUENCES`] is the whole restoration.
+        ///
+        /// # Errors
+        ///
+        /// Never fails; the result matches the shape the other platform's answer has.
+        pub const fn keyboard_state(&self) -> Result<KeyboardState> {
+            Ok(KeyboardState::EMPTY)
         }
     }
 

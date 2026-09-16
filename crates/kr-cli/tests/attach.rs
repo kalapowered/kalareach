@@ -7,7 +7,7 @@
 
 #![cfg(unix)]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -287,6 +287,29 @@ impl TerminalOutput {
     }
 }
 
+/// Answers the keyboard queries the way a terminal that implements both protocols would.
+///
+/// `kr attach` asks the outer terminal what it has negotiated before it changes anything, so that
+/// what it puts back afterwards is that terminal's own state rather than nothing at all. These are
+/// the answers a terminal with the Kitty protocol at flags 5 and `modifyOtherKeys` at level 2
+/// gives, followed by the device attributes that end the exchange.
+fn answer_keyboard_queries(output: &TerminalOutput, mut writer: Box<dyn std::io::Write + Send>) {
+    let output = output.clone();
+    std::thread::spawn(move || {
+        if !output.wait_for(b"\x1b[?u", Duration::from_secs(20)) {
+            return;
+        }
+        let _ = writer.write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+        let _ = writer.flush();
+    });
+}
+
+/// The sequences that put this test's terminal back into the state it reported.
+const KEYBOARD_RESTORED: &[u8] = b"\x1b[=5;1u";
+
+/// The `modifyOtherKeys` level this test's terminal reported, as the restoration writes it.
+const MODIFY_OTHER_KEYS_RESTORED: &[u8] = b"\x1b[>4;2m";
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
     let hosted = hosted("while true; do echo ready; sleep 1; done").await;
@@ -317,6 +340,7 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
         ))
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     assert!(
         output.wait_for(b"ready", Duration::from_secs(30)),
         "the session's output reached the terminal: {}",
@@ -372,6 +396,18 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
         before.input_modes.bits(),
         "and its input modes"
     );
+    // And the keyboard protocols this terminal had negotiated for itself, which termios does not
+    // describe and clearing alone would have taken away.
+    assert!(
+        output.wait_for(KEYBOARD_RESTORED, Duration::from_secs(10)),
+        "the guard put the terminal's own keyboard protocol back: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        output.contains(MODIFY_OTHER_KEYS_RESTORED),
+        "and its modifyOtherKeys level: {}",
+        output.text().escape_debug()
+    );
     // The control characters too. A terminal whose modes look right and whose interrupt key does
     // nothing has not been restored.
     for index in [
@@ -414,6 +450,7 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
         ))
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     assert!(
         output.wait_for(b"ready", Duration::from_secs(30)),
         "the session's output reached the terminal: {}",
@@ -455,6 +492,16 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
         after.local_modes.bits(),
         before.local_modes.bits(),
         "the terminal came back when the attachment ended"
+    );
+    assert!(
+        output.wait_for(KEYBOARD_RESTORED, Duration::from_secs(10)),
+        "and so did the keyboard protocol it had negotiated for itself: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        output.contains(MODIFY_OTHER_KEYS_RESTORED),
+        "and its modifyOtherKeys level: {}",
+        output.text().escape_debug()
     );
     let _ = shell.kill();
     let _ = shell.wait();

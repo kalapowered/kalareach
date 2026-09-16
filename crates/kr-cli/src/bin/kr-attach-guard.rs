@@ -26,7 +26,7 @@ use clap::Parser;
 use kr_cli::attach::{GUARD_READY, GUARD_RELEASE};
 #[cfg(unix)]
 use kr_cli::terminal::RESET_SEQUENCES;
-use kr_cli::terminal::SavedModes;
+use kr_cli::terminal::{KeyboardState, SavedModes};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,11 +38,17 @@ struct Arguments {
     /// The terminal state to restore.
     #[arg(long)]
     modes: String,
+    /// The keyboard protocols the terminal had negotiated before the attachment began.
+    #[arg(long)]
+    keyboard: String,
 }
 
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
     let Ok(saved) = SavedModes::decode(&arguments.modes) else {
+        return ExitCode::FAILURE;
+    };
+    let Ok(keyboard) = KeyboardState::decode(&arguments.keyboard) else {
         return ExitCode::FAILURE;
     };
 
@@ -70,7 +76,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if restore(&saved) {
+    if restore(&saved, &keyboard) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -78,7 +84,7 @@ fn main() -> ExitCode {
 }
 
 #[cfg(unix)]
-fn restore(saved: &SavedModes) -> bool {
+fn restore(saved: &SavedModes, keyboard: &KeyboardState) -> bool {
     use rustix::termios::OptionalActions;
 
     let terminal = std::io::stdout();
@@ -91,6 +97,11 @@ fn restore(saved: &SavedModes) -> bool {
             Ok(()) => {
                 let mut handle = terminal.lock();
                 let _ = handle.write_all(RESET_SEQUENCES);
+                // What this terminal had negotiated for itself, put back after the clearing. The
+                // attach process read it before it changed anything and handed it over here, so a
+                // guard that acts because that process was killed restores the same state a normal
+                // exit would have.
+                let _ = handle.write_all(&keyboard.restore_sequences());
                 let _ = handle.flush();
                 return true;
             }
@@ -104,9 +115,9 @@ fn restore(saved: &SavedModes) -> bool {
 }
 
 #[cfg(not(unix))]
-fn restore(saved: &SavedModes) -> bool {
+fn restore(saved: &SavedModes, keyboard: &KeyboardState) -> bool {
     let Ok(terminal) = kr_cli::terminal::ControllingTerminal::open() else {
         return false;
     };
-    terminal.restore(saved).is_ok()
+    terminal.restore(saved, keyboard).is_ok()
 }

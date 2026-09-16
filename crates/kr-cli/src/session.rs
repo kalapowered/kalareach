@@ -135,6 +135,15 @@ pub async fn run(
     )
     .await?;
 
+    // What this terminal had negotiated for itself, asked before anything is changed. Its answer
+    // is what makes the restoration a restoration rather than a clearing: a person whose shell had
+    // an enhanced key encoding gets it back. `--no-probe` withholds the question, and then there is
+    // nothing to put back and the clearing stands.
+    let keyboard = if options.no_probe {
+        crate::terminal::KeyboardState::default()
+    } else {
+        terminal.keyboard_state()?
+    };
     // The guard is armed before the terminal is touched, and it confirms that it is holding the
     // state before this returns, so there is no window in which the terminal is raw and nothing is
     // holding its previous state.
@@ -143,6 +152,7 @@ pub async fn run(
         &crate::attach::guard_program(),
         &terminal,
         &crate::terminal::SavedModes::from_state(&saved),
+        &keyboard,
     )?;
     let raw_replaced = terminal.enter_raw_mode()?;
 
@@ -179,7 +189,7 @@ pub async fn run(
 
     // The terminal comes back here on every path out of the loop, and the guard is released only
     // once it has.
-    terminal.restore(&raw_replaced)?;
+    terminal.restore(&raw_replaced, &keyboard)?;
     guard.release();
     Ok((outcome, descriptor.session_id))
 }

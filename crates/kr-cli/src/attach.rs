@@ -26,7 +26,7 @@ use kr_protocol::session::Dimensions;
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::{CliError, Result};
-use crate::terminal::{ControllingTerminal, SavedModes};
+use crate::terminal::{ControllingTerminal, KeyboardState, SavedModes};
 
 /// The byte that tells the guard the terminal has already been restored.
 pub const GUARD_RELEASE: u8 = b'R';
@@ -66,6 +66,7 @@ impl RestorationGuard {
         program: &std::path::Path,
         terminal: &ControllingTerminal,
         saved: &SavedModes,
+        keyboard: &KeyboardState,
     ) -> Result<Self> {
         let (reader, writer) = std::io::pipe()
             .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
@@ -79,6 +80,8 @@ impl RestorationGuard {
         command
             .arg("--modes")
             .arg(saved.encode())
+            .arg("--keyboard")
+            .arg(keyboard.encode())
             .stdin(Stdio::from(reader))
             .stdout(Stdio::from(handle))
             .stderr(Stdio::from(ready_writer));

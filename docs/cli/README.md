@@ -82,8 +82,16 @@ and taking input never moves it either.
 A broken connection must not leave a terminal in raw mode, and the restoration has to survive the
 attach process being killed — which no in-process handler can do, because `SIGKILL` runs no handler.
 
-So the saved state lives in another process. Before the terminal is touched, `kr attach` starts
-`kr-attach-guard` and gives it one end of a pipe and its own handle on the terminal.
+So the saved state lives in another process. Before the terminal is touched, `kr attach` asks the
+terminal which keyboard protocols it has negotiated — the Kitty protocol's flags and xterm's
+`modifyOtherKeys` level, neither of which termios describes — then starts `kr-attach-guard` and
+gives it one end of a pipe, its own handle on the terminal, the terminal's complete mode state and
+those answers.
+
+Both paths out put all of it back: the mode words, the control characters, the sequences that undo
+what an application may have left enabled, and then the keyboard protocols the terminal had chosen
+for itself. A terminal that answers neither question has nothing to put back, and the clearing
+stands. `--no-probe` withholds the question with the same effect.
 
 * A clean exit restores the terminal and sends the guard a byte, and the guard leaves without
   acting.
