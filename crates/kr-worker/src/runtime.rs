@@ -36,9 +36,11 @@ pub const WRITE_PIECE_BYTES: usize = 512;
 
 /// How long the read loop waits for the application to write something before it asks again.
 ///
-/// The wait ends by itself when output arrives, so this is only the interval at which a reader with
-/// nothing to read reconsiders whether the terminal is still there.
-pub const READ_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+/// The wait ends by itself the moment output arrives, so this is not latency: it is only how often
+/// a reader with nothing to read wakes to reconsider whether the terminal is still there. A session
+/// sitting idle should cost nothing, and twenty of them waking fifty times a second each is not
+/// nothing, so this is long.
+pub const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long the writer keeps offering a correction the application must have before it gives up.
 ///
