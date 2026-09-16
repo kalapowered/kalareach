@@ -280,8 +280,20 @@ impl Lexer {
     /// The final scalar of a trailing text run is held back until the next read, so that a
     /// combining mark arriving in the next read still joins the scalar it belongs to.
     pub fn feed(&mut self, input: &[u8], out: &mut Vec<Event>) {
-        for &byte in input {
-            self.byte(byte, out);
+        let mut index = 0;
+        while index < input.len() {
+            // Printable ASCII on ground is what most output is, and every byte of it takes the
+            // same branch and does the same thing, so the run is found once and appended whole.
+            // The answer is the answer the per-byte path gives, run bound included.
+            if self.state == State::Ground {
+                let run = printable_ascii_run(&input[index..]);
+                if run > 0 {
+                    index += self.push_ascii_run(&input[index..index + run], out);
+                    continue;
+                }
+            }
+            self.byte(input[index], out);
+            index += 1;
         }
         self.flush_text(out, true);
     }
@@ -436,6 +448,44 @@ impl Lexer {
         self.text.push(byte);
         self.text_scalars += 1;
         self.offset += 1;
+    }
+
+    /// Appends a run of printable ASCII, emitting where the run bound is reached.
+    ///
+    /// Returns how many bytes of `run` were appended, which is all of them unless the bound was
+    /// reached with an empty buffer, which cannot happen while the bound is at least one byte.
+    fn push_ascii_run(&mut self, run: &[u8], out: &mut Vec<Event>) -> usize {
+        let mut taken = 0;
+        while taken < run.len() {
+            let room = if self.text.is_empty() {
+                // A run under construction takes the byte that starts it whatever the bound says,
+                // which is what the per-byte path does: it emits what it has before it appends,
+                // and it has nothing.
+                self.limits.max_text_run.max(1)
+            } else if self.text.len() < self.limits.max_text_run {
+                self.limits.max_text_run - self.text.len()
+            } else {
+                self.flush_text(out, false);
+                continue;
+            };
+            let take = room.min(run.len() - taken);
+            self.push_text_slice(&run[taken..taken + take]);
+            taken += take;
+        }
+        taken
+    }
+
+    /// Appends a run of scalars that each have a width of their own.
+    ///
+    /// `bytes` is never empty, so the last of them starts the last cluster of the run.
+    fn push_text_slice(&mut self, bytes: &[u8]) {
+        if self.text.is_empty() {
+            self.text_start = self.offset;
+        }
+        self.text_cluster = self.text.len() + bytes.len() - 1;
+        self.text.extend_from_slice(bytes);
+        self.text_scalars += bytes.len();
+        self.offset += bytes.len() as u64;
     }
 
     /// Appends one multi-byte scalar, remembering where its cluster began.
@@ -1330,6 +1380,17 @@ impl Default for Lexer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Byte length of the run of printable ASCII at the start of `bytes`.
+///
+/// Printable means what the ground state prints: the graphic range and the space, which is every
+/// byte a text run can hold that is neither a control nor part of a multi-byte scalar.
+fn printable_ascii_run(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .position(|byte| !(0x20..=0x7e).contains(byte))
+        .unwrap_or(bytes.len())
 }
 
 /// Counts the scalars in a run of valid UTF-8.

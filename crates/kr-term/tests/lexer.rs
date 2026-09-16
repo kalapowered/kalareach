@@ -451,6 +451,75 @@ fn text_runs_are_bounded() {
     assert_eq!(total, 100);
 }
 
+/// A printable run is cut at the same places whether it arrives whole or a piece at a time.
+///
+/// The run bound is what a text event may hold, and where a run passes it the run is emitted and
+/// the next one starts. The lexer finds a printable run and appends it whole, so this pins the
+/// lengths it produces: a bound of sixteen over forty bytes, spans that adjoin, and the last
+/// scalar held back for a combining mark until the stream closes.
+#[test]
+fn a_printable_run_is_cut_at_its_bound_wherever_the_reads_fall() {
+    let bounded = LexLimits {
+        max_text_run: 16,
+        ..LexLimits::DEFAULT
+    };
+    let run: Vec<u8> = std::iter::repeat_n(b'x', 40).collect();
+
+    let whole = {
+        let mut lexer = Lexer::with_limits(bounded);
+        let mut events = Vec::new();
+        lexer.feed(&run, &mut events);
+        lexer.close(&mut events);
+        events
+    };
+    let lengths: Vec<usize> = whole.iter().map(|event| event.raw().len()).collect();
+    assert_eq!(lengths, vec![16, 16, 7, 1]);
+    assert!(
+        whole
+            .iter()
+            .all(|event| event.class == SequenceClass::Display)
+    );
+    assert_eq!(whole[0].span.start(), 0);
+    for pair in whole.windows(2) {
+        assert!(
+            pair[0].span.adjoins(pair[1].span),
+            "the runs have to cover the stream without a gap"
+        );
+    }
+
+    // In pieces, with the pieces cutting across the bound in both directions.
+    let mut lexer = Lexer::with_limits(bounded);
+    let mut pieces = Vec::new();
+    for chunk in [&run[..5], &run[5..20], &run[20..21], &run[21..]] {
+        lexer.feed(chunk, &mut pieces);
+    }
+    lexer.close(&mut pieces);
+    assert_eq!(
+        pieces.iter().map(|event| event.raw().len()).sum::<usize>(),
+        40
+    );
+    assert!(
+        pieces
+            .iter()
+            .all(|event| event.raw().len() <= 16 && event.class == SequenceClass::Display)
+    );
+    assert_eq!(text(&pieces), run);
+}
+
+/// A printable run that ends at a control, and one that starts after it.
+#[test]
+fn a_printable_run_ends_where_the_printable_bytes_end() {
+    let events = lex(b"abc\rdef\x1b[31mghi");
+    assert_eq!(classes(&events), "DDDDDD");
+    assert_eq!(events[0].raw(), b"abc");
+    assert_eq!(events[1].raw(), b"\r");
+    assert_eq!(events[2].raw(), b"def");
+    assert_eq!(events[3].raw(), b"\x1b[31m");
+    assert_eq!(events[4].raw(), b"gh");
+    assert_eq!(events[5].raw(), b"i");
+    assert_eq!(text(&events), b"abcdefghi");
+}
+
 #[test]
 fn the_parameter_list_keeps_punctuation() {
     let events = lex(b"\x1b[38:2::12:34:56m");
