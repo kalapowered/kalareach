@@ -328,23 +328,22 @@ async fn attach_to_a_usable_screen() {
 /// daemon's own record of the closure rather than the worker's entry in the process table, because
 /// a process that has exited and has not yet been reaped is still an entry and is not a session.
 async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
-    let mut client = LocalClient::connect(
-        &host
-            .temp
-            .environment()
-            .controller_endpoint()
-            .expect("an endpoint"),
-        LocalClientKind::Cli,
-        build(),
-    )
-    .await
-    .expect("connects to the daemon");
+    let endpoint = host
+        .temp
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the daemon");
     // Every session is asked, whatever any one of them answers. Stopping at the first refusal
     // would leave the rest running, which is the thing this exists to prevent; what each one
     // answered is reported at the end.
     let mut refused = Vec::new();
     for created in sessions {
-        let outcome = client
+        // Whatever any one of them answers, including the connection itself failing. Stopping at
+        // the first would leave the rest running, which is the thing this exists to prevent.
+        match client
             .mutate(
                 Method::SessionClose,
                 ActionId::new(kr_ipc::new_uuid()),
@@ -360,9 +359,10 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) {
                 },
             )
             .await
-            .expect("the call reaches the daemon");
-        if let Err(error) = outcome {
-            refused.push((created.session.session_id, error));
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => refused.push(format!("{}: {error}", created.session.session_id)),
+            Err(error) => refused.push(format!("{}: {error}", created.session.session_id)),
         }
     }
     assert!(
@@ -443,13 +443,16 @@ async fn attach_samples(
         // A usable screen is the whole sequence a person waits for: the connection, the worker's
         // proof, the attachment, the input lease, the subscription, and the screen arriving. A
         // measurement that stopped at the first byte would be measuring the transport.
-        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-            .await
-            .expect("connects");
+        let Ok(mut client) = LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
+        else {
+            // A sample that could not be taken is the absence of one. It is reported that way
+            // rather than by panicking, because the caller has sessions to close first.
+            return Vec::new();
+        };
         let mut requested = CanonicalSet::new();
         requested.insert(AttachmentCapability::ObserveTerminal);
         requested.insert(AttachmentCapability::Input);
-        let attached: kr_protocol::attachment::SessionAttachResult = client
+        let attached: kr_protocol::attachment::SessionAttachResult = match client
             .mutate(
                 Method::SessionAttach,
                 ActionId::new(kr_ipc::new_uuid()),
@@ -470,25 +473,31 @@ async fn attach_samples(
                 },
             )
             .await
-            .expect("the call reaches the worker")
-            .expect("the attach succeeds")
-            .to_typed()
-            .expect("decodes");
+        {
+            Ok(Ok(value)) => match value.to_typed() {
+                Ok(attached) => attached,
+                Err(_) => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
         let mut streams = CanonicalSet::new();
         streams.insert(EventStream::Output);
-        client
-            .request(
-                Method::EventsSubscribe,
-                &EventsSubscribeParams {
-                    session_id: created.session.session_id,
-                    attachment_id: attached.attachment.attachment_id,
-                    streams,
-                    from_cursor: Nullable::null(),
-                },
-            )
-            .await
-            .expect("the call reaches the worker")
-            .expect("the subscription succeeds");
+        if !matches!(
+            client
+                .request(
+                    Method::EventsSubscribe,
+                    &EventsSubscribeParams {
+                        session_id: created.session.session_id,
+                        attachment_id: attached.attachment.attachment_id,
+                        streams,
+                        from_cursor: Nullable::null(),
+                    },
+                )
+                .await,
+            Ok(Ok(_))
+        ) {
+            return Vec::new();
+        }
         // The screen itself. This is what the person sees, and it is where the clock stops.
         let screen = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
