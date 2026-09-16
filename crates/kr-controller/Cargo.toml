@@ -17,6 +17,7 @@ clap.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-ipc.workspace = true
+kr-pairing.workspace = true
 kr-protocol.workspace = true
 kr-transfer.workspace = true
 kr-transport.workspace = true
@@ -29,7 +30,10 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
+iroh = { workspace = true, features = ["test-utils"] }
+iroh-relay = { workspace = true, features = ["server", "test-utils"] }
 kr-cbor.workspace = true
+kr-client.workspace = true
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-transfer.workspace = true

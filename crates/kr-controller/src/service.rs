@@ -53,6 +53,14 @@ use crate::registry::{LaunchPhase, Registry, WorkerRecord};
 use crate::singleton::SingletonLock;
 use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 
+/// The daemon on the network.
+///
+/// It is a child of this module because it is part of the same daemon: it shares the registry, the
+/// authority store, the worker directory and the dispatch leases below, and a network module that
+/// reached them through a public surface would be a second way into the daemon's own state.
+#[path = "net/mod.rs"]
+pub mod net;
+
 /// How long a closing worker is watched before the controller stops waiting for it to end.
 pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -116,6 +124,8 @@ pub struct Controller {
     /// the revision invalidates every outstanding lease at once and a replacement daemon cannot
     /// renew a lease it did not issue.
     leases: LeaseIssuer,
+    /// The network this daemon is on, when its environment selects one.
+    network: std::sync::OnceLock<net::Network>,
     supervisor: Box<dyn WorkerSupervisor>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
@@ -176,6 +186,7 @@ impl Controller {
             shared_clock: Arc::new(kr_ipc::clock::SystemSharedClock),
             leases: LeaseIssuer::with_maximum_validity(generation, authority_revision),
             clock,
+            network: std::sync::OnceLock::new(),
             supervisor: setup.supervisor,
             transfer,
             worker_program: setup.worker_program,
@@ -193,6 +204,10 @@ impl Controller {
         *controller.directory.lock().await = directory;
         controller.recover_reservations().await?;
         crate::transfer::serve(&controller)?;
+        // The network comes up last. A paired device must not reach a daemon that has not yet
+        // recovered its reservations and rebuilt its worker directory, because it would be told
+        // that sessions this host is running do not exist.
+        net::register_from_environment(&controller).await?;
         Ok(controller)
     }
 

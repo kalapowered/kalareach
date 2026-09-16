@@ -2950,9 +2950,13 @@ name = "kr-controller"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "iroh",
+ "iroh-relay",
  "kr-cbor",
+ "kr-client",
  "kr-crypto",
  "kr-ipc",
+ "kr-pairing",
  "kr-protocol",
  "kr-transfer",
  "kr-transport",
