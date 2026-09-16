@@ -2953,6 +2953,7 @@ dependencies = [
  "kr-crypto",
  "kr-ipc",
  "kr-protocol",
+ "kr-transfer",
  "kr-transport",
  "kr-worker",
  "rusqlite",

@@ -1138,8 +1138,8 @@ impl TransferService {
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::InvalidArgument`] when the same identifier carried a different
-    /// payload, or [`TransferError::StoreUnavailable`] when the read fails.
+    /// Returns [`TransferError::IdConflict`] when the same identifier carried a different payload,
+    /// or [`TransferError::StoreUnavailable`] when the read fails.
     pub fn retained_action(
         &self,
         actor: &ActorId,
@@ -1151,10 +1151,10 @@ impl TransferService {
             return Ok(None);
         };
         if record.method != method || record.payload_digest != payload_digest {
-            return Err(TransferError::invalid(format!(
-                "this action identifier was already used for {} with a different payload",
-                record.method
-            )));
+            return Err(TransferError::IdConflict {
+                action: action_id.to_string(),
+                method: record.method,
+            });
         }
         Ok(Some(match (record.result, record.error_code) {
             (Some(result), _) => RetainedOutcome::Ok(result),

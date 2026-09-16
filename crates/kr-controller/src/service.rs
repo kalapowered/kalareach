@@ -117,6 +117,8 @@ pub struct Controller {
     /// renew a lease it did not issue.
     leases: LeaseIssuer,
     supervisor: Box<dyn WorkerSupervisor>,
+    /// The environment's transfer service, whose methods this daemon admits and dispatches.
+    transfer: Arc<crate::transfer::TransferModule>,
     worker_program: PathBuf,
     build_id: BuildId,
     release: String,
@@ -158,6 +160,7 @@ impl Controller {
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
         let clock = Arc::new(SystemContinuousClock::new());
         let authority_revision = registry.authority_revision()?;
+        let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths)?);
         let controller = Arc::new(Self {
             registry: Mutex::new(registry),
             directory: Mutex::new(Directory::default()),
@@ -174,6 +177,7 @@ impl Controller {
             leases: LeaseIssuer::with_maximum_validity(generation, authority_revision),
             clock,
             supervisor: setup.supervisor,
+            transfer,
             worker_program: setup.worker_program,
             build_id: setup.build_id,
             release: setup.release,
@@ -188,6 +192,7 @@ impl Controller {
         };
         *controller.directory.lock().await = directory;
         controller.recover_reservations().await?;
+        crate::transfer::serve(&controller)?;
         Ok(controller)
     }
 
@@ -697,6 +702,17 @@ impl Controller {
         &self.paths
     }
 
+    /// Returns the environment's transfer service.
+    #[must_use]
+    pub const fn transfer(&self) -> &Arc<crate::transfer::TransferModule> {
+        &self.transfer
+    }
+
+    /// Returns the registry, for a module that needs to read the environment's own records.
+    pub(crate) const fn registry_handle(&self) -> &Mutex<Registry> {
+        &self.registry
+    }
+
     /// Serves the owner-only rendezvous socket.
     ///
     /// # Errors
@@ -724,7 +740,9 @@ impl Controller {
             let (connection, peer) = listener.accept().await?;
             let controller = Arc::clone(&self);
             tokio::spawn(async move {
-                let _ = controller.client(connection, peer).await;
+                let _ = controller
+                    .client(connection, peer, StreamKind::Control)
+                    .await;
             });
         }
     }
@@ -1089,6 +1107,9 @@ impl Controller {
                     ));
                 }
             }
+            _ if crate::transfer::TransferModule::serves(method) => {
+                crate::transfer::TransferModule::check_subject(method, mutation)?;
+            }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not a mutation this daemon serves",
@@ -1139,9 +1160,14 @@ impl Controller {
             })
     }
 
-    async fn client(self: &Arc<Self>, connection: Connection, peer: PeerIdentity) -> Result<()> {
+    pub(crate) async fn client(
+        self: &Arc<Self>,
+        connection: Connection,
+        peer: PeerIdentity,
+        kind: StreamKind,
+    ) -> Result<()> {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-        let (mut reader, mut writer) = split(connection, StreamKind::Control);
+        let (mut reader, mut writer) = split(connection, kind);
         let outcome = self
             .serve_client(&mut reader, &mut writer, connection_id, &peer)
             .await;
@@ -1239,7 +1265,7 @@ impl Controller {
                 ControlFrame::Request(request) if negotiated => {
                     match self.authorised(connection_id).await {
                         Ok(_) => {
-                            let answer = self.read_method(&request).await;
+                            let answer = self.read_method(&actor_id, &request).await;
                             // Checked again now the read has finished. A read that passed its check
                             // and then waited for the registry can complete after the authority
                             // behind it was withdrawn, and what the contract forbids is *serving*
@@ -1318,6 +1344,11 @@ impl Controller {
         if let Some(retained) = self.retained(actor_id, &mutation, method).await {
             return retained;
         }
+        if crate::transfer::TransferModule::serves(method)
+            && let Some(retained) = self.transfer.retained(actor_id, &mutation, method).await
+        {
+            return retained;
+        }
         let accepted = match self.check_envelope(connection_id, &mutation, method) {
             Ok(accepted) => accepted,
             Err(error) => {
@@ -1344,7 +1375,7 @@ impl Controller {
         })
     }
 
-    async fn read_method(self: &Arc<Self>, request: &Request) -> ControlFrame {
+    async fn read_method(self: &Arc<Self>, actor_id: &ActorId, request: &Request) -> ControlFrame {
         let Some(method) = request.method.method() else {
             return error_reply(
                 request.request_id,
@@ -1352,6 +1383,9 @@ impl Controller {
                 "the method is not in the registry",
             );
         };
+        if crate::transfer::TransferModule::serves(method) {
+            return self.transfer.read_frame(actor_id, request).await;
+        }
         let outcome = match method {
             Method::HostInfo => self.host_info().await,
             Method::EnvironmentList => self.environment_list().await,
@@ -1374,6 +1408,9 @@ impl Controller {
         connection_id: ConnectionId,
         accepted: AcceptedDeadline,
     ) -> ControlFrame {
+        if crate::transfer::TransferModule::serves(method) {
+            return self.transfer.write_frame(actor_id, mutation, method).await;
+        }
         let outcome = match method {
             Method::SessionCreate => self.session_create(actor_id, mutation, accepted).await,
             Method::SessionClose => {

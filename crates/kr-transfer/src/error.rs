@@ -93,6 +93,14 @@ pub enum TransferError {
         /// What went wrong.
         detail: String,
     },
+    /// An action identifier was reused with a different payload.
+    #[error("action {action} was already used for {method} with a different payload")]
+    IdConflict {
+        /// The identifier that was reused.
+        action: String,
+        /// The method it was first used for.
+        method: String,
+    },
     /// A path escaped, or could have escaped, the directory that authorised it.
     #[error("{0}")]
     Escape(#[from] crate::authority::Escape),
@@ -160,6 +168,7 @@ impl TransferError {
             // is transient. A byte quota does not, which is why they report differently.
             Self::Concurrency { .. } => ErrorCode::ResourceUnavailable,
             Self::DraftConflict { .. } => ErrorCode::DraftConflict,
+            Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::Ipc(error) => error.code(),
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
         }
@@ -169,6 +178,14 @@ impl TransferError {
     #[must_use]
     pub fn to_protocol_error(&self) -> ProtocolError {
         ProtocolError::new(self.code(), self.to_string())
+    }
+}
+
+impl From<TransferError> for ProtocolError {
+    /// A refusal reaches a caller under the code this service decided, never one a host chose for
+    /// it: an integrity failure stays `ATTACHMENT_INTEGRITY`, a budget stays `QUOTA_EXCEEDED`.
+    fn from(error: TransferError) -> Self {
+        error.to_protocol_error()
     }
 }
 

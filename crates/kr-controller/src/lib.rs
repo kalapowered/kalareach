@@ -16,6 +16,7 @@
 //! | [`supervision`] | Starting a worker through the platform's own service manager |
 //! | [`directory`] | The verified directory of workers, rebuilt by challenge after a restart |
 //! | [`service`] | Admission, the rendezvous and the local endpoint |
+//! | [`transfer`] | The environment's transfer service, its attachment-chunk endpoint and its sweep |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
 pub mod directory;
@@ -24,5 +25,6 @@ pub mod registry;
 pub mod service;
 pub mod singleton;
 pub mod supervision;
+pub mod transfer;
 
 pub use crate::error::{ControllerError, Result};

@@ -18,6 +18,7 @@ kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-ipc.workspace = true
 kr-protocol.workspace = true
+kr-transfer.workspace = true
 kr-transport.workspace = true
 kr-worker.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
@@ -28,8 +29,10 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
+kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
+kr-transfer.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 
 [lints]
