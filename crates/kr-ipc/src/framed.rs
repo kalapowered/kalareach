@@ -7,10 +7,14 @@
 //! Reading and writing are separate halves on purpose. A worker publishes output while a client is
 //! still sending input, and one task owning both directions would serialise them.
 
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, StreamKind};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt as _, AsyncWrite as _, ReadHalf, WriteHalf};
 
 use crate::endpoint::Connection;
 use crate::error::{IpcError, Result};
@@ -18,6 +22,7 @@ use crate::error::{IpcError, Result};
 /// Splits a connection into a frame reader and a frame writer.
 #[must_use]
 pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWriter) {
+    let writable = Writable::of(&connection);
     let (reader, writer) = tokio::io::split(connection);
     (
         FrameReader {
@@ -34,8 +39,99 @@ pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWri
             codec: FrameCodec::new(kind),
             pending: Vec::new(),
             sent: 0,
+            writable,
         },
     )
+}
+
+/// What a write attempt that refuses to wait achieved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wrote {
+    /// Every byte of the frame is with the peer.
+    Complete,
+    /// The socket would take no more of it. What is left is retained, and a later attempt
+    /// continues it; [`Writable::ready`] is how a caller waits for that moment without holding
+    /// whatever else it owns.
+    Blocked,
+}
+
+/// A handle on a connection's writability, separate from the writer itself.
+///
+/// Waiting for room and deciding whether bytes may still be sent are two different things, and a
+/// caller that has to do both wants them apart: the waiting happens here, outside whatever lock
+/// makes the decision, and the writing happens inside it without ever waiting. A handle is cheap
+/// to clone and several may wait at once.
+#[derive(Clone, Debug)]
+pub struct Writable(Arc<Readiness>);
+
+impl Writable {
+    fn of(connection: &Connection) -> Self {
+        Self(Arc::new(Readiness::of(connection)))
+    }
+
+    /// Waits until the connection will probably take more bytes.
+    ///
+    /// "Probably" is the honest word: readiness is the kernel's answer at the moment it was asked,
+    /// and the attempt that follows is what settles it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a socket failure when the connection cannot be waited on at all.
+    pub async fn ready(&self) -> Result<()> {
+        self.0.ready().await
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct Readiness(Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>);
+
+#[cfg(unix)]
+impl Readiness {
+    fn of(connection: &Connection) -> Self {
+        // A descriptor of this connection's own, so waiting on it borrows nothing the writer
+        // holds. A connection this cannot be taken for is one whose writes fail anyway, and the
+        // wait below then yields rather than pretending to be readiness.
+        Self(connection.writability().ok().and_then(|descriptor| {
+            tokio::io::unix::AsyncFd::with_interest(descriptor, tokio::io::Interest::WRITABLE).ok()
+        }))
+    }
+
+    async fn ready(&self) -> Result<()> {
+        let Some(descriptor) = self.0.as_ref() else {
+            tokio::task::yield_now().await;
+            return Ok(());
+        };
+        let mut guard = descriptor
+            .writable()
+            .await
+            .map_err(|error| IpcError::socket("wait for the connection", error))?;
+        // Cleared here rather than after a write, because the write happens somewhere this cannot
+        // see: the next wait asks the kernel again instead of trusting a readiness nobody consumed.
+        guard.clear_ready();
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+#[derive(Debug)]
+struct Readiness;
+
+#[cfg(not(unix))]
+impl Readiness {
+    const fn of(_connection: &Connection) -> Self {
+        Self
+    }
+
+    /// Waits a moment and lets the caller try again.
+    ///
+    /// The named-pipe stream this platform uses has no readiness of its own to wait on, so a
+    /// writer that was refused comes back shortly rather than spinning. The attempt itself is the
+    /// same on both platforms, and it is the attempt that never waits.
+    async fn ready(&self) -> Result<()> {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        Ok(())
+    }
 }
 
 /// The reading half of a framed connection.
@@ -134,6 +230,7 @@ pub struct FrameWriter {
     codec: FrameCodec,
     pending: Vec<u8>,
     sent: usize,
+    writable: Writable,
 }
 
 impl FrameWriter {
@@ -148,6 +245,15 @@ impl FrameWriter {
         self.sent < self.pending.len()
     }
 
+    /// Returns a handle on this connection's writability.
+    ///
+    /// It is what a caller waits on while it is *not* holding this writer, so that the decision to
+    /// send and the sending itself can be one step that never waits.
+    #[must_use]
+    pub fn writable(&self) -> Writable {
+        self.writable.clone()
+    }
+
     /// Serialises a message and writes it as one frame.
     ///
     /// # Errors
@@ -159,34 +265,68 @@ impl FrameWriter {
         self.write_frame(&frame).await
     }
 
-    /// Writes an already framed buffer.
+    /// Writes an already framed buffer, waiting for the peer as often as it takes.
     ///
     /// # Errors
     ///
     /// Returns [`IpcError::PeerClosed`] when the peer is gone, or a socket failure.
     pub async fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
-        if self.sent < self.pending.len() {
-            // A previous write was cancelled part way through. Finishing it first keeps the stream
-            // well formed; the frame the caller just supplied is written after it, never instead
-            // of it.
-            self.drain().await?;
+        let mut outcome = self.begin_frame(frame)?;
+        while outcome == Wrote::Blocked {
+            let writable = self.writable.clone();
+            writable.ready().await?;
+            outcome = self.resume_frame()?;
+        }
+        Ok(())
+    }
+
+    /// Offers a frame to the peer without waiting for it.
+    ///
+    /// A frame the socket would not take whole is retained and continued by [`resume_frame`],
+    /// which is what lets the decision to send it be made under a lock that is never held across a
+    /// wait. Starting a frame while another is half written is refused rather than interleaved.
+    ///
+    /// [`resume_frame`]: Self::resume_frame
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::PeerClosed`] when the peer is gone, or a socket failure.
+    pub fn begin_frame(&mut self, frame: &[u8]) -> Result<Wrote> {
+        if self.is_mid_frame() {
+            return Err(IpcError::socket(
+                "write",
+                std::io::Error::other("a frame is already part way to the peer"),
+            ));
         }
         self.pending.clear();
         self.pending.extend_from_slice(frame);
         self.sent = 0;
-        self.drain().await?;
-        self.half
-            .flush()
-            .await
-            .map_err(|error| IpcError::socket("flush", error))
+        self.attempt()
     }
 
-    async fn drain(&mut self) -> Result<()> {
+    /// Offers the rest of a retained frame to the peer without waiting for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::PeerClosed`] when the peer is gone, or a socket failure.
+    pub fn resume_frame(&mut self) -> Result<Wrote> {
+        self.attempt()
+    }
+
+    /// Writes what it can and stops at the first byte the socket will not take.
+    ///
+    /// The poll is made with a waker nothing wakes: what this reports is the socket's answer now,
+    /// and waiting for a different answer is [`Writable::ready`]'s job, somewhere this writer is
+    /// not held.
+    fn attempt(&mut self) -> Result<Wrote> {
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
         while self.sent < self.pending.len() {
-            match self.half.write(&self.pending[self.sent..]).await {
-                Ok(0) => return Err(IpcError::PeerClosed),
-                Ok(written) => self.sent += written,
-                Err(error)
+            match Pin::new(&mut self.half).poll_write(&mut context, &self.pending[self.sent..]) {
+                Poll::Pending => return Ok(Wrote::Blocked),
+                Poll::Ready(Ok(0)) => return Err(IpcError::PeerClosed),
+                Poll::Ready(Ok(written)) => self.sent += written,
+                Poll::Ready(Err(error))
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
@@ -194,10 +334,17 @@ impl FrameWriter {
                 {
                     return Err(IpcError::PeerClosed);
                 }
-                Err(error) => return Err(IpcError::socket("write", error)),
+                Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(Wrote::Blocked);
+                }
+                Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Poll::Ready(Err(error)) => return Err(IpcError::socket("write", error)),
             }
         }
-        Ok(())
+        // A flush the socket defers changes nothing here: the bytes are with the kernel, which is
+        // what delivery means on a local socket.
+        let _ = Pin::new(&mut self.half).poll_flush(&mut context);
+        Ok(Wrote::Complete)
     }
 
     /// Encodes a message into a frame without writing it.
@@ -259,6 +406,49 @@ mod tests {
         let echoed: ControlFrame = reader.read_message().await.expect("reads");
         assert_eq!(echoed, request(9));
         assert_eq!(server.await.expect("server task"), request(9));
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_blocks_the_attempt_rather_than_holding_the_writer() {
+        // What a boundary needs: an attempt that answers now, whatever the peer is doing, and a
+        // wait that happens somewhere else. A peer that reads nothing fills the socket, and the
+        // attempt says so instead of staying inside the write until the peer comes back.
+        let (endpoint, listener, _host) = pair();
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.expect("accepts");
+            // Held, not read from, until the test says so.
+            let (reader, _writer) = split(connection, StreamKind::Control);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(reader);
+        });
+        let client = Connection::connect(&endpoint).await.expect("connects");
+        let (_reader, mut writer) = split(client, StreamKind::Control);
+
+        // One frame after another, without waiting for any of them, until the socket is full.
+        let frame = FrameWriter::encode(StreamKind::Control, &request(1)).expect("encodes");
+        let mut blocked = None;
+        for _ in 0..4096 {
+            match writer.begin_frame(&frame).expect("the peer is still there") {
+                Wrote::Complete => {}
+                Wrote::Blocked => {
+                    blocked = Some(());
+                    break;
+                }
+            }
+        }
+        assert!(
+            blocked.is_some(),
+            "the attempt reports a socket that would take no more rather than waiting for it"
+        );
+        assert!(
+            writer.is_mid_frame(),
+            "and what it could not send is retained rather than lost"
+        );
+        assert!(
+            writer.begin_frame(&frame).is_err(),
+            "a new frame is refused while one is part way to the peer"
+        );
+        server.abort();
     }
 
     #[tokio::test]

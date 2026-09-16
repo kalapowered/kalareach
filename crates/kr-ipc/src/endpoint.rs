@@ -100,6 +100,19 @@ impl Connection {
     pub fn peer(&self) -> Result<PeerIdentity> {
         self.0.peer()
     }
+
+    /// Returns a handle on this connection's writability.
+    ///
+    /// Waiting for a socket to have room and writing to it are two different things, and the
+    /// difference is what lets a caller wait outside the boundary that decides whether the bytes
+    /// may still be sent. This is the waiting half, and it borrows nothing the writer holds.
+    #[cfg(unix)]
+    pub(crate) fn writability(&self) -> Result<std::os::fd::OwnedFd> {
+        use std::os::fd::AsFd as _;
+
+        rustix::io::fcntl_dupfd_cloexec(self.0.as_fd(), 0)
+            .map_err(|error| IpcError::socket("duplicate the connection", error.into()))
+    }
 }
 
 impl AsyncRead for Connection {
@@ -354,6 +367,12 @@ mod platform {
 
     #[derive(Debug)]
     pub(super) struct Connection(UnixStream);
+
+    impl std::os::fd::AsFd for Connection {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.0.as_fd()
+        }
+    }
 
     impl Connection {
         pub(super) async fn connect(endpoint: &Endpoint) -> Result<Self> {

@@ -268,7 +268,13 @@ impl WorkerService {
     ) -> Result<()> {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         let (mut reader, writer) = split(connection, StreamKind::Control);
-        let writer = Arc::new(tokio::sync::Mutex::new(writer));
+        // The lock is an ordinary one, because nothing is ever awaited while it is held: what
+        // happens inside it is the authority check, one attempt that refuses to wait, and the
+        // accounting for what that attempt sent. Waiting for the peer happens outside it, on the
+        // readiness handle beside it, which is what lets a withdrawal take the same lock and know
+        // that no write can begin after it.
+        let writable = writer.writable();
+        let writer = Arc::new(Mutex::new(writer));
         let mut state =
             ConnectionState::new(connection_id, &peer, Arc::new(Mutex::new(Vec::new())));
         // The caller's record is validated and the connection registered in one step. The
@@ -277,7 +283,7 @@ impl WorkerService {
         if peer.authorise(kr_ipc::paths::current_uid()).is_err() {
             return Ok(());
         }
-        let registration = self.admit(connection_id);
+        let registration = self.admit(connection_id, &writer, &writable);
         let withdrawn = Arc::clone(&registration.withdrawn);
         state.attachments = Arc::clone(&registration.attachments);
         // Both timers fire once immediately; that first tick is consumed here so a connection is
@@ -317,14 +323,14 @@ impl WorkerService {
                     // A window is this host's own offer and carries nothing of the session, so it
                     // is written or it is not; what it must not do is wait for a peer that has
                     // stopped reading while this connection still holds anything.
-                    if !write_frame(&writer, &renewed, &withdrawn, !fenced).await {
+                    if !write_frame(&writable, &writer, &renewed, &withdrawn, !fenced).await {
                         break;
                     }
                     continue;
                 }
                 _ = keepalive.tick(), if state.negotiated => {
                     let beat = ControlFrame::Event(ControlEvent::Keepalive);
-                    if !write_frame(&writer, &beat, &withdrawn, !fenced).await {
+                    if !write_frame(&writable, &writer, &beat, &withdrawn, !fenced).await {
                         break;
                     }
                     continue;
@@ -348,7 +354,7 @@ impl WorkerService {
                         gate.release_on_delivery(crate::runtime::ACCEPTANCE_DELIVERY_TIMEOUT),
                     )
                 });
-                let written = write_frame(&writer, &reply, &withdrawn, protected).await;
+                let written = write_frame(&writable, &writer, &reply, &withdrawn, protected).await;
                 if let Some((action_id, delivery)) = armed {
                     if written && state.client_kind == LocalClientKind::Controller {
                         // The requester is not the peer that was just written to: the daemon still
@@ -367,7 +373,7 @@ impl WorkerService {
                 // A controller announces itself in its hello; the worker answers with a challenge
                 // it will only accept once.
                 if let Some(challenge) = state.pending_challenge.take()
-                    && !write_frame(&writer, &challenge, &withdrawn, protected).await
+                    && !write_frame(&writable, &writer, &challenge, &withdrawn, protected).await
                 {
                     break;
                 }
@@ -393,6 +399,7 @@ impl WorkerService {
                 // aborting the task only takes effect where it yields, and a task with every chunk
                 // ready to go does not yield between them.
                 let delivery_withdrawn = Arc::clone(&registration.withdrawn);
+                let delivery_writable = registration.writable.clone();
                 let stream_id = state.stream_id.clone();
                 let restoration = state.restoration.take();
                 let task = tokio::spawn(async move {
@@ -414,12 +421,20 @@ impl WorkerService {
                                 notification(&stream_id, sequence, "session.gap", gap)
                         {
                             sequence += 1;
-                            if !write_frame(&sender, &notification, &delivery_withdrawn, true).await
+                            if !write_frame(
+                                &delivery_writable,
+                                &sender,
+                                &notification,
+                                &delivery_withdrawn,
+                                true,
+                            )
+                            .await
                             {
                                 return;
                             }
                         }
                         if !send_screen(
+                            &delivery_writable,
                             &sender,
                             &delivery_withdrawn,
                             &stream_id,
@@ -448,6 +463,7 @@ impl WorkerService {
                                     .unwrap_or(0)
                                     .min(bytes.len());
                                 send_stream(
+                                    &delivery_writable,
                                     &sender,
                                     &delivery_withdrawn,
                                     &stream_id,
@@ -462,6 +478,7 @@ impl WorkerService {
                             // so the parts do not carry advancing cursors of their own.
                             OutputDelivery::Screen { cursor, bytes } => {
                                 send_screen(
+                                    &delivery_writable,
                                     &sender,
                                     &delivery_withdrawn,
                                     &stream_id,
@@ -478,7 +495,14 @@ impl WorkerService {
                                     continue;
                                 };
                                 sequence += 1;
-                                write_frame(&sender, &notification, &delivery_withdrawn, true).await
+                                write_frame(
+                                    &delivery_writable,
+                                    &sender,
+                                    &notification,
+                                    &delivery_withdrawn,
+                                    true,
+                                )
+                                .await
                             }
                             OutputDelivery::Detached => {
                                 // The attachment has ended. The client is told so it can put its
@@ -490,6 +514,7 @@ impl WorkerService {
                                     &kr_protocol::attachment::SessionDetachParams { attachment_id },
                                 ) {
                                     let _ = write_frame(
+                                        &delivery_writable,
                                         &sender,
                                         &notification,
                                         &delivery_withdrawn,
@@ -883,11 +908,18 @@ impl WorkerService {
     /// The registration is written under the authority lock, in the same critical section as the
     /// check that admitted the connection, so nothing can be admitted against authority that has
     /// already been replaced.
-    fn admit(&self, connection_id: ConnectionId) -> Registration {
+    fn admit(
+        &self,
+        connection_id: ConnectionId,
+        writer: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
+        writable: &kr_ipc::framed::Writable,
+    ) -> Registration {
         let registration = Registration {
             withdrawn: Arc::new(Withdrawal::default()),
             delivery: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(Vec::new())),
+            writer: Arc::clone(writer),
+            writable: writable.clone(),
         };
         let _authority = self
             .authority
@@ -927,7 +959,17 @@ impl WorkerService {
         {
             task.abort();
         }
-        registration.withdrawn.set();
+        {
+            // The latch goes out with the writer held, which is what makes this and a write one
+            // order rather than two races: a write either finished before this line or finds the
+            // latch set when it takes the lock. Nothing waits for the peer while that lock is
+            // held, so a peer that has stopped reading cannot hold a withdrawal up.
+            let _sender = registration
+                .writer
+                .lock()
+                .expect("the connection writer is not poisoned");
+            registration.withdrawn.set();
+        }
         let held = std::mem::take(
             &mut *registration
                 .attachments
@@ -2224,6 +2266,10 @@ struct Registration {
     delivery: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     /// The attachments this connection owns, shared so a withdrawal can take them back itself.
     attachments: Arc<Mutex<Vec<AttachmentId>>>,
+    /// The connection's writer, so a withdrawal is decided on the same lock the writes are.
+    writer: Arc<Mutex<kr_ipc::framed::FrameWriter>>,
+    /// Its readiness, which is where a write waits when the peer has stopped reading.
+    writable: kr_ipc::framed::Writable,
 }
 
 /// A registration's withdrawal, as something every part of a connection can watch at once.
@@ -2286,34 +2332,63 @@ pub const MAX_OUTPUT_EVENT_BYTES: usize = 256 * 1024;
 /// An unprotected frame is one this host produced *after* the withdrawal: the refusal a fenced
 /// caller is owed, or a keepalive. It is written ordinarily, so a fenced connection learns why its
 /// next request failed rather than finding a socket that closed.
+///
+/// The authority and the writing are one step. The lock is taken, the latch is looked at, one
+/// attempt is made that refuses to wait, and the lock is released; the waiting for a peer that has
+/// no room happens outside it, against the latch. A withdrawal takes that same lock to set the
+/// latch, so after it returns no frame of that connection's can begin, and one that had begun is
+/// left half written and ends the connection rather than being finished later.
 async fn write_frame(
-    writer: &Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
+    writable: &kr_ipc::framed::Writable,
+    writer: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
     frame: &ControlFrame,
     withdrawn: &Withdrawal,
     protected: bool,
 ) -> bool {
-    if !protected {
-        let mut sender = writer.lock().await;
-        // A frame that was cut in half when its authority was withdrawn left its beginning with
-        // the peer. Writing anything else now would push the rest of it out first, so this
-        // connection is finished instead: what the host stopped sending stays stopped.
-        if sender.is_mid_frame() {
-            return false;
-        }
-        return sender.write_message(frame).await.is_ok();
-    }
-    tokio::select! {
-        biased;
-        () = withdrawn.wait() => false,
-        written = async {
-            let mut sender = writer.lock().await;
-            // Looked at again with the writer in hand, because waiting for it is where a
-            // withdrawal is most likely to have landed.
-            if withdrawn.is_set() || sender.is_mid_frame() {
+    let Ok(bytes) = kr_ipc::framed::FrameWriter::encode(StreamKind::Control, frame) else {
+        return false;
+    };
+    let mut begun = false;
+    loop {
+        let attempt = {
+            let mut sender = writer
+                .lock()
+                .expect("the connection writer is not poisoned");
+            if protected && withdrawn.is_set() {
                 return false;
             }
-            sender.write_message(frame).await.is_ok()
-        } => written,
+            // A frame that was cut in half left its beginning with the peer. Writing anything else
+            // now would push the rest of it out first, so this connection is finished instead:
+            // what the host stopped sending stays stopped.
+            if !begun && sender.is_mid_frame() {
+                return false;
+            }
+            if begun {
+                sender.resume_frame()
+            } else {
+                sender.begin_frame(&bytes)
+            }
+        };
+        match attempt {
+            Ok(kr_ipc::framed::Wrote::Complete) => return true,
+            Ok(kr_ipc::framed::Wrote::Blocked) => begun = true,
+            Err(_) => return false,
+        }
+        // The peer has no room. Waiting for it happens here, where the lock is not held and a
+        // withdrawal can both take that lock and end this wait.
+        if protected {
+            tokio::select! {
+                biased;
+                () = withdrawn.wait() => return false,
+                ready = writable.ready() => {
+                    if ready.is_err() {
+                        return false;
+                    }
+                }
+            }
+        } else if writable.ready().await.is_err() {
+            return false;
+        }
     }
 }
 
@@ -2322,7 +2397,8 @@ async fn write_frame(
 /// Each frame carries the cursor its own bytes start at, because they are consecutive positions in
 /// one stream.
 async fn send_stream(
-    sender: &Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
+    writable: &kr_ipc::framed::Writable,
+    sender: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
     withdrawn: &Withdrawal,
     stream_id: &StreamId,
     sequence: &mut u64,
@@ -2344,7 +2420,7 @@ async fn send_stream(
         // at the first one after the withdrawal rather than finishing the span it had begun.
         // Stopping the task is not enough on its own: a task whose chunks are all ready writes
         // them without ever yielding to the abort.
-        if !write_frame(sender, &notification, withdrawn, true).await {
+        if !write_frame(writable, sender, &notification, withdrawn, true).await {
             return false;
         }
         at += chunk.len() as u64;
@@ -2357,7 +2433,8 @@ async fn send_stream(
 /// Every frame carries the same cursor: they are parts of one screen at one moment, not
 /// consecutive positions in a stream, and a client draws them in the order they arrive.
 async fn send_screen(
-    sender: &Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
+    writable: &kr_ipc::framed::Writable,
+    sender: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
     withdrawn: &Withdrawal,
     stream_id: &StreamId,
     sequence: &mut u64,
@@ -2377,7 +2454,7 @@ async fn send_screen(
             return false;
         };
         *sequence += 1;
-        if !write_frame(sender, &notification, withdrawn, true).await {
+        if !write_frame(writable, sender, &notification, withdrawn, true).await {
             return false;
         }
     }
@@ -2525,15 +2602,15 @@ pub fn local_actor(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use kr_transport::clock::ManualClock;
 
     use super::{
         ContinuousClock, ContinuousInstant, MAX_OUTPUT_EVENT_BYTES, StreamId, Withdrawal,
-        send_stream, vouched_deadline,
+        notification, send_stream, vouched_deadline, write_frame,
     };
 
     /// Two clocks with one pause between the first reading and the second.
@@ -2649,7 +2726,8 @@ mod tests {
     /// A connected pair of frame halves, on an endpoint of this test's own.
     async fn connected() -> (
         kr_ipc::testing::TempHost,
-        Arc<tokio::sync::Mutex<kr_ipc::framed::FrameWriter>>,
+        kr_ipc::framed::Writable,
+        Arc<Mutex<kr_ipc::framed::FrameWriter>>,
         kr_ipc::framed::FrameReader,
     ) {
         let temp = kr_ipc::testing::TempHost::create();
@@ -2668,7 +2746,107 @@ mod tests {
             .expect("accepts");
         let (_, writer) = kr_ipc::framed::split(server, kr_protocol::frame::StreamKind::Control);
         let (reader, _) = kr_ipc::framed::split(client, kr_protocol::frame::StreamKind::Control);
-        (temp, Arc::new(tokio::sync::Mutex::new(writer)), reader)
+        let writable = writer.writable();
+        (temp, writable, Arc::new(Mutex::new(writer)), reader)
+    }
+
+    /// One output notification of `bytes` bytes, which is what a delivery actually writes.
+    fn output_frame(bytes: usize) -> kr_protocol::envelope::ControlFrame {
+        let stream = StreamId::new("test".to_owned()).expect("a stream identifier");
+        let event = kr_protocol::recovery::OutputEvent {
+            cursor: kr_protocol::scalars::U64::new(0),
+            bytes: kr_protocol::scalars::Bytes::new(vec![b'a'; bytes]),
+        };
+        notification(&stream, 0, "session.output", &event).expect("a notification")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_protected_write_waiting_for_a_peer_ends_at_the_withdrawal() {
+        // The schedule a withdrawal has to win: a peer that has stopped reading, a frame part way
+        // into its socket, and an authority that ends while the writer is waiting for room. The
+        // wait happens outside the lock the withdrawal takes, so the withdrawal does not wait for
+        // the peer, and the write does not resume afterwards.
+        let (_temp, writable, writer, _reader) = connected().await;
+        let withdrawn = Arc::new(Withdrawal::default());
+        let frame = output_frame(MAX_OUTPUT_EVENT_BYTES);
+        let waiting = tokio::spawn({
+            let writable = writable.clone();
+            let writer = Arc::clone(&writer);
+            let withdrawn = Arc::clone(&withdrawn);
+            async move { write_frame(&writable, &writer, &frame, &withdrawn, true).await }
+        });
+
+        // The socket fills, and what could not go stays with the writer.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if writer
+                .lock()
+                .expect("the connection writer is not poisoned")
+                .is_mid_frame()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the peer's socket filled and the write is waiting for room"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The withdrawal, exactly as the service performs it: the latch set with the writer held.
+        let withdrawal = tokio::time::timeout(Duration::from_secs(5), async {
+            let _sender = writer
+                .lock()
+                .expect("the connection writer is not poisoned");
+            withdrawn.set();
+        })
+        .await;
+        assert!(
+            withdrawal.is_ok(),
+            "a peer that has stopped reading does not hold a withdrawal up"
+        );
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .expect("the write answers the withdrawal")
+                .expect("the write task"),
+            "and the frame it was waiting to finish is not delivered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_protected_is_begun_after_a_withdrawal() {
+        // With room in the socket and nothing in flight, a protected frame produced under an
+        // authority that has ended is not written at all: the check and the write are one step, so
+        // there is no moment between them for the withdrawal to land in.
+        let (_temp, writable, writer, mut reader) = connected().await;
+        let withdrawn = Arc::new(Withdrawal::default());
+        {
+            let _sender = writer
+                .lock()
+                .expect("the connection writer is not poisoned");
+            withdrawn.set();
+        }
+        assert!(
+            !write_frame(&writable, &writer, &output_frame(16), &withdrawn, true).await,
+            "a withdrawn registration writes nothing"
+        );
+        assert!(
+            !writer
+                .lock()
+                .expect("the connection writer is not poisoned")
+                .is_mid_frame(),
+            "and nothing of it reached the socket"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                reader.read_message::<kr_protocol::envelope::ControlFrame>(),
+            )
+            .await
+            .is_err(),
+            "so the peer receives nothing"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2677,7 +2855,7 @@ mod tests {
         // withdrawn between any two of them. Stopping the task that writes them is not enough on
         // its own: a task whose frames are all ready writes them without ever yielding to the
         // abort. Each frame therefore passes the withdrawal itself.
-        let (_temp, writer, mut reader) = connected().await;
+        let (_temp, writable, writer, mut reader) = connected().await;
         let withdrawn = Withdrawal::default();
         let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
         let bytes = vec![b'a'; MAX_OUTPUT_EVENT_BYTES * 3];
@@ -2688,13 +2866,24 @@ mod tests {
         // socket nobody is reading: without the boundary the call does not return at all.
         let sent = tokio::time::timeout(
             Duration::from_secs(5),
-            send_stream(&writer, &withdrawn, &stream_id, &mut sequence, 0, &bytes),
+            send_stream(
+                &writable,
+                &writer,
+                &withdrawn,
+                &stream_id,
+                &mut sequence,
+                0,
+                &bytes,
+            ),
         )
         .await
         .expect("a withdrawn registration stops rather than waiting for a peer");
         assert!(!sent, "a withdrawn registration is delivered nothing");
         assert!(
-            !writer.lock().await.is_mid_frame(),
+            !writer
+                .lock()
+                .expect("the connection writer is not poisoned")
+                .is_mid_frame(),
             "and nothing was left half written"
         );
         let nothing = tokio::time::timeout(
