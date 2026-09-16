@@ -363,19 +363,30 @@ mod tests {
 
     #[test]
     fn a_running_process_is_never_listed_as_terminated() {
+        let running = kr_ipc::identity::current_process_start_identity().expect("this process");
         let mut owned = OwnedProcesses::establish(
             OwnershipBoundary::TerminalGroup {
                 group: 1,
                 terminal: None,
             },
-            kr_ipc::identity::current_process_start_identity().expect("this process"),
+            running.clone(),
         );
+        // Observing records whatever else the boundary happens to hold, which on a host where this
+        // group has other members is other people's processes. Nothing is asserted about them: what
+        // this test is about is the one identity it seeded, and a claim about the rest would be a
+        // claim about the machine the test is running on.
         owned.observe();
         assert!(
-            owned.terminated().is_empty(),
-            "this process is running, so nothing has ended"
+            owned.surviving().contains(&running),
+            "this process is running, so it is one of the survivors"
         );
-        assert_eq!(owned.surviving().len(), 1);
+        assert!(
+            !owned
+                .terminated()
+                .iter()
+                .any(|process| process.identity == running),
+            "and a running process is never listed as terminated"
+        );
     }
 
     #[test]
