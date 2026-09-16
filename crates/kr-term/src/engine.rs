@@ -228,6 +228,11 @@ pub struct Engine {
     presentation_revision: u64,
     saved_revision: u64,
     measure_now: bool,
+    /// How many times what the hyperlink objects cost has been read.
+    ///
+    /// A reading replaces what was charged for the links a session opened, so where one happens
+    /// decides whether a charge survives it. The count is what holds that.
+    link_readings: u64,
     alternate_seen: bool,
     title_truncated: bool,
     dropped_marks: u64,
@@ -272,6 +277,7 @@ impl Engine {
             presentation_revision: 0,
             saved_revision: 0,
             measure_now: false,
+            link_readings: 0,
             alternate_seen: false,
             title_truncated: false,
             dropped_marks: 0,
@@ -772,6 +778,28 @@ impl Engine {
                 }
         };
         self.read_links_if_the_charge_would_not_fit(resident.saturating_add(cost));
+        // From here to the end of this decision nothing may read the hyperlink state again: a
+        // reading replaces the account with what the grid is holding, and the object this link is
+        // being admitted for is not on a row yet, so a reading taken between the two charges below
+        // would erase the first of them. The count is checked at the end rather than described in
+        // a comment alone.
+        let readings = self.link_readings;
+        let refusal = self.charge_link(uri, resident, cost, known);
+        debug_assert_eq!(
+            self.link_readings, readings,
+            "the hyperlink state was read again while a link was being charged for"
+        );
+        refusal
+    }
+
+    /// Charges an admitted link, or names why it is refused after all.
+    fn charge_link(
+        &mut self,
+        uri: String,
+        resident: u64,
+        cost: u64,
+        known: bool,
+    ) -> Option<&'static str> {
         if !self.budget.links_fit(resident) {
             self.budget.record_truncation();
             return Some("the session has no room left for another hyperlink");
@@ -938,6 +966,7 @@ impl Engine {
 
     /// Measures what the session's hyperlink state holds, which replaces what was charged for it.
     fn measure_links(&mut self) {
+        self.link_readings = self.link_readings.wrapping_add(1);
         self.budget.set_links(
             self.grid
                 .link_bytes()

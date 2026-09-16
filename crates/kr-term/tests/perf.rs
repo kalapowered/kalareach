@@ -781,47 +781,55 @@ fn a_read_reads_as_many_rows_as_the_geometry_has() {
 /// Every link is charged what it will cost where it arrives, because one read can carry a session's
 /// worth of them. What is charged is at or above what the object turns out to hold, and a row that
 /// is dropped gives nothing back until the objects on it are measured again, so the charged figure
-/// drifts above the truth while a session prints. The engine reads the truth before it refuses
-/// anything, so a session that has scrolled its links away keeps admitting them; and the reading
-/// happens before anything is charged, so it cannot erase a reservation taken for the link being
-/// admitted.
+/// drifts above the truth while a session prints. The engine reads the truth before it charges a
+/// link the drifted figure says would not fit, so a session that has scrolled its links away keeps
+/// admitting them; and it reads before it charges rather than between the object's charge and the
+/// table entry's, because a measurement replaces the account with what the grid is holding and the
+/// object being admitted is not on a row yet.
 #[test]
 fn the_link_envelope_holds_across_a_measurement() {
+    /// Links opened, printed into and closed, one to a read, each with a target of its own.
+    ///
+    /// Enough of them to fill both the envelope and the table of distinct targets a session keeps,
+    /// so the reading that decides a refusal is taken and the refusals after it are taken against
+    /// it. The same count on every build, because what it checks is a bound rather than a rate.
+    const READS: u32 = 4_352;
+    /// Characters of target, which with the parameter field and the scheme is the most one link may
+    /// hold, so the envelope is reached in the fewest reads.
+    const TARGET_CHARS: usize = 2_000;
+
     let mut engine = Engine::new(EngineConfig {
         size: GridSize::new(120, 40),
         ..EngineConfig::DEFAULT
     })
     .expect("engine");
     let envelope = engine.budget().reserved().links;
-    let target: String = std::iter::repeat_n('a', 1_024).collect();
+    let target: String = std::iter::repeat_n('a', TARGET_CHARS).collect();
     let mut admitted = 0usize;
     let mut refused = 0usize;
-    let mut measured_after_refusal = false;
+    let mut seen = 0u64;
+    let mut peak = 0u64;
 
-    // Each read opens one link, prints into it, closes it and ends the line, so every link's cells
-    // scroll off the screen and the objects on them are given up. A session that only ever counted
-    // what it charged would stop admitting links; this one keeps going.
-    for index in 0..4_096u32 {
-        let input = format!(
-            "\x1b]8;id={index};https://example.invalid/{target}\x1b\\link\x1b]8;;\x1b\\ text\r\n"
-        );
-        let outcome = engine.feed(input.as_bytes(), u64::from(index));
-        let truncated = outcome
-            .diagnostics
-            .iter()
-            .any(|entry| entry.detail.contains("hyperlink is not recorded"));
-        if truncated {
+    // One target for every read, so the table of distinct targets fills as well as the envelope,
+    // and the cells of every link scroll off the screen so the objects on them are given up.
+    for index in 0..READS {
+        let input = format!("\x1b]8;;https://{index:05}/{target}\x1b\\link\x1b]8;;\x1b\\ text\r\n");
+        engine.feed(input.as_bytes(), u64::from(index));
+        // Counted from the truncations the budget records rather than from the diagnostics, which
+        // are rate limited: a refusal that was suppressed is still a refusal.
+        let truncations = engine.budget().truncations();
+        if truncations > seen {
             refused += 1;
-            // A refusal is against a measurement, so what the session is holding is at or below
-            // the envelope at that point rather than a drifted figure above it.
-            measured_after_refusal = true;
+            seen = truncations;
         } else {
             admitted += 1;
         }
+        let links = engine.budget().usage().links;
+        peak = peak.max(links);
         assert!(
-            engine.budget().usage().links <= envelope,
-            "the hyperlink state reached {} bytes against a {envelope}-byte envelope at read {index}",
-            engine.budget().usage().links
+            links <= envelope,
+            "the hyperlink state reached {links} bytes against a {envelope}-byte envelope at read \
+             {index}"
         );
         assert_eq!(
             engine.budget().excess(),
@@ -829,7 +837,19 @@ fn the_link_envelope_holds_across_a_measurement() {
             "a measurement found more than the admitted geometry reserved at read {index}"
         );
     }
-    engine.quiesce(4_096);
+    engine.quiesce(u64::from(READS));
+
+    println!("KR-PERF-007 hyperlink admission across a measurement");
+    println!("  reads             {READS}");
+    println!("  links admitted    {admitted}");
+    println!("  links refused     {refused}");
+    println!("  envelope          {envelope} bytes");
+    println!("  peak holding      {peak} bytes");
+    println!(
+        "  settled holding   {} bytes",
+        engine.budget().usage().links
+    );
+
     assert_eq!(
         engine.budget().excess(),
         0,
@@ -840,18 +860,18 @@ fn the_link_envelope_holds_across_a_measurement() {
         "the settled session holds {} bytes of hyperlink state against a {envelope}-byte envelope",
         engine.budget().usage().links
     );
-    println!("KR-PERF-007 hyperlink admission across a measurement");
-    println!("  links admitted    {admitted}");
-    println!("  links refused     {refused}");
-    println!("  envelope          {envelope} bytes");
-    println!(
-        "  holding           {} bytes",
-        engine.budget().usage().links
+    assert!(
+        peak > envelope - envelope / 16,
+        "the run has to reach the part of the envelope where a reading decides something: {peak} \
+         bytes of {envelope}"
     );
     assert!(
-        admitted > 1_024,
+        refused > 0,
+        "the run has to reach a refusal, which is the decision a reading is taken for"
+    );
+    assert!(
+        admitted > READS as usize / 4,
         "a session that scrolls its links away has to keep admitting them: {admitted} admitted, \
          {refused} refused"
     );
-    let _ = measured_after_refusal;
 }
