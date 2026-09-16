@@ -1281,13 +1281,20 @@ impl TransferService {
         bindings.push(binding.clone());
         bindings.sort_by_key(|held| held.ordinal);
         let mut handles = self.handles_of(&store, &bindings)?;
-        // The grant this binding carries is not in the store yet, so the composed result names it
-        // from the row that is about to be committed with it.
+        let position = bindings
+            .iter()
+            .position(|held| held.transfer_id == params.transfer_id);
+        // Neither the session this binding assigns nor the grant it carries is in the store yet,
+        // so the reply names both from the rows that are about to be committed with it. Otherwise
+        // the first reply would say the attachment belongs to no session while the committed row
+        // says it belongs to the draft's, and the retained reply would keep that wrong value.
+        if let Some(session_id) = session_for_attachment
+            && let Some(slot) = position.and_then(|position| handles.get_mut(position))
+        {
+            slot.0.session_id = Nullable::some(session_id);
+        }
         if let Some(grant) = &grant
-            && let Some(position) = bindings
-                .iter()
-                .position(|held| held.transfer_id == params.transfer_id)
-            && let Some(slot) = handles.get_mut(position)
+            && let Some(slot) = position.and_then(|position| handles.get_mut(position))
         {
             slot.1 = Some(AttachmentReadGrant {
                 grant_id: grant.grant_id,
@@ -1385,6 +1392,25 @@ impl TransferService {
                 ..existing
             },
         };
+        // The draft this outcome produces has to fit the frame that carries it, and an outcome
+        // adds text to it. So the whole draft is composed and measured before the outcome commits,
+        // the same way an update and a binding are.
+        {
+            let mut prospective = store.bindings(draft_id)?;
+            for held in &mut prospective {
+                if held.transfer_id == transfer_id {
+                    *held = binding.clone();
+                }
+            }
+            let handles = self.handles_of(&store, &prospective)?;
+            let updated = DraftRow {
+                revision: DraftRevision::new(row.revision.get().saturating_add(1)),
+                updated_at_ms: now,
+                ..row.clone()
+            };
+            let composed = self.compose_draft(&updated, &prospective, &handles)?;
+            check_result_size(&composed, "this draft with the outcome recorded on it")?;
+        }
         store
             // The insertion outcome changes the binding's state and nothing about which session
             // owns the attachment.
@@ -1771,7 +1797,7 @@ impl TransferService {
         method: &str,
         payload_digest: Digest256,
         outcome: &RetainedOutcome,
-    ) -> Result<()> {
+    ) -> Result<Option<RetainedOutcome>> {
         let record = match outcome {
             RetainedOutcome::Ok(result) => ActionRecord {
                 method: method.to_owned(),
@@ -1790,7 +1816,14 @@ impl TransferService {
                 recorded_at_ms: self.clock.now_ms(),
             },
         };
-        self.locked()?.record_action(actor, action_id, &record)
+        if self.locked()?.record_action(actor, action_id, &record)? {
+            // This outcome is the retained one, so it is the one the caller is owed.
+            return Ok(None);
+        }
+        // Another copy of this action recorded first. Two callers of one action get one answer,
+        // and it is the answer that was retained, not the one this copy happened to compute. A
+        // record carrying a different payload is a reused identifier and says so.
+        self.retained_action(actor, action_id, method, payload_digest)
     }
 
     /// Returns the result an action already recorded, decoded into the method's own shape.

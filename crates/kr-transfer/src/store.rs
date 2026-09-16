@@ -1948,11 +1948,13 @@ impl Store {
         actor_id: &ActorId,
         action_id: Uuid,
         record: &ActionRecord,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // The first outcome recorded for an identifier is the one that stands. A later call with
         // the same identifier must not replace it, because the caller that is retrying is entitled
-        // to the answer its action actually produced.
-        self.connection
+        // to the answer its action actually produced. The return says which call this was: true
+        // when this outcome is the retained one, false when one was already there.
+        let changed = self
+            .connection
             .execute(
                 "INSERT INTO actions
                      (actor_id, action_id, method, payload_digest, result, error_code,
@@ -1971,7 +1973,7 @@ impl Store {
                 ],
             )
             .map_err(TransferError::store)?;
-        Ok(())
+        Ok(changed == 1)
     }
 
     /// Removes de-duplication records older than the protocol's retention.

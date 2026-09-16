@@ -473,8 +473,22 @@ impl TransferModule {
                     detail: error.message.clone(),
                 },
             };
-            service.record_action(&actor, action_id, name, digest, &record)?;
-            outcome
+            // Recorded before it is returned, so the reply and the record cannot disagree about
+            // what happened. When another copy of this action recorded first, that record is the
+            // answer both callers get: one action, one receipt.
+            match service.record_action(&actor, action_id, name, digest, &record)? {
+                None => outcome,
+                Some(RetainedOutcome::Ok(result)) => {
+                    kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+                        .map(ParamsValue::new)
+                        .map_err(|error| {
+                            ProtocolError::new(ErrorCode::OutcomeUnknown, error.to_string())
+                        })
+                }
+                Some(RetainedOutcome::Error { code, detail }) => {
+                    Err(ProtocolError::new(code, detail))
+                }
+            }
         })
         .await
     }

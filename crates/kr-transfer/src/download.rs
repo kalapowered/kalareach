@@ -485,16 +485,28 @@ impl TransferService {
         match self.fill_snapshot(&reserved, &stored, &mut source, before, now) {
             Ok(result) => Ok(result),
             Err(error) => {
-                // The reservation goes with the failure, and its payload with it. The removal is
-                // unconditional: this call created that file, and whether something else closed
-                // the row first does not change whose file it is.
-                let _ = self.locked()?.close_snapshot(
-                    transfer_id,
-                    SnapshotState::Failed,
-                    Some(&error.to_string()),
-                    now,
-                );
-                let _ = self.discard_snapshot_payload(&reserved);
+                // The reservation goes with the failure, and its payload with it. Whether this
+                // call was the one that closed the row does not change whose file it is, so the
+                // removal does not depend on that answer — but it does depend on the close having
+                // been written at all. A close that failed leaves the row and the payload for
+                // recovery rather than releasing bytes whose file is gone.
+                // Bound to a local first: a guard in the head of a `match` lives for the whole
+                // expression, and the removal below takes the journal again.
+                let closed = {
+                    let mut store = self.locked()?;
+                    store.close_snapshot(
+                        transfer_id,
+                        SnapshotState::Failed,
+                        Some(&error.to_string()),
+                        now,
+                    )
+                };
+                match closed {
+                    Ok(_) => {
+                        let _ = self.discard_snapshot_payload(&reserved);
+                    }
+                    Err(_) => return Err(error),
+                }
                 Err(error)
             }
         }
@@ -1124,8 +1136,8 @@ impl<'destination> DownloadWriter<'destination> {
                 .open_read(&self.final_name, ObjectPolicy::ReadableFile)?;
             if published.identity() != verified {
                 return Err(TransferError::integrity(format!(
-                    "{} was replaced after this download published it, so what it holds is not \
-                     the object this transfer verified",
+                    "{} does not hold the object this download verified, so this transfer \
+                     published nothing it can vouch for",
                     self.placement.destination_name
                 )));
             }
