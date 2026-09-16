@@ -981,7 +981,7 @@ impl WorkerService {
             // complete. Reporting success while the fence did not run would answer it wrongly.
             return failure(RequestId::new(0), &error.to_protocol_error());
         }
-        self.fence_remote_input(&mut session);
+        self.fence_remote_input(&mut session, None);
         let session_id = session.id();
         let mut authority = self
             .authority
@@ -1016,15 +1016,23 @@ impl WorkerService {
     /// reach the application afterwards. Releasing the lease discards them on the same boundary
     /// the writer takes, which is the step a takeover already uses.
     ///
-    /// Which device the revision was about is not something this worker is told, so every
-    /// forwarded lease is fenced. The device acquires the lease again on its next request, under
-    /// the revision now in force; a local lease is untouched, because no revision replaces the
+    /// `only` names the attachment whose authority ended, when one is known. A revision
+    /// acknowledgement knows no attachment: which device the revision was about is not something
+    /// this worker is told, so every forwarded lease is fenced. A grant that ran out knows exactly
+    /// which attachment it belonged to, and fences nothing else: another device may hold the lease
+    /// by then, and its authority is its own.
+    ///
+    /// Either way the device acquires the lease again on its next request, under the authority
+    /// now in force; a local lease is untouched, because no revision and no grant replaces the
     /// operating-system identity behind it.
-    fn fence_remote_input(&self, session: &mut Session) {
+    fn fence_remote_input(&self, session: &mut Session, only: Option<AttachmentId>) {
         let lease = session.lease();
         let Some(holder) = lease.holder.0 else {
             return;
         };
+        if only.is_some_and(|named| named != holder) {
+            return;
+        }
         let remote = self
             .remote_attachments
             .lock()
@@ -1795,14 +1803,21 @@ impl WorkerService {
     /// The refusal alone is not the fence. Input this caller has already handed over and the
     /// terminal has not taken goes with it, on the writer's own boundary, the same way a takeover
     /// discards the previous holder's bytes.
-    fn check_authority_deadline(&self, caller: &Caller, session: &mut Session) -> Result<()> {
+    fn check_authority_deadline(
+        &self,
+        caller: &Caller,
+        session: &mut Session,
+        attachment_id: AttachmentId,
+    ) -> Result<()> {
         let Some(deadline) = caller.authority_deadline_boot_ms else {
             return Ok(());
         };
         if self.shared_clock.boot_elapsed_ms() < deadline {
             return Ok(());
         }
-        self.fence_remote_input(session);
+        // Only this request's own attachment. Another device may hold the lease by now, and its
+        // authority has nothing to do with this one's having ended.
+        self.fence_remote_input(session, Some(attachment_id));
         Err(WorkerError::GenerationFenced {
             detail: "the authority this request was admitted under has run out".to_owned(),
         })
@@ -2179,7 +2194,7 @@ impl WorkerService {
             // grant behind it runs out, and what the boundary decides is what actually reaches the
             // application.
             self.check_validated_revision(caller)?;
-            self.check_authority_deadline(caller, &mut session)?;
+            self.check_authority_deadline(caller, &mut session, params.attachment_id)?;
             Self::check_session(&session, params.session_id)?;
             Self::check_capability(&session, params.attachment_id, AttachmentCapability::Input)?;
             let accepted = session.write_input(
