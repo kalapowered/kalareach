@@ -730,9 +730,13 @@ reserved before it is applied, against the hyperlink envelope, and one that will
 refusing one ends the link that was open, because the text that belonged to the refused link must
 not end up inside the previous one. What is reserved for a link is at or above what the object turns
 out to hold, and a row that is dropped gives nothing back until the objects on it are measured
-again, so the reserved figure drifts above the truth while a session prints. A refusal on that
-figure would refuse a link the session has room for, so the objects are measured before anything is
-refused, and only then: a link is admitted on a reservation and refused only on a measurement. A link with parameters and no target is refused the same way:
+again, so the reserved figure drifts above the truth while a session prints. A refusal against the
+envelope on that figure would refuse a link the session has room for, so the objects are measured
+first, before anything is charged for the link being admitted: a measurement replaces the account
+with what the grid is holding, and the object this link is for is not on a row yet. The other three
+refusals need no measurement, because none of them is against the envelope: a link longer than one
+link may be, a parameter field arriving with no target, and a table already holding as many
+distinct targets as a session keeps. A link with parameters and no target is refused the same way:
 that is a close, and keeping its parameters would let an application hold a session's worth of
 identifiers in links nothing can follow. A cell that reaches its content bound drops the marks past
 it. The alert channel holds a bounded number of alerts, each cut to a bounded length.
@@ -770,12 +774,16 @@ when a link would otherwise be refused, and when something asked for it; between
 link is reserved for where it arrives, so the figure the envelope is checked against is at or above
 the truth. A snapshot of the history reads retained rows too, when one is asked for.
 
-Nothing else on the read path reads a retained row. What the session's screens hold is read from the
-rows that are showing; what their records cost is read from how many rows there are, which the
-library already knows; and what the retained rows hold is carried. So the whole of that measurement
-costs what a screen costs, whatever the history behind it, and it is taken on every read rather
-than on a schedule. What the account removes is the walk a *single row leaving the screen* used to
-cost, which is the one that grew with the history and happened thousands of times a read.
+Nothing else on the read path reads a retained row's cells. What the session's screens hold is read
+from the rows that are showing; what their records cost is read from how many rows there are, which
+the library already knows; and what the retained rows hold is carried. The walk that finds the
+showing rows still steps over the retained ones, because the library offers no borrow of one row of
+a screen that is correct for both halves of the deque its rows sit in, so a retained row costs an
+index comparison there and nothing more. `CanonicalGrid::rows_read` counts the rows a measurement
+read the cells of, and `a_read_reads_as_many_rows_as_the_geometry_has` holds that a session at its
+cache bound reads no more than twice what a session with an empty history reads over the same run.
+What the account removes is the walk a *single row leaving the screen* used to cost, which is the
+one that grew with the history and happened thousands of times a read.
 
 `CanonicalGrid::measure_history_bytes` is the same figure worked out by walking the rows, and a
 test compares the two after every operation of a randomised sequence of prints, resizes, buffer
@@ -1011,45 +1019,47 @@ keeps no file; continuous integration sets it and retains the directory.
 
 ### What a read costs
 
-A read is one lexical pass over its bytes, one policy decision and one grid mutation for each event
-that pass produced, and one measurement of resident state. Each of those is proportional to the
-bytes of the read or to the screen. None of them is proportional to the history behind the screen,
-to how many links the session has opened, or to how long it has been printing:
+A read is one lexical pass over its bytes, a policy decision for each event that pass produced, the
+grid work each event asks for, and a measurement of resident state. What each of those costs is
+bounded by the bytes of the read and by the geometry. None of it is proportional to the history
+behind the screen, to how many links the session has opened, or to how long it has been printing:
 
 * the lexical pass appends a run of printable bytes in one step rather than a byte at a time, and
-  keeps the buffer it collects a sequence in between sequences, so collecting a sequence costs no
-  allocation;
-* the actions an event adapts to are handed to the grid library rather than copied to it, and a
-  parameter list is split into the shape the class table is written in without growing as it goes;
-* a printed cell is read back where it sits, rather than by asking the library for its row's cells.
-  Asking rewrites the row into a vector of cells and leaves it that way until something compacts it
-  again, which for a session printing into a screen is every row twice over: into cells where the
-  run is placed, and back into clustered text where the row scrolls off. The read-back also happens
-  only where a combining mark can still join the cell, which for a run cut at every cell boundary is
-  the cell the run ends on rather than each cell in it;
+  reuses the buffer it collects a sequence in rather than handing it over, so a sequence no longer
+  than the room that buffer has already grown to costs no allocation to collect. A sequence longer
+  than the room there is still grows it once, and a sequence longer than the inline form still
+  allocates the copy the event carries;
+* the actions an event adapts to are handed to the grid library rather than copied to it on the
+  session's own path, and a parameter list is split into the shape the class table is written in
+  without growing as it goes. `CanonicalGrid::apply` still returns the actions it applied, for a
+  caller that wants them;
 * what the screens hold is read from the rows that are showing, what their records cost from how
   many rows there are, and what the retained rows hold is carried;
 * what the hyperlink objects cost is the one figure that has to be found wherever the objects sit,
   because an object is shared and a row that is not showing can be the only place one sits. That is
-  read every sixty-fourth read, before a link would otherwise be refused, and when something asked.
+  read every sixty-fourth read, before a link is charged that the reserved figure says would not
+  fit, and when something asked.
 
 ### What the target measures on real hosts
 
 The figures below are what this engine measured on the hosts it has run on, in September 2026, each
-one the rate three passes sustained after a discarded warm-up. The plain stream is the harder of the
-two on every host measured here: most of what it asks for is the screen cleared, and clearing a
-screen writes every cell of forty rows.
+one the rate three passes sustained after a discarded warm-up. Neither stream is reliably the harder
+of the two: the one that scrolls pays for every row joining the historical cache, and the plain one
+spends most of what it is asked to do on clearing the screen, which writes the cells of as many rows
+as the erasure covers.
 
 | Host | Plain stream | Stream that scrolls | Where it was measured |
 | --- | --- | --- | --- |
-| Apple M4 Pro, 12 processors | 12.0 to 12.4 MiB/s | 16.1 to 17.0 MiB/s | local runs of this revision |
-| AMD EPYC 7763 64-Core, 4 processors | 5.7 MiB/s | 8.0 MiB/s | `core-ci` run 35150987281 |
-| AMD EPYC 9V74 80-Core, 4 processors | 5.7 MiB/s | 8.1 MiB/s | `core-ci` run 35152906656 |
-| Intel Xeon Platinum 8573C, 4 processors | 7.5 MiB/s | 7.2 MiB/s | `core-ci` run 35148943978 |
+| Apple M4 Pro, 12 processors | 11.9 to 12.2 MiB/s | 11.2 to 11.5 MiB/s | local runs of this revision |
+| AMD EPYC 7763 64-Core, 4 processors | 5.9 MiB/s | 5.7 to 5.8 MiB/s | `core-ci` runs 35159810650 and 35161103854 |
+| AMD EPYC 9V74 80-Core, 4 processors | 7.3 MiB/s | 7.4 MiB/s | `core-ci` run 35158750320 |
 
-Each row is one host's sampled runs and not a fixed property of that processor. The runs named are
-`core-ci` runs of this revision's terminal engine, and each of them retains the figures, the
-processor and the verdict it measured, so a row can be read back to the run it came from.
+Each row is one host's sampled runs and not a fixed property of that processor. The platform names a
+class of processor rather than a machine, and one named class has answered a third apart on the
+plain stream across the runs behind this revision, so the rows above are not a ranking of
+processors. The runs named are `core-ci` runs of this revision's terminal engine, each one retaining
+the figures, the processor and the verdict it measured, so a row can be read back to the run it came
+from.
 
 Section 27 asks a reference host for at least four CPU cores and 8 GiB, so four processors is the
 floor a host has to meet the target on, and every four-processor host above meets it on both
