@@ -227,7 +227,7 @@ impl DescriptorDirectory {
                 reason: "a descriptor directory must be owned by this user",
             });
         }
-        if u32::from(metadata.st_mode) & 0o077 != 0 {
+        if metadata.st_mode & 0o077 != 0 {
             return Err(IpcError::UntrustedFile {
                 path: path.to_path_buf(),
                 reason: "a descriptor directory must not be reachable by anyone else",
