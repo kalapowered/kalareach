@@ -40,9 +40,10 @@ git push origin "packages/v0.2.0+${commit:0:12}"
 `.github/workflows/package-release.yml` runs on a tag matching `packages/v*`. It packs the archives
 with `scripts/release-packages.sh`, refuses to go on if that tag already has a release or a draft,
 attaches the archives and `SHA512SUMS` to a draft, and publishes the draft only once GitHub's record
-of every asset, down to its own sha256 of the bytes it stored, matches what was packed. Then it
-fetches each asset back from the URL GitHub serves it at, holds it to the packed sha512, writes
-those URLs into the notes, and confirms the published release cannot be replaced.
+of every asset, down to the sha256 GitHub computed over the bytes it stored, matches what was packed.
+Publication then confirms that the release cannot be replaced, and the last step fetches each asset
+back from the URL GitHub serves it at, holds it to the packed sha512, and writes those URLs into the
+notes.
 
 The script is what makes the release that commit's output rather than a working tree's:
 
@@ -51,14 +52,17 @@ The script is what makes the release that commit's output rather than a working 
 - it asks each generator whether the committed schema, TypeScript types, WIT package and
   conformance vectors are still what it produces, so an archive never carries output that has
   drifted from the Rust types it came from;
-- it packs from a fresh checkout of the commit, because a working tree also holds files Git ignores
-  and pnpm packs what is inside a published directory whether Git ignores it or not;
-- it refuses a configured `pack-gzip-level`, which changes the compressed bytes,
-  `ignore-scripts`, which would skip the step that generates most of what the protocol package
-  publishes, and `skip-manifest-obfuscation`, which changes the manifest written into the archive;
-- it packs each archive twice and compares the two, then asks each archive what it contains: a file
-  under every path the manifest publishes, the file behind every entry point it declares, a manifest
-  naming that package and version, and a provenance file naming this commit;
+- it packs from a fresh checkout of the commit with line-ending conversion turned off, because a
+  working tree also holds files Git ignores, pnpm packs what is inside a published directory whether
+  Git ignores it or not, and it packs the bytes it finds;
+- it refuses a configured `pack-gzip-level`, which changes the compressed bytes, `ignore-scripts`,
+  which would skip the step that generates most of what the protocol package publishes,
+  `skip-manifest-obfuscation`, which changes the manifest written into the archive, and a configured
+  `pnpmfile` or `global-pnpmfile`, which can rewrite that manifest from outside the commit;
+- it packs each archive twice and compares the two, then asks each archive what it contains, against
+  what the package in the checkout publishes rather than against the archive's own manifest: a file
+  under every published path, the file behind every entry point, those declarations unchanged, a
+  manifest naming that package and version, and a provenance file naming this commit;
 - it names each archive after the commit and writes `SHA512SUMS` beside them, and nothing reaches
   the output directory until all of that has passed.
 
@@ -73,12 +77,14 @@ It needs the pinned Rust toolchain for the generators, and pnpm for the install 
 A published archive is never replaced. Turn on the repository's immutable-releases setting before
 cutting the first release, so that GitHub holds to that rather than a convention holding to it: a URL
 a consumer pinned then keeps resolving to the bytes its lockfile recorded, whoever has write access.
-The setting is what also gives each asset the sha256 GitHub reports, which the workflow compares
-before it publishes anything, and the workflow's last step fails when a release it published turns
-out to be replaceable. Immutability is about replacement and not about availability: a whole release
-can still be deleted, which is why a mistake is corrected by a new commit and a new tag while the
-earlier release stays where it is. Pushing a tag that is already on the remote produces no event at
-all, and a run whose upload failed leaves a draft: delete that draft before tagging again.
+The workflow fails right after publishing when the release it published turns out to be replaceable.
+
+Immutability is about replacement and not about availability: a whole release can still be deleted,
+and the tag of a deleted immutable release cannot be used again. So a published release stays where
+it is, and a mistake is corrected by releasing a new commit under its own tag. A run that failed
+before publishing is the other case: it leaves a draft, and once that draft is deleted the same tag
+can be released again by re-running the run that failed, because pushing a tag that is already on
+the remote produces no event at all.
 
 ## How a consumer pins a release
 
@@ -142,10 +148,11 @@ its own name.
 ## Reproducing a release
 
 The archive layout is pnpm's: members in a fixed order under a fixed timestamp, with fixed
-permissions and no machine identity. The bytes are therefore a function of the commit, the Node and
-pnpm versions and the three pack settings the script refuses a configured value for. The double pack
-inside one run catches something that varies from moment to moment; it says nothing about another
-machine, which is what the pinned versions and the refused settings are for.
+permissions and no machine identity. What is left is the environment, and the script narrows it: the
+checkout takes the committed bytes with no line-ending conversion, and a configured value for any
+pnpm setting that reaches an archive is refused rather than packed under. The double pack inside one
+run catches something that varies from moment to moment; it says nothing about another machine, which
+is what the pinned Node and pnpm versions are for.
 
 To reproduce a release, use a fresh checkout of its commit, the pnpm version in the root
 `package.json`'s `packageManager` field, and the Node version the release workflow installs. Where

@@ -9,9 +9,10 @@
 # contains, names it after the commit, and writes the digests a consumer pins and verifies against.
 #
 # The archive format belongs to pnpm: members in a fixed order under a fixed timestamp, with fixed
-# permissions and no machine identity. The bytes are a function of the commit, the Node and pnpm
-# versions and three pnpm settings, so the script refuses a configured value for any of the three
-# and packs each archive twice to catch anything that varies within one run.
+# permissions and no machine identity. What is left to vary is the environment, so the script pins
+# the checkout's line endings, refuses a configured value for each pnpm setting that reaches an
+# archive's bytes, and packs each archive twice to catch anything that varies within one run. The
+# Node and pnpm versions are the release's own, pinned where the release runs.
 #
 #   bash scripts/release-packages.sh                                  # writes dist/packages
 #   bash scripts/release-packages.sh --output /tmp/kalareach-packages
@@ -27,16 +28,19 @@ cd "$root"
 # The packages a release carries. One tag names one version, so both of these hold the same one.
 packages=(packages/protocol packages/plugin-sdk)
 
-# The pnpm settings a release's bytes depend on, as "<setting>|<the value a release is packed
-# under>|<what another value changes>". `pack-gzip-level` reaches zlib directly. `ignore-scripts`
-# decides whether the step that generates the declarations, the conformance vectors and the
-# provenance file of the protocol package runs at all, and a pack that skipped it is a smaller
-# archive that still packs and still equals a second pack of itself.
-# `skip-manifest-obfuscation` decides which manifest is written into the archive.
+# The pnpm settings that reach an archive, as "<setting>|<the value a release is packed under>|<what
+# another value changes>". `pack-gzip-level` reaches zlib directly. `ignore-scripts` decides whether
+# the step that generates the declarations, the conformance vectors and the provenance file of the
+# protocol package runs at all, and a pack that skipped it is a smaller archive that still packs and
+# still equals a second pack of itself. `skip-manifest-obfuscation` decides which manifest is
+# written into the archive, and a configured pnpmfile can rewrite that manifest from outside the
+# commit through its packing hook.
 settings=(
   "pack-gzip-level|undefined|the compressed bytes"
   "ignore-scripts|false|whether most of what the protocol package publishes is generated at all"
   "skip-manifest-obfuscation|false|the manifest written into the archive"
+  "pnpmfile|undefined|the manifest written into the archive"
+  "global-pnpmfile|undefined|the manifest written into the archive"
 )
 
 output="$root/dist/packages"
@@ -159,12 +163,12 @@ read_digest() {
 }
 
 # Asks one archive what it contains, rather than trusting that packing went well: a file under every
-# path the manifest publishes, the file behind every entry point it declares, a manifest naming that
-# package and version, and a provenance file, where the package has one, naming this commit. An
-# archive packed without the step that generates most of its contents is otherwise a well-formed
-# archive of the wrong thing.
+# path the package publishes, the file behind every entry point it declares, those declarations
+# unchanged, a manifest naming that package and version, and a provenance file, where the package
+# has one, naming this commit. What the package publishes is read from the checkout, because an
+# archive measured against its own manifest is an archive asked whether it agrees with itself.
 verify_archive() {
-  local archive="$1" directory="$2" expected_name="$3" expected_version="$4" unpacked
+  local archive="$1" source="$2" expected_name="$3" expected_version="$4" unpacked
 
   unpacked="$staging/unpacked"
   rm -rf "$unpacked"
@@ -174,67 +178,101 @@ verify_archive() {
   # shellcheck disable=SC2016  # the ${} below are JavaScript template placeholders.
   node -e '
     const { readdirSync, readFileSync, statSync } = require("node:fs")
-    const [directory, label, expectedName, expectedVersion, commit] = process.argv.slice(1)
+    const [source, archive, label, expectedName, expectedVersion, commit] = process.argv.slice(1)
 
-    const carried = readdirSync(directory, { recursive: true })
-      .filter((entry) => statSync(`${directory}/${entry}`).isFile())
+    const declared = JSON.parse(readFileSync(`${source}/package.json`, "utf8"))
+    const packed = JSON.parse(readFileSync(`${archive}/package.json`, "utf8"))
+
+    const carried = readdirSync(archive, { recursive: true })
+      .filter((entry) => statSync(`${archive}/${entry}`).isFile())
       .map((entry) => entry.split("\\").join("/"))
 
     const problems = []
     const bare = (path) => path.replace(/^\.\//, "")
-    const found = JSON.parse(readFileSync(`${directory}/package.json`, "utf8"))
 
-    if (found.name !== expectedName) {
-      problems.push(`${label} contains ${found.name}, not ${expectedName}`)
+    // A path with a `*` in it is met by anything that matches; a plain path by itself.
+    const matches = (pattern, entry) =>
+      new RegExp(
+        `^${bare(pattern)
+          .split("*")
+          .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join(".*")}$`
+      ).test(entry)
+
+    if (declared.name !== expectedName || declared.version !== expectedVersion) {
+      problems.push(
+        `${source}/package.json names ${declared.name} ${declared.version}, ` +
+          `not ${expectedName} ${expectedVersion}`
+      )
     }
-    if (found.version !== expectedVersion) {
-      problems.push(`${label} contains version ${found.version}, not ${expectedVersion}`)
+    if (packed.name !== expectedName) {
+      problems.push(`${label} contains ${packed.name}, not ${expectedName}`)
+    }
+    if (packed.version !== expectedVersion) {
+      problems.push(`${label} contains version ${packed.version}, not ${expectedVersion}`)
+    }
+
+    // The declarations a consumer resolves through have to survive packing. pnpm rewrites the
+    // manifest it puts in the archive, dropping the lifecycle scripts among other things, so these
+    // are compared field by field and not as whole documents.
+    const canonical = (value) =>
+      value === null || typeof value !== "object"
+        ? JSON.stringify(value === undefined ? null : value)
+        : Array.isArray(value)
+          ? `[${value.map(canonical).join(",")}]`
+          : `{${Object.keys(value)
+              .sort()
+              .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
+              .join(",")}}`
+
+    for (const field of ["main", "types", "exports"]) {
+      if (canonical(declared[field]) !== canonical(packed[field])) {
+        problems.push(
+          `${label} declares ${field} ${canonical(packed[field])}, ` +
+            `not ${canonical(declared[field])}`
+        )
+      }
     }
 
     // Each published path has to hold a file. A directory on its own says nothing: an empty `types`
     // directory and a `types` directory with the declarations in it both exist.
-    for (const published of Array.isArray(found.files) ? found.files : []) {
-      const prefix = bare(published).split("*")[0].replace(/\/+$/, "")
-      const holds = carried.some((entry) => entry === prefix || entry.startsWith(`${prefix}/`))
+    for (const published of Array.isArray(declared.files) ? declared.files : []) {
+      const path = bare(published).replace(/\/+$/, "")
+      const holds = path.includes("*")
+        ? carried.some((entry) => matches(path, entry))
+        : carried.some((entry) => entry === path || entry.startsWith(`${path}/`))
 
       if (!holds) {
-        problems.push(`${label} carries no file under ${published}, which it publishes`)
+        problems.push(`${label} carries no file under ${published}, which the package publishes`)
       }
     }
 
     // What the package points at is what a consumer resolves: its main, its declarations and every
-    // target in its exports map, with a pattern satisfied by anything that matches it.
+    // target in its exports map. Each is compared as a path, so a manifest that leaned on Node
+    // resolving an extension or a directory index would need this to grow.
     const targets = new Set()
     const collect = (value) => {
       if (typeof value === "string") targets.add(value)
       else if (value !== null && typeof value === "object") Object.values(value).forEach(collect)
     }
 
-    collect(found.main)
-    collect(found.types)
-    collect(found.exports)
+    collect(declared.main)
+    collect(declared.types)
+    collect(declared.exports)
 
     for (const target of targets) {
       const path = bare(target)
+      const present = path.includes("*")
+        ? carried.some((entry) => matches(path, entry))
+        : carried.includes(path)
 
-      if (path.includes("*")) {
-        const pattern = new RegExp(
-          `^${path
-            .split("*")
-            .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-            .join(".+")}$`
-        )
-
-        if (!carried.some((entry) => pattern.test(entry))) {
-          problems.push(`${label} carries nothing matching ${target}, which it exports`)
-        }
-      } else if (!carried.includes(path)) {
-        problems.push(`${label} carries no ${target}, which it exports`)
+      if (!present) {
+        problems.push(`${label} carries nothing at ${target}, which the package exports`)
       }
     }
 
     if (carried.includes("provenance.json")) {
-      const provenance = JSON.parse(readFileSync(`${directory}/provenance.json`, "utf8"))
+      const provenance = JSON.parse(readFileSync(`${archive}/provenance.json`, "utf8"))
 
       if (provenance.core_commit !== commit) {
         problems.push(`${label} was packed from ${provenance.core_commit}, not from ${commit}`)
@@ -252,7 +290,8 @@ verify_archive() {
       process.stderr.write(`It carries:\n${carried.sort().join("\n")}\n`)
       process.exit(1)
     }
-  ' "$unpacked/package" "$(basename "$archive")" "$expected_name" "$expected_version" "$commit"
+  ' "$source" "$unpacked/package" "$(basename "$archive")" "$expected_name" "$expected_version" \
+    "$commit"
 
   rm -rf "$unpacked"
 }
@@ -330,9 +369,12 @@ echo
 
 # Packing happens in a checkout of nothing but this commit. A working tree also holds files Git
 # ignores, and pnpm packs what is inside a published directory whether Git ignores it or not, so a
-# stray file here would otherwise travel inside a release.
+# stray file here would otherwise travel inside a release. The checkout takes the committed bytes
+# exactly: pnpm packs the bytes it finds, and line-ending conversion is a machine's setting.
 echo "checking out $short to pack from"
 git clone --quiet --shared --no-checkout "$root" "$checkout"
+git -C "$checkout" config core.autocrlf false
+git -C "$checkout" config core.eol lf
 git -C "$checkout" checkout --quiet --detach "$commit"
 pnpm -C "$checkout" install --frozen-lockfile
 echo
@@ -396,7 +438,7 @@ done
 } >"$staging/assets/SHA512SUMS"
 
 # Nothing reaches the output directory until every archive is packed, checked and summed, so a run
-# that stopped part way leaves no half a release behind.
+# that stopped before this point leaves nothing behind at all.
 mv "$staging/assets/"* "$output/"
 
 echo
