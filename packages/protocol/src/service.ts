@@ -185,6 +185,8 @@ export const SERVICE_METHODS: readonly Method[] = [
   'push.sender.renew',
   'push.sender.revoke',
   'mailbox.read',
+  'mailbox.deliver',
+  'mailbox.acknowledge',
   'authority.sync',
   'sync.compare_exchange',
   'backup.manifest'

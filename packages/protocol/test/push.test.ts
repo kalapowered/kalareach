@@ -262,6 +262,8 @@ describe('the service credential', () => {
       [
         'authority.sync',
         'backup.manifest',
+        'mailbox.acknowledge',
+        'mailbox.deliver',
         'mailbox.read',
         'push.installation.register',
         'push.sender.issue',
