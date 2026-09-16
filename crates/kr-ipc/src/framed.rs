@@ -137,6 +137,17 @@ pub struct FrameWriter {
 }
 
 impl FrameWriter {
+    /// Returns whether a frame has been partly written and not finished.
+    ///
+    /// A write that was cancelled part way left its beginning with the peer, so the stream can only
+    /// continue by finishing that frame. A caller that no longer stands behind what was cut in half
+    /// asks this before it writes anything else, and ends the connection instead: the alternative
+    /// is pushing out the rest of something it has decided not to send.
+    #[must_use]
+    pub const fn is_mid_frame(&self) -> bool {
+        self.sent < self.pending.len()
+    }
+
     /// Serialises a message and writes it as one frame.
     ///
     /// # Errors

@@ -2277,6 +2277,12 @@ async fn write_frame(
 ) -> bool {
     if !protected {
         let mut sender = writer.lock().await;
+        // A frame that was cut in half when its authority was withdrawn left its beginning with
+        // the peer. Writing anything else now would push the rest of it out first, so this
+        // connection is finished instead: what the host stopped sending stays stopped.
+        if sender.is_mid_frame() {
+            return false;
+        }
         return sender.write_message(frame).await.is_ok();
     }
     tokio::select! {
@@ -2284,6 +2290,11 @@ async fn write_frame(
         () = withdrawn.wait() => false,
         written = async {
             let mut sender = writer.lock().await;
+            // Looked at again with the writer in hand, because waiting for it is where a
+            // withdrawal is most likely to have landed.
+            if withdrawn.is_set() || sender.is_mid_frame() {
+                return false;
+            }
             sender.write_message(frame).await.is_ok()
         } => written,
     }
