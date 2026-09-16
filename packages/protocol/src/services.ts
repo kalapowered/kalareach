@@ -37,6 +37,7 @@ import type {
   EnvelopePlaintext,
   EnvelopeRouting,
   OrganisationPolicyPayload,
+  RevocationAcknowledgement,
   RevocationRequest,
   SealedEnvelope,
   SealedSyncObject,
@@ -479,6 +480,54 @@ export function readSealedEnvelope (value: unknown): SealedEnvelope {
           : uuidToJson(identifierBytes('a coalescing thread identifier', thread))
     }
   }
+}
+
+const ACKNOWLEDGEMENT_FIELDS = [
+  'acknowledged_at_ms',
+  'authority_revision',
+  'completion',
+  'host_device_id',
+  'request_id'
+] as const
+
+const PENDING_FIELDS = ['pending_workers'] as const
+
+/**
+ * One host's acknowledgement of a revocation request, read against its closed schema.
+ *
+ * The one record in this group that carries no signature: what authenticates it is the host
+ * credential that carried it, so nothing else closes its shape. A service stores it and serves it
+ * back to the publisher, which is exactly the case {@link readSealedEnvelope} states — a field
+ * nobody agreed on would be stored, served back and covered by nothing.
+ *
+ * @throws {ServicesSchemaError} naming the rule the acknowledgement breaks.
+ */
+export function readRevocationAcknowledgement (value: unknown): RevocationAcknowledgement {
+  const record = closed('an acknowledgement', value, ACKNOWLEDGEMENT_FIELDS)
+
+  return {
+    acknowledged_at_ms: counterText('an acknowledgement time', record['acknowledged_at_ms']),
+    authority_revision: counterText('an authority revision', record['authority_revision']),
+    completion: readCompletion(record['completion']),
+    host_device_id: uuidToJson(identifierBytes('a host device identifier', record['host_device_id'])),
+    request_id: uuidToJson(identifierBytes('a request identifier', record['request_id']))
+  }
+}
+
+/**
+ * The two completions the protocol declares, and nothing else.
+ *
+ * `"complete"` is the unit case, so it travels as that text; `pending` carries how many workers are
+ * still outstanding. An empty object would be a statement that says nothing, and a third member
+ * would be a completion nobody defined.
+ */
+function readCompletion (value: unknown): RevocationAcknowledgement['completion'] {
+  if (value === 'complete') {
+    return 'complete'
+  }
+  const record = closed('a completion', value, ['pending'] as const)
+  const pending = closed('a pending completion', record['pending'], PENDING_FIELDS)
+  return { pending: { pending_workers: counterText('the pending workers', pending['pending_workers']) } }
 }
 
 const SEALED_SYNC_OBJECT_FIELDS = ['ciphertext', 'nonce', 'size_bucket_bytes'] as const

@@ -47,6 +47,7 @@ import {
   readArchiveDescriptor,
   readBackupGenerationPublication,
   readBackupWriterRecord,
+  readRevocationAcknowledgement,
   checkSealedEnvelope,
   checkSealedSyncObject,
   envelopeStoredBytes,
@@ -403,6 +404,55 @@ describe('the authority feed', () => {
     expect(() =>
       revocationRequestSigningInput({ ...request, target: { hosts: { host_ids: [] } } } as never)
     ).toThrow(ServicesSchemaError)
+  })
+})
+
+describe("a host's acknowledgement, which carries no signature", () => {
+  const acknowledgement = {
+    request_id: '2f1c7a10-0000-4000-8000-000000000001',
+    host_device_id: '2f1c7a10-0000-4000-8000-000000000002',
+    authority_revision: '4',
+    completion: 'complete',
+    acknowledged_at_ms: '1774000000000'
+  } as const
+
+  it('reads the two completions the protocol declares and nothing else', () => {
+    expect(readRevocationAcknowledgement(acknowledgement)).toEqual(acknowledgement)
+
+    const pending = {
+      ...acknowledgement,
+      completion: { pending: { pending_workers: '2' } }
+    }
+    expect(readRevocationAcknowledgement(pending)).toEqual(pending)
+
+    for (const completion of [
+      {},
+      'finished',
+      { pending: {} },
+      { pending: { pending_workers: 2 } },
+      { pending: { pending_workers: '007' } },
+      { pending: { pending_workers: '1' }, complete: null }
+    ]) {
+      expect(() =>
+        readRevocationAcknowledgement({ ...acknowledgement, completion })
+      ).toThrow(ServicesSchemaError)
+    }
+  })
+
+  it('refuses a field nobody agreed on, and a counter that is not one', () => {
+    // A service stores this and serves it back to the publisher, so a field nobody agreed on would
+    // be stored, served back and covered by nothing at all.
+    expect(() =>
+      readRevocationAcknowledgement({ ...acknowledgement, prompt: 'explain this failure' })
+    ).toThrow(ServicesSchemaError)
+    expect(() =>
+      readRevocationAcknowledgement({ ...acknowledgement, authority_revision: 'soon' })
+    ).toThrow(ServicesSchemaError)
+    expect(() =>
+      readRevocationAcknowledgement({ ...acknowledgement, acknowledged_at_ms: '-1' })
+    ).toThrow(ServicesSchemaError)
+    const { request_id: _omitted, ...missing } = acknowledgement
+    expect(() => readRevocationAcknowledgement(missing)).toThrow(ServicesSchemaError)
   })
 })
 
