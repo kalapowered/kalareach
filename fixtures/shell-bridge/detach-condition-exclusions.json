@@ -1,0 +1,646 @@
+{
+  "id": "detach-condition-exclusions",
+  "purpose": "The detach condition needs the managed root editor, the primary prompt and an empty buffer, and the ten states in which the next character belongs to something already in progress, or came from somewhere other than the person at the keyboard, give it back to the editor.",
+  "covers": [
+    "KR-REQ-07.74",
+    "KR-REQ-07.70"
+  ],
+  "shells": [
+    "zsh",
+    "bash",
+    "fish",
+    "powershell"
+  ],
+  "script": {
+    "pre_eof": {
+      "view": {
+        "session_id": "11111111-1111-1111-1111-111111111111",
+        "fence": null,
+        "gesture": {
+          "terminal_eof": {
+            "byte": "4"
+          }
+        },
+        "pending_gesture": null,
+        "hinted_for": null
+      },
+      "steps": [
+        {
+          "publish": {
+            "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+            "root_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "prompt_generation": "1",
+            "reader_revision": "1",
+            "input_epoch": "3",
+            "originating_attachment": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+          }
+        },
+        {
+          "offer": {
+            "name": "an-empty-primary-prompt-is-eligible",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "submit_detach": {
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                "prompt_generation": "1",
+                "input_epoch": "3"
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "not-the-managed-root-editor",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": false,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "not_managed_root_editor"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "continuation-input",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "continuation",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "continuation_input"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "the-read-builtin",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "read_builtin",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "read_builtin"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "a-buffer-with-something-in-it",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "2",
+                  "buffer_empty": false,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "buffer_not_empty"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "quoted-insertion",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": true,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "quoted_insertion"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "macro-input-in-progress",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": true,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "macro_input"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "the-last-character-of-a-macro",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "macro",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "macro_input"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "a-key-a-widget-pushed-back",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "pushed_back",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "macro_input"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "search",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": true,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "search"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "a-numeric-argument",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": true,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "numeric_argument"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "a-pending-multikey-sequence",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": true,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "multikey_sequence"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "a-vi-motion",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "vi_command",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": true,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "vi_motion"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "an-open-paste",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": true
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "paste"
+                }
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "the-last-character-of-a-paste",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "paste",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": {
+                  "excluded": "paste"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

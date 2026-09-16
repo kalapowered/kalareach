@@ -3054,6 +3054,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-shell-integration"
+version = "0.1.0"
+dependencies = [
+ "kr-cbor",
+ "kr-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "kr-term"
 version = "0.1.0"
 dependencies = [

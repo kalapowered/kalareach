@@ -1,0 +1,327 @@
+{
+  "id": "handshake-accept",
+  "purpose": "Each package's own reader mechanisms register it as the session's root integration, and the accept carries the hold, the configured gesture, the hint and the instruction to take the bootstrap values out of the exported environment.",
+  "covers": [
+    "KR-REQ-07.39",
+    "KR-REQ-07.70",
+    "KR-REQ-07.89",
+    "KR-REQ-07.40"
+  ],
+  "shells": [
+    "zsh",
+    "bash",
+    "fish",
+    "powershell"
+  ],
+  "script": {
+    "handshake": {
+      "expectation": {
+        "session_id": "11111111-1111-1111-1111-111111111111",
+        "root_process": {
+          "pid": "4242",
+          "source": "macos_proc_bsd_info",
+          "start_value": "900"
+        },
+        "supported_editor_abis": [
+          "zle-5.9",
+          "readline-8.2",
+          "fish-reader-4.0",
+          "psreadline-2.3"
+        ],
+        "supported_integration_versions": [
+          "1"
+        ],
+        "already_registered": false,
+        "gesture": {
+          "terminal_eof": {
+            "byte": "4"
+          }
+        }
+      },
+      "cases": [
+        {
+          "name": "patched-zsh-reader-mailbox-and-native-hook",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "accepted": {
+              "editor_abi": "zle-5.9",
+              "hold_ms": "250",
+              "gesture": {
+                "terminal_eof": {
+                  "byte": "4"
+                }
+              },
+              "hint": "Use kr detach --attachment <id> to detach.",
+              "secret_location": "private_integration_state",
+              "unexport": [
+                "KR_SHELL_BRIDGE",
+                "KR_SHELL_BRIDGE_SECRET"
+              ]
+            }
+          }
+        },
+        {
+          "name": "patched-bash-idle-mailbox-and-native-hook",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "bash",
+              "executable": "/opt/kalareach/shells/readline-8.2/bin/bash",
+              "upstream_version": "5.2.37",
+              "editor_abi": "readline-8.2",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "bash-reader-bridge",
+                  "upstream_revision": "readline-8.2",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "bash/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/readline-8.2/lib",
+                  "editor_abi": "readline-8.2"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "idle_reader_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "accepted": {
+              "editor_abi": "readline-8.2",
+              "hold_ms": "250",
+              "gesture": {
+                "terminal_eof": {
+                  "byte": "4"
+                }
+              },
+              "hint": "Use kr detach --attachment <id> to detach.",
+              "secret_location": "private_integration_state",
+              "unexport": [
+                "KR_SHELL_BRIDGE",
+                "KR_SHELL_BRIDGE_SECRET"
+              ]
+            }
+          }
+        },
+        {
+          "name": "fish-reader-event-bridge-and-named-binding",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "fish",
+              "executable": "/opt/kalareach/shells/fish-reader-4.0/bin/fish",
+              "upstream_version": "4.0.2",
+              "editor_abi": "fish-reader-4.0",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "fish-reader-bridge",
+                  "upstream_revision": "fish-reader-4.0",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "fish/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/fish-reader-4.0/lib",
+                  "editor_abi": "fish-reader-4.0"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "reader_event_bridge",
+              "pre_eof": "named_reader_binding",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "accepted": {
+              "editor_abi": "fish-reader-4.0",
+              "hold_ms": "250",
+              "gesture": {
+                "terminal_eof": {
+                  "byte": "4"
+                }
+              },
+              "hint": "Use kr detach --attachment <id> to detach.",
+              "secret_location": "private_integration_state",
+              "unexport": [
+                "KR_SHELL_BRIDGE",
+                "KR_SHELL_BRIDGE_SECRET"
+              ]
+            }
+          }
+        },
+        {
+          "name": "psreadline-reader-thread-queue-and-state-handler",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "powershell",
+              "executable": "/opt/kalareach/shells/psreadline-2.3/bin/powershell",
+              "upstream_version": "7.4.6",
+              "editor_abi": "psreadline-2.3",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "powershell-reader-bridge",
+                  "upstream_revision": "psreadline-2.3",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "powershell/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/psreadline-2.3/lib",
+                  "editor_abi": "psreadline-2.3"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "reader_thread_queue",
+              "pre_eof": "reader_state_handler",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "accepted": {
+              "editor_abi": "psreadline-2.3",
+              "hold_ms": "250",
+              "gesture": {
+                "terminal_eof": {
+                  "byte": "4"
+                }
+              },
+              "hint": "Use kr detach --attachment <id> to detach.",
+              "secret_location": "private_integration_state",
+              "unexport": [
+                "KR_SHELL_BRIDGE",
+                "KR_SHELL_BRIDGE_SECRET"
+              ]
+            }
+          }
+        }
+      ],
+      "activation": [
+        {
+          "name": "the-root-shell-has-both-bootstrap-values",
+          "inputs": {
+            "exported_endpoint": "/tmp/kalareach/s/shell-bridge",
+            "exported_secret": true
+          },
+          "expect": "attempt"
+        }
+      ]
+    }
+  }
+}

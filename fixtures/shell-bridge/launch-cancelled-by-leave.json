@@ -1,0 +1,298 @@
+{
+  "id": "launch-cancelled-by-leave",
+  "purpose": "The reader leaves while the launch is in its mailbox: the reader is told, the caller gets EDITOR_BUSY, the fence is invalidated, and the input held for the transaction goes to whatever is reading the terminal now rather than waiting for a reader that has gone.",
+  "covers": [
+    "KR-REQ-07.83",
+    "KR-REQ-07.33"
+  ],
+  "shells": [
+    "zsh",
+    "bash",
+    "fish",
+    "powershell"
+  ],
+  "script": {
+    "fence": {
+      "session_id": "11111111-1111-1111-1111-111111111111",
+      "lease": {
+        "epoch": "3",
+        "holder": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+      },
+      "steps": [
+        {
+          "at_ms": "0",
+          "stimulus": {
+            "editor_entered": {
+              "params": {
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "root_process": {
+                  "pid": "4242",
+                  "source": "macos_proc_bsd_info",
+                  "start_value": "900"
+                },
+                "prompt_generation": "1",
+                "reader_revision": "1",
+                "reader_context": "primary",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                },
+                "cwd_revision": "2"
+              },
+              "candidate_fence": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1"
+            }
+          },
+          "expect": {
+            "state": "unfenced",
+            "fence": null,
+            "held": [],
+            "actions": [
+              {
+                "ask_fence": {
+                  "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                  "prompt_generation": "1",
+                  "reader_revision": "1",
+                  "deadline_ms": "250",
+                  "cause": "editor_entry"
+                }
+              }
+            ],
+            "detach_target": null
+          }
+        },
+        {
+          "at_ms": "5",
+          "stimulus": {
+            "fence_acknowledged": {
+              "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+              "reader_context": "primary",
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "queues": {
+                "tty_typeahead_drained": true,
+                "macro_input_drained": true,
+                "partial_key_drained": true
+              },
+              "snapshot": {
+                "keys": "",
+                "pending_bytes": "0",
+                "queued_keys": "0"
+              },
+              "editor": {
+                "buffer_revision": "1",
+                "buffer_empty": true,
+                "keymap": "emacs",
+                "pending": {
+                  "quoted_insertion": false,
+                  "macro_input": false,
+                  "search": false,
+                  "numeric_argument": false,
+                  "multikey_sequence": false,
+                  "vi_motion": false,
+                  "paste": false
+                }
+              },
+              "cwd_revision": "2"
+            }
+          },
+          "expect": {
+            "state": "fenced",
+            "fence": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+            "held": [],
+            "actions": [
+              {
+                "publish_fence": {
+                  "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                  "root_process": {
+                    "pid": "4242",
+                    "source": "macos_proc_bsd_info",
+                    "start_value": "900"
+                  },
+                  "prompt_generation": "1",
+                  "reader_revision": "1",
+                  "input_epoch": "3",
+                  "originating_attachment": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+                }
+              }
+            ],
+            "detach_target": null
+          }
+        },
+        {
+          "at_ms": "10",
+          "stimulus": {
+            "launch_requested": {
+              "params": {
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "command": {
+                  "arguments": [
+                    "codex",
+                    "--resume"
+                  ]
+                },
+                "expected_prompt_generation": "1",
+                "expected_buffer_revision": "1"
+              },
+              "requester": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+              "transaction": "71717171-7171-7171-7171-717171717171"
+            }
+          },
+          "expect": {
+            "state": "launch_reserved",
+            "fence": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+            "held": [],
+            "actions": [
+              {
+                "send_launch": {
+                  "transaction": "71717171-7171-7171-7171-717171717171",
+                  "command": {
+                    "arguments": [
+                      "codex",
+                      "--resume"
+                    ]
+                  },
+                  "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                  "expected_prompt_generation": "1",
+                  "expected_buffer_revision": "1",
+                  "expected_cwd_revision": "2",
+                  "deadline_ms": "200"
+                }
+              }
+            ],
+            "detach_target": null
+          }
+        },
+        {
+          "at_ms": "15",
+          "stimulus": {
+            "input_arrived": {
+              "input": "typed-during-the-transaction",
+              "attachment_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+              "epoch": "3",
+              "bytes": "3"
+            }
+          },
+          "expect": {
+            "state": "launch_reserved",
+            "fence": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+            "held": [
+              "typed-during-the-transaction"
+            ],
+            "actions": [
+              {
+                "hold": "typed-during-the-transaction"
+              }
+            ],
+            "detach_target": null
+          }
+        },
+        {
+          "at_ms": "20",
+          "stimulus": {
+            "editor_left": {
+              "session_id": "11111111-1111-1111-1111-111111111111",
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "reason": "command_accepted"
+            }
+          },
+          "expect": {
+            "state": "outside",
+            "fence": null,
+            "held": [],
+            "actions": [
+              {
+                "revoke_launch": {
+                  "transaction": "71717171-7171-7171-7171-717171717171",
+                  "reason": "editor_left"
+                }
+              },
+              {
+                "invalidate_fence": "editor_left"
+              },
+              {
+                "release": [
+                  "typed-during-the-transaction"
+                ]
+              }
+            ],
+            "detach_target": null
+          }
+        },
+        {
+          "at_ms": "25",
+          "stimulus": {
+            "input_arrived": {
+              "input": "straight-to-the-application",
+              "attachment_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+              "epoch": "3",
+              "bytes": "2"
+            }
+          },
+          "expect": {
+            "state": "outside",
+            "fence": null,
+            "held": [],
+            "actions": [
+              {
+                "forward": "straight-to-the-application"
+              }
+            ],
+            "detach_target": null
+          }
+        },
+        {
+          "at_ms": "30",
+          "stimulus": {
+            "launch_decided": {
+              "accepted": {
+                "transaction": "71717171-7171-7171-7171-717171717171",
+                "installed": {
+                  "arguments": [
+                    "codex",
+                    "--resume"
+                  ]
+                },
+                "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                "prompt_generation": "1",
+                "buffer_revision": "2",
+                "reader_revision": "1"
+              }
+            }
+          },
+          "expect": {
+            "state": "outside",
+            "fence": null,
+            "held": [],
+            "actions": [
+              {
+                "late_installation": {
+                  "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                  "prompt_generation": "1"
+                }
+              },
+              {
+                "install_launch": {
+                  "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                  "prompt_generation": "1",
+                  "buffer_revision": "2"
+                }
+              }
+            ],
+            "detach_target": null
+          }
+        }
+      ]
+    }
+  }
+}

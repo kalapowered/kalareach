@@ -10,6 +10,7 @@ members = [
     "crates/kr-pairing",
     "crates/kr-plugin-sdk",
     "crates/kr-protocol",
+    "crates/kr-shell-integration",
     "crates/kr-term",
     "crates/kr-transport",
     "crates/kr-worker",

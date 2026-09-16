@@ -1,0 +1,1230 @@
+{
+  "id": "handshake-reject",
+  "purpose": "Every named qualification error, including a child that claims its parent's identity with a valid proof, and the two reasons a starting shell does not attempt the handshake at all.",
+  "covers": [
+    "KR-REQ-07.39",
+    "KR-REQ-07.70",
+    "KR-REQ-07.89",
+    "KR-REQ-07.40"
+  ],
+  "shells": [
+    "zsh",
+    "bash",
+    "fish",
+    "powershell"
+  ],
+  "script": {
+    "handshake": {
+      "expectation": {
+        "session_id": "11111111-1111-1111-1111-111111111111",
+        "root_process": {
+          "pid": "4242",
+          "source": "macos_proc_bsd_info",
+          "start_value": "900"
+        },
+        "supported_editor_abis": [
+          "zle-5.9",
+          "readline-8.2",
+          "fish-reader-4.0",
+          "psreadline-2.3"
+        ],
+        "supported_integration_versions": [
+          "1"
+        ],
+        "already_registered": false,
+        "gesture": {
+          "terminal_eof": {
+            "byte": "4"
+          }
+        }
+      },
+      "cases": [
+        {
+          "name": "another-protocol",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/0",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "protocol_mismatch",
+              "code": "UNSUPPORTED_SCHEMA"
+            }
+          }
+        },
+        {
+          "name": "a-stale-inherited-session",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "22222222-2222-2222-2222-222222222222",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "session_mismatch",
+              "code": "PERMISSION_DENIED"
+            }
+          }
+        },
+        {
+          "name": "a-child-shell-of-the-root-shell",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4243",
+              "source": "macos_proc_bsd_info",
+              "start_value": "901"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4243",
+              "source": "macos_proc_bsd_info",
+              "start_value": "901"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "process_mismatch",
+              "code": "PERMISSION_DENIED"
+            }
+          }
+        },
+        {
+          "name": "a-child-shell-claiming-its-parents-identity-with-a-valid-proof",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4243",
+              "source": "macos_proc_bsd_info",
+              "start_value": "901"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "process_mismatch",
+              "code": "PERMISSION_DENIED"
+            }
+          }
+        },
+        {
+          "name": "a-connection-the-platform-cannot-identify",
+          "peer": {
+            "uid": 501,
+            "process": null
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "peer_unidentified",
+              "code": "PERMISSION_DENIED"
+            }
+          }
+        },
+        {
+          "name": "a-proof-that-does-not-verify",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "failed",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "proof_mismatch",
+              "code": "PERMISSION_DENIED"
+            }
+          }
+        },
+        {
+          "name": "a-file-descriptor-watcher-instead-of-a-mailbox",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "file_descriptor_watcher",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "unqualified_mailbox",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "another-readers-mailbox",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "reader_thread_queue",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "mailbox_not_for_shell",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "a-key-binding-wrapper-instead-of-the-readers-own-hook",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "key_binding_wrapper",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "key_binding_pre_eof",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "another-readers-pre-eof-mechanism",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "reader_state_handler",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "pre_eof_not_for_shell",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "a-prompt-hook-as-the-fence-proof",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "prompt_hook",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "unprovable_fence",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "an-empty-kernel-queue-as-the-fence-proof",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "empty_kernel_queue",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "unprovable_fence",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "a-foreground-process-group-as-the-fence-proof",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "foreground_process_group",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "unprovable_fence",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "screen-coordinates-as-the-fence-proof",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "screen_coordinates",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "unprovable_fence",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "no-non-destructive-cancellation",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "unavailable",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "no_cancellation_path",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "key-injection-into-the-terminal-as-the-launch-path",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "pseudo_terminal_key_injection"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "key_injection_forbidden",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "an-integration-version-this-build-does-not-support",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "2",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "integration_version_unsupported",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "an-editor-abi-this-build-was-not-qualified-against",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.8/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.8",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.8",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.8/lib",
+                  "editor_abi": "zle-5.8"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "editor_abi_unsupported",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "an-abi-incompatible-user-native-module",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                },
+                {
+                  "name": "zsh/user-native-module",
+                  "search_path": "/usr/local/lib/zsh/5.8",
+                  "editor_abi": "zle-5.8"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": null,
+          "expect": {
+            "refused": {
+              "reason": "module_tree_unsupported",
+              "code": "SHELL_INTEGRATION_UNSUPPORTED"
+            }
+          }
+        },
+        {
+          "name": "a-second-root-integration-for-one-session",
+          "peer": {
+            "uid": 501,
+            "process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            }
+          },
+          "hello": {
+            "protocol": "kr-shell-bridge/1",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "shell_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "shell": {
+              "kind": "zsh",
+              "executable": "/opt/kalareach/shells/zle-5.9/bin/zsh",
+              "upstream_version": "5.9",
+              "editor_abi": "zle-5.9",
+              "integration_version": "1",
+              "patches": [
+                {
+                  "name": "zsh-reader-bridge",
+                  "upstream_revision": "zle-5.9",
+                  "revision": "1"
+                }
+              ],
+              "modules": [
+                {
+                  "name": "zsh/kr-bridge",
+                  "search_path": "/opt/kalareach/shells/zle-5.9/lib",
+                  "editor_abi": "zle-5.9"
+                }
+              ]
+            },
+            "abi": {
+              "mailbox": "key_sequence_boundary_mailbox",
+              "pre_eof": "native_hook",
+              "fence_proof": "atomic_reader_state",
+              "cancellation": "non_destructive_key_wait",
+              "launch_delivery": "reader_mailbox"
+            },
+            "proof": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+          },
+          "proof": "verified",
+          "expectation": {
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "root_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "supported_editor_abis": [
+              "zle-5.9",
+              "readline-8.2",
+              "fish-reader-4.0",
+              "psreadline-2.3"
+            ],
+            "supported_integration_versions": [
+              "1"
+            ],
+            "already_registered": true,
+            "gesture": {
+              "terminal_eof": {
+                "byte": "4"
+              }
+            }
+          },
+          "expect": {
+            "refused": {
+              "reason": "already_registered",
+              "code": "PERMISSION_DENIED"
+            }
+          }
+        }
+      ],
+      "activation": [
+        {
+          "name": "a-child-shell-inherits-no-bootstrap-values",
+          "inputs": {
+            "exported_endpoint": null,
+            "exported_secret": false
+          },
+          "expect": {
+            "skip": "no_endpoint"
+          }
+        },
+        {
+          "name": "an-endpoint-without-its-secret",
+          "inputs": {
+            "exported_endpoint": "/tmp/kalareach/s/shell-bridge",
+            "exported_secret": false
+          },
+          "expect": {
+            "skip": "no_secret"
+          }
+        }
+      ]
+    }
+  }
+}

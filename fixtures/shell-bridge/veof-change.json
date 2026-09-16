@@ -1,0 +1,230 @@
+{
+  "id": "veof-change",
+  "purpose": "A reassigned VEOF is a user change to the gesture and takes effect at the next prompt: the character typed at this prompt is still judged by the gesture that was in force when it was typed.",
+  "covers": [
+    "KR-REQ-07.73",
+    "KR-REQ-07.74"
+  ],
+  "shells": [
+    "zsh",
+    "bash",
+    "fish"
+  ],
+  "script": {
+    "pre_eof": {
+      "view": {
+        "session_id": "11111111-1111-1111-1111-111111111111",
+        "fence": null,
+        "gesture": {
+          "terminal_eof": {
+            "byte": "4"
+          }
+        },
+        "pending_gesture": null,
+        "hinted_for": null
+      },
+      "steps": [
+        {
+          "publish": {
+            "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+            "root_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "prompt_generation": "1",
+            "reader_revision": "1",
+            "input_epoch": "3",
+            "originating_attachment": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+          }
+        },
+        {
+          "offer": {
+            "name": "the-default-gesture-detaches",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "submit_detach": {
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                "prompt_generation": "1",
+                "input_epoch": "3"
+              }
+            }
+          }
+        },
+        {
+          "gesture": {
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "gesture": {
+              "terminal_eof": {
+                "byte": "113"
+              }
+            },
+            "effective_at": "2"
+          }
+        },
+        {
+          "offer": {
+            "name": "the-old-byte-still-detaches-at-the-prompt-it-was-typed-at",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "submit_detach": {
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                "prompt_generation": "1",
+                "input_epoch": "3"
+              }
+            }
+          }
+        },
+        {
+          "publish": {
+            "fence_id": "f2f2f2f2-f2f2-f2f2-f2f2-f2f2f2f2f2f2",
+            "root_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "prompt_generation": "2",
+            "reader_revision": "1",
+            "input_epoch": "3",
+            "originating_attachment": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+          }
+        },
+        {
+          "offer": {
+            "name": "at-the-next-prompt-the-old-byte-is-ordinary-input",
+            "context": {
+              "prompt_generation": "2",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": "not_the_gesture"
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "and-the-new-byte-carries-the-detach",
+            "context": {
+              "prompt_generation": "2",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "113"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "submit_detach": {
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "fence_id": "f2f2f2f2-f2f2-f2f2-f2f2-f2f2f2f2f2f2",
+                "prompt_generation": "2",
+                "input_epoch": "3"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

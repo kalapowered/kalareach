@@ -1,0 +1,159 @@
+{
+  "id": "psreadline-chord-gesture",
+  "purpose": "Windows uses the configured PSReadLine gesture, which is a chord rather than a byte: the configured chord carries the detach and any other chord is the editor's own.",
+  "covers": [
+    "KR-REQ-07.73",
+    "KR-REQ-07.74"
+  ],
+  "shells": [
+    "powershell"
+  ],
+  "script": {
+    "pre_eof": {
+      "view": {
+        "session_id": "11111111-1111-1111-1111-111111111111",
+        "fence": null,
+        "gesture": {
+          "chord": {
+            "keys": "Ctrl+d"
+          }
+        },
+        "pending_gesture": null,
+        "hinted_for": null
+      },
+      "steps": [
+        {
+          "publish": {
+            "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+            "root_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "prompt_generation": "1",
+            "reader_revision": "1",
+            "input_epoch": "3",
+            "originating_attachment": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+          }
+        },
+        {
+          "offer": {
+            "name": "the-configured-chord-detaches",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "chord": {
+                  "keys": "Ctrl+d"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "submit_detach": {
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                "prompt_generation": "1",
+                "input_epoch": "3"
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "another-chord-is-the-editors-own",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "chord": {
+                  "keys": "Ctrl+k"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": "not_the_gesture"
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "and-so-is-the-unix-byte",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "native": {
+                "reason": "not_the_gesture"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "kr-shell-integration"
+description = "The KalaReach root-editor bridge contract: transport and handshake, reader events, the fence and detach state machine and the cross-shell fixtures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kr-shell-fixtures"
+path = "src/bin/kr-shell-fixtures.rs"
+
+[dependencies]
+kr-cbor.workspace = true
+kr-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,450 @@
+{
+  "id": "launch-reader-decisions",
+  "purpose": "The reader thread's own check before anything is installed: this reader, this fence, inside its deadline, with no input of the person's waiting and the prompt, directory and buffer the caller expected.",
+  "covers": [
+    "KR-REQ-07.83",
+    "KR-REQ-07.32",
+    "KR-REQ-07.33"
+  ],
+  "shells": [
+    "zsh",
+    "bash",
+    "fish",
+    "powershell"
+  ],
+  "script": {
+    "launch": {
+      "request": {
+        "session_id": "11111111-1111-1111-1111-111111111111",
+        "transaction": "71717171-7171-7171-7171-717171717171",
+        "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+        "command": {
+          "arguments": [
+            "codex",
+            "--message",
+            "fix \"$HOME\"; rm -rf /"
+          ]
+        },
+        "expected_prompt_generation": "4",
+        "expected_buffer_revision": "9",
+        "expected_cwd_revision": "2",
+        "deadline_ms": "200"
+      },
+      "cases": [
+        {
+          "name": "an-empty-primary-prompt-at-the-expected-revisions",
+          "state": {
+            "prompt_generation": "4",
+            "reader_revision": "1",
+            "reader_context": "primary",
+            "editor": {
+              "buffer_revision": "9",
+              "buffer_empty": true,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": false,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "0",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "2",
+            "fence_live": true,
+            "revoked": false,
+            "waited_ms": "3"
+          },
+          "expect": {
+            "installed": {
+              "installed": {
+                "arguments": [
+                  "codex",
+                  "--message",
+                  "fix \"$HOME\"; rm -rf /"
+                ]
+              },
+              "buffer_revision": "10"
+            }
+          }
+        },
+        {
+          "name": "a-revocation-the-reader-saw-in-the-same-step",
+          "state": {
+            "prompt_generation": "4",
+            "reader_revision": "1",
+            "reader_context": "primary",
+            "editor": {
+              "buffer_revision": "9",
+              "buffer_empty": true,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": false,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "0",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "2",
+            "fence_live": true,
+            "revoked": true,
+            "waited_ms": "3"
+          },
+          "expect": {
+            "rejected": {
+              "reason": "revoked",
+              "code": "EDITOR_BUSY"
+            }
+          }
+        },
+        {
+          "name": "a-fence-the-reader-no-longer-holds",
+          "state": {
+            "prompt_generation": "4",
+            "reader_revision": "1",
+            "reader_context": "primary",
+            "editor": {
+              "buffer_revision": "9",
+              "buffer_empty": true,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": false,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "0",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "2",
+            "fence_live": false,
+            "revoked": false,
+            "waited_ms": "3"
+          },
+          "expect": {
+            "rejected": {
+              "reason": "fence_invalid",
+              "code": "EDITOR_BUSY"
+            }
+          }
+        },
+        {
+          "name": "a-continuation-line",
+          "state": {
+            "prompt_generation": "4",
+            "reader_revision": "1",
+            "reader_context": "continuation",
+            "editor": {
+              "buffer_revision": "9",
+              "buffer_empty": true,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": false,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "0",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "2",
+            "fence_live": true,
+            "revoked": false,
+            "waited_ms": "3"
+          },
+          "expect": {
+            "rejected": {
+              "reason": "not_primary_reader",
+              "code": "EDITOR_BUSY"
+            }
+          }
+        },
+        {
+          "name": "the-readers-own-deadline-has-passed",
+          "state": {
+            "prompt_generation": "4",
+            "reader_revision": "1",
+            "reader_context": "primary",
+            "editor": {
+              "buffer_revision": "9",
+              "buffer_empty": true,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": false,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "0",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "2",
+            "fence_live": true,
+            "revoked": false,
+            "waited_ms": "250"
+          },
+          "expect": {
+            "rejected": {
+              "reason": "timeout",
+              "code": "EDITOR_BUSY"
+            }
+          }
+        },
+        {
+          "name": "input-the-person-typed-first",
+          "state": {
+            "prompt_generation": "4",
+            "reader_revision": "1",
+            "reader_context": "primary",
+            "editor": {
+              "buffer_revision": "9",
+              "buffer_empty": true,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": false,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "3",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "2",
+            "fence_live": true,
+            "revoked": false,
+            "waited_ms": "3"
+          },
+          "expect": {
+            "rejected": {
+              "reason": "queued_prior_input",
+              "code": "EDITOR_BUSY"
+            }
+          }
+        },
+        {
+          "name": "a-macro-still-feeding-the-reader",
+          "state": {
+            "prompt_generation": "4",
+            "reader_revision": "1",
+            "reader_context": "primary",
+            "editor": {
+              "buffer_revision": "9",
+              "buffer_empty": true,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": true,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "0",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "2",
+            "fence_live": true,
+            "revoked": false,
+            "waited_ms": "3"
+          },
+          "expect": {
+            "rejected": {
+              "reason": "queued_prior_input",
+              "code": "EDITOR_BUSY"
+            }
+          }
+        },
+        {
+          "name": "another-prompt-than-the-caller-expected",
+          "state": {
+            "prompt_generation": "5",
+            "reader_revision": "1",
+            "reader_context": "primary",
+            "editor": {
+              "buffer_revision": "9",
+              "buffer_empty": true,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": false,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "0",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "2",
+            "fence_live": true,
+            "revoked": false,
+            "waited_ms": "3"
+          },
+          "expect": {
+            "rejected": {
+              "reason": "prompt_generation_mismatch",
+              "code": "DRAFT_CONFLICT"
+            }
+          }
+        },
+        {
+          "name": "another-working-directory",
+          "state": {
+            "prompt_generation": "4",
+            "reader_revision": "1",
+            "reader_context": "primary",
+            "editor": {
+              "buffer_revision": "9",
+              "buffer_empty": true,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": false,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "0",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "3",
+            "fence_live": true,
+            "revoked": false,
+            "waited_ms": "3"
+          },
+          "expect": {
+            "rejected": {
+              "reason": "cwd_revision_mismatch",
+              "code": "DRAFT_CONFLICT"
+            }
+          }
+        },
+        {
+          "name": "something-typed-into-the-buffer",
+          "state": {
+            "prompt_generation": "4",
+            "reader_revision": "1",
+            "reader_context": "primary",
+            "editor": {
+              "buffer_revision": "9",
+              "buffer_empty": false,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": false,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "0",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "2",
+            "fence_live": true,
+            "revoked": false,
+            "waited_ms": "3"
+          },
+          "expect": {
+            "rejected": {
+              "reason": "buffer_not_empty",
+              "code": "DRAFT_CONFLICT"
+            }
+          }
+        },
+        {
+          "name": "a-buffer-revision-that-has-moved",
+          "state": {
+            "prompt_generation": "4",
+            "reader_revision": "1",
+            "reader_context": "primary",
+            "editor": {
+              "buffer_revision": "11",
+              "buffer_empty": true,
+              "keymap": "emacs",
+              "pending": {
+                "quoted_insertion": false,
+                "macro_input": false,
+                "search": false,
+                "numeric_argument": false,
+                "multikey_sequence": false,
+                "vi_motion": false,
+                "paste": false
+              }
+            },
+            "snapshot": {
+              "keys": "",
+              "pending_bytes": "0",
+              "queued_keys": "0"
+            },
+            "cwd_revision": "2",
+            "fence_live": true,
+            "revoked": false,
+            "waited_ms": "3"
+          },
+          "expect": {
+            "rejected": {
+              "reason": "buffer_revision_mismatch",
+              "code": "DRAFT_CONFLICT"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

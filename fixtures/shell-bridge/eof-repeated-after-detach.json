@@ -1,0 +1,234 @@
+{
+  "id": "eof-repeated-after-detach",
+  "purpose": "A gesture that has already been delivered is consumed while the reader is unfenced, and a detach the worker refuses is consumed the same way: the character has already left the reader, so the hint is the only honest answer left.",
+  "covers": [
+    "KR-REQ-07.82",
+    "KR-REQ-07.81"
+  ],
+  "shells": [
+    "zsh",
+    "bash",
+    "fish",
+    "powershell"
+  ],
+  "script": {
+    "pre_eof": {
+      "view": {
+        "session_id": "11111111-1111-1111-1111-111111111111",
+        "fence": null,
+        "gesture": {
+          "terminal_eof": {
+            "byte": "4"
+          }
+        },
+        "pending_gesture": null,
+        "hinted_for": null
+      },
+      "steps": [
+        {
+          "publish": {
+            "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+            "root_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "prompt_generation": "1",
+            "reader_revision": "1",
+            "input_epoch": "3",
+            "originating_attachment": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+          }
+        },
+        {
+          "offer": {
+            "name": "the-fenced-gesture-detaches-its-own-attachment",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "submit_detach": {
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "fence_id": "f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1",
+                "prompt_generation": "1",
+                "input_epoch": "3"
+              }
+            }
+          }
+        },
+        "invalidate",
+        {
+          "offer": {
+            "name": "the-repeat-after-the-detach-is-consumed",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "consume": {
+                "hint": "Use kr detach --attachment <id> to detach.",
+                "reason": "fence_missing"
+              }
+            }
+          }
+        },
+        {
+          "offer": {
+            "name": "and-cannot-adopt-whatever-arrives-next",
+            "context": {
+              "prompt_generation": "1",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "consume": {
+                "hint": null,
+                "reason": "fence_missing"
+              }
+            }
+          }
+        },
+        {
+          "publish": {
+            "fence_id": "f2f2f2f2-f2f2-f2f2-f2f2-f2f2f2f2f2f2",
+            "root_process": {
+              "pid": "4242",
+              "source": "macos_proc_bsd_info",
+              "start_value": "900"
+            },
+            "prompt_generation": "2",
+            "reader_revision": "1",
+            "input_epoch": "4",
+            "originating_attachment": "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2"
+          }
+        },
+        {
+          "offer": {
+            "name": "the-next-attachments-fence-detaches-the-next-attachment",
+            "context": {
+              "prompt_generation": "2",
+              "reader_revision": "1",
+              "key": {
+                "byte": {
+                  "byte": "4"
+                }
+              },
+              "condition": {
+                "managed_root_editor": true,
+                "reader_context": "primary",
+                "source": "terminal",
+                "editor": {
+                  "buffer_revision": "1",
+                  "buffer_empty": true,
+                  "keymap": "emacs",
+                  "pending": {
+                    "quoted_insertion": false,
+                    "macro_input": false,
+                    "search": false,
+                    "numeric_argument": false,
+                    "multikey_sequence": false,
+                    "vi_motion": false,
+                    "paste": false
+                  }
+                }
+              }
+            },
+            "expect": {
+              "submit_detach": {
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "fence_id": "f2f2f2f2-f2f2-f2f2-f2f2-f2f2f2f2f2f2",
+                "prompt_generation": "2",
+                "input_epoch": "4"
+              }
+            }
+          }
+        },
+        {
+          "detach_refused": {
+            "name": "a-detach-the-worker-refuses-prints-the-hint",
+            "prompt_generation": "2",
+            "expect_hint": "Use kr detach --attachment <id> to detach."
+          }
+        },
+        {
+          "detach_refused": {
+            "name": "and-only-once-for-that-prompt",
+            "prompt_generation": "2",
+            "expect_hint": null
+          }
+        }
+      ]
+    }
+  }
+}
