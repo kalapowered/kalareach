@@ -52,9 +52,10 @@ The script is what makes the release that commit's output rather than a working 
 - it asks each generator whether the committed schema, TypeScript types, WIT package and
   conformance vectors are still what it produces, so an archive never carries output that has
   drifted from the Rust types it came from;
-- it packs from a fresh checkout of the commit with line-ending conversion turned off, because a
-  working tree also holds files Git ignores, pnpm packs what is inside a published directory whether
-  Git ignores it or not, and it packs the bytes it finds;
+- it packs from a fresh checkout of the commit, taking the committed bytes with no line-ending
+  conversion from a setting or from an attribute file outside the commit, because a working tree
+  also holds files Git ignores, pnpm packs what is inside a published directory whether Git ignores
+  it or not, and it packs the bytes it finds;
 - it refuses a configured `pack-gzip-level`, which changes the compressed bytes, `ignore-scripts`,
   which would skip the step that generates most of what the protocol package publishes,
   `skip-manifest-obfuscation`, which changes the manifest written into the archive, and a configured
@@ -149,8 +150,8 @@ its own name.
 
 The archive layout is pnpm's: members in a fixed order under a fixed timestamp, with fixed
 permissions and no machine identity. What is left is the environment, and the script narrows it: the
-checkout takes the committed bytes with no line-ending conversion, and a configured value for any
-pnpm setting that reaches an archive is refused rather than packed under. The double pack inside one
+checkout takes the committed bytes with no line-ending conversion, and a configured value for any of
+the pnpm settings the script lists is refused rather than packed under. The double pack inside one
 run catches something that varies from moment to moment; it says nothing about another machine, which
 is what the pinned Node and pnpm versions are for.
 

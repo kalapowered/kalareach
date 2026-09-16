@@ -9,10 +9,10 @@
 # contains, names it after the commit, and writes the digests a consumer pins and verifies against.
 #
 # The archive format belongs to pnpm: members in a fixed order under a fixed timestamp, with fixed
-# permissions and no machine identity. What is left to vary is the environment, so the script pins
-# the checkout's line endings, refuses a configured value for each pnpm setting that reaches an
-# archive's bytes, and packs each archive twice to catch anything that varies within one run. The
-# Node and pnpm versions are the release's own, pinned where the release runs.
+# permissions and no machine identity. What is left to vary is the environment, so the script takes
+# the committed bytes with no conversion, refuses a configured value for each of the pnpm settings
+# listed below, and packs each archive twice to catch anything that varies within one run. The Node
+# and pnpm versions are the release's own, pinned where the release runs.
 #
 #   bash scripts/release-packages.sh                                  # writes dist/packages
 #   bash scripts/release-packages.sh --output /tmp/kalareach-packages
@@ -214,36 +214,32 @@ verify_archive() {
 
     // The declarations a consumer resolves through have to survive packing. pnpm rewrites the
     // manifest it puts in the archive, dropping the lifecycle scripts among other things, so these
-    // are compared field by field and not as whole documents.
-    const canonical = (value) =>
-      value === null || typeof value !== "object"
-        ? JSON.stringify(value === undefined ? null : value)
-        : Array.isArray(value)
-          ? `[${value.map(canonical).join(",")}]`
-          : `{${Object.keys(value)
-              .sort()
-              .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
-              .join(",")}}`
+    // are compared field by field and not as whole documents. The comparison keeps the order of an
+    // exports map: the conditions in it are tried in the order they appear, so two maps with the
+    // same entries in another order resolve differently.
+    const written = (value) => JSON.stringify(value === undefined ? null : value)
 
     for (const field of ["main", "types", "exports"]) {
-      if (canonical(declared[field]) !== canonical(packed[field])) {
+      if (written(declared[field]) !== written(packed[field])) {
         problems.push(
-          `${label} declares ${field} ${canonical(packed[field])}, ` +
-            `not ${canonical(declared[field])}`
+          `${label} declares ${field} ${written(packed[field])}, not ${written(declared[field])}`
         )
       }
     }
 
-    // Each published path has to hold a file. A directory on its own says nothing: an empty `types`
-    // directory and a `types` directory with the declarations in it both exist.
+    // Each published path is met the way the checkout holds it. A file has to be that file, so a
+    // directory of that name is not a `provenance.json`; a directory has to hold something, so an
+    // empty `types` is not the declarations. Every entry in `carried` is a regular file.
     for (const published of Array.isArray(declared.files) ? declared.files : []) {
       const path = bare(published).replace(/\/+$/, "")
       const holds = path.includes("*")
         ? carried.some((entry) => matches(path, entry))
-        : carried.some((entry) => entry === path || entry.startsWith(`${path}/`))
+        : statSync(`${source}/${path}`, { throwIfNoEntry: false })?.isDirectory()
+          ? carried.some((entry) => entry.startsWith(`${path}/`))
+          : carried.includes(path)
 
       if (!holds) {
-        problems.push(`${label} carries no file under ${published}, which the package publishes`)
+        problems.push(`${label} carries no ${published}, which the package publishes`)
       }
     }
 
@@ -370,12 +366,14 @@ echo
 # Packing happens in a checkout of nothing but this commit. A working tree also holds files Git
 # ignores, and pnpm packs what is inside a published directory whether Git ignores it or not, so a
 # stray file here would otherwise travel inside a release. The checkout takes the committed bytes
-# exactly: pnpm packs the bytes it finds, and line-ending conversion is a machine's setting.
+# exactly: pnpm packs the bytes it finds, and line-ending conversion is configured per machine, both
+# as a setting and through attribute files outside the commit.
 echo "checking out $short to pack from"
 git clone --quiet --shared --no-checkout "$root" "$checkout"
 git -C "$checkout" config core.autocrlf false
 git -C "$checkout" config core.eol lf
-git -C "$checkout" checkout --quiet --detach "$commit"
+git -C "$checkout" config core.attributesFile /dev/null
+GIT_ATTR_NOSYSTEM=1 git -C "$checkout" checkout --quiet --detach "$commit"
 pnpm -C "$checkout" install --frozen-lockfile
 echo
 
