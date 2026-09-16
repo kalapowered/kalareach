@@ -174,17 +174,82 @@ fn owner_key(text: &str) -> Result<AuthorisationKey> {
     Ok(AuthorisationKey::from_bytes(bytes))
 }
 
+/// What a daemon owns while it is on the network.
+///
+/// The accept loop holds the handler, so anything the handler owned would be kept alive by the
+/// loop itself and nothing would ever stop either. This is the other side of that: the listener
+/// and the host's own tasks live here, outside the handler, and go when the last holder of this
+/// goes. The host is reachable through it, because a revocation needs the host and the daemon
+/// reaches it through this.
+#[derive(Debug)]
+pub struct NetworkGuard {
+    host: Arc<NetworkHost>,
+    /// The listener serving this host, once it is accepting.
+    ///
+    /// The guard is recorded on the daemon before the listener exists, because a revocation has to
+    /// be able to reach a connection from the moment one can be admitted. Dropping a listener
+    /// stops it accepting; a shutdown also closes its endpoint, which is the orderly end.
+    listener: std::sync::Mutex<Option<kr_transport::listener::NetworkListener>>,
+    /// The tasks this host runs for itself, rather than for one connection.
+    tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+impl NetworkGuard {
+    /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
+    fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+        self.listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|listener| listener.endpoint().bound_sockets())
+            .unwrap_or_default()
+    }
+
+    /// Stops accepting connections, ends this host's own tasks and closes the endpoint.
+    async fn shutdown(&self) {
+        self.stop_tasks();
+        let listener = self
+            .listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(listener) = listener {
+            listener.shutdown().await;
+        }
+    }
+
+    fn stop_tasks(&self) {
+        for task in self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for NetworkGuard {
+    fn drop(&mut self) {
+        // Whichever way this goes: a shutdown that awaited the endpoint, a registration that
+        // failed after the tasks had started, or a daemon that was simply dropped. Nothing here
+        // can await, and dropping the listener is what stops it accepting.
+        self.stop_tasks();
+    }
+}
+
 /// A daemon that is on the network.
 #[derive(Debug)]
 pub struct Network {
-    host: Arc<NetworkHost>,
+    guard: Arc<NetworkGuard>,
 }
 
 impl Network {
     /// Returns this host's endpoint identity, which is what a pairing invitation pins.
     #[must_use]
     pub fn endpoint_id(&self) -> EndpointKey {
-        self.host.endpoint_id
+        self.guard.host.endpoint_id
     }
 
     /// Returns the configuration a pairing invitation carries, with this endpoint's current hints.
@@ -197,12 +262,13 @@ impl Network {
     /// Returns an error when a selected service cannot be expressed as a network hint.
     pub fn network_config(&self) -> Result<NetworkConfig> {
         let mut config = self
+            .guard
             .host
             .endpoint
             .to_network_config()
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         config.direct_addresses = self
-            .host
+            .guard
             .bound_sockets()
             .into_iter()
             .filter_map(|socket| kr_protocol::pairing::NetworkHint::new(socket.to_string()).ok())
@@ -214,19 +280,19 @@ impl Network {
     /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
     #[must_use]
     pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
-        self.host.bound_sockets()
+        self.guard.bound_sockets()
     }
 
     /// Returns the host's pairing state machine, for the owner operations it serves.
     #[must_use]
     pub fn pairing(&self) -> Option<&Arc<PairingHost>> {
-        self.host.pairing.as_ref()
+        self.guard.host.pairing.as_ref()
     }
 
     /// Returns the device directory this host authorises connections against.
     #[must_use]
     pub fn devices(&self) -> &Arc<DeviceDirectory> {
-        &self.host.devices
+        &self.guard.host.devices
     }
 
     /// Revokes one device, and reports which workers have not yet acknowledged it.
@@ -245,12 +311,12 @@ impl Network {
     ///
     /// Returns an error when the record or the revision cannot be written.
     pub async fn revoke_device(&self, device_id: DeviceId) -> Result<RevocationStatus> {
-        self.host.revoke_device(device_id).await
+        self.guard.host.revoke_device(device_id).await
     }
 
     /// Stops accepting connections and closes the endpoint.
     pub async fn shutdown(self) {
-        self.host.shutdown().await;
+        self.guard.shutdown().await;
     }
 }
 
@@ -290,15 +356,8 @@ pub struct NetworkHost {
     live: std::sync::Mutex<std::collections::BTreeMap<ConnectionId, Arc<RemoteConnection>>>,
     /// This host's endpoint identity, which is what a pairing invitation pins.
     endpoint_id: EndpointKey,
-    /// The listener serving this host, once it is accepting.
-    ///
-    /// The host is recorded on the daemon before the listener exists, because a revocation has to
-    /// be able to reach a connection from the moment one can be admitted. The listener is put here
-    /// afterwards so the daemon owns it for as long as it owns the host, and taken out again by a
-    /// shutdown, which consumes it.
-    listener: std::sync::Mutex<Option<kr_transport::listener::NetworkListener>>,
-    /// The task that keeps this host's record of the wall clock moving.
-    clock_mark: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    /// Expiry records this host owes its directory, and has not yet written.
+    pending_expiry: Arc<devices::PendingExpiry>,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -468,18 +527,17 @@ impl NetworkHost {
             // already found unreliable, and be answered plausibly.
             self.devices.note_clock_untrusted(observed.now)?;
         }
+        // Recorded distrust stands until something authenticates the clock again. Reaching a
+        // moment this host had already written down is not that evidence: it proves neither what
+        // the time is now nor how much of it passed while the host was not running. What clears it
+        // is an owner present at the machine committing a pairing, which is an authenticated
+        // action on this host rather than a reading of the same untrusted clock.
         if self.devices.clock_untrusted()? {
-            if observed.behind_ms > 0 {
-                return Err(ControllerError::ClockUntrusted {
-                    detail: format!(
-                        "this host's wall clock is {} ms behind a moment it has already recorded, so it cannot say whether this device's grant has run out",
-                        observed.behind_ms
-                    ),
-                });
-            }
-            // The clock has caught up with everything this host recorded, which is the evidence
-            // that was missing. Nothing else clears it.
-            self.devices.trust_clock()?;
+            return Err(ControllerError::ClockUntrusted {
+                detail: "this host's clock went backwards and has not been established again, so \
+                         it cannot say whether this device's grant has run out"
+                    .to_owned(),
+            });
         }
         let remaining = expires_at_ms.get().saturating_sub(observed.now.get());
         if remaining > 0 {
@@ -526,6 +584,7 @@ impl NetworkHost {
         let remote = Arc::new(RemoteConnection::new(
             Arc::clone(&controller),
             Arc::clone(&self.devices),
+            Arc::clone(&self.pending_expiry),
             device,
             &session,
             notifications,
@@ -606,39 +665,6 @@ impl NetworkHost {
         controller.announce_authority_revision().await
     }
 
-    /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
-    fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
-        self.listener
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|listener| listener.endpoint().bound_sockets())
-            .unwrap_or_default()
-    }
-
-    /// Stops accepting connections and closes the endpoint.
-    async fn shutdown(&self) {
-        let (listener, clock_mark) = {
-            let listener = self
-                .listener
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let clock_mark = self
-                .clock_mark
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            (listener, clock_mark)
-        };
-        if let Some(clock_mark) = clock_mark {
-            clock_mark.abort();
-        }
-        if let Some(listener) = listener {
-            listener.shutdown().await;
-        }
-    }
-
     /// Fences every live connection whose registration has gone.
     ///
     /// A registration is what a remote connection writes under, and a revocation that withdraws
@@ -705,13 +731,31 @@ impl NetworkHost {
 /// backwards without this host noticing.
 pub const CLOCK_MARK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Keeps this host's record of the wall clock moving for as long as it is on the network.
-async fn mark_the_clock(devices: Arc<DeviceDirectory>) {
+/// Keeps this host's records of the wall clock and of expiry moving while it is on the network.
+///
+/// Two things it owns rather than a connection: the mark that says time has passed, and the
+/// tombstones a connection observed but could not write. Both have to outlive the connection that
+/// noticed them, and neither can wait for the next device to arrive.
+async fn keep_the_record(devices: Arc<DeviceDirectory>, pending: Arc<devices::PendingExpiry>) {
     loop {
         tokio::time::sleep(CLOCK_MARK_INTERVAL).await;
-        if let Err(error) = devices.utc_at_least(kr_ipc::now_ms()) {
-            eprintln!("kr-controller: could not record the moment this host is at: {error}");
+        match devices.utc_at_least(kr_ipc::now_ms()) {
+            // A clock stepped backwards is the same fact whoever sees it. This task sees it
+            // between connections, which is exactly when nothing else would.
+            Ok(observed) if observed.behind_ms > CLOCK_TOLERANCE_MS => {
+                if let Err(error) = devices.note_clock_untrusted(observed.now) {
+                    eprintln!(
+                        "kr-controller: could not record that this host's clock went backwards: \
+                         {error}"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("kr-controller: could not record the moment this host is at: {error}");
+            }
         }
+        pending.settle(&devices);
     }
 }
 
@@ -866,25 +910,30 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         grant_deadlines: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         live: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         endpoint_id,
-        listener: std::sync::Mutex::new(None),
-        clock_mark: std::sync::Mutex::new(None),
+        pending_expiry: Arc::new(devices::PendingExpiry::default()),
     });
     // The record of the wall clock moves while this host runs, whether or not anything asks it a
     // question. A mark that only advanced when a device connected would stand still through a
     // quiet night, and a clock stepped back to where it stood then would look perfectly ordinary:
     // a grant that ran out while nothing was watching would come back. This is what makes the
     // mark evidence of time having passed rather than of connections having arrived.
-    let marking = tokio::spawn(mark_the_clock(Arc::clone(&host.devices)));
-    *host
-        .clock_mark
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(marking.abort_handle());
+    let marking = tokio::spawn(keep_the_record(
+        Arc::clone(&host.devices),
+        Arc::clone(&host.pending_expiry),
+    ));
+    // The guard owns that task from here, so every way out of this function ends it: a duplicate
+    // registration, an endpoint that will not bind, or a daemon that is dropped.
+    let guard = Arc::new(NetworkGuard {
+        host: Arc::clone(&host),
+        listener: std::sync::Mutex::new(None),
+        tasks: std::sync::Mutex::new(vec![marking.abort_handle()]),
+    });
     // Before the listener serves anything. The daemon reaches these connections through this
     // handle when it withdraws their registrations, and a connection admitted before the handle
     // was there would be one a revocation could not fence. A daemon is a singleton, so it is set
     // once and never replaced: a second listener on one environment's identity is a mistake, not a
     // configuration.
-    if controller.network.set(Arc::clone(&host)).is_err() {
+    if controller.network.set(Arc::clone(&guard)).is_err() {
         return Err(ControllerError::NotConfigured(
             "this daemon is already on the network".to_owned(),
         ));
@@ -908,11 +957,11 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     )
     .await
     .map_err(|error| ControllerError::NotConfigured(error.to_string()))?;
-    *host
+    *guard
         .listener
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(listener);
-    Ok(Network { host })
+    Ok(Network { guard })
 }
 
 /// Loads this host's network device keys, creating them on a genuine first start.
@@ -976,8 +1025,8 @@ impl Controller {
     /// Called where registrations are withdrawn without the devices holding them being named.
     /// A host with no network has none to fence.
     pub(crate) async fn fence_network_connections(&self) {
-        if let Some(host) = self.network.get() {
-            host.fence_withdrawn().await;
+        if let Some(guard) = self.network.get() {
+            guard.host.fence_withdrawn().await;
         }
     }
 
@@ -1220,9 +1269,9 @@ impl Controller {
         self.registry.lock().await.authority_revision()
     }
 
-    /// Returns the host serving this daemon's network, when its environment selected one.
+    /// Returns what this daemon owns of its network, when its environment selected one.
     #[must_use]
-    pub fn network_host(&self) -> Option<&Arc<NetworkHost>> {
+    pub fn network_guard(&self) -> Option<&Arc<NetworkGuard>> {
         self.network.get()
     }
 }

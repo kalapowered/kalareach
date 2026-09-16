@@ -384,6 +384,16 @@ impl NetworkListener {
     }
 }
 
+impl Drop for NetworkListener {
+    fn drop(&mut self) {
+        // A listener nobody holds accepts nothing. The accept loop owns a handle on the host, so a
+        // detached loop would keep that host, its database and its connections alive for as long
+        // as the process ran; a shutdown that can await the endpoint's close is the orderly end,
+        // and this is the one that happens either way.
+        self.accept_loop.abort();
+    }
+}
+
 /// Puts a host on the network.
 ///
 /// # Errors

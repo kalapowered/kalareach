@@ -131,7 +131,7 @@ pub struct Controller {
     /// the connections holding those registrations have to lose their write boundary with it. It is
     /// recorded before the listener serves anything, so no connection can be admitted before the
     /// revocation path can reach it.
-    network: std::sync::OnceLock<Arc<net::NetworkHost>>,
+    network: std::sync::OnceLock<Arc<net::NetworkGuard>>,
     supervisor: Box<dyn WorkerSupervisor>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,

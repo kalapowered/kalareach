@@ -199,6 +199,13 @@ impl InvitationStore for SharedInvitations {
                     .map_err(|error| kr_pairing::PairingError::Store {
                         reason: error.to_string(),
                     })?;
+                // An owner is at this machine and has just confirmed a pairing on it. That is the
+                // authenticated action this host's clock needs to be trusted again after it was
+                // found to have gone backwards: nothing a clock says about itself can establish
+                // it, and until something does, no grant's expiry can be decided from the wall
+                // clock. A failure to clear it leaves the host refusing those decisions, which is
+                // the safe side of it.
+                let _ = self.devices.trust_clock();
                 self.state
                     .commitments
                     .lock()

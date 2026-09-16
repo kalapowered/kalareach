@@ -132,6 +132,8 @@ struct Authorisation {
     controller: Arc<Controller>,
     /// Where an observed expiry is written, so the decision outlives this connection.
     devices: Arc<super::devices::DeviceDirectory>,
+    /// What this host owes its directory, for an expiry whose write did not succeed here.
+    pending: Arc<super::devices::PendingExpiry>,
     device_id: DeviceId,
     connection_id: ConnectionId,
     /// When this connection's grant runs out, on the continuous clock.
@@ -176,46 +178,25 @@ impl Authorisation {
         false
     }
 
-    /// Writes down an expiry this connection has observed, once.
+    /// Hands an expiry this connection has observed to the host, and tries to write it.
     ///
     /// The record is what makes the decision outlive this connection: the grant's expiry is a UTC
-    /// moment, and the next connection would read it against a wall clock that can be stepped
-    /// backwards. Section 9 does not let withdrawn authority come back, so the first observation
-    /// of an expiry is written down, against a UTC moment that never goes earlier than the latest
-    /// this host has recorded.
+    /// moment, and a later boot would read it against a wall clock that can be stepped backwards.
+    /// Section 9 does not let withdrawn authority come back, so every observation is handed over,
+    /// whichever check made it, against a UTC moment that never goes earlier than the latest this
+    /// host has recorded. What the host holds it does not lose: a write that fails here is retried
+    /// by the host's own task, which outlives this connection.
     fn note_expiry(&self) {
-        if !self.expired.load(Ordering::Acquire) || self.recorded.load(Ordering::Acquire) {
-            return;
+        self.expired.store(true, Ordering::Release);
+        if !self.recorded.swap(true, Ordering::AcqRel) {
+            let now = self
+                .devices
+                .utc_at_least(kr_ipc::now_ms())
+                .map_or_else(|_| kr_ipc::now_ms(), |observed| observed.now);
+            self.pending.owe(self.device_id, now);
         }
-        // Marked as recorded only once it is recorded. A write that failed leaves the next caller
-        // to try again, because the flag is what stops this being written twice and a flag set
-        // over a failed write would stop it being written at all.
-        if self.record_expiry() {
-            self.recorded.store(true, Ordering::Release);
-        }
-    }
-
-    /// Writes down that this device's grant has run out.
-    ///
-    /// A failure to write it cannot make this connection current again: it is fenced either way,
-    /// and the boot-bound deadline this host holds is what the next connection reads. What is lost
-    /// is only the tombstone a later boot would have read, so the failure is reported rather than
-    /// dropped.
-    fn record_expiry(&self) -> bool {
-        let now = self
-            .devices
-            .utc_at_least(kr_ipc::now_ms())
-            .map_or_else(|_| kr_ipc::now_ms(), |observed| observed.now);
-        match self.devices.record_expiry(self.device_id, now) {
-            Ok(()) => true,
-            Err(error) => {
-                eprintln!(
-                    "kr-controller: could not record that device {} has run out of grant: {error}",
-                    self.device_id
-                );
-                false
-            }
-        }
+        // Written here when it can be, so the ordinary case costs nothing but this call.
+        self.pending.settle(&self.devices);
     }
 }
 
@@ -400,6 +381,7 @@ impl RemoteConnection {
     pub fn new(
         controller: Arc<Controller>,
         devices: Arc<super::devices::DeviceDirectory>,
+        pending: Arc<super::devices::PendingExpiry>,
         device: DeviceRecord,
         session: &AuthorisedSession,
         notifications: tokio::sync::mpsc::Sender<Relayed>,
@@ -410,6 +392,7 @@ impl RemoteConnection {
             controller: Arc::clone(&controller),
             device_id: device.device_id,
             devices: Arc::clone(&devices),
+            pending,
             connection_id: session.connection_id,
             expired: AtomicBool::new(false),
             recorded: AtomicBool::new(false),

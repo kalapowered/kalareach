@@ -30,6 +30,65 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::error::{ControllerError, Result};
 
+/// Expiry records this host owes its own directory.
+///
+/// A grant's expiry is written down where it is observed, and a write can fail: a full disk, a
+/// database another process is holding. The connection that observed it then ends, and the record
+/// is still owed, so it is kept here and written by the host's own task. Section 9 does not let
+/// withdrawn authority come back, and a tombstone that was never written is how it would.
+#[derive(Debug, Default)]
+pub struct PendingExpiry {
+    owed: std::sync::Mutex<std::collections::BTreeMap<DeviceId, TimestampMs>>,
+}
+
+impl PendingExpiry {
+    /// Records that one device's grant was found to have run out.
+    ///
+    /// The first moment observed for a device stays: a later observation of the same expiry is the
+    /// same fact, and the earliest reading is the one closest to when it actually happened.
+    pub fn owe(&self, device_id: DeviceId, now_ms: TimestampMs) {
+        self.owed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(device_id)
+            .or_insert(now_ms);
+    }
+
+    /// Writes down what is owed, and keeps whatever could not be written.
+    pub fn settle(&self, devices: &DeviceDirectory) {
+        let owed: Vec<(DeviceId, TimestampMs)> = self
+            .owed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(device, at)| (*device, *at))
+            .collect();
+        for (device_id, at) in owed {
+            match devices.record_expiry(device_id, at) {
+                Ok(()) => {
+                    self.owed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&device_id);
+                }
+                Err(error) => eprintln!(
+                    "kr-controller: could not record that device {device_id} has run out of \
+                     grant: {error}"
+                ),
+            }
+        }
+    }
+
+    /// Returns how many records are still owed. A test reads it; nothing else needs it.
+    #[must_use]
+    pub fn owed(&self) -> usize {
+        self.owed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
 /// What this host makes of the wall clock, against the latest moment it has recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObservedUtc {
