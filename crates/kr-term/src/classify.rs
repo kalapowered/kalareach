@@ -66,7 +66,9 @@ impl CsiView {
             intermediates.insert(0, *byte);
             rest = &rest[..rest.len() - 1];
         }
-        let mut numbers = Vec::new();
+        // A slot is at most one item of what is left, so the room is known before the walk and the
+        // list never grows while it is being built.
+        let mut numbers = Vec::with_capacity(rest.len());
         let mut slot: Option<i64> = None;
         let mut slot_open = false;
         let mut sub_parameters = false;
