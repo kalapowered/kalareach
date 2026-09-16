@@ -466,24 +466,19 @@ impl RemoteConnection {
                 });
                 settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
             }
+            // A close is dispatched to the worker, so it goes over a bounded link of its own
+            // rather than over the connection this host announces authority revisions on: a worker
+            // that stopped answering a close would otherwise hold that connection. Opening the
+            // link is also what asks the worker for the acknowledgement a dispatch lease needs,
+            // which a device closing a session it never attached to has not caused yet.
             Method::SessionClose => {
-                // A close is dispatched to the worker, so it needs a lease, and a lease is renewed
-                // only after the worker has acknowledged the revision in force. A device closing a
-                // session it never attached to has opened no link, so nothing has asked this
-                // worker for that acknowledgement yet.
-                if let Some(session_id) = mutation.target.session_id.as_ref().copied() {
-                    let _ = self
-                        .controller
-                        .acknowledge_worker_revision(session_id)
-                        .await;
-                }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
                 let envelope = self.envelope(validated);
                 let request_id = mutation.request_id;
                 let effect = tokio::spawn(async move {
                     controller
-                        .session_close(&mutation, &envelope, accepted)
+                        .close_remote_session(&mutation, &envelope, accepted)
                         .await
                 });
                 settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)

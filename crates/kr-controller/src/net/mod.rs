@@ -749,6 +749,83 @@ impl Controller {
         Ok(proxy)
     }
 
+    /// Closes one session over a link opened for the close, and settles what it answered.
+    ///
+    /// A remote close takes the journey every other remote mutation takes: a bounded link of its
+    /// own, opened with a timeout and closed after the exchange, rather than the shared connection
+    /// this host announces authority revisions on. A worker that stopped answering a close would
+    /// otherwise hold that connection for as long as it liked, and the close is dispatched from a
+    /// task that outlives the connection that asked for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is unknown, when the link cannot be opened, when the
+    /// exchange does not complete inside the proxy's bound, or when the worker refuses the close.
+    pub(crate) async fn close_remote_session(
+        self: &Arc<Self>,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        accepted: AcceptedDeadline,
+    ) -> Result<kr_protocol::envelope::ParamsValue> {
+        let params: kr_protocol::session::SessionCloseParams =
+            crate::service::parse(&mutation.params)?;
+        let session_id = params.session_id;
+        if self.directory.lock().await.get(session_id).is_none() {
+            // Nothing is running under that identity. Either it has already closed, and the record
+            // is the answer, or it never existed here.
+            let closure = self.registry.lock().await.closure(session_id)?;
+            return match closure {
+                Some(closure) => {
+                    crate::service::encode(&kr_protocol::session::SessionCloseResult {
+                        session_id,
+                        state: kr_protocol::session::SessionState::Closed,
+                        durability: closure.durability,
+                        closure: kr_protocol::scalars::Nullable::some(closure),
+                    })
+                }
+                None => Err(ControllerError::UnknownSession {
+                    session: session_id.to_string(),
+                }),
+            };
+        }
+        let deadline = self.forwarded_deadline(session_id, actor, accepted).await?;
+        // The link is this close's own, and it is released whichever way the exchange ends.
+        let (notifications, _unread) = tokio::sync::mpsc::channel(1);
+        let proxy = self
+            .open_proxy(
+                session_id,
+                notifications,
+                Arc::new(RelayBudget::new(0)),
+                Arc::new(tokio::sync::Notify::new()),
+            )
+            .await?;
+        let answered = proxy.forward_mutation(mutation, actor, deadline).await;
+        proxy.close();
+        let response = answered?;
+        let value = match response.outcome {
+            kr_protocol::envelope::Outcome::Ok(value) => value,
+            kr_protocol::envelope::Outcome::Error(error) => {
+                return Err(ControllerError::InvalidArgument(error.to_string()));
+            }
+        };
+        let reply: kr_protocol::session::SessionCloseResult = value
+            .to_typed()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        match reply.closure.as_ref() {
+            Some(record) => self.retire(record).await?,
+            // The worker has accepted the close and is stopping its processes. Something has to
+            // notice when that finishes, so the tombstone is written and the descriptor removed
+            // rather than left pointing at a process that has gone.
+            None => {
+                tokio::spawn(Arc::clone(self).watch_closure(
+                    session_id,
+                    kr_protocol::session::ClosureReason::CloseRequested,
+                ));
+            }
+        }
+        crate::service::encode(&reply)
+    }
+
     /// Asks one worker to install this environment's authority revision.
     ///
     /// A revocation is complete for a worker once that worker has acknowledged the revision that
