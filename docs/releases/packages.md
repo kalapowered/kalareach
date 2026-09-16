@@ -33,8 +33,8 @@ A release is one commit's output. Tag that commit and push the tag:
 
 ```bash
 commit=$(git rev-parse HEAD)
-git tag "packages/v0.1.0+${commit:0:12}" "$commit"
-git push origin "packages/v0.1.0+${commit:0:12}"
+git tag "packages/v0.2.0+${commit:0:12}" "$commit"
+git push origin "packages/v0.2.0+${commit:0:12}"
 ```
 
 `.github/workflows/package-release.yml` runs on a tag matching `packages/v*`, packs the archives
@@ -86,7 +86,7 @@ Ask for that URL in the dependent package's `package.json`:
 ```json
 {
   "dependencies": {
-    "@kalareach/protocol": "https://github.com/kalapowered/kalareach/releases/download/packages/v0.1.0+0123456789ab/kalareach-protocol-0.1.0+0123456789ab.tgz"
+    "@kalareach/protocol": "https://github.com/kalapowered/kalareach/releases/download/packages/v0.2.0+0123456789ab/kalareach-protocol-0.2.0+0123456789ab.tgz"
   }
 }
 ```

@@ -16,7 +16,7 @@
 #
 #   bash scripts/release-packages.sh                                  # writes dist/packages
 #   bash scripts/release-packages.sh --output /tmp/kalareach-packages
-#   bash scripts/release-packages.sh --tag packages/v0.1.0+0123456789ab
+#   bash scripts/release-packages.sh --tag packages/v0.2.0+0123456789ab
 #
 # `--tag` is what the release workflow passes. The tag has to name this commit and this version, so
 # a tag pushed at the wrong revision fails here rather than publishing a mislabelled archive.
