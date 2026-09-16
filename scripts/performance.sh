@@ -18,9 +18,46 @@ if [ -n "$log" ]; then
   exec > >(tee "$log") 2>&1
 fi
 
+# What the machine is, and what else it is doing. A resource figure is about a machine under
+# conditions, so a run that does not record them cannot be compared with the next one, and a
+# processor average taken while the machine was busy with something else is not the same
+# measurement as one taken while it was quiet.
+processors() {
+  sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo unknown
+}
+
+processor_name() {
+  sysctl -n machdep.cpu.brand_string 2>/dev/null ||
+    sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -1 ||
+    echo unknown
+}
+
+power_mode() {
+  local mode="" supply=""
+  if command -v pmset > /dev/null 2>&1; then
+    mode="$(pmset -g 2>/dev/null | awk '/^[[:space:]]*powermode/ { print $2; exit }')" || true
+    supply="$(pmset -g batt 2>/dev/null | sed -n "s/Now drawing from '\(.*\)'/\1/p")" || true
+    printf 'powermode %s, %s' "${mode:-unknown}" "${supply:-unknown}"
+  elif [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+    printf 'governor %s' "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+  else
+    printf 'unknown'
+  fi
+}
+
+load_average() {
+  if [ -r /proc/loadavg ]; then
+    cut -d' ' -f1-3 /proc/loadavg
+  else
+    sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{ print $1, $2, $3 }' || echo unknown
+  fi
+}
+
 echo "kalareach performance measurements"
 echo "  commit: $(git rev-parse HEAD)"
 echo "  host: $(uname -sr) $(uname -m)"
+echo "  processors: $(processors) logical, $(processor_name)"
+echo "  power: $(power_mode)"
 echo "  taken at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo
 # Nothing this script started may outlive it. A worker is deliberately not a child of whatever
@@ -71,15 +108,20 @@ measurement() {
   local name="$1"
   echo
   echo "running $name"
+  # The load at each edge of the measurement, so a figure can be read against what else the machine
+  # was doing while it was taken.
+  echo "  load average entering this measurement: $(load_average)"
   local output
   # The measurement prints its own conditions. `--nocapture` is what lets them reach this log.
   if ! output="$(CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test --release -p kr-worker \
     --test performance -- --ignored --exact --nocapture "$name" 2>&1)"; then
     echo "$output"
+    echo "  load average leaving this measurement: $(load_average)"
     echo "FAILED: $name did not meet its bound"
     return 1
   fi
   echo "$output"
+  echo "  load average leaving this measurement: $(load_average)"
   if ! grep -q "measurement" <<<"$output"; then
     echo "FAILED: $name produced no measurement"
     return 1

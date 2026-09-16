@@ -361,23 +361,54 @@ fn resident_kib(pid: u32) -> Result<u64, String> {
 }
 
 /// Returns the processor time a process has used, in seconds.
+///
+/// A reading this host could not take is not zero here either. A process the kernel will not name,
+/// or a column it does not print the way this reads it, would otherwise be counted as having used
+/// nothing, which is the one direction a resource measurement must never be wrong in.
 fn processor_seconds(pid: u32) -> Result<f64, String> {
     let output = std::process::Command::new("ps")
         .args(["-o", "time=", "-p", &pid.to_string()])
         .output()
         .map_err(|error| format!("read the process table: {error}"))?;
-    // `ps` prints elapsed processor time as `[[dd-]hh:]mm:ss`.
+    // `ps` prints processor time as `[[dd-]hh:]mm:ss`, with a fraction of a second where the
+    // platform's own column carries one.
     let text = String::from_utf8_lossy(&output.stdout);
     let text = text.trim();
     if text.is_empty() {
-        return Ok(0.0);
+        return Err(format!("the kernel reports process {pid}'s processor time"));
+    }
+    // A day field is scaled differently from the fields below it, and nothing this measurement
+    // starts is a day old, so it is refused rather than read as another sixty of something.
+    if text.contains('-') {
+        return Err(format!(
+            "process {pid} reports a processor time of `{text}`, which this reading does not cover"
+        ));
     }
     let mut seconds = 0.0;
     for part in text.split(':') {
-        let part: f64 = part.trim().parse().unwrap_or(0.0);
+        let part: f64 = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("process {pid} reports a processor time of `{text}`"))?;
         seconds = seconds * 60.0 + part;
     }
     Ok(seconds)
+}
+
+/// Takes one reading for every process, keeping which process it came from.
+///
+/// The totals are what the bounds are about, and a total that missed a bound says nothing about
+/// where the cost is. This keeps the readings apart so the measurement can report both.
+fn each<T>(
+    pids: &[u32],
+    daemon: u32,
+    reading: impl Fn(u32) -> Result<T, String>,
+) -> Result<Vec<(u32, T)>, String> {
+    pids.iter()
+        .copied()
+        .chain(std::iter::once(daemon))
+        .map(|pid| reading(pid).map(|value| (pid, value)))
+        .collect()
 }
 
 /// Adds up one reading across every process, or says which one could not be taken.
@@ -453,6 +484,9 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     // it. The worker is where the canonical grid and the retained output live, so a measurement
     // that counted only the shell would leave out the thing it is meant to be measuring.
     let mut measured: Vec<u32> = Vec::new();
+    // Which of them is which, so a figure that misses its bound says whether the cost is in the
+    // hosts or in the shells they are holding.
+    let mut shells: Vec<u32> = Vec::new();
     for created in &owned.sessions {
         // A session with no root process, or a worker the kernel will not name, is a measurement
         // this host cannot take. Quietly leaving it out would make the answer smaller than the
@@ -464,6 +498,7 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
             .ok_or_else(|| "every live session names its root process".to_owned())?;
         let shell = u32::try_from(root.pid.get()).map_err(|_| "a process identifier".to_owned())?;
         measured.push(shell);
+        shells.push(shell);
         measured.push(
             parent_of(shell)
                 .ok_or_else(|| "the kernel names each root shell's worker".to_owned())?,
@@ -476,11 +511,47 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     let daemon = std::process::id();
 
     let started = Instant::now();
-    let before = total(&workers, daemon, processor_seconds)?;
+    let before = each(&workers, daemon, processor_seconds)?;
     tokio::time::sleep(IDLE_WINDOW).await;
-    let after = total(&workers, daemon, processor_seconds)?;
+    let after = each(&workers, daemon, processor_seconds)?;
     let elapsed = started.elapsed().as_secs_f64();
-    let cores = (after - before) / elapsed;
+    // Per process, because a total that missed its bound does not say what spent the time. A
+    // reading that went backwards is an identifier that is no longer the process it was, and a
+    // pair of readings that do not line up is not a difference: both are refused rather than
+    // subtracted into a smaller answer.
+    let mut spent: Vec<(u32, f64)> = Vec::with_capacity(after.len());
+    for (&(pid, after), &(same, before)) in after.iter().zip(before.iter()) {
+        if pid != same {
+            return Err("both readings cover the same processes in the same order".to_owned());
+        }
+        if after < before {
+            return Err(format!("process {pid}'s processor time went backwards"));
+        }
+        spent.push((pid, after - before));
+    }
+    let used: f64 = spent.iter().map(|&(_, seconds)| seconds).sum();
+    let cores = used / elapsed;
+    let kind = |pid: u32| {
+        if pid == daemon {
+            "the daemon"
+        } else if shells.contains(&pid) {
+            "a root shell"
+        } else {
+            "a session host"
+        }
+    };
+    let by_kind = |wanted: &str| -> (usize, f64) {
+        let mine = spent.iter().filter(|&&(pid, _)| kind(pid) == wanted);
+        (
+            mine.clone().count(),
+            mine.map(|&(_, seconds)| seconds).sum(),
+        )
+    };
+    let (daemons, in_daemon) = by_kind("the daemon");
+    let (hosts, in_hosts) = by_kind("a session host");
+    let (roots, in_roots) = by_kind("a root shell");
+    let mut largest: Vec<(u32, f64)> = spent.clone();
+    largest.sort_by(|left, right| right.1.total_cmp(&left.1));
     let resident = total(&workers, daemon, resident_kib)?;
 
     println!("KR-PERF-003 measurement");
@@ -493,6 +564,21 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
         grid.rows.get()
     );
     println!("  processor: {cores:.5} of one core averaged over {elapsed:.0} seconds");
+    println!(
+        "  processor time: {used:.3} s in all over {elapsed:.1} s: {in_hosts:.3} s across {hosts} \
+         session hosts, {in_roots:.3} s across {roots} root shells, and {in_daemon:.3} s in \
+         {daemons} daemon, which is this measurement's own process and also holds the \
+         {ATTACHED_VIEWS} views' client ends"
+    );
+    println!(
+        "  the processes that spent the most: {}",
+        largest
+            .iter()
+            .take(5)
+            .map(|&(pid, seconds)| format!("{} {pid} {seconds:.3} s", kind(pid)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!(
         "  resident: {resident} KiB across {} processes (each session's worker and its root shell) \
          and the daemon",
