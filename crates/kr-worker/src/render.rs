@@ -65,6 +65,8 @@ pub struct Carried {
     pub soft_wraps: usize,
     /// The keyboard negotiation of the buffer that is not showing.
     pub other_keyboard: bool,
+    /// Keyboard-stack entries the session holds, which this restoration does not install.
+    pub keyboard_stack: usize,
     /// A pending wrap this restoration could not reproduce.
     pub pending_wrap: bool,
 }
@@ -79,6 +81,7 @@ impl Carried {
             && self.clipped_rows == 0
             && self.soft_wraps == 0
             && !self.other_keyboard
+            && self.keyboard_stack == 0
             && !self.pending_wrap
     }
 
@@ -100,6 +103,7 @@ impl Carried {
             && self.title_stack == 0
             && self.soft_wraps == 0
             && !self.other_keyboard
+            && self.keyboard_stack == 0
             && !self.pending_wrap
     }
 }
@@ -360,10 +364,6 @@ impl Writer {
         body.extend_from_slice(keyboard.modify_other_keys.to_string().as_bytes());
         body.push(b'm');
         self.csi(&body);
-        // The stack belongs to the buffer that is showing. Emptying it first is what makes the
-        // result the snapshot's stack rather than the snapshot's stack on top of whatever the
-        // terminal already had.
-        self.csi(b"<65535u");
         let (kitty, other) = match self.active {
             ActiveBuffer::Primary => (&keyboard.primary, &keyboard.alternate),
             ActiveBuffer::Alternate => (&keyboard.alternate, &keyboard.primary),
@@ -373,25 +373,19 @@ impl Writer {
         if other.flags.is_some() || !other.stack.is_empty() {
             self.carried.other_keyboard = true;
         }
-        // A push saves the flags that are *current* and installs its argument, so rebuilding a
-        // stack means setting each value first and pushing the next one on top of it. Pushing the
-        // stack's own values in order would save whatever happened to be current instead, and the
-        // next pop would select an encoding the application never negotiated.
-        let mut values = kitty.stack.clone();
-        values.extend(kitty.flags);
-        let mut values = values.into_iter();
-        if let Some(first) = values.next() {
+        // What is installed is the flags in force, and nothing else. The terminal's keyboard stack
+        // is not this session's: the attachment that borrowed the terminal saved its owner's own
+        // negotiation there before any of this arrived, and emptying it or pushing onto it would
+        // take that away or bury it. A stack the session holds is therefore counted as something
+        // this restoration did not carry, which is what keeps such an attachment projected rather
+        // than handed the stream with a stack it would pop into somebody else's state.
+        if let Some(flags) = kitty.flags {
             let mut set = b"=".to_vec();
-            set.extend_from_slice(first.to_string().as_bytes());
+            set.extend_from_slice(flags.to_string().as_bytes());
             set.extend_from_slice(b";1u");
             self.csi(&set);
         }
-        for value in values {
-            let mut push = b">".to_vec();
-            push.extend_from_slice(value.to_string().as_bytes());
-            push.push(b'u');
-            self.csi(&push);
-        }
+        self.carried.keyboard_stack += kitty.stack.len();
     }
 
     fn tab_stops(&mut self, columns: &[u32]) {
@@ -1423,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn the_keyboard_stack_is_emptied_before_it_is_rebuilt() {
+    fn a_restoration_installs_the_flags_in_force_and_leaves_the_terminals_stack_alone() {
         let rendered = render(
             &[RestoreOp::SetKeyboard {
                 keyboard: KeyboardSnapshot {
@@ -1440,12 +1434,18 @@ mod tests {
             }],
             viewport(24, 80),
         );
-        // A push saves what is current, so the stack is rebuilt by setting each value and pushing
-        // the next on top of it: set 1, push 3 (saving 1), push 5 (saving 3). The result is the
-        // stack [1, 3] with 5 in force.
+        // The level and the flags in force, and nothing that touches the terminal's stack: the
+        // entry the attachment saved its owner's negotiation in sits there, and a restoration that
+        // emptied the stack or pushed onto it would take that away or bury it.
+        assert_eq!(rendered.bytes, b"\x1b[>4;2m\x1b[=5;1u".to_vec());
         assert_eq!(
-            rendered.bytes,
-            b"\x1b[>4;2m\x1b[<65535u\x1b[=1;1u\x1b[>3u\x1b[>5u".to_vec()
+            rendered.carried.keyboard_stack, 2,
+            "and the stack the session holds is counted as something this could not carry"
+        );
+        assert!(
+            !rendered.carried.continues_the_stream(),
+            "so the terminal is not handed the stream with a stack it would pop into \
+             somebody else's state"
         );
     }
 }
