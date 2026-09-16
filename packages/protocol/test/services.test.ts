@@ -19,6 +19,8 @@ import {
   BACKUP_PUBLICATION_DOMAIN,
   BACKUP_WRITER_DOMAIN,
   KEY_ID_DOMAIN,
+  MAILBOX_CLAIM_DOMAIN,
+  MAILBOX_CLAIM_LIFETIME_MS,
   MAILBOX_PAYLOAD_TYPES,
   MAX_ADAPTER_ALLOWLIST,
   MAX_MAILBOX_BYTES,
@@ -38,14 +40,19 @@ import {
   backupWriterRecordSigningInput,
   base64UrlToBytes,
   bytesToBase64Url,
+  canonicalBody,
+  canonicalBodyDigest,
   checkOrganisationPolicy,
   checkSealedEnvelope,
   checkSealedSyncObject,
   envelopeStoredBytes,
   granularityForBucket,
   keyId,
+  mailboxClaimValue,
   mailboxSizeBucket,
   organisationPolicySigningInput,
+  readSealedEnvelope,
+  readSealedSyncObject,
   revocationRequestSigningInput,
   routingMatchesPlaintext,
   storedEnvelopeKeyId,
@@ -85,6 +92,23 @@ interface Document {
   }
   readonly mailbox_limits: Record<string, unknown>
   readonly sync_limits: Record<string, unknown>
+  readonly canonical_bodies: {
+    readonly cases: ReadonlyArray<{
+      readonly id: string
+      readonly json: unknown
+      readonly cbor_hex: string
+      readonly sha256: string
+    }>
+    readonly refused: readonly string[]
+  }
+  readonly mailbox_claim: {
+    readonly domain: string
+    readonly lifetime_ms: string
+    readonly ephemeral_key: string
+    readonly recipient_key: string
+    readonly shared_secret: string
+    readonly claim_value_hex: string
+  }
 }
 
 const document = JSON.parse(
@@ -119,6 +143,124 @@ describe('key identifiers', () => {
 
   it('refuses anything that is not a 32-byte key', async () => {
     await expect(authorisationKeyId(new Uint8Array(31))).rejects.toThrow(ServicesSchemaError)
+  })
+})
+
+describe('the canonical body a signature covers', () => {
+  it('encodes each published document to the bytes the host produces', async () => {
+    for (const entry of document.canonical_bodies.cases) {
+      expect(hex(canonicalBody(entry.json)), entry.id).toBe(entry.cbor_hex)
+      expect(hex(await canonicalBodyDigest(entry.json)), entry.id).toBe(entry.sha256)
+    }
+  })
+
+  it('digests two spellings of one document to one value', async () => {
+    const one = document.canonical_bodies.cases.find((entry) => entry.id === 'mailbox_read')
+    const other = document.canonical_bodies.cases.find(
+      (entry) => entry.id === 'mailbox_read_reordered'
+    )
+    expect(one?.sha256).toBe(other?.sha256)
+    expect(hex(await canonicalBodyDigest(one?.json))).toBe(
+      hex(await canonicalBodyDigest(other?.json))
+    )
+  })
+
+  it('refuses every document the host refuses', () => {
+    for (const text of document.canonical_bodies.refused) {
+      // The text is parsed the way a gateway parses a request body, and then refused for the
+      // number it carries rather than for how it was written.
+      const body = JSON.parse(text) as unknown
+      expect(() => canonicalBody(body), text).toThrow(ServicesSchemaError)
+    }
+  })
+})
+
+describe('the value that claims a mailbox', () => {
+  it('derives the value the host derives', async () => {
+    const claim = document.mailbox_claim
+    expect(claim.domain).toBe(MAILBOX_CLAIM_DOMAIN)
+    expect(claim.lifetime_ms).toBe(String(MAILBOX_CLAIM_LIFETIME_MS))
+    expect(
+      hex(
+        await mailboxClaimValue(
+          base64UrlToBytes(claim.ephemeral_key),
+          base64UrlToBytes(claim.recipient_key),
+          base64UrlToBytes(claim.shared_secret)
+        )
+      )
+    ).toBe(claim.claim_value_hex)
+  })
+
+  it('answers one challenge and no other', async () => {
+    const claim = document.mailbox_claim
+    const ephemeral = base64UrlToBytes(claim.ephemeral_key)
+    const recipient = base64UrlToBytes(claim.recipient_key)
+    const secret = base64UrlToBytes(claim.shared_secret)
+    const elsewhere = new Uint8Array(32).fill(9)
+
+    expect(hex(await mailboxClaimValue(elsewhere, recipient, secret))).not.toBe(
+      claim.claim_value_hex
+    )
+    expect(hex(await mailboxClaimValue(ephemeral, elsewhere, secret))).not.toBe(
+      claim.claim_value_hex
+    )
+    expect(hex(await mailboxClaimValue(ephemeral, recipient, elsewhere))).not.toBe(
+      claim.claim_value_hex
+    )
+    await expect(mailboxClaimValue(new Uint8Array(31), recipient, secret)).rejects.toThrow(
+      ServicesSchemaError
+    )
+  })
+})
+
+describe('reading a sealed record against its closed schema', () => {
+  it('returns the record it was given, in canonical spelling', () => {
+    const item = vector('mailbox_item')
+    const { sealed } = item.json as { sealed: SealedEnvelope }
+    expect(readSealedEnvelope(sealed)).toEqual(sealed)
+  })
+
+  it('refuses a field nobody agreed on, in the envelope and in the routing record', () => {
+    const item = vector('mailbox_item')
+    const { sealed } = item.json as { sealed: SealedEnvelope }
+    expect(() => readSealedEnvelope({ ...sealed, nickname: 'extra' })).toThrow(ServicesSchemaError)
+    expect(() =>
+      readSealedEnvelope({
+        ...sealed,
+        routing: { ...sealed.routing, nickname: 'extra' }
+      })
+    ).toThrow(ServicesSchemaError)
+  })
+
+  it('refuses a scalar of the wrong width or shape', () => {
+    const item = vector('mailbox_item')
+    const { sealed } = item.json as { sealed: SealedEnvelope }
+    expect(() => readSealedEnvelope({ ...sealed, nonce: sealed.nonce.slice(0, 8) })).toThrow(
+      ServicesSchemaError
+    )
+    expect(() =>
+      readSealedEnvelope({
+        ...sealed,
+        routing: { ...sealed.routing, recipient_key_id: 'AAAA' }
+      })
+    ).toThrow(ServicesSchemaError)
+    expect(() =>
+      readSealedEnvelope({ ...sealed, routing: { ...sealed.routing, envelope_id: 'not-a-uuid' } })
+    ).toThrow(ServicesSchemaError)
+    expect(() =>
+      readSealedEnvelope({ ...sealed, routing: { ...sealed.routing, expires_at_ms: 12 } })
+    ).toThrow(ServicesSchemaError)
+    expect(() =>
+      readSealedEnvelope({ ...sealed, routing: { ...sealed.routing, payload_type: 'keystroke' } })
+    ).toThrow(ServicesSchemaError)
+  })
+
+  it('reads a sealed synchronised object the same way', () => {
+    const record = vector('sync_object_record').json as SyncObjectRecord
+    expect(readSealedSyncObject(record.object)).toEqual(record.object)
+    expect(() => readSealedSyncObject({ ...record.object, nickname: 'extra' })).toThrow(
+      ServicesSchemaError
+    )
   })
 })
 

@@ -92,6 +92,39 @@ const NOW_MS: u64 = 1_767_225_600_000;
 /// The key the published key-identifier vectors are derived from. Test material.
 const IDENTIFIED_KEY: [u8; 32] = [0x44; 32];
 
+/// The ephemeral, recipient and agreed bytes of the published claim vector. Test material.
+const CLAIM_EPHEMERAL_KEY: [u8; 32] = [0x55; 32];
+const CLAIM_RECIPIENT_KEY: [u8; 32] = [0x66; 32];
+const CLAIM_SHARED_SECRET: [u8; 32] = [0x77; 32];
+
+/// Request bodies whose canonical encoding both languages must produce.
+///
+/// The second and third are one document written two ways, so their digests are equal; the fourth
+/// carries the one kind of number these bodies admit.
+const CANONICAL_BODIES: &[(&str, &str)] = &[
+    ("empty", "{}"),
+    (
+        "mailbox_read",
+        "{\"recipient_key\":\"ZmFrZS1yZWNpcGllbnQta2V5\",\"after_sequence\":\"12\",\"limit\":32}",
+    ),
+    (
+        "mailbox_read_reordered",
+        "{ \"limit\" : 32 , \"after_sequence\" : \"12\" , \"recipient_key\" : \"ZmFrZS1yZWNpcGllbnQta2V5\" }",
+    ),
+    (
+        "authority_read",
+        "{\"read\":{\"host_device_id\":\"4d4d4d4d-4d4d-4d4d-4d4d-4d4d4d4d4d4d\",\"summary_only\":true,\"after_sequence\":null}}",
+    ),
+];
+
+/// Bodies a canonical digest refuses. Both languages must refuse every one.
+const REFUSED_BODIES: &[&str] = &[
+    "{\"limit\":1.5}",
+    "{\"limit\":-1}",
+    "{\"limit\":9007199254740993}",
+    "{\"limit\":18446744073709551615}",
+];
+
 /// Origins a gateway accepts. Both languages must accept every one.
 const ACCEPTED_ORIGINS: &[&str] = &[
     "https://reach.kala.to",
@@ -896,6 +929,54 @@ fn services() -> Value {
                     })
                 })
                 .collect::<Vec<_>>()
+        },
+        "canonical_bodies": {
+            "description": "The bodies of these four methods are JSON documents, so the digest a signature carries is the SHA-256 of the document's canonical KR-CBOR-1 encoding. Two spellings of one document produce one digest; a number that is not an exact unsigned count is refused.",
+            "cases": CANONICAL_BODIES
+                .iter()
+                .map(|(id, json)| {
+                    let document: Value =
+                        serde_json::from_str(json).expect("a canonical body document");
+                    let encoded = crate::service::canonical_body(&document)
+                        .expect("a canonical body encoding");
+                    json!({
+                        "id": id,
+                        "json": document,
+                        "cbor_hex": hex(&encoded),
+                        "sha256": hex(&kr_cbor::sha256(&encoded)),
+                        "value": describe(
+                            &kr_cbor::decode(&encoded, &kr_cbor::Limits::default())
+                                .expect("valid KR-CBOR-1")
+                        ),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "refused": REFUSED_BODIES
+        },
+        "mailbox_claim": {
+            "description": "What answers a mailbox claim challenge: SHA256(CBOR([domain, ephemeral key, recipient key, shared secret])). A mailbox is addressed by the identifier of a public key every paired peer knows, so what distinguishes the recipient is the private half, and this is how a service asks for it without holding anything that could open an envelope.",
+            "domain": crate::mailbox::MAILBOX_CLAIM_DOMAIN,
+            "lifetime_ms": U64::new(crate::mailbox::MAILBOX_CLAIM_LIFETIME_MS).to_string(),
+            "ephemeral_key": serde_json::to_value(StoredEnvelopeKey::from_bytes(CLAIM_EPHEMERAL_KEY))
+                .expect("a key"),
+            "recipient_key": serde_json::to_value(StoredEnvelopeKey::from_bytes(CLAIM_RECIPIENT_KEY))
+                .expect("a key"),
+            "shared_secret": serde_json::to_value(Bytes::new(CLAIM_SHARED_SECRET.to_vec()))
+                .expect("a secret"),
+            "claim_value": serde_json::to_value(crate::mailbox::mailbox_claim_value(
+                &StoredEnvelopeKey::from_bytes(CLAIM_EPHEMERAL_KEY),
+                &StoredEnvelopeKey::from_bytes(CLAIM_RECIPIENT_KEY),
+                &CLAIM_SHARED_SECRET,
+            ))
+            .expect("a claim value"),
+            "claim_value_hex": hex(
+                crate::mailbox::mailbox_claim_value(
+                    &StoredEnvelopeKey::from_bytes(CLAIM_EPHEMERAL_KEY),
+                    &StoredEnvelopeKey::from_bytes(CLAIM_RECIPIENT_KEY),
+                    &CLAIM_SHARED_SECRET,
+                )
+                .as_bytes()
+            )
         },
         "mailbox_limits": {
             "item_lifetime_ms": U64::new(MAX_MAILBOX_ITEM_LIFETIME_MS).to_string(),

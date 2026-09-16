@@ -370,6 +370,98 @@ pub fn body_digest(canonical_body: &[u8]) -> Digest256 {
     Digest256::from_bytes(sha256(canonical_body))
 }
 
+/// The largest count a request body may carry as a number.
+///
+/// It is the largest integer a double-precision reader holds exactly. The other half of this
+/// contract is such a reader, so a larger value is one the two halves would not encode the same
+/// way; every counter these bodies carry as a quantity travels as a decimal string instead.
+const MAX_BODY_COUNT: f64 = 9_007_199_254_740_991.0;
+
+/// A request body that cannot be canonicalised.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BodyError {
+    /// A number that is not an exact count both languages hold identically.
+    ///
+    /// Every counter these methods carry travels as a decimal string, so a JSON number is either a
+    /// small exact count or a value nobody agreed on. The bound is the largest integer a
+    /// double-precision reader holds exactly, because the other half of this contract is one: a
+    /// value past it is a value the two halves would encode differently, so it is refused rather
+    /// than rounded into agreement. A float, a negative and a fraction are refused for the same
+    /// reason.
+    #[error("a request body carries no number that is not an exact count at or below 2^53-1")]
+    Number,
+    /// A map whose keys are not canonical, or that repeats one.
+    #[error("a request body's members are canonical and distinct: {0}")]
+    Members(String),
+}
+
+/// The canonical bytes of one request body.
+///
+/// The bodies of the mailbox, authority-feed, settings-sync and backup-manifest methods are JSON
+/// documents rather than protocol objects, and a signature covers bytes rather than a document. So
+/// the document is encoded in KR-CBOR-1 — text keys in canonical order, text as text, an exact
+/// count as an unsigned integer — and the digest of those bytes is what the signature carries.
+/// Both halves of the contract build it from the document they hold, so a caller signs what a
+/// service will recompute and nothing depends on how either wrote its JSON.
+///
+/// # Errors
+///
+/// Returns [`BodyError`] when the document is outside the subset: a number that is not an exact
+/// unsigned integer, or a map that repeats a key.
+pub fn canonical_body(body: &serde_json::Value) -> Result<Vec<u8>, BodyError> {
+    Ok(kr_cbor::encode(&canonical_body_value(body)?))
+}
+
+/// The SHA-256 of [`canonical_body`], which is what a signature's `body_digest` carries.
+///
+/// # Errors
+///
+/// Returns [`BodyError`] when the document is outside the subset.
+pub fn canonical_body_digest(body: &serde_json::Value) -> Result<Digest256, BodyError> {
+    Ok(Digest256::from_bytes(sha256(&canonical_body(body)?)))
+}
+
+fn canonical_body_value(body: &serde_json::Value) -> Result<kr_cbor::CanonicalValue, BodyError> {
+    use kr_cbor::CanonicalValue;
+
+    match body {
+        serde_json::Value::Null => Ok(CanonicalValue::Null),
+        serde_json::Value::Bool(value) => Ok(CanonicalValue::Bool(*value)),
+        serde_json::Value::Number(number) => {
+            // A spelling is not a value: `1000` and `1e3` are one number, and JSON says so, so
+            // both encode to the same integer. What is refused is a value rather than a spelling.
+            let value = number.as_f64().ok_or(BodyError::Number)?;
+            if !value.is_finite()
+                || value.fract() != 0.0
+                || !(0.0..=MAX_BODY_COUNT).contains(&value)
+            {
+                return Err(BodyError::Number);
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "the value is a non-negative integer at or below 2^53-1"
+            )]
+            Ok(CanonicalValue::Integer((value as u64).into()))
+        }
+        serde_json::Value::String(text) => Ok(CanonicalValue::text(text)),
+        serde_json::Value::Array(items) => Ok(CanonicalValue::Array(
+            items
+                .iter()
+                .map(canonical_body_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        serde_json::Value::Object(members) => {
+            let mut map = kr_cbor::CanonicalMap::new();
+            for (key, value) in members {
+                map.insert(key.clone(), canonical_body_value(value)?)
+                    .map_err(|error| BodyError::Members(error.to_string()))?;
+            }
+            Ok(CanonicalValue::Map(map))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +507,59 @@ mod tests {
             signed + 2 * SERVICE_REQUEST_FRESHNESS_MS
         );
         assert_eq!(nonce_retained_until_ms(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn a_body_is_digested_from_the_document_rather_than_from_its_text() {
+        // Two spellings of one document. The canonical encoding is the same bytes, so the digest a
+        // signature carries does not depend on how either side wrote its JSON.
+        let one: serde_json::Value =
+            serde_json::from_str("{\"b\":\"two\",\"a\":1}").expect("a document");
+        let other: serde_json::Value =
+            serde_json::from_str("{ \"a\" : 1 , \"b\" : \"two\" }").expect("a document");
+        assert_eq!(
+            canonical_body_digest(&one).expect("a digest"),
+            canonical_body_digest(&other).expect("a digest")
+        );
+
+        // A different document is a different digest.
+        let different: serde_json::Value =
+            serde_json::from_str("{\"a\":1,\"b\":\"three\"}").expect("a document");
+        assert_ne!(
+            canonical_body_digest(&one).expect("a digest"),
+            canonical_body_digest(&different).expect("a digest")
+        );
+    }
+
+    #[test]
+    fn a_body_carries_no_number_that_is_not_an_exact_count() {
+        for text in [
+            "{\"limit\":1.5}",
+            "{\"limit\":-1}",
+            "{\"limit\":9007199254740993}",
+        ] {
+            let body: serde_json::Value = serde_json::from_str(text).expect("a document");
+            assert_eq!(
+                canonical_body_digest(&body),
+                Err(BodyError::Number),
+                "{text}"
+            );
+        }
+
+        let counted: serde_json::Value =
+            serde_json::from_str("{\"limit\":32}").expect("a document");
+        assert!(canonical_body_digest(&counted).is_ok());
+
+        // One number written two ways is one document, so it is one digest: the other half of this
+        // contract cannot tell the two spellings apart, and neither should this one.
+        let exponent: serde_json::Value =
+            serde_json::from_str("{\"limit\":1e3}").expect("a document");
+        let plain: serde_json::Value =
+            serde_json::from_str("{\"limit\":1000}").expect("a document");
+        assert_eq!(
+            canonical_body_digest(&exponent).expect("a digest"),
+            canonical_body_digest(&plain).expect("a digest")
+        );
     }
 
     #[test]

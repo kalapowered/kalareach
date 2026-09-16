@@ -2872,7 +2872,12 @@ export interface EnvelopePlaintext {
    * What the payload is.
    */
   payload_type:
-    'authority_feed_change' | 'signed_authority_object' | 'notification_preview' | 'sync_change'
+    | 'authority_feed_change'
+    | 'action_receipt'
+    | 'state_reference'
+    | 'signed_authority_object'
+    | 'notification_preview'
+    | 'sync_change'
   /**
    * The recipient's stored-envelope key.
    */
@@ -4789,7 +4794,12 @@ export interface EnvelopeRouting {
    * the box authenticated and drops the item when the two differ.
    */
   payload_type:
-    'authority_feed_change' | 'signed_authority_object' | 'notification_preview' | 'sync_change'
+    | 'authority_feed_change'
+    | 'action_receipt'
+    | 'state_reference'
+    | 'signed_authority_object'
+    | 'notification_preview'
+    | 'sync_change'
   /**
    * The recipient the service delivers to.
    */

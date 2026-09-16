@@ -15,7 +15,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{EnvelopeId, EnvironmentId, GrantId, MailboxThreadId, SessionEpoch, SessionId};
-use crate::scalars::{Bytes, KeyId, Nonce192, Nullable, TimestampMs, U64};
+use crate::scalars::{
+    Bytes, Digest256, KeyId, Nonce192, Nullable, StoredEnvelopeKey, TimestampMs, U64,
+};
 
 /// The envelope format this build writes and reads.
 #[derive(
@@ -44,6 +46,17 @@ pub enum MailboxPayloadType {
     /// has its own retention and is not coalesced with notifications; a device that sees this
     /// announcement synchronises the feed.
     AuthorityFeedChange,
+    /// A receipt for one action the host admitted, dispatched or refused.
+    ///
+    /// It records what happened; it asks for nothing. An action reaches a host over its
+    /// authenticated connection and comes back with a receipt, and this is how that receipt reaches
+    /// a device that was not connected at the time.
+    ActionReceipt,
+    /// A reference to state a device can fetch from the host when it reconnects.
+    ///
+    /// A reference and not the state: what it names is read under current authority from the host
+    /// that holds it. It is the repeated kind, so it is the one coalescing is mostly about.
+    StateReference,
     /// A signed authority object forwarded to a device: a grant, a revocation request or a host
     /// authority revision record.
     ///
@@ -58,8 +71,10 @@ pub enum MailboxPayloadType {
 
 impl MailboxPayloadType {
     /// Every payload kind, in declaration order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::AuthorityFeedChange,
+        Self::ActionReceipt,
+        Self::StateReference,
         Self::SignedAuthorityObject,
         Self::NotificationPreview,
         Self::SyncChange,
@@ -70,6 +85,8 @@ impl MailboxPayloadType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AuthorityFeedChange => "authority_feed_change",
+            Self::ActionReceipt => "action_receipt",
+            Self::StateReference => "state_reference",
             Self::SignedAuthorityObject => "signed_authority_object",
             Self::NotificationPreview => "notification_preview",
             Self::SyncChange => "sync_change",
@@ -86,7 +103,11 @@ impl MailboxPayloadType {
     pub const fn bears_authority(self) -> bool {
         match self {
             Self::SignedAuthorityObject => true,
-            Self::AuthorityFeedChange | Self::NotificationPreview | Self::SyncChange => false,
+            Self::AuthorityFeedChange
+            | Self::ActionReceipt
+            | Self::StateReference
+            | Self::NotificationPreview
+            | Self::SyncChange => false,
         }
     }
 }
@@ -210,6 +231,13 @@ pub const MAX_MAILBOX_ITEM_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
 /// The most items one device's mailbox holds (section 9).
 pub const MAX_MAILBOX_ITEMS: u64 = 1_000;
 
+/// The most one stored item may occupy, in bytes.
+///
+/// A mailbox item travels as a control message, and section 9 bounds a control message at 1 MiB.
+/// The bound is on the whole stored item — the ciphertext, the nonce and the routing record — so a
+/// producer cannot reach past it by declaring a larger bucket than a message could carry.
+pub const MAX_MAILBOX_ITEM_BYTES: u64 = 1024 * 1024;
+
 /// The most stored ciphertext one device's mailbox holds, in bytes (section 9).
 ///
 /// Quota accounting measures the complete stored ciphertext and envelope, not the unpadded
@@ -259,6 +287,14 @@ pub enum EnvelopeStructureError {
     AlreadyExpired {
         /// How long ago it expired.
         behind: u64,
+    },
+    /// The item is larger than a control message may be.
+    #[error("a stored item is at most {limit} bytes; this one occupies {stored}")]
+    ItemTooLarge {
+        /// What the item occupies.
+        stored: u64,
+        /// The limit.
+        limit: u64,
     },
     /// An authority-bearing payload asked to be coalesced.
     ///
@@ -318,6 +354,14 @@ impl SealedEnvelope {
             });
         }
 
+        let stored = self.stored_bytes();
+        if stored > MAX_MAILBOX_ITEM_BYTES {
+            return Err(EnvelopeStructureError::ItemTooLarge {
+                stored,
+                limit: MAX_MAILBOX_ITEM_BYTES,
+            });
+        }
+
         if self.routing.payload_type.bears_authority() && self.routing.thread_id.is_present() {
             return Err(EnvelopeStructureError::AuthorityCoalesced);
         }
@@ -333,6 +377,60 @@ impl SealedEnvelope {
 /// so its encoded size varies by a few bytes and a fixed figure keeps one sender's quota from
 /// depending on how the service happens to store it.
 pub const ROUTING_RECORD_BYTES: u64 = 256;
+
+/// The domain the value that claims a mailbox is derived under.
+pub const MAILBOX_CLAIM_DOMAIN: &str = "kr-mailbox-claim/1";
+
+/// What a service asks of a device that says a mailbox is its own.
+///
+/// A mailbox is addressed by the identifier of the recipient's stored-envelope key, and every
+/// paired peer of that recipient knows the key: it is what they seal to. So a service that served
+/// a mailbox to whoever asked for it would serve a person's items to their own peers, and a
+/// service that gave the mailbox to the first caller would let a peer take it. Neither is
+/// acceptable, and neither needs a pairing record to fix: what distinguishes the recipient from
+/// everybody who knows its public key is the private half.
+///
+/// The service generates one ephemeral X25519 keypair per challenge, derives the shared secret
+/// with the claimed recipient key, and asks for [`mailbox_claim_value`] of it. Only the holder of
+/// the recipient's private key can derive the same secret, so the answer proves possession without
+/// the private key leaving the device and without the service holding anything that could open an
+/// envelope: the secret is discarded with the challenge.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxClaimChallenge {
+    /// The mailbox the challenge is about.
+    pub recipient_key_id: KeyId,
+    /// The service's ephemeral X25519 public key for this challenge, and for no other.
+    pub ephemeral_key: StoredEnvelopeKey,
+    /// When the challenge stops being answerable, in UTC milliseconds.
+    pub expires_at_ms: TimestampMs,
+}
+
+/// How long a claim challenge stays answerable, in milliseconds.
+pub const MAILBOX_CLAIM_LIFETIME_MS: u64 = 5 * 60 * 1000;
+
+/// The value that answers one claim challenge.
+///
+/// `SHA256(CBOR(["kr-mailbox-claim/1", ephemeral_key, recipient_key, shared_secret]))`, where the
+/// shared secret is the X25519 agreement of the two keys. Both public keys are inside the hash, so
+/// an answer derived for one challenge cannot answer another, and the domain keeps the value from
+/// meaning anything anywhere else.
+#[must_use]
+pub fn mailbox_claim_value(
+    ephemeral_key: &StoredEnvelopeKey,
+    recipient_key: &StoredEnvelopeKey,
+    shared_secret: &[u8; 32],
+) -> Digest256 {
+    let value = kr_cbor::signing_value(
+        MAILBOX_CLAIM_DOMAIN,
+        vec![
+            kr_cbor::CanonicalValue::bytes(ephemeral_key.as_bytes().as_slice()),
+            kr_cbor::CanonicalValue::bytes(recipient_key.as_bytes().as_slice()),
+            kr_cbor::CanonicalValue::bytes(shared_secret.as_slice()),
+        ],
+    );
+    Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(&value)))
+}
 
 /// One kibibyte.
 pub const KIB: u64 = 1024;
@@ -460,6 +558,42 @@ mod tests {
     }
 
     #[test]
+    fn an_item_larger_than_a_control_message_is_refused() {
+        // Section 9 bounds a control message at 1 MiB, and a mailbox item travels as one. The
+        // bound is on the whole stored item, so a larger bucket cannot reach past it.
+        let bucket = 1024 * KIB;
+        let envelope = sealed(bucket, 1_000 + MAX_MAILBOX_ITEM_LIFETIME_MS);
+        assert!(matches!(
+            envelope.check_structure(1_000),
+            Err(EnvelopeStructureError::ItemTooLarge { .. })
+        ));
+        // One bucket down fits, with the nonce and the routing record inside the bound.
+        let smaller = sealed(bucket - 64 * KIB, 1_000 + MAX_MAILBOX_ITEM_LIFETIME_MS);
+        assert_eq!(smaller.check_structure(1_000), Ok(()));
+    }
+
+    #[test]
+    fn a_claim_value_names_both_keys_and_the_secret() {
+        let ephemeral = StoredEnvelopeKey::from_bytes([1; 32]);
+        let recipient = StoredEnvelopeKey::from_bytes([2; 32]);
+        let secret = [3u8; 32];
+
+        let value = mailbox_claim_value(&ephemeral, &recipient, &secret);
+        assert_eq!(value, mailbox_claim_value(&ephemeral, &recipient, &secret));
+        // A different challenge, a different mailbox or a different secret is a different answer,
+        // so an answer cannot be carried from one challenge to another.
+        assert_ne!(
+            value,
+            mailbox_claim_value(&StoredEnvelopeKey::from_bytes([9; 32]), &recipient, &secret)
+        );
+        assert_ne!(
+            value,
+            mailbox_claim_value(&ephemeral, &StoredEnvelopeKey::from_bytes([9; 32]), &secret)
+        );
+        assert_ne!(value, mailbox_claim_value(&ephemeral, &recipient, &[9; 32]));
+    }
+
+    #[test]
     fn the_payload_kinds_are_closed_and_none_of_them_is_an_action() {
         // Section 9 is a list of what a mailbox does not queue: keystrokes, shell commands,
         // approval decisions, process termination and session closure. The set below is what it
@@ -468,6 +602,8 @@ mod tests {
             MailboxPayloadType::ALL.map(MailboxPayloadType::as_str),
             [
                 "authority_feed_change",
+                "action_receipt",
+                "state_reference",
                 "signed_authority_object",
                 "notification_preview",
                 "sync_change",
@@ -481,6 +617,8 @@ mod tests {
         // An announcement is not authority: the device synchronises the feed to learn what
         // changed, and the feed's own signed records carry the authority.
         assert!(!MailboxPayloadType::AuthorityFeedChange.bears_authority());
+        assert!(!MailboxPayloadType::ActionReceipt.bears_authority());
+        assert!(!MailboxPayloadType::StateReference.bears_authority());
         assert!(!MailboxPayloadType::NotificationPreview.bears_authority());
         assert!(!MailboxPayloadType::SyncChange.bears_authority());
     }

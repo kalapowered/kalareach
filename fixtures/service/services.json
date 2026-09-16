@@ -1,4 +1,129 @@
 {
+  "canonical_bodies": {
+    "cases": [
+      {
+        "cbor_hex": "a0",
+        "id": "empty",
+        "json": {},
+        "sha256": "c19a797fa1fd590cd2e5b42d1cf5f246e29b91684e2f87404b81dc345c7a56a0",
+        "value": {
+          "map": []
+        }
+      },
+      {
+        "cbor_hex": "a3656c696d697418206d726563697069656e745f6b657978185a6d46725a5331795a574e7063476c6c626e5174613256356e61667465725f73657175656e6365623132",
+        "id": "mailbox_read",
+        "json": {
+          "after_sequence": "12",
+          "limit": 32,
+          "recipient_key": "ZmFrZS1yZWNpcGllbnQta2V5"
+        },
+        "sha256": "0eaef75b9fb3ce47b828ebae8e28a3cdef020e958b67ba1cb36ced069fa6ad59",
+        "value": {
+          "map": [
+            [
+              "limit",
+              {
+                "int": "32"
+              }
+            ],
+            [
+              "recipient_key",
+              {
+                "text": "ZmFrZS1yZWNpcGllbnQta2V5"
+              }
+            ],
+            [
+              "after_sequence",
+              {
+                "text": "12"
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a3656c696d697418206d726563697069656e745f6b657978185a6d46725a5331795a574e7063476c6c626e5174613256356e61667465725f73657175656e6365623132",
+        "id": "mailbox_read_reordered",
+        "json": {
+          "after_sequence": "12",
+          "limit": 32,
+          "recipient_key": "ZmFrZS1yZWNpcGllbnQta2V5"
+        },
+        "sha256": "0eaef75b9fb3ce47b828ebae8e28a3cdef020e958b67ba1cb36ced069fa6ad59",
+        "value": {
+          "map": [
+            [
+              "limit",
+              {
+                "int": "32"
+              }
+            ],
+            [
+              "recipient_key",
+              {
+                "text": "ZmFrZS1yZWNpcGllbnQta2V5"
+              }
+            ],
+            [
+              "after_sequence",
+              {
+                "text": "12"
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a16472656164a36c73756d6d6172795f6f6e6c79f56e61667465725f73657175656e6365f66e686f73745f6465766963655f6964782434643464346434642d346434642d346434642d346434642d346434643464346434643464",
+        "id": "authority_read",
+        "json": {
+          "read": {
+            "after_sequence": null,
+            "host_device_id": "4d4d4d4d-4d4d-4d4d-4d4d-4d4d4d4d4d4d",
+            "summary_only": true
+          }
+        },
+        "sha256": "40013c561edcf74e26e902e5dc9eb33ff8c5a36ba3f600f5b94a409d71b8a5e9",
+        "value": {
+          "map": [
+            [
+              "read",
+              {
+                "map": [
+                  [
+                    "summary_only",
+                    {
+                      "bool": true
+                    }
+                  ],
+                  [
+                    "after_sequence",
+                    {
+                      "null": null
+                    }
+                  ],
+                  [
+                    "host_device_id",
+                    {
+                      "text": "4d4d4d4d-4d4d-4d4d-4d4d-4d4d4d4d4d4d"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    ],
+    "description": "The bodies of these four methods are JSON documents, so the digest a signature carries is the SHA-256 of the document's canonical KR-CBOR-1 encoding. Two spellings of one document produce one digest; a number that is not an exact unsigned count is refused.",
+    "refused": [
+      "{\"limit\":1.5}",
+      "{\"limit\":-1}",
+      "{\"limit\":9007199254740993}",
+      "{\"limit\":18446744073709551615}"
+    ]
+  },
   "cases": [
     {
       "cbor_hex": "ad677061796c6f6164507a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a6776657273696f6e6c6b722d6d61696c626f782f31686772616e745f6964f6697468726561645f6964503f1c880a526d4b198e270d61aa3477906a73657373696f6e5f6964f66b656e76656c6f70655f6964508a441e7b29034c5db16e3892cf05612d6c7061796c6f61645f747970656b73796e635f6368616e67656d637265617465645f61745f6d731b0000019b76daa8006d657870697265735f61745f6d731b0000019b7c0104006d73656e6465725f6b65795f6964582092929292929292929292929292929292929292929292929292929292929292926d73657373696f6e5f65706f6368f66e656e7669726f6e6d656e745f6964502121212121212121212121212121212170726563697069656e745f6b65795f696458209191919191919191919191919191919191919191919191919191919191919191",
@@ -846,10 +971,22 @@
     ],
     "public_key": "REREREREREREREREREREREREREREREREREREREREREQ"
   },
+  "mailbox_claim": {
+    "claim_value": "hCOuvIyzNGQJHRfDCiKx7g_VXIyUaVsiC-aAr5-ghDU",
+    "claim_value_hex": "8423aebc8cb33464091d17c30a22b1ee0fd55c8c94695b220be680af9fa08435",
+    "description": "What answers a mailbox claim challenge: SHA256(CBOR([domain, ephemeral key, recipient key, shared secret])). A mailbox is addressed by the identifier of a public key every paired peer knows, so what distinguishes the recipient is the private half, and this is how a service asks for it without holding anything that could open an envelope.",
+    "domain": "kr-mailbox-claim/1",
+    "ephemeral_key": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU",
+    "lifetime_ms": "300000",
+    "recipient_key": "ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmY",
+    "shared_secret": "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3c"
+  },
   "mailbox_limits": {
     "bytes_per_device": "33554432",
     "coalesced_payload_types": [
       "authority_feed_change",
+      "action_receipt",
+      "state_reference",
       "notification_preview",
       "sync_change"
     ],
@@ -857,6 +994,8 @@
     "items_per_device": "1000",
     "payload_types": [
       "authority_feed_change",
+      "action_receipt",
+      "state_reference",
       "signed_authority_object",
       "notification_preview",
       "sync_change"

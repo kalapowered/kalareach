@@ -28,7 +28,7 @@ import {
   krText,
   type CanonicalValue
 } from './cbor/value.js'
-import { base64UrlToBytes, jsonToU64, jsonToUuid, uuidToJson } from './json.js'
+import { base64UrlToBytes, bytesToBase64Url, jsonToU64, jsonToUuid, uuidToJson } from './json.js'
 import type {
   ArchiveDescriptor,
   AuthorityRevisionRecord,
@@ -79,6 +79,14 @@ export const MAX_MAILBOX_ITEM_LIFETIME_MS = 24 * 60 * 60 * 1000
 /** How long a replay identifier is retained past its envelope's expiry, in milliseconds. */
 export const REPLAY_ID_RETENTION_MS = 24 * 60 * 60 * 1000
 
+/**
+ * The most one stored item may occupy, in bytes.
+ *
+ * A mailbox item travels as a control message, and section 9 bounds one at 1 MiB. The bound is on
+ * the whole stored item, so a producer cannot reach past it by declaring a larger bucket.
+ */
+export const MAX_MAILBOX_ITEM_BYTES = 1024 * 1024
+
 /** The most items one device's mailbox holds. */
 export const MAX_MAILBOX_ITEMS = 1_000
 
@@ -109,6 +117,8 @@ export const MAX_ARCHIVE_DESCRIPTOR_LEN = 64 * 1024
 /** Every mailbox payload kind, in the order the protocol declares them. */
 export const MAILBOX_PAYLOAD_TYPES: readonly MailboxPayloadType[] = [
   'authority_feed_change',
+  'action_receipt',
+  'state_reference',
   'signed_authority_object',
   'notification_preview',
   'sync_change'
@@ -319,9 +329,206 @@ export function mailboxSizeBucket (length: number): number {
   return (Math.floor(length / granularity) + 1) * granularity
 }
 
+/** The domain the value that claims a mailbox is derived under. */
+export const MAILBOX_CLAIM_DOMAIN = 'kr-mailbox-claim/1'
+
+/** How long a claim challenge stays answerable, in milliseconds. */
+export const MAILBOX_CLAIM_LIFETIME_MS = 5 * 60 * 1000
+
+/**
+ * The value that answers one mailbox claim challenge.
+ *
+ * `SHA256(CBOR(["kr-mailbox-claim/1", ephemeral_key, recipient_key, shared_secret]))`, where the
+ * shared secret is the X25519 agreement of the two keys. A mailbox is addressed by the identifier
+ * of the recipient's stored-envelope key, which every paired peer of that recipient knows, so what
+ * distinguishes the recipient from everybody who knows its public key is the private half. This is
+ * how a service asks for it without the private key leaving the device and without the service
+ * keeping anything that could open an envelope: the secret is discarded with the challenge.
+ *
+ * Both public keys are inside the hash, so an answer derived for one challenge cannot answer
+ * another.
+ */
+export async function mailboxClaimValue (
+  ephemeralKey: Uint8Array,
+  recipientKey: Uint8Array,
+  sharedSecret: Uint8Array
+): Promise<Uint8Array> {
+  for (const [what, bytes] of [
+    ['an ephemeral key', ephemeralKey],
+    ['a recipient key', recipientKey],
+    ['a shared secret', sharedSecret]
+  ] as const) {
+    if (bytes.length !== KEY_BYTES) {
+      refuse(`${what} is ${String(KEY_BYTES)} bytes, not ${String(bytes.length)}`)
+    }
+  }
+
+  const encoded = encodeCanonical(
+    krArray([
+      krText(MAILBOX_CLAIM_DOMAIN),
+      krBytes(ephemeralKey),
+      krBytes(recipientKey),
+      krBytes(sharedSecret)
+    ])
+  )
+  const digest = await crypto.subtle.digest('SHA-256', encoded as unknown as BufferSource)
+  return new Uint8Array(digest)
+}
+
+/**
+ * The canonical bytes of one request body.
+ *
+ * The bodies of the mailbox, authority-feed, settings-sync and backup-manifest methods are JSON
+ * documents rather than protocol objects, and a signature covers bytes rather than a document. So
+ * the document is encoded in KR-CBOR-1 — text keys in canonical order, text as text, an exact
+ * count as an unsigned integer — and the digest of those bytes is the `body_digest` a service
+ * request carries. Both halves of the contract build it from the document they hold, so a caller
+ * signs what a service recomputes and nothing depends on how either wrote its JSON.
+ *
+ * Numbers are the one place this is strict: every counter these bodies carry travels as a decimal
+ * string, so a JSON number is either a small exact count or a value nobody agreed on. A float, a
+ * negative or anything past the exact-integer range is refused rather than rounded into one.
+ */
+export function canonicalBody (body: unknown): Uint8Array {
+  return encodeCanonical(canonicalBodyValue(body))
+}
+
+/** The SHA-256 of {@link canonicalBody}, which is what a signature's `body_digest` carries. */
+export async function canonicalBodyDigest (body: unknown): Promise<Uint8Array> {
+  const digest = await crypto.subtle.digest('SHA-256', canonicalBody(body) as unknown as BufferSource)
+  return new Uint8Array(digest)
+}
+
+function canonicalBodyValue (body: unknown): CanonicalValue {
+  if (body === null) {
+    return krNull()
+  }
+  if (typeof body === 'boolean') {
+    return krBool(body)
+  }
+  if (typeof body === 'number') {
+    if (!Number.isSafeInteger(body) || body < 0) {
+      refuse('a request body carries no number that is not an exact unsigned integer')
+    }
+    return krInt(BigInt(body))
+  }
+  if (typeof body === 'string') {
+    return krText(body)
+  }
+  if (Array.isArray(body)) {
+    return krArray((body as unknown[]).map(canonicalBodyValue))
+  }
+  if (typeof body === 'object') {
+    return krMap(
+      Object.entries(body as Record<string, unknown>).map(
+        ([key, value]) => [key, canonicalBodyValue(value)] as const
+      )
+    )
+  }
+  refuse('a request body carries objects, arrays, text, exact counts, booleans and null')
+}
+
+const SEALED_ENVELOPE_FIELDS = ['ciphertext', 'nonce', 'routing'] as const
+
+const ENVELOPE_ROUTING_FIELDS = [
+  'envelope_id',
+  'expires_at_ms',
+  'payload_type',
+  'recipient_key_id',
+  'sender_key_id',
+  'size_bucket_bytes',
+  'thread_id'
+] as const
+
+/**
+ * One sealed envelope, read against its closed schema.
+ *
+ * A service stores what a caller sends, so what it stores has to be exactly the record and nothing
+ * beside it: a field nobody agreed on would be stored, served back and counted against nobody's
+ * quota. Every scalar is checked for its own width and shape here, and the value returned is built
+ * from the checked fields, so a caller cannot smuggle anything through by adding to the document.
+ *
+ * @throws {ServicesSchemaError} naming the rule the envelope breaks.
+ */
+export function readSealedEnvelope (value: unknown): SealedEnvelope {
+  const envelope = closed('a sealed envelope', value, SEALED_ENVELOPE_FIELDS)
+  const routing = closed('a routing record', envelope['routing'], ENVELOPE_ROUTING_FIELDS)
+  const thread = routing['thread_id']
+
+  return {
+    // Every field is re-encoded from what was checked, so the value is canonical text whatever
+    // spelling arrived: a key that decodes to the same bytes is the same key.
+    ciphertext: bytesToBase64Url(opaqueBytes('a ciphertext', envelope['ciphertext'])),
+    nonce: bytesToBase64Url(
+      fixedBytes('an envelope nonce', envelope['nonce'], ENVELOPE_NONCE_BYTES)
+    ),
+    routing: {
+      envelope_id: uuidToJson(identifierBytes('an envelope identifier', routing['envelope_id'])),
+      expires_at_ms: counterText('an envelope expiry', routing['expires_at_ms']),
+      payload_type: member('a mailbox payload kind', routing['payload_type'], MAILBOX_PAYLOAD_TYPES),
+      recipient_key_id: bytesToBase64Url(
+        fixedBytes('a recipient key identifier', routing['recipient_key_id'], KEY_ID_BYTES)
+      ),
+      sender_key_id: bytesToBase64Url(
+        fixedBytes('a sender key identifier', routing['sender_key_id'], KEY_ID_BYTES)
+      ),
+      size_bucket_bytes: counterText('a declared size bucket', routing['size_bucket_bytes']),
+      thread_id:
+        thread === null
+          ? null
+          : uuidToJson(identifierBytes('a coalescing thread identifier', thread))
+    }
+  }
+}
+
+const SEALED_SYNC_OBJECT_FIELDS = ['ciphertext', 'nonce', 'size_bucket_bytes'] as const
+
+/**
+ * One sealed synchronised object, read against its closed schema.
+ *
+ * For the reason {@link readSealedEnvelope} states: a service stores this, so it stores the record
+ * and nothing beside it.
+ *
+ * @throws {ServicesSchemaError} naming the rule the object breaks.
+ */
+export function readSealedSyncObject (value: unknown): SealedSyncObject {
+  const object = closed('a sealed object', value, SEALED_SYNC_OBJECT_FIELDS)
+
+  return {
+    ciphertext: bytesToBase64Url(opaqueBytes('a ciphertext', object['ciphertext'])),
+    nonce: bytesToBase64Url(fixedBytes('an object nonce', object['nonce'], ENVELOPE_NONCE_BYTES)),
+    size_bucket_bytes: counterText('a declared size bucket', object['size_bucket_bytes'])
+  }
+}
+
+/** A 16-byte identifier from its hyphenated text. */
+function identifierBytes (what: string, value: unknown): Uint8Array {
+  if (typeof value !== 'string') {
+    refuse(`${what} is a hyphenated identifier`)
+  }
+  try {
+    return jsonToUuid(value)
+  } catch (error) {
+    refuse(`${what} is a hyphenated identifier: ${error instanceof Error ? error.message : 'invalid'}`)
+  }
+}
+
+/** A counter that travelled as a decimal string, as the exact text it means. */
+function counterText (what: string, value: unknown): string {
+  if (typeof value !== 'string') {
+    refuse(`${what} is an unsigned counter written as a decimal string`)
+  }
+  try {
+    return jsonToU64(value).toString()
+  } catch (error) {
+    refuse(`${what} is an unsigned counter: ${error instanceof Error ? error.message : 'invalid'}`)
+  }
+}
+
 /** Why a sealed record is not one this contract admits. */
 export type StructureRefusal =
   | { readonly reason: 'unknown_payload_type'; readonly declared: string }
+  | { readonly reason: 'item_too_large'; readonly stored: number; readonly limit: number }
   | { readonly reason: 'undeclared_bucket'; readonly bucket: bigint }
   | { readonly reason: 'ciphertext_length'; readonly length: bigint; readonly expected: bigint }
   | { readonly reason: 'too_large'; readonly bucket: bigint; readonly limit: number }
@@ -367,6 +574,10 @@ export function checkSealedEnvelope (
   const ahead = expires - now
   if (ahead > BigInt(MAX_MAILBOX_ITEM_LIFETIME_MS)) {
     return { reason: 'lifetime_too_long', ahead, limit: MAX_MAILBOX_ITEM_LIFETIME_MS }
+  }
+  const stored = envelopeStoredBytes(envelope)
+  if (stored > MAX_MAILBOX_ITEM_BYTES) {
+    return { reason: 'item_too_large', stored, limit: MAX_MAILBOX_ITEM_BYTES }
   }
   if (
     (AUTHORITY_BEARING_PAYLOAD_TYPES as readonly string[]).includes(routing.payload_type) &&
@@ -455,9 +666,11 @@ function revocationTarget (value: unknown): CanonicalValue {
     }
     text.push(entry)
   }
-  // A canonical set is in ascending order of the encoded members and carries no duplicates. The
-  // order is checked rather than imposed: a verifier checks the bytes it received, so sorting them
-  // here would cover bytes the issuer never sent.
+  // A canonical set is in ascending order of its members and carries no duplicates. The members
+  // are compared as the bytes they encode to rather than as the text they arrived as, because one
+  // identifier has two spellings: a verifier that compared the text would admit an upper-case
+  // duplicate of a lower-case member and cover bytes the host's own decoder refuses. The order is
+  // checked rather than imposed, because a verifier checks the bytes it received.
   const encoded = text.map((entry) => uuidToJson(jsonToUuid(entry)))
   for (let index = 1; index < encoded.length; index += 1) {
     if ((encoded[index - 1] as string) >= (encoded[index] as string)) {
@@ -531,8 +744,11 @@ export function authorityRevisionSigningInput (record_: AuthorityRevisionRecord)
     }
     requests.push(entry)
   }
-  for (let index = 1; index < requests.length; index += 1) {
-    if ((requests[index - 1] as string) >= (requests[index] as string)) {
+  // Compared as the bytes they encode to, for the reason `revocationTarget` states: one identifier
+  // has two spellings, and the host's own set refuses the duplicate a text comparison would admit.
+  const appliedBytes = requests.map((entry) => uuidToJson(jsonToUuid(entry)))
+  for (let index = 1; index < appliedBytes.length; index += 1) {
+    if ((appliedBytes[index - 1] as string) >= (appliedBytes[index] as string)) {
       refuse('applied_requests is in ascending order without duplicates')
     }
   }

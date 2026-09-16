@@ -4736,6 +4736,16 @@
           "type": "string"
         },
         {
+          "const": "action_receipt",
+          "description": "A receipt for one action the host admitted, dispatched or refused.\n\nIt records what happened; it asks for nothing. An action reaches a host over its\nauthenticated connection and comes back with a receipt, and this is how that receipt reaches\na device that was not connected at the time.",
+          "type": "string"
+        },
+        {
+          "const": "state_reference",
+          "description": "A reference to state a device can fetch from the host when it reconnects.\n\nA reference and not the state: what it names is read under current authority from the host\nthat holds it. It is the repeated kind, so it is the one coalescing is mostly about.",
+          "type": "string"
+        },
+        {
           "const": "signed_authority_object",
           "description": "A signed authority object forwarded to a device: a grant, a revocation request or a host\nauthority revision record.\n\nThe payload is the signed object's canonical bytes. The issuer's signature is what\nauthorises it; the envelope only delivers it.",
           "type": "string"
