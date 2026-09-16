@@ -47,6 +47,7 @@
 //! | [`session`] | The session lifecycle, closure records and the session method group |
 //! | [`attachment`] | Attachments, geometry ownership and the attachment method group |
 //! | [`input`] | The single input lease and the input method group |
+//! | [`root`] | The trusted root integration: the editor fence, its events and the launch transaction |
 //! | [`recovery`] | Subscriptions, snapshots, history pages and resynchronisation |
 //! | [`hostinfo`] | Host and environment reads, and read-only diagnostics |
 //! | [`worker`] | Worker descriptors, the startup rendezvous, the verify challenge and the generation token |
@@ -110,6 +111,7 @@ pub mod receipt;
 pub mod recovery;
 pub mod relay;
 pub mod rights;
+pub mod root;
 pub mod scalars;
 pub mod schema;
 pub mod service;

@@ -58,6 +58,12 @@ use crate::relay::{
     RelayConsumptionAck, RelayConsumptionReport, RelayLeaseAck, RelayLeaseRequest,
     SignedRelayConsumptionReceipt, SignedRelayInstanceRegistration,
 };
+use crate::root::{
+    EditorBusyEvent, EditorFence, FencePublication, RootCommandAcceptedParams,
+    RootCommandAcceptedResult, RootEditorEnterParams, RootEditorEnterResult, RootEditorFenceParams,
+    RootEditorFenceResult, RootEditorLeaveParams, RootEditorLeaveResult, RootEofDetachParams,
+    RootEofDetachResult, ShellLaunchParams, ShellLaunchResult,
+};
 use crate::service::ServiceRequestSignature;
 use crate::session::{
     ClosureRecord, SessionCloseParams, SessionCloseResult, SessionCreateParams,
@@ -182,6 +188,19 @@ pub fn protocol_schema() -> Value {
         "resync_required" => ResyncRequired,
         "revocation_acknowledgement" => RevocationAcknowledgement,
         "revocation_request" => RevocationRequest,
+        "root_command_accepted_params" => RootCommandAcceptedParams,
+        "root_command_accepted_result" => RootCommandAcceptedResult,
+        "root_editor_busy_event" => EditorBusyEvent,
+        "root_editor_enter_params" => RootEditorEnterParams,
+        "root_editor_enter_result" => RootEditorEnterResult,
+        "root_editor_fence" => EditorFence,
+        "root_editor_fence_params" => RootEditorFenceParams,
+        "root_editor_fence_publication" => FencePublication,
+        "root_editor_fence_result" => RootEditorFenceResult,
+        "root_editor_leave_params" => RootEditorLeaveParams,
+        "root_editor_leave_result" => RootEditorLeaveResult,
+        "root_eof_detach_params" => RootEofDetachParams,
+        "root_eof_detach_result" => RootEofDetachResult,
         "sealed_envelope" => SealedEnvelope,
         "service_request_signature" => ServiceRequestSignature,
         "session_attach_params" => SessionAttachParams,
@@ -198,6 +217,8 @@ pub fn protocol_schema() -> Value {
         "session_read_result" => SessionReadResult,
         "session_ref" => SessionRef,
         "session_summary" => SessionSummary,
+        "shell_launch_params" => ShellLaunchParams,
+        "shell_launch_result" => ShellLaunchResult,
         "signed_archive_manifest" => SignedArchiveManifest,
         "signed_client_bundle" => SignedClientBundle,
         "signed_host_bundle" => SignedHostBundle,

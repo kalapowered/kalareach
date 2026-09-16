@@ -701,6 +701,83 @@ export type RelayLeaseRequest =
       }
     }
 /**
+ * One published editor fence. An identity from an unacknowledged exchange names no fence.
+ */
+export type FenceId = string
+/**
+ * What the worker tells the bridge about the fence.
+ *
+ * The bridge cannot conclude that its acknowledgement published a fence: the hold may have expired
+ * while the answer was in flight, and a fence the worker never published must not be quoted in a
+ * detach. Nor can it conclude that a fence it was given is still live. So all three are stated
+ * rather than inferred, and a bridge holds a fence only between a [`Self::Published`] and the
+ * [`Self::Invalidated`] that ends it.
+ */
+export type FencePublication =
+  | {
+      published: EditorFence
+    }
+  | {
+      withheld: {
+        /**
+         * Why not.
+         */
+        reason:
+          | 'exchange_timed_out'
+          | 'editor_entered'
+          | 'detach_accepted'
+          | 'attachment_removed'
+          | 'integration_lost'
+          | 'queues_not_drained'
+          | 'refused'
+          | 'reader_moved'
+          | 'lease_changed'
+          | 'editor_left'
+          | 'session_closing'
+        /**
+         * The state the editor is in now.
+         */
+        state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
+      }
+    }
+  | {
+      invalidated: {
+        /**
+         * The fence that has gone.
+         */
+        fence_id: string
+        /**
+         * Why.
+         */
+        reason:
+          | 'exchange_timed_out'
+          | 'editor_entered'
+          | 'detach_accepted'
+          | 'attachment_removed'
+          | 'integration_lost'
+          | 'queues_not_drained'
+          | 'refused'
+          | 'reader_moved'
+          | 'lease_changed'
+          | 'editor_left'
+          | 'session_closing'
+        /**
+         * The state the editor is in now.
+         */
+        state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
+      }
+    }
+/**
+ * The result of `root.editor.fence`.
+ */
+export type RootEditorFenceResult =
+  | {
+      acknowledged: FenceAcknowledgement
+    }
+  | {
+      refused: FenceRefusal
+    }
+/**
  * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
  */
 export type NetworkHint = string
@@ -881,6 +958,19 @@ export interface KalaReachProtocol {
   resync_required?: ResyncRequired
   revocation_acknowledgement?: RevocationAcknowledgement
   revocation_request?: RevocationRequest
+  root_command_accepted_params?: RootCommandAcceptedParams
+  root_command_accepted_result?: RootCommandAcceptedResult
+  root_editor_busy_event?: EditorBusyEvent
+  root_editor_enter_params?: RootEditorEnterParams
+  root_editor_enter_result?: RootEditorEnterResult
+  root_editor_fence?: EditorFence
+  root_editor_fence_params?: RootEditorFenceParams
+  root_editor_fence_publication?: FencePublication
+  root_editor_fence_result?: RootEditorFenceResult
+  root_editor_leave_params?: RootEditorLeaveParams
+  root_editor_leave_result?: RootEditorLeaveResult
+  root_eof_detach_params?: RootEofDetachParams
+  root_eof_detach_result?: RootEofDetachResult
   sealed_envelope?: SealedEnvelope
   service_request_signature?: ServiceRequestSignature
   session_attach_params?: SessionAttachParams
@@ -897,6 +987,8 @@ export interface KalaReachProtocol {
   session_read_result?: SessionReadResult
   session_ref?: SessionRef
   session_summary?: SessionSummary2
+  shell_launch_params?: ShellLaunchParams
+  shell_launch_result?: ShellLaunchResult
   signed_archive_manifest?: SignedArchiveManifest
   signed_client_bundle?: SignedClientBundle
   signed_host_bundle?: SignedHostBundle
@@ -5434,6 +5526,497 @@ export interface RevocationRequest {
       }
 }
 /**
+ * Parameters of `root.command.accepted`.
+ *
+ * Sent from the reader at acceptance, inside the fenced context, before the reader leaves. The
+ * order matters: a record sent after the leave would arrive with the fence already invalidated and
+ * could only ever say `unverifiable`.
+ */
+export interface RootCommandAcceptedParams {
+  /**
+   * The fence the acceptance happened under, when one was live.
+   */
+  fence_id: FenceId | null
+  /**
+   * The origin the bridge can prove from its own reader state.
+   */
+  origin:
+    | {
+        fenced: {
+          /**
+           * The attachment that typed it.
+           */
+          attachment_id: string
+          /**
+           * The epoch its bytes arrived under.
+           */
+          input_epoch: string
+        }
+      }
+    | 'mixed'
+    | 'unverifiable'
+  /**
+   * The prompt generation of the accepted line.
+   */
+  prompt_generation: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `root.command.accepted`.
+ */
+export interface RootCommandAcceptedResult {
+  /**
+   * The origin the worker recorded, which is what a later unqualified detach resolves against.
+   */
+  origin:
+    | {
+        fenced: {
+          /**
+           * The attachment that typed it.
+           */
+          attachment_id: string
+          /**
+           * The epoch its bytes arrived under.
+           */
+          input_epoch: string
+        }
+      }
+    | 'mixed'
+    | 'unverifiable'
+  /**
+   * The state after acceptance.
+   */
+  state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
+}
+/**
+ * The `EDITOR_BUSY` attachment event.
+ *
+ * It is an event about the editor, not a failed `input.acquire`: the lease change it follows
+ * stands, the epoch below is the one that now holds input, and the released bytes went to the
+ * terminal in the order they arrived. The worker retries the fence at the reader's next entry,
+ * leave or idle callback.
+ */
+export interface EditorBusyEvent {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  attachment_id: string
+  /**
+   * The lease epoch that stands.
+   */
+  input_epoch: string
+  /**
+   * Why the editor could not be fenced.
+   */
+  reason:
+    | 'fence_exchange_timed_out'
+    | 'fence_refused'
+    | 'queues_not_drained'
+    | 'launch_reservation_timed_out'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  released_input_bytes: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The state the editor is in now.
+   */
+  state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
+}
+/**
+ * Parameters of `root.editor.enter`.
+ *
+ * Sent when the actual primary reader starts, not when a prompt is printed. A prompt hook runs
+ * before the reader exists and cannot stand in for this.
+ */
+export interface RootEditorEnterParams {
+  /**
+   * The shell's working-directory revision at this boundary.
+   */
+  cwd_revision: string
+  editor: EditorState
+  /**
+   * The prompt the reader is starting at.
+   */
+  prompt_generation: string
+  /**
+   * Which reader started.
+   */
+  reader_context: 'primary' | 'continuation' | 'read_builtin'
+  /**
+   * The revision of this reader inside that prompt.
+   */
+  reader_revision: string
+  root_process: ProcessStartIdentity5
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The reader's own initial state, including its keymap.
+ */
+export interface EditorState {
+  /**
+   * True when the buffer holds nothing, as the reader itself reports it.
+   */
+  buffer_empty: boolean
+  /**
+   * The buffer revision this state was read at.
+   */
+  buffer_revision: string
+  /**
+   * The keymap in force.
+   */
+  keymap: 'emacs' | 'vi_insert' | 'vi_command' | 'custom'
+  pending: PendingReaderInput
+}
+/**
+ * What the reader is in the middle of.
+ */
+export interface PendingReaderInput {
+  /**
+   * The reader is consuming a macro rather than the terminal.
+   */
+  macro_input: boolean
+  /**
+   * A multikey sequence has begun and is waiting for its remaining keys.
+   */
+  multikey_sequence: boolean
+  /**
+   * A numeric argument is being accumulated.
+   */
+  numeric_argument: boolean
+  /**
+   * A bracketed paste is open.
+   */
+  paste: boolean
+  /**
+   * A quoted insertion is waiting for the character to insert literally.
+   */
+  quoted_insertion: boolean
+  /**
+   * An incremental or non-incremental search is active.
+   */
+  search: boolean
+  /**
+   * A vi motion is waiting for its target.
+   */
+  vi_motion: boolean
+}
+/**
+ * A process and the kernel's record of when it started.
+ *
+ * Every ownership check compares both fields. A process identifier alone can be reused by an
+ * unrelated program within milliseconds of the original exiting, so the host never terminates,
+ * adopts or trusts a process on its identifier alone.
+ */
+export interface ProcessStartIdentity5 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * The result of `root.editor.enter`.
+ */
+export interface RootEditorEnterResult {
+  /**
+   * The fence exchange the worker started, when it started one.
+   */
+  fence_exchange: FenceId | null
+  /**
+   * The state after registration. Entry always invalidates the previous fence, so this is
+   * `unfenced` until an exchange is acknowledged.
+   */
+  state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
+}
+/**
+ * The ownership proof for the input delivered during one editor epoch.
+ *
+ * Every field is evidence rather than inference. The root process says which shell this is, the
+ * prompt generation and reader revision say which reader instance, the lease epoch says which
+ * client's bytes could have reached it, and the single originating attachment is the one a detach
+ * or an accepted line belongs to.
+ */
+export interface EditorFence {
+  /**
+   * The fence identity.
+   */
+  fence_id: string
+  /**
+   * The input-lease epoch the fenced input belongs to.
+   */
+  input_epoch: string
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  originating_attachment: string
+  /**
+   * The prompt the reader is at.
+   */
+  prompt_generation: string
+  /**
+   * The reader revision inside that prompt.
+   */
+  reader_revision: string
+  root_process: ProcessStartIdentity6
+}
+/**
+ * The root shell process, with the kernel's record of when it started.
+ */
+export interface ProcessStartIdentity6 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * Parameters of `root.editor.fence`: the worker asking the bridge to resolve prior input.
+ *
+ * The identity travels with the question so the acknowledgement can be matched to it. An
+ * acknowledgement that arrives after the deadline names an exchange that no longer exists and
+ * publishes nothing.
+ */
+export interface RootEditorFenceParams {
+  /**
+   * Why the worker is asking.
+   */
+  cause: 'editor_entry' | 'lease_change' | 'retry'
+  /**
+   * How long the worker will hold input for this exchange.
+   */
+  deadline_ms: string
+  /**
+   * One published editor fence. An identity from an unacknowledged exchange names no fence.
+   */
+  fence_id: string
+  /**
+   * The prompt generation the worker believes the reader is at.
+   */
+  prompt_generation: string
+  /**
+   * The reader revision the worker believes is current.
+   */
+  reader_revision: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The bridge's answer that prior input is resolved.
+ *
+ * It is evidence, not agreement: the drain report and the snapshot are what the worker checks
+ * before it publishes anything.
+ */
+export interface FenceAcknowledgement {
+  /**
+   * The shell's working-directory revision at the same instant.
+   */
+  cwd_revision: string
+  editor: EditorState1
+  /**
+   * The exchange being answered.
+   */
+  fence_id: string
+  /**
+   * The prompt generation at the moment of the snapshot.
+   */
+  prompt_generation: string
+  queues: QueueDrainReport
+  /**
+   * The reader the bridge is answering from.
+   */
+  reader_context: 'primary' | 'continuation' | 'read_builtin'
+  /**
+   * The reader revision at the moment of the snapshot.
+   */
+  reader_revision: string
+  snapshot: KeyQueueSnapshot
+}
+/**
+ * The reader's edit-buffer state at the same instant.
+ */
+export interface EditorState1 {
+  /**
+   * True when the buffer holds nothing, as the reader itself reports it.
+   */
+  buffer_empty: boolean
+  /**
+   * The buffer revision this state was read at.
+   */
+  buffer_revision: string
+  /**
+   * The keymap in force.
+   */
+  keymap: 'emacs' | 'vi_insert' | 'vi_command' | 'custom'
+  pending: PendingReaderInput
+}
+/**
+ * Which queues the bridge has cleared.
+ */
+export interface QueueDrainReport {
+  /**
+   * No macro input remains.
+   */
+  macro_input_drained: boolean
+  /**
+   * No partial key sequence remains.
+   */
+  partial_key_drained: boolean
+  /**
+   * The terminal's typeahead has been consumed by this reader.
+   */
+  tty_typeahead_drained: boolean
+}
+/**
+ * The atomically read key queues behind that report.
+ */
+export interface KeyQueueSnapshot {
+  /**
+   * The key sequence that invoked the reader's current operation. Empty between operations.
+   */
+  keys: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pending_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  queued_keys: string
+}
+/**
+ * A bridge's refusal to resolve prior input.
+ */
+export interface FenceRefusal {
+  /**
+   * The exchange being refused.
+   */
+  fence_id: string
+  /**
+   * The reader the refusal came from.
+   */
+  reader_context: 'primary' | 'continuation' | 'read_builtin'
+  /**
+   * Why.
+   */
+  reason: 'reader_busy' | 'queues_not_drained' | 'reader_moved' | 'cancellation_unavailable'
+  snapshot: KeyQueueSnapshot1
+}
+/**
+ * What was still in the reader's queues.
+ */
+export interface KeyQueueSnapshot1 {
+  /**
+   * The key sequence that invoked the reader's current operation. Empty between operations.
+   */
+  keys: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pending_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  queued_keys: string
+}
+/**
+ * Parameters of `root.editor.leave`.
+ */
+export interface RootEditorLeaveParams {
+  /**
+   * The prompt the reader was at.
+   */
+  prompt_generation: string
+  /**
+   * The revision of the reader that is leaving.
+   */
+  reader_revision: string
+  /**
+   * Why it stopped.
+   */
+  reason: 'command_accepted' | 'preexec' | 'reader_takeover' | 'cancellation' | 'root_exit'
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `root.editor.leave`.
+ */
+export interface RootEditorLeaveResult {
+  /**
+   * The state after the reader left. Leaving invalidates the fence.
+   */
+  state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
+}
+/**
+ * Parameters of `root.eof.detach`.
+ *
+ * The bridge submits this at an eligible empty primary prompt. Naming the fence, the prompt and
+ * the epoch is what makes the request attributable: the worker removes the attachment the fence
+ * names, never whichever one holds the lease when the request arrives.
+ */
+export interface RootEofDetachParams {
+  /**
+   * One published editor fence. An identity from an unacknowledged exchange names no fence.
+   */
+  fence_id: string
+  /**
+   * The current input lease epoch.
+   */
+  input_epoch: string
+  /**
+   * The prompt generation the gesture arrived at.
+   */
+  prompt_generation: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `root.eof.detach`.
+ */
+export interface RootEofDetachResult {
+  /**
+   * One CLI or application attachment, independently of its device.
+   */
+  detached_attachment: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  discarded_input_bytes: string
+  /**
+   * The state after the detach. The fence is invalidated before this answer is sent.
+   */
+  state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
+}
+/**
  * One signed service request.
  *
  * It authenticates a request; it authorises nothing by itself. What the caller may do with the
@@ -6081,6 +6664,53 @@ export interface SessionRef {
   session_id: string
 }
 /**
+ * Parameters of `shell.launch`.
+ */
+export interface ShellLaunchParams {
+  /**
+   * What to install.
+   */
+  command:
+    | {
+        arguments: string[]
+      }
+    | {
+        quoted_command: string
+      }
+  /**
+   * The buffer revision the caller expects an empty buffer to be at.
+   */
+  expected_buffer_revision: string
+  /**
+   * The prompt generation the caller expects the root editor to be at.
+   */
+  expected_prompt_generation: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of a `shell.launch` that was installed and submitted.
+ *
+ * A launch that was not installed is an error rather than a result: `EDITOR_BUSY` when the
+ * transaction could not be held, `DRAFT_CONFLICT` when the editor's own state had moved.
+ */
+export interface ShellLaunchResult {
+  /**
+   * The buffer revision after the command was installed.
+   */
+  buffer_revision: string
+  /**
+   * One published editor fence. An identity from an unacknowledged exchange names no fence.
+   */
+  fence_id: string
+  /**
+   * The prompt generation it was accepted at.
+   */
+  prompt_generation: string
+}
+/**
  * A manifest and the backup writer's signature over it.
  */
 export interface SignedArchiveManifest {
@@ -6536,7 +7166,7 @@ export interface WorkerDescriptor {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  process_start_identity: ProcessStartIdentity5
+  process_start_identity: ProcessStartIdentity7
   protocol_version: ProtocolVersion5
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
@@ -6580,7 +7210,7 @@ export interface BootIdentity5 {
  * unrelated program within milliseconds of the original exiting, so the host never terminates,
  * adopts or trusts a process on its identifier alone.
  */
-export interface ProcessStartIdentity5 {
+export interface ProcessStartIdentity7 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
