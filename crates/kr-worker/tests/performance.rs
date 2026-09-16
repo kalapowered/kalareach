@@ -369,9 +369,6 @@ async fn attach(host: &Host, owned: &mut Vec<SessionCreateResult>) -> Result<Dur
 /// daemon's own record of the closure rather than the worker's entry in the process table, because
 /// a process that has exited and has not yet been reaped is still an entry and is not a session.
 async fn close_all(host: &Host, sessions: &[SessionCreateResult]) -> Result<(), String> {
-    if sessions.is_empty() {
-        return Ok(());
-    }
     let endpoint = host
         .temp
         .environment()
@@ -382,8 +379,26 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) -> Result<(), 
     // to prevent.
     let mut client = None;
     let mut refused = Vec::new();
-    for created in sessions {
-        let session_id = created.session.session_id;
+    // What the daemon says this environment holds, not only what the measurement kept a note of.
+    // A create whose answer never arrived is a session all the same, and this host is the
+    // measurement's own, so everything in it is the measurement's to close.
+    let mut wanted: std::collections::BTreeSet<_> = sessions
+        .iter()
+        .map(|created| created.session.session_id)
+        .collect();
+    match list_sessions(&endpoint, host.environment_id).await {
+        Ok(listed) => wanted.extend(listed),
+        Err(error) => refused.push(format!("the daemon's session list: {error}")),
+    }
+    if wanted.is_empty() {
+        return if refused.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("the daemon answered: {refused:?}"))
+        };
+    }
+    for session_id in &wanted {
+        let session_id = *session_id;
         let mut attempts = 0;
         loop {
             attempts += 1;
@@ -438,10 +453,6 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) -> Result<(), 
         }
     }
 
-    let wanted: std::collections::BTreeSet<_> = sessions
-        .iter()
-        .map(|created| created.session.session_id)
-        .collect();
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let mut connected = match client.take() {
@@ -491,6 +502,35 @@ async fn close_all(host: &Host, sessions: &[SessionCreateResult]) -> Result<(), 
     } else {
         Err(format!("the daemon accepted every close: {refused:?}"))
     }
+}
+
+/// Returns every session the daemon holds for this environment, closed ones aside.
+async fn list_sessions(
+    endpoint: &kr_ipc::paths::Endpoint,
+    environment_id: EnvironmentId,
+) -> Result<Vec<SessionId>, String> {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .map_err(|error| format!("connect to the daemon: {error}"))?;
+    let listed: kr_protocol::session::SessionListResult = client
+        .request(
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: Nullable::some(environment_id),
+                include_closed: false,
+            },
+        )
+        .await
+        .map_err(|error| format!("the list call: {error}"))?
+        .map_err(|error| format!("the list failed: {error}"))?
+        .to_typed()
+        .map_err(|error| format!("the list result: {error}"))?;
+    Ok(listed
+        .sessions
+        .iter()
+        .filter(|summary| summary.state != kr_protocol::session::SessionState::Closed)
+        .map(|summary| summary.session_id)
+        .collect())
 }
 
 /// Returns a process's parent, which for a session's root shell is its worker.
