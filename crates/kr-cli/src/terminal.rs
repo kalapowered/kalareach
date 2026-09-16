@@ -51,25 +51,39 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// cursor, so the primary screen is not disturbed by the visit. Leaving a terminal in an enhanced key encoding is the failure a
 /// person cannot work around: their shell receives escape sequences where it expects characters.
 ///
-/// These cover the modes an application can leave enabled *other than* the keyboard protocols. The
-/// keyboard protocols are in [`KEYBOARD_RESET_SEQUENCES`] and are only ever sent together with what
-/// replaces them, because clearing one this attachment never changed would take away something the
-/// person set up for themselves.
+/// These cover the modes an application can leave enabled *other than* the keyboard protocols. Those
+/// are given back by [`KEYBOARD_RESTORE_SEQUENCES`], and only by a cleanup that follows an
+/// attachment which began forwarding, because only such an attachment could have changed them.
 pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
 
-/// The sequences that clear the keyboard protocols a session may have negotiated, in both buffers.
+/// The sequence that opens the attachment's own entry in the terminal's keyboard stack.
+///
+/// It is written once, where the attachment begins forwarding, and it is what makes the outer
+/// terminal's keyboard state restorable **without having read it**. The Kitty protocol keeps a
+/// stack per screen buffer: pushing saves whatever the terminal had negotiated and sets the flags
+/// this attachment starts from, which is none of them, so the session negotiates what it wants from
+/// a known baseline. A terminal that does not implement the protocol ignores the sequence.
+pub const KEYBOARD_BEGIN_SEQUENCES: &[u8] = b"\x1b[>0u";
+
+/// The sequences that give the keyboard protocols back, in both buffers.
 ///
 /// Each screen buffer has its own Kitty stack and its own `modifyOtherKeys` level, and a terminal
-/// can be left in either buffer, so both are visited: cleared where the terminal is, then in the
-/// alternate buffer, then in the primary one it is left in. Entering and leaving the alternate
-/// buffer through `?1049` saves and restores the cursor, so the primary screen is not disturbed by
-/// the visit.
+/// can be left in either buffer, so both are visited. Entering and leaving the alternate buffer
+/// through `?1049` saves and restores the cursor, so the primary screen is not disturbed by the
+/// visit.
+///
+/// What each buffer gets differs, because what is in them differs. The alternate buffer's stack
+/// belongs to whatever ran there, so it is emptied and the level is reset. The primary buffer is
+/// where [`KEYBOARD_BEGIN_SEQUENCES`] pushed this attachment's entry, so exactly that entry is
+/// popped and the terminal is left with the flags it had before the attachment began, whether or
+/// not anything ever read them. `\x1b[>4m` without a level is `modifyOtherKeys` back to the value
+/// the terminal itself starts with, which is the only form of that state a terminal can restore
+/// on its own.
 ///
 /// They are sent only by a cleanup that follows an attachment which began forwarding, because only
-/// then could the session have changed them. A cleanup that runs before that leaves them alone:
-/// nothing that had happened could have touched them.
-pub const KEYBOARD_RESET_SEQUENCES: &[u8] =
-    b"\x1b[<65535u\x1b[>4;0m\x1b[?1049h\x1b[<65535u\x1b[>4;0m\x1b[?1049l\x1b[<65535u\x1b[>4;0m";
+/// then could the session have changed them, and only then was the entry pushed.
+pub const KEYBOARD_RESTORE_SEQUENCES: &[u8] =
+    b"\x1b[?1049h\x1b[<65535u\x1b[>4m\x1b[?1049l\x1b[<1u\x1b[>4m";
 
 /// The whole probe's deadline.
 ///
@@ -107,13 +121,15 @@ impl Probe {
 /// Two of them are in use, and neither is readable from termios: the Kitty keyboard protocol keeps
 /// a flag set per screen buffer, and xterm's `modifyOtherKeys` keeps a level. A terminal that has
 /// been left in either one sends escape sequences where the person's shell expects characters,
-/// which is the failure they cannot work around; a terminal that had *chosen* one and had it
-/// cleared has lost something it set up. Both are therefore read before anything is changed, and
-/// written back on the way out.
+/// which is the failure they cannot work around.
+///
+/// Putting the terminal back does not depend on this: the attachment pushes an entry onto the
+/// terminal's own keyboard stack before it forwards anything, and the cleanup pops it, which
+/// restores a state nothing had to read. What was read is written back after that pop as the exact
+/// value the terminal reported, for a terminal whose stack this attachment cannot be sure of.
 ///
 /// `None` means the terminal did not answer that query, which is how a terminal says it does not
-/// implement the protocol. Nothing is then written back for it, and the clearing in
-/// [`RESET_SEQUENCES`] stands.
+/// implement the protocol. Nothing is then written back for it, and the pop stands on its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KeyboardState {
     /// The Kitty keyboard-protocol flags the terminal reported.
@@ -143,24 +159,23 @@ impl KeyboardState {
         self.kitty.is_some() || self.modify_other_keys.is_some()
     }
 
-    /// Returns the sequences that clear the session's keyboard protocols and put these back.
+    /// Returns the sequences that give the terminal its keyboard protocols back.
     ///
-    /// The clearing happens whatever was read, because a session that has been forwarding can have
-    /// set these modes whether or not the outer terminal ever said what it had. What was read comes
-    /// back after it; a terminal that answered nothing gets nothing back, which is the cost of
-    /// never asking it.
+    /// The pop in [`KEYBOARD_RESTORE_SEQUENCES`] does the work, and it does it whether or not
+    /// anything was ever read: the attachment's own entry is what it takes off. What was read is
+    /// written after it, which corrects the one case the stack cannot: an application inside the
+    /// session that pushed an entry of its own and exited without popping it.
     #[must_use]
     pub fn cleanup_sequences(&self) -> Vec<u8> {
-        let mut out = Vec::from(KEYBOARD_RESET_SEQUENCES);
+        let mut out = Vec::from(KEYBOARD_RESTORE_SEQUENCES);
         out.extend_from_slice(&self.restore_sequences());
         out
     }
 
     /// Returns the sequences that put a terminal back into this state.
     ///
-    /// They follow [`RESET_SEQUENCES`], which has already cleared whatever the session left. The
-    /// Kitty form sets the flags to exactly what was read rather than pushing them, because what
-    /// is being restored is a state and not a stack entry.
+    /// The Kitty form sets the flags to exactly what was read rather than pushing them, because
+    /// what is being restored is a state and not a stack entry.
     #[must_use]
     pub fn restore_sequences(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -304,7 +319,10 @@ mod unix {
 
     use rustix::termios::{OptionalActions, SpecialCodeIndex, Termios, Winsize};
 
-    use super::{KeyboardState, PROBE_DEADLINE, Probe, RESET_SEQUENCES, TerminalSize};
+    use super::{
+        KEYBOARD_BEGIN_SEQUENCES, KeyboardState, PROBE_DEADLINE, Probe, RESET_SEQUENCES,
+        TerminalSize,
+    };
     use crate::error::{CliError, Result};
 
     /// A handle on this process's controlling terminal.
@@ -390,12 +408,26 @@ mod unix {
             Ok(saved)
         }
 
+        /// Opens this attachment's entry in the terminal's keyboard stack.
+        ///
+        /// Written once, where forwarding begins. It is what makes the outer terminal's keyboard
+        /// state restorable without having read it, and it is paired with the pop in
+        /// [`KeyboardState::cleanup_sequences`].
+        pub fn begin_keyboard(&self) {
+            use std::io::Write as _;
+
+            let mut handle = &self.handle;
+            let _ = handle.write_all(KEYBOARD_BEGIN_SEQUENCES);
+            let _ = handle.flush();
+        }
+
         /// Restores saved modes and undoes the modes an application may have left enabled.
         ///
         /// `keyboard` is present once the attachment has begun forwarding, and carries whatever the
         /// outer terminal said it had negotiated. Its presence is what says the keyboard protocols
-        /// need clearing at all: a cleanup that runs before forwarding began passes `None` and
-        /// leaves them alone, because nothing that had happened could have changed them.
+        /// are this attachment's to put back at all: a cleanup that runs before forwarding began
+        /// passes `None` and leaves them alone, because nothing that had happened could have
+        /// changed them and nothing had pushed the entry this would pop.
         ///
         /// # Errors
         ///
@@ -777,8 +809,32 @@ mod tests {
     }
 
     #[test]
-    fn the_keyboard_is_cleared_only_together_with_what_replaces_it() {
-        // A terminal that answered: cleared in both buffers, then put back.
+    fn a_terminal_that_was_never_asked_still_gets_its_keyboard_state_back() {
+        // Nothing was read, which is what `--no-probe` chooses and what a terminal that answers
+        // neither query leaves. The entry this attachment pushed is still popped, so the terminal
+        // is left with the flags it had before the attachment began rather than with none.
+        let unknown =
+            String::from_utf8_lossy(&KeyboardState::EMPTY.cleanup_sequences()).into_owned();
+        assert!(
+            unknown.contains("\u{1b}[<1u"),
+            "this attachment's own stack entry comes off: {unknown:?}"
+        );
+        assert!(
+            !unknown.contains("\u{1b}[>4;0m"),
+            "and no level is imposed on a terminal that never reported one: {unknown:?}"
+        );
+        assert!(
+            unknown.contains("\u{1b}[>4m"),
+            "modifyOtherKeys goes back to the terminal's own initial value: {unknown:?}"
+        );
+        assert!(
+            !unknown.contains("\u{1b}[="),
+            "and nothing is set to a state nobody read: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn what_a_terminal_reported_is_put_back_after_the_stack_entry_comes_off() {
         let known = KeyboardState {
             kitty: Some(5),
             modify_other_keys: Some(2),
@@ -790,26 +846,32 @@ mod tests {
         );
         assert_eq!(
             cleanup.matches("\u{1b}[<65535u").count(),
-            3,
-            "the Kitty stack is cleared where the terminal is and in both buffers"
+            1,
+            "the stack emptied is the alternate buffer's, which belongs to what ran there"
+        );
+        assert!(
+            cleanup.contains("\u{1b}[<1u"),
+            "and the primary buffer gives back exactly this attachment's entry: {cleanup:?}"
         );
         assert!(
             cleanup.ends_with("\u{1b}[=5;1u\u{1b}[>4;2m"),
-            "and what it had comes back last: {cleanup:?}"
+            "with what the terminal itself reported last of all: {cleanup:?}"
         );
+    }
 
-        // A terminal that was never asked, cleaned up after an attachment that had been
-        // forwarding: the session's own modes are still cleared, because it could have set them,
-        // and nothing comes back, which is what never asking costs.
-        let unknown =
-            String::from_utf8_lossy(&KeyboardState::EMPTY.cleanup_sequences()).into_owned();
-        assert!(
-            unknown.contains("\u{1b}[<65535u"),
-            "the session's modes are cleared"
+    #[test]
+    fn forwarding_opens_the_entry_the_cleanup_takes_off() {
+        let begin = String::from_utf8_lossy(KEYBOARD_BEGIN_SEQUENCES).into_owned();
+        assert_eq!(
+            begin, "\u{1b}[>0u",
+            "one push, with the flags this attachment starts from: {begin:?}"
         );
-        assert!(
-            !unknown.contains("\u{1b}[="),
-            "and nothing is put back: {unknown:?}"
+        let cleanup =
+            String::from_utf8_lossy(&KeyboardState::EMPTY.cleanup_sequences()).into_owned();
+        assert_eq!(
+            cleanup.matches("\u{1b}[<1u").count(),
+            1,
+            "and one pop against it: {cleanup:?}"
         );
     }
 }

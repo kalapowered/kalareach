@@ -332,8 +332,11 @@ const KEYBOARD_RESTORED: &[u8] = b"\x1b[=5;1u";
 /// The `modifyOtherKeys` level this test's terminal reported, as the restoration writes it.
 const MODIFY_OTHER_KEYS_RESTORED: &[u8] = b"\x1b[>4;2m";
 
-/// The first sequence a cleanup that clears the keyboard protocols sends.
-const KEYBOARD_CLEARED: &[u8] = b"\x1b[<65535u";
+/// The push that opens this attachment's entry in the terminal's keyboard stack.
+const KEYBOARD_PUSHED: &[u8] = b"\x1b[>0u";
+
+/// The pop that gives the terminal's keyboard state back, whether or not anything read it.
+const KEYBOARD_POPPED: &[u8] = b"\x1b[<1u";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
@@ -681,8 +684,13 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
         output.text().escape_debug()
     );
     assert!(
-        !output.contains(KEYBOARD_CLEARED),
-        "and nothing cleared the keyboard protocols it never changed: {}",
+        !output.contains(KEYBOARD_PUSHED),
+        "nothing opened a keyboard stack entry, because nothing began forwarding: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        !output.contains(KEYBOARD_POPPED),
+        "and nothing took the keyboard protocols away from a terminal it never changed: {}",
         output.text().escape_debug()
     );
     let after = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
@@ -690,6 +698,66 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
         after.local_modes.bits(),
         before.local_modes.bits(),
         "while the modes it borrowed for the handshake came back"
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attachment_that_asked_nothing_still_gives_the_keyboard_state_back() {
+    // `--no-probe` is chosen before any query is sent and asks the terminal nothing, so there is no
+    // answer to write back on the way out. The terminal's own keyboard stack holds the state
+    // instead: the attachment pushes an entry as it begins forwarding and the cleanup pops it, so a
+    // person who had negotiated a keyboard protocol for themselves still has it afterwards.
+    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let display = hosted.display.get().to_string();
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!(
+                "{} attach {display} --no-probe; printf 'attach-finished-%s\\n' \"$?\"",
+                env!("CARGO_BIN_EXE_kr")
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    assert!(
+        output.wait_for(b"ready", Duration::from_secs(30)),
+        "the session's output reached the terminal: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        output.contains(KEYBOARD_PUSHED),
+        "the attachment opened its own entry in the terminal's keyboard stack: {}",
+        output.text().escape_debug()
+    );
+
+    let attach = attach_process(shell.process_id().expect("the shell has an identifier"))
+        .expect("the shell started the attach command");
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &attach.to_string()])
+        .status()
+        .expect("sends the signal");
+    assert!(killed.success(), "the attach process was killed");
+
+    assert!(
+        output.wait_for(KEYBOARD_POPPED, Duration::from_secs(10)),
+        "and the guard gave the terminal its keyboard state back: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        !output.contains(b"\x1b[="),
+        "without setting it to anything nobody ever read: {}",
+        output.text().escape_debug()
     );
     let _ = shell.kill();
     let _ = shell.wait();

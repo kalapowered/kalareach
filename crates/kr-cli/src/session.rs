@@ -168,10 +168,14 @@ pub async fn run(
     )
     .await?;
 
-    // The guard is told whatever was read, including nothing, at the moment forwarding is about to
-    // begin and not before: being told at all is what says the keyboard protocols the session may
-    // set are this attachment's to clear, and an attach that failed on its way here changed
-    // nothing that needs clearing.
+    // Forwarding begins here, and the terminal's keyboard protocols are dealt with at this exact
+    // boundary and not before. The push opens this attachment's own entry in the terminal's
+    // keyboard stack, so whatever the terminal had negotiated is held by the terminal itself and
+    // comes back on the way out whether or not anything ever read it. The guard is told the same
+    // thing at the same moment, including that nothing was read: being told at all is what says
+    // the entry exists and the protocols are this attachment's to put back. An attach that failed
+    // on its way here pushed nothing and changed nothing.
+    terminal.begin_keyboard();
     guard.learn_keyboard(&keyboard);
     let raw_replaced = terminal.enter_raw_mode()?;
 

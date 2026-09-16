@@ -59,7 +59,9 @@ mod console {
     use std::fs::File;
 
     use crate::error::{CliError, Result};
-    use crate::terminal::{KeyboardState, Probe, RESET_SEQUENCES, TerminalSize};
+    use crate::terminal::{
+        KEYBOARD_BEGIN_SEQUENCES, KeyboardState, Probe, RESET_SEQUENCES, TerminalSize,
+    };
 
     /// A handle on this process's console.
     ///
@@ -176,10 +178,23 @@ mod console {
             Ok(saved)
         }
 
+        /// Opens this attachment's entry in the terminal's keyboard stack.
+        ///
+        /// The console host itself implements neither keyboard protocol, but the sequence is
+        /// written all the same: what is on the other end of this console may be a terminal that
+        /// does, and a terminal that does not ignores it.
+        pub fn begin_keyboard(&self) {
+            use std::io::Write as _;
+
+            let mut handle = &self.output;
+            let _ = handle.write_all(KEYBOARD_BEGIN_SEQUENCES);
+            let _ = handle.flush();
+        }
+
         /// Restores saved modes and undoes the modes an application may have left enabled.
         ///
         /// `keyboard` is what this console had negotiated before the attachment began, written
-        /// after the clearing sequences.
+        /// after the entry this attachment pushed comes off.
         ///
         /// # Errors
         ///
