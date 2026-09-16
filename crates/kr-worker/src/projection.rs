@@ -191,10 +191,12 @@ impl TerminalEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error when the grid cannot be that size.
-    pub fn resize(&mut self, canonical: Dimensions) -> Result<()> {
+    /// Returns an error when the grid cannot be that size, including
+    /// [`WorkerError::ResourceUnavailable`] when what both screen buffers would hold at that size
+    /// does not fit the session's budget. Nothing is allocated and nothing moves in that case.
+    pub fn resize(&mut self, canonical: Dimensions, now_ms: u64) -> Result<()> {
         let size = grid_size(canonical)?;
-        self.engine.resize(size).map_err(term_failure)?;
+        self.engine.resize(size, now_ms).map_err(term_failure)?;
         self.canonical = canonical;
         // A resize advances the engine's projection, so every client's screen is described again
         // from a snapshot rather than continued from one taken at another size. The retained bytes
@@ -404,7 +406,15 @@ fn grid_size(dimensions: Dimensions) -> Result<GridSize> {
 
 /// Renders a terminal-engine failure as a worker failure.
 fn term_failure(error: kr_term::TermError) -> WorkerError {
-    WorkerError::InvalidArgument(error.to_string())
+    // The engine says what each of its failures is on the wire, and a geometry it refuses before
+    // allocating anything is not the caller's mistake but this session's capacity: a client answers
+    // it by asking for a size that fits, which is what `RESOURCE_UNAVAILABLE` tells it to do.
+    match error.code() {
+        kr_protocol::error::ErrorCode::ResourceUnavailable => WorkerError::ResourceUnavailable {
+            detail: error.to_string(),
+        },
+        _ => WorkerError::InvalidArgument(error.to_string()),
+    }
 }
 
 /// Returns whether a side effect is one a terminal is shown at all.

@@ -787,3 +787,46 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
     let runtime = std::sync::Arc::clone(&runtime);
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_geometry_the_session_budget_cannot_admit_is_refused_before_anything_moves() {
+    // A size is refused by what it would cost, not only by what the kernel will take: both screen
+    // buffers at that geometry have to fit the session's budget, and one that does not is refused
+    // before a cell is allocated. The answer names a resource rather than the caller's argument,
+    // because the same size is one another session runs at and a client answers it by asking for a
+    // size that fits.
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 120");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Geometry);
+    session
+        .attach(&terminal_attachment(session_id), requested, attachment_id)
+        .expect("attaches");
+    let before = session.geometry();
+
+    let refused = session
+        .resize(
+            attachment_id,
+            Dimensions::new(2_048, 128),
+            before.epoch.get(),
+        )
+        .expect_err("a geometry that does not fit the session's budget is refused");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "the refusal names the resource: {refused}"
+    );
+    let after = session.geometry();
+    assert_eq!(
+        (after.dimensions, after.epoch),
+        (before.dimensions, before.epoch),
+        "and the terminal the application is looking at did not move"
+    );
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}

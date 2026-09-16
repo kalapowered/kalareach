@@ -396,8 +396,11 @@ impl Session {
     /// They are one size. A terminal whose kernel size and canonical grid disagreed would place
     /// its cursor by one and wrap by the other, so neither is moved without the other.
     fn resize_canonical(&mut self, dimensions: Dimensions) -> Result<()> {
+        // The grid decides first, because it is the one that can refuse: a size whose two screen
+        // buffers do not fit this session's budget is refused before anything is allocated for it,
+        // and the terminal the application is looking at must not have moved in the meantime.
+        self.engine.resize(dimensions, kr_ipc::now_ms().get())?;
         self.pty.resize(dimensions)?;
-        self.engine.resize(dimensions)?;
         // A resize advances the engine's projection: every client's screen is at the old size and
         // nothing continues from it. They are told, here, rather than on the next byte the
         // application happens to write, which for an idle session may be never.
