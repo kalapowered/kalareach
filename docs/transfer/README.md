@@ -1,0 +1,360 @@
+# Transfer reference
+
+How bytes get into and out of an execution environment, what a completed attachment is, and what an
+adapter or a client can build on top. The code is `crates/kr-transfer`, hosted by the control daemon
+in `crates/kr-controller/src/transfer.rs`; the wire types are `kr_protocol::transfer`.
+
+One service does this for everybody. The command line, the desktop and mobile applications, an
+adapter that needs a staged image, and anything else that speaks the protocol are all callers. There
+is no graphical half.
+
+```text
+upload.begin ─▶ upload.chunk ─▶ upload.finish ─▶ attachment handle
+       │             │               │                  │
+       │             │               │                  ├─▶ agent.draft.add_attachment
+       │             │               │                  │     then agent.prompt.submit
+       │             │               │                  └─▶ download.begin ─▶ download.chunk
+       └─────────────┴── upload.status ─── resume, or resolve a lost reply
+```
+
+There are four stages and four records. Transfer moves bytes. Storage publishes them as an
+attachment. Insertion offers that attachment to an agent through its adapter. Submission is a
+further action again. A failed insertion loses none of the three stages before it.
+
+## The seven methods
+
+| Method | Effect | What it does |
+| --- | --- | --- |
+| `upload.begin` | write | Reserves the declared size and returns the upload identity, the chunk layout, an empty received-chunk bitmap and an expiry |
+| `upload.status` | read | Reports verified chunk status, and the published handle once there is one |
+| `upload.chunk` | write | Accepts one chunk with its index, exact length and digest |
+| `upload.finish` | write | Verifies the whole-file digest and size, then publishes the handle |
+| `upload.cancel` | write | Cancels an unfinished upload and releases its reservation |
+| `download.begin` | read | Opens an immutable source or stages a bounded immutable snapshot, and describes its chunks |
+| `download.chunk` | read | Reads one chunk of that same snapshot, rechecking read authority first |
+
+`draft.create`, `draft.update` and `agent.draft.add_attachment` are in the same method group and the
+same service. `agent.prompt.submit` is not: submission goes to the worker that owns the session.
+
+Every one of these returns an opaque identifier. None of them returns a client-supplied absolute
+host path, and none accepts one.
+
+## Limits
+
+These are configurable resource limits, not subscription restrictions. A self-hosted owner changes
+them; nothing in the protocol depends on the defaults.
+
+| Limit | Default | Where it lives |
+| --- | --- | --- |
+| chunk size | 1 MiB | `kr_protocol::limits::UPLOAD_CHUNK_LEN`, fixed by the wire contract |
+| one file | 2 GiB | `max_file_len`, per environment |
+| staged bytes | 8 GiB | `max_staged_len`, per environment |
+| concurrent transfers | 2 | `max_concurrent_transfers`, per device |
+| unfinished upload | 24 hours | `UNFINISHED_UPLOAD_LIFETIME` |
+| unused attachment | 7 days | `UNUSED_ATTACHMENT_LIFETIME` |
+| download snapshot | 24 hours | `DOWNLOAD_SNAPSHOT_LIFETIME` |
+
+A submitted attachment follows its session's retention instead of the seven-day window, which is why
+submission is recorded rather than inferred from age. The host tells the service which sessions its
+retention still covers; the service never guesses.
+
+The environment's staged total counts three things together: receiving uploads at their declared
+size, published attachments still on disk, and open download snapshots. A snapshot is storage this
+environment spent, so it is charged like everything else. Reading a published attachment in place
+charges nothing, because those bytes are already counted against the attachment that holds them.
+
+A byte quota is `QUOTA_EXCEEDED`, which nothing retries into. The concurrency ceiling is
+`RESOURCE_UNAVAILABLE`, because it clears when one of the caller's own transfers finishes.
+
+## Which stream a chunk travels on
+
+A 1 MiB chunk does not fit a control frame. Section 23 gives it its own stream kind with its own
+bound, 1 MiB of chunk data plus at most 4 KiB of metadata and framing, and says outright that the
+larger bound cannot be selected on a control stream. So chunks have their own stream on both
+transports.
+
+On the network transport it is a data stream whose header declares `attachment_chunks` and names the
+transfer, validated against the established control connection. On a local endpoint there are no
+streams to multiplex, so the daemon listens on a second endpoint beside its control endpoint and
+frames that connection at the attachment bound. The handshake, the peer-credential
+authentication and the action windows are the control connection's, unchanged. The frame bound is
+the only difference, and it is why the endpoint exists at all.
+
+| Endpoint | Unix | Windows | Carries |
+| --- | --- | --- | --- |
+| clients | `<runtime>/<prefix>/c.sock` | `kalareach-<uid>-<prefix>-c` | every method whose frames fit 1 MiB |
+| attachment chunks | `<runtime>/<prefix>/t.sock` | `kalareach-<uid>-<prefix>-t` | `upload.chunk` and `download.chunk` |
+
+What travels is the same `ControlFrame` union both transports carry, so a chunk is an ordinary
+mutation with an ordinary action window and an ordinary response. That is what keeps `upload.chunk`
+inside the host's admission path rather than beside it. `kr_transfer::chunks::ChunkChannel` is the
+client half; it replaces the window whenever the host renews one, so a long chunk sequence never has
+to think about freshness.
+
+## Storage layout
+
+```text
+<state>/environments/<prefix>/transfers/
+  transfers.sqlite
+  <32 random hexadecimal characters>/
+    incomplete/   uploads still receiving chunks
+    complete/     verified, published attachments
+    snapshots/    immutable download snapshots
+```
+
+The staging directory is 0700 on Unix. On Windows it is created with a protected access-control list
+holding one entry for the object's owner and one inherit-only entry that becomes an owner entry on
+everything created beneath it, so inheritance from the user profile cannot widen it.
+
+Incomplete files live in a different directory from completed ones. Nothing can read a partially
+written payload as though it were an attachment, because a published handle names a file in the
+completed area.
+
+Payload files are created exclusively, without following links, mode 0600, and never with an
+executable bit. The storage name comes from the transfer identifier in hexadecimal, plus at most a
+validated extension taken from the original filename: ASCII alphanumeric, sixteen bytes or fewer, and
+not one of the extensions Windows would execute. Everything else about the client's name is
+metadata. Separators, traversal segments, reserved device names and stream separators never reach
+the storage path.
+
+The random directory name is not a secret and nothing depends on it staying unknown. It is there so
+two installations, or an installation and a restored backup, never collide on a payload name, and so
+a path guessed from a transfer identifier alone names nothing.
+
+## The journal, and what makes a transfer resumable
+
+`transfers.sqlite` runs in write-ahead-logging mode with full synchronisation and forward-only
+migrations. Every state change commits together with the outbox row that announces it.
+
+| Table | What it holds |
+| --- | --- |
+| `uploads` | one row per upload: the declaration, the reservation, the state, the verified digest and the preview |
+| `chunks` | the per-chunk journal: index, exact length, digest and when it was written |
+| `snapshots`, `snapshot_chunks` | download snapshots, their chunk layout and the source facts they were taken against |
+| `scopes` | registered read scopes, with the stable filesystem identity each one was recorded for |
+| `drafts`, `draft_attachments` | drafts, the attachments bound to them and what became of each offer |
+| `grants` | narrow read grants over one attachment each |
+| `actions` | retained mutation outcomes, keyed by actor and action identifier |
+| `events`, `cursors` | the outbox and its consumers' positions |
+
+The order the rows are written in is what makes a resume possible.
+
+An upload row exists before a single byte is accepted, with its declared size already charged against
+the environment's budget. A chunk row is written after its bytes are on disk and flushed, because a
+row with no bytes behind it would let a later verification trust a hole; bytes with no row are simply
+sent again, which costs one chunk.
+
+Publication is two commits with a recoverable state between them. The row moves to `publishing`
+naming both the incomplete and the published name, then the file is renamed, then the row moves to
+`published`. A daemon that dies in the middle finds the `publishing` row at startup and resolves it
+from whichever name exists: the published name means the rename landed and only the row was behind,
+and the incomplete name means it did not and the verified bytes are still there to move. A row with
+neither is invalidated, because a handle whose file is gone is not a handle. Nothing here needs a
+separate directory flush, since the record answers either way.
+
+That is what makes the ownership contract true rather than merely stated. A worker's death
+invalidates an insertion; it does not change the identity of a file this service already verified.
+
+## Integrity
+
+Every chunk carries its index, its exact length and the SHA-256 digest of exactly those bytes.
+Three rules follow.
+
+Bytes that do not match their own descriptor are refused, and the upload survives. A transmission
+fault is the caller's to retry.
+
+A duplicate that matches what was recorded is acknowledged, and nothing is rewritten.
+
+A duplicate that conflicts invalidates the upload. Two different byte sequences claimed the same
+position, and nothing can choose between them without guessing, so the identifier is spent and a
+new one is required.
+
+`upload.finish` then reads the whole staged file back through its own handle and compares the digest
+and the size against what `upload.begin` recorded. A mismatch invalidates the upload with
+`ATTACHMENT_INTEGRITY`. This is also the check that catches another process under the same account
+writing to the staged file, which the authority model does not exclude.
+
+A `upload.finish` whose declared size or digest differs from the one `upload.begin` recorded is
+`SOURCE_CHANGED`. A changed source needs a new upload identifier: the reservation, the layout and
+every chunk already accepted belong to the first declaration.
+
+A lost reply to `upload.finish` is resolved two ways, both of which return the same handle and
+neither of which produces a second file. `upload.status` reports the published handle. Repeating the
+same action identifier returns the retained outcome, and the retained record is consulted before the
+freshness window is, because a retry carries the window it was first admitted under and the
+connection now holds a newer one. The same identifier with a different payload is `ID_CONFLICT`.
+
+## Filesystem authority
+
+Section 14 paragraph 5 asks for opened directory and object handles rather than validated path
+strings, and that is what `AuthorisedDirectory` is: an open directory descriptor, with every
+descendant opened relative to it, one component at a time.
+
+The no-escape policy, qualified:
+
+- A name is relative in this crate's accepted form. No root, no drive prefix, no `..`, no `.`, no
+  empty component, no NUL or other control byte, no separator other than `/`, no trailing dot or
+  space on a component, no alternate-data-stream colon, and no Windows reserved device name with or
+  without an extension. The same rules apply on every platform, so a name one host accepts is a name
+  every host accepts.
+- Resolution opens each intermediate component with the no-follow open. A component that is a
+  symbolic link or a reparse point fails the lookup instead of redirecting it, whether it points
+  inside the tree or out of it. Replacing a component with a link during the walk fails the same
+  way, because the open that would have crossed it is the one that refuses.
+- After the open, the object's stable filesystem identity, device and inode on Unix or volume serial
+  and file index on Windows, is read back through the handle and checked against the policy the
+  caller asked for. A payload file this host created must have exactly one name; a file the host only
+  reads may have more, because a hard link is a name inside the directory rather than a path that
+  leaves it.
+- A directory handle's identity is recorded when it is opened. A scope reopened after a restart is
+  refused unless it finds the same object, so a rename, a case alias or a replacement directory at
+  the same path does not extend the grant to an unrelated tree. The handle is the authority; the
+  recorded path is for diagnostics and for reopening.
+- An environment identity travels with every handle. A handle from one environment is never accepted
+  by another, which is how a Windows path and a WSL path stay separate rather than aliasing.
+
+`cap-std` 4.0.3 owns the three platform implementations: `openat2` with `RESOLVE_BENEATH` on Linux,
+component-wise `openat` with `O_NOFOLLOW` on other Unix systems, and relative `NtCreateFile` opens
+with reparse-point rejection on Windows. This crate is the policy, not the syscalls.
+
+An open is non-blocking on Unix, so a name replaced with a named pipe cannot hold the service open
+waiting for a writer. The handle's own metadata then decides whether it is a regular file.
+
+`fixtures/transfer/no-escape.json` is the policy in one document: the names the validator accepts and
+refuses, the tree a lookup runs against, and what each lookup must do. The Unix cases run in
+`crates/kr-transfer/tests/authority.rs`. The Windows cases are in the same fixture and are built
+when the running platform can build them; where it cannot, the case is reported as not exercised
+rather than counted as passed.
+
+### What this does not promise
+
+Handle-based resolution removes path-resolution races. It does not make an authorised file private
+from another process running as the same operating-system user: such a process can open and write a
+file this host has authorised, and nothing in this crate prevents it. Where immutability is the
+requirement, as it is for a download, the host stages its own copy and verifies it instead of
+trusting an open handle.
+
+## Verified downloads
+
+One distinction decides everything else. A published attachment is already an immutable
+revision, because nothing writes it after it is verified, so it is read where it lies. Any other source is
+concurrently writable, and an open handle does not make it otherwise, so the host stages a bounded
+immutable copy and serves that. `download.begin` says which of the two happened in its result, so
+nothing has to infer it.
+
+A snapshot records the source's stable identity, its size and its modification time as they were
+when the copy was taken. If any of them moved by the time the copy finished, or the source grew past
+the size the snapshot reserved for it, the snapshot fails with `SOURCE_CHANGED` and keeps a failed
+record. It never serves chunks that came from two versions of a file. The staged copy is then read
+back through its own handle and verified, so a snapshot something else wrote during staging fails
+there rather than serving bytes nothing checked.
+
+Resuming names the transfer. The same snapshot answers with the same identity, size, digest, chunk
+layout and expiry. A snapshot that has expired, failed or been released is refused rather than
+silently replaced, and a new transfer is required.
+
+Read authority is rechecked on every chunk, not once at the start. A revoked read scope stops
+further bytes at once; so does an attachment whose retention has ended. Every chunk's bytes are
+rehashed and compared against the digest recorded for them, so a snapshot file tampered with after
+staging fails integrity.
+
+### The client's half
+
+The host never writes to a client destination. `DownloadWriter` is the contract the client performs,
+and it is in this crate so both halves run the same code.
+
+It verifies every chunk against its own digest before writing it, refuses a conflicting duplicate
+rather than replacing what was accepted, writes through a temporary file in the destination itself,
+and checks the total size and the whole-file digest before the destination is named. An existing
+destination is refused unless the placement carries the user's explicit overwrite action for that
+exact destination, which is checked again at the publish because a destination can appear while a
+download runs. A writer that is dropped without publishing takes its temporary file with it.
+
+## Attachments, drafts and insertion
+
+`upload.finish` returns an `AttachmentHandle`: an opaque, environment-bound identity with the
+verified size and digest of the bytes behind it, the media type the client declared, the original
+filename as metadata, a bounded preview where one could be made, and an expiry. It carries no host
+path.
+
+`presented_as_image` is true only when the bytes decoded as one of the four supported formats. An
+adapter reads that rather than guessing from a declared media type or a filename, which is how
+unsupported media transfers as a file without being offered as a model image.
+
+A draft is durable and device-owned, with its own revision. Every update and every binding names the
+revision it expects, and a mismatch is `DRAFT_CONFLICT` that changes nothing. Losing a connection
+removes an attachment's association, not the draft.
+
+`agent.draft.add_attachment` binds a completed handle to a draft and records that the adapter was
+asked. The binding starts at `recorded`, which says exactly that and no more. It reaches
+`accepted_by_agent` only when an adapter reports the upstream part or native draft binding, and
+nothing else sets it. A failure records `failed` with its reason and keeps both the draft and the
+published attachment, so a retry has something to retry with.
+
+A contribution declares what one operation accepts before anything is offered: the media types, the
+selected model's size limit, how many attachments a draft may carry, the insertion method and any
+external destination. The host checks the handle against that declaration. An operation that claims
+a model media capability cannot bind bytes that did not decode as an image.
+
+Section 12 allows three insertion methods and no others:
+
+| Method | Needs a readable path | What it is |
+| --- | --- | --- |
+| `typed_submission` | no | A typed submission against the exact upstream binding |
+| `verified_composer_insertion` | yes | Insertion into a native composer behind a qualified atomic editor boundary |
+| `manual_terminal_workflow` | yes | The user performs the native operation after an environment-local transfer, with the host showing the tested syntax |
+
+The two that need a readable path get an `AttachmentReadGrant`: one file, read only, one purpose,
+fifteen minutes. The staged file is inside the environment's state directory and outside every
+repository, which is what keeps an upload from becoming a file in a working tree. No sandbox is
+widened and no file is placed in a repository. A typed submission needs no path and is given none.
+
+## Previews
+
+Section 14 fixes four numbers and a format list, and the decoder is those bounds and nothing else:
+40 megapixels of input, 256 MiB of decode memory, a 16 MiB decoded-thumbnail budget, and PNG, JPEG,
+WebP and the first frame of a GIF. The `image` crate is pinned at 0.25.10 with only those four
+decoders compiled in.
+
+The format comes from the bytes. A declared media type is a claim and an extension is metadata, so
+the crate's own sniffing decides which decoder runs. The dimensions are read from the header before
+anything is decoded, which means an image above the pixel limit costs a header read rather than an
+allocation. A GIF decoded as one image yields its first frame and reads no further; the animation
+interface is a separate call this crate never makes.
+
+HTML and SVG stay files. Rendering either needs a reviewed renderer, and this is not one, so both are
+refused by declared media type and again by the bytes.
+
+When a decode fails, or the image is too large, or the format is one this decoder does not
+handle, the attachment publishes with no preview, the reply says why, and the original file is
+untouched. Nothing invents a placeholder image to stand in for it.
+
+## Errors
+
+| Code | When |
+| --- | --- |
+| `ATTACHMENT_INTEGRITY` | a chunk, a size or a whole-file digest did not verify |
+| `SOURCE_CHANGED` | a declaration changed, a source moved under a snapshot, or a snapshot is gone |
+| `QUOTA_EXCEEDED` | a per-file or per-environment byte limit |
+| `RESOURCE_UNAVAILABLE` | the device's concurrency ceiling, or a transfer in a state that admits no more |
+| `DRAFT_CONFLICT` | the draft's revision is not the one the caller expected |
+| `PERMISSION_DENIED` | a name that leaves an authorised directory, a revoked scope or grant, or another principal's transfer |
+| `ENVIRONMENT_UNAVAILABLE` | the request names an environment this service does not own |
+| `ID_CONFLICT` | one action identifier used for two different payloads |
+| `INVALID_ARGUMENT` | a malformed request, or an identifier that names nothing |
+| `STORAGE_UNAVAILABLE` | the journal or the staging area could not be used |
+
+An identifier that names nothing is `INVALID_ARGUMENT` rather than a code of its own, so a caller
+never learns from the error whether something with that identifier exists.
+
+## What a caller builds on
+
+The Rust API is `kr_transfer`. A host opens `TransferService::open(&environment_paths)`, calls
+`recover()` before serving anything, and drives the methods above; the control daemon does exactly
+that in `crates/kr-controller/src/transfer.rs`. A client that wants a file on disk uses
+`DownloadWriter`, which never holds more than one chunk in memory. A caller that needs a readable
+source registers it with `register_scope` and addresses files beneath it by relative name.
+
+`AuthorisedDirectory` is the type the project and change-set services reuse. The policy is the
+same whether it authorises a staging area, a repository working tree or a client's chosen
+destination.

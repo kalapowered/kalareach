@@ -21,7 +21,7 @@ Two roots, both owner-only, both checked rather than assumed on every open.
 | Root | macOS | Linux | Override | Holds |
 | --- | --- | --- | --- | --- |
 | runtime | `$TMPDIR/kalareach` | `$XDG_RUNTIME_DIR/kalareach` | `KR_RUNTIME_DIR` | the control socket, the rendezvous socket, worker endpoints, published descriptors |
-| state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback |
+| state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback, the transfer store and its staging area |
 
 Everything above a root is created with the platform's ordinary permissions; `/tmp` is
 world-writable by design and `~/.cache` is usually group-readable, and neither is KalaReach's to
@@ -35,9 +35,10 @@ much of that; it is not unique, so each directory also carries an `environment` 
 complete identifier. A second environment whose identifier shares the prefix is refused, never
 silently given another environment's registry.
 
-Endpoints are `c.sock` (clients), `r.sock` (the owner-only rendezvous) and `w<display>.sock` (one
-worker). On Windows they are named pipes scoped by user and environment, carrying an owner-only
-access-control list, because the pipe namespace has no directory permissions to inherit.
+Endpoints are `c.sock` (clients), `r.sock` (the owner-only rendezvous), `t.sock` (attachment
+chunks) and `w<display>.sock` (one worker). On Windows they are named pipes scoped by user and
+environment, carrying an owner-only access-control list, because the pipe namespace has no directory
+permissions to inherit.
 
 ## Descriptors
 
@@ -370,6 +371,30 @@ at all. Silence here is therefore not evidence of idleness: idle means a verifie
 pending request and no active owned work, which is a different question asked elsewhere. What a
 closure rests on instead is the boundary observed again as the processes are asked to stop, as
 whatever is left is forced, and as the record is written.
+
+## The transfer service
+
+The daemon hosts the environment's transfer service, which owns `transfers.sqlite` and a private
+staging directory under the state directory. The daemon owns three things about it: admission, the
+endpoints and the retention.
+
+Admission is the ordinary path. A transfer read is checked against current authority before and
+after it runs. A transfer mutation carries an action window, is checked against the method registry,
+and runs on a task a dropped connection cannot cancel part way. A retry after a lost reply is
+answered from the retained record before the freshness window is considered, because the retry
+carries the window it was first admitted under.
+
+A 1 MiB attachment chunk does not fit a control frame, so chunk traffic has its own endpoint,
+`t.sock`, framed at the attachment bound. Everything else about that connection is the control
+connection's: the same handshake, the same peer credentials and the same action windows.
+
+The service cannot know which sessions this host still retains, so the daemon answers for them: a
+session the registry has a reservation for keeps what was submitted to it. An hourly sweep expires
+unfinished uploads after twenty-four hours, unused attachments after seven days, and download
+snapshots at their own expiry. At startup the service resolves any publication an earlier daemon
+left between its two commits, so a handle never names a file this host has not found.
+
+`docs/transfer/` has the protocol, the limits, the storage layout and the authority model.
 
 ## Closure
 
