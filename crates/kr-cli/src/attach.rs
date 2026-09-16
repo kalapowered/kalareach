@@ -37,14 +37,16 @@ pub const GUARD_RELEASE: u8 = b'R';
 /// the terminal, and nothing may change the terminal before something is holding what it had.
 pub const GUARD_KEYBOARD: u8 = b'K';
 
-/// The byte that asks the guard to open this attachment's entry in the terminal's keyboard stack.
+/// The byte that tells the guard this attachment is about to begin forwarding.
 ///
-/// The guard does it, and not the attach process, because the operation is not repeatable: a push
-/// that happened and a pop that answers it have to be one pair, whichever process is alive to send
-/// it. A guard that pushed pops on its way out however this attachment ended.
+/// From that moment the session can change the terminal's keyboard protocols, so the guard owes
+/// them back however this attachment ends. It is told before the first byte is forwarded, because a
+/// guard that learned it afterwards would have a window in which the terminal was changed and
+/// nothing was going to put it back.
 pub const GUARD_BEGIN: u8 = b'B';
 
-/// The byte a guard sends once it is holding the terminal's state, and again once it has pushed.
+/// The byte a guard sends once it is holding the terminal's state, and again once it has been told
+/// that forwarding is beginning.
 pub const GUARD_READY: u8 = b'A';
 
 /// How long the attach process waits for its guard to report that it is armed.
@@ -148,13 +150,10 @@ impl RestorationGuard {
         }
     }
 
-    /// Asks the guard to open this attachment's entry in the terminal's keyboard stack.
+    /// Tells the guard that this attachment is about to begin forwarding.
     ///
-    /// It returns once the guard has done it, so forwarding begins after the terminal is holding
-    /// what it had negotiated and not before. The push and the pop that answers it belong to the
-    /// guard together: it is the process that is still there however this attachment ends, and a
-    /// push this process made and a pop the guard made would be two operations on one stack with
-    /// nothing keeping them in step.
+    /// It returns once the guard has recorded it, so forwarding begins after something that
+    /// outlives this process owes the keyboard protocols back, and not before.
     ///
     /// # Errors
     ///
@@ -186,9 +185,8 @@ impl RestorationGuard {
     ///
     /// The guard is armed before anything touches the terminal, and reading this state is itself a
     /// change to it, so the answer arrives here rather than as a starting argument. It is what the
-    /// guard writes after the pop, to correct the one thing a pop cannot: an application inside the
-    /// session that pushed an entry of its own and left without popping it. A guard that never
-    /// hears it pops and writes nothing more, which is what a terminal that was never asked gets.
+    /// guard writes on its way out, as a state rather than as a stack operation. A guard that never
+    /// hears it writes nothing of it, which is what a terminal that was never asked gets.
     pub fn learn_keyboard(&mut self, keyboard: &KeyboardState) {
         use std::io::Write as _;
 
@@ -203,8 +201,9 @@ impl RestorationGuard {
 
     /// Releases the guard after the caller has restored the terminal's modes itself.
     ///
-    /// What the guard pushed is still the guard's to pop, so it does that on its way out. This
-    /// waits for it to finish, which is what keeps the two halves of the restoration in order.
+    /// The keyboard protocols are still the guard's to write back, so it does that on its way out.
+    /// This waits for it to finish, which is what keeps the two halves of the restoration in
+    /// order.
     pub fn release(mut self) {
         use std::io::Write as _;
 

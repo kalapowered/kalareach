@@ -341,11 +341,36 @@ const KEYBOARD_RESTORED: &[u8] = b"\x1b[=5;1u";
 /// The `modifyOtherKeys` level this test's terminal reported, as the restoration writes it.
 const MODIFY_OTHER_KEYS_RESTORED: &[u8] = b"\x1b[>4;2m";
 
-/// The push that opens this attachment's entry in the terminal's keyboard stack.
-const KEYBOARD_PUSHED: &[u8] = b"\x1b[>0u";
-
-/// The pop that gives the terminal's keyboard state back, whether or not anything read it.
-const KEYBOARD_POPPED: &[u8] = b"\x1b[<1u";
+/// Counts the Kitty keyboard stack operations in what reached a terminal.
+///
+/// A push is `CSI > flags u` and a pop is `CSI < count u`. KalaReach writes neither: the stack of
+/// the terminal an attachment borrows belongs to whatever was running when it arrived, and an entry
+/// pushed there could be taken off by an application inside the session, so the pop that answered
+/// it would land on somebody else's. `CSI > 4 ; level m` is the `modifyOtherKeys` level and is not
+/// a stack operation, which is why this looks at the final byte rather than at the introducer.
+fn stack_operations(bytes: &[u8]) -> usize {
+    let mut seen = 0;
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if &bytes[index..index + 2] != b"\x1b[" {
+            index += 1;
+            continue;
+        }
+        let introducer = bytes[index + 2];
+        index += 2;
+        if introducer != b'>' && introducer != b'<' {
+            continue;
+        }
+        let mut end = index + 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if bytes.get(end) == Some(&b'u') {
+            seen += 1;
+        }
+    }
+    seen
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
@@ -540,13 +565,110 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
         "and its modifyOtherKeys level: {}",
         output.text().escape_debug()
     );
-    // An attachment that ended of its own accord opened the entry once and gave it back once, the
-    // same as one that was killed: the guard owns both halves, so neither is repeated by the
-    // process that restored the modes.
+    // And the terminal's own keyboard stack was never operated: what this attachment put back is
+    // the state the terminal reported, so an application inside the session that emptied the stack
+    // cannot have made this cleanup take an entry belonging to whatever was running before.
     assert_eq!(
-        (output.count(KEYBOARD_PUSHED), output.count(KEYBOARD_POPPED)),
-        (1, 1),
-        "the entry was opened once and given back once: {}",
+        stack_operations(output.text().as_bytes()),
+        0,
+        "nothing was pushed or popped: {}",
+        output.text().escape_debug()
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_terminals_own() {
+    // Section 8, finding 10: the Kitty keyboard stack of the terminal an attachment borrows belongs
+    // to whatever was running when it arrived. An application inside the session can empty that
+    // stack with one sequence, and it does so here. Because KalaReach never put an entry of its own
+    // on it, there is no pop written on the way out to land on an outer entry instead: what the
+    // terminal reported is written back as the state it is.
+    let hosted = hosted("printf '\\033[<65535u'; while true; do echo ready; sleep 1; done").await;
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+
+    let display = hosted.display.get().to_string();
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!(
+                "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
+                env!("CARGO_BIN_EXE_kr")
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
+    assert!(
+        output.wait_for(b"ready", Duration::from_secs(30)),
+        "the session's output reached the terminal: {}",
+        output.text()
+    );
+
+    let session = hosted.session_id.to_string();
+    let detach = std::process::Command::new(env!("CARGO_BIN_EXE_kr"))
+        .args(["detach", &session])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "KR_RUNTIME_DIR",
+            hosted.temp.paths().runtime_root().display().to_string(),
+        )
+        .env(
+            "KR_STATE_DIR",
+            hosted.temp.paths().state_root().display().to_string(),
+        )
+        .output()
+        .expect("runs the detach");
+    assert!(
+        detach.status.success(),
+        "the detach succeeded: {}",
+        String::from_utf8_lossy(&detach.stderr)
+    );
+    assert!(
+        output.wait_for(b"attach-finished-0", Duration::from_secs(30)),
+        "the attachment ended: {}",
+        output.text()
+    );
+    assert!(
+        output.wait_for(KEYBOARD_RESTORED, Duration::from_secs(10)),
+        "the terminal's own keyboard protocol was put back: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        output.contains(MODIFY_OTHER_KEYS_RESTORED),
+        "and its modifyOtherKeys level: {}",
+        output.text().escape_debug()
+    );
+
+    // Whatever stack operations reached this terminal are the application's own. None of them is
+    // one of this attachment's, so the entry an outer program had pushed before `kr` ran is still
+    // on the stack and its own pop will find it.
+    assert_eq!(
+        output.count(b"\x1b[>0u"),
+        0,
+        "no entry of this attachment's was opened: {}",
+        output.text().escape_debug()
+    );
+    assert_eq!(
+        output.count(b"\x1b[<1u"),
+        0,
+        "and none was taken off: {}",
+        output.text().escape_debug()
+    );
+    assert_eq!(
+        output.count(b"\x1b[<65535u"),
+        stack_operations(output.text().as_bytes()),
+        "every stack operation this terminal saw is the application's own: {}",
         output.text().escape_debug()
     );
     let _ = shell.kill();
@@ -701,13 +823,14 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
         "the handshake did happen, so this terminal's state was read: {}",
         output.text().escape_debug()
     );
-    assert!(
-        !output.contains(KEYBOARD_PUSHED),
-        "nothing opened a keyboard stack entry, because nothing began forwarding: {}",
+    assert_eq!(
+        stack_operations(output.text().as_bytes()),
+        0,
+        "no keyboard stack of this terminal's was operated: {}",
         output.text().escape_debug()
     );
     assert!(
-        !output.contains(KEYBOARD_POPPED),
+        !output.contains(b"\x1b[>4m"),
         "and nothing took the keyboard protocols away from a terminal it never changed: {}",
         output.text().escape_debug()
     );
@@ -777,13 +900,13 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Nothing about the keyboard was ever written to this terminal: no entry was opened, none was
-    // given back, no level was imposed and no flags were set. A terminal nobody was allowed to ask
-    // keeps exactly what its owner set up.
+    // Nothing about the keyboard was ever written to this terminal: no stack was operated, no
+    // level was imposed and no flags were set. A terminal nobody was allowed to ask keeps exactly
+    // what its owner set up.
     assert_eq!(
-        (output.count(KEYBOARD_PUSHED), output.count(KEYBOARD_POPPED)),
-        (0, 0),
-        "no keyboard stack entry was opened or taken off: {}",
+        stack_operations(output.text().as_bytes()),
+        0,
+        "no keyboard stack of this terminal's was operated: {}",
         output.text().escape_debug()
     );
     assert!(

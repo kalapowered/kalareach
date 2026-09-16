@@ -179,7 +179,7 @@ mod console {
         /// Restores saved modes and undoes the modes an application may have left enabled.
         ///
         /// `keyboard` is what this console had negotiated before the attachment began, written
-        /// after the entry this attachment pushed comes off.
+        /// back as the state it is.
         ///
         /// # Errors
         ///

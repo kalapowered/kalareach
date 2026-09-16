@@ -26,7 +26,7 @@ use clap::Parser;
 use kr_cli::attach::{GUARD_BEGIN, GUARD_KEYBOARD, GUARD_READY, GUARD_RELEASE};
 #[cfg(unix)]
 use kr_cli::terminal::RESET_SEQUENCES;
-use kr_cli::terminal::{KEYBOARD_BEGIN_SEQUENCES, KeyboardState, SavedModes};
+use kr_cli::terminal::{KeyboardState, SavedModes};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
     // guard is holding the terminal's modes; it asks for the keyboard entry to be opened when it
     // is about to forward; and then it sends either the release byte or nothing at all.
     let mut keyboard = None;
-    let mut pushed = false;
+    let mut began = false;
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
     let mut input = std::io::stdin();
@@ -77,8 +77,8 @@ fn main() -> ExitCode {
             // The attach process is gone, however it went. The terminal is restored.
             Ok(0) | Err(_) => break,
             Ok(_) => match byte[0] {
-                // It restored the terminal's modes itself. What this guard pushed is still this
-                // guard's to pop, so it does that below and then leaves.
+                // It restored the terminal's modes itself. The keyboard state is still this
+                // guard's to write back, so it does that below and then leaves.
                 GUARD_RELEASE => {
                     released = true;
                     break;
@@ -91,22 +91,13 @@ fn main() -> ExitCode {
                     {
                         keyboard = Some(state);
                     }
-                    // The entry that holds what this terminal had negotiated. This guard opens it
-                    // rather than the attach process, because a push and the pop that answers it
-                    // are one pair and only one process is certain to be there for both.
-                    if line.first() == Some(&GUARD_BEGIN) && !pushed {
-                        let mut terminal = std::io::stdout();
-                        // `pushed` is set by the write that happened, before anything else can
-                        // fail. Nothing between here and the restoration below returns early: once
-                        // the entry is open, every way out of this process goes through the pop,
-                        // including the attach process disappearing while this was answering it.
-                        if terminal.write_all(KEYBOARD_BEGIN_SEQUENCES).is_ok()
-                            && terminal.flush().is_ok()
-                        {
-                            pushed = true;
-                        } else {
-                            break;
-                        }
+                    // The attachment is about to forward, so from here on the session can change
+                    // this terminal's keyboard protocols and this guard owes them back. It is
+                    // recorded before the answer goes out, so every way out of this process after
+                    // the attach process is told - including that process disappearing while this
+                    // was answering it - restores them.
+                    if line.first() == Some(&GUARD_BEGIN) && !began {
+                        began = true;
                         if ready.write_all(&[GUARD_READY]).is_err() || ready.flush().is_err() {
                             break;
                         }
@@ -120,16 +111,12 @@ fn main() -> ExitCode {
         }
     }
 
-    // A released guard has had the modes put back for it and only owes the keyboard entry; one
+    // A released guard has had the modes put back for it and only owes the keyboard state; one
     // whose process is gone owes everything.
     let restored = if released {
-        !pushed || give_back_the_keyboard(keyboard.as_ref())
+        !began || give_back_the_keyboard(keyboard.as_ref())
     } else {
-        restore(
-            &saved,
-            pushed.then_some(keyboard.as_ref()).flatten(),
-            pushed,
-        )
+        restore(&saved, began.then_some(keyboard.as_ref()).flatten(), began)
     };
     if restored {
         ExitCode::SUCCESS
@@ -138,7 +125,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Pops the entry this guard pushed, and writes back whatever the terminal had reported.
+/// Writes back whatever the terminal had reported, without touching any stack.
 #[cfg(unix)]
 fn give_back_the_keyboard(keyboard: Option<&KeyboardState>) -> bool {
     let terminal = std::io::stdout();
@@ -147,7 +134,7 @@ fn give_back_the_keyboard(keyboard: Option<&KeyboardState>) -> bool {
     handle.write_all(&sequences.cleanup_sequences()).is_ok() && handle.flush().is_ok()
 }
 
-/// Pops the entry this guard pushed, and writes back whatever the terminal had reported.
+/// Writes back whatever the terminal had reported, without touching any stack.
 #[cfg(not(unix))]
 fn give_back_the_keyboard(keyboard: Option<&KeyboardState>) -> bool {
     let mut handle = std::io::stdout();
@@ -156,7 +143,7 @@ fn give_back_the_keyboard(keyboard: Option<&KeyboardState>) -> bool {
 }
 
 #[cfg(unix)]
-fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>, pushed: bool) -> bool {
+fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>, began: bool) -> bool {
     use rustix::termios::OptionalActions;
 
     let terminal = std::io::stdout();
@@ -169,11 +156,10 @@ fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>, pushed: bool) -
             Ok(()) => {
                 let mut handle = terminal.lock();
                 let _ = handle.write_all(RESET_SEQUENCES);
-                // The entry this guard opened, given back, together with whatever the terminal
-                // itself reported before the attachment began. A guard that never opened one
-                // leaves the keyboard protocols alone: nothing it is cleaning up had begun to
-                // change them.
-                if pushed {
+                // Whatever the terminal itself reported before the attachment began. A guard
+                // for an attachment that never began forwarding leaves the keyboard protocols
+                // alone: nothing it is cleaning up had begun to change them.
+                if began {
                     let sequences = keyboard.copied().unwrap_or(KeyboardState::EMPTY);
                     let _ = handle.write_all(&sequences.cleanup_sequences());
                 }
@@ -190,10 +176,10 @@ fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>, pushed: bool) -
 }
 
 #[cfg(not(unix))]
-fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>, pushed: bool) -> bool {
+fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>, began: bool) -> bool {
     let Ok(terminal) = kr_cli::terminal::ControllingTerminal::open() else {
         return false;
     };
-    let keyboard = pushed.then(|| keyboard.copied().unwrap_or(KeyboardState::EMPTY));
+    let keyboard = began.then(|| keyboard.copied().unwrap_or(KeyboardState::EMPTY));
     terminal.restore(saved, keyboard.as_ref()).is_ok()
 }

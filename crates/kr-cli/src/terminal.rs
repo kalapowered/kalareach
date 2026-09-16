@@ -54,34 +54,20 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// shell receives escape sequences where it expects characters.
 pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
 
-/// The sequence that opens the attachment's own entry in the terminal's keyboard stack.
+/// The sequence that puts `modifyOtherKeys` back to the value the terminal itself starts with.
 ///
-/// It is written once, where the attachment begins forwarding, and it is what makes the outer
-/// terminal's keyboard state restorable **without having read it**. The Kitty protocol keeps a
-/// stack per screen buffer: pushing saves whatever the terminal had negotiated and sets the flags
-/// this attachment starts from, which is none of them, so the session negotiates what it wants from
-/// a known baseline. A terminal that does not implement the protocol ignores the sequence.
-pub const KEYBOARD_BEGIN_SEQUENCES: &[u8] = b"\x1b[>0u";
-
-/// The sequences that give the keyboard protocols back, in both buffers.
+/// It is the only form of that state a terminal can restore on its own, and it is the whole of what
+/// a cleanup writes before the state it read: **KalaReach never operates the terminal's keyboard
+/// stack.** The Kitty protocol's stack belongs to whatever was running when this attachment
+/// arrived. An entry pushed here could not be taken off reliably - an application inside the
+/// session can empty the stack with one sequence, and nothing can ask a terminal how deep its stack
+/// is - so a pop written on the way out would take somebody else's entry instead of this
+/// attachment's. What the terminal reported is therefore put back as a state, with
+/// [`KeyboardState::restore_sequences`], and every stack is left exactly as it was found.
 ///
-/// Each screen buffer has its own Kitty stack and its own `modifyOtherKeys` level, and a terminal
-/// can be left in either buffer, so both are visited. Entering and leaving the alternate buffer
-/// through `?1049` saves and restores the cursor, so the primary screen is not disturbed by the
-/// visit.
-///
-/// What each buffer gets differs, because what is in them differs. The alternate buffer's stack
-/// belongs to whatever ran there, so it is emptied and the level is reset. The primary buffer is
-/// where [`KEYBOARD_BEGIN_SEQUENCES`] pushed this attachment's entry, so exactly that entry is
-/// popped and the terminal is left with the flags it had before the attachment began, whether or
-/// not anything ever read them. `\x1b[>4m` without a level is `modifyOtherKeys` back to the value
-/// the terminal itself starts with, which is the only form of that state a terminal can restore
-/// on its own.
-///
-/// They are sent only by a cleanup that follows an attachment which began forwarding, because only
-/// then could the session have changed them, and only then was the entry pushed.
-pub const KEYBOARD_RESTORE_SEQUENCES: &[u8] =
-    b"\x1b[?1049h\x1b[<65535u\x1b[>4m\x1b[?1049l\x1b[<1u\x1b[>4m";
+/// Sent only by a cleanup that follows an attachment which began forwarding, because only then
+/// could the session have changed anything.
+pub const KEYBOARD_RESTORE_SEQUENCES: &[u8] = b"\x1b[>4m";
 
 /// The whole probe's deadline.
 ///
@@ -159,10 +145,9 @@ impl KeyboardState {
 
     /// Returns the sequences that give the terminal its keyboard protocols back.
     ///
-    /// The pop in [`KEYBOARD_RESTORE_SEQUENCES`] does the work, and it does it whether or not
-    /// anything was ever read: the attachment's own entry is what it takes off. What was read is
-    /// written after it, which corrects the one case the stack cannot: an application inside the
-    /// session that pushed an entry of its own and exited without popping it.
+    /// The level goes back to the terminal's own initial value and then the state that was read is
+    /// written over it, so a terminal that reported nothing is left as it was rather than cleared.
+    /// Nothing here touches a stack; see [`KEYBOARD_RESTORE_SEQUENCES`].
     #[must_use]
     pub fn cleanup_sequences(&self) -> Vec<u8> {
         let mut out = Vec::from(KEYBOARD_RESTORE_SEQUENCES);
@@ -409,7 +394,7 @@ mod unix {
         /// outer terminal said it had negotiated. Its presence is what says the keyboard protocols
         /// are this attachment's to put back at all: a cleanup that runs before forwarding began
         /// passes `None` and leaves them alone, because nothing that had happened could have
-        /// changed them and nothing had pushed the entry this would pop.
+        /// changed them.
         ///
         /// # Errors
         ///
@@ -791,15 +776,15 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_that_was_never_asked_still_gets_its_keyboard_state_back() {
+    fn a_terminal_that_was_never_asked_is_left_with_the_keyboard_it_already_had() {
         // Nothing was read, which is what `--no-probe` chooses and what a terminal that answers
-        // neither query leaves. The entry this attachment pushed is still popped, so the terminal
-        // is left with the flags it had before the attachment began rather than with none.
+        // neither query leaves. There is nothing to put back, and nothing of the terminal's own is
+        // taken away.
         let unknown =
             String::from_utf8_lossy(&KeyboardState::EMPTY.cleanup_sequences()).into_owned();
         assert!(
-            unknown.contains("\u{1b}[<1u"),
-            "this attachment's own stack entry comes off: {unknown:?}"
+            !unknown.contains('u'),
+            "no stack of the terminal's is operated: {unknown:?}"
         );
         assert!(
             !unknown.contains("\u{1b}[>4;0m"),
@@ -816,44 +801,30 @@ mod tests {
     }
 
     #[test]
-    fn what_a_terminal_reported_is_put_back_after_the_stack_entry_comes_off() {
+    fn what_a_terminal_reported_is_put_back_without_touching_anybodys_stack() {
+        // The stack an application inside the session can empty with one sequence is not this
+        // attachment's to operate: a pop written here would take an entry that belongs to whatever
+        // was running when this attachment arrived.
         let known = KeyboardState {
             kitty: Some(5),
             modify_other_keys: Some(2),
         };
         let cleanup = String::from_utf8_lossy(&known.cleanup_sequences()).into_owned();
         assert!(
-            cleanup.contains("?1049h"),
-            "the alternate buffer is visited"
-        );
-        assert_eq!(
-            cleanup.matches("\u{1b}[<65535u").count(),
-            1,
-            "the stack emptied is the alternate buffer's, which belongs to what ran there"
+            !cleanup.contains("\u{1b}[<"),
+            "nothing is popped: {cleanup:?}"
         );
         assert!(
-            cleanup.contains("\u{1b}[<1u"),
-            "and the primary buffer gives back exactly this attachment's entry: {cleanup:?}"
+            !cleanup.contains("\u{1b}[>0u") && !cleanup.contains("\u{1b}[>5u"),
+            "and nothing is pushed: {cleanup:?}"
+        );
+        assert!(
+            !cleanup.contains("?1049"),
+            "and no buffer is entered to reach a stack: {cleanup:?}"
         );
         assert!(
             cleanup.ends_with("\u{1b}[=5;1u\u{1b}[>4;2m"),
-            "with what the terminal itself reported last of all: {cleanup:?}"
-        );
-    }
-
-    #[test]
-    fn forwarding_opens_the_entry_the_cleanup_takes_off() {
-        let begin = String::from_utf8_lossy(KEYBOARD_BEGIN_SEQUENCES).into_owned();
-        assert_eq!(
-            begin, "\u{1b}[>0u",
-            "one push, with the flags this attachment starts from: {begin:?}"
-        );
-        let cleanup =
-            String::from_utf8_lossy(&KeyboardState::EMPTY.cleanup_sequences()).into_owned();
-        assert_eq!(
-            cleanup.matches("\u{1b}[<1u").count(),
-            1,
-            "and one pop against it: {cleanup:?}"
+            "what the terminal itself reported is written as the state it is: {cleanup:?}"
         );
     }
 }

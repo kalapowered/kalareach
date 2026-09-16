@@ -173,14 +173,15 @@ pub async fn run(
     //
     // An attachment that asked its terminal nothing changes nothing about its keyboard: the host
     // serves it a screen that installs no protocol, because nothing could put back what installing
-    // one would take away. There is then no entry to open and none to give back.
+    // one would take away. There is then nothing for the guard to give back.
     //
-    // One that did ask opens an entry in the terminal's own keyboard stack, so whatever that
-    // terminal had negotiated is held by the terminal itself, and the answers it gave are written
-    // back after the entry comes off, which is what corrects an application inside the session
-    // that emptied the stack on its way past. The guard does both, because it is the process that
-    // is certain to be there for the second one, and it confirms before this returns, so nothing
-    // is forwarded until the state is held. An attach that failed on its way here opened nothing.
+    // One that did ask hands the guard the answers it got and tells it that forwarding is about to
+    // begin. The guard then owes those protocols back however this attachment ends, and it writes
+    // them as the state they are: no stack of the terminal's is operated, because an entry pushed
+    // here could be taken off by an application inside the session and the pop would then land on
+    // somebody else's. The guard confirms before this returns, so nothing is forwarded until
+    // something that outlives this process is holding what the terminal had. An attach that failed
+    // on its way here told it nothing.
     if !options.no_probe {
         guard.learn_keyboard(&keyboard);
         guard.begin_keyboard()?;
@@ -221,8 +222,8 @@ pub async fn run(
 
     // The terminal comes back here on every path out of the loop, and the guard is released only
     // once it has.
-    // The modes are this process's to put back; the keyboard entry is the guard's, and it gives
-    // that back as it is released, which is what keeps one push answered by exactly one pop.
+    // The modes are this process's to put back; the keyboard protocols are the guard's, and it
+    // writes them back as it is released, which is what keeps the two halves in order.
     terminal.restore(&raw_replaced, None)?;
     guard.release();
     Ok((outcome, descriptor.session_id))
