@@ -49,8 +49,29 @@ pub const MAX_PREVIEW_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum size of a decoded thumbnail, in bytes.
 pub const MAX_PREVIEW_THUMBNAIL_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Longest edge of a generated thumbnail, in pixels.
-pub const PREVIEW_THUMBNAIL_EDGE: u32 = 512;
+/// Largest encoded thumbnail a result carries, in bytes.
+///
+/// The specification's 16 MiB is the *decoded* budget. A result travels in one frame, and a draft's
+/// result carries one preview per bound attachment, so the encoded thumbnail has a much smaller
+/// ceiling than the decode does: a 1 MiB control frame has to hold a draft with several of them
+/// plus everything else in it. A thumbnail that does not fit is re-encoded at a smaller edge, and
+/// one that still does not fit is left out entirely.
+pub const MAX_PREVIEW_FRAME_BYTES: u64 = 48 * 1024;
+
+/// The thumbnail edges tried, largest first, until one encodes inside the frame budget.
+///
+/// The first is the longest edge a thumbnail ever has. The rest are what an image whose thumbnail
+/// does not encode small enough steps down to, and the last is small enough that its raw pixels
+/// fit the frame budget whatever they are, so the ladder always ends somewhere.
+pub const PREVIEW_THUMBNAIL_EDGES: &[u32] = &[512, 320, 192, 96];
+
+/// Largest encoded image a preview decoder reads.
+///
+/// The decode-memory limit is what bounds the decoded pixels; this bounds the *encoded* input,
+/// which several decoders read into memory before they report a dimension. Without it a small
+/// image with a large trailing payload would spend the whole decode budget in the pass that was
+/// supposed to read only a header. An attachment above this publishes as a file.
+pub const MAX_PREVIEW_INPUT_BYTES: u64 = 48 * 1024 * 1024;
 
 /// Maximum length of a recorded original filename, in bytes.
 ///
@@ -60,6 +81,12 @@ pub const MAX_ORIGINAL_FILE_NAME_LEN: usize = 255;
 
 /// Maximum length of a declared media type, in bytes.
 pub const MAX_MEDIA_TYPE_LEN: usize = 127;
+
+/// Maximum length of a declared external destination, in characters.
+///
+/// It is a disclosure a person reads, so it is bounded like every other string that reaches a
+/// client rather than left to the caller's generosity.
+pub const MAX_EXTERNAL_DESTINATION_LEN: usize = 255;
 
 /// The chunk layout of one transfer.
 ///
@@ -329,6 +356,14 @@ impl UploadState {
     pub const fn accepts_chunks(self) -> bool {
         matches!(self, Self::Receiving)
     }
+
+    /// Returns true when a payload of this upload is meant to be on disk.
+    ///
+    /// What a reconciliation pass asks of a name it found: is there a row that accounts for it.
+    #[must_use]
+    pub const fn holds_payload(self) -> bool {
+        matches!(self, Self::Receiving | Self::Publishing | Self::Published)
+    }
 }
 
 /// The image formats a preview decoder accepts.
@@ -591,6 +626,13 @@ pub struct DraftAttachment {
     pub failure_detail: Nullable<String>,
     /// The read grant issued for this binding, when its insertion method needed one.
     pub read_grant: Nullable<AttachmentReadGrant>,
+    /// Where the bytes leave this environment for, as the operation declared it.
+    ///
+    /// Null means the bytes stay here. A value is a disclosure: it is recorded with the binding so
+    /// a client can show the destination before the prompt is submitted, and so the draft record
+    /// still names it afterwards. The host does not resolve it, reach it or check it against
+    /// anything; what it does is refuse to lose it.
+    pub external_destination: Nullable<String>,
 }
 
 /// What state a draft is in.
@@ -863,9 +905,26 @@ pub struct DownloadBeginParams {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadImmutability {
-    /// The source is an already immutable revision and is read in place.
+    /// A published attachment, read in place.
+    ///
+    /// Its whole-file digest and its per-chunk digests were recorded when it was verified, and
+    /// every chunk served is checked against them. Nothing this host does writes it afterwards.
+    /// What that does **not** promise is that another process under the same operating-system user
+    /// cannot change it: such a change makes the affected chunk fail integrity rather than being
+    /// served.
     ImmutableSource,
-    /// The host staged a bounded copy, because the source could be written while it was read.
+    /// The host took a filesystem clone of the source.
+    ///
+    /// An atomic copy-on-write clone, so the snapshot is one revision of the source whatever a
+    /// concurrent writer does afterwards. Available where the filesystem supports it, which is
+    /// APFS on Apple platforms and btrfs or XFS on Linux.
+    ClonedSnapshot,
+    /// The host staged a bounded byte copy, because the filesystem offers no clone.
+    ///
+    /// The source's stable identity, its size and its modification time are compared before and
+    /// after, so a replacement or a resize fails the snapshot. A writer that rewrites the source in
+    /// place with the same length and restores its modification time is not detectable from those
+    /// facts, which is why the result names which of the three mechanisms produced it.
     StagedSnapshot,
 }
 
@@ -875,6 +934,7 @@ impl DownloadImmutability {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ImmutableSource => "immutable_source",
+            Self::ClonedSnapshot => "cloned_snapshot",
             Self::StagedSnapshot => "staged_snapshot",
         }
     }
@@ -884,9 +944,16 @@ impl DownloadImmutability {
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "immutable_source" => Some(Self::ImmutableSource),
+            "cloned_snapshot" => Some(Self::ClonedSnapshot),
             "staged_snapshot" => Some(Self::StagedSnapshot),
             _ => None,
         }
+    }
+
+    /// Returns true when the host holds its own copy of the bytes.
+    #[must_use]
+    pub const fn is_staged(self) -> bool {
+        matches!(self, Self::ClonedSnapshot | Self::StagedSnapshot)
     }
 }
 
@@ -1141,6 +1208,7 @@ mod tests {
         }
         for immutability in [
             DownloadImmutability::ImmutableSource,
+            DownloadImmutability::ClonedSnapshot,
             DownloadImmutability::StagedSnapshot,
         ] {
             assert_eq!(

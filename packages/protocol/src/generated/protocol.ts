@@ -1426,6 +1426,15 @@ export interface AgentDraftAddAttachmentResult {
  */
 export interface DraftAttachment {
   /**
+   * Where the bytes leave this environment for, as the operation declared it.
+   *
+   * Null means the bytes stay here. A value is a disclosure: it is recorded with the binding so
+   * a client can show the destination before the prompt is submitted, and so the draft record
+   * still names it afterwards. The host does not resolve it, reach it or check it against
+   * anything; what it does is refuse to lose it.
+   */
+  external_destination: string | null
+  /**
    * Why the insertion failed, when it did.
    */
   failure_detail: string | null
@@ -1624,6 +1633,15 @@ export interface DraftRecord {
  * One attachment bound to a draft, and what became of it.
  */
 export interface DraftAttachment1 {
+  /**
+   * Where the bytes leave this environment for, as the operation declared it.
+   *
+   * Null means the bytes stay here. A value is a disclosure: it is recorded with the binding so
+   * a client can show the destination before the prompt is submitted, and so the draft record
+   * still names it afterwards. The host does not resolve it, reach it or check it against
+   * anything; what it does is refuse to lose it.
+   */
+  external_destination: string | null
   /**
    * Why the insertion failed, when it did.
    */
@@ -3331,7 +3349,7 @@ export interface DownloadBeginResult {
   /**
    * How the bytes were made immutable.
    */
-  immutability: 'immutable_source' | 'staged_snapshot'
+  immutability: 'immutable_source' | 'cloned_snapshot' | 'staged_snapshot'
   layout: ChunkLayout
   /**
    * True when this call resumed an existing snapshot rather than creating one.

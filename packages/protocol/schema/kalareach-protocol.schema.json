@@ -2659,12 +2659,17 @@
       "oneOf": [
         {
           "const": "immutable_source",
-          "description": "The source is an already immutable revision and is read in place.",
+          "description": "A published attachment, read in place.\n\nIts whole-file digest and its per-chunk digests were recorded when it was verified, and\nevery chunk served is checked against them. Nothing this host does writes it afterwards.\nWhat that does **not** promise is that another process under the same operating-system user\ncannot change it: such a change makes the affected chunk fail integrity rather than being\nserved.",
+          "type": "string"
+        },
+        {
+          "const": "cloned_snapshot",
+          "description": "The host took a filesystem clone of the source.\n\nAn atomic copy-on-write clone, so the snapshot is one revision of the source whatever a\nconcurrent writer does afterwards. Available where the filesystem supports it, which is\nAPFS on Apple platforms and btrfs or XFS on Linux.",
           "type": "string"
         },
         {
           "const": "staged_snapshot",
-          "description": "The host staged a bounded copy, because the source could be written while it was read.",
+          "description": "The host staged a bounded byte copy, because the filesystem offers no clone.\n\nThe source's stable identity, its size and its modification time are compared before and\nafter, so a replacement or a resize fails the snapshot. A writer that rewrites the source in\nplace with the same length and restores its modification time is not detectable from those\nfacts, which is why the result names which of the three mechanisms produced it.",
           "type": "string"
         }
       ]
@@ -2761,6 +2766,17 @@
       "additionalProperties": false,
       "description": "One attachment bound to a draft, and what became of it.",
       "properties": {
+        "external_destination": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the bytes leave this environment for, as the operation declared it.\n\nNull means the bytes stay here. A value is a disclosure: it is recorded with the binding so\na client can show the destination before the prompt is submitted, and so the draft record\nstill names it afterwards. The host does not resolve it, reach it or check it against\nanything; what it does is refuse to lose it."
+        },
         "failure_detail": {
           "anyOf": [
             {
@@ -2813,7 +2829,8 @@
         "state",
         "upstream_evidence",
         "failure_detail",
-        "read_grant"
+        "read_grant",
+        "external_destination"
       ],
       "type": "object"
     },
