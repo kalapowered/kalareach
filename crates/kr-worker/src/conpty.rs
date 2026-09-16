@@ -159,18 +159,14 @@ impl Write for Writer {
 /// A read that cannot be answered now says so and leaves the read it started with the operating
 /// system; the waiter beside it waits on that read's own event, and the next call collects it.
 pub struct Reader {
-    handle: Arc<OwnedHandle>,
     pending: handle::Pending,
-    buffer: Vec<u8>,
     ready: std::ops::Range<usize>,
 }
 
 impl Reader {
     fn over(handle: Arc<OwnedHandle>, event: OwnedHandle) -> Self {
         Self {
-            pending: handle::Pending::over(event),
-            handle,
-            buffer: vec![0; READ_BYTES],
+            pending: handle::Pending::over(handle, event, READ_BYTES),
             ready: 0..0,
         }
     }
@@ -179,11 +175,10 @@ impl Reader {
 impl Read for Reader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if self.ready.is_empty() {
-            let read = handle::read(&self.handle, &mut self.pending, &mut self.buffer)?;
-            self.ready = 0..read;
+            self.ready = 0..self.pending.read()?;
         }
         let taken = self.ready.len().min(out.len());
-        out[..taken].copy_from_slice(&self.buffer[self.ready.start..self.ready.start + taken]);
+        out[..taken].copy_from_slice(self.pending.taken(self.ready.start, taken));
         self.ready.start += taken;
         Ok(taken)
     }
@@ -234,7 +229,7 @@ mod handle {
 
     use portable_pty::{CommandBuilder, ExitStatus, PtySize};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NO_DATA,
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
         ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
         WAIT_TIMEOUT,
     };
@@ -452,85 +447,108 @@ mod handle {
             )
         };
         if wrote == 0 {
-            let failure = std::io::Error::last_os_error();
-            // A pipe in this mode reports "no data" when it could take nothing at all, which is not
-            // a failure: it is the answer the boundary wants.
-            return match failure.raw_os_error() {
-                Some(code) if u32::try_from(code) == Ok(ERROR_NO_DATA) => {
-                    Err(std::io::ErrorKind::WouldBlock.into())
-                }
-                _ => Err(failure),
-            };
+            // Every failure here is a failure. A pipe in this mode that has no room does not fail:
+            // it takes what it can and says how much, which is the short write below. "No data" is
+            // this pipe closing, and reading that as no room would leave the writer asking a pipe
+            // that has gone, for ever.
+            return Err(std::io::Error::last_os_error());
         }
         if written == 0 && !bytes.is_empty() {
+            // Nothing fitted. That is the answer the boundary wants: the terminal is there, and it
+            // will take more when the application has read what it has.
             return Err(std::io::ErrorKind::WouldBlock.into());
         }
         Ok(written as usize)
     }
 
-    /// One read this host has started and the operating system has not finished.
+    /// A read of the terminal's output: the pipe, the block it is started through, and the memory
+    /// it is read into.
+    ///
+    /// The three are one object because the operating system owns all three for as long as a read
+    /// is outstanding. A read still with it when this is dropped is taken back through the **pipe**
+    /// - cancelling names the handle the read was started on, not the event it signals - and then
+    /// waited for, because cancelling asks and does not wait. Only then can the block and the
+    /// buffer be freed.
     pub(super) struct Pending {
+        pipe: Arc<OwnedHandle>,
         overlapped: Box<OVERLAPPED>,
-        event: OwnedHandle,
+        /// Held for as long as the block that names it.
+        _event: OwnedHandle,
+        buffer: Vec<u8>,
         outstanding: bool,
     }
 
-    // SAFETY: the block and the event belong to one reader, which owns both and is the only thing
-    // that starts or collects a read through them. Nothing is shared between threads except by
-    // moving the whole reader, which is what `Send` is.
+    // SAFETY: the pipe, the block, the event and the buffer belong to one reader, which owns all of
+    // them and is the only thing that starts or collects a read through them. Nothing is shared
+    // between threads except by moving the whole reader, which is what `Send` is.
     unsafe impl Send for Pending {}
 
     impl Pending {
-        /// Builds the block a read is started through, signalling the event it is given.
-        pub(super) fn over(event: OwnedHandle) -> Self {
+        /// Builds the read: this pipe, signalling this event, into a buffer of this size.
+        pub(super) fn over(pipe: Arc<OwnedHandle>, event: OwnedHandle, bytes: usize) -> Self {
             // SAFETY: `OVERLAPPED` is a structure of integers and one handle, and all zeroes is the
             // state the operating system documents for starting a read.
             let mut overlapped: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
             overlapped.hEvent = event.as_raw_handle().cast();
             Self {
+                pipe,
                 overlapped,
-                event,
+                _event: event,
+                buffer: vec![0; bytes],
                 outstanding: false,
             }
         }
-    }
 
-    impl Drop for Pending {
-        fn drop(&mut self) {
+        /// Returns part of what the last read produced.
+        pub(super) fn taken(&self, from: usize, len: usize) -> &[u8] {
+            &self.buffer[from..from + len]
+        }
+
+        /// Collects the read that was started, or starts one and says there is nothing yet.
+        pub(super) fn read(&mut self) -> std::io::Result<usize> {
             if self.outstanding {
-                // The buffer that read is writing into is about to go, so the read is taken back
-                // first.
-                //
-                // SAFETY: the event is the one the read was started on and the block is that read's
-                // own, both still alive here. A read that has already finished makes this fail
-                // rather than act.
-                let _ = unsafe {
-                    CancelIoEx(
-                        self.event.as_raw_handle().cast(),
-                        std::ptr::from_mut::<OVERLAPPED>(self.overlapped.as_mut()),
-                    )
+                return self.collect(0);
+            }
+            let mut read = 0_u32;
+            // SAFETY: the pipe is open for the call; the buffer and the block outlive the read,
+            // because this object owns both and takes the read back before either can be freed.
+            let started = unsafe {
+                ReadFile(
+                    self.pipe.as_raw_handle().cast(),
+                    self.buffer.as_mut_ptr(),
+                    u32::try_from(self.buffer.len()).unwrap_or(u32::MAX),
+                    &raw mut read,
+                    std::ptr::from_mut::<OVERLAPPED>(self.overlapped.as_mut()),
+                )
+            };
+            if started == 0 {
+                let failure = std::io::Error::last_os_error();
+                return match failure
+                    .raw_os_error()
+                    .and_then(|code| u32::try_from(code).ok())
+                {
+                    Some(ERROR_IO_PENDING) => {
+                        self.outstanding = true;
+                        Err(std::io::ErrorKind::WouldBlock.into())
+                    }
+                    Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED) => Ok(0),
+                    _ => Err(failure),
                 };
             }
+            Ok(read as usize)
         }
-    }
 
-    /// Collects the read that was started, or starts one and says there is nothing yet.
-    pub(super) fn read(
-        handle: &OwnedHandle,
-        pending: &mut Pending,
-        buffer: &mut [u8],
-    ) -> std::io::Result<usize> {
-        if pending.outstanding {
+        /// Asks what the outstanding read has done, waiting for it or not.
+        fn collect(&mut self, wait: i32) -> std::io::Result<usize> {
             let mut read = 0_u32;
-            // SAFETY: the handle and the block are the ones the read was started with, and the
-            // count is a local this thread owns. The final `0` asks for the answer now rather than
-            // waiting for it.
+            // SAFETY: the pipe and the block are the ones the read was started with, and the count
+            // is a local this thread owns.
             let finished = unsafe {
                 GetOverlappedResult(
-                    handle.as_raw_handle().cast(),
-                    std::ptr::from_mut::<OVERLAPPED>(pending.overlapped.as_mut()),
+                    self.pipe.as_raw_handle().cast(),
+                    std::ptr::from_mut::<OVERLAPPED>(self.overlapped.as_mut()),
                     &raw mut read,
-                    0,
+                    wait,
                 )
             };
             if finished == 0 {
@@ -541,45 +559,39 @@ mod handle {
                 {
                     Some(ERROR_IO_INCOMPLETE) => Err(std::io::ErrorKind::WouldBlock.into()),
                     Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED) => {
-                        pending.outstanding = false;
+                        self.outstanding = false;
                         Ok(0)
                     }
                     _ => {
-                        pending.outstanding = false;
+                        self.outstanding = false;
                         Err(failure)
                     }
                 };
             }
-            pending.outstanding = false;
-            return Ok(read as usize);
+            self.outstanding = false;
+            Ok(read as usize)
         }
-        let mut read = 0_u32;
-        // SAFETY: the handle is open for the call; the buffer and the block outlive the read,
-        // because the reader owns both and the block is taken back before either can be dropped.
-        let started = unsafe {
-            ReadFile(
-                handle.as_raw_handle().cast(),
-                buffer.as_mut_ptr(),
-                u32::try_from(buffer.len()).unwrap_or(u32::MAX),
-                &raw mut read,
-                std::ptr::from_mut::<OVERLAPPED>(pending.overlapped.as_mut()),
-            )
-        };
-        if started == 0 {
-            let failure = std::io::Error::last_os_error();
-            return match failure
-                .raw_os_error()
-                .and_then(|code| u32::try_from(code).ok())
-            {
-                Some(ERROR_IO_PENDING) => {
-                    pending.outstanding = true;
-                    Err(std::io::ErrorKind::WouldBlock.into())
-                }
-                Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED) => Ok(0),
-                _ => Err(failure),
+    }
+
+    impl Drop for Pending {
+        fn drop(&mut self) {
+            if !self.outstanding {
+                return;
+            }
+            // The block and the buffer are about to be freed, and the operating system is still
+            // writing into them. Cancelling asks; waiting is what makes it true.
+            //
+            // SAFETY: the pipe is the handle the read was started on and the block is that read's
+            // own, both still alive here. A read that has already finished makes this fail rather
+            // than act.
+            let _ = unsafe {
+                CancelIoEx(
+                    self.pipe.as_raw_handle().cast(),
+                    std::ptr::from_mut::<OVERLAPPED>(self.overlapped.as_mut()),
+                )
             };
+            let _ = self.collect(1);
         }
-        Ok(read as usize)
     }
 
     /// Creates the event a read is signalled on.
@@ -716,46 +728,12 @@ mod handle {
         })
     }
 
-    /// Builds the command line the way the operating system takes one apart again.
+    /// Builds the command line, quoted the way the operating system takes one apart again.
     ///
-    /// An argument is quoted when it is empty or contains a space, a tab or a quotation mark. Inside
-    /// the quotes a run of backslashes before a quotation mark is doubled, and so is one at the end,
-    /// which is the documented inverse of how a program's own argument parser reads it back.
+    /// The rule itself is [`crate::pty::command_line`], which is a rule about a string with nothing
+    /// of this platform in it, so it is tested on a machine that cannot run Windows.
     fn command_line(command: &CommandBuilder) -> Vec<u16> {
-        let mut line = String::new();
-        for argument in command.get_argv() {
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            let argument = argument.to_string_lossy();
-            if !argument.is_empty() && !argument.contains([' ', '\t', '"']) {
-                line.push_str(&argument);
-                continue;
-            }
-            line.push('"');
-            let mut backslashes = 0_usize;
-            for character in argument.chars() {
-                match character {
-                    '\\' => backslashes += 1,
-                    '"' => {
-                        for _ in 0..=backslashes {
-                            line.push('\\');
-                        }
-                        backslashes = 0;
-                        line.push('"');
-                    }
-                    _ => {
-                        backslashes = 0;
-                        line.push(character);
-                    }
-                }
-            }
-            for _ in 0..backslashes {
-                line.push('\\');
-            }
-            line.push('"');
-        }
-        std::ffi::OsString::from(line)
+        std::ffi::OsString::from(crate::pty::command_line(command.get_argv()))
             .encode_wide()
             .chain(std::iter::once(0))
             .collect()

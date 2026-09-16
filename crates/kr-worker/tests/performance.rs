@@ -119,23 +119,27 @@ struct Owned {
 /// had already made running, so each step reports its failure and the caller closes what it owns
 /// before it reports anything.
 async fn create(host: &Host, owned: &mut Owned) -> Result<SessionCreateResult, String> {
-    // The request is composed before it is sent and kept. A create whose answer never arrives has
-    // still happened, so sending that exact request again is how the measurement learns what it
-    // owns rather than leaving a session nobody will close; the daemon answers an exact duplicate
-    // with the outcome it recorded the first time. It goes into the record before the call, because
-    // the moment it is on the wire is the moment it can have made something.
-    let endpoint = match host.temp.environment().controller_endpoint() {
-        Ok(endpoint) => endpoint,
-        Err(error) => return Err(format!("the daemon's endpoint: {error}")),
-    };
-    let mut client = match LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await {
-        Ok(client) => client,
-        Err(error) => return Err(format!("connect to the daemon: {error}")),
-    };
-    // Composed on the connection that sends it, because a first admission quotes the freshness
-    // window that connection holds. Every later send of it is a repeat rather than a first
-    // admission, which is the only reason it may travel over another connection.
-    let request = match client
+    let (mut client, request) = compose(host).await?;
+    admit(host, owned, &mut client, request).await
+}
+
+/// Opens a connection and composes the create it will send.
+///
+/// Composed on the connection that sends it, because a first admission quotes the freshness window
+/// that connection holds. Every later send of it is a repeat rather than a first admission, which
+/// is the only reason it may travel over another connection.
+async fn compose(
+    host: &Host,
+) -> Result<(LocalClient, kr_protocol::envelope::MutationRequest), String> {
+    let endpoint = host
+        .temp
+        .environment()
+        .controller_endpoint()
+        .map_err(|error| format!("the daemon's endpoint: {error}"))?;
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .map_err(|error| format!("connect to the daemon: {error}"))?;
+    let request = client
         .compose(
             Method::SessionCreate,
             ActionId::new(kr_ipc::new_uuid()),
@@ -143,26 +147,35 @@ async fn create(host: &Host, owned: &mut Owned) -> Result<SessionCreateResult, S
             &create_params(host),
         )
         .await
-    {
-        Ok(request) => request,
-        Err(error) => return Err(format!("compose the create: {error}")),
-    };
+        .map_err(|error| format!("compose the create: {error}"))?;
+    Ok((client, request))
+}
+
+/// Sends a create the daemon has not admitted yet, and records what this run then owns.
+///
+/// The request goes into the record before the call, because the moment it is on the wire is the
+/// moment it can have made something, and it comes out again **only** when the daemon names the
+/// session it made. Nothing else settles it: an answer that is an error is not proof that nothing
+/// was created - the daemon can start a worker, take its readiness and then fail to read its
+/// summary - and a run that released the request there would leave that session running.
+async fn admit(
+    host: &Host,
+    owned: &mut Owned,
+    client: &mut LocalClient,
+    request: kr_protocol::envelope::MutationRequest,
+) -> Result<SessionCreateResult, String> {
     let action = request.action_id;
     owned.unresolved.push(request.clone());
     let asked = match client.repeat(&request).await {
         Ok(Ok(value)) => value
             .to_typed()
-            .map_err(|error| Unresolved::Nothing(format!("the create result: {error}"))),
-        Ok(Err(error)) => Err(Unresolved::Nothing(format!("the create failed: {error}"))),
+            .map_err(|error| format!("the create result: {error}")),
+        Ok(Err(error)) => Err(format!("the daemon's answer: {error}")),
         // The answer was lost. Whether the session exists is exactly what asking again settles, and
         // asking again is what cleanup does with the request this run is holding.
-        Err(error) => match ask_create(host, &request, CREATE_ATTEMPTS).await {
-            Ok(created) => Ok(created),
-            Err(Unresolved::Nothing(failure)) => Err(Unresolved::Nothing(failure)),
-            Err(Unresolved::Unknown(failure)) => Err(Unresolved::Unknown(format!(
-                "the create call: {error}; and asking again: {failure}"
-            ))),
-        },
+        Err(error) => ask_create(host, &request, CREATE_ATTEMPTS)
+            .await
+            .map_err(|failure| format!("the create call: {error}; and asking again: {failure}")),
     };
     match asked {
         Ok(created) => {
@@ -170,14 +183,7 @@ async fn create(host: &Host, owned: &mut Owned) -> Result<SessionCreateResult, S
             owned.sessions.push(created.clone());
             Ok(created)
         }
-        Err(Unresolved::Nothing(failure)) => {
-            // The daemon answered that it made nothing, so there is nothing to own.
-            owned.unresolved.retain(|held| held.action_id != action);
-            Err(failure)
-        }
-        // Whether this request made a session is still unknown, so it stays owned and cleanup
-        // sends it again.
-        Err(Unresolved::Unknown(failure)) => Err(failure),
+        Err(failure) => Err(failure),
     }
 }
 
@@ -198,14 +204,6 @@ fn create_params(host: &Host) -> SessionCreateParams {
     }
 }
 
-/// Why a create did not name a session.
-enum Unresolved {
-    /// The daemon refused it before it made anything.
-    Nothing(String),
-    /// What that request made, if anything, the answer does not say.
-    Unknown(String),
-}
-
 /// Sends a request the daemon has already admitted, again, until it answers with what that made.
 ///
 /// The request goes exactly as it was composed, over whichever connection this can open. That is
@@ -222,12 +220,12 @@ async fn ask_create(
     host: &Host,
     request: &kr_protocol::envelope::MutationRequest,
     attempts: usize,
-) -> Result<SessionCreateResult, Unresolved> {
+) -> Result<SessionCreateResult, String> {
     let endpoint = host
         .temp
         .environment()
         .controller_endpoint()
-        .map_err(|error| Unresolved::Unknown(format!("the daemon's endpoint: {error}")))?;
+        .map_err(|error| format!("the daemon's endpoint: {error}"))?;
     let mut failure = String::new();
     for _ in 0..attempts {
         let mut client = match LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
@@ -242,14 +240,14 @@ async fn ask_create(
             Ok(Ok(value)) => {
                 return value
                     .to_typed()
-                    .map_err(|error| Unresolved::Unknown(format!("the create result: {error}")));
+                    .map_err(|error| format!("the create result: {error}"));
             }
             Ok(Err(error)) => failure = format!("the daemon's answer: {error}"),
             // The answer was lost. Whether the session exists is exactly what asking again settles.
             Err(error) => failure = format!("the create call: {error}"),
         }
     }
-    Err(Unresolved::Unknown(failure))
+    Err(failure)
 }
 
 /// How many times cleanup asks the daemon what this environment holds before it gives up.
@@ -274,41 +272,53 @@ async fn a_create_whose_answer_was_lost_is_closed_by_the_run_that_asked_for_it()
         .environment()
         .controller_endpoint()
         .expect("the daemon's endpoint");
+    let mut owned = Owned::default();
 
-    // The create, composed and sent the way `create` does it, on one connection.
-    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+    let (mut client, request) = compose(&host).await.expect("composes a create");
+    let made = admit(&host, &mut owned, &mut client, request.clone())
         .await
-        .expect("connects to the daemon");
-    let request = client
-        .compose(
-            Method::SessionCreate,
-            ActionId::new(kr_ipc::new_uuid()),
-            ActionTarget::environment(host.environment_id),
-            &create_params(&host),
-        )
-        .await
-        .expect("composes a create");
-    let made: SessionCreateResult = client
-        .repeat(&request)
-        .await
-        .expect("the call reaches the daemon")
-        .expect("the create succeeds")
-        .to_typed()
-        .expect("decodes");
+        .expect("the create succeeds");
     assert!(
         !made.deduplicated,
         "the first send is the one that made the session"
     );
+    assert!(
+        owned.unresolved.is_empty(),
+        "a create the daemon named leaves nothing hanging"
+    );
+
+    // An answer that is *not* a session leaves the request owned, whichever send it came from. The
+    // refusal here is one this test can produce - the same identifier with a different payload -
+    // and it stands for the one it cannot: a daemon that started a worker, took its readiness and
+    // then failed to read its summary answers with an error about a session that exists.
+    let different = client
+        .compose(
+            Method::SessionCreate,
+            request.action_id,
+            ActionTarget::environment(host.environment_id),
+            &SessionCreateParams {
+                cwd: Nullable::some(host.temp.root().join("elsewhere").display().to_string()),
+                ..create_params(&host)
+            },
+        )
+        .await
+        .expect("composes the same identifier with another payload");
+    let refused = admit(&host, &mut owned, &mut client, different)
+        .await
+        .expect_err("the daemon refuses a reused identifier");
+    assert_eq!(
+        owned.unresolved.len(),
+        1,
+        "and the run keeps the request rather than concluding that nothing was made: {refused}"
+    );
+    owned.unresolved.clear();
     drop(client);
 
-    // From here the run behaves as though that answer never arrived: it holds the request and
+    // From here the run behaves as though the first answer never arrived: it holds the request and
     // nothing else. Sending it again, on another connection, is what cleanup does.
-    let again = match ask_create(&host, &request, CREATE_ATTEMPTS).await {
-        Ok(created) => created,
-        Err(Unresolved::Nothing(failure) | Unresolved::Unknown(failure)) => {
-            panic!("the daemon answers the exact duplicate: {failure}")
-        }
-    };
+    let again = ask_create(&host, &request, CREATE_ATTEMPTS)
+        .await
+        .unwrap_or_else(|failure| panic!("the daemon answers the exact duplicate: {failure}"));
     assert_eq!(
         again.session.session_id, made.session.session_id,
         "one request, one session, whichever connection asks about it"
@@ -318,37 +328,10 @@ async fn a_create_whose_answer_was_lost_is_closed_by_the_run_that_asked_for_it()
         "and the daemon says it is the one it recorded rather than a second launch"
     );
 
-    // And an answer that is not a session settles nothing. Here the same identifier is sent under
-    // another connection's window, which is a different payload and is refused; a run that read
-    // that refusal as "nothing was made" would stop looking for a session that exists.
-    let mut elsewhere = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-        .await
-        .expect("connects to the daemon");
-    let different = elsewhere
-        .compose(
-            Method::SessionCreate,
-            request.action_id,
-            ActionTarget::environment(host.environment_id),
-            &create_params(&host),
-        )
-        .await
-        .expect("composes the same identifier under another window");
-    drop(elsewhere);
-    match ask_create(&host, &different, 1).await {
-        Err(Unresolved::Unknown(_)) => {}
-        Err(Unresolved::Nothing(failure)) => {
-            panic!("a refusal is not proof that nothing was made: {failure}")
-        }
-        Ok(created) => panic!(
-            "the daemon answered a different payload with {}",
-            created.session.session_id
-        ),
-    }
-
     // So a run that holds only the request closes what that request made.
-    let mut owned = Owned::default();
-    owned.unresolved.push(request);
-    close_all(&host, &owned)
+    let mut holding = Owned::default();
+    holding.unresolved.push(request);
+    close_all(&host, &holding)
         .await
         .expect("closes what the run owns");
     assert!(
@@ -636,11 +619,10 @@ async fn close_all(host: &Host, owned: &Owned) -> Result<(), String> {
             Ok(created) => {
                 wanted.insert(created.session.session_id);
             }
-            Err(Unresolved::Nothing(_)) => {}
-            // The daemon holds a reservation under this identifier and will not name what it made.
-            // Everything live in this environment is closed below whatever that was, and the run
-            // says it could not account for the identifier rather than ending quietly.
-            Err(Unresolved::Unknown(failure)) => {
+            // The daemon would not name what this request made. Everything live in this environment
+            // is closed below whatever that was, and the run says it could not account for the
+            // request rather than ending quietly.
+            Err(failure) => {
                 refused.push(format!("{action}: what it made was never named: {failure}"));
             }
         }

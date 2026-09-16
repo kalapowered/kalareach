@@ -228,7 +228,9 @@ struct Terminal<'a, W: std::io::Write> {
 /// - so a write takes what there is room for and says so, and what it took is what is released.
 ///
 /// A piece is at most [`WRITE_PIECE_BYTES`], so a takeover reaches a writer between pieces instead
-/// of behind a whole batch, and `room` is waited on outside the boundary. A piece never *ends*
+/// of behind a whole batch. `room` is waited on outside the boundary, and only after the terminal
+/// has said it has none: the write is the thing that knows, and asking anything else first would
+/// pay for room the terminal already had. A piece never *ends*
 /// inside a paste delimiter: a terminal takes what it has room for, so a short write can stop in
 /// the middle of one. Half a delimiter is the one thing an abandoned batch cannot leave behind,
 /// because the next actor's first bytes would complete it and their paste would begin inside the
@@ -253,21 +255,6 @@ fn write_batch(
         // The rest of a delimiter the last piece stopped inside of, already counted as delivered
         // and not yet written. It goes before anything else this writer does.
         let mut owed: Option<std::ops::Range<usize>> = None;
-        // The waiting happens here, outside the boundary, so that a writer holding bytes an
-        // application is not reading holds nothing else: a lease change takes the boundary while
-        // this waits, and the next look at the fence sees it.
-        if !wait_for_room(room, gate, stale) {
-            return (
-                delivered,
-                if room.is_some_and(|waiter| {
-                    waiter.wait(std::time::Duration::ZERO) == crate::pty::Room::Gone
-                }) {
-                    Delivery::Gone
-                } else {
-                    Delivery::Abandoned
-                },
-            );
-        }
         // One boundary for the fence, the write, the delimiter it may have stopped inside of, and
         // the accounting for every byte of that. A delimiter finished after the boundary was let go
         // would be bytes written after a takeover counted them as discarded, which is the one thing
@@ -318,7 +305,21 @@ fn write_batch(
                     std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                continue;
+                // The terminal has no room for more. This is the only wait, it happens outside the
+                // boundary, and it happens only after the terminal itself has said so: a writer
+                // that waited before every piece would pay for room it already had.
+                if !wait_for_room(room, gate, stale) {
+                    return (
+                        delivered,
+                        if room.is_some_and(|waiter| {
+                            waiter.wait(std::time::Duration::ZERO) == crate::pty::Room::Gone
+                        }) {
+                            Delivery::Gone
+                        } else {
+                            Delivery::Abandoned
+                        },
+                    );
+                }
             }
             Err(_) => return (delivered, Delivery::Gone),
         }

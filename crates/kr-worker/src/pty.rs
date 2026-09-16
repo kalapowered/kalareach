@@ -552,6 +552,41 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_command_line_can_be_taken_apart_again() {
+        use std::ffi::OsString;
+
+        // A path is mostly backslashes. The shell this host starts is named by one, so a line that
+        // dropped them would start the wrong program or none at all.
+        let plain = command_line(&[OsString::from(r"C:\Windows\System32\cmd.exe")]);
+        assert_eq!(plain, r"C:\Windows\System32\cmd.exe");
+
+        // A space makes it quoted, and the backslashes inside stay exactly as they are: they are
+        // only special in front of a quotation mark.
+        let spaced = command_line(&[OsString::from(r"C:\Program Files\PowerShell\pwsh.exe")]);
+        assert_eq!(spaced, "\"C:\\Program Files\\PowerShell\\pwsh.exe\"");
+
+        // A run of backslashes before a quotation mark is doubled, and one more is added for the
+        // quotation mark itself.
+        let embedded = command_line(&[OsString::from("say \\\\\"this\"")]);
+        assert_eq!(embedded, "\"say \\\\\\\\\\\"this\\\"\"");
+
+        // A run at the end is doubled, so the closing quote is not the one that was escaped.
+        let trailing = command_line(&[OsString::from(r"c:\a b\")]);
+        assert_eq!(trailing, "\"c:\\a b\\\\\"");
+
+        // An empty argument is a pair of quotes rather than nothing at all.
+        assert_eq!(command_line(&[OsString::from("")]), "\"\"");
+
+        // And the arguments are separated by one space, in the order they were given.
+        let several = command_line(&[
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("echo hello"),
+        ]);
+        assert_eq!(several, "/bin/sh -c \"echo hello\"");
+    }
+
+    #[test]
     fn a_wait_of_a_whole_second_is_a_wait_rather_than_a_refusal() {
         // A nanosecond field of a second or more is not a duration `poll` accepts: it is refused,
         // and a refusal reads as a terminal that has gone, which would stop a session's output for
@@ -819,6 +854,57 @@ fn answer_rather_than_wait(master: &dyn MasterPty) {
 /// Waiting for the terminal's output, which on Windows is waiting for the read that was started.
 #[cfg(windows)]
 pub use crate::conpty::OutputWaiter;
+
+/// Builds a Windows command line the way the operating system takes one apart again.
+///
+/// An argument is quoted when it is empty or contains a space, a tab or a quotation mark. Inside
+/// the quotes the rule is the documented inverse of how a program's own argument parser reads it
+/// back: a run of `n` backslashes before a quotation mark is written as `2n + 1` of them, a run
+/// before the closing quote as `2n`, and a run anywhere else exactly as it is. A path is mostly
+/// backslashes, so a version of this that dropped them would start the wrong program or none.
+///
+/// It lives here rather than beside the console it is for, so that it can be tested on a machine
+/// that cannot run Windows: the rule is a string rule and has nothing of the platform in it.
+#[cfg(any(windows, test))]
+pub(crate) fn command_line(argv: &[std::ffi::OsString]) -> String {
+    let mut line = String::new();
+    for argument in argv {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        let argument = argument.to_string_lossy();
+        if !argument.is_empty() && !argument.contains([' ', '\t', '"']) {
+            line.push_str(&argument);
+            continue;
+        }
+        line.push('"');
+        let mut backslashes = 0_usize;
+        for character in argument.chars() {
+            match character {
+                '\\' => backslashes += 1,
+                '"' => {
+                    for _ in 0..=backslashes.saturating_mul(2) {
+                        line.push('\\');
+                    }
+                    backslashes = 0;
+                    line.push('"');
+                }
+                _ => {
+                    for _ in 0..backslashes {
+                        line.push('\\');
+                    }
+                    backslashes = 0;
+                    line.push(character);
+                }
+            }
+        }
+        for _ in 0..backslashes.saturating_mul(2) {
+            line.push('\\');
+        }
+        line.push('"');
+    }
+    line
+}
 
 /// A waiter for room in a terminal whose writes answer rather than wait.
 ///
