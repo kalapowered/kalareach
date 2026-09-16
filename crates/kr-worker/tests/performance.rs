@@ -103,12 +103,14 @@ fn build() -> BuildId {
 /// What a measurement is responsible for closing.
 ///
 /// A create the daemon answered names a session. A create whose answer was lost names nothing yet,
-/// and what it may have made is exactly what nobody else will close, so its identifier stays here
-/// until the daemon is asked again and says what that identifier made.
+/// and what it may have made is exactly what nobody else will close, so the request itself stays
+/// here until the daemon is asked again and says what it made. The whole request, not the
+/// identifier alone: section 23 de-duplicates on the payload, the freshness window included, so
+/// only the original request is the exact duplicate the host answers with its recorded outcome.
 #[derive(Default)]
 struct Owned {
     sessions: Vec<SessionCreateResult>,
-    unresolved: Vec<ActionId>,
+    unresolved: Vec<kr_protocol::envelope::MutationRequest>,
 }
 
 /// Creates one session, recording what it owns, or says why it could not be created.
@@ -117,51 +119,71 @@ struct Owned {
 /// had already made running, so each step reports its failure and the caller closes what it owns
 /// before it reports anything.
 async fn create(host: &Host, owned: &mut Owned) -> Result<SessionCreateResult, String> {
-    // The identifier is decided before the call and kept. A create whose answer never arrives has
-    // still happened, so asking again with the same identifier is how the measurement learns what
-    // it owns rather than leaving a session nobody will close; the daemon answers a repeat with the
-    // outcome it recorded the first time. It goes into the record before the call, because the
-    // moment it is on the wire is the moment it can have made something.
-    let action = ActionId::new(kr_ipc::new_uuid());
-    owned.unresolved.push(action);
-    let asked = ask_create(host, action, CREATE_ATTEMPTS).await;
+    // The request is composed before it is sent and kept. A create whose answer never arrives has
+    // still happened, so sending that exact request again is how the measurement learns what it
+    // owns rather than leaving a session nobody will close; the daemon answers an exact duplicate
+    // with the outcome it recorded the first time. It goes into the record before the call, because
+    // the moment it is on the wire is the moment it can have made something.
+    let endpoint = match host.temp.environment().controller_endpoint() {
+        Ok(endpoint) => endpoint,
+        Err(error) => return Err(format!("the daemon's endpoint: {error}")),
+    };
+    let mut client = match LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await {
+        Ok(client) => client,
+        Err(error) => return Err(format!("connect to the daemon: {error}")),
+    };
+    // Composed on the connection that sends it, because a first admission quotes the freshness
+    // window that connection holds. Every later send of it is a repeat rather than a first
+    // admission, which is the only reason it may travel over another connection.
+    let request = match client
+        .compose(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &create_params(host),
+        )
+        .await
+    {
+        Ok(request) => request,
+        Err(error) => return Err(format!("compose the create: {error}")),
+    };
+    let action = request.action_id;
+    owned.unresolved.push(request.clone());
+    let asked = match client.repeat(&request).await {
+        Ok(Ok(value)) => value
+            .to_typed()
+            .map_err(|error| Unresolved::Nothing(format!("the create result: {error}"))),
+        Ok(Err(error)) => Err(Unresolved::Nothing(format!("the create failed: {error}"))),
+        // The answer was lost. Whether the session exists is exactly what asking again settles, and
+        // asking again is what cleanup does with the request this run is holding.
+        Err(error) => match ask_create(host, &request, CREATE_ATTEMPTS).await {
+            Ok(created) => Ok(created),
+            Err(Unresolved::Nothing(failure)) => Err(Unresolved::Nothing(failure)),
+            Err(Unresolved::Unknown(failure)) => Err(Unresolved::Unknown(format!(
+                "the create call: {error}; and asking again: {failure}"
+            ))),
+        },
+    };
     match asked {
         Ok(created) => {
-            owned.unresolved.retain(|held| *held != action);
+            owned.unresolved.retain(|held| held.action_id != action);
             owned.sessions.push(created.clone());
             Ok(created)
         }
         Err(Unresolved::Nothing(failure)) => {
             // The daemon answered that it made nothing, so there is nothing to own.
-            owned.unresolved.retain(|held| *held != action);
+            owned.unresolved.retain(|held| held.action_id != action);
             Err(failure)
         }
-        // Whether this identifier made a session is still unknown, so it stays owned and cleanup
-        // asks about it again.
+        // Whether this request made a session is still unknown, so it stays owned and cleanup
+        // sends it again.
         Err(Unresolved::Unknown(failure)) => Err(failure),
     }
 }
 
-/// Why a create did not name a session.
-enum Unresolved {
-    /// The daemon answered that it made nothing.
-    Nothing(String),
-    /// What that identifier made, if anything, the answer does not say.
-    Unknown(String),
-}
-
-/// Asks the daemon to perform one create, repeating the same identifier while the answer is lost.
-async fn ask_create(
-    host: &Host,
-    action: ActionId,
-    attempts: usize,
-) -> Result<SessionCreateResult, Unresolved> {
-    let endpoint = host
-        .temp
-        .environment()
-        .controller_endpoint()
-        .map_err(|error| Unresolved::Unknown(format!("the daemon's endpoint: {error}")))?;
-    let params = SessionCreateParams {
+/// The session every measurement creates.
+fn create_params(host: &Host) -> SessionCreateParams {
+    SessionCreateParams {
         environment_id: host.environment_id,
         presentation: Presentation::Invisible,
         shell: Nullable::some("/bin/sh".to_owned()),
@@ -173,7 +195,33 @@ async fn ask_create(
             name: "PATH".to_owned(),
             value: "/usr/bin:/bin".to_owned(),
         }],
-    };
+    }
+}
+
+/// Why a create did not name a session.
+enum Unresolved {
+    /// The daemon answered that it made nothing.
+    Nothing(String),
+    /// What that identifier made, if anything, the answer does not say.
+    Unknown(String),
+}
+
+/// Sends one create, and sends the same request again while the answer is lost.
+///
+/// The request is sent exactly as it was composed, over whichever connection this can open. That is
+/// what makes a repeat an exact duplicate rather than a new first admission: the daemon holds the
+/// payload digest of what it admitted, the freshness window is part of that payload, and only the
+/// original request still matches it.
+async fn ask_create(
+    host: &Host,
+    request: &kr_protocol::envelope::MutationRequest,
+    attempts: usize,
+) -> Result<SessionCreateResult, Unresolved> {
+    let endpoint = host
+        .temp
+        .environment()
+        .controller_endpoint()
+        .map_err(|error| Unresolved::Unknown(format!("the daemon's endpoint: {error}")))?;
     let mut failure = String::new();
     for _ in 0..attempts {
         let mut client = match LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
@@ -184,20 +232,7 @@ async fn ask_create(
                 continue;
             }
         };
-        // Each connection carries its own freshness window, and section 23 binds the window into
-        // the payload digest: a repeat over a new connection is a new first admission rather than
-        // an automatic retry, and the daemon says so. That answer still tells this caller
-        // something - the identifier reached the daemon and made a reservation - but not what it
-        // made, which is why such an identifier stays owned.
-        match client
-            .mutate(
-                Method::SessionCreate,
-                action,
-                ActionTarget::environment(host.environment_id),
-                &params,
-            )
-            .await
-        {
+        match client.repeat(request).await {
             Ok(Ok(value)) => {
                 return value
                     .to_typed()
@@ -205,7 +240,14 @@ async fn ask_create(
             }
             Ok(Err(error)) if error.code == kr_protocol::error::ErrorCode::IdConflict => {
                 return Err(Unresolved::Unknown(format!(
-                    "the identifier had already been admitted under another window: {error}"
+                    "the identifier was admitted under a different payload: {error}"
+                )));
+            }
+            // The daemon retains no such action, so it fell through to first admission and refused
+            // a window that is not this connection's. Nothing was made under this request.
+            Ok(Err(error)) if error.code == kr_protocol::error::ErrorCode::PermissionDenied => {
+                return Err(Unresolved::Nothing(format!(
+                    "the daemon has no record of this action: {error}"
                 )));
             }
             Ok(Err(error)) => {
@@ -231,49 +273,71 @@ const CREATE_ATTEMPTS: usize = 3;
 async fn a_create_whose_answer_was_lost_is_closed_by_the_run_that_asked_for_it() {
     // A measurement owns a session from the moment it asks for one, not from the moment it is told
     // about it. The daemon's list is not enough on its own: a worker it momentarily cannot read is
-    // absent from it, and the session would outlive the run that made it.
+    // absent from it, and the session would outlive the run that made it. What the run keeps is the
+    // request, because section 23 de-duplicates on the payload and the freshness window is part of
+    // it: only the original request is the exact duplicate the daemon answers with what it made.
     let host = host().await;
     let endpoint = host
         .temp
         .environment()
         .controller_endpoint()
         .expect("the daemon's endpoint");
-    let mut owned = Owned::default();
-    create(&host, &mut owned)
+
+    // The create, composed and sent the way `create` does it, on one connection.
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
-        .expect("creates one the ordinary way");
-    assert_eq!(owned.sessions.len(), 1);
+        .expect("connects to the daemon");
+    let request = client
+        .compose(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &create_params(&host),
+        )
+        .await
+        .expect("composes a create");
+    let made: SessionCreateResult = client
+        .repeat(&request)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the create succeeds")
+        .to_typed()
+        .expect("decodes");
     assert!(
-        owned.unresolved.is_empty(),
-        "a create that was answered leaves nothing hanging"
+        !made.deduplicated,
+        "the first send is the one that made the session"
+    );
+    drop(client);
+
+    // From here the run behaves as though that answer never arrived: it holds the request and
+    // nothing else. Sending it again, on another connection, is what cleanup does.
+    let again = match ask_create(&host, &request, CREATE_ATTEMPTS).await {
+        Ok(created) => created,
+        Err(Unresolved::Nothing(failure) | Unresolved::Unknown(failure)) => {
+            panic!("the daemon answers the exact duplicate: {failure}")
+        }
+    };
+    assert_eq!(
+        again.session.session_id, made.session.session_id,
+        "one request, one session, whichever connection asks about it"
+    );
+    assert!(
+        again.deduplicated,
+        "and the daemon says it is the one it recorded rather than a second launch"
     );
 
-    // And one whose answer never arrived: the identifier is all the run has, which is exactly what
-    // `create` leaves in the record when it cannot resolve it.
-    let lost = ActionId::new(kr_ipc::new_uuid());
-    owned.unresolved.push(lost);
+    // So a run that holds only the request closes what that request made.
+    let mut owned = Owned::default();
+    owned.unresolved.push(request);
     close_all(&host, &owned)
         .await
-        .expect("closes everything the run owns");
-
-    // Cleanup asked under that identifier, so the daemon has admitted it: asking now, on another
-    // connection and so under another window, is refused as the new first admission it would be.
-    // That refusal is the evidence, because an identifier nobody had used would create a session
-    // here instead - which is exactly what the environment would have been left holding.
-    match ask_create(&host, lost, CREATE_ATTEMPTS).await {
-        Err(Unresolved::Unknown(_)) => {}
-        Ok(created) => panic!(
-            "the run never asked what that identifier made, and made {} asking now",
-            created.session.session_id
-        ),
-        Err(Unresolved::Nothing(failure)) => panic!("the daemon's answer: {failure}"),
-    }
+        .expect("closes what the run owns");
     assert!(
         list_sessions(&endpoint, host.environment_id)
             .await
             .expect("the daemon's session list")
             .is_empty(),
-        "and the run leaves no session of its own running"
+        "the run leaves no session of its own running"
     );
     let _ = host.controller;
     let _ = host.worker;
@@ -547,8 +611,9 @@ async fn close_all(host: &Host, owned: &Owned) -> Result<(), String> {
     // that create made; if it made none, this makes one, which is then closed with the rest. Either
     // way nothing this measurement started is left behind, which is what the list alone cannot
     // promise: a worker the daemon momentarily cannot read is absent from it.
-    for action in &owned.unresolved {
-        match ask_create(host, *action, CREATE_ATTEMPTS).await {
+    for request in &owned.unresolved {
+        let action = request.action_id;
+        match ask_create(host, request, CREATE_ATTEMPTS).await {
             Ok(created) => {
                 wanted.insert(created.session.session_id);
             }

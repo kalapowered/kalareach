@@ -279,23 +279,72 @@ impl LocalClient {
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         // The window this mutation will quote is taken after everything the host has already
         // pushed has been applied.
+        let mutation = self.compose(method, action_id, target, params).await?;
+        self.writer
+            .write_message(&ControlFrame::Mutation(Box::new(mutation.clone())))
+            .await?;
+        self.await_response(mutation.request_id).await
+    }
+
+    /// Builds the mutation this client would send, without sending it.
+    ///
+    /// A caller that has to be able to ask again about what an action did keeps this and sends it
+    /// with [`Self::repeat`]; everything the host de-duplicates on is in it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport failure, or a parameter this protocol cannot encode.
+    pub async fn compose<T: serde::Serialize + ?Sized>(
+        &mut self,
+        method: Method,
+        action_id: ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        params: &T,
+    ) -> Result<MutationRequest> {
+        // The window this mutation will quote is taken after everything the host has already
+        // pushed has been applied.
         self.absorb_pending().await?;
-        let request_id = self.next_id();
         let params = ParamsValue::from_typed(params)
             .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))?;
+        Ok(MutationRequest {
+            request_id: self.next_id(),
+            method: method.into(),
+            method_version: MethodVersion::V1,
+            action_id,
+            grant_id: Nullable::null(),
+            target,
+            expected: ParamsValue::empty(),
+            action_window_id: self.acknowledgement.action_window.action_window_id.clone(),
+            requested_ttl_ms: DurationMs::new(kr_protocol::limits::DEFAULT_MUTATION_TTL.get()),
+            params,
+        })
+    }
+
+    /// Sends a mutation again exactly as it was first sent, and returns what the host says now.
+    ///
+    /// This is the recovery an action identifier exists for. A caller whose answer never arrived
+    /// does not know what its action did; section 23 says the host keeps the payload digest and
+    /// returns the existing receipt for an exact duplicate, and that the freshness window is part
+    /// of that payload. So an exact duplicate is the *original* request, window and all - not the
+    /// same identifier under this connection's own window, which is a different payload and is
+    /// refused as a reused identifier. The window is not re-validated for an action the host has
+    /// already admitted, which is what lets this work over a new connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error, or a transport failure.
+    pub async fn repeat(
+        &mut self,
+        mutation: &MutationRequest,
+    ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
+        self.absorb_pending().await?;
+        let request_id = self.next_id();
+        let mut mutation = mutation.clone();
+        // The only field that is this connection's rather than the action's. A response correlates
+        // a request on one connection; the durable identity is the action identifier.
+        mutation.request_id = request_id;
         self.writer
-            .write_message(&ControlFrame::Mutation(Box::new(MutationRequest {
-                request_id,
-                method: method.into(),
-                method_version: MethodVersion::V1,
-                action_id,
-                grant_id: Nullable::null(),
-                target,
-                expected: ParamsValue::empty(),
-                action_window_id: self.acknowledgement.action_window.action_window_id.clone(),
-                requested_ttl_ms: DurationMs::new(kr_protocol::limits::DEFAULT_MUTATION_TTL.get()),
-                params,
-            })))
+            .write_message(&ControlFrame::Mutation(Box::new(mutation)))
             .await?;
         self.await_response(request_id).await
     }
