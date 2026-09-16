@@ -960,11 +960,19 @@ Regeneration gives the same bytes on every supported host, because every figure 
 fixture records is fixed rather than read from the machine. So the check above is a check on the
 code, not on where it ran.
 
-The KR-PERF-007 figure comes from an optimised build:
+The KR-PERF-007 figure comes from an optimised build, one test at a time, because three of the
+tests in that file are timings and they measure each other otherwise:
 
 ```bash
-cargo test -p kr-term --release --test perf -- --nocapture
+cargo test -p kr-term --release --test perf -- --nocapture --test-threads=1
 ```
+
+Each rate is the best of three passes, after a warm-up pass that is discarded, and every run
+records the operating system, the architecture and the processors it had. A rate is a property of
+the engine, and the first pass through a fresh process is not: it pays for the allocator growing
+its arena and for the first touch of every page the grid and the row cache come to hold. Nor is a
+pass the machine interrupted, which is what section 27's idle host is about. Every bound is checked
+on every pass, because a bound holds whatever the machine was doing.
 
 It drains a 5 MiB stream of mixed text, colour changes, cursor movement, wide characters,
 hyperlinks, alternate-screen churn and queries, and checks that the response lane, the row cache and
