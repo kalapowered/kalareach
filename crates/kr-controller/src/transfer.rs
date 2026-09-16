@@ -274,11 +274,10 @@ impl TransferModule {
         mutation: &MutationRequest,
         method: Method,
     ) -> ControlFrame {
-        let outcome = match self.check_stored_subject(actor_id, mutation, method).await {
-            Ok(()) => self.write(actor_id, mutation, method).await,
-            Err(error) => Err(error),
-        };
-        frame(mutation.request_id, outcome)
+        frame(
+            mutation.request_id,
+            self.write(actor_id, mutation, method).await,
+        )
     }
 
     /// Checks that a mutation's envelope names the subject its stored object belongs to.
@@ -289,7 +288,10 @@ impl TransferModule {
     /// name a session the effect never touched. Ownership does not catch it, because both are the
     /// same principal's. The stored subject is the authority, and this is where the two are
     /// compared.
-    async fn check_stored_subject(
+    /// This is a read, and it waits: for a blocking thread and for the journal's lock. So the
+    /// caller runs it *before* the admission check, and the admission check is the last thing
+    /// between a mutation and its effect.
+    pub async fn check_subject_of_record(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
@@ -309,12 +311,29 @@ impl TransferModule {
                 "this object belongs to another environment",
             ));
         }
+        // An object bound to a session is acted on by a request that names that session. A
+        // target that names none would otherwise produce a receipt against the environment for an
+        // effect on a session, and one that names another session would name the wrong one.
+        if stored.session_id.is_some() && mutation.target.session_id.0 != stored.session_id {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "this object belongs to a session, and the request's target does not name it",
+            ));
+        }
         if mutation.target.session_id.0.is_some()
             && mutation.target.session_id.0 != stored.session_id
         {
             return Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 "the request's target and the object it acts on name different sessions",
+            ));
+        }
+        if stored.application_instance_id.is_some()
+            && mutation.target.application_instance_id.0 != stored.application_instance_id
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "this object belongs to an application, and the request's target does not name it",
             ));
         }
         if mutation.target.application_instance_id.0.is_some()

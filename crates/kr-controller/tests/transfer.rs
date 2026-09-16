@@ -818,6 +818,31 @@ async fn a_mutation_that_names_another_session_than_its_transfer_is_refused() {
         refusal.message
     );
 
+    // A target that names no session at all is refused too: an object that belongs to a session is
+    // acted on by a request that names that session, or the receipt names something the effect
+    // never touched.
+    let refusal = failure(
+        control
+            .mutate(
+                Method::UploadFinish,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &UploadFinishParams {
+                    transfer_id: begun.transfer_id,
+                    declared_byte_len: U64::new(bytes.len() as u64),
+                    declared_digest: digest(&bytes),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refusal.code, ErrorCode::InvalidArgument);
+    assert!(
+        refusal.message.contains("session"),
+        "the refusal says what the target left out: {}",
+        refusal.message
+    );
+
     // The transfer is untouched, and the same call under its own session publishes it.
     let finished: UploadFinishResult = typed(
         &control

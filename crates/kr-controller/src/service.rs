@@ -1428,10 +1428,24 @@ impl Controller {
         accepted: AcceptedDeadline,
     ) -> ControlFrame {
         if crate::transfer::TransferModule::serves(method) {
-            // The admission is checked once more, here, because everything between it and this
-            // point can wait: for this task to be scheduled, for the store's lock, for a blocking
-            // thread. An action whose accepted deadline passed while it queued does not go on to
-            // write, and neither does one whose connection lost its authority in the meantime.
+            // The stored subject is read first, because reading it waits: for a blocking thread
+            // and for the journal's lock. Then the admission is checked, so that check is the last
+            // thing between this mutation and its effect rather than one more thing with waits
+            // after it.
+            if let Err(error) = self
+                .transfer
+                .check_subject_of_record(actor_id, mutation, method)
+                .await
+            {
+                return ControlFrame::Response(Response {
+                    request_id: mutation.request_id,
+                    outcome: Outcome::Error(error),
+                });
+            }
+            // Everything between the envelope check and this point can wait: for this task to be
+            // scheduled, for a blocking thread, for the subject read above. An action whose
+            // accepted deadline passed while it queued does not go on to write, and neither does
+            // one whose connection lost its authority in the meantime.
             if self.clock.now() >= accepted.deadline {
                 return respond(
                     mutation.request_id,
