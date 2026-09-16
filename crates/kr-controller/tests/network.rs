@@ -73,6 +73,15 @@ use kr_transport::scheduler::SendLimits;
 /// How long a test waits for something the machine has to do before it calls it a failure.
 const PATIENCE: Duration = Duration::from_secs(30);
 
+/// What the shell prints when it has actually run what was typed.
+///
+/// The command's own text does not contain it, so a terminal that merely echoed the keystrokes
+/// cannot satisfy an assertion about it: what passes is the shell having executed the command.
+const MARKER: &str = "kalareach-ran";
+
+/// The command that produces it.
+const MARKER_COMMAND: &str = "printf 'kala%s-ran\n' reach\n";
+
 /// A host tree on the internal disk, with the worker beside it.
 struct Host {
     temp: kr_ipc::testing::TempHost,
@@ -92,6 +101,12 @@ impl Host {
         let environment_id = temp.environment_id();
         let worker = temp.root().join("kr-worker");
         std::fs::copy(&worker_build, &worker).expect("copies the worker");
+        // A launched worker inherits this process's working directory, and this process starts in
+        // the build tree, which may be on a removable volume: a process a service manager started
+        // that reaches one asks the person at the machine for permission. Moving this process into
+        // the host tree moves every worker it launches with it. Every test in this binary wants
+        // the same thing, so which of them set it last does not matter.
+        std::env::set_current_dir(temp.root()).expect("moves into the host tree");
         Some(Self {
             temp,
             worker,
@@ -169,7 +184,13 @@ impl Host {
     }
 }
 
-/// Returns the worker binary beside this test's own, when the build produced one.
+/// Returns the worker binary beside this test's own.
+///
+/// # Panics
+///
+/// Panics when the build has not produced one. A suite that skipped instead would report a pass
+/// for something it never ran, which is worse than a failure: this is why every test here is
+/// `#[ignore]`d and run by `scripts/end-to-end.sh`, which builds the worker first.
 fn worker_program() -> Option<PathBuf> {
     let mut directory = std::env::current_exe().expect("the test binary");
     directory.pop();
@@ -181,15 +202,13 @@ fn worker_program() -> Option<PathBuf> {
     } else {
         "kr-worker"
     });
-    if worker.is_file() {
-        Some(worker)
-    } else {
-        eprintln!(
-            "the network suite needs the worker binary at {}; build it and run this again",
-            worker.display()
-        );
-        None
-    }
+    assert!(
+        worker.is_file(),
+        "this suite launches a worker process and there is none at {}; build it with \
+         `cargo build -p kr-worker` or run `scripts/end-to-end.sh`, which does",
+        worker.display()
+    );
+    Some(worker)
 }
 
 struct RunningDaemon {
@@ -405,7 +424,7 @@ async fn pair_with(
 
     // The candidate scans it and redeems it over the pre-authorisation surface, which is the only
     // thing an unpaired endpoint reaches.
-    let host_addr = host_addr(daemon, &payload);
+    let host_addr = host_addr(&payload);
     let connection = device
         .endpoint
         .connect(host_addr, kr_protocol::hello::ALPN)
@@ -524,23 +543,27 @@ impl kr_pairing::platform::LivePeer for HostPeer {
     }
 }
 
-/// Returns where a device dials the host, from the invitation and this endpoint's own addresses.
-fn host_addr(daemon: &RunningDaemon, payload: &DirectQrPayload) -> EndpointAddr {
+/// Returns where a candidate dials the host, from the invitation alone.
+///
+/// A candidate has the QR and nothing else, so this is built from the QR: the endpoint identity it
+/// pins, the relay it names and the address hints it carries. A test that reached into the daemon
+/// for the address instead would be proving that the *test* knows where the host is.
+fn host_addr(payload: &DirectQrPayload) -> EndpointAddr {
     let endpoint_id = iroh::PublicKey::from_bytes(payload.endpoint_id.as_bytes())
         .expect("the invitation pins a usable endpoint identity");
     let mut addr = EndpointAddr::new(endpoint_id);
-    if let Some(relay) = daemon
-        .network
-        .network_config()
-        .expect("a network configuration")
+    if let Some(relay) = payload
+        .network_config
         .relay_urls
         .first()
         .and_then(|hint| hint.as_str().parse::<iroh::RelayUrl>().ok())
     {
         addr = addr.with_relay_url(relay);
     }
-    for socket in daemon.network.bound_sockets() {
-        addr = addr.with_ip_addr(socket);
+    for hint in &payload.network_config.direct_addresses {
+        if let Ok(socket) = hint.as_str().parse::<std::net::SocketAddr>() {
+            addr = addr.with_ip_addr(socket);
+        }
     }
     addr
 }
@@ -626,7 +649,10 @@ async fn attach(
         .expect("an attachment");
     let attachment_id = attached.attachment.attachment_id;
 
-    // Section 8's order: subscribe from the cursor first, then install what it returns.
+    // Section 8's order: subscribe from the cursor first, then install what it returns. The
+    // subscription is opened before the events it queues are read, and the events themselves are
+    // what the restoration installs, so nothing here pretends to have installed a snapshot it was
+    // never given.
     let mut restoration = Restoration::start(output_stream(), &session.cursors().await);
     let params = restoration
         .subscribe_params(session_id, attachment_id, &[EventStream::Output])
@@ -636,15 +662,46 @@ async fn attach(
         .await
         .expect("the subscription succeeds");
     restoration.subscribed().expect("the order is kept");
-    session
-        .installed_snapshot(&output_stream(), kr_protocol::ids::EventSequence::new(0))
-        .await;
-    session
-        .applied_content(&output_stream(), subscribed.from_cursor)
-        .await;
-    restoration.installed().expect("the order is kept");
-    assert_eq!(restoration.step(), RestorationStep::Live);
     (attachment_id, subscribed)
+}
+
+/// Reads the session's output until `wanted` appears, applying everything it takes as it goes.
+///
+/// This is what installing a restoration and following the stream looks like from a client: every
+/// event is folded into the client's state and its content position moves with it, so the position
+/// a later reconnect resumes from is one a consumer actually reached.
+async fn observe(
+    session: &Session,
+    events: &mut tokio::sync::broadcast::Receiver<kr_protocol::envelope::Notification>,
+    wanted: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut seen = String::new();
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Ok(notification)) =
+            tokio::time::timeout(Duration::from_secs(5), events.recv()).await
+        else {
+            continue;
+        };
+        if notification.event_type.as_str() != "session.output" {
+            continue;
+        }
+        let event: OutputEvent = notification.payload.to_typed().expect("an output event");
+        seen.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+        session
+            .applied_content(
+                &output_stream(),
+                U64::new(event.cursor.get() + event.bytes.len() as u64),
+            )
+            .await;
+        session
+            .applied(&output_stream(), notification.sequence)
+            .await;
+        if seen.contains(wanted) {
+            return seen;
+        }
+    }
+    panic!("the session's output never carried {wanted:?}: {seen:?}");
 }
 
 /// Takes the input lease, types `text`, and waits for it to come back as output.
@@ -694,34 +751,7 @@ async fn type_and_observe(
         written.forwarded_bytes.get() > 0,
         "the bytes reached the application"
     );
-
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    let mut seen = String::new();
-    while tokio::time::Instant::now() < deadline {
-        let Ok(Ok(notification)) =
-            tokio::time::timeout(Duration::from_secs(5), events.recv()).await
-        else {
-            continue;
-        };
-        if notification.event_type.as_str() != "session.output" {
-            continue;
-        }
-        let event: OutputEvent = notification.payload.to_typed().expect("an output event");
-        seen.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
-        session
-            .applied_content(
-                &output_stream(),
-                U64::new(event.cursor.get() + event.bytes.len() as u64),
-            )
-            .await;
-        session
-            .applied(&output_stream(), notification.sequence)
-            .await;
-        if seen.contains("kalareach") {
-            return seen;
-        }
-    }
-    panic!("the session's output never carried what was typed: {seen:?}");
+    observe(session, &mut events, MARKER).await
 }
 
 /// Closes a session and waits for the daemon to record that its worker has gone.
@@ -770,6 +800,10 @@ async fn close_session(client: &mut LocalClient, host: &Host, session_id: Sessio
     panic!("the session did not finish closing");
 }
 
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor() {
     let Some(host) = Host::create() else {
@@ -802,10 +836,25 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         host.environment_id,
         session_id,
         attachment_id,
-        "echo kalareach\n",
+        MARKER_COMMAND,
     )
     .await;
-    assert!(seen.contains("kalareach"));
+    assert!(seen.contains(MARKER));
+
+    // Something is typed that the device will *not* wait for, and then its connection is lost.
+    // What the session produces next happens while the device is away, which is what makes the
+    // restoration on the next connection worth checking.
+    let away = "printf 'while%s-away\n' -it\n";
+    session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id,
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+            sequence: kr_protocol::ids::InputSequence::new(1),
+            bytes: kr_protocol::scalars::Bytes::new(away.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the second batch is accepted");
 
     // The control stream is lost. What the client carries across is the content position, not the
     // previous connection's event sequences.
@@ -815,48 +864,61 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         .applied_cursor(&output_stream())
         .expect("the client holds a position");
     assert!(resumed_from.get() > 0);
+    assert_eq!(
+        carried.cursors.received(&output_stream()),
+        None,
+        "the previous connection's event sequences do not travel"
+    );
     session.close();
     drop(session);
 
-    let session = connect(&daemon, &device, &record).await;
-    let session = {
-        session.close();
-        // A reconnect resumes the cursors it carried.
-        let transport = NetworkTransport::connect(
-            &device.endpoint,
-            {
-                let mut addr = EndpointAddr::new(
-                    iroh::PublicKey::from_bytes(daemon.network.endpoint_id().as_bytes())
-                        .expect("a usable endpoint identity"),
-                );
-                for socket in daemon.network.bound_sockets() {
-                    addr = addr.with_ip_addr(socket);
-                }
-                addr
-            },
-            &device.paired_identity(record.device_id),
-            &host_paired_record(&daemon),
-            SendLimits::default(),
-        )
-        .await
-        .expect("the device reconnects");
-        Session::resume(Arc::new(transport), carried.cursors).expect("a resumed session")
-    };
+    // A reconnect resumes the cursors it carried, and the subscription it opens is asked to start
+    // from exactly them.
+    let transport = NetworkTransport::connect(
+        &device.endpoint,
+        host_addr_of(&daemon),
+        &device.paired_identity(record.device_id),
+        &host_paired_record(&daemon),
+        SendLimits::default(),
+    )
+    .await
+    .expect("the device reconnects");
+    let session = Session::resume(Arc::new(transport), carried.cursors).expect("a resumed session");
     let restoration = Restoration::start(output_stream(), &session.cursors().await);
     assert_eq!(
         restoration.step(),
         RestorationStep::SubscribeFrom(resumed_from),
         "the reconnect subscribes from the cursor it carried"
     );
+    let mut events = session.events();
     let (_attachment_id, resumed) = attach(&session, host.environment_id, session_id).await;
     assert!(
-        resumed.from_cursor.get() >= resumed_from.get() || resumed.gap.as_ref().is_some(),
-        "a resumed subscription starts at the cursor or says what it cannot replay"
+        resumed.from_cursor.get() >= resumed_from.get(),
+        "a resumed subscription starts no earlier than the position the client held"
+    );
+    // And the screen it is drawn carries what the session produced while it was away. That is the
+    // restoration: the client asked from its own cursor and was given the state at it.
+    let restored = observe(&session, &mut events, "while-it-away").await;
+    assert!(
+        restored.contains("while-it-away"),
+        "the restoration carries what happened while the device was away: {restored:?}"
     );
 
     session.close();
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
+}
+
+/// Returns the address a device dials this host at, from the endpoint's own bound sockets.
+fn host_addr_of(daemon: &RunningDaemon) -> EndpointAddr {
+    let mut addr = EndpointAddr::new(
+        iroh::PublicKey::from_bytes(daemon.network.endpoint_id().as_bytes())
+            .expect("a usable endpoint identity"),
+    );
+    for socket in daemon.network.bound_sockets() {
+        addr = addr.with_ip_addr(socket);
+    }
+    addr
 }
 
 fn host_paired_record(daemon: &RunningDaemon) -> PairedPeer {
@@ -869,6 +931,10 @@ fn host_paired_record(daemon: &RunningDaemon) -> PairedPeer {
     }
 }
 
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     let Some(host) = Host::create() else {
@@ -933,6 +999,10 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     daemon.stop().await;
 }
 
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_session_runs_over_a_local_socket_and_over_the_network() {
     let Some(host) = Host::create() else {
@@ -988,6 +1058,10 @@ async fn one_session_runs_over_a_local_socket_and_over_the_network() {
     daemon.stop().await;
 }
 
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_remote_path_ending_takes_neither_the_worker_nor_a_local_attachment() {
     let Some(host) = Host::create() else {
@@ -1058,11 +1132,23 @@ async fn the_remote_path_ending_takes_neither_the_worker_nor_a_local_attachment(
         .to_typed()
         .expect("decodes");
     assert_eq!(still_live.session.state, SessionState::Live);
+    let attachments: kr_protocol::recovery::EventsSnapshotResult = attached_locally
+        .request(
+            Method::EventsSnapshot,
+            &kr_protocol::recovery::EventsSnapshotParams { session_id },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the worker answers")
+        .to_typed()
+        .expect("decodes");
     assert!(
-        still_live.session.attachment_count.get() >= 1,
-        "the local attachment survived the remote path ending"
+        attachments
+            .attachments
+            .iter()
+            .any(|summary| summary.attachment_id == local_attachment.attachment.attachment_id),
+        "the local attachment, by identity, survived the remote path ending"
     );
-    let _ = local_attachment;
 
     drop(attached_locally);
     close_session(&mut local, &host, session_id).await;
@@ -1132,6 +1218,10 @@ impl LocalRelay {
     }
 }
 
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_session() {
     let Some(host) = Host::create() else {
@@ -1157,7 +1247,7 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
         LocalClient::connect(&worker_endpoint, LocalClientKind::Cli, build())
             .await
             .expect("the local client reaches the worker");
-    let _local_attachment: SessionAttachResult = attached_locally
+    let local_attachment: SessionAttachResult = attached_locally
         .mutate(
             Method::SessionAttach,
             ActionId::new(kr_ipc::new_uuid()),
@@ -1210,13 +1300,17 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
         host.environment_id,
         session_id,
         attachment_id,
-        "echo kalareach\n",
+        MARKER_COMMAND,
     )
     .await;
-    assert!(seen.contains("kalareach"), "the relay carried the session");
+    assert!(seen.contains(MARKER), "the relay carried the session");
 
-    // The relay path goes, which is what a lease that has run out of reserved bytes does to it.
-    // The remote path ends with it; the worker and the local attachment do not.
+    // The device's path goes: the relay it reached the host through is stopped, and its endpoint
+    // is closed. Two loopback endpoints hole-punch a direct path whatever they were told about, so
+    // stopping the relay alone would not prove the remote path had ended; closing the endpoint is
+    // the simulation section 17's quota disconnect gets here, and what it establishes is the half
+    // that matters: the remote path ending takes neither the worker nor the local attachment with
+    // it.
     relay.shut_down().await;
     device.endpoint.close().await;
     drop(session);
@@ -1233,9 +1327,22 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
         SessionState::Live,
         "losing the relay path did not end the session"
     );
+    let attachments: kr_protocol::recovery::EventsSnapshotResult = attached_locally
+        .request(
+            Method::EventsSnapshot,
+            &kr_protocol::recovery::EventsSnapshotParams { session_id },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the worker answers")
+        .to_typed()
+        .expect("decodes");
     assert!(
-        still_live.session.attachment_count.get() >= 1,
-        "and the local attachment is still attached"
+        attachments
+            .attachments
+            .iter()
+            .any(|summary| summary.attachment_id == local_attachment.attachment.attachment_id),
+        "the local attachment, by identity, is still attached"
     );
 
     drop(attached_locally);
@@ -1267,6 +1374,10 @@ fn viewer_proposal(session_selector: SessionSelector) -> ProposedGrant {
     }
 }
 
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_devices_grant_bounds_what_it_can_reach() {
     let Some(host) = Host::create() else {
@@ -1430,6 +1541,10 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
     daemon.stop().await;
 }
 
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_listing_names_only_the_sessions_a_grant_admits() {
     let Some(host) = Host::create() else {

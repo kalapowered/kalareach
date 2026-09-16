@@ -133,15 +133,37 @@ pub enum Keyboard {
     Withhold,
 }
 
+/// What of the session's screen a restoration may carry.
+///
+/// Section 10's live-screen exception is exactly that: the currently visible screen, and never the
+/// buffer that is not showing, the scrollback or the backing transcript. A caller whose authority
+/// is that exception is served [`Scope::LiveScreen`], and the rows of the other buffer are counted
+/// among what the restoration did not carry rather than painted into it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+    /// Everything the snapshot describes, including the buffer that is not showing.
+    #[default]
+    WholeScreen,
+    /// The currently visible screen only.
+    LiveScreen,
+}
+
 /// Renders a restoration for a terminal showing `viewport` of the canonical grid.
 ///
 /// The viewport decides which canonical rows land on which screen lines and which columns are
 /// shown, so a terminal smaller than the session sees the part it is looking at rather than a
 /// wrapped approximation of the whole. `keyboard` decides whether this terminal's keyboard
-/// protocols may be changed at all.
+/// protocols may be changed at all, and `scope` decides how much of the screen this caller's
+/// authority reaches.
 #[must_use]
-pub fn render(operations: &[RestoreOp], viewport: Viewport, keyboard: Keyboard) -> Restoration {
+pub fn render(
+    operations: &[RestoreOp],
+    viewport: Viewport,
+    keyboard: Keyboard,
+    scope: Scope,
+) -> Restoration {
     let mut writer = Writer::new(viewport, keyboard);
+    writer.scope = scope;
     for operation in operations {
         writer.apply(operation);
     }
@@ -162,6 +184,8 @@ const ST: &[u8] = b"\x1b\\";
 struct Writer {
     out: Vec<u8>,
     viewport: Viewport,
+    /// How much of the screen this caller's authority reaches.
+    scope: Scope,
     active: ActiveBuffer,
     /// The rendition the terminal is in, once this writer has put it in one.
     ///
@@ -196,6 +220,7 @@ impl Writer {
         Self {
             out: Vec::new(),
             viewport,
+            scope: Scope::WholeScreen,
             active: ActiveBuffer::Primary,
             pen: None,
             link: None,
@@ -716,6 +741,13 @@ impl Writer {
             return;
         }
         let rows = std::mem::take(&mut self.inactive);
+        if self.scope == Scope::LiveScreen {
+            // Outside this caller's authority. The rows are counted among what the restoration did
+            // not carry, which is the same accounting a row a byte stream cannot paint gets: what
+            // the screen holds and the caller was not shown is never silently dropped.
+            self.carried.inactive_rows = self.carried.inactive_rows.saturating_add(rows.len());
+            return;
+        }
         let active = self.active;
         let window = self.viewport;
         // Into the other buffer. Switching resets the pen on the terminals this profile is written
@@ -1092,7 +1124,12 @@ mod tests {
                 },
             },
         ];
-        let rendered = render(&operations, viewport(24, 80), Keyboard::Install);
+        let rendered = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
         let bytes = rendered.bytes;
         assert!(
             !bytes.windows(2).any(|pair| pair == b"\x1b]52"),
@@ -1114,6 +1151,7 @@ mod tests {
             }],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         // Line three, cleared, then the text.
         assert_eq!(
@@ -1130,6 +1168,7 @@ mod tests {
             }],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         assert!(rendered.bytes.is_empty());
     }
@@ -1144,6 +1183,7 @@ mod tests {
             }],
             viewport(24, 4),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert!(text.ends_with("abcd"), "{text:?}");
@@ -1158,6 +1198,7 @@ mod tests {
             }],
             viewport(24, 2),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert!(text.ends_with('a'), "{text:?}");
@@ -1178,6 +1219,7 @@ mod tests {
             }],
             viewport(24, 40),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert!(text.ends_with("\x1b[?25l"), "{text:?}");
@@ -1214,7 +1256,12 @@ mod tests {
                 },
             },
         ];
-        let rendered = render(&operations, viewport(24, 80), Keyboard::Install);
+        let rendered = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         let painted = text.find("top").expect("the row is painted");
         let region = text.find("\x1b[6;21r").expect("the scroll region is set");
@@ -1240,6 +1287,7 @@ mod tests {
             }],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         assert!(
             rendered.bytes.is_empty(),
@@ -1261,6 +1309,7 @@ mod tests {
             }],
             looking_at,
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         // Canonical row 11 is the second line shown; canonical column 6 is the third column shown.
         assert_eq!(rendered.bytes, b"\x1b[2;1H\x1b[K\x1b[3G\x1b[0mab".to_vec());
@@ -1287,7 +1336,12 @@ mod tests {
                 },
             },
         ];
-        let rendered = render(&operations, viewport(24, 80), Keyboard::Install);
+        let rendered = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
         assert_eq!(rendered.bytes, b"\x1b[?1049h\x1b[?7h".to_vec());
     }
 
@@ -1303,6 +1357,7 @@ mod tests {
             &[RestoreOp::SetRendition { rendition: bold }],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         assert_eq!(rendered.bytes, b"\x1b[0;1;91;48:2::1:2:3m".to_vec());
     }
@@ -1322,7 +1377,12 @@ mod tests {
                 row: row(0, 0, "application"),
             },
         ];
-        let rendered = render(&operations, viewport(24, 80), Keyboard::Install);
+        let rendered = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         let into_primary = text
             .find("\x1b[?47l")
@@ -1361,7 +1421,12 @@ mod tests {
                 },
             },
         ];
-        let rendered = render(&operations, viewport(24, 80), Keyboard::Install);
+        let rendered = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
         assert_eq!(rendered.carried.other_saved_cursors, 1);
         assert!(!rendered.carried.complete());
     }
@@ -1386,11 +1451,60 @@ mod tests {
                 },
             },
         ];
-        let rendered = render(&operations, viewport(24, 4), Keyboard::Install);
+        let rendered = render(
+            &operations,
+            viewport(24, 4),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert_eq!(text.matches("abcd").count(), 1, "{text:?}");
         assert!(rendered.carried.pending_wrap);
         assert!(!rendered.carried.complete());
+    }
+
+    #[test]
+    fn a_live_screen_scope_is_not_drawn_the_buffer_that_is_not_showing() {
+        let operations = [
+            RestoreOp::SelectBuffer {
+                buffer: ActiveBuffer::Alternate,
+            },
+            RestoreOp::PaintInactiveRow {
+                row: row(0, 0, "secret"),
+            },
+            RestoreOp::PaintRow {
+                row: row(0, 0, "shown"),
+            },
+        ];
+        let whole = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
+        let whole_text = String::from_utf8_lossy(&whole.bytes).into_owned();
+        assert!(
+            whole_text.contains("secret"),
+            "the whole screen carries both buffers"
+        );
+        assert_eq!(whole.carried.inactive_rows, 0);
+
+        let live = render(
+            &operations,
+            viewport(24, 80),
+            Keyboard::Install,
+            Scope::LiveScreen,
+        );
+        let live_text = String::from_utf8_lossy(&live.bytes).into_owned();
+        assert!(
+            !live_text.contains("secret"),
+            "the live screen is the visible screen and nothing behind it: {live_text:?}"
+        );
+        assert!(live_text.contains("shown"), "and it is still drawn");
+        assert_eq!(
+            live.carried.inactive_rows, 1,
+            "what it did not carry is counted rather than forgotten"
+        );
     }
 
     #[test]
@@ -1408,6 +1522,7 @@ mod tests {
             }],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert!(
@@ -1430,6 +1545,7 @@ mod tests {
             &[RestoreOp::PaintRow { row: dangerous }],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         assert!(!rendered.bytes.contains(&0x07));
     }
@@ -1444,6 +1560,7 @@ mod tests {
             }],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert_eq!(text, "\x1b]8;;https://example.invalid/\x1b\\");
@@ -1460,6 +1577,7 @@ mod tests {
             ],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         let text = String::from_utf8_lossy(&rendered.bytes).into_owned();
         assert!(text.ends_with("\x1b]8;;\x1b\\"), "{text:?}");
@@ -1483,6 +1601,7 @@ mod tests {
             }],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         // The level and the flags in force, and nothing that touches the terminal's stack: the
         // entry the attachment saved its owner's negotiation in sits there, and a restoration that
@@ -1521,6 +1640,7 @@ mod tests {
             }],
             viewport(24, 80),
             Keyboard::Withhold,
+            Scope::WholeScreen,
         );
         assert!(
             withheld.bytes.is_empty(),
@@ -1542,6 +1662,7 @@ mod tests {
             &[RestoreOp::SetKeyboard { keyboard }],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         assert_eq!(installed.bytes, b"\x1b[>4;2m\x1b[=5;1u".to_vec());
     }
@@ -1567,6 +1688,7 @@ mod tests {
             }],
             viewport(24, 80),
             Keyboard::Install,
+            Scope::WholeScreen,
         );
         assert_eq!(rendered.bytes, b"\x1b[>4;0m\x1b[=0;1u".to_vec());
         assert_eq!(rendered.carried.keyboard_stack, 0);

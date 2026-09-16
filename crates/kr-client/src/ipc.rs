@@ -135,14 +135,22 @@ impl ControlTransport for IpcTransport {
             if self.has_closed() {
                 return Err(ClientError::ConnectionEnded);
             }
-            let mut held = self.writer.lock().await;
-            let writer = held.as_mut().ok_or(ClientError::ConnectionEnded)?;
+            // The write half is taken out for the duration of the write and put back afterwards,
+            // for the same reason the read half is: a caller that drops this future part way
+            // through drops the half with it, so a cancelled write cannot leave the socket open on
+            // a transport nobody is using. It cannot be resumed either, and the frame writer
+            // refuses to continue a stream an interrupted write left in pieces.
+            let Some(mut writer) = self.writer.lock().await.take() else {
+                return Err(ClientError::ConnectionEnded);
+            };
             let outcome = writer.write_message(frame).await;
             // A write that failed has ended this connection, and so has a close that arrived while
-            // this one was waiting for the socket. Either way the half goes now rather than at the
-            // next call.
-            if outcome.is_err() || self.has_closed() {
-                held.take();
+            // this one was waiting for the socket. Either way the half goes rather than going back.
+            if outcome.is_ok() {
+                let mut held = self.writer.lock().await;
+                if !self.has_closed() {
+                    *held = Some(writer);
+                }
             }
             outcome?;
             Ok(())
@@ -174,11 +182,17 @@ impl ControlTransport for IpcTransport {
             // away. To a session the two are one thing: the connection ended.
             let frame = reader.read_message::<ControlFrame>().await;
             match frame {
-                Ok(frame) if !self.has_closed() => {
-                    *self.reader.lock().await = Some(reader);
+                Ok(frame) => {
+                    // The slot is taken before the flag is read again, so a close that lands while
+                    // this read was waiting cannot be overtaken by the reinsertion.
+                    let mut held = self.reader.lock().await;
+                    if self.has_closed() {
+                        return Ok(None);
+                    }
+                    *held = Some(reader);
                     Ok(Some(frame))
                 }
-                Ok(_) | Err(_) => Ok(None),
+                Err(_) => Ok(None),
             }
         })
     }

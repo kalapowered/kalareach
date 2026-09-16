@@ -76,25 +76,70 @@ pub struct RemoteOutput {
     withdrawn: AtomicBool,
     sender: ControlSender,
     connection: iroh::endpoint::Connection,
+    /// The authority this connection writes under, read inside the turn.
+    ///
+    /// The latch above is what a *device* revocation sets. An authority revision the daemon
+    /// advances for another reason withdraws the registration without touching this connection, so
+    /// the registration itself is read here as well: either way, no frame begins on a connection
+    /// whose authority has gone.
+    authority: Arc<Authorisation>,
+}
+
+/// What a connection must still hold for a frame to be written on it.
+#[derive(Debug)]
+struct Authorisation {
+    controller: Arc<Controller>,
+    connection_id: ConnectionId,
+    /// When this connection's grant runs out, on the continuous clock.
+    ///
+    /// Anchored once, when the connection was admitted, from what the wall clock then said was
+    /// left. A wall clock stepped afterwards cannot lengthen it, and the continuous clock is the
+    /// one every other deadline on this host is measured on.
+    grant_deadline: Option<kr_transport::clock::ContinuousInstant>,
+    /// Set the first time the grant is found to have run out. It never comes back.
+    expired: AtomicBool,
+}
+
+impl Authorisation {
+    /// Returns whether this connection may still be served.
+    async fn stands(&self) -> bool {
+        self.grant_is_current() && self.controller.authorised(self.connection_id).await.is_ok()
+    }
+
+    fn grant_is_current(&self) -> bool {
+        if self.expired.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(deadline) = self.grant_deadline else {
+            return true;
+        };
+        if self.controller.clock.now() < deadline {
+            return true;
+        }
+        self.expired.store(true, Ordering::Release);
+        false
+    }
 }
 
 impl RemoteOutput {
-    fn new(session: &AuthorisedSession) -> Self {
+    fn new(session: &AuthorisedSession, authority: Arc<Authorisation>) -> Self {
         Self {
             turn: tokio::sync::Mutex::new(()),
             withdrawn: AtomicBool::new(false),
             sender: session.control.sender(),
             connection: session.connection.clone(),
+            authority,
         }
     }
 
     /// Sends one frame, and returns whether it was sent.
     ///
-    /// The latch is read after the turn is taken, so a frame is never begun on a connection whose
-    /// authority has been withdrawn.
+    /// The latch and the registration are both read after the turn is taken, so a frame is never
+    /// begun on a connection whose authority has been withdrawn — by a device revocation, which
+    /// sets the latch, or by an authority revision, which withdraws the registration.
     pub async fn send(&self, frame: &ControlFrame) -> bool {
         let _turn = self.turn.lock().await;
-        if self.has_withdrawn() {
+        if self.has_withdrawn() || !self.authority.stands().await {
             return false;
         }
         self.sender.send(frame).await.is_ok()
@@ -127,18 +172,16 @@ pub struct RemoteConnection {
     actor: ConnectionActor,
     connection_id: ConnectionId,
     output: Arc<RemoteOutput>,
+    authority: Arc<Authorisation>,
     /// This connection's own link to the worker it has attached to, opened on first use.
     proxy: tokio::sync::Mutex<Option<Arc<WorkerProxy>>>,
     /// Where a notification the proxy read is written.
     notifications: tokio::sync::mpsc::Sender<Relayed>,
     /// What this connection has queued for the device and not yet had written.
     budget: Arc<RelayBudget>,
+    /// Notified when this connection's link to its worker ends, whichever way it ends.
+    lost: Arc<tokio::sync::Notify>,
     windows: Arc<kr_transport::window::ActionWindowIssuer>,
-    /// Set the first time this connection's grant is found to have expired.
-    ///
-    /// A grant that has run out never comes back, and section 9 says so of an expired grant
-    /// explicitly. The wall clock can be stepped backwards; this cannot.
-    grant_expired: AtomicBool,
 }
 
 impl std::fmt::Debug for RemoteConnection {
@@ -160,17 +203,24 @@ impl RemoteConnection {
         session: &AuthorisedSession,
         notifications: tokio::sync::mpsc::Sender<Relayed>,
     ) -> Self {
+        let authority = Arc::new(Authorisation {
+            grant_deadline: grant_deadline(&controller, &device),
+            controller: Arc::clone(&controller),
+            connection_id: session.connection_id,
+            expired: AtomicBool::new(false),
+        });
         Self {
             controller,
             device,
             actor: session.actor.clone(),
             connection_id: session.connection_id,
-            output: Arc::new(RemoteOutput::new(session)),
+            output: Arc::new(RemoteOutput::new(session, Arc::clone(&authority))),
+            authority,
             proxy: tokio::sync::Mutex::new(None),
             notifications,
             budget: Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
+            lost: Arc::new(tokio::sync::Notify::new()),
             windows: Arc::clone(&session.windows),
-            grant_expired: AtomicBool::new(false),
         }
     }
 
@@ -194,17 +244,10 @@ impl RemoteConnection {
 
     /// Returns true when this connection's grant still has time on it.
     ///
-    /// Once it has been found expired it stays expired, so a wall clock stepped backwards cannot
-    /// revive authority that ran out.
+    /// The deadline was anchored on the continuous clock when the connection was admitted, and
+    /// once it has passed it stays passed: a wall clock stepped backwards revives nothing.
     pub fn grant_is_current(&self) -> bool {
-        if self.grant_expired.load(Ordering::Acquire) {
-            return false;
-        }
-        if self.device.grant.expiry.is_valid_at(kr_ipc::now_ms().get()) {
-            return true;
-        }
-        self.grant_expired.store(true, Ordering::Release);
-        false
+        self.authority.grant_is_current()
     }
 
     /// Answers one frame from the device.
@@ -352,6 +395,14 @@ impl RemoteConnection {
             Ok(accepted) => accepted,
             Err(error) => return failure(mutation.request_id, error),
         };
+        // The last check before the effect is admitted. Everything between here and it is
+        // synchronous, so nothing can withdraw this connection's authority in between; what a
+        // revocation *after* this point reaches is an action the host already admitted, which
+        // section 9 lets finish under the deadline it was admitted with and reports as pending
+        // until the worker acknowledges the revision.
+        if let Err(error) = self.authorised().await {
+            return failure(mutation.request_id, error);
+        }
         match entry.method {
             // The daemon's own effects. They run on a task that outlives this connection, because
             // dropping a future is a cancellation and a durable commit cannot be left half done
@@ -368,6 +419,16 @@ impl RemoteConnection {
                 settled(request_id, effect.await)
             }
             Method::SessionClose => {
+                // A close is dispatched to the worker, so it needs a lease, and a lease is renewed
+                // only after the worker has acknowledged the revision in force. A device closing a
+                // session it never attached to has opened no link, so nothing has asked this
+                // worker for that acknowledgement yet.
+                if let Some(session_id) = mutation.target.session_id.as_ref().copied() {
+                    let _ = self
+                        .controller
+                        .acknowledge_worker_revision(session_id)
+                        .await;
+                }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
                 let envelope = self.envelope(validated);
@@ -432,11 +493,16 @@ impl RemoteConnection {
         entry: &'static MethodEntry,
         validated: AuthorityRevision,
     ) -> ControlFrame {
-        let session_id = match session_of(&request.params, entry) {
-            Ok(session_id) => session_id,
+        // A read that names its session goes to that session's worker. `action.read` names an
+        // action rather than a session, and an action's receipt lives in the journal of whichever
+        // session it was performed on, so it goes to the one this connection is already serving:
+        // that is where a device's own actions on this host were performed.
+        let proxy = match session_of(&request.params, entry) {
+            Ok(session_id) => self.proxy_for(session_id).await,
+            Err(_) if entry.method == Method::ActionRead => self.attached_proxy().await,
             Err(error) => return failure(request.request_id, error),
         };
-        let proxy = match self.proxy_for(session_id).await {
+        let proxy = match proxy {
             Ok(proxy) => proxy,
             Err(error) => return failure(request.request_id, error.to_protocol_error()),
         };
@@ -532,10 +598,26 @@ impl RemoteConnection {
                 session_id,
                 self.notifications.clone(),
                 Arc::clone(&self.budget),
+                Arc::clone(&self.lost),
             )
             .await?;
         *held = Some(Arc::clone(&proxy));
         Ok(proxy)
+    }
+
+    /// Returns the link this connection already has, for a read that names no session.
+    ///
+    /// A device's receipts are in the journal of the session it acted on, and this connection acts
+    /// on one session. A connection that has not attached to anything has no receipts to read.
+    async fn attached_proxy(&self) -> Result<Arc<WorkerProxy>> {
+        let held = self.proxy.lock().await;
+        match held.as_ref() {
+            Some(proxy) if proxy.is_open() => Ok(Arc::clone(proxy)),
+            Some(_) | None => Err(ControllerError::InvalidArgument(
+                "this connection is not serving a session, so it has no receipts to read"
+                    .to_owned(),
+            )),
+        }
     }
 
     /// Ends this connection's worker link and detaches whatever it owned.
@@ -580,6 +662,22 @@ impl RemoteConnection {
         version: kr_protocol::method::MethodVersion,
     ) -> std::result::Result<&'static MethodEntry, ProtocolError> {
         self.actor.admit(method, version)
+    }
+
+    /// Resolves once this connection's link to its worker has ended.
+    ///
+    /// A connection with no link has no subscription and no attachment, so it is not a connection
+    /// that can go on being served. It resolves immediately when there is no link to lose, so a
+    /// caller selecting on it does not have to know whether one was ever opened — except that a
+    /// connection which has not attached yet has nothing to lose, and waits.
+    pub async fn link_lost(&self) {
+        let held = self.proxy.lock().await.as_ref().map(Arc::clone);
+        match held {
+            Some(proxy) => proxy.lost().await,
+            // Nothing to lose yet. Waiting for the notification the first link will send is what
+            // keeps a connection that has not attached from ending itself.
+            None => self.lost.notified().await,
+        }
     }
 
     /// Returns whether this connection's registration still stands.
@@ -694,33 +792,11 @@ impl RemoteConnection {
                 self.connection_id,
                 self.controller.boot_epoch,
                 mutation.requested_ttl_ms,
-                self.grant_deadline(),
+                self.authority.grant_deadline,
             )
             .map_err(|refusal| {
                 ProtocolError::new(ErrorCode::PermissionDenied, window_refusal_detail(refusal))
             })
-    }
-
-    /// Returns the authority deadline the grant's own expiry imposes.
-    ///
-    /// Section 9 makes the accepted deadline the earliest of the window's expiry, receipt time plus
-    /// the requested lifetime and any applicable authority deadline. A grant that runs out in ten
-    /// seconds is exactly such a deadline, and without it an action admitted a moment before the
-    /// expiry could dispatch a minute after it.
-    ///
-    /// It is anchored on the continuous clock from what the wall clock says is left, so a wall
-    /// clock stepped forwards cannot shorten an action's life and one stepped backwards cannot
-    /// lengthen it.
-    fn grant_deadline(&self) -> Option<kr_transport::clock::ContinuousInstant> {
-        let kr_protocol::grant::GrantExpiry::At { expires_at_ms } = self.device.grant.expiry else {
-            return None;
-        };
-        let now = kr_ipc::now_ms().get();
-        let remaining = expires_at_ms.get().saturating_sub(now);
-        self.controller
-            .clock
-            .now()
-            .checked_add(std::time::Duration::from_millis(remaining))
     }
 
     /// Checks the grant this device holds against what the method requires.
@@ -802,13 +878,16 @@ impl RemoteConnection {
             // A geometry claim is what the request asks for, and the request is what says so.
             // `session.attach` and `attachment.configure` both carry the flag and the capability.
             RightCondition::GeometryClaim => claims_geometry,
-            // Whose subject it is belongs to the subject, and a condition the host cannot decide
-            // is treated as holding so the right is asked for rather than skipped: a condition
-            // nobody can evaluate must not be the reason a requirement goes unchecked.
+            // Whose subject it is belongs to the subject, and these conditions are alternatives
+            // keyed to that answer: `own_subject` and `other_actor` cannot both hold, so treating
+            // both as holding would demand the authority for somebody else's subject from a caller
+            // acting on its own. The subject resolves them inside its own barrier, where it
+            // refuses what it must: a device detaches the attachment its connection created, and
+            // a receipt lookup keyed by the verified actor finds only that actor's own actions.
             RightCondition::OwnSubject
             | RightCondition::OtherActor
             | RightCondition::CandidateEndpoint
-            | RightCondition::IssuingOwner => true,
+            | RightCondition::IssuingOwner => false,
         }
     }
 
@@ -845,6 +924,31 @@ impl RemoteConnection {
             },
         }
     }
+}
+
+/// Returns when one device's grant runs out, on the continuous clock.
+///
+/// Section 9 makes the accepted deadline the earliest of the window's expiry, receipt time plus the
+/// requested lifetime and any applicable authority deadline. A grant that runs out in ten seconds
+/// is exactly such a deadline, and without it an action admitted a moment before the expiry could
+/// dispatch a minute after it.
+///
+/// It is anchored once, from what the wall clock says is left at admission, because the continuous
+/// clock is the one every deadline this host decides is measured on and the only one a step cannot
+/// move. A grant with no expiry has no deadline, and the window and the requested lifetime still
+/// bound the action.
+fn grant_deadline(
+    controller: &Arc<Controller>,
+    device: &DeviceRecord,
+) -> Option<kr_transport::clock::ContinuousInstant> {
+    let kr_protocol::grant::GrantExpiry::At { expires_at_ms } = device.grant.expiry else {
+        return None;
+    };
+    let remaining = expires_at_ms.get().saturating_sub(kr_ipc::now_ms().get());
+    controller
+        .clock
+        .now()
+        .checked_add(std::time::Duration::from_millis(remaining))
 }
 
 /// Returns whether one request claims or adds a geometry claim.

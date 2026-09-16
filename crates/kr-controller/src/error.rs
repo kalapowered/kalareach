@@ -79,6 +79,15 @@ pub enum ControllerError {
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
+    /// What became of the action is not known.
+    ///
+    /// Section 9 makes this its own answer rather than a failure: the intent may have been
+    /// dispatched, so nothing may report it as refused and nothing may retry it automatically.
+    #[error("{detail}")]
+    Uncertain {
+        /// What is not known.
+        detail: String,
+    },
     /// Local IPC failed.
     #[error("{0}")]
     Ipc(#[from] kr_ipc::IpcError),
@@ -128,6 +137,7 @@ impl ControllerError {
             Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::NotListed { .. } | Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
+            Self::Uncertain { .. } => ErrorCode::OutcomeUnknown,
             Self::Ipc(error) => error.code(),
             Self::NotConfigured(_) => ErrorCode::HostNotConfigured,
         }

@@ -91,8 +91,17 @@ for entry in "${suites[@]}"; do
   echo
   echo "running $crate --test $suite"
   echo "  demonstrates: $description"
+  # The network suite is ignored by default, because the binary it launches is built above rather
+  # than by the package under test. Running it here is the whole point of this script. The flag is
+  # a plain word rather than an array: this shell runs under `set -u`, where an empty array
+  # expansion is an error on the version macOS ships.
+  ignored=""
+  if [ "$suite" = "network" ]; then
+    ignored="--include-ignored"
+  fi
+  # shellcheck disable=SC2086
   if ! output="$(CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test -p "$crate" --test "$suite" \
-    -- --test-threads=1 2>&1)"; then
+    -- --test-threads=1 $ignored 2>&1)"; then
     echo "$output"
     echo "FAILED: $crate --test $suite"
     failed=1

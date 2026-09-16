@@ -743,6 +743,19 @@ async fn read_loop(transport: Arc<dyn ControlTransport>, state: Arc<SessionState
     state.end();
 }
 
+/// Returns whether one response settled what it answered.
+///
+/// An error whose retry category is an unknown outcome has settled nothing: the host is saying it
+/// does not know whether the action happened. Everything else is a decision, including a refusal.
+fn definite(response: &Response) -> bool {
+    match &response.outcome {
+        Outcome::Ok(_) => true,
+        Outcome::Error(error) => {
+            error.code.retry_category() != kr_protocol::error::RetryCategory::OutcomeUnknown
+        }
+    }
+}
+
 /// Routes one frame, and returns whether the session may continue.
 ///
 /// A frame that does not belong on this ingress ends the session. The union is closed so that a
@@ -754,10 +767,17 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
     match frame {
         ControlFrame::Response(response) => {
             let request_id = response.request_id;
-            // A correlated answer is definite, whichever way it went: the host reached a decision
-            // about whatever this request carried. Settling it here rather than in the caller means
-            // a caller that has gone away does not leave its action pending for ever.
-            state.outcomes.lock().await.settle(request_id);
+            // A correlated answer settles the action *when it is definite*. Most are: the host
+            // reached a decision about whatever the request carried, and settling it here rather
+            // than in the caller means a caller that has gone away does not leave its action
+            // pending for ever. An answer that says the outcome is unknown is not a decision, and
+            // section 9 forbids forgetting one: the action stays on the unresolved list so the
+            // client can ask what became of it rather than assume.
+            if definite(&response) {
+                state.outcomes.lock().await.settle(request_id);
+            } else {
+                state.outcomes.lock().await.correlations.remove(&request_id);
+            }
             state.answer(request_id, Answer::Response(response));
         }
         ControlFrame::Receipt(answer) => {

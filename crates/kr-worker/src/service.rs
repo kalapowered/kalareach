@@ -1147,6 +1147,13 @@ impl WorkerService {
         if let Err(error) = self.check_authority(state) {
             return failure(request.request_id, &error.to_protocol_error());
         }
+        // A read the daemon admitted under an authority revision this worker has installed past is
+        // a read whose authority has been withdrawn. It matters most for raw input, which is a
+        // write that travels as a request: bytes forwarded under the old revision can still be on
+        // the socket when the new one is acknowledged.
+        if let Err(error) = self.check_validated_revision(caller) {
+            return failure(request.request_id, &error.to_protocol_error());
+        }
         let Some(method) = request.method.method() else {
             return failure(request.request_id, &unlisted());
         };
@@ -2130,7 +2137,14 @@ impl WorkerService {
                 // proved the caller is this user, and the worker's own authority covers its
                 // session.
                 let granted = params.requested.clone();
+                // And it is drawn the whole screen, because it holds no grant to be narrowed by.
+                // A forwarded caller is drawn the live screen alone: section 10's live-screen
+                // exception never reaches the buffer that is not showing, and this build serves a
+                // device no retained content beyond it.
                 let result = session.attach(&params, granted, attachment_id)?;
+                if caller.is_remote() {
+                    session.narrow_content(attachment_id, crate::render::Scope::LiveScreen);
+                }
                 state.add_attachment(attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
             }

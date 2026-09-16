@@ -153,6 +153,13 @@ pub struct Session {
     engine: crate::projection::TerminalEngine,
     /// What the renderings this session has produced could not carry.
     restoration_losses: crate::render::Carried,
+    /// How much of the screen each attachment's caller may be shown.
+    ///
+    /// Section 10's live-screen exception is the currently visible screen and never the buffer
+    /// that is not showing, so a caller whose authority is that exception is drawn the active
+    /// buffer alone. It is recorded per attachment because every repaint asks the same question
+    /// and the caller is not there to be asked again.
+    content_scopes: std::collections::BTreeMap<AttachmentId, crate::render::Scope>,
     /// The host's own answers that have been queued for the application and not yet written.
     ///
     /// The response lane bounds what it holds; this bounds what has left the lane. Counting only
@@ -258,6 +265,7 @@ impl Session {
             pending_input: Vec::new(),
             owned: None,
             root_exit: None,
+            content_scopes: std::collections::BTreeMap::new(),
             engine,
             restoration_losses: crate::render::Carried::default(),
             queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -601,6 +609,7 @@ impl Session {
     /// Returns [`WorkerError::UnknownAttachment`] when the identifier names no attachment of this
     /// session.
     pub fn restoration(&mut self, attachment_id: AttachmentId) -> Result<(u64, Vec<u8>)> {
+        let scope = self.content_scope(attachment_id);
         let dimensions = self
             .attachments
             .own_dimensions(attachment_id)
@@ -612,13 +621,35 @@ impl Session {
         let keyboard = self.attachments.keyboard_control(attachment_id);
         let (cursor, restoration, settled) =
             self.engine
-                .restoration(dimensions, gate, kr_ipc::now_ms().get(), keyboard);
+                .restoration(dimensions, gate, kr_ipc::now_ms().get(), keyboard, scope);
         // Taking a snapshot settles the screen, and whatever that released belongs to the
         // attachments that were already watching. Delivering it here is what stops one client's
         // snapshot swallowing a character that was owed to another.
         self.deliver(settled);
         self.note_restoration(attachment_id, &restoration);
         Ok((cursor, restoration.bytes))
+    }
+
+    /// Narrows what one attachment may be shown of the session's screen.
+    ///
+    /// It is recorded with the attachment because every later repaint has to answer the same
+    /// question and the caller is not there to be asked again. An attachment nobody narrows is
+    /// drawn the whole screen, which is the local case: a caller the operating system
+    /// authenticated as this user holds no grant to be narrowed by.
+    pub fn narrow_content(&mut self, attachment_id: AttachmentId, scope: crate::render::Scope) {
+        self.content_scopes.insert(attachment_id, scope);
+    }
+
+    /// Returns how much of the screen one attachment's caller may be shown.
+    ///
+    /// An attachment with no recorded scope is drawn the whole screen. That is the local case: a
+    /// caller the operating system authenticated as this user is not narrowed by a grant, because
+    /// it holds none.
+    fn content_scope(&self, attachment_id: AttachmentId) -> crate::render::Scope {
+        self.content_scopes
+            .get(&attachment_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Records what a rendered restoration could not carry.
@@ -674,6 +705,7 @@ impl Session {
         let (attachment, change) =
             self.attachments
                 .attach(params, granted, attachment_id, kr_ipc::now_ms())?;
+
         if change.resize_required
             && let Err(error) = self.resize_canonical(change.state.dimensions)
         {
@@ -698,6 +730,7 @@ impl Session {
     ///
     /// Returns an error when the attachment is unknown.
     pub fn detach(&mut self, attachment_id: AttachmentId) -> Result<SessionDetachResult> {
+        self.content_scopes.remove(&attachment_id);
         // Undelivered input from the removed attachment goes with it; nothing is replayed. A paste
         // it had open is closed first, so the application is not left inside a bracketed paste
         // whose source has gone.
@@ -1527,9 +1560,10 @@ impl Session {
         for (attachment_id, dimensions) in projected {
             let gate = self.lane_gate();
             let keyboard = self.attachments.keyboard_control(attachment_id);
+            let scope = self.content_scope(attachment_id);
             let (cursor, restoration, settled) =
                 self.engine
-                    .restoration(dimensions, gate, kr_ipc::now_ms().get(), keyboard);
+                    .restoration(dimensions, gate, kr_ipc::now_ms().get(), keyboard, scope);
             self.note_restoration(attachment_id, &restoration);
             let shared = Arc::new(restoration.bytes);
             if self

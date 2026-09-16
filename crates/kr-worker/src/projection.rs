@@ -327,6 +327,7 @@ impl TerminalEngine {
         gate: LaneGate,
         now_ms: u64,
         keyboard: crate::render::Keyboard,
+        scope: crate::render::Scope,
     ) -> (u64, Restoration, Filtered) {
         let mut viewport = self.viewport_for(dimensions);
         let (mut snapshot, settled) = self.engine.snapshot(viewport, now_ms);
@@ -340,7 +341,7 @@ impl TerminalEngine {
         let operations = restoration_operations(&snapshot);
         (
             snapshot.output_cursor,
-            render(&operations, viewport, keyboard),
+            render(&operations, viewport, keyboard, scope),
             settled,
         )
     }
@@ -528,6 +529,7 @@ mod tests {
             LaneGate::default(),
             0,
             crate::render::Keyboard::Install,
+            crate::render::Scope::WholeScreen,
         );
         assert!(cursor > 0);
         let text = String::from_utf8_lossy(&restoration.bytes).into_owned();

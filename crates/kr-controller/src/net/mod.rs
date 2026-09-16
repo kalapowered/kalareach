@@ -395,17 +395,21 @@ impl NetworkHost {
         // this future is *cancelled* rather than finished the moment the control stream ends: the
         // transport races the handler against the stream and against the connection, so the end of
         // the loop below is not a place cleanup can live.
-        let _guard = ConnectionGuard {
+        let mut guard = ConnectionGuard {
             host: Arc::clone(&self),
             controller: Arc::clone(&controller),
             remote: Arc::clone(&remote),
             connection_id,
+            relay: None,
         };
         // The relay is its own task, because a subscription delivers whenever the session produces
         // output and the request loop below is usually waiting for the device rather than for the
         // worker. It checks the registration and the grant before each batch it writes, which is
         // what stops a fenced connection from being served a subscription it had already started.
         let mut relay = tokio::spawn(relay_loop(relayed, Arc::clone(&remote)));
+        // The guard owns the relay's abort handle, so a handler the transport drops still stops it.
+        // A detached relay would hold this connection and its controller for as long as it waited.
+        guard.relay = Some(relay.abort_handle());
         loop {
             tokio::select! {
                 frame = session.control.recv() => {
@@ -494,20 +498,25 @@ async fn relay_loop(
     mut relayed: tokio::sync::mpsc::Receiver<Relayed>,
     remote: Arc<RemoteConnection>,
 ) {
-    while let Some(item) = relayed.recv().await {
-        // Before it is served, not after. A revocation that landed while this batch was waiting
-        // has already withdrawn the registration, and section 9's dispatch barrier does not cover
-        // a subscription that was already running. The grant is checked here too, because a grant
-        // that ran out mid-subscription is an authority that has gone just as surely.
-        let authorised = remote.is_authorised().await && remote.grant_is_current();
-        let frame = kr_protocol::envelope::ControlFrame::Notification(item.notification.clone());
-        item.release();
-        if !authorised {
-            return;
-        }
+    loop {
+        let item = tokio::select! {
+            item = relayed.recv() => match item {
+                Some(item) => item,
+                None => return,
+            },
+            // The link to the worker has gone, so the subscription this was relaying has gone
+            // with it. Ending here ends the connection, and the device restores its state on the
+            // next one from the cursor it holds.
+            () = remote.link_lost() => return,
+        };
+        // The registration and the grant are read inside the write boundary itself, so a
+        // revocation that lands while this frame is waiting for the peer stops it there. The item
+        // holds its charge against the connection's queue until it is written or dropped.
+        let frame = kr_protocol::envelope::ControlFrame::Notification(item.notification().clone());
         if !remote.output().send(&frame).await {
             return;
         }
+        drop(item);
     }
 }
 
@@ -521,10 +530,14 @@ struct ConnectionGuard {
     controller: Arc<Controller>,
     remote: Arc<RemoteConnection>,
     connection_id: ConnectionId,
+    relay: Option<tokio::task::AbortHandle>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
+        if let Some(relay) = self.relay.take() {
+            relay.abort();
+        }
         self.host
             .live
             .lock()
@@ -608,10 +621,20 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     );
     config.send_limits = setup.settings.send_limits;
     config.preauth_limits = setup.settings.preauth_limits;
-    let listener =
-        kr_transport::listener::register(config, identity, &keys.transport, Arc::clone(&host))
-            .await
-            .map_err(|error| ControllerError::NotConfigured(error.to_string()))?;
+    // The daemon's own clock, not a second one. Deadlines from the transport's action windows are
+    // compared with deadlines the daemon decided, and a continuous instant is anchored privately:
+    // two clocks would make those comparisons meaningless rather than merely imprecise.
+    let clock: Arc<dyn kr_transport::clock::ContinuousClock> =
+        Arc::clone(&controller.clock) as Arc<_>;
+    let listener = kr_transport::listener::register_with_clock(
+        config,
+        identity,
+        &keys.transport,
+        Arc::clone(&host),
+        clock,
+    )
+    .await
+    .map_err(|error| ControllerError::NotConfigured(error.to_string()))?;
     Ok(Network { listener, host })
 }
 
@@ -646,6 +669,7 @@ impl Controller {
         session_id: kr_protocol::ids::SessionId,
         notifications: tokio::sync::mpsc::Sender<Relayed>,
         budget: Arc<RelayBudget>,
+        lost: Arc<tokio::sync::Notify>,
     ) -> Result<Arc<WorkerProxy>> {
         // A worker that has started answering since the last attempt rejoins the directory here,
         // so a device can attach to a session the daemon had not reached at startup.
@@ -661,7 +685,7 @@ impl Controller {
             .ok_or_else(|| ControllerError::UnknownSession {
                 session: session_id.to_string(),
             })?;
-        let proxy = WorkerProxy::open(self, &worker, notifications, budget).await?;
+        let proxy = WorkerProxy::open(self, &worker, notifications, budget, lost).await?;
         // A dispatch lease is renewed only after the worker has acknowledged the authority
         // revision in force, and a worker starts having acknowledged nothing. Asking *this* worker
         // for its acknowledgement is what makes the first remote dispatch to it possible; asking
@@ -699,26 +723,33 @@ impl Controller {
         // The binding is taken before the announcement travels, so an acknowledgement that arrives
         // over a control path this daemon has already given up on lifts nothing.
         let binding = self.leases.binding(session_id);
-        let answered = {
+        // The bound covers the whole exchange, including waiting for this worker's connection:
+        // another operation may be holding it, and a wait that only started once it was free would
+        // not be a bound at all.
+        let exchange = async {
             let mut held = self.worker_client(&worker).await?;
             let client = held.as_mut().expect("the connection is open");
-            let answered = tokio::time::timeout(
-                ACKNOWLEDGEMENT_TIMEOUT,
-                client.announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
+            let answered = client
+                .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
                     environment_id: self.paths().environment_id(),
                     revision,
-                }),
-            )
-            .await;
+                })
+                .await;
             match answered {
-                Ok(Ok(ack)) => Some(ack),
-                // A worker that did not answer, or that could not be reached, has not installed
-                // the revision. Renewal stops for it until it does.
-                Ok(Err(_)) | Err(_) => {
+                Ok(ack) => Ok(Some(ack)),
+                Err(error) => {
                     *held = None;
-                    self.leases.stop_renewal(session_id, binding);
-                    None
+                    Err(ControllerError::from(error))
                 }
+            }
+        };
+        let answered = match tokio::time::timeout(ACKNOWLEDGEMENT_TIMEOUT, exchange).await {
+            Ok(Ok(answered)) => answered,
+            // A worker that did not answer, or that could not be reached, has not installed the
+            // revision. Renewal stops for it until it does.
+            Ok(Err(_)) | Err(_) => {
+                self.leases.stop_renewal(session_id, binding);
+                None
             }
         };
         match answered {

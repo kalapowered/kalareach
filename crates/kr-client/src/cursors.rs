@@ -98,12 +98,14 @@ impl StreamCursors {
         if self.needs_snapshot.contains(stream_id) {
             return;
         }
-        let current = self
-            .applied_cursor
-            .get(stream_id)
-            .map_or(0, |position| position.get());
-        if cursor.get() > current {
-            self.applied_cursor.insert(stream_id.clone(), cursor);
+        // A stream held at zero is not the same as a stream held nowhere: the first says resume
+        // from the beginning, the second says start wherever the host is. So an explicit zero is
+        // recorded rather than read as an absent entry's default.
+        match self.applied_cursor.get(stream_id) {
+            Some(current) if current.get() >= cursor.get() => {}
+            Some(_) | None => {
+                self.applied_cursor.insert(stream_id.clone(), cursor);
+            }
         }
     }
 
@@ -673,6 +675,23 @@ mod tests {
         assert_eq!(
             Restoration::start(stream_id.clone(), &cursors).step(),
             RestorationStep::SubscribeFrom(U64::new(4_096))
+        );
+    }
+
+    #[test]
+    fn a_stream_held_at_the_beginning_is_not_a_stream_held_nowhere() {
+        let mut cursors = StreamCursors::new();
+        let stream_id = stream("session.output");
+        assert_eq!(cursors.applied_cursor(&stream_id), None);
+        cursors.applied_content(&stream_id, U64::ZERO);
+        assert_eq!(
+            cursors.applied_cursor(&stream_id),
+            Some(U64::ZERO),
+            "resuming from the beginning is a position; holding none is not"
+        );
+        assert_eq!(
+            Restoration::start(stream_id, &cursors).step(),
+            RestorationStep::SubscribeFrom(U64::ZERO)
         );
     }
 

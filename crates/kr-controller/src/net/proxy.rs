@@ -21,7 +21,6 @@ use kr_protocol::actor::ActorEnvelope;
 use kr_protocol::envelope::{
     ControlEvent, ControlFrame, MutationRequest, Notification, ParamsValue, Request, Response,
 };
-use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::local::{
     ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalClientKind,
@@ -41,6 +40,13 @@ use crate::service::Controller;
 /// slot while it does.
 pub const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long opening a proxy link to a worker may take, handshake and all.
+///
+/// Verifying the worker, declaring what this connection is for and presenting a generation are
+/// three round trips on a socket a busy worker may not be reading yet. A device waits for this
+/// once, when it attaches.
+pub const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// How many notifications the relay holds for a remote connection that is not reading them.
 ///
 /// Section 9's rule for a slow client is that it is told rather than waited for. A relay this far
@@ -55,19 +61,29 @@ pub const RELAY_DEPTH: usize = 256;
 /// discarded.
 pub const RELAY_QUEUED_BYTES: usize = kr_protocol::limits::MAX_SEND_QUEUE_BYTES;
 
-/// One notification on its way to a remote connection, and what it is charged.
+/// One notification on its way to a remote connection, holding its charge until it is delivered.
+///
+/// The charge is released by the destructor and by nothing else, so it is released exactly once
+/// and it covers the notification's whole life: from the moment the proxy reads it to the moment
+/// it has been written or dropped. A charge released before the write would let the producer refill
+/// the budget while the write was still waiting, which is the memory the bound exists to cap.
 #[derive(Debug)]
 pub struct Relayed {
-    /// The notification.
-    pub notification: Notification,
-    /// What it was charged against the connection's queue.
+    notification: Notification,
     charged: usize,
     budget: Arc<RelayBudget>,
 }
 
 impl Relayed {
-    /// Releases this notification's charge, once it has been written or discarded.
-    pub fn release(&self) {
+    /// Returns the notification this carries.
+    #[must_use]
+    pub const fn notification(&self) -> &Notification {
+        &self.notification
+    }
+}
+
+impl Drop for Relayed {
+    fn drop(&mut self) {
         self.budget.release(self.charged);
     }
 }
@@ -116,6 +132,12 @@ impl RelayBudget {
 #[derive(Debug)]
 pub struct WorkerProxy {
     session_id: SessionId,
+    /// Notified once this link has ended, whichever way it ended.
+    ///
+    /// A connection whose link has gone has no subscription and no attachment at the worker, so it
+    /// is not a connection that can go on being served: section 8 has the device reconnect and
+    /// restore its state from the cursor it holds.
+    lost: Arc<tokio::sync::Notify>,
     writer: Mutex<kr_ipc::framed::FrameWriter>,
     /// Shared with the reader task, because a response and the request that is waiting for it are
     /// one fact. Two maps would let a response arrive for a request that was never recorded.
@@ -148,6 +170,26 @@ impl WorkerProxy {
         worker: &KnownWorker,
         notifications: tokio::sync::mpsc::Sender<Relayed>,
         budget: Arc<RelayBudget>,
+        lost: Arc<tokio::sync::Notify>,
+    ) -> Result<Arc<Self>> {
+        // Bounded, because every step of it waits for a worker: a session that has stopped reading
+        // its socket must not be able to hold a device's attachment open indefinitely.
+        tokio::time::timeout(
+            OPEN_TIMEOUT,
+            Self::handshake(controller, worker, notifications, budget, lost),
+        )
+        .await
+        .map_err(|_| {
+            ControllerError::supervision("the worker did not accept a proxy connection in time")
+        })?
+    }
+
+    async fn handshake(
+        controller: &Arc<Controller>,
+        worker: &KnownWorker,
+        notifications: tokio::sync::mpsc::Sender<Relayed>,
+        budget: Arc<RelayBudget>,
+        lost: Arc<tokio::sync::Notify>,
     ) -> Result<Arc<Self>> {
         let mut client = LocalClient::connect(
             &worker.endpoint,
@@ -190,9 +232,11 @@ impl WorkerProxy {
             Arc::clone(&waiters),
             notifications,
             budget,
+            Arc::clone(&lost),
         ));
         Ok(Arc::new(Self {
             session_id: worker.descriptor.session_id,
+            lost,
             writer: Mutex::new(writer),
             waiters,
             reader,
@@ -285,6 +329,7 @@ impl WorkerProxy {
             waiters.pending.clear();
         }
         self.reader.abort();
+        self.lost.notify_waiters();
     }
 
     async fn call(&self, request_id: RequestId, frame: &ControlFrame) -> Result<Response> {
@@ -302,26 +347,73 @@ impl WorkerProxy {
         // The whole exchange is bounded, not only the wait for the answer. A worker that is not
         // reading its socket can block the write itself, and a timeout that started afterwards
         // would never start at all.
+        //
+        // A frame that was interrupted part way through leaves the stream in pieces, and the frame
+        // writer refuses to continue one: the link ends rather than staying open with a suffix the
+        // worker is still waiting for. Whether the frame reached the worker is then unknown, which
+        // is what the caller is told.
         let exchange = async {
-            self.writer.lock().await.write_message(frame).await?;
-            Ok::<_, ControllerError>(receiver.await)
+            let mut writer = self.writer.lock().await;
+            let written = writer.write_message(frame).await;
+            let interrupted = writer.is_mid_frame();
+            drop(writer);
+            (written, interrupted)
         };
-        match tokio::time::timeout(CALL_TIMEOUT, exchange).await {
-            Ok(Ok(Ok(response))) => Ok(response),
-            Ok(Ok(Err(_))) => Err(ControllerError::supervision(
-                "this session's proxy link ended before the worker answered",
-            )),
-            Ok(Err(error)) => {
-                self.waiters().pending.remove(&request_id);
-                Err(error)
+        let sent = match tokio::time::timeout(CALL_TIMEOUT, exchange).await {
+            Ok((written, interrupted)) => {
+                if interrupted {
+                    self.close();
+                    return Err(ControllerError::Uncertain {
+                        detail: "this session's link was interrupted part way through the action, \
+                                 so what became of it is unknown"
+                            .to_owned(),
+                    });
+                }
+                written
             }
             Err(_) => {
+                self.close();
+                return Err(ControllerError::Uncertain {
+                    detail: "this session did not take the action in time, so what became of it \
+                             is unknown"
+                        .to_owned(),
+                });
+            }
+        };
+        if let Err(error) = sent {
+            self.waiters().pending.remove(&request_id);
+            return Err(error.into());
+        }
+        match tokio::time::timeout(CALL_TIMEOUT, receiver).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(ControllerError::Uncertain {
+                detail: "this session's link ended before it answered, so what became of the \
+                         action is unknown"
+                    .to_owned(),
+            }),
+            Err(_) => {
                 self.waiters().pending.remove(&request_id);
-                Err(ControllerError::supervision(
-                    "the worker did not answer in time",
-                ))
+                Err(ControllerError::Uncertain {
+                    detail: "this session did not answer in time, so what became of the action is \
+                             unknown"
+                        .to_owned(),
+                })
             }
         }
+    }
+
+    /// Resolves once this link has ended.
+    pub async fn lost(&self) {
+        // Checked before and after parking: a link that ended before anybody waited would
+        // otherwise fire into an empty room.
+        if !self.is_open() {
+            return;
+        }
+        let waiting = self.lost.notified();
+        if !self.is_open() {
+            return;
+        }
+        waiting.await;
     }
 
     fn waiters(&self) -> std::sync::MutexGuard<'_, Waiters> {
@@ -347,6 +439,7 @@ async fn read_loop(
     waiters: Arc<std::sync::Mutex<Waiters>>,
     notifications: tokio::sync::mpsc::Sender<Relayed>,
     budget: Arc<RelayBudget>,
+    lost: Arc<tokio::sync::Notify>,
 ) {
     loop {
         let frame: ControlFrame = match reader.read_message().await {
@@ -382,8 +475,8 @@ async fn read_loop(
                     charged,
                     budget: Arc::clone(&budget),
                 };
-                if let Err(refused) = notifications.try_send(relayed) {
-                    refused.into_inner().release();
+                // A refused item releases its own charge when the returned value is dropped.
+                if notifications.try_send(relayed).is_err() {
                     break;
                 }
             }
@@ -396,17 +489,16 @@ async fn read_loop(
             _ => break,
         }
     }
-    let mut held = waiters
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    held.ended = true;
-    held.pending.clear();
-}
-
-/// Returns the protocol error a failed proxied call is reported as.
-#[must_use]
-pub fn proxy_failure(detail: &str) -> ProtocolError {
-    ProtocolError::new(ErrorCode::OutcomeUnknown, detail)
+    {
+        let mut held = waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.ended = true;
+        held.pending.clear();
+    }
+    // The connection is told, rather than left to discover it when it next asks for something: its
+    // subscription has stopped and its attachment at the worker has gone with the socket.
+    lost.notify_waiters();
 }
 
 fn frame_name(frame: &ControlFrame) -> &'static str {
