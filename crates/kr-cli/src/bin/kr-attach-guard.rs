@@ -96,14 +96,19 @@ fn main() -> ExitCode {
                     // are one pair and only one process is certain to be there for both.
                     if line.first() == Some(&GUARD_BEGIN) && !pushed {
                         let mut terminal = std::io::stdout();
-                        if terminal.write_all(KEYBOARD_BEGIN_SEQUENCES).is_err()
-                            || terminal.flush().is_err()
+                        // `pushed` is set by the write that happened, before anything else can
+                        // fail. Nothing between here and the restoration below returns early: once
+                        // the entry is open, every way out of this process goes through the pop,
+                        // including the attach process disappearing while this was answering it.
+                        if terminal.write_all(KEYBOARD_BEGIN_SEQUENCES).is_ok()
+                            && terminal.flush().is_ok()
                         {
-                            return ExitCode::FAILURE;
+                            pushed = true;
+                        } else {
+                            break;
                         }
-                        pushed = true;
                         if ready.write_all(&[GUARD_READY]).is_err() || ready.flush().is_err() {
-                            return ExitCode::FAILURE;
+                            break;
                         }
                     }
                     line.clear();
