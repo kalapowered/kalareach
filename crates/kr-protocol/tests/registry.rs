@@ -215,26 +215,46 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
-    // Section 23's table is the minimum public surface, and the two below are the whole of what
-    // this build adds to it. The mailbox is written and acknowledged as well as read, and section
-    // 23 requires each effect to carry its own exhaustive authority entry with its own effect
-    // class, so a write does not travel under the read entry. Every other method is the
-    // specification's own; a third addition changes this list and is noticed here.
-    let added = ["mailbox.deliver", "mailbox.acknowledge"];
-    for name in added {
+    // Section 23's table is the minimum public surface, and the entries below are the whole of
+    // what this build adds to it. Each is a managed-service method whose credential names the
+    // method it was signed for, so a surface section 17 describes and section 23's table does not
+    // list still needs an entry here: without one there is no name to sign, and a signature made
+    // for one operation would serve for another. Section 23 also requires each effect to carry its
+    // own exhaustive entry with its own effect class, so a write never travels under a read entry:
+    // the mailbox is written and acknowledged as well as read, and managed storage reads objects
+    // and its own status apart from everything it writes. Every other method is the
+    // specification's own; a further addition changes this list and is noticed here.
+    let added = [
+        ("mailbox.deliver", EffectClass::Write),
+        ("mailbox.acknowledge", EffectClass::Write),
+        ("storage.status", EffectClass::Read),
+        ("storage.retention.set", EffectClass::Write),
+        ("storage.upload.create", EffectClass::Write),
+        ("storage.upload.part", EffectClass::Write),
+        ("storage.upload.complete", EffectClass::Write),
+        ("storage.upload.abort", EffectClass::Write),
+        ("storage.object.read", EffectClass::Read),
+        ("storage.object.delete", EffectClass::Write),
+    ];
+    for (name, effect) in added {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
-        assert_eq!(entry.effect, EffectClass::Write, "{name} is a write");
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
         assert_eq!(
             entry.group,
             MethodGroup::Services,
             "{name} is a service method"
+        );
+        assert_eq!(
+            entry.freshness,
+            FreshnessRequirement::ServiceCredential,
+            "{name} is proven by a service credential"
         );
     }
 
     assert_eq!(
         REGISTRY.len(),
         required.len() + added.len(),
-        "the registry holds the required methods and the two named additions"
+        "the registry holds the required methods and the named additions"
     );
 }
 

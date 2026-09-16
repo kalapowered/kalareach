@@ -1220,6 +1220,69 @@ methods! {
     confirmation: None, idempotency: keyed("backup generation"),
     doc: "Publish or fetch a backup generation manifest. Writer authority is verified.";
 
+    StorageStatus = "storage.status", Services,
+    effect: Read, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    selectors: [Installation],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
+    confirmation: None, idempotency: READ,
+    doc: "Report what managed storage this principal holds, what is awaiting deletion and the \
+          retention the service applies to it.";
+
+    StorageRetentionSet = "storage.retention.set", Services,
+    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    selectors: [Installation],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
+    confirmation: None, idempotency: keyed("principal + retention revision"),
+    doc: "Turn managed backup storage on and set how many daily snapshots it keeps, within the \
+          bounds the service publishes. It is off until this is asked for.";
+
+    StorageUploadCreate = "storage.upload.create", Services,
+    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    selectors: [Transfer, Installation],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
+    confirmation: None, idempotency: keyed("archive id + object id"),
+    doc: "Reserve the declared maximum and allocate one random object key, upload identifier and \
+          immutable part table. No content is accepted before all of that exists.";
+
+    StorageUploadPart = "storage.upload.part", Services,
+    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    selectors: [Transfer],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
+    confirmation: None, idempotency: keyed("upload id + part number"),
+    doc: "Upload one part. The service reads at most the declared length and refuses an oversized \
+          or wrong-hash body before it writes anything.";
+
+    StorageUploadComplete = "storage.upload.complete", Services,
+    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    selectors: [Transfer],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
+    confirmation: None, idempotency: keyed("upload id"),
+    doc: "Complete the upload. The service verifies every part size and the total, settles the \
+          hold as stored bytes, and answers a repeat with the result it already gave.";
+
+    StorageUploadAbort = "storage.upload.abort", Services,
+    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    selectors: [Transfer],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
+    confirmation: None, idempotency: keyed("upload id"),
+    doc: "Abandon the upload. New parts and completions are fenced first, then the stored state is \
+          removed, and the hold is given back only once that removal is confirmed.";
+
+    StorageObjectRead = "storage.object.read", Services,
+    effect: Read, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    selectors: [Transfer],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
+    confirmation: None, idempotency: READ,
+    doc: "Read a bounded range of one stored object's ciphertext. The service holds no key for it.";
+
+    StorageObjectDelete = "storage.object.delete", Services,
+    effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],
+    selectors: [Transfer],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
+    confirmation: None, idempotency: keyed("archive id + object id"),
+    doc: "Delete one stored object. It becomes a tombstone for the published window before the \
+          ciphertext is removed and the allowance released.";
+
     // ----- Voice ----------------------------------------------------------------------------
     VoiceStart = "voice.start", Voice,
     effect: Write, ingress: [PairedDevice], rights: [basis(VoiceGrant)],

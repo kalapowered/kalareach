@@ -189,7 +189,15 @@ export const SERVICE_METHODS: readonly Method[] = [
   'mailbox.acknowledge',
   'authority.sync',
   'sync.compare_exchange',
-  'backup.manifest'
+  'backup.manifest',
+  'storage.status',
+  'storage.retention.set',
+  'storage.upload.create',
+  'storage.upload.part',
+  'storage.upload.complete',
+  'storage.upload.abort',
+  'storage.object.read',
+  'storage.object.delete'
 ]
 
 /** True when `method` is one a service credential may name. */

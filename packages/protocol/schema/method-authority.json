@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 129,
+  "method_count": 137,
   "methods": [
     {
       "capability": "none",
@@ -3830,6 +3830,231 @@
         "mailbox"
       ],
       "summary": "Publish or fetch a backup generation manifest. Writer authority is verified.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "service_client"
+      ],
+      "method": "storage.status",
+      "name": "storage.status",
+      "required_rights": [
+        {
+          "authority": "service_credential",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "installation"
+      ],
+      "summary": "Report what managed storage this principal holds, what is awaiting deletion and the retention the service applies to it.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "principal + retention revision"
+        }
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "storage.retention.set",
+      "name": "storage.retention.set",
+      "required_rights": [
+        {
+          "authority": "service_credential",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "installation"
+      ],
+      "summary": "Turn managed backup storage on and set how many daily snapshots it keeps, within the bounds the service publishes. It is off until this is asked for.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "archive id + object id"
+        }
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "storage.upload.create",
+      "name": "storage.upload.create",
+      "required_rights": [
+        {
+          "authority": "service_credential",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer",
+        "installation"
+      ],
+      "summary": "Reserve the declared maximum and allocate one random object key, upload identifier and immutable part table. No content is accepted before all of that exists.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "upload id + part number"
+        }
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "storage.upload.part",
+      "name": "storage.upload.part",
+      "required_rights": [
+        {
+          "authority": "service_credential",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer"
+      ],
+      "summary": "Upload one part. The service reads at most the declared length and refuses an oversized or wrong-hash body before it writes anything.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "upload id"
+        }
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "storage.upload.complete",
+      "name": "storage.upload.complete",
+      "required_rights": [
+        {
+          "authority": "service_credential",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer"
+      ],
+      "summary": "Complete the upload. The service verifies every part size and the total, settles the hold as stored bytes, and answers a repeat with the result it already gave.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "upload id"
+        }
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "storage.upload.abort",
+      "name": "storage.upload.abort",
+      "required_rights": [
+        {
+          "authority": "service_credential",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer"
+      ],
+      "summary": "Abandon the upload. New parts and completions are fenced first, then the stored state is removed, and the hold is given back only once that removal is confirmed.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "service_client"
+      ],
+      "method": "storage.object.read",
+      "name": "storage.object.read",
+      "required_rights": [
+        {
+          "authority": "service_credential",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer"
+      ],
+      "summary": "Read a bounded range of one stored object's ciphertext. The service holds no key for it.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "service_credential",
+      "group": "services",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "archive id + object id"
+        }
+      },
+      "ingress": [
+        "service_client"
+      ],
+      "method": "storage.object.delete",
+      "name": "storage.object.delete",
+      "required_rights": [
+        {
+          "authority": "service_credential",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "transfer"
+      ],
+      "summary": "Delete one stored object. It becomes a tombstone for the published window before the ciphertext is removed and the allowance released.",
       "version": 1
     },
     {

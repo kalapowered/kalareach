@@ -269,6 +269,14 @@ describe('the service credential', () => {
         'push.sender.issue',
         'push.sender.renew',
         'push.sender.revoke',
+        'storage.object.delete',
+        'storage.object.read',
+        'storage.retention.set',
+        'storage.status',
+        'storage.upload.abort',
+        'storage.upload.complete',
+        'storage.upload.create',
+        'storage.upload.part',
         'sync.compare_exchange'
       ].sort()
     )

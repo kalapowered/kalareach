@@ -6364,6 +6364,46 @@
           "type": "string"
         },
         {
+          "const": "storage.status",
+          "description": "Report what managed storage this principal holds, what is awaiting deletion and the retention the service applies to it.",
+          "type": "string"
+        },
+        {
+          "const": "storage.retention.set",
+          "description": "Turn managed backup storage on and set how many daily snapshots it keeps, within the bounds the service publishes. It is off until this is asked for.",
+          "type": "string"
+        },
+        {
+          "const": "storage.upload.create",
+          "description": "Reserve the declared maximum and allocate one random object key, upload identifier and immutable part table. No content is accepted before all of that exists.",
+          "type": "string"
+        },
+        {
+          "const": "storage.upload.part",
+          "description": "Upload one part. The service reads at most the declared length and refuses an oversized or wrong-hash body before it writes anything.",
+          "type": "string"
+        },
+        {
+          "const": "storage.upload.complete",
+          "description": "Complete the upload. The service verifies every part size and the total, settles the hold as stored bytes, and answers a repeat with the result it already gave.",
+          "type": "string"
+        },
+        {
+          "const": "storage.upload.abort",
+          "description": "Abandon the upload. New parts and completions are fenced first, then the stored state is removed, and the hold is given back only once that removal is confirmed.",
+          "type": "string"
+        },
+        {
+          "const": "storage.object.read",
+          "description": "Read a bounded range of one stored object's ciphertext. The service holds no key for it.",
+          "type": "string"
+        },
+        {
+          "const": "storage.object.delete",
+          "description": "Delete one stored object. It becomes a tombstone for the published window before the ciphertext is removed and the allowance released.",
+          "type": "string"
+        },
+        {
           "const": "voice.start",
           "description": "Start a voice session. Budget and account checks happen at the managed broker.",
           "type": "string"
