@@ -31,10 +31,11 @@
 //!
 //! Two things it does not count. The encoder's own working memory, which is allocated and freed
 //! inside one synchronous encode with no await in it, so it cannot accumulate across blocked
-//! writes; that includes the buffer an oversized message is built in before its length is measured
-//! and it is refused. And bytes the connection has accepted but the peer has not yet acknowledged,
-//! which sit in the QUIC send window where nothing iroh exposes says when they leave. So this
-//! bounds what the application offers the connection; it reserves no capacity inside the window.
+//! writes; an oversized message is refused by the canonical encoder before a byte of its encoding
+//! is written, so it never costs a buffer the size of what it would have been. And bytes the
+//! connection has accepted but the peer has not yet acknowledged, which sit in the QUIC send window
+//! where nothing iroh exposes says when they leave. So this bounds what the application offers the
+//! connection; it reserves no capacity inside the window.
 
 use std::sync::{Arc, Mutex};
 
@@ -211,8 +212,8 @@ impl SendLimits {
     ///
     /// A message is encoded under this as well as under its stream kind's bound, so a message that
     /// this connection could never queue is refused as too large before it costs a write. The
-    /// encoder still builds the encoding before it measures it; what this saves is the write and
-    /// the charge, not the work.
+    /// encoder counts the encoding's length before it writes it, so the refusal costs neither the
+    /// write, nor the charge, nor a buffer the size of the message.
     #[must_use]
     pub const fn ceiling_for(&self, class: StreamClass) -> usize {
         match class {

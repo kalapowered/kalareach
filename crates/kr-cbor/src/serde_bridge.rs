@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::decode::decode;
-use crate::encode::encode;
+use crate::encode::{encode, encode_within};
 use crate::error::{CborError, Result};
 use crate::limits::Limits;
 use crate::value::{CanonicalMap, CanonicalValue, Integer};
@@ -111,6 +111,11 @@ where
 
 /// Serialises a value to canonical bytes and checks it against `limits` first.
 ///
+/// Nothing the size of the encoding is allocated for a message that will be refused: the length is
+/// counted through a counting writer, and only a message inside the bound is written into a buffer
+/// of exactly that length. So an oversized message costs the value tree the caller already built
+/// and nothing further.
+///
 /// # Errors
 ///
 /// Returns a profile error, a limit error, or [`CborError::InputTooLarge`] when the encoding is
@@ -121,14 +126,7 @@ where
 {
     let value = to_canonical_value(value)?;
     value.check_limits(limits)?;
-    let bytes = encode(&value);
-    if bytes.len() > limits.max_message_len {
-        return Err(CborError::InputTooLarge {
-            len: bytes.len(),
-            limit: limits.max_message_len,
-        });
-    }
-    Ok(bytes)
+    encode_within(&value, limits.max_message_len)
 }
 
 /// Deserialises a validated canonical value.

@@ -75,7 +75,7 @@ pub use crate::decode::decode;
 pub use crate::digest::{
     SHA256_LEN, sha256, sha256_of_canonical, signing_digest, signing_input, signing_value,
 };
-pub use crate::encode::{encode, encode_into};
+pub use crate::encode::{encode, encode_into, encode_within, encoded_len};
 pub use crate::error::{CborError, Result};
 pub use crate::limits::Limits;
 pub use crate::serde_bridge::{

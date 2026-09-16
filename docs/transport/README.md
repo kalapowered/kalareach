@@ -241,11 +241,13 @@ retries. A message is encoded under the smaller of its stream kind's frame bound
 frame its class could ever be admitted with, so a frame this connection could never queue is refused
 as too large before it costs a write.
 
-What is not charged is the encoder's own working memory, including the buffer an oversized message
-is built in before its length is measured and it is refused. That memory is allocated and released
-inside one synchronous encode with nothing awaited in it, so it cannot accumulate across blocked
-writes. Making the encoder refuse an oversized message before it builds it is a change to the
-canonical CBOR encoder rather than to the transport.
+What is not charged is the encoder's own working memory. An oversized message no longer costs a
+buffer the size of its encoding: the canonical encoder counts the encoding's length through a
+counting writer and refuses the message before writing a byte of it, so what a refusal costs is the
+value tree the caller already had. A message inside the bound is written into a buffer of exactly
+its own length, which is what the charge then covers. The rest of that working memory is allocated
+and released inside one synchronous encode with nothing awaited in it, so it cannot accumulate
+across blocked writes.
 
 An empty frame is refused before the write, because a zero length is what the peer's decoder reads
 as a malformed frame. A caller's mistake stays a local error rather than becoming stream damage.
