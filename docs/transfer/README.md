@@ -323,6 +323,22 @@ rather than counted as passed, and the run prints the names it skipped so a Wind
 pass knows which ones it owns. The Windows access-list checks have their own tests beside the code
 that performs them, and they run on Windows.
 
+### Two limits the host states rather than hides
+
+A download published into a client's destination with the user's explicit overwrite action cannot be
+rolled back: the temporary name is checked against the verified object immediately before the
+rename, and a rename replaces atomically with nothing to restore afterwards. The no-replace publish
+has no such window, because a link that finds the name taken fails. The window that remains is
+inside the service's own owner-only private directory, where anything able to swap the temporary
+name could already have tampered with the bytes before they were verified.
+
+A byte copy of a source this service does not own is not an atomic snapshot. It refuses every change
+the host can observe: the source's identity, its size, its modification time, and the digest of a
+second bounded read compared with the copy. A writer that reproduces the same interleaving in both
+reads is not excluded. Where the filesystem offers a clone, `cloned_snapshot` has the property
+outright, and a caller that needs it on a filesystem without one coordinates with the writer or
+copies the file itself.
+
 ### What this does not promise
 
 Three residuals, stated rather than implied.
@@ -496,7 +512,15 @@ widened and no file is placed in a repository. A typed submission needs no path 
 
 Section 14 fixes four numbers and a format list: 40 megapixels of input, 256 MiB of decode memory, a
 16 MiB decoded-thumbnail budget, and PNG, JPEG, WebP and the first frame of a GIF. The `image` crate
-is pinned at 0.25.10 with only those four decoders compiled in.
+is pinned at 0.25.10 with only the decoders named below compiled in.
+
+WebP is on that list and is withheld. The pinned lossless decoder takes its Huffman group count from
+a sixteen-bit metadata field and allocates a table set per group, so a file of a few kilobytes can
+ask for hundreds of megabytes that no bound on pixels can catch. The decoder is therefore not
+compiled in at all; a WebP is recognised from its twelve-byte container signature and publishes with
+no preview and the reason `no preview for this format`. The transfer itself succeeds, because an
+attachment without a preview is still an attachment. WebP previews return when the pin bounds that
+allocation.
 
 Two of those numbers need this crate's own enforcement rather than the library's. `image` documents
 its allocation limit as advisory, and its decoders hold more than the output while they work, so the
@@ -507,12 +531,10 @@ canvas at once, so an image whose charge fits the budget cannot make these decod
 charge belongs to the pins in the manifest and is re-derived when they move.
 
 It bounds the *pixel* buffers, which is what image dimensions decide. It does not bound every
-structure a codec can allocate from its own metadata: the pinned lossless WebP decoder derives a
-Huffman group count from a sixteen-bit field, and a small file can ask for tables far larger than
-its pixels. Those allocations are outside the enforced budget entirely, because the pinned wrapper
-passes no allocation accounting down to them. It is recorded as a dependency risk against the pin
-rather than presented as enforced, and closing it needs either a decoder that accounts for its own
-structures or a decode that runs somewhere its memory can be capped from outside.
+structure a codec can allocate from its own metadata, and where a pinned decoder does that the
+answer here is not to run it: that is why WebP is withheld above. Among the decoders that are
+compiled in, the pixel charge is the bound, and a decoder whose metadata could allocate past it is
+one this host does not link.
 
 An image whose charge is above the budget publishes as a file. What that establishes is a bound on
 the *pixel* buffers of an accepted image, not a proof that an accepted image cannot make a decoder
