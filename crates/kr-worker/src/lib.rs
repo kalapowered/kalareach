@@ -12,13 +12,14 @@
 //! | [`history`] | Retained output: a resident window, an indexed spool and explicit gaps |
 //! | [`input`] | The single input lease, its epochs and paste-delimiter framing |
 //! | [`journal`] | The private receipt journal: acceptance, dispatch markers, de-duplication and retention |
+//! | [`lifecycle`] | What a live session is watched for: the root shell's exit, its desktop, and what it owns |
 //! | [`output`] | Fan-out with bounded per-attachment queues and explicit resynchronisation |
 //! | [`ownership`] | Which processes a session owns, and how much of that the host can account for |
 //! | [`projection`] | The canonical grid, the filtered stream and the presentation a terminal is served |
 //! | [`render`] | Turning a side-effect-free restoration into terminal bytes |
 //! | [`pty`] | The pseudo-terminal, created before the root shell, and the shell it runs |
 //! | [`session`] | The session: lifecycle, the serial order every change shares, and closure |
-//! | [`runtime`] | The reader, the writer, the recogniser timer and the closure sequence |
+//! | [`runtime`] | The reader, the writer, the recogniser timer, the supervision and the closure sequence |
 //! | [`service`] | The private endpoint: the handshake, the challenge and the method dispatch |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
@@ -29,6 +30,7 @@ pub mod error;
 pub mod history;
 pub mod input;
 pub mod journal;
+pub mod lifecycle;
 pub mod output;
 pub mod ownership;
 pub mod projection;

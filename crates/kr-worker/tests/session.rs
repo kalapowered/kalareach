@@ -1200,3 +1200,68 @@ async fn a_controller_whose_keys_cannot_be_established_is_refused_the_keys() {
     let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_root_shell_that_exits_is_noticed_without_waiting_for_a_sweep() {
+    // The exit is an event the kernel reports, not something the host is asked to keep checking
+    // for: the session closes on the child signal, far inside the sweep that is only there in case
+    // one is lost. A host that had gone back to polling would still close the session, so the
+    // margin here is the assertion.
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "printf 'kr-leaving\\n'; exit 7");
+    let started = tokio::time::Instant::now();
+    let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
+    let record = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed())
+        .await
+        .expect("the session closes on its own");
+    let taken = started.elapsed();
+
+    assert_eq!(record.reason, ClosureReason::RootExit);
+    assert_eq!(
+        record.root_exit_code.0.map(kr_protocol::scalars::U64::get),
+        Some(7),
+        "the shell's own status"
+    );
+    assert!(
+        taken < kr_worker::lifecycle::IDLE_SWEEP_INTERVAL,
+        "the exit reached the host before the sweep could have found it: {taken:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
+    // What the observation cadence is for. A closure only signals what is still running, so a job
+    // that started and finished while the session was live is in the record only because the host
+    // had already seen it - and what makes the host look is the session's own traffic, since a
+    // process starts from input it accepted or shows itself in output it produced.
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 4 & printf 'kr-working\\n'; exec cat");
+    let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
+    // Long enough for the job to have been observed while it ran, and to have ended afterwards.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        runtime.state(),
+        SessionState::Live,
+        "the shell is still there"
+    );
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+    let record = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed())
+        .await
+        .expect("the closure finishes");
+
+    assert_eq!(record.reason, ClosureReason::CloseRequested);
+    assert!(
+        record.terminated.len() >= 2,
+        "the record names the job as well as the root shell: {:?}",
+        record.terminated
+    );
+    assert!(
+        record
+            .terminated
+            .iter()
+            .any(|process| process.name.0.as_deref() == Some("the session's root shell")),
+        "and says which of them was the root shell: {:?}",
+        record.terminated
+    );
+}

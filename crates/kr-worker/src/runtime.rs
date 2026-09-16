@@ -2,12 +2,18 @@
 //!
 //! [`crate::session::Session`] holds the state and changes it one call at a time. This module is
 //! what calls it: a blocking reader on the pseudo-terminal, a blocking writer for input, a timer
-//! for the paste recogniser, and the closure sequence with its grace and drain periods.
+//! for the paste recogniser, the supervision of the root shell and what it owns, and the closure
+//! sequence with its grace and drain periods.
 //!
 //! The reader is the part with a rule attached. It must never stop because a client is slow, and
 //! it must never discard what it has read; both would make the worker's idea of the screen wrong.
 //! So it reads, hands the bytes to the session, and goes back to reading. Everything that could
 //! wait happens on the delivery side.
+//!
+//! Every wait here is on something that happens rather than on a clock, because a session sitting
+//! idle has to cost nothing (KR-PERF-003): the reader waits on the terminal's own descriptor, the
+//! writer on room in it, the recogniser on its one deadline, and the supervision on the events
+//! [`crate::lifecycle`] describes. What is left on a clock is named there, with what it costs.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -34,13 +40,21 @@ pub const READ_QUEUE_DEPTH: usize = 64;
 /// below, where a takeover reaches it at once.
 pub const WRITE_PIECE_BYTES: usize = 512;
 
-/// How long the read loop waits for the application to write something before it asks again.
+/// How long the read loop waits on the terminal for the application to write something.
 ///
-/// The wait ends by itself the moment output arrives, so this is not latency: it is only how often
-/// a reader with nothing to read wakes to reconsider whether the terminal is still there. A session
-/// sitting idle should cost nothing, and twenty of them waking fifty times a second each is not
-/// nothing, so this is long.
-pub const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// The wait ends by itself the moment output arrives, and again the moment the terminal goes: the
+/// terminal's own descriptor is what it waits on, and both of those are events on it. So this is
+/// neither latency nor how quickly an ended terminal is noticed. It is a safety net for a platform
+/// that reports neither, and a session sitting idle should cost nothing, so it is long.
+pub const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often a read loop with nothing to wait on asks the terminal again.
+///
+/// This is the one wait here that *is* latency: a terminal with no descriptor to wait on cannot
+/// wake anybody, so its output waits for the next read instead. No backend in this host's
+/// repertoire is in that position, and the interval is short enough to be a fallback rather than a
+/// behaviour.
+pub const READ_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long the writer keeps offering bytes the application must have where it cannot ask a waiter.
 ///
@@ -55,24 +69,6 @@ pub const INSIST_LIMIT: std::time::Duration = std::time::Duration::from_secs(30)
 /// The wait ends by itself when the application reads, so this is only the interval at which a
 /// writer that is waiting reconsiders whether the bytes it is holding are still wanted.
 pub const WRITE_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
-
-/// How often the root shell's status is checked, independently of the terminal.
-///
-/// Asking the kernel whether one child has exited costs almost nothing, so this is often.
-pub const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// How often the set of processes a session owns is observed.
-///
-/// Enumerating a process group and reading each member's start identity is a kernel query per
-/// process, and a host that did it ten times a second for every idle session would spend more of a
-/// core on watching nothing happen than KR-PERF-003 allows the whole host.
-///
-/// The cost of the longer interval is stated rather than hidden: a process that both starts and
-/// ends inside one interval is not recorded, so it is not in the closure record's list of what was
-/// stopped. The record already never claims every application was discovered, and the coverage flag
-/// says which boundary produced it; this widens the window in which that is true rather than
-/// changing what is claimed.
-pub const OWNERSHIP_OBSERVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How often a closing session is asked whether its processes have stopped.
 pub const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -415,6 +411,8 @@ pub struct SessionRuntime {
     wake: Arc<Notify>,
     closed: Arc<Notify>,
     fence: Arc<std::sync::atomic::AtomicU64>,
+    /// What tells the supervision that a process this session owns can have appeared.
+    activity: Arc<crate::lifecycle::Activity>,
 }
 
 impl SessionRuntime {
@@ -459,6 +457,10 @@ impl SessionRuntime {
         let (output_sender, mut output_receiver) = mpsc::channel::<ReadEvent>(READ_QUEUE_DEPTH);
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
+        // A process this session owns starts from input it accepted or shows itself in output it
+        // produced, so both of those are what ask the supervision to look. Nothing here is on a
+        // clock that an idle session pays for.
+        let activity = crate::lifecycle::Activity::new();
 
         // The read loop runs on its own thread. The terminal answers a read with nothing to read
         // rather than waiting inside it, so this waits on the descriptor and then reads what is
@@ -515,7 +517,7 @@ impl SessionRuntime {
                             }
                             // No descriptor to wait on: the read is asked again after a moment
                             // rather than in a loop that spins.
-                            None => std::thread::sleep(READ_WAIT),
+                            None => std::thread::sleep(READ_RETRY),
                             Some(_) => {}
                         }
                     }
@@ -671,15 +673,20 @@ impl SessionRuntime {
             wake: Arc::clone(&wake),
             closed: Arc::clone(&closed),
             fence: Arc::clone(&fence),
+            activity: Arc::clone(&activity),
         };
 
         let ingest_session = Arc::clone(&session);
         let ingest_closed = Arc::clone(&closed);
         let ingest_input = input_sender.clone();
+        let ingest_activity = Arc::clone(&activity);
         tokio::spawn(async move {
             while let Some(event) = output_receiver.recv().await {
                 match event {
                     ReadEvent::Bytes(bytes) => {
+                        // Something in this session is running. Whatever it is may be a process
+                        // that was not there at the last observation.
+                        ingest_activity.note();
                         if let Ok(mut session) = ingest_session.lock() {
                             session.ingest_output(&bytes);
                             // Nothing else is waiting, so the terminal has gone quiet and the
@@ -715,6 +722,7 @@ impl SessionRuntime {
         let monitor_input = input_sender.clone();
         let monitor_wake = Arc::clone(&wake);
         let monitor_fence = Arc::clone(&fence);
+        let monitor_activity = Arc::clone(&activity);
         tokio::spawn(async move {
             // The monitor holds a runtime of its own so a closure it begins publishes its fence and
             // its paste terminator the same way a requested one does. Building it only once the
@@ -727,10 +735,18 @@ impl SessionRuntime {
                 wake: Arc::clone(&monitor_wake),
                 closed: Arc::clone(&monitor_closed),
                 fence: Arc::clone(&monitor_fence),
+                activity: Arc::clone(&monitor_activity),
             });
-            let mut next_observation = Instant::now();
+            // Built here rather than by the caller: waiting for a child to end is the runtime's
+            // own facility, and this is the task that does the waiting.
+            let mut supervision =
+                crate::lifecycle::Supervision::begin(monitor_activity, Instant::now());
+            // The shell is asked about once before anything is waited on, because the child signal
+            // only reports what happens after it is open: a shell that ended in between is found
+            // here instead. Nothing is observed on this first look; the boundary was recorded as it
+            // was established.
+            let mut wake = crate::lifecycle::Wake::Session;
             loop {
-                tokio::time::sleep(CHILD_POLL_INTERVAL).await;
                 let initiated = {
                     let Ok(mut session) = monitor_session.lock() else {
                         break;
@@ -738,14 +754,13 @@ impl SessionRuntime {
                     if session.state() == SessionState::Closed {
                         break;
                     }
-                    // The set of processes the session owns is built up while it runs, on its own
-                    // slower cadence: one that starts and ends between two observations is never
-                    // recorded, and observing at the rate the shell is checked would cost more than
-                    // the whole host is allowed to spend while idle.
-                    let now = Instant::now();
-                    if now >= next_observation {
+                    // The set of processes the session owns is built up while it runs, on the
+                    // cadence [`crate::lifecycle`] describes: a process that starts and ends
+                    // between two observations is never recorded, and enumerating the boundary
+                    // every time the shell is asked about would cost more than the whole host is
+                    // allowed to spend while idle.
+                    if wake == crate::lifecycle::Wake::Ownership {
                         session.observe_owned();
-                        next_observation = now + OWNERSHIP_OBSERVE_INTERVAL;
                     }
                     // A desktop-bound session belongs to one login. When that login ends the
                     // session ends with it, with the reason that says so.
@@ -772,6 +787,7 @@ impl SessionRuntime {
                     .release();
                     break;
                 }
+                wake = supervision.next().await;
             }
         });
 
@@ -847,6 +863,7 @@ impl SessionRuntime {
     /// A mutation runs inside the session's serial boundary, so it cannot take the lock again to
     /// flush. It hands the batches out instead, and this sends them once the boundary is over.
     pub fn send_input(&self, batches: Vec<InputBatch>) {
+        let sent = !batches.is_empty();
         for batch in batches {
             let _ = self.input.send(batch);
         }
@@ -857,6 +874,11 @@ impl SessionRuntime {
         // keystroke, which is the one thing section 8 says it must never do. There is exactly one
         // consumer of this signal, so storing a permit for it is what this needs.
         self.wake.notify_one();
+        if sent {
+            // Input the session accepted is how a process it owns usually starts, so the
+            // supervision looks at the boundary shortly after this rather than on a clock.
+            self.activity.note();
+        }
     }
 
     /// Admits a close and returns the acceptance, before anything is signalled.
