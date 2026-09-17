@@ -525,10 +525,10 @@ allocation.
 Two of those numbers need this crate's own enforcement rather than the library's. `image` documents
 its allocation limit as advisory, and its decoders hold more than the output while they work, so the
 limit is set on the decoder *and* the decode is refused in advance on a charge this crate makes: the
-declared pixels at sixteen bytes each. Sixteen is the worst case among the four formats compiled in
-here, a PNG decoded to sixteen-bit RGBA and an animated WebP holding its output, its frame and its
-canvas at once, so an image whose charge fits the budget cannot make these decoders exceed it. The
-charge belongs to the pins in the manifest and is re-derived when they move.
+declared pixels at sixteen bytes each. Sixteen is the worst case among the decoders compiled in
+here, a PNG decoded to sixteen-bit RGBA and a compositing decoder holding its output, its frame and
+its canvas at once. The charge belongs to the pins in the manifest and is re-derived when they
+move.
 
 It bounds the *pixel* buffers, which is what image dimensions decide. It does not bound every
 structure a codec can allocate from its own metadata, and where a pinned decoder does that the
