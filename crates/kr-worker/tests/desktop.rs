@@ -976,6 +976,37 @@ async fn the_desktop_a_session_was_created_on_is_readable_after_its_worker_has_g
             Some(true),
             "and that record still describes the desktop this host is in"
         );
+        // The question a host asks about a worker that has gone is about the login session that
+        // worker was created on, asked of the platform by name. This desktop is still here, so the
+        // answer is that it is present: the session ended for some other reason.
+        assert_eq!(
+            desktop::recorded_presence(&recorded.desktop),
+            desktop::Presence::Present,
+            "the recorded login session is still there, whatever became of its worker"
+        );
+        // A record naming a login session this platform does not have is that desktop gone, and it
+        // is a different answer from the one above although the host and its desktop are the same.
+        // The name is the recorded one with a session identifier no platform here hands out.
+        let elsewhere = kr_protocol::identity::DesktopBinding {
+            desktop_session_id: Nullable::some(
+                kr_protocol::ids::DesktopSessionId::new(
+                    recorded
+                        .desktop
+                        .desktop_session_id
+                        .as_ref()
+                        .expect("a name")
+                        .as_str()
+                        .replace(":session=", ":session=99"),
+                )
+                .expect("a name"),
+            ),
+            login_generation: recorded.desktop.login_generation.clone(),
+        };
+        assert_eq!(
+            desktop::recorded_presence(&elsewhere),
+            desktop::Presence::Ended,
+            "a login session this platform does not have is one that has ended"
+        );
     }
     daemon.stop().await;
 }

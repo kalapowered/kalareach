@@ -251,9 +251,32 @@ pub struct Controller {
     /// The sleep assertion this daemon holds, where it holds one, and whether a review of it is
     /// running.
     inhibitor: Mutex<Inhibitor>,
-    /// How far into its sessions the last look at what this host has outstanding got.
-    demand_cursor: Mutex<usize>,
+    /// How far the last look at what this host has outstanding got, and what it saw.
+    demand_scan: Mutex<DemandScan>,
     _lock: SingletonLock,
+}
+
+/// Where the last look at what this host has outstanding got to, and what it found.
+///
+/// A scan that cannot ask every worker inside its budget is not evidence that the work it did not
+/// ask about has ended, so what each session last answered is kept here and counted again. Only a
+/// session's own answer changes what that session contributes, and an entry lives exactly as long
+/// as its session is in the directory: a closed session's work goes with its entry.
+#[derive(Debug, Default)]
+struct DemandScan {
+    /// Where the last scan stopped, so the next one starts after it.
+    cursor: usize,
+    /// What each live session was last observed to have outstanding.
+    seen: BTreeMap<SessionId, SessionDemand>,
+}
+
+/// What one session was last observed to have outstanding.
+#[derive(Clone, Copy, Debug, Default)]
+struct SessionDemand {
+    /// Whether its worker reported an agent at work.
+    work: bool,
+    /// Requests this host has accepted for it and not finished.
+    outstanding: u64,
 }
 
 /// The desktop this host has, and how old the reading is.
@@ -359,7 +382,7 @@ impl Controller {
                 read_at: std::time::Instant::now(),
             }),
             inhibitor: Mutex::new(Inhibitor::new()),
-            demand_cursor: Mutex::new(0),
+            demand_scan: Mutex::new(DemandScan::default()),
             _lock: lock,
         });
         // Reconnecting is not only verifying. A replacement daemon has to present the generation it
@@ -2272,10 +2295,19 @@ impl Controller {
     /// The records are compared with the ones the current revision was established for, ignoring
     /// the revision itself and when each was observed. Anything else that has changed is a change
     /// in the evidence, and the revision advances with it: a new login, a tool installed or
-    /// replaced, a permission that now answers differently, a desktop that is now locked. An
-    /// action bound to the old revision is then refused and asks again, which is what section 11
-    /// requires of evidence that has gone stale.
-    async fn capability_report(&self) -> kr_protocol::desktop::DesktopCapabilityReport {
+    /// replaced, a permission that now answers differently, a desktop that is now locked. A
+    /// revision that has moved is how a caller holding an earlier record can tell that the answer
+    /// it read has gone stale, which is what section 11 requires of evidence. No method in this
+    /// build dispatches a desktop operation, so nothing here refuses one on that ground yet: what
+    /// this publishes is the evidence and the revision to compare against.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evidence has changed and the revision it changed to cannot be
+    /// recorded. Evidence that has changed is never published under the revision the previous
+    /// evidence was described by: one revision would then describe two different answers, and an
+    /// action that had bound to the first would find its binding current.
+    async fn capability_report(&self) -> Result<kr_protocol::desktop::DesktopCapabilityReport> {
         let (context, revision) = self.desktop().await;
         let mut report =
             crate::desktop::capabilities(self.paths.environment_id(), context, revision);
@@ -2303,16 +2335,18 @@ impl Controller {
                     reading.records = report.records.clone();
                     advanced
                 }
-                // Nothing was recorded, so nothing is published: the records keep the revision the
-                // last stored one described, and the next report tries again.
-                Err(_) => reading.revision,
+                // Nothing was recorded, so nothing is published. Handing these records out under
+                // the stored revision would describe the tool that was replaced and the one that
+                // replaced it with one number, so the answer is the storage failure it is and the
+                // next report tries again.
+                Err(error) => return Err(ControllerError::Ipc(error)),
             }
         };
         for record in &mut report.records {
             record.revision = revision;
         }
         drop(reading);
-        report
+        Ok(report)
     }
 
     /// Returns the execution profile this host creates sessions with when a request chooses none.
@@ -2425,18 +2459,27 @@ impl Controller {
     /// Each worker is given a bounded moment to answer. A session whose worker holds its socket
     /// and stops answering must not be able to keep this host awake for good, and it must not be
     /// able to delay the answer another session is waiting for either.
+    ///
+    /// What a scan cannot ask about inside its budget it counts as it last found it. A partial
+    /// scan says nothing about the sessions it skipped, so counting those as idle would release
+    /// the assertion in the middle of a closure it had just taken one for.
     async fn demand(&self) -> Demand {
         let mut workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
+        let mut scan = self.demand_scan.lock().await;
+        // A session that is no longer in the directory is a session that has gone, and what it had
+        // outstanding went with it.
+        let live: std::collections::BTreeSet<SessionId> = workers
+            .iter()
+            .map(|worker| worker.descriptor.session_id)
+            .collect();
+        scan.seen.retain(|session_id, _| live.contains(session_id));
         // Where the last scan stopped. A scan that always began at the same end of the same
         // ordered set would ask the same workers every time, and one that never got past a few
         // slow ones would never see what the rest had outstanding.
-        let mut cursor = self.demand_cursor.lock().await;
         let count = workers.len();
         if count > 0 {
-            workers.rotate_left(*cursor % count);
+            workers.rotate_left(scan.cursor % count);
         }
-        let mut sessions_with_work = 0;
-        let mut outstanding = 0;
         let spent = std::time::Instant::now();
         let mut asked = 0;
         for worker in workers {
@@ -2451,27 +2494,33 @@ impl Controller {
                 .read_from_worker_within(&worker, Some(DEMAND_PATIENCE.min(left)))
                 .await
                 .ok();
+            // A worker that did not answer has not said its work ended, so what it last said
+            // stands until it says otherwise or its session leaves the directory.
             let Some(summary) = summary else {
                 continue;
             };
+            let mut observed = SessionDemand::default();
             if summary.application_state.as_ref()
                 == Some(&kr_protocol::session::ApplicationState::AgentBusy)
             {
-                sessions_with_work += 1;
+                observed.work = true;
             }
             if summary.application_state.as_ref()
                 == Some(&kr_protocol::session::ApplicationState::AwaitingApproval)
             {
-                outstanding += 1;
+                observed.outstanding += 1;
             }
             // A closure this host accepted and has not finished. Suspending in the middle of one
             // is how a session's own processes stop being accounted for.
             if summary.state == SessionState::Closing {
-                outstanding += 1;
+                observed.outstanding += 1;
             }
+            scan.seen.insert(worker.descriptor.session_id, observed);
         }
-        *cursor = cursor.wrapping_add(asked);
-        drop(cursor);
+        scan.cursor = scan.cursor.wrapping_add(asked);
+        let sessions_with_work = scan.seen.values().filter(|seen| seen.work).count() as u64;
+        let outstanding: u64 = scan.seen.values().map(|seen| seen.outstanding).sum();
+        drop(scan);
         Demand {
             sessions_with_work,
             pending_requests: outstanding + self.pending.lock().await.len() as u64,
@@ -2493,7 +2542,7 @@ impl Controller {
                 self.paths.environment_id()
             )));
         }
-        let desktop = self.capability_report().await;
+        let desktop = self.capability_report().await?;
         encode(&EnvironmentCapabilitiesResult {
             environment_id: self.paths.environment_id(),
             default_worker_profile: crate::desktop::default_profile(&desktop.desktop),
@@ -3331,8 +3380,10 @@ impl Controller {
     /// A desktop-bound worker whose desktop has gone went with it: the platform ended the job with
     /// the login session it was in, which is what a logout does, and the worker had no chance to
     /// write its own record. The desktop the session was created on is in the worker's own
-    /// journal, which outlives the worker, so this is an answer rather than a guess even after the
-    /// person has logged in again and the host has a desktop once more.
+    /// journal, which outlives the worker, so the platform can be asked about that login session
+    /// by name. That is an answer rather than a guess even after the person has logged in again,
+    /// and it is an answer about the right session on a host where one user holds several at once:
+    /// the desktop this daemon itself is in says nothing about another login's.
     ///
     /// Everything else is a worker that ended for reasons this host does not know, including a
     /// desktop it could not read: an unreadable platform is not a logout.
@@ -3343,21 +3394,12 @@ impl Controller {
         let Some(recorded) = self.recorded_desktop(session_id) else {
             return ClosureReason::WorkerCrash;
         };
-        if !recorded.desktop_session_id.is_present() && !recorded.login_generation.is_present() {
-            return ClosureReason::WorkerCrash;
-        }
-        match kr_worker::desktop::current() {
-            kr_worker::desktop::Reading::Desktop(live) => {
-                match kr_worker::desktop::describes(&live, &recorded) {
-                    // The login session this session was created on is not the one that is there.
-                    Some(false) => ClosureReason::DesktopLost,
-                    Some(true) | None => ClosureReason::WorkerCrash,
-                }
+        match kr_worker::desktop::recorded_presence(&recorded) {
+            // The login session this session was created on is not there any more.
+            kr_worker::desktop::Presence::Ended => ClosureReason::DesktopLost,
+            kr_worker::desktop::Presence::Present | kr_worker::desktop::Presence::Unknown => {
+                ClosureReason::WorkerCrash
             }
-            // The platform says this user has no graphical login at all, and this session was
-            // created on one.
-            kr_worker::desktop::Reading::None => ClosureReason::DesktopLost,
-            kr_worker::desktop::Reading::Unavailable => ClosureReason::WorkerCrash,
         }
     }
 
@@ -3489,13 +3531,19 @@ impl Controller {
     /// leave this connection with an answer nobody read, and the next caller to use it would take
     /// that answer for its own; ending the connection is the only way to abandon a request on it,
     /// and that can only be done from inside, while its guard is still held.
+    ///
+    /// One deadline covers both halves. Waiting for the connection and waiting for the answer are
+    /// two waits on one worker, and giving each the whole patience would let a worker take twice
+    /// what its caller allowed, which is what a caller dividing a budget between workers is
+    /// counting on it not doing.
     async fn read_from_worker_within(
         &self,
         worker: &KnownWorker,
         patience: Option<std::time::Duration>,
     ) -> Result<SessionSummary> {
-        let mut held = match patience {
-            Some(patience) => tokio::time::timeout(patience, self.worker_client(worker))
+        let deadline = patience.map(|patience| tokio::time::Instant::now() + patience);
+        let mut held = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.worker_client(worker))
                 .await
                 .map_err(|_| {
                     ControllerError::supervision("the worker's connection was busy for too long")
@@ -3507,8 +3555,8 @@ impl Controller {
             session_id: worker.descriptor.session_id,
         };
         let asked = client.request(Method::SessionRead, &params);
-        let result = match patience {
-            Some(patience) => match tokio::time::timeout(patience, asked).await {
+        let result = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, asked).await {
                 Ok(result) => result,
                 Err(_) => {
                     // The request was abandoned, so this connection has an answer nobody will
