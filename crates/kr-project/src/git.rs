@@ -1481,51 +1481,60 @@ pub fn redact(text: &str) -> String {
         }
         // A token travels in a query as often as in user information
         // (`https://host/path?access_token=...`), and a fragment is no safer, so everything from
-        // the first `?` or `#` to the end of this URL goes too.
+        // the first `?` or `#` goes too.
         //
-        // Where this URL ends decides two things: what is removed with the query, and where the
-        // scan for the *next* URL starts. It is the earlier of whitespace or a quote, and the
-        // start of the next URL's own scheme, because a message can hold two URLs with nothing but a
-        // comma between them, and treating the second as part of the first's path would leave its
-        // credential in the message. What is deliberately *not* treated as an end is any
-        // character a query could contain: text after a query is removed with it, because a
-        // query's own terminator cannot be told from a token's content, and losing the tail of a
-        // diagnostic is the safe direction.
-        let ends_at = end_of_url(tail);
-        let (url_tail, beyond) = tail.split_at(ends_at);
-        match url_tail.find(['?', '#']) {
+        // How far it goes is the whole of this decision. A query can hold anything, including
+        // another URL (`?next=https://elsewhere/&access_token=...`), so a query is removed all
+        // the way to whitespace or a quote: stopping earlier would leave whatever followed the
+        // nested URL, which is where the token was. Where there is *no* query, the URL ends at
+        // the earlier of that delimiter and the start of the next URL's own scheme, because a
+        // message can hold two URLs with nothing but a comma between them and treating the second
+        // as part of the first's path would leave its credential in the message.
+        //
+        // What is deliberately not treated as an end of a query is any character a query could
+        // contain. Text after a query is removed with it, because a query's own terminator cannot
+        // be told from a token's content, and losing the tail of a diagnostic is the safe
+        // direction.
+        let delimiter = tail
+            .find([' ', '\t', '\n', '\r', '"', '\''])
+            .unwrap_or(tail.len());
+        let query = tail[..delimiter].find(['?', '#']);
+        match query {
             Some(query) => {
-                out.push_str(&url_tail[..query]);
+                out.push_str(&tail[..query]);
                 out.push_str("<query removed>");
+                rest = &tail[delimiter..];
             }
-            None => out.push_str(url_tail),
+            None => {
+                let ends_at = delimiter.min(next_scheme(tail));
+                out.push_str(&tail[..ends_at]);
+                rest = &tail[ends_at..];
+            }
         }
-        rest = beyond;
     }
     out.push_str(rest);
     out
 }
 
-/// Returns where one URL ends inside the text that follows its authority.
+/// Returns where the next URL's scheme begins, or the length of the text when there is none.
 ///
-/// The earlier of two things: whitespace or a quote, and the beginning of the next URL's scheme.
-/// A scheme is the run of scheme characters immediately before a `://`, so the second answer is
-/// that run's start rather than the `://` itself.
-fn end_of_url(tail: &str) -> usize {
-    let delimiter = tail
-        .find([' ', '\t', '\n', '\r', '"', '\''])
-        .unwrap_or(tail.len());
-    let next = tail.find("://").map_or(tail.len(), |marker| {
-        tail[..marker]
-            .rfind(|character: char| {
+/// A scheme is the run of scheme characters immediately before a `://`, so what this returns is
+/// that run's start rather than the `://` itself. The answer is always a character boundary: the
+/// character *after* the last one that cannot be part of a scheme, which is found by its own
+/// length rather than by adding one to its offset.
+fn next_scheme(text: &str) -> usize {
+    text.find("://").map_or(text.len(), |marker| {
+        let head = &text[..marker];
+        head.char_indices()
+            .rev()
+            .find(|(_, character)| {
                 !(character.is_ascii_alphanumeric()
-                    || character == '+'
-                    || character == '-'
-                    || character == '.')
+                    || *character == '+'
+                    || *character == '-'
+                    || *character == '.')
             })
-            .map_or(0, |boundary| boundary + 1)
-    });
-    delimiter.min(next)
+            .map_or(0, |(offset, character)| offset + character.len_utf8())
+    })
 }
 
 /// What a bounded read produced.
@@ -1714,6 +1723,18 @@ mod tests {
         let redacted = super::redact("https://a.invalid/p?access_token=VERYSECRET");
         assert!(!redacted.contains("VERYSECRET"), "{redacted}");
         assert!(redacted.contains("<query removed>"), "{redacted}");
+        // A query can hold another URL, and what followed it was the token. A query therefore
+        // goes all the way to the end of the word rather than to the nested URL.
+        let redacted = super::redact(
+            "https://a.invalid/p?next=https://b.invalid/x&access_token=VERYSECRET after",
+        );
+        assert!(!redacted.contains("VERYSECRET"), "{redacted}");
+        assert!(redacted.ends_with(" after"), "{redacted}");
+        // A boundary that falls inside a multi-byte character is not a boundary. This used to
+        // split one.
+        let redacted =
+            super::redact("https://a.invalid/p,\u{e9}https://user:VERYSECRET@b.invalid/x");
+        assert!(!redacted.contains("VERYSECRET"), "{redacted}");
         // Text that holds no URL is returned as it is.
         assert_eq!(super::redact("no url here"), "no url here");
     }

@@ -2027,3 +2027,100 @@ fn a_staging_name_with_no_recorded_identity_is_never_removed() {
         "a name with no identity beside it is not this host's to remove"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_link_the_policy_includes_is_named_rather_than_copied() {
+    // A symbolic link, a socket and a device are not file content, and this host carries file
+    // content. One inside a wholly ignored directory the policy includes is therefore a path the
+    // workspace does not hold as the policy asked, and the creation names it.
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "linked");
+    write(&path, ".gitignore", "generated/\n");
+    support::git_raw(&path, ["add", "-A"]);
+    support::git_raw(&path, ["commit", "-m", "the base"]);
+    std::fs::create_dir_all(path.join("generated")).expect("an ignored directory");
+    write(&path.join("generated"), "real.txt", "a real file\n");
+    std::os::unix::fs::symlink("real.txt", path.join("generated/link.txt"))
+        .expect("a link beside it");
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "linked"),
+                label: "linked".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 67)),
+        )
+        .expect("it is adopted")
+        .project
+        .project_repository_id;
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "linked".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "linked-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 68)),
+        )
+        .expect("the workspace is created");
+    assert!(
+        created
+            .unapplied
+            .iter()
+            .any(|path| path == "generated/link.txt"),
+        "the link is named: {:?}",
+        created.unapplied
+    );
+    assert!(
+        !created.preview.counts_complete,
+        "and the counts say they do not cover it"
+    );
+    assert!(
+        created
+            .preview
+            .limitations
+            .iter()
+            .any(|line| line.contains("symbolic link")),
+        "the preview says what it could not carry: {:?}",
+        created.preview.limitations
+    );
+    let tree = fixture.work().join("linked-tree");
+    assert!(
+        std::fs::read_to_string(tree.join("generated/real.txt")).is_ok(),
+        "the file beside it is carried"
+    );
+    assert!(
+        !tree.join("generated/link.txt").exists(),
+        "and nothing is put where the link was"
+    );
+    // The path is journalled with the rest, so a recovered answer names it too.
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    let recorded: String = journal
+        .query_row(
+            "SELECT outcome FROM workspace_progress WHERE path = ?1",
+            rusqlite::params!["generated/link.txt"],
+            |row| row.get(0),
+        )
+        .expect("the link has a row");
+    assert_eq!(recorded, "unapplied");
+}

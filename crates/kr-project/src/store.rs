@@ -46,7 +46,7 @@ use crate::identity::RepositoryIdentity;
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// What an inclusion records for a path it has not reached yet.
 pub const PROGRESS_PLANNED: &str = "planned";
@@ -486,6 +486,11 @@ impl Store {
             // Forward only. `CREATE TABLE IF NOT EXISTS` leaves a table that already exists
             // exactly as it was, so a store written by an earlier build has the tables and not
             // the columns added since: each one is added here and the version is moved on.
+            //
+            // The version says which *build* wrote the store, not which columns it has, and one
+            // earlier build moved a store to version 2 while adding only some of them. So the
+            // step runs for every version below the current one and adds whatever is missing,
+            // rather than trusting a version number to describe a shape.
             Some(version) if version < SCHEMA_VERSION => {
                 self.add_missing_columns()?;
                 self.connection
@@ -1140,7 +1145,14 @@ impl Store {
     /// Written before the copy starts, in one transaction. What it buys is that a crash anywhere
     /// in the copy leaves every path either resolved or `planned`: a path with no row at all
     /// would be a path nothing accounts for, which is the thing a replacement daemon cannot
-    /// report.
+    /// report. `planned` means this host did not establish what became of that path, not that it
+    /// was not copied: a copy that landed and whose flush this host never saw leaves the row as
+    /// it was.
+    ///
+    /// The transaction is as large as the inclusion, which is bounded by what a working tree's
+    /// status can report rather than by a constant. That is one transaction of inserts against a
+    /// local database, taken before any file is touched, which is cheaper than the copy it
+    /// precedes.
     ///
     /// # Errors
     ///
@@ -3013,133 +3025,139 @@ mod tests {
     }
 
     #[test]
+    fn every_path_an_inclusion_will_attempt_is_recorded_before_any_of_them_settles() {
+        // What makes an interrupted inclusion reportable is the order: the paths go in as
+        // `planned` first, and each outcome replaces its own row. So a journal read part way
+        // through says which paths this host had not established anything about.
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        let workspace_id = WorkspaceId::new(Uuid::from_bytes([70; 16]));
+        let paths = vec!["a.txt".to_owned(), "b/c.txt".to_owned(), "d.bin".to_owned()];
+        store
+            .plan_workspace_progress(workspace_id, &paths)
+            .expect("the plan is written");
+        let planned = store
+            .workspace_progress(workspace_id)
+            .expect("the progress reads");
+        assert_eq!(planned.len(), 3);
+        assert!(
+            planned
+                .iter()
+                .all(|(_, outcome)| outcome == PROGRESS_PLANNED),
+            "every path starts unresolved: {planned:?}"
+        );
+        // One path settles, which is what a daemon that died after the first batch leaves.
+        store
+            .record_workspace_progress(workspace_id, &[("a.txt".to_owned(), "carried")])
+            .expect("one outcome is written");
+        let mixed = store
+            .workspace_progress(workspace_id)
+            .expect("the progress reads again");
+        assert_eq!(
+            mixed.len(),
+            3,
+            "an outcome replaces a row rather than adding one"
+        );
+        assert_eq!(
+            mixed
+                .iter()
+                .filter(|(_, outcome)| outcome == PROGRESS_PLANNED)
+                .count(),
+            2,
+            "and the rest are still unresolved: {mixed:?}"
+        );
+    }
+
+    #[test]
     fn a_store_written_by_an_earlier_build_gains_the_columns_it_is_missing() {
         // The tables are created only when they are absent, so a store an earlier build wrote has
         // the tables and not the columns added since. Opening it has to add them: a replacement
-        // daemon that cannot read its own journal cannot recover anything.
+        // daemon that cannot read its own journal cannot recover anything. And the version says
+        // which build wrote the store rather than which columns it has, so the step runs for
+        // every version below the current one and adds whatever is missing.
+        const EARLIEST: &str = "
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (1);
+            CREATE TABLE operations (
+                action_id             BLOB PRIMARY KEY,
+                actor_id              TEXT NOT NULL,
+                environment_id        BLOB NOT NULL,
+                project_repository_id BLOB NOT NULL,
+                method                TEXT NOT NULL,
+                state                 TEXT NOT NULL,
+                remote_name           TEXT,
+                remote_transport      TEXT,
+                remote_url            TEXT,
+                remote_provider       TEXT,
+                remote_broker         TEXT,
+                flow                  TEXT,
+                destination_state     TEXT NOT NULL,
+                parent_path           TEXT NOT NULL,
+                destination_name      TEXT NOT NULL,
+                staging_name          TEXT,
+                staged_device         INTEGER,
+                staged_file_id        INTEGER,
+                detail                TEXT,
+                started_at_ms         INTEGER NOT NULL,
+                ended_at_ms           INTEGER
+            );
+            CREATE TABLE workspaces (
+                workspace_id          BLOB PRIMARY KEY,
+                project_repository_id BLOB NOT NULL,
+                environment_id        BLOB NOT NULL,
+                label                 TEXT NOT NULL,
+                kind                  TEXT NOT NULL,
+                isolation             TEXT,
+                dirty_files           TEXT NOT NULL,
+                untracked_files       TEXT NOT NULL,
+                submodules            TEXT NOT NULL,
+                binary_files          TEXT NOT NULL,
+                generated_artefacts   TEXT NOT NULL,
+                state                 TEXT NOT NULL,
+                base_revision         TEXT NOT NULL,
+                base_change_set_id    BLOB,
+                tree_device           INTEGER,
+                tree_file_id          INTEGER,
+                display_path          TEXT NOT NULL,
+                retention             TEXT,
+                created_at_ms         INTEGER NOT NULL,
+                removed_at_ms         INTEGER
+            );";
         let directory = tempfile::tempdir().expect("a directory");
-        let path = directory.path().join("projects.sqlite");
-        let earlier = Connection::open(&path).expect("an earlier store opens");
-        earlier
-            .execute_batch(
-                "CREATE TABLE schema_version (version INTEGER NOT NULL);
-                 INSERT INTO schema_version (version) VALUES (1);
-                 CREATE TABLE operations (
-                     action_id             BLOB PRIMARY KEY,
-                     actor_id              TEXT NOT NULL,
-                     environment_id        BLOB NOT NULL,
-                     project_repository_id BLOB NOT NULL,
-                     method                TEXT NOT NULL,
-                     state                 TEXT NOT NULL,
-                     remote_name           TEXT,
-                     remote_transport      TEXT,
-                     remote_url            TEXT,
-                     remote_provider       TEXT,
-                     remote_broker         TEXT,
-                     flow                  TEXT,
-                     destination_state     TEXT NOT NULL,
-                     parent_path           TEXT NOT NULL,
-                     destination_name      TEXT NOT NULL,
-                     staging_name          TEXT,
-                     staged_device         INTEGER,
-                     staged_file_id        INTEGER,
-                     staged_created_at_ms  INTEGER,
-                     detail                TEXT,
-                     started_at_ms         INTEGER NOT NULL,
-                     ended_at_ms           INTEGER
-                 );
-                 CREATE TABLE workspaces (
-                     workspace_id          BLOB PRIMARY KEY,
-                     project_repository_id BLOB NOT NULL,
-                     environment_id        BLOB NOT NULL,
-                     label                 TEXT NOT NULL,
-                     kind                  TEXT NOT NULL,
-                     isolation             TEXT,
-                     dirty_files           TEXT NOT NULL,
-                     untracked_files       TEXT NOT NULL,
-                     submodules            TEXT NOT NULL,
-                     binary_files          TEXT NOT NULL,
-                     generated_artefacts   TEXT NOT NULL,
-                     state                 TEXT NOT NULL,
-                     base_revision         TEXT NOT NULL,
-                     base_change_set_id    BLOB,
-                     tree_device           INTEGER,
-                     tree_file_id          INTEGER,
-                     display_path          TEXT NOT NULL,
-                     staging_name          TEXT,
-                     detail                TEXT,
-                     retention             TEXT,
-                     created_at_ms         INTEGER NOT NULL,
-                     removed_at_ms         INTEGER
-                 );",
-            )
-            .expect("the earlier shape is written");
-        drop(earlier);
-        let store = Store::open(&path, environment()).expect("this build opens it");
-        drop(store);
-        // And the shape before that one, which had neither of the workspace columns this build
-        // reads nor the staged instant: every earlier shape has to be readable, not only the last.
+        // The earliest shape of version 1, which had neither of the workspace columns this build
+        // reads nor the staged instant.
         let earliest = directory.path().join("earliest.sqlite");
         let first = Connection::open(&earliest).expect("the earliest store opens");
         first
-            .execute_batch(
-                "CREATE TABLE schema_version (version INTEGER NOT NULL);
-                 INSERT INTO schema_version (version) VALUES (1);
-                 CREATE TABLE operations (
-                     action_id             BLOB PRIMARY KEY,
-                     actor_id              TEXT NOT NULL,
-                     environment_id        BLOB NOT NULL,
-                     project_repository_id BLOB NOT NULL,
-                     method                TEXT NOT NULL,
-                     state                 TEXT NOT NULL,
-                     remote_name           TEXT,
-                     remote_transport      TEXT,
-                     remote_url            TEXT,
-                     remote_provider       TEXT,
-                     remote_broker         TEXT,
-                     flow                  TEXT,
-                     destination_state     TEXT NOT NULL,
-                     parent_path           TEXT NOT NULL,
-                     destination_name      TEXT NOT NULL,
-                     staging_name          TEXT,
-                     staged_device         INTEGER,
-                     staged_file_id        INTEGER,
-                     detail                TEXT,
-                     started_at_ms         INTEGER NOT NULL,
-                     ended_at_ms           INTEGER
-                 );
-                 CREATE TABLE workspaces (
-                     workspace_id          BLOB PRIMARY KEY,
-                     project_repository_id BLOB NOT NULL,
-                     environment_id        BLOB NOT NULL,
-                     label                 TEXT NOT NULL,
-                     kind                  TEXT NOT NULL,
-                     isolation             TEXT,
-                     dirty_files           TEXT NOT NULL,
-                     untracked_files       TEXT NOT NULL,
-                     submodules            TEXT NOT NULL,
-                     binary_files          TEXT NOT NULL,
-                     generated_artefacts   TEXT NOT NULL,
-                     state                 TEXT NOT NULL,
-                     base_revision         TEXT NOT NULL,
-                     base_change_set_id    BLOB,
-                     tree_device           INTEGER,
-                     tree_file_id          INTEGER,
-                     display_path          TEXT NOT NULL,
-                     retention             TEXT,
-                     created_at_ms         INTEGER NOT NULL,
-                     removed_at_ms         INTEGER
-                 );",
-            )
+            .execute_batch(EARLIEST)
             .expect("the earliest shape is written");
         drop(first);
-        let store = Store::open(&earliest, environment()).expect("this build opens that too");
-        assert!(store.operations_in(&[OperationState::Publishing]).is_ok());
-        assert!(store.workspaces(environment(), None).is_ok());
-        drop(store);
-        let store = Store::open(&path, environment()).expect("and the later shape again");
-        // The columns a replacement daemon reads are there, and the version says so.
+        let store = Store::open(&earliest, environment()).expect("this build opens it");
         assert!(store.operations_in(&[OperationState::Staging]).is_ok());
+        assert!(store.workspaces(environment(), None).is_ok());
+        let version: i64 = store
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("the version reads");
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(store);
+        // The shape a *partial* migration left: an earlier build moved a store to version 2 while
+        // adding only some of the columns, so the version number does not describe the shape.
+        let partial = directory.path().join("partial.sqlite");
+        let half = Connection::open(&partial).expect("the partial store opens");
+        half.execute_batch(EARLIEST)
+            .expect("the earliest shape is written again");
+        half.execute_batch(
+            "ALTER TABLE operations ADD COLUMN staging_device INTEGER;
+             ALTER TABLE operations ADD COLUMN staging_file_id INTEGER;
+             ALTER TABLE workspaces ADD COLUMN staging_device INTEGER;
+             ALTER TABLE workspaces ADD COLUMN staging_file_id INTEGER;
+             ALTER TABLE workspaces ADD COLUMN removal_action BLOB;
+             UPDATE schema_version SET version = 2;",
+        )
+        .expect("the partial migration is written");
+        drop(half);
+        let store = Store::open(&partial, environment()).expect("this build repairs it");
+        assert!(store.operations_in(&[OperationState::Publishing]).is_ok());
         assert!(store.workspaces(environment(), None).is_ok());
         let version: i64 = store
             .connection
@@ -3155,7 +3173,7 @@ mod tests {
             )
             .expect("a later version is written");
         drop(store);
-        let refusal = Store::open(&path, environment()).expect_err("a later store is refused");
+        let refusal = Store::open(&partial, environment()).expect_err("a later store is refused");
         assert_eq!(refusal.code(), ErrorCode::StorageUnavailable);
     }
 

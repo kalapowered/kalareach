@@ -222,7 +222,8 @@ base holds nothing. It never means the original is touched. The service reads th
 and writes only into the new one.
 
 An inclusion replaces the destination rather than writing over it: the copy is written to a name of
-this host's own, flushed to disk, given the source's permission bits, and then renamed over the
+this host's own, derived from the destination's path, given the source's permission bits, flushed
+to disk, and then renamed over the
 destination. A rename replaces a file in one step, so the destination is either the base's file or
 the user's and never half of each, and a failure anywhere before the rename leaves the destination
 as it was. What the host could not carry it names rather than hides: a symbolic link, a device, a
@@ -329,7 +330,10 @@ parent's modules directory, which the parent's own configuration listing does no
 defined there is one the audit cannot see, and checking a submodule's dirtiness runs Git *inside*
 the submodule, where it would apply. So every read passes `--ignore-submodules=all` as well as
 setting `submodule.recurse=false` and `diff.ignoreSubmodules=all`, submodules are counted from the
-index, and the preview says that what a submodule holds is neither measured nor copied.
+index, and the preview says that what a submodule holds is neither measured nor copied. An index
+that holds a path this host cannot read as text is refused rather than approximated: decoding it
+lossily would have the host asking the filesystem about a different name, and a submodule it could
+not find would look like one that is not there.
 
 That cuts both ways for a removal. An empty status is an empty status of the tree *outside* its
 submodules, so a workspace holding a populated submodule is a workspace whose contents this host
@@ -387,10 +391,13 @@ check rather than the guarantee. The Windows path has not been executed on Windo
 outside this host's handles: it passes a path with `-C`, and Git opens the configuration for itself.
 So a writer under the same operating-system account could put a different tree at that path, or add
 a driver the audit did not blank, between the check and the invocation. Neither is preventable
-through Git's own interface, so what this host does is notice, and shorten the window. Before a
-*write* it re-reads the configuration and refuses a change; after a review refresh it re-opens the
+through Git's own interface, so what this host does is notice, and shorten the window. Before each
+write to the user's own repository (adding a worktree, staging a clone of it, pruning a worktree
+record) it re-reads the configuration and refuses a change; after a review refresh it re-opens the
 path, compares both filesystem identities, re-reads the configuration and compares its digest, and
-a result produced against something else is refused rather than returned. Detection is not
+a result produced against something else is refused rather than returned. A write *inside* a
+directory this host created, such as the checkout in a staged clone, runs under the configuration
+of a repository this host made a moment earlier. Detection is not
 prevention: a driver added in the moment between the last reading and the process starting runs,
 and this host reports afterwards that the configuration changed. Closing that needs an isolation
 boundary outside Git — a sandbox that denies the process anything but the paths it was granted —
@@ -407,11 +414,20 @@ ends, and a reservation an earlier daemon held is released on recovery.
 host did not finish keeps every file in its directory: the files may be the user's, and this host
 does not know which of them it wrote. What it does not do is call that workspace ready. The row
 moves out of the states anything may hold, the reason is recorded, and a person decides. What the
-inclusion had applied when the daemon ended is recorded too: each path's outcome is journalled as
-the copy goes, in batches, so an interrupted inclusion leaves a record of the paths it carried
-rather than only the fact that it stopped. Applying a change set path by path is the diff service's
-contract, not this one's; what this service records is which tree it created, what it carried into
-it, and how far it got.
+inclusion had applied when the daemon ended is recorded too. Every path it will attempt goes in as
+`planned` before the copy starts, and each outcome replaces its own row in batches, so a crash
+anywhere leaves every path either resolved or planned and none of them unaccounted for. `planned`
+means this host did not establish what became of that path rather than that nothing happened to
+it: a copy that landed and whose flush this host never saw leaves the row as it was. The reason on
+the workspace says how many paths were carried and how many are unestablished.
+
+The temporary name a copy writes under follows from the destination's own path rather than from
+chance, which is what makes the `planned` row account for the temporary as well: a replacement
+daemon can turn the recorded path back into the one name a copy of it could have left behind. A
+stale one is this host's own leftover and is taken away before the copy is written again.
+
+Applying a change set path by path is the diff service's contract, not this one's; what this
+service records is which tree it created, what it carried into it, and how far it got.
 
 **A cancellation contains a process group on Unix and a single process elsewhere.** Every Git child
 this service starts leads its own process group, so a cancellation ends the helper, the ssh process
@@ -441,14 +457,16 @@ refusal rather than a thing to work around.
 
 `projects.sqlite`, write-ahead logging, full synchronisation, forward-only migrations: the tables are created
 where they are absent and a store an earlier build wrote gains the columns added since, one
-`ALTER TABLE` each, before the recorded version moves on. A store from a *later* build is refused
-rather than half read.
+`ALTER TABLE` each, before the recorded version moves on. The version says which build wrote the
+store rather than which columns it has, so the step runs for every version below the current one
+and adds whatever is missing instead of trusting a number to describe a shape. A store from a
+*later* build is refused rather than half read.
 
 | Table | What it holds |
 | --- | --- |
 | `operations` | One row per creation, keyed by the caller's action identifier: the create token |
 | `operation_paths` | Every staging path an operation left behind or removed |
-| `workspace_progress` | What an inclusion made of each path it reached, written as it went |
+| `workspace_progress` | Every path an inclusion will attempt, written as `planned` before it starts, then each outcome as it settles: `carried`, `removed`, `unapplied`, or `leftover` for a copy in progress nobody could take away |
 | `projects` | One row per repository, with both filesystem identities |
 | `workspaces` | One row per working copy, with its policy, its base and its tree's identity |
 | `workspace_sessions` | Which sessions are bound to a workspace, and which are still live |

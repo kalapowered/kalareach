@@ -386,9 +386,10 @@ impl ProjectService {
                 &WorkspaceUpdate {
                     detail: Some(&format!(
                         "the daemon that was materialising this workspace ended before it \
-                         finished, with {carried} of its paths carried in and {pending} not \
-                         reached, so what is in its directory is not what its creation asked \
-                         for; the files are left where they are and nothing new may hold it"
+                         finished, with {carried} of its paths carried in and {pending} this \
+                         host did not establish, so what is in its directory is not what its \
+                         creation asked for; the files are left where they are and nothing new \
+                         may hold it"
                     )),
                     ..WorkspaceUpdate::default()
                 },
@@ -676,7 +677,7 @@ impl ProjectService {
             // Nothing was published, because the identity a publication needs was never recorded.
             // The destination is untouched, so the staged content is removed and the operation is
             // recorded as failed under its own create token rather than started again.
-            let path = staging.as_ref().map(|sibling| sibling.path().to_owned());
+            let mut left_behind: Option<String> = None;
             // As above: the publication is committed, and a cleanup that fails is recorded rather
             // than allowed to undo it.
             if let Some(sibling) = staging {
@@ -691,6 +692,9 @@ impl ProjectService {
                         .unwrap_or_else(|_| !sibling.occupied(&destination)),
                     None => false,
                 };
+                if !removed {
+                    left_behind = Some(path.clone());
+                }
                 let _ = self
                     .writable()
                     .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
@@ -707,8 +711,13 @@ impl ProjectService {
                 },
                 OperationState::Failed,
             )?;
-            let _ = path;
-            return Ok(ResolvedStep::Cleaned);
+            // What this counted is what it removed. A staging directory it left alone, because
+            // nothing recorded which object this host had created, is reported as a path that is
+            // still there rather than as one that was cleaned up.
+            return Ok(match left_behind {
+                None => ResolvedStep::Cleaned,
+                Some(path) => ResolvedStep::Unresolved(Some(path)),
+            });
         };
         match reconcile(&destination, staging.as_ref(), staged)? {
             Reconciliation::Published(identity) => {

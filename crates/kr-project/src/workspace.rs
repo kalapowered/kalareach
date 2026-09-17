@@ -203,7 +203,18 @@ pub fn submodule_paths(
         OsStr::new("--stage"),
         OsStr::new("-z"),
     ];
-    let reported = profile.run_checked(&repository.read(&arguments))?;
+    let output = profile.run(&repository.read(&arguments))?;
+    output.require_success()?;
+    // `-z` means Git writes the paths as bytes rather than quoting them, so a path this host
+    // cannot read as text is one it cannot name. Decoding it lossily would put a replacement
+    // character where a byte was, and the host would then be asking the filesystem about a
+    // different name: a populated submodule would look absent, and a removal would delete work
+    // nobody inspected. So the listing is refused rather than approximated.
+    let reported = std::str::from_utf8(&output.stdout).map_err(|_| ProjectError::GitFailed {
+        detail: "this repository's index holds a path this host cannot read as text, so it \
+                 cannot say what that path holds"
+            .to_owned(),
+    })?;
     let mut paths = Vec::new();
     for record in reported.split('\0') {
         // `<mode> <object> <stage>\t<path>`
@@ -448,7 +459,14 @@ pub fn survey(
         unsupported: unsupported
             .into_iter()
             .filter(|(_, class)| {
-                shared || matches!(request.policy.choice(*class), InclusionChoice::Include)
+                // The same decision the entries get: the origin class first, and then the
+                // content. A link, a socket or a device is content this host could not classify,
+                // and an exclusion of binary files excludes what might be binary, so it excludes
+                // these too. Otherwise an excluded path would be reported as one the workspace
+                // failed to hold.
+                shared
+                    || (matches!(request.policy.choice(*class), InclusionChoice::Include)
+                        && matches!(request.policy.binary_files, InclusionChoice::Include))
             })
             .map(|(path, _)| path)
             .collect(),
@@ -924,9 +942,18 @@ fn copy_one(
     // a name of this host's own, flushed, and then renamed over the destination: a rename replaces
     // a file in one step, so the destination is either the base's file or the user's and never
     // half of each. A failure anywhere before the rename leaves the destination as it was.
-    let temporary = RelativeName::parse(&format!(".kr-copy-{}", random_name()))?;
-    // Created exclusively, and never removed first: a name this host has not written is not its
-    // to delete, however unlikely the collision.
+    // The temporary's name follows from the destination's own path rather than from chance, so
+    // the journal's row for that path accounts for the temporary as well: a replacement daemon
+    // that finds a path recorded as `planned` can name the one temporary a copy of it could have
+    // left. A random name would be an object nothing could account for.
+    let temporary = RelativeName::parse(&temporary_name(name))?;
+    // A copy of *this* path that an earlier daemon did not finish. The name is this host's own,
+    // derived from the path it was copying, so taking it away is taking away this host's own
+    // leftover rather than anything of the user's. A name this host could not look at is left
+    // alone and the creation below reports the path instead.
+    if target.occupied(&temporary).unwrap_or(false) && target.remove(&temporary).is_err() {
+        return Ok(false);
+    }
     let mut written = match target.create_new(&temporary) {
         Ok(created) => created,
         Err(_) => return Ok(false),
@@ -1055,10 +1082,18 @@ fn apply_mode(_file: &kr_transfer::AuthorisedFile, _mode: Option<u32>) -> Result
     Ok(())
 }
 
-/// Returns a name for a copy in progress that nothing else will collide with.
-fn random_name() -> String {
-    let mut text = String::with_capacity(32);
-    for byte in uuid::Uuid::new_v4().as_bytes() {
+/// Returns the name a copy of one path is written under before it replaces it.
+///
+/// Derived from the path rather than drawn at random, so the name is recoverable: the journal
+/// records the destination path before the copy begins, and this function is how a replacement
+/// daemon turns that path back into the one temporary name a copy of it could have left behind.
+/// The digest is the whole relative path, so two paths in one directory never collide.
+#[must_use]
+pub fn temporary_name(name: &RelativeName) -> String {
+    let digest = kr_cbor::sha256(name.to_string().as_bytes());
+    let mut text = String::with_capacity(41);
+    text.push_str(".kr-copy-");
+    for byte in &digest[..16] {
         text.push_str(&format!("{byte:02x}"));
     }
     text

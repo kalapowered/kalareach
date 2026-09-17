@@ -771,6 +771,35 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
         .read_operation(cloned.operation.action_id)
         .expect("the operation reads");
     assert_eq!(operation.state, OperationState::Failed);
+    // And the same row with *no* recorded identity: the daemon died before it could say which
+    // object it had created, so the name alone authorises nothing.
+    let unproven = fixture.work().join(format!("{STAGING_PREFIX}unproven"));
+    std::fs::create_dir_all(unproven.join("tree")).expect("a sibling with no recorded identity");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE operations SET state = 'staging', ended_at_ms = NULL, staged_device = NULL,
+                    staged_file_id = NULL, staging_name = ?2, staging_device = NULL,
+                    staging_file_id = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![
+                cloned.operation.action_id.get().as_bytes().to_vec(),
+                format!("{STAGING_PREFIX}unproven"),
+            ],
+        )
+        .expect("the name is recorded and the identity is not");
+    drop(journal);
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs again");
+    assert_eq!(
+        recovery.staging_removed, 0,
+        "a name with no identity beside it is not this host's to remove"
+    );
+    assert!(unproven.join("tree").is_dir(), "so it is still there");
     assert!(
         operation
             .detail
