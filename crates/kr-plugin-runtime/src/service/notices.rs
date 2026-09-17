@@ -123,7 +123,10 @@ impl NoticeSink {
         }
         queue.admit(notice);
         drop(queue);
-        self.shared.wake.notify_waiters();
+        // One waiter, so one wake-up, and it leaves a permit behind when nobody is waiting yet. A
+        // wake-up that woke nobody would otherwise be lost between the reader looking at an empty
+        // queue and the reader waiting on it.
+        self.shared.wake.notify_one();
         true
     }
 
@@ -132,7 +135,7 @@ impl NoticeSink {
         if let Ok(mut queue) = self.shared.queue.lock() {
             queue.closed = true;
         }
-        self.shared.wake.notify_waiters();
+        self.shared.wake.notify_one();
     }
 
     /// Returns true once the queue is closed.
@@ -402,5 +405,28 @@ mod tests {
             .expect("a notice");
         assert_eq!(notice.binding_id(), binding(3));
         sending.await.expect("the sender finished");
+    }
+
+    #[tokio::test]
+    async fn a_notice_that_arrives_before_the_reader_waits_still_wakes_it() {
+        // The order that loses a wake-up if the queue only wakes whoever is already waiting: the
+        // reader looks, finds nothing, and something arrives before it settles down to wait.
+        let (sink, mut stream) = channel();
+        assert!(stream.try_recv().is_none());
+        sink.send(document(binding(4), 8));
+        let notice = tokio::time::timeout(core::time::Duration::from_secs(5), stream.recv())
+            .await
+            .expect("the reader was not left waiting")
+            .expect("a notice");
+        assert_eq!(notice.binding_id(), binding(4));
+
+        // And a queue closed the same way ends a reader rather than leaving it waiting.
+        sink.close();
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_secs(5), stream.recv())
+                .await
+                .expect("the reader was not left waiting")
+                .is_none()
+        );
     }
 }

@@ -79,6 +79,14 @@ const MAX_CONCURRENT_CALLS: usize = 16;
 /// How long a connection's notices are given to finish being written once it is over.
 const NOTICE_DRAIN: core::time::Duration = core::time::Duration::from_secs(2);
 
+/// How long one frame is given to reach a worker.
+///
+/// A worker that has not taken a frame in this long is a worker that has stopped reading, and this
+/// host will not hold a task and the connection's writer waiting for it. Every frame this host
+/// sends is bounded and its queues are bounded, so the only reason a write waits this long is the
+/// peer.
+const WRITE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(10);
+
 /// How much of a refusal is carried back to the worker.
 ///
 /// A refusal names a component's own failure, and a component chooses those words. Clipping them
@@ -594,8 +602,14 @@ impl BindingPlaces {
 /// Writes one connection's notices, one frame at a time.
 async fn write_notices(mut notices: NoticeStream, writer: Arc<tokio::sync::Mutex<FrameWriter>>) {
     while let Some(notice) = notices.recv().await {
-        let mut writer = writer.lock().await;
-        if writer.write_message(&Frame::Notice(notice)).await.is_err() {
+        let written = tokio::time::timeout(WRITE_DEADLINE, async {
+            let mut writer = writer.lock().await;
+            writer.write_message(&Frame::Notice(notice)).await
+        })
+        .await;
+        // A failed write and a peer that never took the frame end the same way: there is nobody to
+        // tell any more.
+        if !matches!(written, Ok(Ok(()))) {
             return;
         }
     }
@@ -611,28 +625,34 @@ async fn respond(
     name: &str,
     body: ResponseBody,
 ) -> bool {
-    let mut writer = writer.lock().await;
-    match writer
-        .write_message(&Frame::Response { reply_to, body })
-        .await
-    {
-        Ok(()) => true,
-        Err(kr_ipc::IpcError::Frame(error)) => {
-            let refused = ResponseBody::Refused {
-                request: name.to_owned(),
-                detail: format!("this host could not deliver its own answer: {error}"),
-                disabled: false,
-            };
-            writer
-                .write_message(&Frame::Response {
-                    reply_to,
-                    body: refused,
-                })
-                .await
-                .is_ok()
+    // The whole of it, the wait for the writer included: a peer that has stopped reading would
+    // otherwise hold this task and every other answer on this connection behind it.
+    let written = tokio::time::timeout(WRITE_DEADLINE, async {
+        let mut writer = writer.lock().await;
+        match writer
+            .write_message(&Frame::Response { reply_to, body })
+            .await
+        {
+            Ok(()) => true,
+            Err(kr_ipc::IpcError::Frame(error)) => {
+                let refused = ResponseBody::Refused {
+                    request: name.to_owned(),
+                    detail: format!("this host could not deliver its own answer: {error}"),
+                    disabled: false,
+                };
+                writer
+                    .write_message(&Frame::Response {
+                        reply_to,
+                        body: refused,
+                    })
+                    .await
+                    .is_ok()
+            }
+            Err(_error) => false,
         }
-        Err(_error) => false,
-    }
+    })
+    .await;
+    written.unwrap_or(false)
 }
 
 /// Returns true for the requests this host answers without entering a component.

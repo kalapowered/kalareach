@@ -69,6 +69,13 @@ pub const DEFAULT_DEADLINE: core::time::Duration = core::time::Duration::from_se
 pub const REGISTER_DEADLINE: core::time::Duration =
     core::time::Duration::from_millis(crate::runtime::compile::COMPILE_DEADLINE_MS + 5_000);
 
+/// How long one offered event is given to reach the host.
+///
+/// An offered event is not something anybody is waiting for an answer to, and a host that has not
+/// taken one in this long is a host that has stopped reading. The writer stops rather than holding
+/// the lock every request on this connection needs.
+const OFFER_WRITE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(10);
+
 /// How many offered events may be waiting to be written.
 ///
 /// The terminal path hands an event over and carries on, so there has to be somewhere for it to
@@ -635,11 +642,17 @@ async fn write_offered(
 ) {
     while let Some(request) = offered.recv().await {
         let cost = offered_bytes_of(&request);
-        let mut writer = writer.lock().await;
-        let written = writer.write_message(&request).await;
-        drop(writer);
-        held.fetch_sub(cost.min(held.load(Ordering::Acquire)), Ordering::AcqRel);
-        if written.is_err() {
+        // Bounded, the wait for the writer included: a host that stopped reading would otherwise
+        // hold this task and the lock every request on this connection needs.
+        let written = tokio::time::timeout(OFFER_WRITE_DEADLINE, async {
+            let mut writer = writer.lock().await;
+            writer.write_message(&request).await
+        })
+        .await;
+        let _released = held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+            Some(bytes.saturating_sub(cost))
+        });
+        if !matches!(written, Ok(Ok(()))) {
             return;
         }
     }
