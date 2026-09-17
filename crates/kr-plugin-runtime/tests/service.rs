@@ -34,8 +34,10 @@ impl Served {
     async fn start() -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
+        // Owner-only: it holds the payloads this host compiles, and the host refuses a packages
+        // directory anybody else could write to.
         let packages = environment.state_dir().join("packages");
-        std::fs::create_dir_all(&packages).expect("the packages directory");
+        kr_ipc::paths::create_private_directory(&packages).expect("the packages directory");
         let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
         let endpoint = host_endpoint(&environment).expect("an endpoint");
         let descriptor = HostDescriptor {
@@ -122,6 +124,7 @@ async fn documents_until(
                 binding_id: bound,
                 call: drew,
                 nodes,
+                ..
             })) => {
                 assert_eq!(bound, binding_id.get());
                 if drew == call {

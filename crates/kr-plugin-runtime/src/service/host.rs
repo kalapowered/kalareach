@@ -34,7 +34,7 @@ use kr_protocol::scalars::Uuid;
 
 use crate::runtime::binding::{
     BindingEvent, BindingId, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE, Runtime,
-    RuntimeConfig, remaining_of,
+    RuntimeConfig, Unbound, remaining_of,
 };
 use crate::runtime::budget::CallKind;
 use crate::runtime::compile::CompileOrigin;
@@ -44,7 +44,7 @@ use crate::runtime::host::{
 };
 use crate::runtime::queue::Admission;
 use crate::service::launcher::{HostIdentity, LaunchError, LaunchResult};
-use crate::service::notices::{NoticeSink, NoticeStream, node_bytes};
+use crate::service::notices::{NoticeSink, NoticeStream, Offered, node_bytes};
 use crate::service::protocol::{
     BindingRegistration, CallValue, ComponentSource, Frame, HostHealth, Notice, Request,
     RequestBody, ResponseBody, WireFacts, WireNode, WireSourceEvent,
@@ -109,6 +109,10 @@ pub struct PluginHost {
     identity: HostIdentity,
     runtime: Arc<Runtime>,
     config: HostConfig,
+    /// The packages directory, opened once. Every payload is opened relative to this handle, which
+    /// is what keeps a component's location inside it a property of the open rather than of a
+    /// comparison made before it.
+    packages: Arc<cap_std::fs::Dir>,
     started: std::time::Instant,
 }
 
@@ -135,10 +139,31 @@ impl PluginHost {
                     detail: format!("the component runtime could not be built: {error}"),
                 }
             })?;
+        // Created if it is not there yet, owner-only. A host is started the first time a binding
+        // needs a component, and an environment that has never installed one has no such directory;
+        // that is a first state rather than a misconfiguration. Opening it once here is what lets
+        // every payload afterwards be opened relative to this handle.
+        kr_ipc::paths::create_private_directory(&config.packages_root).map_err(|error| {
+            LaunchError::Refused {
+                detail: format!(
+                    "the packages directory {} cannot be made: {error}",
+                    config.packages_root.display()
+                ),
+            }
+        })?;
+        let packages =
+            cap_std::fs::Dir::open_ambient_dir(&config.packages_root, cap_std::ambient_authority())
+                .map_err(|error| LaunchError::Refused {
+                    detail: format!(
+                        "the packages directory {} cannot be opened: {error}",
+                        config.packages_root.display()
+                    ),
+                })?;
         Ok(Self {
             identity,
             runtime: Arc::new(runtime),
             config,
+            packages: Arc::new(packages),
             started: std::time::Instant::now(),
         })
     }
@@ -217,20 +242,27 @@ impl PluginHost {
         let (reader, writer) = split(connection, StreamKind::Control);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
         let (sink, stream) = crate::service::notices::channel();
+        let conversation = Arc::new(Conversation::new());
         let served = Arc::new(Served {
             owner: BindingOwner::next(),
             notices: sink.clone(),
             writer: Arc::clone(&writer),
             work: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CALLS)),
             bindings: BindingPlaces::default(),
+            conversation: Arc::clone(&conversation),
         });
 
         // One task writes notices, so a burst of document nodes from one binding cannot interleave
         // with another's inside a frame.
         let notice_writer = Arc::clone(&writer);
-        let mut notices_task = tokio::spawn(write_notices(stream, notice_writer));
+        let mut notices_task = tokio::spawn(write_notices(
+            stream,
+            notice_writer,
+            Arc::clone(&conversation),
+        ));
 
         Arc::clone(&self).read_requests(reader, &served).await;
+        conversation.end();
 
         // The queue is closed first, so the writer stops waiting for more; it is then given a
         // bounded moment to finish what it holds before it is abandoned. A peer that has stopped
@@ -261,13 +293,21 @@ impl PluginHost {
 
     async fn read_requests(self: Arc<Self>, mut reader: FrameReader, served: &Arc<Served>) {
         loop {
-            let request: Request = match reader.read_message().await {
-                Ok(request) => request,
-                // A closed connection or a frame this protocol does not admit. Either way this
-                // conversation is over; the union is closed so an unrecognised frame is a refusal
-                // rather than something to guess at.
-                Err(_error) => return,
+            let request: Request = tokio::select! {
+                // Anything that decided this connection is over ends the reading too, rather than
+                // leaving a reader waiting for a request nobody could be answered about.
+                () = served.conversation.ended() => return,
+                read = reader.read_message() => match read {
+                    Ok(request) => request,
+                    // A closed connection or a frame this protocol does not admit. Either way this
+                    // conversation is over; the union is closed so an unrecognised frame is a
+                    // refusal rather than something to guess at.
+                    Err(_error) => return,
+                },
             };
+            if served.conversation.is_over() {
+                return;
+            }
             let reply_to = request.request_id;
             let name = request.body.name();
             if immediate(&request.body) {
@@ -300,7 +340,12 @@ impl PluginHost {
             tokio::spawn(async move {
                 let _permit = permit;
                 let body = host.answer(request.body, &served).await;
-                let _delivered = respond(&served.writer, reply_to, name, body).await;
+                // An answer that could not be delivered ends the connection. Leaving the reader
+                // waiting for the next request on a connection whose last answer never arrived
+                // would be serving a worker that cannot hear.
+                if !respond(&served.writer, reply_to, name, body).await {
+                    served.conversation.end();
+                }
             });
         }
     }
@@ -324,13 +369,33 @@ impl PluginHost {
     fn forward_notices(
         binding_id: BindingId,
         notices: NoticeSink,
+        binding: Arc<tokio::sync::OnceCell<Arc<crate::runtime::binding::BindingHandle>>>,
+        conversation: Arc<Conversation>,
     ) -> tokio::sync::mpsc::Sender<BindingEvent> {
         let (events, mut pending) = tokio::sync::mpsc::channel::<BindingEvent>(DEFAULT_EVENT_QUEUE);
+        let mut documents = 0_u64;
         tokio::spawn(async move {
             while let Some(event) = pending.recv().await {
-                for notice in notices_of(binding_id, event) {
-                    if !notices.send(notice) {
-                        return;
+                if matches!(event, BindingEvent::Document { .. }) {
+                    documents = documents.saturating_add(1);
+                }
+                for notice in notices_of(binding_id, documents, event) {
+                    match notices.send(notice) {
+                        Offered::Kept => {}
+                        // The reader never saw what the component drew, so the component draws
+                        // again. Without this the binding would sit on a document nobody has.
+                        Offered::Dropped => {
+                            if let Some(handle) = binding.get() {
+                                handle.require_snapshot();
+                            }
+                        }
+                        // What had to arrive would not fit. Nothing further this connection said
+                        // could be answered honestly, so it is over.
+                        Offered::Overflowed => {
+                            conversation.end();
+                            return;
+                        }
+                        Offered::Closed => return,
                     }
                 }
             }
@@ -411,13 +476,18 @@ impl PluginHost {
                 let runtime = Arc::clone(&self.runtime);
                 let owner = served.owner;
                 let binding = BindingId::new(binding_id);
-                let existed = tokio::task::spawn_blocking(move || runtime.unbind(owner, binding))
+                let removed = tokio::task::spawn_blocking(move || runtime.unbind(owner, binding))
                     .await
-                    .unwrap_or(false);
-                if existed {
+                    .unwrap_or(Unbound::Absent);
+                // Only a binding that existed had a place of its own. A preparation that was still
+                // running holds its place until it finishes and gives it back itself, so counting
+                // it here as well would let this connection hold more bindings than it may.
+                if matches!(removed, Unbound::Stopped) {
                     served.bindings.give_back();
                 }
-                Ok(ResponseBody::Unbound { existed })
+                Ok(ResponseBody::Unbound {
+                    existed: removed.existed(),
+                })
             }
             RequestBody::Health => Ok(ResponseBody::Health(Box::new(HostHealth {
                 live_bindings: self.runtime.live_bindings() as u64,
@@ -457,9 +527,25 @@ impl PluginHost {
 
         // Reading a file is blocking work, and a payload is up to sixteen mebibytes. Neither
         // belongs on the executor that is reading this connection's next request.
+        let packages = Arc::clone(&self.packages);
         let root = self.config.packages_root.clone();
-        let wasm = tokio::task::spawn_blocking(move || read_component(&root, &component))
+        let reading =
+            tokio::task::spawn_blocking(move || read_component(&packages, &root, &component));
+        // Inside the registration's own deadline, like every other stage: a read that is somehow
+        // still going when the worker has stopped waiting is not one this host keeps waiting for.
+        let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
+        let wasm = tokio::time::timeout(remaining, reading)
             .await
+            .map_err(|_elapsed| {
+                (
+                    RuntimeError::CallerDeadline {
+                        deadline_ms: u64::try_from(REGISTER_DEADLINE.as_millis())
+                            .unwrap_or(u64::MAX),
+                    }
+                    .to_string(),
+                    false,
+                )
+            })?
             .map_err(|error| (format!("the payload could not be read: {error}"), false))?
             .map_err(|detail| (detail, false))?;
 
@@ -481,12 +567,23 @@ impl PluginHost {
             facts: facts_of(&facts),
             executable,
         };
-        let events = Self::forward_notices(binding, served.notices.clone());
+        // The forwarder is started before the instance exists, because the instance reports what
+        // `bind` drew as it is created. The cell is how it learns which binding it is forwarding
+        // for, so that a document the worker never received can be asked for again.
+        let handle = Arc::new(tokio::sync::OnceCell::new());
+        let events = Self::forward_notices(
+            binding,
+            served.notices.clone(),
+            Arc::clone(&handle),
+            Arc::clone(&served.conversation),
+        );
         let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
-        self.runtime
+        let bound = self
+            .runtime
             .instantiate(served.owner, request, &compiled, events, remaining)
             .await
             .map_err(refusal)?;
+        let _first = handle.set(bound);
         admitted.keep();
         Ok(ResponseBody::Registered {
             origin: match compiled.origin {
@@ -542,6 +639,45 @@ struct Served {
     work: Arc<tokio::sync::Semaphore>,
     /// How many bindings it holds.
     bindings: BindingPlaces,
+    /// Whether it is still worth talking on.
+    conversation: Arc<Conversation>,
+}
+
+/// Whether one connection is still worth talking on.
+///
+/// One place a connection ends, whatever ended it: the worker closed it, a frame could not be
+/// written, or what had to be reported would not fit. Everything serving that connection watches
+/// this, so a failure in one direction is not something the other direction keeps working past.
+#[derive(Debug)]
+struct Conversation {
+    over: tokio::sync::watch::Sender<bool>,
+}
+
+impl Conversation {
+    fn new() -> Self {
+        Self {
+            over: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    /// Ends the connection. Saying so twice is the same as saying it once.
+    fn end(&self) {
+        let _told = self.over.send(true);
+    }
+
+    /// Returns true once the connection is over.
+    fn is_over(&self) -> bool {
+        *self.over.borrow()
+    }
+
+    /// Waits until the connection is over.
+    async fn ended(&self) {
+        let mut watching = self.over.subscribe();
+        if *watching.borrow_and_update() {
+            return;
+        }
+        let _changed = watching.changed().await;
+    }
 }
 
 /// How many bindings one connection holds, and how many it may.
@@ -608,7 +744,11 @@ impl BindingPlaces {
 }
 
 /// Writes one connection's notices, one frame at a time.
-async fn write_notices(mut notices: NoticeStream, writer: Arc<tokio::sync::Mutex<FrameWriter>>) {
+async fn write_notices(
+    mut notices: NoticeStream,
+    writer: Arc<tokio::sync::Mutex<FrameWriter>>,
+    conversation: Arc<Conversation>,
+) {
     while let Some(notice) = notices.recv().await {
         let written = tokio::time::timeout(WRITE_DEADLINE, async {
             let mut writer = writer.lock().await;
@@ -616,10 +756,16 @@ async fn write_notices(mut notices: NoticeStream, writer: Arc<tokio::sync::Mutex
         })
         .await;
         // A failed write and a peer that never took the frame end the same way: there is nobody to
-        // tell any more.
+        // tell any more, and a connection whose news cannot be delivered is over.
         if !matches!(written, Ok(Ok(()))) {
+            conversation.end();
             return;
         }
+    }
+    // The queue closed. If it closed because what had to arrive would not fit, that is the
+    // connection's end rather than the writer's.
+    if notices.overflowed() {
+        conversation.end();
     }
 }
 
@@ -695,117 +841,6 @@ fn clipped(text: String) -> String {
     format!("{} (and {} more bytes)", &text[..end], text.len() - end)
 }
 
-/// Reads a component payload, refusing anything outside the packages directory.
-///
-/// Blocking work, called off the executor. What it refuses, in order: a path that does not resolve
-/// inside the packages directory, something that is not a regular file, a length the caller did not
-/// declare, more bytes than this host compiles, and bytes that are not the payload whose digest the
-/// caller verified against the catalogue. The digest is taken over the bytes this read returned and
-/// no others, so a file replaced between the check and the read is refused by its contents.
-fn read_component(root: &Path, source: &ComponentSource) -> Result<Arc<[u8]>, String> {
-    if source.bytes > crate::runtime::compile::MAX_COMPONENT_BYTES {
-        return Err(format!(
-            "the component declares {} bytes, over the {} byte compilation bound",
-            source.bytes,
-            crate::runtime::compile::MAX_COMPONENT_BYTES
-        ));
-    }
-    let path = Path::new(&source.path);
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let resolved = path
-        .canonicalize()
-        .map_err(|error| format!("{} is unreadable: {error}", path.display()))?;
-    if !resolved.starts_with(&root) {
-        return Err(format!(
-            "{} is outside the packages directory {}",
-            resolved.display(),
-            root.display()
-        ));
-    }
-
-    let mut file = std::fs::File::open(&resolved)
-        .map_err(|error| format!("{} is unreadable: {error}", resolved.display()))?;
-    let opened = file
-        .metadata()
-        .map_err(|error| format!("{} is unreadable: {error}", resolved.display()))?;
-    // A directory, a device or a named pipe is not a component. A pipe matters most: reading one
-    // would wait for a writer that may never come, and no length would bound it.
-    if !opened.is_file() {
-        return Err(format!(
-            "{} is not a regular file, and a component payload is",
-            resolved.display()
-        ));
-    }
-    if !same_file(&opened, &resolved) {
-        return Err(format!(
-            "{} was replaced while it was being opened",
-            resolved.display()
-        ));
-    }
-    if opened.len() != source.bytes {
-        return Err(format!(
-            "{} is {} bytes and the caller verified {}",
-            resolved.display(),
-            opened.len(),
-            source.bytes
-        ));
-    }
-
-    // Bounded by what the caller declared rather than by what the file says now, and read one byte
-    // past it so a file that grew between the check and the read is refused rather than truncated.
-    let limit = source.bytes.saturating_add(1);
-    let mut bytes = Vec::with_capacity(usize::try_from(source.bytes).unwrap_or(0));
-    file.by_ref()
-        .take(limit)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("{} is unreadable: {error}", resolved.display()))?;
-    if bytes.len() as u64 != source.bytes {
-        return Err(format!(
-            "{} read as {} bytes and the caller verified {}",
-            resolved.display(),
-            bytes.len(),
-            source.bytes
-        ));
-    }
-
-    // The digest the caller verified against the catalogue, over the bytes this read returned.
-    // Bytes that do not match it never reach the compiler, so what becomes machine code is what the
-    // catalogue signed.
-    let digest = PayloadDigest::of(&bytes);
-    if digest != source.digest {
-        return Err(format!(
-            "{} is not the payload the caller verified",
-            resolved.display()
-        ));
-    }
-    Ok(Arc::from(bytes))
-}
-
-/// Returns whether an open handle and a path still name the same file.
-///
-/// A canonical path is checked against the packages directory before the file is opened, and the
-/// two steps are not one operation. Comparing what was opened with what the path names now closes
-/// the window in which a component of that path could have been replaced.
-#[cfg(unix)]
-fn same_file(opened: &std::fs::Metadata, path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    std::fs::metadata(path)
-        .is_ok_and(|named| named.dev() == opened.dev() && named.ino() == opened.ino())
-}
-
-#[cfg(not(unix))]
-fn same_file(opened: &std::fs::Metadata, path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|named| {
-        named.len() == opened.len() && named.modified().ok() == opened.modified().ok()
-    })
-}
-
-/// Turns what a call produced into the answer that carries it.
-///
-/// The document the call drew is not in here. Nodes travel as notices, chunked to fit a frame, and
-/// they have already been sent by the time this is built: carrying them again in the response would
-/// deliver every document twice and would make an answer that fitted the output budget one the
-/// protocol could not deliver.
 fn called_of(
     result: Result<Result<CallValue, String>, RuntimeError>,
 ) -> Result<ResponseBody, (String, bool)> {
@@ -848,7 +883,7 @@ fn admission_of(admission: Admission) -> ResponseBody {
 /// mebibyte across many nodes, and a control frame carries a mebibyte including its envelope, so a
 /// document sent whole would be a document that fitted every stated bound and still could not be
 /// delivered. Each node is already bounded below one frame, so every chunk holds at least one node.
-fn notices_of(binding_id: BindingId, event: BindingEvent) -> Vec<Notice> {
+fn notices_of(binding_id: BindingId, document: u64, event: BindingEvent) -> Vec<Notice> {
     let binding_id = binding_id.get();
     match event {
         BindingEvent::Document { call, nodes } => {
@@ -862,6 +897,8 @@ fn notices_of(binding_id: BindingId, event: BindingEvent) -> Vec<Notice> {
                     chunks.push(Notice::Document {
                         binding_id,
                         call: call.clone(),
+                        document,
+                        last: false,
                         nodes: core::mem::take(&mut holding),
                     });
                     held = 0;
@@ -873,6 +910,8 @@ fn notices_of(binding_id: BindingId, event: BindingEvent) -> Vec<Notice> {
                 chunks.push(Notice::Document {
                     binding_id,
                     call,
+                    document,
+                    last: true,
                     nodes: holding,
                 });
             }
@@ -882,15 +921,17 @@ fn notices_of(binding_id: BindingId, event: BindingEvent) -> Vec<Notice> {
             binding_id,
             events: gap.events,
             bytes: gap.bytes,
+            documents: 0,
         }],
         // A dropped presentation is a gap in what the worker has seen rather than in what the
         // component has: no event was lost, and the component is rebuilding its document. The
-        // worker is told by the same notice, with no events named, so it knows to expect a fresh
-        // document rather than a continuation.
+        // worker is told by the same notice, counted apart from lost observations, so it knows to
+        // expect a fresh document rather than a continuation.
         BindingEvent::PresentationDropped { documents } => vec![Notice::Gap {
             binding_id,
             events: 0,
-            bytes: u64::from(documents),
+            bytes: 0,
+            documents: u64::from(documents),
         }],
         BindingEvent::Fault {
             call,
@@ -1009,6 +1050,144 @@ pub fn callable() -> &'static [CallKind] {
 pub fn no_rights() -> Vec<ActionRight> {
     Vec::new()
 }
+/// Reads a component payload from inside the packages directory, and nowhere else.
+///
+/// Blocking work, called off the executor and inside the registration's own deadline.
+///
+/// The directory is opened once, when the host is built, and every payload is opened relative to
+/// that handle. That is what makes containment a property of the open rather than of a comparison
+/// made before it: a name that becomes a link out of the directory between the check and the open
+/// is refused by the open, because there is no check to race.
+///
+/// What else it refuses, in order: a declared length over what this host compiles, a path that is
+/// not a plain name inside the directory, something that is not a regular file, a length the caller
+/// did not declare, and bytes that are not the payload whose digest the caller verified against the
+/// catalogue. The digest is taken over the bytes this read returned and no others.
+fn read_component(
+    packages: &cap_std::fs::Dir,
+    root: &Path,
+    source: &ComponentSource,
+) -> Result<Arc<[u8]>, String> {
+    if source.bytes > crate::runtime::compile::MAX_COMPONENT_BYTES {
+        return Err(format!(
+            "the component declares {} bytes, over the {} byte compilation bound",
+            source.bytes,
+            crate::runtime::compile::MAX_COMPONENT_BYTES
+        ));
+    }
+    let inside = inside_packages(root, &source.path)?;
+
+    // The open refuses a link and does not wait. Without `FollowSymlinks::No` a name replaced by a
+    // link would redirect the read; without `O_NONBLOCK` a name replaced by a named pipe would hold
+    // this read open until somebody wrote to it, and no declared length would bound that.
+    let mut options = cap_std::fs::OpenOptions::new();
+    {
+        use cap_fs_ext::OpenOptionsFollowExt as _;
+        options.read(true).follow(cap_fs_ext::FollowSymlinks::No);
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = packages.open_with(&inside, &options).map_err(|error| {
+        format!(
+            "{} is not a readable payload inside {}: {error}",
+            inside.display(),
+            root.display()
+        )
+    })?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("{} is unreadable: {error}", inside.display()))?;
+    if !opened.is_file() {
+        return Err(format!(
+            "{} is not a regular file, and a component payload is",
+            inside.display()
+        ));
+    }
+    if opened.len() != source.bytes {
+        return Err(format!(
+            "{} is {} bytes and the caller verified {}",
+            inside.display(),
+            opened.len(),
+            source.bytes
+        ));
+    }
+
+    // Bounded by what the caller declared rather than by what the file says now, and read one byte
+    // past it so a file that grew between the check and the read is refused rather than truncated.
+    let limit = source.bytes.saturating_add(1);
+    let mut bytes = Vec::with_capacity(usize::try_from(source.bytes).unwrap_or(0));
+    file.by_ref()
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{} is unreadable: {error}", inside.display()))?;
+    if bytes.len() as u64 != source.bytes {
+        return Err(format!(
+            "{} read as {} bytes and the caller verified {}",
+            inside.display(),
+            bytes.len(),
+            source.bytes
+        ));
+    }
+
+    // The digest the caller verified against the catalogue, over the bytes this read returned.
+    // Bytes that do not match it never reach the compiler, so what becomes machine code is what the
+    // catalogue signed.
+    let digest = PayloadDigest::of(&bytes);
+    if digest != source.digest {
+        return Err(format!(
+            "{} is not the payload the caller verified",
+            inside.display()
+        ));
+    }
+    Ok(Arc::from(bytes))
+}
+
+/// Turns what a worker named into a path inside the packages directory.
+///
+/// A worker may name the payload absolutely or relative to the directory; either way what comes out
+/// is a plain relative path with no `..` and no root in it. The open then does the rest: a path this
+/// accepts still cannot leave the directory, because it is opened relative to the directory's own
+/// handle and links are not followed.
+fn inside_packages(root: &Path, named: &str) -> Result<PathBuf, String> {
+    let named = Path::new(named);
+    let relative = if named.is_absolute() {
+        // Either spelling of the directory: the one this host was started with, and the one the
+        // filesystem resolves it to. On a host where the state directory is reached through a link,
+        // a worker that resolved the path and a worker that did not are both naming the same file.
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        named
+            .strip_prefix(root)
+            .or_else(|_| named.strip_prefix(&canonical))
+            .map_err(|_| {
+                format!(
+                    "{} is outside the packages directory {}",
+                    named.display(),
+                    root.display()
+                )
+            })?
+    } else {
+        named
+    };
+    if relative.as_os_str().is_empty() {
+        return Err("a component payload has a name".to_owned());
+    }
+    for part in relative.components() {
+        match part {
+            std::path::Component::Normal(_) => {}
+            _ => {
+                return Err(format!(
+                    "{} is outside the packages directory {}",
+                    named.display(),
+                    root.display()
+                ));
+            }
+        }
+    }
+    Ok(relative.to_path_buf())
+}
 
 #[cfg(test)]
 mod tests {
@@ -1102,15 +1281,24 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_component_outside_the_packages_directory_is_refused() {
+    /// Opens a packages directory and returns it with its path.
+    fn packages() -> (tempfile::TempDir, cap_std::fs::Dir, std::path::PathBuf) {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let packages = directory.path().join("packages");
         std::fs::create_dir_all(&packages).expect("the packages directory");
+        let opened = cap_std::fs::Dir::open_ambient_dir(&packages, cap_std::ambient_authority())
+            .expect("the packages directory opens");
+        (directory, opened, packages)
+    }
+
+    #[test]
+    fn a_component_outside_the_packages_directory_is_refused() {
+        let (directory, opened, packages) = packages();
         let elsewhere = directory.path().join("elsewhere.wasm");
         std::fs::write(&elsewhere, b"not a component").expect("a file");
 
         let error = read_component(
+            &opened,
             &packages,
             &ComponentSource {
                 path: elsewhere.display().to_string(),
@@ -1121,10 +1309,45 @@ mod tests {
         .expect_err("a path outside the packages directory is refused");
         assert!(error.contains("outside the packages directory"));
 
-        // Inside it, the digest still has to match what the caller verified.
+        // Nor by climbing out of it.
+        let error = read_component(
+            &opened,
+            &packages,
+            &ComponentSource {
+                path: "../elsewhere.wasm".to_owned(),
+                digest: PayloadDigest::of(b"not a component"),
+                bytes: 15,
+            },
+        )
+        .expect_err("a path that climbs out is refused");
+        assert!(error.contains("outside the packages directory"));
+
+        // Nor through a link that points out of it: the open does not follow one.
         let inside = packages.join("component.wasm");
         std::fs::write(&inside, b"not a component").expect("a file");
+        #[cfg(unix)]
+        {
+            let link = packages.join("link.wasm");
+            std::os::unix::fs::symlink(&elsewhere, &link).expect("a link");
+            let error = read_component(
+                &opened,
+                &packages,
+                &ComponentSource {
+                    path: "link.wasm".to_owned(),
+                    digest: PayloadDigest::of(b"not a component"),
+                    bytes: 15,
+                },
+            )
+            .expect_err("a link out of the packages directory is refused");
+            assert!(
+                error.contains("not a readable payload"),
+                "the refusal was {error}"
+            );
+        }
+
+        // Inside it, the digest still has to match what the caller verified.
         let error = read_component(
+            &opened,
             &packages,
             &ComponentSource {
                 path: inside.display().to_string(),
@@ -1137,6 +1360,7 @@ mod tests {
 
         // And so does the length.
         let error = read_component(
+            &opened,
             &packages,
             &ComponentSource {
                 path: inside.display().to_string(),
@@ -1147,33 +1371,35 @@ mod tests {
         .expect_err("a length that does not match is refused");
         assert!(error.contains("the caller verified"));
 
-        // With both right, the bytes are read.
-        let bytes = read_component(
-            &packages,
-            &ComponentSource {
-                path: inside.display().to_string(),
-                digest: PayloadDigest::of(b"not a component"),
-                bytes: 15,
-            },
-        )
-        .expect("the payload is read");
-        assert_eq!(&bytes[..], b"not a component");
+        // With both right, the bytes are read, whether the worker named the payload absolutely or
+        // relative to the directory.
+        for named in [inside.display().to_string(), "component.wasm".to_owned()] {
+            let bytes = read_component(
+                &opened,
+                &packages,
+                &ComponentSource {
+                    path: named,
+                    digest: PayloadDigest::of(b"not a component"),
+                    bytes: 15,
+                },
+            )
+            .expect("the payload is read");
+            assert_eq!(&bytes[..], b"not a component");
+        }
     }
 
     #[test]
     fn a_declared_length_is_refused_before_anything_is_read() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let packages = directory.path().join("packages");
-        std::fs::create_dir_all(&packages).expect("the packages directory");
-        let inside = packages.join("component.wasm");
-        std::fs::write(&inside, b"small").expect("a file");
+        let (_directory, opened, packages) = packages();
+        std::fs::write(packages.join("component.wasm"), b"small").expect("a file");
 
         // The declared length is over the compilation bound. Nothing is opened and nothing is
         // allocated: the refusal is the declaration's own.
         let error = read_component(
+            &opened,
             &packages,
             &ComponentSource {
-                path: inside.display().to_string(),
+                path: "component.wasm".to_owned(),
                 digest: PayloadDigest::of(b"small"),
                 bytes: crate::runtime::compile::MAX_COMPONENT_BYTES + 1,
             },
@@ -1185,26 +1411,24 @@ mod tests {
 
     #[test]
     fn something_that_is_not_a_regular_file_is_refused_without_being_read() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let packages = directory.path().join("packages");
-        std::fs::create_dir_all(&packages).expect("the packages directory");
+        let (_directory, opened, packages) = packages();
         // A directory where a payload should be. On a Unix host this opens and then reads nothing
         // useful; a named pipe would wait for a writer that never comes. Neither is a component,
         // and the file kind is what says so before anything is read.
-        let not_a_payload = packages.join("component.wasm");
-        std::fs::create_dir(&not_a_payload).expect("a directory");
+        std::fs::create_dir(packages.join("component.wasm")).expect("a directory");
 
         let error = read_component(
+            &opened,
             &packages,
             &ComponentSource {
-                path: not_a_payload.display().to_string(),
+                path: "component.wasm".to_owned(),
                 digest: PayloadDigest::of(b""),
                 bytes: 0,
             },
         )
         .expect_err("a directory is not a component payload");
         assert!(
-            error.contains("not a regular file"),
+            error.contains("not a regular file") || error.contains("not a readable payload"),
             "the refusal was {error}"
         );
     }
@@ -1223,6 +1447,7 @@ mod tests {
             .collect();
         let notices = notices_of(
             binding,
+            7,
             BindingEvent::Document {
                 call: CallKind::Snapshot,
                 nodes,
@@ -1230,12 +1455,22 @@ mod tests {
         );
         assert!(notices.len() > 1, "the document was not split");
         let mut carried = 0;
-        for notice in &notices {
-            let Notice::Document { nodes, .. } = notice else {
+        for (index, notice) in notices.iter().enumerate() {
+            let Notice::Document {
+                nodes,
+                document,
+                last,
+                ..
+            } = notice
+            else {
                 panic!("a document became {notice:?}");
             };
             let bytes: u64 = nodes.iter().map(node_bytes).sum();
             assert!(bytes <= MAX_NODE_BYTES, "a frame would carry {bytes} bytes");
+            // Every piece names the document it belongs to, and only the last says so, which is
+            // how a reader knows which notices go together and when it has all of them.
+            assert_eq!(*document, 7);
+            assert_eq!(*last, index + 1 == notices.len());
             carried += nodes.len();
         }
         assert_eq!(carried, 4, "a node was lost in the splitting");
@@ -1246,6 +1481,7 @@ mod tests {
         let binding = BindingId::new(Uuid::from_bytes([5; 16]));
         let notices = notices_of(
             binding,
+            1,
             BindingEvent::Document {
                 call: CallKind::Observe,
                 nodes: vec![crate::runtime::host::EmittedNode {
@@ -1258,6 +1494,7 @@ mod tests {
         assert_eq!(notices.len(), 1);
         let faults = notices_of(
             binding,
+            1,
             BindingEvent::Fault {
                 call: CallKind::Observe,
                 detail: "the component trapped".to_owned(),

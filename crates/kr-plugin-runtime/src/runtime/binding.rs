@@ -298,10 +298,42 @@ struct Registration {
 
 #[derive(Debug)]
 enum RegistrationState {
-    /// Somebody is preparing this binding.
-    Reserved,
+    /// Somebody is preparing this binding, under this attempt.
+    ///
+    /// The attempt is what makes a reservation one preparation's and not the identifier's. Without
+    /// it, a preparation that had lost its reservation -- because the identifier was unbound while
+    /// it ran -- could take the reservation a later preparation of the same identifier had made,
+    /// and hand that caller an instance it never asked for.
+    Reserved(Attempt),
     /// The binding is live.
     Live(Arc<BindingHandle>),
+}
+
+/// One preparation's claim on an identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Attempt(u64);
+
+/// The source of attempt numbers, which are never reused inside a process.
+static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// What removing a binding found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unbound {
+    /// A live binding was removed and its thread stopped.
+    Stopped,
+    /// A preparation was under way, and its reservation is gone; the preparation gives its
+    /// instance up when it finds out.
+    Preparing,
+    /// The owner holds no such binding.
+    Absent,
+}
+
+impl Unbound {
+    /// Returns whether there was anything to remove.
+    #[must_use]
+    pub const fn existed(self) -> bool {
+        !matches!(self, Self::Absent)
+    }
 }
 
 impl Runtime {
@@ -392,11 +424,36 @@ impl Runtime {
             })
     }
 
+    /// Takes one preparation's claim on an identifier, or says it is taken.
+    ///
+    /// The returned guard gives the reservation up if the preparation does not finish, however it
+    /// ends: a refusal, a caller's deadline, or a future nobody polled again.
+    fn reserve_attempt(
+        self: &Arc<Self>,
+        owner: BindingOwner,
+        binding_id: BindingId,
+    ) -> RuntimeResult<Reservation> {
+        let attempt = Attempt(NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed));
+        self.reserve(owner, binding_id, attempt)?;
+        Ok(Reservation {
+            runtime: Arc::clone(self),
+            owner,
+            binding_id,
+            attempt,
+            kept: false,
+        })
+    }
+
     /// Reserves an identifier for `owner`, or says it is taken.
     ///
     /// Taken under the lock and before anything is started, so two registrations of one identifier
     /// cannot both get past it.
-    fn reserve(&self, owner: BindingOwner, binding_id: BindingId) -> RuntimeResult<()> {
+    fn reserve(
+        &self,
+        owner: BindingOwner,
+        binding_id: BindingId,
+        attempt: Attempt,
+    ) -> RuntimeResult<()> {
         let mut bindings = self
             .bindings
             .lock()
@@ -412,21 +469,21 @@ impl Runtime {
             binding_id,
             Registration {
                 owner,
-                state: RegistrationState::Reserved,
+                state: RegistrationState::Reserved(attempt),
             },
         );
         Ok(())
     }
 
-    /// Gives up a reservation that did not become a binding.
-    fn release(&self, owner: BindingOwner, binding_id: BindingId) {
+    /// Gives up one attempt's reservation, if it is still that attempt's.
+    fn release(&self, owner: BindingOwner, binding_id: BindingId, attempt: Attempt) {
         if let Ok(mut bindings) = self.bindings.lock()
             && matches!(
                 bindings.get(&binding_id),
                 Some(Registration {
                     owner: held,
-                    state: RegistrationState::Reserved,
-                }) if *held == owner
+                    state: RegistrationState::Reserved(held_attempt),
+                }) if *held == owner && *held_attempt == attempt
             )
         {
             bindings.remove(&binding_id);
@@ -463,7 +520,7 @@ impl Runtime {
     /// deadline, and [`RuntimeError::NoSuchBinding`]'s opposite -- a refusal naming the binding --
     /// when that binding is already live.
     pub async fn instantiate(
-        &self,
+        self: &Arc<Self>,
         owner: BindingOwner,
         request: BindingRequest,
         compiled: &Compiled,
@@ -473,8 +530,9 @@ impl Runtime {
         let binding_id = request.binding_id;
         // One binding, one instance. Replacing a live binding silently would leave an instance
         // running that nothing could reach and nothing would stop, so the identifier is taken
-        // before anything is started rather than checked before anything is awaited.
-        self.reserve(owner, binding_id)?;
+        // before anything is started rather than checked before anything is awaited. The guard
+        // gives it up however this ends, including a caller that stopped polling.
+        let mut reservation = self.reserve_attempt(owner, binding_id)?;
 
         let handle = BindingHandle::start(
             request,
@@ -483,43 +541,19 @@ impl Runtime {
             self.config.fuel_rate,
             FaultCounter::new(Arc::clone(&self.config.clock)),
             events,
-        )
-        .inspect_err(|_| self.release(owner, binding_id))?;
+        )?;
         let handle = Arc::new(handle);
-        match handle.ready(within).await {
-            Ok(()) => {}
-            Err(error) => {
-                // Signalled rather than joined: this is an asynchronous caller whose deadline has
-                // run out, and joining here would hold its thread for as long as the instantiation
-                // it gave up on.
-                handle.signal_stop();
-                self.release(owner, binding_id);
-                return Err(error);
-            }
+        if let Err(error) = handle.ready(within).await {
+            // Signalled rather than joined: this is an asynchronous caller whose deadline has run
+            // out, and joining here would hold its thread for as long as the instantiation it gave
+            // up on.
+            handle.signal_stop();
+            return Err(error);
         }
-        // The reservation is what this replaces. An owner that went away while its instance was
-        // starting took its reservation with it, and the instance it no longer has a use for is
-        // stopped here rather than left running for nobody.
-        let live = self
-            .bindings
-            .lock()
-            .is_ok_and(|mut bindings| match bindings.get(&binding_id) {
-                Some(Registration {
-                    owner: held,
-                    state: RegistrationState::Reserved,
-                }) if *held == owner => {
-                    bindings.insert(
-                        binding_id,
-                        Registration {
-                            owner,
-                            state: RegistrationState::Live(Arc::clone(&handle)),
-                        },
-                    );
-                    true
-                }
-                _ => false,
-            });
-        if !live {
+        // The reservation is what this replaces, and only if it is still this attempt's. An owner
+        // that went away while its instance was starting took its reservation with it, and the
+        // instance it no longer has a use for is stopped here rather than left running for nobody.
+        if !reservation.becomes(&handle) {
             handle.signal_stop();
             return Err(RuntimeError::NoSuchBinding {
                 binding: binding_id.to_string(),
@@ -540,7 +574,7 @@ impl Runtime {
     /// [`RuntimeError::CallerDeadline`] when the whole preparation does not finish inside
     /// `deadline`.
     pub async fn prepare(
-        &self,
+        self: &Arc<Self>,
         owner: BindingOwner,
         request: BindingRequest,
         wasm: Arc<[u8]>,
@@ -560,7 +594,7 @@ impl Runtime {
     /// Blocks until the thread is gone, so a caller knows the instance is no longer running when
     /// this returns. The component's own state goes with it; nothing a decision depends on was in
     /// there, because pending and dispatch state is the worker broker's.
-    pub fn unbind(&self, owner: BindingOwner, binding_id: BindingId) -> bool {
+    pub fn unbind(&self, owner: BindingOwner, binding_id: BindingId) -> Unbound {
         let entry =
             self.bindings
                 .lock()
@@ -575,15 +609,18 @@ impl Runtime {
                 ..
             }) => {
                 handle.stop();
-                true
+                Unbound::Stopped
             }
             // A reservation somebody is still preparing. Removing it is the whole of the removal:
-            // the preparation will find its reservation gone and give the handle up.
+            // the preparation will find its reservation gone and give the handle up. The caller is
+            // told which of the two it was, because the preparation's own accounting is still
+            // outstanding and giving its place back twice would let a connection hold more
+            // bindings than it may.
             Some(Registration {
-                state: RegistrationState::Reserved,
+                state: RegistrationState::Reserved(_),
                 ..
-            }) => true,
-            None => false,
+            }) => Unbound::Preparing,
+            None => Unbound::Absent,
         }
     }
 
@@ -630,7 +667,7 @@ impl Runtime {
                     .drain()
                     .filter_map(|(_id, entry)| match entry.state {
                         RegistrationState::Live(handle) => Some(handle),
-                        RegistrationState::Reserved => None,
+                        RegistrationState::Reserved(_) => None,
                     })
                     .collect()
             })
@@ -644,6 +681,55 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.unbind_all();
+    }
+}
+
+/// One preparation's claim on an identifier, given up if the preparation does not finish.
+///
+/// Held across every await a preparation makes, so a caller that stopped polling leaves no
+/// reservation behind for an identifier nothing is preparing any more.
+struct Reservation {
+    runtime: Arc<Runtime>,
+    owner: BindingOwner,
+    binding_id: BindingId,
+    attempt: Attempt,
+    kept: bool,
+}
+
+impl Reservation {
+    /// Turns this claim into the live binding, if it is still this attempt's claim.
+    fn becomes(&mut self, handle: &Arc<BindingHandle>) -> bool {
+        let Ok(mut bindings) = self.runtime.bindings.lock() else {
+            return false;
+        };
+        let held = matches!(
+            bindings.get(&self.binding_id),
+            Some(Registration {
+                owner,
+                state: RegistrationState::Reserved(attempt),
+            }) if *owner == self.owner && *attempt == self.attempt
+        );
+        if !held {
+            return false;
+        }
+        bindings.insert(
+            self.binding_id,
+            Registration {
+                owner: self.owner,
+                state: RegistrationState::Live(Arc::clone(handle)),
+            },
+        );
+        self.kept = true;
+        true
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.runtime
+                .release(self.owner, self.binding_id, self.attempt);
+        }
     }
 }
 
@@ -879,6 +965,18 @@ impl BindingHandle {
     #[must_use]
     pub fn queued_bytes(&self) -> u64 {
         self.queue.lock().map_or(0, |queue| queue.held_bytes())
+    }
+
+    /// Says the component's view is stale and a fresh snapshot is owed.
+    ///
+    /// For a caller that lost what the component drew: a document that never reached whoever was
+    /// to read it leaves that reader with a stale view, and the answer is the same one a lost
+    /// observation gets -- the component draws again.
+    pub fn require_snapshot(&self) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.require_snapshot();
+        }
+        self.wake();
     }
 
     /// Returns true when the component owes a fresh snapshot.
@@ -1313,7 +1411,14 @@ impl BindingWorker {
                 // The snapshot failed, or the component declined it. Either way the obligation
                 // stands, and delivering observations against a document that does not exist
                 // would interpret them against nothing.
-                self.rearm(true);
+                //
+                // Only a failure asks for another pass now. A failure is a fault, and three faults
+                // in a minute disable the binding, so retrying is bounded. A component that
+                // *declined* the snapshot has broken no bound and has not been counted, so asking
+                // it again immediately would be an unbounded loop of calls nothing asked for: its
+                // obligation waits for the next thing that happens to the binding instead.
+                let failed = outcome.is_err();
+                self.rearm(failed);
                 return;
             }
         }
@@ -1648,7 +1753,13 @@ mod tests {
         let (_directory, config) = config();
         let runtime = Runtime::new(config).expect("a runtime");
         let owner = BindingOwner::next();
-        assert!(!runtime.unbind(owner, BindingId::new(Uuid::from_bytes([9; 16]))));
+        assert_eq!(
+            runtime.unbind(owner, BindingId::new(Uuid::from_bytes([9; 16]))),
+            Unbound::Absent
+        );
+        assert!(!Unbound::Absent.existed());
+        assert!(Unbound::Stopped.existed());
+        assert!(Unbound::Preparing.existed());
         assert_eq!(runtime.bindings_of(owner), 0);
         assert_eq!(runtime.release_owner(owner), 0);
     }

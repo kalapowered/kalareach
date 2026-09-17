@@ -483,15 +483,28 @@ pub struct HostHealth {
 #[serde(rename_all = "snake_case")]
 pub enum Notice {
     /// A component emitted document nodes.
+    ///
+    /// One call's document may take more than one of these: a call may draw a mebibyte and a frame
+    /// carries a mebibyte including its envelope. `document` is the number that call's output
+    /// carries, counted per binding, and `last` marks the final piece, so a reader knows which
+    /// notices belong together and when it has all of them.
     Document {
         /// The binding.
         binding_id: kr_protocol::scalars::Uuid,
         /// Which export emitted them.
         call: String,
+        /// Which of this binding's documents these nodes belong to.
+        document: u64,
+        /// Whether this is the last piece of that document.
+        last: bool,
         /// The nodes.
         nodes: Vec<WireNode>,
     },
-    /// The observation stream has a gap, and a fresh snapshot follows.
+    /// Something was lost, and a fresh snapshot follows.
+    ///
+    /// The two kinds of loss are counted apart because they mean different things. Lost
+    /// observations are events the component never saw. Lost documents are drawings the reader
+    /// never saw; the component has been asked to draw again.
     Gap {
         /// The binding.
         binding_id: kr_protocol::scalars::Uuid,
@@ -499,6 +512,8 @@ pub enum Notice {
         events: u32,
         /// How many bytes they held.
         bytes: u64,
+        /// How many documents the reader never received.
+        documents: u64,
     },
     /// A call failed and the binding survived it.
     Fault {
@@ -639,6 +654,7 @@ mod tests {
             binding_id,
             events: 4,
             bytes: 8192,
+            documents: 1,
         };
         assert_eq!(notice.binding_id(), binding_id);
         round_trip(&Frame::Notice(notice));
@@ -658,6 +674,8 @@ mod tests {
         round_trip(&Frame::Notice(Notice::Document {
             binding_id: kr_protocol::scalars::Uuid::from_bytes([7; 16]),
             call: "snapshot".to_owned(),
+            document: 3,
+            last: true,
             nodes: vec![WireNode {
                 node_id: "n0".to_owned(),
                 node_revision: 2,

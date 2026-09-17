@@ -3253,11 +3253,14 @@ dependencies = [
 name = "kr-plugin-runtime"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "kr-cbor",
  "kr-crypto",
  "kr-ipc",
  "kr-plugin-sdk",
  "kr-protocol",
+ "libc",
  "schemars",
  "serde",
  "serde_json",

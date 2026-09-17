@@ -100,8 +100,10 @@ impl Host {
         let plugin_host = temp.root().join("kr-plugin-host");
         std::fs::copy(env!("CARGO_BIN_EXE_kr-plugin-host"), &plugin_host)
             .expect("copies the plugin host");
+        // Owner-only: it holds the payloads this host compiles, and the host refuses a packages
+        // directory anybody else could write to.
         let packages = temp.environment().state_dir().join("packages");
-        std::fs::create_dir_all(&packages).expect("the packages directory");
+        kr_ipc::paths::create_private_directory(&packages).expect("the packages directory");
         Self {
             temp,
             plugin_host,

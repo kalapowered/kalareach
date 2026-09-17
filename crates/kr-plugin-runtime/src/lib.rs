@@ -39,7 +39,9 @@
 //! use kr_plugin_runtime::runtime::binding::{BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE};
 //!
 //! # async fn example(request: BindingRequest, wasm: Arc<[u8]>) -> Result<(), kr_plugin_runtime::RuntimeError> {
-//! let runtime = Runtime::new(RuntimeConfig::new("/var/lib/kalareach/plugin-cache"))?;
+//! let runtime = Arc::new(Runtime::new(RuntimeConfig::new(
+//!     "/var/lib/kalareach/plugin-cache",
+//! ))?);
 //! let (events, received) = tokio::sync::mpsc::channel(DEFAULT_EVENT_QUEUE);
 //!
 //! // Every binding belongs to somebody: one owner per worker connection, and one per caller that

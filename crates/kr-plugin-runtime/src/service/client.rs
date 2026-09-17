@@ -48,7 +48,7 @@ use crate::runtime::host::{BindingFacts, ScopedSourceEvent};
 use crate::runtime::queue::Admission;
 use crate::service::host::{wire_event, wire_facts};
 use crate::service::launcher::{self, LaunchError};
-use crate::service::notices::{self, MAX_NOTICE_BYTES, NoticeSink, NoticeStream};
+use crate::service::notices::{self, MAX_NOTICE_BYTES, NoticeSink, NoticeStream, Offered};
 use crate::service::protocol::{
     BindingRegistration, CallValue, ComponentSource, Frame, HostDescriptor, HostHealth, Notice,
     Request, RequestBody, ResponseBody,
@@ -68,6 +68,24 @@ pub const DEFAULT_DEADLINE: core::time::Duration = core::time::Duration::from_se
 /// first would report its own patience as the host's failure.
 pub const REGISTER_DEADLINE: core::time::Duration =
     core::time::Duration::from_millis(crate::runtime::compile::COMPILE_DEADLINE_MS + 5_000);
+
+/// How much longer than a component's own deadline a caller waits for the answer.
+///
+/// A call carries the deadline the component runs under, and the host stops the component at it.
+/// What is left is the round trip: two frames and whatever the host's own queues are doing. A
+/// caller that allowed 10 ms for a component should not then wait seconds for the answer, so the
+/// exchange is that deadline plus this and nothing more.
+pub const ROUND_TRIP_ALLOWANCE: core::time::Duration = core::time::Duration::from_millis(500);
+
+/// The largest single event this client will hand over.
+///
+/// A control frame carries a mebibyte including its envelope, so an event larger than this is one
+/// the writer could never deliver. Refusing it at the handoff is what keeps one oversized event
+/// from ending every delivery that would have followed it.
+pub const MAX_OFFERED_EVENT_BYTES: u64 = crate::runtime::host::MAX_NODE_BYTES;
+
+/// What one offered event costs of the handoff's allowance before its bytes are counted.
+const OFFER_OVERHEAD_BYTES: u64 = 128;
 
 /// How long one offered event is given to reach the host.
 ///
@@ -92,6 +110,13 @@ pub enum Handoff {
         /// How many bytes the queue was holding.
         held_bytes: u64,
     },
+    /// The event is larger than one frame carries, so nothing could have delivered it.
+    TooLarge {
+        /// What it would have cost.
+        bytes: u64,
+        /// The bound.
+        limit: u64,
+    },
     /// The connection to the host is gone.
     Unavailable,
 }
@@ -107,11 +132,20 @@ struct Pending {
 }
 
 impl Pending {
-    /// Records that a request is waiting for its number.
-    fn wait_for(&self, request_id: u64, answer: Answer) {
-        if let Ok(mut waiting) = self.waiting.lock() {
-            waiting.insert(request_id, answer);
+    /// Records that a request is waiting for its number, unless the connection has already gone.
+    ///
+    /// The check and the insertion are one step under the lock. Two steps would let a request be
+    /// admitted between a reader deciding the connection was over and its clearing the waiting
+    /// set, and that request would then wait for an answer nobody could send.
+    fn wait_for(&self, request_id: u64, answer: Answer) -> bool {
+        let Ok(mut waiting) = self.waiting.lock() else {
+            return false;
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return false;
         }
+        waiting.insert(request_id, answer);
+        true
     }
 
     /// Takes one request's sender, if it is still waiting.
@@ -127,9 +161,13 @@ impl Pending {
     /// Dropping a sender is what tells its caller the host closed the connection, at once, rather
     /// than each caller waiting out its own deadline for an answer that cannot arrive.
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+        // The flag is set under the lock an admission takes, so an admission either happens before
+        // the connection ended or is refused by it; there is no order in which it happens after.
         if let Ok(mut waiting) = self.waiting.lock() {
+            self.closed.store(true, Ordering::Release);
             waiting.clear();
+        } else {
+            self.closed.store(true, Ordering::Release);
         }
     }
 
@@ -151,6 +189,30 @@ struct Waiting<'a> {
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
         let _taken = self.pending.take(self.request_id);
+    }
+}
+
+/// One frame on its way to the host, and what happens if it does not get there.
+///
+/// A [`FrameWriter`] that is part way through a frame refuses every later one, and nothing on this
+/// side can resume a frame whose sender has gone. So a write that did not finish, for whatever
+/// reason, is the end of the connection rather than the end of one call.
+struct Attempting<'a> {
+    pending: &'a Pending,
+    finished: bool,
+}
+
+impl Attempting<'_> {
+    fn finished(mut self, wrote: bool) {
+        self.finished = wrote;
+    }
+}
+
+impl Drop for Attempting<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.pending.close();
+        }
     }
 }
 
@@ -227,6 +289,7 @@ impl PluginClient {
             waiting_events,
             Arc::clone(&writer),
             Arc::clone(&offered_bytes),
+            Arc::clone(&pending),
         ));
 
         let client = Self {
@@ -318,13 +381,31 @@ impl PluginClient {
     /// writes it. A full queue is an immediate refusal the caller records as a gap, which is the
     /// same answer the host's own queue gives when it overflows and for the same reason.
     pub fn offer(&self, binding_id: BindingId, event: &ScopedSourceEvent) -> Handoff {
-        let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let wire = wire_event(event);
-        let cost = wire.bytes.len() as u64 + wire.handle.as_str().len() as u64;
-        let held = self.offered_bytes.load(Ordering::Acquire);
-        if held.saturating_add(cost) > MAX_NOTICE_BYTES {
-            return Handoff::Refused { held_bytes: held };
+        let cost = offered_cost(&wire);
+        // An event a frame cannot carry is one nothing could deliver. Saying so here is what keeps
+        // it from stopping the writer and taking every later delivery with it.
+        if cost > MAX_OFFERED_EVENT_BYTES {
+            return Handoff::TooLarge {
+                bytes: cost,
+                limit: MAX_OFFERED_EVENT_BYTES,
+            };
         }
+        // Reserved before the event is published, and in one step, because the writer releases the
+        // reservation when it consumes the event: a charge made afterwards could be made after its
+        // own release, and the allowance would drift until it admitted nothing.
+        let Ok(held) =
+            self.offered_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                    let wanted = held.saturating_add(cost);
+                    (wanted <= MAX_NOTICE_BYTES).then_some(wanted)
+                })
+        else {
+            return Handoff::Refused {
+                held_bytes: self.offered_bytes.load(Ordering::Acquire),
+            };
+        };
+        let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let request = Request {
             request_id,
             body: RequestBody::Event {
@@ -333,14 +414,15 @@ impl PluginClient {
             },
         };
         match self.offered.try_send(request) {
-            Ok(()) => {
-                self.offered_bytes.fetch_add(cost, Ordering::AcqRel);
-                Handoff::Accepted
-            }
+            Ok(()) => Handoff::Accepted,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                release(&self.offered_bytes, cost);
                 Handoff::Refused { held_bytes: held }
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Handoff::Unavailable,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                release(&self.offered_bytes, cost);
+                Handoff::Unavailable
+            }
         }
     }
 
@@ -402,10 +484,13 @@ impl PluginClient {
         binding_id: BindingId,
         deadline: core::time::Duration,
     ) -> RuntimeResult<Called> {
-        self.call(RequestBody::Snapshot {
-            binding_id: binding_id.get(),
-            deadline_ms: millis(deadline),
-        })
+        self.call(
+            RequestBody::Snapshot {
+                binding_id: binding_id.get(),
+                deadline_ms: millis(deadline),
+            },
+            deadline,
+        )
         .await
     }
 
@@ -419,10 +504,13 @@ impl PluginClient {
         binding_id: BindingId,
         deadline: core::time::Duration,
     ) -> RuntimeResult<Called> {
-        self.call(RequestBody::Checkpoint {
-            binding_id: binding_id.get(),
-            deadline_ms: millis(deadline),
-        })
+        self.call(
+            RequestBody::Checkpoint {
+                binding_id: binding_id.get(),
+                deadline_ms: millis(deadline),
+            },
+            deadline,
+        )
         .await
     }
 
@@ -437,11 +525,14 @@ impl PluginClient {
         state: Vec<u8>,
         deadline: core::time::Duration,
     ) -> RuntimeResult<Called> {
-        self.call(RequestBody::Restore {
-            binding_id: binding_id.get(),
-            state,
-            deadline_ms: millis(deadline),
-        })
+        self.call(
+            RequestBody::Restore {
+                binding_id: binding_id.get(),
+                state,
+                deadline_ms: millis(deadline),
+            },
+            deadline,
+        )
         .await
     }
 
@@ -485,8 +576,17 @@ impl PluginClient {
         self.notices.recv().await
     }
 
-    async fn call(&self, body: RequestBody) -> RuntimeResult<Called> {
-        let answered = self.request(body).await?;
+    async fn call(
+        &self,
+        body: RequestBody,
+        deadline: core::time::Duration,
+    ) -> RuntimeResult<Called> {
+        // The component's own deadline plus the round trip, rather than a fixed figure: a caller
+        // that allowed ten milliseconds for a component did not mean to wait five seconds for the
+        // answer when the host stops answering.
+        let answered = self
+            .request_within(body, deadline.saturating_add(ROUND_TRIP_ALLOWANCE))
+            .await?;
         match answered {
             ResponseBody::Called { value, fault } => Ok(Called {
                 state: match value {
@@ -535,7 +635,11 @@ impl PluginClient {
         }
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (answer, reply) = oneshot::channel();
-        self.pending.wait_for(request_id, answer);
+        if !self.pending.wait_for(request_id, answer) {
+            return Err(RuntimeError::ServiceUnavailable {
+                detail: "the plugin host closed the connection".to_owned(),
+            });
+        }
         // Removed however this call ends: answered, timed out, failed to write, or dropped by a
         // caller that stopped waiting.
         let _place = Waiting {
@@ -545,13 +649,20 @@ impl PluginClient {
 
         let exchange = async {
             {
+                // A frame that is half written and then abandoned -- by a failure, by a deadline,
+                // or by a caller that stopped polling -- leaves the writer unable to start another
+                // one. There is no way back from that on this connection, so the guard ends it
+                // unless the write finished.
+                let attempt = Attempting {
+                    pending: &self.pending,
+                    finished: false,
+                };
                 let mut writer = self.writer.lock().await;
-                writer
-                    .write_message(&Request { request_id, body })
-                    .await
-                    .map_err(|error| RuntimeError::ServiceUnavailable {
-                        detail: error.to_string(),
-                    })?;
+                let written = writer.write_message(&Request { request_id, body }).await;
+                attempt.finished(written.is_ok());
+                written.map_err(|error| RuntimeError::ServiceUnavailable {
+                    detail: error.to_string(),
+                })?;
             }
             match reply.await {
                 Ok(body) => Ok(body),
@@ -624,8 +735,12 @@ async fn read_frames(mut reader: FrameReader, pending: Arc<Pending>, notices: No
                 }
             }
             Frame::Notice(notice) => {
-                if !notices.send(notice) {
-                    break;
+                // A queue that cannot hold what must arrive is a connection this worker cannot
+                // trust to tell it when a binding stops working, so it ends here rather than
+                // carrying on with a partial account.
+                match notices.send(notice) {
+                    Offered::Kept | Offered::Dropped => {}
+                    Offered::Overflowed | Offered::Closed => break,
                 }
             }
         }
@@ -639,6 +754,7 @@ async fn write_offered(
     mut offered: tokio::sync::mpsc::Receiver<Request>,
     writer: Arc<tokio::sync::Mutex<FrameWriter>>,
     held: Arc<AtomicU64>,
+    pending: Arc<Pending>,
 ) {
     while let Some(request) = offered.recv().await {
         let cost = offered_bytes_of(&request);
@@ -649,21 +765,45 @@ async fn write_offered(
             writer.write_message(&request).await
         })
         .await;
-        let _released = held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
-            Some(bytes.saturating_sub(cost))
-        });
+        release(&held, cost);
         if !matches!(written, Ok(Ok(()))) {
+            // A frame that failed or was never taken leaves the writer with a part-written frame,
+            // and nothing after it could be delivered. The connection is over, and everything
+            // waiting on it is told rather than left to time out one by one. What is still queued
+            // is released and reported by the queue emptying.
+            pending.close();
+            offered.close();
+            while let Some(abandoned) = offered.recv().await {
+                release(&held, offered_bytes_of(&abandoned));
+            }
             return;
         }
     }
 }
 
+/// Gives back what one offered event reserved.
+fn release(held: &AtomicU64, cost: u64) {
+    let _released = held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+        Some(bytes.saturating_sub(cost))
+    });
+}
+
+/// Returns what one offered event costs of the handoff's allowance.
+///
+/// The bytes it carries, the handle that names it, and a fixed cost for the record itself: a
+/// request number, a binding identifier and the envelope that carries them.
+fn offered_cost(event: &crate::service::protocol::WireSourceEvent) -> u64 {
+    OFFER_OVERHEAD_BYTES
+        + event.bytes.len() as u64
+        + event.handle.as_str().len() as u64
+        + event.provenance.len() as u64
+        + event.request_id.as_ref().map_or(0, |id| id.len() as u64)
+}
+
 /// Returns what one offered event was counted as when it was admitted.
 fn offered_bytes_of(request: &Request) -> u64 {
     match &request.body {
-        RequestBody::Event { event, .. } => {
-            event.bytes.len() as u64 + event.handle.as_str().len() as u64
-        }
+        RequestBody::Event { event, .. } => offered_cost(event),
         _ => 0,
     }
 }

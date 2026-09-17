@@ -36,17 +36,23 @@ const COMPILE_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
 /// A cache directory that removes itself, the runtime built over it, and who its bindings belong to.
 struct Host {
     _directory: tempfile::TempDir,
-    runtime: Runtime,
+    runtime: Arc<Runtime>,
     owner: BindingOwner,
 }
 
 fn host() -> Host {
+    host_with(|_config| {})
+}
+
+/// A runtime built with the defaults, and whatever this test needs changed about them.
+fn host_with(adjust: impl FnOnce(&mut RuntimeConfig)) -> Host {
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let runtime =
-        Runtime::new(RuntimeConfig::new(directory.path().join("plugin-cache"))).expect("a runtime");
+    let mut config = RuntimeConfig::new(directory.path().join("plugin-cache"));
+    adjust(&mut config);
+    let runtime = Runtime::new(config).expect("a runtime");
     Host {
         _directory: directory,
-        runtime,
+        runtime: Arc::new(runtime),
         owner: BindingOwner::next(),
     }
 }
@@ -872,7 +878,13 @@ async fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
     let Some(wasm) = components::component("slow-compile") else {
         return;
     };
-    let host = host();
+    // The compilation budget is the host's own bound on how long a compile may take, and this
+    // machine's speed is not the case under test: what is under test is that a cold compile is not
+    // inside an observation's deadline. So this runtime is given a budget that a build machine
+    // under load cannot make it miss, and the deadline the test measures is the observation's.
+    let host = host_with(|config| {
+        config.compile.deadline_ms = COMPILE_WAIT.as_millis() as u64;
+    });
     let (events, mut received) = events();
 
     let compile_started = std::time::Instant::now();
@@ -1202,8 +1214,12 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
     let facts: &BindingFacts = &handle.request().facts;
     assert_eq!(facts.plugin_id, request.identity.plugin_id.as_str());
 
-    assert!(host.runtime.unbind(host.owner, request.binding_id));
-    assert!(host.runtime.unbind(host.owner, second.binding_id));
+    assert!(
+        host.runtime
+            .unbind(host.owner, request.binding_id)
+            .existed()
+    );
+    assert!(host.runtime.unbind(host.owner, second.binding_id).existed());
     assert_eq!(host.runtime.live_bindings(), 0);
 }
 

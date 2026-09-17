@@ -9,6 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-ipc.workspace = true
@@ -22,6 +24,12 @@ thiserror.workspace = true
 thread-priority.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 wasmtime.workspace = true
+
+# The open flag that stops a name replaced by a named pipe from holding a read open until somebody
+# writes to it. `cap-std` exposes it through its own `OpenOptionsExt`; the constant is this crate's
+# only use of the C library.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 kr-ipc = { workspace = true, features = ["testing"] }

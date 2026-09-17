@@ -6,17 +6,24 @@
 //! mebibyte per call, and a reader that has stopped reading must not be able to make either process
 //! grow without limit.
 //!
-//! # What gives way
+//! # One bound, and nothing outside it
 //!
-//! Presentation. A document a reader never collected is a document the component can draw again, so
-//! an overflow drops the oldest documents, counts them, and reports the loss as a gap with no events
-//! named. The reader knows to expect a fresh document rather than a continuation, which is the same
-//! answer a lost observation gets and for the same reason.
+//! [`MAX_NOTICE_BYTES`] covers everything this queue holds, the record of what it has already
+//! dropped included. Three things follow from that.
 //!
-//! A fault and a disabling are not presentation. Nothing else tells a reader that a binding stopped
-//! working, so they are admitted whatever the queue holds; what keeps that from being a hole in the
-//! bound is that their text is clipped where it is built and a connection holds a bounded number of
-//! bindings, each of which faults a bounded number of times before it is disabled.
+//! Presentation gives way first. A document a reader never collected is a document the component
+//! can draw again, so an overflow drops the oldest documents and counts them.
+//!
+//! Losses coalesce rather than accumulate. Every loss against one binding -- observations the
+//! runtime's queue dropped, documents this queue dropped -- folds into one record per binding and
+//! travels as one gap, so a reader that has stopped reading cannot be given a backlog of gaps
+//! either.
+//!
+//! A fault and a disabling are never dropped: nothing else tells a reader that a binding stopped
+//! working. If even those will not fit once every document has gone, the queue says so and the
+//! connection is over. A connection whose reliable news cannot be delivered is not one worth
+//! keeping open, and pretending otherwise would be the unbounded growth this bound exists to
+//! prevent.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -34,7 +41,8 @@ pub const MAX_NOTICE_BYTES: u64 = 4 * 1024 * 1024;
 /// What one notice costs of the queue before its contents are counted.
 ///
 /// A notice is a record with a binding identifier and a discriminant, and it occupies a place in
-/// this queue and a frame on the wire whatever its strings say.
+/// this queue and a frame on the wire whatever its strings say. A loss record costs the same: it is
+/// a binding identifier and three counts, and it becomes a notice.
 const NOTICE_OVERHEAD_BYTES: u64 = 64;
 
 /// What one document node costs.
@@ -42,6 +50,20 @@ const NOTICE_OVERHEAD_BYTES: u64 = 64;
 /// The runtime charges the same fixed cost per node against a call's output budget, so a document
 /// that fitted that budget fits this queue's accounting too.
 const NODE_OVERHEAD_BYTES: u64 = crate::runtime::host::NODE_OVERHEAD_BYTES;
+
+/// What became of a notice this queue was offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Offered {
+    /// It is in the queue, or folded into a loss the reader will be told about.
+    Kept,
+    /// It was presentation and there was no room. The loss is recorded, and the binding it came
+    /// from should be asked to rebuild its document.
+    Dropped,
+    /// What must arrive will not fit, even with every document gone. The connection is over.
+    Overflowed,
+    /// The reader is gone.
+    Closed,
+}
 
 /// Returns what one notice costs of the queue.
 #[must_use]
@@ -63,6 +85,14 @@ pub fn node_bytes(node: &WireNode) -> u64 {
     NODE_OVERHEAD_BYTES + (node.node_id.len() + node.body_json.len()) as u64
 }
 
+/// What one binding has lost, waiting to be told.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Loss {
+    events: u32,
+    bytes: u64,
+    documents: u64,
+}
+
 /// The shared state behind a sink and its stream.
 #[derive(Debug)]
 struct Shared {
@@ -74,11 +104,13 @@ struct Shared {
 struct Queued {
     waiting: VecDeque<Notice>,
     held: u64,
-    /// Documents dropped for want of room, by the binding they belonged to, waiting to be reported.
-    lost: HashMap<Uuid, u64>,
+    /// What each binding has lost, waiting to be reported as one gap.
+    lost: HashMap<Uuid, Loss>,
     /// The order the losses are reported in, so the oldest loss is the first a reader hears about.
     lost_order: VecDeque<Uuid>,
     closed: bool,
+    /// Set when what must arrive would not fit. The connection is over.
+    overflowed: bool,
     /// How many documents this queue has dropped in its life, for the health report.
     dropped: u64,
 }
@@ -112,22 +144,20 @@ pub fn channel() -> (NoticeSink, NoticeStream) {
 
 impl NoticeSink {
     /// Offers one notice, dropping presentation rather than growing or waiting.
-    ///
-    /// Returns false once the stream is closed, which is what tells a forwarder to stop.
-    pub fn send(&self, notice: Notice) -> bool {
+    pub fn send(&self, notice: Notice) -> Offered {
         let Ok(mut queue) = self.shared.queue.lock() else {
-            return false;
+            return Offered::Closed;
         };
         if queue.closed {
-            return false;
+            return Offered::Closed;
         }
-        queue.admit(notice);
+        let offered = queue.admit(notice);
         drop(queue);
         // One waiter, so one wake-up, and it leaves a permit behind when nobody is waiting yet. A
         // wake-up that woke nobody would otherwise be lost between the reader looking at an empty
         // queue and the reader waiting on it.
         self.shared.wake.notify_one();
-        true
+        offered
     }
 
     /// Closes the queue, so a reader waiting on it stops waiting.
@@ -201,6 +231,12 @@ impl NoticeStream {
     pub fn is_closed(&self) -> bool {
         self.shared.queue.lock().is_ok_and(|queue| queue.closed)
     }
+
+    /// Returns true when the queue closed because what had to arrive would not fit.
+    #[must_use]
+    pub fn overflowed(&self) -> bool {
+        self.shared.queue.lock().is_ok_and(|queue| queue.overflowed)
+    }
 }
 
 impl Drop for NoticeStream {
@@ -209,6 +245,8 @@ impl Drop for NoticeStream {
         if let Ok(mut queue) = self.shared.queue.lock() {
             queue.closed = true;
             queue.waiting.clear();
+            queue.lost.clear();
+            queue.lost_order.clear();
             queue.held = 0;
         }
     }
@@ -216,18 +254,81 @@ impl Drop for NoticeStream {
 
 impl Queued {
     /// Admits one notice, making room by dropping presentation.
-    fn admit(&mut self, notice: Notice) {
+    fn admit(&mut self, notice: Notice) -> Offered {
+        // A gap is not queued: it folds into what its binding has already lost, so a reader that
+        // has stopped reading cannot be given a backlog of them either.
+        if let Notice::Gap {
+            binding_id,
+            events,
+            bytes,
+            documents,
+        } = notice
+        {
+            return self.absorb(
+                binding_id,
+                Loss {
+                    events,
+                    bytes,
+                    documents,
+                },
+            );
+        }
+
         let cost = notice_bytes(&notice);
         let droppable = matches!(notice, Notice::Document { .. });
         while self.held + cost > MAX_NOTICE_BYTES && self.evict_oldest_document() {}
-        if self.held + cost > MAX_NOTICE_BYTES && droppable {
-            // Nothing left to make room with, and this is presentation. It goes, and the reader is
-            // told so it expects a fresh document.
-            self.record_loss(notice.binding_id());
-            return;
+        if self.held + cost > MAX_NOTICE_BYTES {
+            if droppable {
+                // Nothing left to make room with, and this is presentation. It goes, and the
+                // reader is told so it expects a fresh document.
+                return self.absorb(
+                    notice.binding_id(),
+                    Loss {
+                        documents: 1,
+                        ..Loss::default()
+                    },
+                );
+            }
+            // What must arrive will not fit even with every document gone. Nothing this connection
+            // could say next would be answerable, so it is over.
+            self.closed = true;
+            self.overflowed = true;
+            return Offered::Overflowed;
         }
         self.held += cost;
         self.waiting.push_back(notice);
+        Offered::Kept
+    }
+
+    /// Folds one loss into what its binding has already lost.
+    fn absorb(&mut self, binding_id: Uuid, loss: Loss) -> Offered {
+        let dropped_document = loss.documents > 0;
+        let answer = if dropped_document {
+            Offered::Dropped
+        } else {
+            Offered::Kept
+        };
+        if let Some(held) = self.lost.get_mut(&binding_id) {
+            held.events = held.events.saturating_add(loss.events);
+            held.bytes = held.bytes.saturating_add(loss.bytes);
+            held.documents = held.documents.saturating_add(loss.documents);
+            self.dropped = self.dropped.saturating_add(loss.documents);
+            return answer;
+        }
+        // A binding this queue has no loss record for yet. The record is one more thing the queue
+        // holds, so it is charged like anything else.
+        while self.held + NOTICE_OVERHEAD_BYTES > MAX_NOTICE_BYTES && self.evict_oldest_document() {
+        }
+        if self.held + NOTICE_OVERHEAD_BYTES > MAX_NOTICE_BYTES {
+            self.closed = true;
+            self.overflowed = true;
+            return Offered::Overflowed;
+        }
+        self.held += NOTICE_OVERHEAD_BYTES;
+        self.lost.insert(binding_id, loss);
+        self.lost_order.push_back(binding_id);
+        self.dropped = self.dropped.saturating_add(loss.documents);
+        answer
     }
 
     /// Drops the oldest document, if there is one, and says whether it dropped anything.
@@ -243,29 +344,38 @@ impl Queued {
             return false;
         };
         self.held = self.held.saturating_sub(notice_bytes(&dropped));
-        self.record_loss(dropped.binding_id());
-        true
-    }
-
-    /// Counts one lost document against the binding it belonged to.
-    fn record_loss(&mut self, binding_id: Uuid) {
+        let binding_id = dropped.binding_id();
+        // Counted here rather than through `absorb`, which would try to make room again while it
+        // is making room.
+        match self.lost.get_mut(&binding_id) {
+            Some(held) => held.documents = held.documents.saturating_add(1),
+            None => {
+                self.lost.insert(
+                    binding_id,
+                    Loss {
+                        documents: 1,
+                        ..Loss::default()
+                    },
+                );
+                self.lost_order.push_back(binding_id);
+                self.held += NOTICE_OVERHEAD_BYTES;
+            }
+        }
         self.dropped = self.dropped.saturating_add(1);
-        let counted = self.lost.entry(binding_id).or_insert_with(|| {
-            self.lost_order.push_back(binding_id);
-            0
-        });
-        *counted = counted.saturating_add(1);
+        true
     }
 
     /// Takes the next notice: a loss first, because a reader has to know before it reads on.
     fn take(&mut self) -> Option<Notice> {
         if let Some(binding_id) = self.lost_order.pop_front()
-            && let Some(documents) = self.lost.remove(&binding_id)
+            && let Some(loss) = self.lost.remove(&binding_id)
         {
+            self.held = self.held.saturating_sub(NOTICE_OVERHEAD_BYTES);
             return Some(Notice::Gap {
                 binding_id,
-                events: 0,
-                bytes: documents,
+                events: loss.events,
+                bytes: loss.bytes,
+                documents: loss.documents,
             });
         }
         let notice = self.waiting.pop_front()?;
@@ -282,6 +392,8 @@ mod tests {
         Notice::Document {
             binding_id,
             call: "observe".to_owned(),
+            document: 1,
+            last: true,
             nodes: vec![WireNode {
                 node_id: "n0".to_owned(),
                 node_revision: 1,
@@ -297,7 +409,7 @@ mod tests {
     #[test]
     fn a_reader_that_keeps_up_gets_what_was_sent() {
         let (sink, mut stream) = channel();
-        assert!(sink.send(document(binding(1), 16)));
+        assert_eq!(sink.send(document(binding(1), 16)), Offered::Kept);
         assert!(matches!(stream.try_recv(), Some(Notice::Document { .. })));
         assert_eq!(stream.held_bytes(), 0);
         assert!(stream.try_recv().is_none());
@@ -308,7 +420,7 @@ mod tests {
         let (sink, mut stream) = channel();
         // Far more than the queue holds, from a component that keeps drawing.
         for _ in 0..64 {
-            assert!(sink.send(document(binding(1), 256 * 1024)));
+            sink.send(document(binding(1), 256 * 1024));
         }
         assert!(
             stream.held_bytes() <= MAX_NOTICE_BYTES,
@@ -316,14 +428,37 @@ mod tests {
             stream.held_bytes()
         );
         assert!(stream.dropped_documents() > 0);
+        assert!(!stream.overflowed());
 
         // And the first thing the reader is told is that it missed documents, so it expects a
         // fresh one rather than a continuation.
         let first = stream.try_recv().expect("a notice");
         assert!(
-            matches!(first, Notice::Gap { events: 0, bytes, .. } if bytes > 0),
+            matches!(first, Notice::Gap { documents, .. } if documents > 0),
             "the reader was told {first:?}"
         );
+    }
+
+    #[test]
+    fn gaps_coalesce_rather_than_accumulate() {
+        let (sink, mut stream) = channel();
+        for _ in 0..100_000 {
+            sink.send(Notice::Gap {
+                binding_id: binding(1),
+                events: 1,
+                bytes: 16,
+                documents: 0,
+            });
+        }
+        // One record, whatever the number of gaps: a reader that has stopped reading cannot be
+        // given a backlog of them.
+        assert!(stream.held_bytes() <= NOTICE_OVERHEAD_BYTES);
+        let Some(Notice::Gap { events, bytes, .. }) = stream.try_recv() else {
+            panic!("the losses were not reported");
+        };
+        assert_eq!(events, 100_000);
+        assert_eq!(bytes, 1_600_000);
+        assert!(stream.try_recv().is_none());
     }
 
     #[test]
@@ -332,16 +467,22 @@ mod tests {
         for _ in 0..64 {
             sink.send(document(binding(1), 256 * 1024));
         }
-        assert!(sink.send(Notice::Fault {
-            binding_id: binding(1),
-            call: "observe".to_owned(),
-            detail: "the component trapped".to_owned(),
-            faults_in_window: 1,
-        }));
-        assert!(sink.send(Notice::Disabled {
-            binding_id: binding(1),
-            reason: "three faults in a minute".to_owned(),
-        }));
+        assert_eq!(
+            sink.send(Notice::Fault {
+                binding_id: binding(1),
+                call: "observe".to_owned(),
+                detail: "the component trapped".to_owned(),
+                faults_in_window: 1,
+            }),
+            Offered::Kept
+        );
+        assert_eq!(
+            sink.send(Notice::Disabled {
+                binding_id: binding(1),
+                reason: "three faults in a minute".to_owned(),
+            }),
+            Offered::Kept
+        );
 
         let mut faults = 0;
         let mut disabled = 0;
@@ -357,6 +498,34 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_that_cannot_hold_what_must_arrive_ends_the_connection() {
+        let (sink, stream) = channel();
+        // Faults alone, with nothing droppable to make room with. The queue says what it cannot do
+        // rather than growing past its bound.
+        let mut overflowed = false;
+        for index in 0..200_000 {
+            let offered = sink.send(Notice::Fault {
+                binding_id: binding(1),
+                call: "observe".to_owned(),
+                detail: format!("fault {index} {}", "x".repeat(1024)),
+                faults_in_window: 1,
+            });
+            if offered == Offered::Overflowed {
+                overflowed = true;
+                break;
+            }
+        }
+        assert!(overflowed, "the queue grew past its bound");
+        assert!(stream.overflowed());
+        assert!(stream.is_closed());
+        assert!(
+            stream.held_bytes() <= MAX_NOTICE_BYTES,
+            "the queue held {} bytes",
+            stream.held_bytes()
+        );
+    }
+
+    #[test]
     fn a_loss_is_reported_against_the_binding_it_belonged_to() {
         let (sink, mut stream) = channel();
         for _ in 0..32 {
@@ -369,15 +538,15 @@ mod tests {
         while let Some(notice) = stream.try_recv() {
             if let Notice::Gap {
                 binding_id,
-                events: 0,
-                bytes,
+                documents,
+                ..
             } = notice
             {
-                lost.push((binding_id, bytes));
+                lost.push((binding_id, documents));
             }
         }
         assert!(lost.iter().any(|(id, _)| *id == binding(1)));
-        assert!(lost.iter().all(|(_, bytes)| *bytes > 0));
+        assert!(lost.iter().all(|(_, documents)| *documents > 0));
     }
 
     #[tokio::test]
@@ -388,7 +557,7 @@ mod tests {
         // And a sink whose reader is gone says so, which is what stops a forwarder.
         let (sink, stream) = channel();
         drop(stream);
-        assert!(!sink.send(document(binding(1), 8)));
+        assert_eq!(sink.send(document(binding(1), 8)), Offered::Closed);
         assert!(sink.is_closed());
     }
 
