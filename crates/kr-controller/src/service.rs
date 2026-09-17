@@ -1945,6 +1945,10 @@ impl Controller {
         // hold that connection for every later caller, and the wait for it would be unbounded on
         // both sides of the handover.
         let budget = tokio::time::Instant::now() + CLOSE_EXCHANGE;
+        // Taken before the exchange begins, so an acknowledgement that arrives over a control path
+        // this daemon has already given up on lifts nothing. Losing the path is what stops the
+        // renewal, and the path is lost the moment this daemon retires the link.
+        let binding = self.leases.binding(params.session_id);
         let result = {
             // The connection comes first. Waiting for it can take as long as whatever else is using
             // it, and a deadline computed before that wait would hand the worker time that had
@@ -1952,10 +1956,8 @@ impl Controller {
             let mut held = tokio::time::timeout_at(budget, self.worker_client(&worker))
                 .await
                 .map_err(|_| {
-                    // Nothing was dispatched: this close never reached the worker. The caller can
-                    // ask again, and the operation that is holding the connection is bounded by
-                    // this same budget, so the next attempt is not queueing behind something
-                    // without end.
+                    // Nothing was dispatched: this close never reached the worker, and the link it
+                    // was queueing for belongs to whoever is holding it. The caller can ask again.
                     ControllerError::supervision(
                         "the connection to the worker that owns this session did not come free in \
                          time, so nothing was closed",
@@ -1986,8 +1988,13 @@ impl Controller {
             .await
             {
                 Ok(Ok(result)) => result,
+                // The path this daemon announces authority revisions over is gone, whether it
+                // ended or stopped answering. Renewal stops with it: section 9 lets a remote
+                // dispatch lease be renewed only after the worker has acknowledged the revision,
+                // and this daemon can no longer hear an acknowledgement from that worker.
                 Ok(Err(error)) => {
                     *held = None;
+                    self.leases.stop_renewal(params.session_id, binding);
                     return Err(error.into());
                 }
                 // The close was written and no answer came back inside the time a closure is
@@ -1998,6 +2005,7 @@ impl Controller {
                 // does not let an interrupted dispatch be reported as a refusal.
                 Err(_) => {
                     *held = None;
+                    self.leases.stop_renewal(params.session_id, binding);
                     return Err(ControllerError::Uncertain {
                         detail:
                             "the worker did not answer this close within the time a closure is \
@@ -3080,6 +3088,21 @@ mod a_close_a_worker_never_answers {
             bound: DeadlineBound::RequestedTtl,
         };
 
+        // The worker holds this environment's authority revision, so its dispatch leases renew.
+        let binding = controller.leases.binding(session_id);
+        controller
+            .leases
+            .acknowledge(session_id, binding, controller.leases.authority_revision());
+        assert!(
+            matches!(
+                controller
+                    .leases
+                    .renew(session_id, controller.generation, &*controller.clock),
+                Ok(Ok(_))
+            ),
+            "an acknowledged worker's lease renews before the close"
+        );
+
         let started = tokio::time::Instant::now();
         let first = controller
             .session_close(&close_request(environment_id, session_id), &actor, accepted)
@@ -3093,6 +3116,25 @@ mod a_close_a_worker_never_answers {
         assert!(
             matches!(first, ControllerError::Uncertain { .. }),
             "the caller is told the outcome is not known: {first}"
+        );
+
+        // The path this daemon announces authority revisions over is the one it just gave up on,
+        // so renewal stops with it: section 9 lets a remote dispatch lease be renewed only after
+        // the worker has acknowledged the revision, and an acknowledgement can no longer arrive.
+        assert!(
+            controller.leases.is_fenced(session_id),
+            "renewal is fenced for the worker whose link was retired"
+        );
+        assert!(
+            matches!(
+                controller
+                    .leases
+                    .renew(session_id, controller.generation, &*controller.clock),
+                Ok(Err(
+                    kr_transport::lease::LeaseRefusal::RevisionNotAcknowledged
+                ))
+            ),
+            "and a lease is refused until that worker acknowledges the revision again"
         );
 
         // The slot this daemon keeps for that worker is free, and what was in it has gone. A
