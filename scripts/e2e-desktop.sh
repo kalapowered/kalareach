@@ -138,6 +138,17 @@ for _ in $(seq 1 100); do
 done
 if ! "$kr" doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
   fail "the control daemon did not start"
+  echo "--- what the daemon printed ---"
+  tail -20 "$run_root/evidence/controller.log" || true
+  echo "--- what kr said ---"
+  tail -5 "$run_root/evidence/doctor.json" || true
+  # A daemon that printed nothing at all has not reached the point of serving. The step before
+  # that is opening this platform's credential store for its own signing key, which can wait on
+  # the person at the machine, so say so rather than leaving the reason to be guessed at.
+  if [ ! -s "$run_root/evidence/controller.log" ]; then
+    echo "the daemon printed nothing, so it had not started serving: on a platform whose"
+    echo "credential store prompts, it waits there until the prompt is answered"
+  fi
   exit 1
 fi
 
