@@ -1000,7 +1000,7 @@ async fn the_desktop_a_session_was_created_on_is_readable_after_its_worker_has_g
                 )
                 .expect("a name"),
             ),
-            login_generation: recorded.desktop.login_generation.clone(),
+            login_generation: recorded.desktop.login_generation,
         };
         assert_eq!(
             desktop::recorded_presence(&elsewhere),
