@@ -785,6 +785,16 @@ pub mod setting {
     /// The key the setting is written under.
     pub const KEY: &str = "sleep_inhibition";
 
+    /// The key the document's own version is written under.
+    pub const VERSION_KEY: &str = "version";
+
+    /// The version this build writes and reads.
+    ///
+    /// A document that declares a version this build does not know is left alone and read as off.
+    /// Guessing at a newer document's meaning is how a host ends up holding an assertion its owner
+    /// did not ask for.
+    pub const VERSION: u64 = 1;
+
     /// The longest setting file this host reads.
     ///
     /// The document holds one choice. A file larger than this is not one of ours, and reading it
@@ -793,15 +803,24 @@ pub mod setting {
 
     /// Returns the setting a file's contents ask for.
     ///
-    /// Anything this build does not recognise reads as off. An unrecognised file is not consent:
-    /// the setting exists because the owner chose it, so the absence of a choice is the absence of
-    /// the setting.
+    /// Anything this build does not recognise reads as off: a document it cannot parse, a version
+    /// it does not know, a value outside the three choices. An unrecognised file is not consent:
+    /// the setting exists because the owner chose it, so the absence of a choice this build
+    /// understands is the absence of the setting.
     #[must_use]
     pub fn parse(contents: &[u8]) -> SleepInhibitionSetting {
-        serde_json::from_slice::<serde_json::Value>(contents)
-            .ok()
-            .as_ref()
-            .and_then(|document| document.get(KEY))
+        let Ok(document) = serde_json::from_slice::<serde_json::Value>(contents) else {
+            return SleepInhibitionSetting::Off;
+        };
+        // A document with no version is this version: the first one, which wrote none.
+        let version = document
+            .get(VERSION_KEY)
+            .map_or(Some(VERSION), serde_json::Value::as_u64);
+        if version != Some(VERSION) {
+            return SleepInhibitionSetting::Off;
+        }
+        document
+            .get(KEY)
             .and_then(serde_json::Value::as_str)
             .and_then(SleepInhibitionSetting::from_wire)
             .unwrap_or(SleepInhibitionSetting::Off)
@@ -810,7 +829,10 @@ pub mod setting {
     /// Returns the file contents that record one setting.
     #[must_use]
     pub fn document(setting: SleepInhibitionSetting) -> String {
-        format!("{{\n  \"{KEY}\": \"{}\"\n}}\n", setting.as_str())
+        format!(
+            "{{\n  \"{VERSION_KEY}\": {VERSION},\n  \"{KEY}\": \"{}\"\n}}\n",
+            setting.as_str()
+        )
     }
 }
 
@@ -996,12 +1018,19 @@ mod tests {
             let document = setting::document(chosen);
             assert_eq!(setting::parse(document.as_bytes()), chosen);
         }
+        assert_eq!(
+            setting::parse(b"{\"sleep_inhibition\": \"mains_only\"}"),
+            SleepInhibitionSetting::MainsOnly,
+            "a document from before the version key is this version"
+        );
         for damaged in [
             b"".as_slice(),
             b"not a document".as_slice(),
             b"{}".as_slice(),
             b"{\"sleep_inhibition\": \"always\"}".as_slice(),
             b"{\"sleep_inhibition\": true}".as_slice(),
+            b"{\"version\": 2, \"sleep_inhibition\": \"battery_too\"}".as_slice(),
+            b"{\"version\": \"1\", \"sleep_inhibition\": \"battery_too\"}".as_slice(),
         ] {
             assert_eq!(
                 setting::parse(damaged),
