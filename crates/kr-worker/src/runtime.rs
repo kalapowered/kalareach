@@ -417,16 +417,6 @@ pub struct SessionRuntime {
     fence: Arc<std::sync::atomic::AtomicU64>,
     /// What tells the supervision that a process this session owns can have appeared.
     activity: Arc<crate::lifecycle::Activity>,
-    /// The callers waiting for a reader to say what it did with their launch.
-    ///
-    /// An answer arrives from the bridge's own task, long after the mutation that asked for it
-    /// released the session boundary, so it is delivered here rather than returned there.
-    launches: Mutex<
-        std::collections::HashMap<
-            kr_shell_integration::contract::requests::LaunchTransactionId,
-            tokio::sync::oneshot::Sender<crate::fence::driver::LaunchAnswer>,
-        >,
-    >,
 }
 
 impl SessionRuntime {
@@ -741,7 +731,6 @@ impl SessionRuntime {
             closed: Arc::clone(&closed),
             fence: Arc::clone(&fence),
             activity: Arc::clone(&activity),
-            launches: Mutex::new(std::collections::HashMap::new()),
         };
 
         let ingest_session = Arc::clone(&session);
@@ -805,7 +794,6 @@ impl SessionRuntime {
                 wake: Arc::clone(&monitor_wake),
                 closed: Arc::clone(&monitor_closed),
                 fence: Arc::clone(&monitor_fence),
-                launches: Mutex::new(std::collections::HashMap::new()),
                 activity: Arc::clone(&monitor_activity),
             });
             // Built here rather than by the caller: waiting for a child to end is the runtime's
@@ -1006,59 +994,38 @@ impl SessionRuntime {
 
     /// Returns the session's current lifecycle state.
     #[must_use]
-    /// Carries out what one fence stimulus left for the session, and moves its input on.
+    /// Applies one fence stimulus and everything that came of it, under one session lock.
     ///
-    /// The session is locked for the effects and unlocked before the writer is woken, which is the
-    /// same boundary every other producer of input uses.
-    pub fn apply_fence_effects(
-        self: &Arc<Self>,
-        effects: crate::fence::Effects,
-    ) -> crate::session::FenceOutcome {
+    /// The transition and its effects are one step. Releasing the lock between them would let
+    /// another writer put a batch in front of one the machine had just released, and would leave a
+    /// takeover counting neither.
+    pub fn drive_fence<F>(self: &Arc<Self>, stimulate: F) -> crate::session::FenceOutcome
+    where
+        F: FnOnce(&mut crate::fence::FenceDriver) -> crate::fence::Effects,
+    {
         let outcome = {
             let mut session = self.session();
+            let Some(driver) = session.fence_mut() else {
+                return crate::session::FenceOutcome::default();
+            };
+            let effects = stimulate(driver);
             let outcome = session.apply_fence_effects(effects);
             self.flush_locked(&mut session);
             outcome
         };
-        for (transaction, answer) in &outcome.launch_answers {
-            self.answer_launch(*transaction, answer.clone());
-        }
-        if outcome.close_session.is_some() {
-            // Section 7: an integration failure before the session is qualified closes the session
-            // that was being created and records its diagnostics. An explicit compatibility retry
-            // is a new create request, never a silent substitution here.
-            let (_, gate) = self.close(ClosureReason::RootLaunchFailed);
-            gate.release();
-        }
+        self.settle_fence(&outcome);
         outcome
     }
 
-    /// Registers a caller waiting for a launch the reader is deciding.
-    pub fn register_launch(
-        &self,
-        transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
-    ) -> tokio::sync::oneshot::Receiver<crate::fence::driver::LaunchAnswer> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.launches
-            .lock()
-            .expect("the launch table is not poisoned")
-            .insert(transaction, sender);
-        receiver
-    }
-
-    /// Delivers one launch answer to the caller waiting for it.
-    fn answer_launch(
-        &self,
-        transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
-        answer: crate::fence::driver::LaunchAnswer,
-    ) {
-        let waiting = self
-            .launches
-            .lock()
-            .expect("the launch table is not poisoned")
-            .remove(&transaction);
-        if let Some(sender) = waiting {
-            let _ = sender.send(answer);
+    /// Carries out what a fence outcome left for the runtime rather than the session.
+    ///
+    /// One thing: a loss before qualification closes the session that was being created and records
+    /// why. Section 7 makes an explicit compatibility retry a new create request, never a silent
+    /// substitution here.
+    fn settle_fence(self: &Arc<Self>, outcome: &crate::session::FenceOutcome) {
+        if outcome.close_session.is_some() {
+            let (_, gate) = self.close(ClosureReason::RootLaunchFailed);
+            gate.release();
         }
     }
 
@@ -1067,10 +1034,7 @@ impl SessionRuntime {
         &self,
         transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
     ) {
-        self.launches
-            .lock()
-            .expect("the launch table is not poisoned")
-            .remove(&transaction);
+        self.session().forget_launch(transaction);
     }
 
     /// Returns the session's lifecycle state.

@@ -261,6 +261,25 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(server.serve())
     });
 
+    // The endpoint serves from here, before anything is waited for. A session that is still being
+    // created is reachable on it: section 7 lets a native startup prompt read input in its own
+    // non-primary context while the profiles run, and a worker that only began serving afterwards
+    // would be the deadlock that paragraph forbids.
+    let service = Arc::new(WorkerService::new(
+        Arc::clone(&runtime),
+        identity,
+        endpoint.clone(),
+        ServiceBinding {
+            environment_id,
+            boot_identity,
+            controller_public_key: specification.controller_public_key,
+            controller_generation: specification.controller_generation,
+            build_id: build_id(),
+            journal_path: Some(environment.journal_database(specification.session_id)),
+        },
+    )?);
+    let serving = tokio::spawn(Arc::clone(&service).serve(listener));
+
     // Section 7 paragraph 4: a managed create succeeds only after full post-profile qualification.
     // The shell is running and its startup files are executing; until the integration reports its
     // hooks live, this session is authenticated rather than qualified, and it reports nothing
@@ -268,10 +287,18 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     if bridge_server.is_some()
         && let Err(error) = await_qualification(&runtime, QUALIFICATION_DEADLINE).await
     {
-        writer
+        // The failure is reported if it can be, and the session is closed either way: a create that
+        // could not deliver the managed contract leaves a closure record rather than a shell nobody
+        // is going to use.
+        let _ = writer
             .write_message(&ControlFrame::WorkerFailed(error.clone()))
-            .await?;
+            .await;
         runtime.close(ClosureReason::RootLaunchFailed).1.release();
+        let _ = runtime.wait_closed().await;
+        serving.abort();
+        if let Some(server) = bridge_server {
+            server.abort();
+        }
         return Err(error.message.into());
     }
 
@@ -283,12 +310,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             root_process: session
                 .root_identity()
                 .ok_or("the root shell has no process identity")?,
-            shell_path: specification
-                .create
-                .shell
-                .as_ref()
-                .cloned()
-                .unwrap_or_default(),
+            // The executable this session actually launched, which for a managed session is the
+            // package's binary rather than whatever the request named.
+            shell_path: session.config().shell.program.clone(),
             dimensions: session.geometry().dimensions,
         }
     };
@@ -309,20 +333,6 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     drop(writer);
     drop(reader);
 
-    let service = Arc::new(WorkerService::new(
-        Arc::clone(&runtime),
-        identity,
-        endpoint,
-        ServiceBinding {
-            environment_id,
-            boot_identity,
-            controller_public_key: specification.controller_public_key,
-            controller_generation: specification.controller_generation,
-            build_id: build_id(),
-            journal_path: Some(environment.journal_database(specification.session_id)),
-        },
-    )?);
-    let serving = tokio::spawn(Arc::clone(&service).serve(listener));
     // The worker exists for its session. When the session closes, the last record is written and
     // the process ends; nothing here restarts a shell.
     let _record = runtime.wait_closed().await;

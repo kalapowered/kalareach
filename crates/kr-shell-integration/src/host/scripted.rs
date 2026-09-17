@@ -86,7 +86,15 @@ impl ScriptedBridge {
         address: &BridgeEndpoint,
         hello: &BridgeHello,
     ) -> Result<(Self, HandshakeOutcome)> {
-        let endpoint = Endpoint::from_path(&address.path)?;
+        // kr-ipc takes the namespaced name on Windows and supplies the pipe prefix itself, while
+        // the bootstrap transcript is taken over the full address the shell was given. Stripping it
+        // here keeps both true.
+        let endpoint = Endpoint::from_path(
+            address
+                .path
+                .strip_prefix(crate::contract::transport::WINDOWS_PIPE_PREFIX)
+                .unwrap_or(&address.path),
+        )?;
         let connection = Connection::connect(&endpoint).await?;
         let (reader, writer) = split(connection, BRIDGE_STREAM_KIND);
         let mut bridge = Self {

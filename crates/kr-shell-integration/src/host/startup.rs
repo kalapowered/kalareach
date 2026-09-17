@@ -107,7 +107,7 @@ impl HomeLayout {
                     .clone()
                     .unwrap_or_else(|| self.home.join(".config"))
                     .join("fish/conf.d/kalareach.fish"),
-                reason: "a guarded conf.d entry, which runs after the user's own configuration",
+                reason: "a guarded conf.d entry; it loads before config.fish and defers its own activation until after it",
             }],
             ShellKind::PowerShell => vec![StartupTarget {
                 kind,
@@ -145,7 +145,10 @@ impl HomeLayout {
 /// rewriting anything the user owns.
 #[must_use]
 pub fn entry(kind: ShellKind, package_entry: &Path, nsh_bypass: bool) -> String {
-    let path = package_entry.display();
+    // The path is quoted for the shell that will read this file, by the same rules a launch is
+    // quoted by. An installation directory with an apostrophe in it would otherwise end the string
+    // and turn the rest of the path into shell syntax.
+    let path = crate::host::quoting::quote(kind, &package_entry.display().to_string());
     let mut body = String::new();
     body.push_str(MARKER_BEGIN);
     body.push('\n');
@@ -160,7 +163,7 @@ pub fn entry(kind: ShellKind, package_entry: &Path, nsh_bypass: bool) -> String 
                     "[ -n \"${{KR_SHELL_BRIDGE:-}}\" ] && export {NSH_BYPASS_VARIABLE}=1\n"
                 ));
             }
-            body.push_str(&format!("[ -r '{path}' ] && . '{path}'\n"));
+            body.push_str(&format!("[ -r {path} ] && . {path}\n"));
         }
         ShellKind::Fish => {
             if nsh_bypass {
@@ -168,7 +171,7 @@ pub fn entry(kind: ShellKind, package_entry: &Path, nsh_bypass: bool) -> String 
                     "if set -q KR_SHELL_BRIDGE; set -gx {NSH_BYPASS_VARIABLE} 1; end\n"
                 ));
             }
-            body.push_str(&format!("if test -r '{path}'; source '{path}'; end\n"));
+            body.push_str(&format!("if test -r {path}; source {path}; end\n"));
         }
         ShellKind::PowerShell => {
             if nsh_bypass {
@@ -176,7 +179,7 @@ pub fn entry(kind: ShellKind, package_entry: &Path, nsh_bypass: bool) -> String 
                     "if ($env:KR_SHELL_BRIDGE) {{ $env:{NSH_BYPASS_VARIABLE} = '1' }}\n"
                 ));
             }
-            body.push_str(&format!("if (Test-Path '{path}') {{ . '{path}' }}\n"));
+            body.push_str(&format!("if (Test-Path {path}) {{ . {path} }}\n"));
         }
     }
     body.push_str(MARKER_END);
@@ -391,6 +394,20 @@ mod tests {
                 !without.contains(NSH_BYPASS_VARIABLE),
                 "{kind} sets nothing when the option is off"
             );
+        }
+    }
+
+    #[test]
+    fn a_path_with_an_apostrophe_stays_one_word() {
+        for kind in ShellKind::ALL {
+            let body = entry(*kind, Path::new("/home/it's mine/kr/entry"), false);
+            // The apostrophe is escaped rather than ending the string, so the line still names one
+            // path and nothing after it is read as shell syntax.
+            assert!(
+                !body.contains("/home/it's mine/kr/entry"),
+                "{kind} left the apostrophe unescaped: {body}"
+            );
+            assert!(body.contains("mine/kr/entry"), "{kind}: {body}");
         }
     }
 

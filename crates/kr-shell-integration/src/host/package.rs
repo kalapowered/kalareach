@@ -295,7 +295,7 @@ impl PackageSet {
     /// not installed.
     pub fn select(&self, requested: Option<&str>) -> Result<&ShellPackage, PackageFault> {
         let package = match requested {
-            None => self.packages.first().ok_or(PackageFault::NoPackages)?,
+            None => self.default_package().ok_or(PackageFault::NoPackages)?,
             Some(requested) => {
                 let requested = requested.trim();
                 if let Some(detail) = script_invocation(requested) {
@@ -320,6 +320,28 @@ impl PackageSet {
             });
         }
         Ok(package)
+    }
+}
+
+impl PackageSet {
+    /// Returns the package a request that names no shell takes.
+    ///
+    /// The shell this user's own login uses, when a package qualifies it: a session should start
+    /// the shell the person already has. Failing that, the first package this installation holds,
+    /// in the order [`ShellKind::ALL`] lists them.
+    fn default_package(&self) -> Option<&ShellPackage> {
+        let configured = std::env::var("SHELL")
+            .ok()
+            .map(|shell| executable_name(&shell));
+        configured
+            .and_then(|name| {
+                ShellKind::ALL
+                    .iter()
+                    .copied()
+                    .find(|kind| kind.as_str() == name || alias(*kind) == name)
+            })
+            .and_then(|kind| self.get(kind))
+            .or_else(|| self.packages.first())
     }
 }
 
@@ -361,18 +383,32 @@ fn executable_name(requested: &str) -> String {
 
 /// Returns why a request is a script invocation rather than a shell.
 ///
-/// A create request names an executable, not a command line. Anything carrying arguments, a
-/// redirection or a `-c` is somebody asking for a script to be run, and section 7 is explicit that
-/// a non-interactive script request never becomes an interactive shell.
+/// A create request names an executable, not a command line. Section 7 is explicit that a
+/// non-interactive script request never becomes an interactive shell, so anything carrying an
+/// option, a redirection or a separator is refused rather than run.
+///
+/// A path with a space in it is a path. `/Applications/Some Shell/bin/zsh` names a file, and
+/// treating every space as an argument boundary would refuse a perfectly ordinary installation.
 fn script_invocation(requested: &str) -> Option<String> {
-    if requested.is_empty() {
+    if requested.is_empty() || Path::new(requested).is_file() {
         return None;
     }
-    if requested.split_whitespace().count() > 1 {
-        return Some(format!(
-            "{requested} is a command line rather than the path of a shell to run interactively"
-        ));
+    let script = |detail: &str| {
+        Some(format!(
+            "{requested} is {detail} rather than the path of a shell to run interactively"
+        ))
+    };
+    if requested.contains(['<', '>', '|', ';', '&', '`', '$']) {
+        return script("a command line");
     }
+    let mut words = requested.split_whitespace();
+    let _ = words.next();
+    if words.any(|word| word.starts_with('-')) {
+        return script("an invocation with arguments");
+    }
+    // Several words and none of them an option: a path with spaces that this host does not have.
+    // It is still not a command line, so it is refused as an unqualified shell rather than as a
+    // script, which names the right thing.
     None
 }
 
@@ -436,7 +472,12 @@ mod tests {
         let root = tempfile::tempdir().expect("a directory");
         install(root.path(), ShellKind::Bash, true);
         let set = PackageSet::discover(root.path()).expect("reads the packages");
-        for request in ["bash -c 'echo hello'", "/bin/sh script.sh", "zsh -lc make"] {
+        for request in [
+            "bash -c 'echo hello'",
+            "zsh -lc make",
+            "zsh > /tmp/out",
+            "sh; rm -rf /",
+        ] {
             let fault = set.select(Some(request)).expect_err("refused");
             assert!(
                 matches!(fault, PackageFault::NotInteractive { .. }),
@@ -444,6 +485,32 @@ mod tests {
             );
             assert_eq!(fault.code(), ErrorCode::ShellIntegrationUnsupported);
         }
+    }
+
+    #[test]
+    fn a_path_with_a_space_in_it_is_a_path() {
+        let root = tempfile::tempdir().expect("a directory");
+        let spaced = root.path().join("Some Shell/bin");
+        std::fs::create_dir_all(&spaced).expect("creates the directory");
+        let executable = spaced.join("zsh");
+        std::fs::write(&executable, b"#!/bin/sh\n").expect("writes");
+        install(root.path(), ShellKind::Zsh, false);
+        let set = PackageSet::discover(root.path()).expect("reads the package");
+        // It names a file, so it is a path rather than a command line, and the package that
+        // qualifies that shell is what a session launches.
+        let package = set
+            .select(Some(executable.to_str().expect("utf-8")))
+            .expect("qualified");
+        assert_eq!(package.manifest.shell, ShellKind::Zsh);
+
+        // A shell no package qualifies, at a path with a space in it, is refused as unqualified
+        // rather than as a script.
+        let other = spaced.join("ksh");
+        std::fs::write(&other, b"#!/bin/sh\n").expect("writes");
+        let fault = set
+            .select(Some(other.to_str().expect("utf-8")))
+            .expect_err("refused");
+        assert!(matches!(fault, PackageFault::Unqualified { .. }), "{fault}");
     }
 
     #[test]

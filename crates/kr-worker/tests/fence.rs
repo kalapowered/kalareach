@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
-use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
+use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
@@ -160,6 +160,33 @@ impl Wired {
     }
 }
 
+/// Reads everything the session has retained.
+fn retained(session: &Session) -> Vec<u8> {
+    let mut seen = Vec::new();
+    let mut cursor = 0_u64;
+    loop {
+        let page = session
+            .history_page(cursor, 1024 * 1024)
+            .expect("reads the retained output");
+        if page.bytes.as_slice().is_empty() {
+            break;
+        }
+        seen.extend_from_slice(page.bytes.as_slice());
+        cursor = page.next_cursor.get();
+    }
+    seen
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    position(haystack, needle).is_some()
+}
+
+fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 fn reference() -> ReferenceShell {
     ReferenceShell::new(ShellKind::Zsh, "/bin/cat", "5.9", "zle-5.9")
 }
@@ -223,10 +250,12 @@ async fn wired_with(mode: ShellMode, register: bool) -> Wired {
         )
         .expect("a session key"),
     );
-    let store = kr_crypto::store::open_store("KalaReachFence", &environment.secrets_dir())
-        .expect("a secret store");
-    let controller = ControllerIdentity::initialise(store.store.as_ref(), environment_id)
-        .expect("a controller identity");
+    // No controller connects in this suite, so the key a generation token would be checked against
+    // is a fresh one rather than the environment's own. Opening the environment's identity writes to
+    // the platform credential store, which costs about a minute per session and proves nothing here.
+    let controller_public_key = *kr_crypto::keys::AuthorisationKeyPair::generate()
+        .expect("an authorisation key")
+        .public();
 
     // The bridge endpoint is inside the session's own owner-only runtime directory, on the
     // internal disk, and it is bound before the shell starts.
@@ -304,7 +333,7 @@ async fn wired_with(mode: ShellMode, register: bool) -> Wired {
             ServiceBinding {
                 environment_id,
                 boot_identity: boot,
-                controller_public_key: *controller.public_key(),
+                controller_public_key,
                 controller_generation: ControllerGeneration::new(1),
                 build_id: build(),
             },
@@ -1020,15 +1049,9 @@ async fn a_launch_the_reader_never_answers_revokes_and_reports_what_it_can() {
     };
     assert_eq!(revoked, LaunchRejectionReason::Timeout);
     // The reader is gone, so nothing can say whether a command reached the editor.
-    {
-        let mut session = wired.runtime.session();
-        let effects = session
-            .fence_mut()
-            .expect("a driver")
-            .integration_lost(IntegrationLoss::BridgeDisconnected);
-        drop(session);
-        let _ = wired.runtime.apply_fence_effects(effects);
-    }
+    let _ = wired
+        .runtime
+        .drive_fence(|driver| driver.integration_lost(IntegrationLoss::BridgeDisconnected));
     let error = tokio::time::timeout(SOON, calling)
         .await
         .expect("the caller was answered")
@@ -1078,18 +1101,13 @@ async fn an_integration_failure_before_qualification_closes_the_creating_session
         );
         assert!(!driver.phase().permits_launch());
     }
-    let effects = {
-        let mut session = wired.runtime.session();
-        session
-            .fence_mut()
-            .expect("a driver")
-            .integration_lost(IntegrationLoss::PostStartupFailure)
-    };
+    let outcome = wired
+        .runtime
+        .drive_fence(|driver| driver.integration_lost(IntegrationLoss::PostStartupFailure));
     assert_eq!(
-        effects.close_session,
+        outcome.close_session,
         Some(IntegrationLoss::PostStartupFailure)
     );
-    let _ = wired.runtime.apply_fence_effects(effects);
     let record = tokio::time::timeout(SOON, wired.runtime.wait_closed())
         .await
         .expect("the session closed");
@@ -1102,18 +1120,13 @@ async fn a_live_session_that_loses_its_hooks_stops_attributing_and_stops_install
     let mut wired = wired().await;
     let _holder = wired.holder();
     let _fence = fenced(&mut wired, 1, 1).await;
-    let effects = {
-        let mut session = wired.runtime.session();
-        session
-            .fence_mut()
-            .expect("a driver")
-            .integration_lost(IntegrationLoss::SemanticHookLoss)
-    };
+    let outcome = wired
+        .runtime
+        .drive_fence(|driver| driver.integration_lost(IntegrationLoss::SemanticHookLoss));
     assert_eq!(
-        effects.close_session, None,
+        outcome.close_session, None,
         "a live session is not closed by it"
     );
-    let _ = wired.runtime.apply_fence_effects(effects);
     {
         let session = wired.runtime.session();
         let driver = session.fence().expect("a driver");
@@ -1205,5 +1218,254 @@ async fn a_withheld_fence_is_retried_at_the_next_idle_callback() {
     assert_ne!(retried.fence_id, asked.fence_id);
     let _ = EditorBusyReason::FenceExchangeTimedOut;
     let _ = InputRef::new("unused");
+    wired.close().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-07.79, KR-REQ-07.82: what happens to a client's keystrokes while a fence is being made.
+// --------------------------------------------------------------------------------------------
+
+/// KR-REQ-07.79: the held input reaches the terminal in its original order, and the client is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_input_reaches_the_terminal_in_order_and_the_client_hears_why_it_waited() {
+    let mut wired = wired().await;
+    let holder = wired.holder();
+    let mut events = {
+        let mut session = wired.runtime.session();
+        session.subscribe(holder).expect("subscribes")
+    };
+    // A reader starts and never answers the exchange, so everything typed is held.
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Fence(_) => break,
+                _ => continue,
+            },
+            _ => continue,
+        }
+    }
+    let epoch = wired.runtime.session().lease().epoch.get();
+    for (sequence, bytes) in [b"first\n".as_slice(), b"second\n".as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        let mut session = wired.runtime.session();
+        session
+            .write_input(
+                holder,
+                epoch,
+                sequence as u64,
+                bytes,
+                std::time::Instant::now(),
+            )
+            .expect("accepted");
+        assert_eq!(
+            session.fence().expect("a driver").held().len(),
+            sequence + 1,
+            "each batch is held while the exchange is in flight"
+        );
+    }
+    assert!(
+        !contains(&retained(&wired.runtime.session()), b"first"),
+        "nothing reaches the terminal while the exchange is in flight"
+    );
+
+    // The hold ends at its own deadline. The batches go to the terminal in the order they arrived,
+    // which is what the program on the other end of it echoes back.
+    let seen = tokio::time::timeout(SOON, async {
+        loop {
+            let seen = retained(&wired.runtime.session());
+            if contains(&seen, b"first") && contains(&seen, b"second") {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hold ended and both batches reached the terminal");
+    let first = position(&seen, b"first").expect("the first batch");
+    let second = position(&seen, b"second").expect("the second batch");
+    assert!(
+        first < second,
+        "released in the order they arrived, not the order they were let go"
+    );
+
+    // And the client whose keystrokes waited is told why, on its own attachment event stream.
+    let busy = tokio::time::timeout(SOON, async {
+        loop {
+            match events.recv().await {
+                Some(kr_worker::output::OutputDelivery::EditorBusy(event)) => return Some(*event),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+    })
+    .await
+    .expect("an attachment event")
+    .expect("the stream stayed open");
+    assert_eq!(busy.attachment_id, holder);
+    assert_eq!(busy.reason, EditorBusyReason::FenceExchangeTimedOut);
+    assert_eq!(busy.state, FenceState::Unfenced);
+    assert_eq!(
+        busy.released_input_bytes.get(),
+        b"first\nsecond\n".len() as u64,
+        "the event counts what went to the terminal"
+    );
+    assert_eq!(
+        busy.input_epoch.get(),
+        epoch,
+        "the lease change stands: this is an event about the editor, not a failed acquire"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-07.78: a reader that never answers its cancellation leaves the receipt saying so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_that_never_answers_leaves_the_takeover_receipt_unknown() {
+    let mut wired = wired().await;
+    let _first = wired.holder();
+    let _fence = fenced(&mut wired, 1, 1).await;
+    let second = AttachmentId::new(kr_ipc::new_uuid());
+    {
+        let params = terminal(wired.session_id);
+        let mut session = wired.runtime.session();
+        session
+            .attach(&params, params.requested.clone(), second)
+            .expect("attaches");
+        session
+            .acquire_input(second, ConnectionId::new(kr_ipc::new_uuid()), None)
+            .expect("takes the keys");
+    }
+    // The cancellation goes out and is never answered.
+    loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Cancel(_) => break,
+                _ => continue,
+            },
+            _ => continue,
+        }
+    }
+    let receipt = tokio::time::timeout(SOON, async {
+        loop {
+            if let Some(receipt) = wired.runtime.session().last_takeover_receipt() {
+                return receipt;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the receipt closed at the hold's deadline");
+    assert_eq!(
+        receipt.reader_discards,
+        ReaderDiscards::Unknown,
+        "nobody measured it, so the receipt says so rather than reporting a zero"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-07.83: two callers waiting at once are each answered, in the order they were revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_outstanding_confirmations_are_each_answered() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let _holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    let target = wired.target();
+    let session_id = wired.session_id;
+    let prompt = fence.prompt_generation;
+
+    let mut second = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    // The second connection has no attachment of its own, so it is refused before the machine sees
+    // it: a launch belongs to the client that holds the keys on the connection that asked.
+    let refused = second
+        .mutate(
+            Method::ShellLaunch,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &ShellLaunchParams {
+                session_id,
+                command: LaunchCommand::QuotedCommand("ls".to_owned()),
+                expected_prompt_generation: prompt,
+                expected_buffer_revision: EditorBufferRevision::new(1),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("refused");
+    assert_eq!(refused.code, ErrorCode::LeaseLost);
+
+    // The holder's own launch is dispatched, times out, and is then answered by the reader.
+    let calling = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &ShellLaunchParams {
+                    session_id,
+                    command: LaunchCommand::QuotedCommand("ls".to_owned()),
+                    expected_prompt_generation: prompt,
+                    expected_buffer_revision: EditorBufferRevision::new(1),
+                },
+            )
+            .await
+    });
+    let request = loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Launch(request) => break request,
+                _ => continue,
+            },
+            _ => continue,
+        }
+    };
+    let revoked = loop {
+        match wired.next().await {
+            ToBridge::LaunchRevoked { transaction, .. } => break transaction,
+            _ => continue,
+        }
+    };
+    assert_eq!(revoked, request.transaction);
+    // The reader answers after the revocation. The command is in the editor, so the caller is told
+    // what happened rather than told it failed.
+    wired
+        .bridge
+        .answer(
+            kr_protocol::ids::RequestId::new(0),
+            BridgeAnswer::Launch(LaunchDecision::Accepted(LaunchAccepted {
+                transaction: request.transaction,
+                installed: request.command.clone(),
+                fence_id: request.fence_id,
+                prompt_generation: prompt,
+                buffer_revision: EditorBufferRevision::new(2),
+                reader_revision: ReaderRevision::new(1),
+            })),
+        )
+        .await
+        .expect("installs");
+    let result: ShellLaunchResult = tokio::time::timeout(SOON, calling)
+        .await
+        .expect("the caller was answered")
+        .expect("joins")
+        .expect("reaches the worker")
+        .expect("installed")
+        .to_typed()
+        .expect("a launch result");
+    assert_eq!(result.buffer_revision, EditorBufferRevision::new(2));
+    assert_eq!(
+        wired.runtime.session().late_installations().len(),
+        1,
+        "the session records a command the reader installed after the transaction was revoked"
+    );
     wired.close().await;
 }

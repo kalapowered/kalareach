@@ -69,9 +69,11 @@ Section 7 separates authentication from qualification, and the difference decide
 | `terminal_only` | yes | no | no | no | the shell's own | no |
 
 A session is `authenticated` from the moment its bridge registers and `qualified` from the moment
-the integration reports its hooks live, which is after the user's startup files have run. A startup
-profile that asks a question therefore reads its input normally and is never held up by a fence,
-which is exactly what the `authenticated` row says.
+the integration reports its hooks live, which is after the user's startup files have run. No fence
+is held below `qualified`, so a startup profile that asks a question is never held up by one: its
+input reaches the terminal the moment it arrives. The worker's own endpoint is serving from before
+that wait, so such a prompt is reachable; what is not yet reachable is a session the daemon has not
+published a descriptor for, which is a limit of the create flow rather than of the fence.
 
 Before qualification every loss closes the session that was being created and records why: a create
 that cannot deliver the managed contract fails rather than succeeding with less. After it, a lost
@@ -94,6 +96,14 @@ adds three things to it and nothing else.
 Every consequence is one of the machine's own actions, carried out in the order the outcome lists
 them. There is no second state machine and no heuristic fence: nothing in the worker concludes
 anything about the reader from a prompt, a timestamp or a byte count.
+
+A loss that leaves the session below `qualified` is followed by an `editor_left` stimulus naming the
+reader the bridge last reported, so the machine deregisters it. Without that the machine would keep
+a registered editor and start another exchange at the next lease change, and a session the phase says
+is degraded would publish a fence and hand out a detach proof it cannot stand behind.
+
+The stimulus and everything that came of it happen under one session lock. Releasing it between the
+two would let another writer put a batch in front of one the machine had just released.
 
 | Action | What the worker does |
 | --- | --- |
@@ -134,13 +144,20 @@ The caller's answer is the reader's word. The sequence is:
 4. At the deadline the worker revokes the transaction, releases the held input in its original order
    and emits `editor_busy`. It does not answer the caller: only the reader knows whether it installed
    anything.
-5. The answer is what the reader said. `EDITOR_BUSY` when it installed nothing, the installed result
-   when it had, and `OUTCOME_UNKNOWN` when the reader can no longer answer at all — which is the one
-   launch outcome a caller must never retry under the same action identifier.
+5. The answer is what the reader said. The installed result when it installed one; `DRAFT_CONFLICT`
+   when the reader's own buffer, prompt or working directory had moved under it; `EDITOR_BUSY` when
+   the transaction could not be held; and `OUTCOME_UNKNOWN` when the reader can no longer answer at
+   all.
+
+The wait happens on a task of its own rather than on the connection's read loop, so the same client
+goes on typing, interrupting and detaching while its launch is with the reader.
 
 Because the outcome is not known when the boundary ends, the receipt is settled when the reader
-answers. The dispatch marker was committed before the request reached the reader, so a crash in
-between leaves the receipt `unknown`, which is exactly what a command that may be in the editor is.
+answers. A reader that proved it installed nothing settles the receipt as `refused`; only an answer
+nothing can give any more settles it as `unknown`. The dispatch marker was committed before the
+request reached the reader, so a crash in between also leaves it `unknown`, which is exactly what a
+command that may be in the editor is. A caller that repeats an `OUTCOME_UNKNOWN` action under the
+same identifier is given the retained receipt rather than a second attempt.
 
 Nothing is ever written into the pseudo-terminal for a launch. There is no wake marker, no launch
 string and no private key injection; a bridge that offers key injection is refused registration.
@@ -189,8 +206,10 @@ manifest's own directory, so a package that was copied elsewhere is still the sa
 | `modules` | The module tree, with each module's search path and ABI |
 | `startup_entry` | The file the guarded startup entry sources |
 
-The identity the manifest declares is what a hello is checked against, so a package rebuilt with a
-different reader patch is a different package rather than the same one.
+The worker checks a hello against the package's editor ABI and integration version. The rest of the
+identity — the executable, the upstream revision, the patches and the module tree — is recorded with
+the session for diagnostics rather than compared, and comparing it whole is the next step named in
+this task's handoff.
 
 ## Setup
 
@@ -203,7 +222,7 @@ and mode, and where each guarded entry goes and whether it is there. It writes n
 | --- | --- |
 | Zsh | `.zshrc` inside the configured `ZDOTDIR` when there is one |
 | Bash | `.bashrc`, plus the first login file this user has when it does not already source `.bashrc` |
-| Fish | a guarded `conf.d` entry, which runs after the user's own configuration |
+| Fish | a guarded `conf.d` entry; it loads before `config.fish` and its own activation is deferred until after it |
 | PowerShell | the user's own profile, added to rather than replaced |
 
 The entry is delimited by `# >>> KalaReach shell integration >>>` and `# <<< KalaReach shell
@@ -217,6 +236,19 @@ runs without rewriting anything they own. Nothing replaces `.bashrc`, points a s
 It changes no other setting of that tool and affects no ordinary terminal.
 
 `kr shell remove` deletes exactly the marked entry. Everything the user wrote stays as they left it.
+
+## What is not here yet
+
+Three things this document would otherwise be read as promising, and are not true at this commit.
+
+* `kr detach` without an attachment identifier still resolves through the CLI's own rule rather than
+  through the recorded origin. The host knows the origin — the machine records it at acceptance and
+  `FenceDriver::detach_target()` returns it, with `AMBIGUOUS_ATTACHMENT` for a mixed or unverifiable
+  one — and no wire field carries it to the caller yet.
+* The opt-in command integration and the command blocks are typed and tested, and nothing produces
+  or consumes them: no agent gateway establishes a worker-owned backend, and no hook reports a
+  block.
+* The terminal selection order is decided here and the CLI still opens its terminal its own way.
 
 ## Section 23's private group
 

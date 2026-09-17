@@ -12,10 +12,11 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{AttachmentId, InputLeaseEpoch, RequestId, SessionId};
 use kr_protocol::input::InterruptAction;
 use kr_protocol::root::{
-    AcceptedOrigin, EditorBusyEvent, EditorFence, FenceId, FencePublication, FenceState,
-    RootCommandAcceptedParams, RootCommandAcceptedResult, RootEditorEnterParams,
-    RootEditorEnterResult, RootEditorLeaveParams, RootEditorLeaveResult, RootEofDetachParams,
-    ShellLaunchParams, ShellLaunchResult, WithheldReason,
+    AcceptedOrigin, EditorBusyEvent, EditorFence, EditorLeaveReason, FenceId, FencePublication,
+    FenceState, PromptGeneration, ReaderRevision, RootCommandAcceptedParams,
+    RootCommandAcceptedResult, RootEditorEnterParams, RootEditorEnterResult, RootEditorLeaveParams,
+    RootEditorLeaveResult, RootEofDetachParams, ShellLaunchParams, ShellLaunchResult,
+    WithheldReason,
 };
 use kr_protocol::scalars::{Nullable, U64};
 use kr_shell_integration::contract::events::{BridgeEvent, ReaderIdle};
@@ -127,6 +128,10 @@ pub struct Effects {
     pub write: Vec<InputBatch>,
     /// Accepted input that was dropped rather than delivered.
     pub discarded_bytes: u64,
+    /// Bytes the machine has taken into its hold.
+    pub held_added: usize,
+    /// Bytes the machine has let go of, by writing them or dropping them.
+    pub held_removed: usize,
     /// The `editor_busy` events to deliver to their attachments.
     pub editor_busy: Vec<EditorBusyEvent>,
     /// Attachments to remove.
@@ -155,6 +160,8 @@ impl Effects {
     fn merge(&mut self, other: Self) {
         self.write.extend(other.write);
         self.discarded_bytes = self.discarded_bytes.saturating_add(other.discarded_bytes);
+        self.held_added = self.held_added.saturating_add(other.held_added);
+        self.held_removed = self.held_removed.saturating_add(other.held_removed);
         self.editor_busy.extend(other.editor_busy);
         self.remove_attachments.extend(other.remove_attachments);
         self.interrupt = other.interrupt.or(self.interrupt);
@@ -188,17 +195,29 @@ enum Context {
 struct Held {
     batch: InputBatch,
     bytes: u64,
+    /// Whether these bytes are charged against the session's input budget.
+    ///
+    /// A batch is charged when the machine holds it and released when the machine lets go. A batch
+    /// the machine forwarded or discarded on arrival was never held, so it is never charged and
+    /// never released: it goes straight to the writer's own counter or nowhere at all.
+    charged: bool,
 }
 
 /// The worker's side of the root-editor contract, driven against a real clock.
 pub struct FenceDriver {
+    session_id: SessionId,
     machine: FenceMachine,
     phase: PhaseGate,
     clock: std::sync::Arc<dyn ContinuousClock>,
     anchor: ContinuousInstant,
     hold: BTreeMap<InputRef, Held>,
     next_batch: u64,
-    outbound: VecDeque<Outbound>,
+    /// Where a frame for the bridge goes.
+    ///
+    /// The connection's writer owns the other end. Queueing rather than writing is what keeps the
+    /// session boundary free of socket writes: a reader that has stopped reading its own socket
+    /// must not be able to hold the worker's input path or its one timer.
+    outbound: Option<tokio::sync::mpsc::UnboundedSender<Outbound>>,
     /// The fence the bridge currently holds, so an invalidation can name it.
     published: Option<FenceId>,
     /// The transaction the reader is deciding now, and the ones whose callers are still waiting
@@ -209,6 +228,9 @@ pub struct FenceDriver {
     receipt: Option<TakeoverReceipt>,
     /// The bridge event being answered, while one is.
     answering: Option<RequestId>,
+    /// The reader the bridge last reported, so a loss that costs the fence can say which reader
+    /// went. It is what the bridge said, kept to be quoted back, not a second view of the machine.
+    reader: Option<(PromptGeneration, ReaderRevision)>,
     /// What the connection's own task waits on when the deadline or the queue may have moved.
     waker: std::sync::Arc<tokio::sync::Notify>,
 }
@@ -220,7 +242,7 @@ impl std::fmt::Debug for FenceDriver {
             .field("state", &self.machine.state())
             .field("phase", &self.phase.phase())
             .field("held", &self.hold.len())
-            .field("outbound", &self.outbound.len())
+            .field("connected", &self.outbound.is_some())
             .finish()
     }
 }
@@ -235,18 +257,20 @@ impl FenceDriver {
     ) -> Self {
         let anchor = clock.now();
         Self {
+            session_id,
             machine: FenceMachine::new(session_id, lease),
             phase: PhaseGate::unauthenticated(),
             clock,
             anchor,
             hold: BTreeMap::new(),
             next_batch: 0,
-            outbound: VecDeque::new(),
+            outbound: None,
             published: None,
             live_launch: None,
             awaiting: VecDeque::new(),
             receipt: None,
             answering: None,
+            reader: None,
             waker: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -297,9 +321,21 @@ impl FenceDriver {
         self.receipt.as_ref()
     }
 
-    /// Takes the frames waiting for the bridge connection.
-    pub fn take_outbound(&mut self) -> Vec<Outbound> {
-        self.outbound.drain(..).collect()
+    /// Sends this connection's frames through `outbound` from now on.
+    pub fn send_through(&mut self, outbound: tokio::sync::mpsc::UnboundedSender<Outbound>) {
+        self.outbound = Some(outbound);
+    }
+
+    /// Stops queueing frames, because the connection they would travel on has ended.
+    pub fn stop_sending(&mut self) {
+        self.outbound = None;
+    }
+
+    /// Queues one frame for the bridge, when a connection is there to carry it.
+    fn send(&self, frame: Outbound) {
+        if let Some(outbound) = self.outbound.as_ref() {
+            let _ = outbound.send(frame);
+        }
     }
 
     /// Returns how long the driver's timer should wait, when it has a deadline.
@@ -353,7 +389,14 @@ impl FenceDriver {
     ) -> Effects {
         let bytes = batch.len() as u64;
         let input = self.name_batch();
-        self.hold.insert(input.clone(), Held { batch, bytes });
+        self.hold.insert(
+            input.clone(),
+            Held {
+                batch,
+                bytes,
+                charged: false,
+            },
+        );
         self.apply(
             &Stimulus::InputArrived(InputArrived {
                 input,
@@ -419,8 +462,33 @@ impl FenceDriver {
     /// A bridge whose connection ends reports nothing; this is how the session hears about it.
     pub fn integration_lost(&mut self, loss: IntegrationLoss) -> Effects {
         let mut effects = self.apply(&Stimulus::IntegrationLost(loss), Context::Other);
-        if self.phase.lost(loss).closes_session {
+        let decision = self.phase.lost(loss);
+        if decision.closes_session {
             effects.close_session = Some(loss);
+        }
+        // A session that can no longer hold a fence has no reader it can speak for, so the machine
+        // is told the reader has gone. Without it the machine would keep a registered editor and
+        // start another exchange at the next lease change, and a session the phase says is degraded
+        // would publish a fence and hand out a detach proof it cannot stand behind.
+        if !decision.closes_session
+            && !self.phase.retains_fence()
+            && let Some((prompt_generation, reader_revision)) = self.reader.take()
+        {
+            let left = self.apply(
+                &Stimulus::EditorLeft(RootEditorLeaveParams {
+                    session_id: self.session_id,
+                    prompt_generation,
+                    reader_revision,
+                    reason: match loss {
+                        IntegrationLoss::UnqualifiedRootReplacement => EditorLeaveReason::RootExit,
+                        IntegrationLoss::PostStartupFailure
+                        | IntegrationLoss::SemanticHookLoss
+                        | IntegrationLoss::BridgeDisconnected => EditorLeaveReason::Cancellation,
+                    },
+                }),
+                Context::Other,
+            );
+            effects.merge(left);
         }
         effects
     }
@@ -527,6 +595,7 @@ impl FenceDriver {
             }));
             return Effects::default();
         }
+        self.reader = Some((params.prompt_generation, params.reader_revision));
         let candidate_fence = FenceId::new(kr_ipc::new_uuid());
         let effects = self.apply(
             &Stimulus::EditorEntered(EditorEntered {
@@ -535,10 +604,9 @@ impl FenceDriver {
             }),
             Context::Other,
         );
-        let started = self
-            .outbound
-            .iter()
-            .any(|frame| matches!(frame, Outbound::Request(request) if matches!(**request, WorkerRequest::Fence(_))));
+        // The exchange the entry started, when the machine started one: a fence a client is told
+        // about is one the reader has actually been asked for.
+        let started = self.machine.deadline().is_some();
         self.answer(EventOutcome::EditorEntered(RootEditorEnterResult {
             state: self.machine.state(),
             fence_exchange: if started {
@@ -551,6 +619,7 @@ impl FenceDriver {
     }
 
     fn editor_left(&mut self, params: &RootEditorLeaveParams) -> Effects {
+        self.reader = None;
         let effects = self.apply(&Stimulus::EditorLeft(params.clone()), Context::Other);
         self.answer(EventOutcome::EditorLeft(RootEditorLeaveResult {
             state: self.machine.state(),
@@ -563,6 +632,7 @@ impl FenceDriver {
             self.answer(EventOutcome::Received);
             return Effects::default();
         }
+        self.reader = Some((idle.prompt_generation, idle.reader_revision));
         let effects = self.apply(
             &Stimulus::ReaderIdled(ReaderIdled {
                 idle: idle.clone(),
@@ -601,7 +671,7 @@ impl FenceDriver {
     /// sent.
     fn answer(&mut self, outcome: EventOutcome) {
         if let Some(id) = self.answering {
-            self.outbound.push_back(Outbound::EventResult {
+            self.send(Outbound::EventResult {
                 id,
                 result: Box::new(outcome),
             });
@@ -616,7 +686,7 @@ impl FenceDriver {
             let produced = self.carry_out(action, context, outcome.state);
             effects.merge(produced);
         }
-        self.waker.notify_waiters();
+        self.waker.notify_one();
         effects
     }
 
@@ -625,12 +695,16 @@ impl FenceDriver {
         let mut effects = Effects::default();
         match action {
             Action::AskFence(params) => {
-                self.outbound
-                    .push_back(Outbound::Request(Box::new(WorkerRequest::Fence(
-                        params.clone(),
-                    ))));
+                self.send(Outbound::Request(Box::new(WorkerRequest::Fence(
+                    params.clone(),
+                ))));
             }
-            Action::Hold(_) => {}
+            Action::Hold(input) => {
+                if let Some(held) = self.hold.get_mut(input) {
+                    held.charged = true;
+                    effects.held_added = effects.held_added.saturating_add(held.batch.len());
+                }
+            }
             Action::Forward(input) => {
                 if let Some(held) = self.hold.remove(input) {
                     effects.write.push(held.batch);
@@ -639,6 +713,10 @@ impl FenceDriver {
             Action::Release(order) => {
                 for input in order {
                     if let Some(held) = self.hold.remove(input) {
+                        if held.charged {
+                            effects.held_removed =
+                                effects.held_removed.saturating_add(held.batch.len());
+                        }
                         effects.write.push(held.batch);
                     }
                 }
@@ -646,6 +724,10 @@ impl FenceDriver {
             Action::Discard { input, .. } => {
                 for name in input {
                     if let Some(held) = self.hold.remove(name) {
+                        if held.charged {
+                            effects.held_removed =
+                                effects.held_removed.saturating_add(held.batch.len());
+                        }
                         effects.discarded_bytes =
                             effects.discarded_bytes.saturating_add(held.bytes);
                     }
@@ -653,33 +735,29 @@ impl FenceDriver {
             }
             Action::RefuseInput(refusal) => effects.input_refused = Some(*refusal),
             Action::CancelNativeOperations(cancel) => {
-                self.outbound
-                    .push_back(Outbound::Request(Box::new(WorkerRequest::Cancel(
-                        cancel.clone(),
-                    ))));
+                self.send(Outbound::Request(Box::new(WorkerRequest::Cancel(
+                    cancel.clone(),
+                ))));
             }
             Action::PublishFence(fence) => {
                 self.published = Some(fence.fence_id);
-                self.outbound
-                    .push_back(Outbound::Publication(FencePublication::Published(
-                        fence.clone(),
-                    )));
+                self.send(Outbound::Publication(FencePublication::Published(
+                    fence.clone(),
+                )));
             }
             Action::WithholdFence(reason) => {
-                self.outbound
-                    .push_back(Outbound::Publication(FencePublication::Withheld {
-                        reason: *reason,
-                        state,
-                    }));
+                self.send(Outbound::Publication(FencePublication::Withheld {
+                    reason: *reason,
+                    state,
+                }));
             }
             Action::InvalidateFence(reason) => {
                 if let Some(fence_id) = self.published.take() {
-                    self.outbound
-                        .push_back(Outbound::Publication(FencePublication::Invalidated {
-                            fence_id,
-                            reason: withheld_for(*reason),
-                            state,
-                        }));
+                    self.send(Outbound::Publication(FencePublication::Invalidated {
+                        fence_id,
+                        reason: withheld_for(*reason),
+                        state,
+                    }));
                 }
             }
             Action::EmitEditorBusy(event) => effects.editor_busy.push(event.clone()),
@@ -704,10 +782,9 @@ impl FenceDriver {
             }
             Action::SendLaunch(request) => {
                 self.live_launch = Some(request.transaction);
-                self.outbound
-                    .push_back(Outbound::Request(Box::new(WorkerRequest::Launch(
-                        request.clone(),
-                    ))));
+                self.send(Outbound::Request(Box::new(WorkerRequest::Launch(
+                    request.clone(),
+                ))));
             }
             Action::RevokeLaunch {
                 transaction,
@@ -717,7 +794,7 @@ impl FenceDriver {
                     self.live_launch = None;
                 }
                 self.awaiting.push_back(*transaction);
-                self.outbound.push_back(Outbound::Revocation {
+                self.send(Outbound::Revocation {
                     transaction: *transaction,
                     reason: *reason,
                 });

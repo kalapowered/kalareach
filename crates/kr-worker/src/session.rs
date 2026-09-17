@@ -16,6 +16,7 @@
 //! worker's current in-memory authority and identities, and the reply says `durability=volatile`
 //! rather than pretending it was recorded.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -190,6 +191,22 @@ pub struct Session {
     root_integration: Option<kr_shell_integration::host::handshake::Registration>,
     /// The last takeover receipt the machine completed.
     takeover_receipt: Option<crate::fence::TakeoverReceipt>,
+    /// The callers waiting for a reader to say what it did with their launch.
+    ///
+    /// It lives beside the machine rather than beside the runtime, because every answer is produced
+    /// while this session is locked: an answer that arrives with a closure, a lost bridge or a
+    /// reader's decision is delivered on the same step that produced it, and none can be dropped on
+    /// the way out.
+    launches: BTreeMap<
+        kr_shell_integration::contract::requests::LaunchTransactionId,
+        tokio::sync::oneshot::Sender<crate::fence::driver::LaunchAnswer>,
+    >,
+    /// Commands a reader installed after their transaction had been revoked.
+    late_installations: Vec<kr_protocol::root::ShellLaunchResult>,
+    /// Why the last interrupt this session tried did not reach the foreground group.
+    interrupt_failed: Option<String>,
+    /// Accepted bytes the root editor's machine is holding for a reader transition.
+    held_input_bytes: usize,
     /// What the renderings this session has produced could not carry.
     restoration_losses: crate::render::Carried,
     /// How much of the screen each attachment's caller may be shown.
@@ -404,6 +421,10 @@ impl Session {
             fence: None,
             root_integration: None,
             takeover_receipt: None,
+            launches: BTreeMap::new(),
+            late_installations: Vec::new(),
+            interrupt_failed: None,
+            held_input_bytes: 0,
             restoration_losses: crate::render::Carried::default(),
             forwarding_held: std::collections::BTreeMap::new(),
             projections: crate::snapshot::Bases::new(),
@@ -508,11 +529,42 @@ impl Session {
         self.root_integration.as_ref()
     }
 
+    /// Registers a caller waiting for a launch the reader is deciding.
+    pub fn register_launch(
+        &mut self,
+        transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
+    ) -> tokio::sync::oneshot::Receiver<crate::fence::driver::LaunchAnswer> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.launches.insert(transaction, sender);
+        receiver
+    }
+
+    /// Forgets a caller that is no longer waiting.
+    pub fn forget_launch(
+        &mut self,
+        transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
+    ) {
+        self.launches.remove(&transaction);
+    }
+
+    /// Returns the commands a reader installed after their transaction had been revoked.
+    ///
+    /// The transaction was over, so no caller is told they were installed; what it means is that the
+    /// editor holds a command this session had given up on, and the session records it.
+    #[must_use]
+    pub fn late_installations(&self) -> &[kr_protocol::root::ShellLaunchResult] {
+        &self.late_installations
+    }
+
     /// Carries out what one fence stimulus left for the session to do.
     ///
     /// The order is the machine's: released input reaches the writer before the event that explains
     /// why it waited, and an attachment is removed after the fence that named it has gone.
     pub fn apply_fence_effects(&mut self, effects: crate::fence::Effects) -> FenceOutcome {
+        self.held_input_bytes = self
+            .held_input_bytes
+            .saturating_add(effects.held_added)
+            .saturating_sub(effects.held_removed);
         for batch in effects.write {
             self.queue_input(batch);
         }
@@ -536,10 +588,22 @@ impl Session {
             let _ = self.detach(attachment_id);
         }
         if effects.interrupt.is_some() {
-            let _ = self.interrupt_foreground();
+            self.interrupt_failed = self
+                .interrupt_foreground()
+                .err()
+                .map(|error| error.to_string());
         }
         if let Some(receipt) = effects.receipts.last() {
             self.takeover_receipt = Some(*receipt);
+        }
+        self.late_installations
+            .extend(effects.late_installations.iter().cloned());
+        // Every caller waiting for one of these is answered here, on the step that produced the
+        // answer. A closure, a lost bridge and a reader's decision all reach this line.
+        for (transaction, answer) in &effects.launch_answers {
+            if let Some(sender) = self.launches.remove(transaction) {
+                let _ = sender.send(answer.clone());
+            }
         }
         self.pump_replies();
         FenceOutcome {
@@ -1571,7 +1635,11 @@ impl Session {
         let claimed = bytes.len().saturating_add(crate::input::PASTE_END.len());
         let queued = self
             .queued_input_bytes
-            .load(std::sync::atomic::Ordering::Acquire);
+            .load(std::sync::atomic::Ordering::Acquire)
+            // What the root editor's machine is holding for a reader transition has been accepted
+            // and not delivered, so it is against the same bound. Leaving it out would let a client
+            // that keeps typing through a hold exceed the bound without limit.
+            .saturating_add(self.held_input_bytes);
         if queued.saturating_add(claimed) > MAX_QUEUED_INPUT_BYTES {
             return Err(WorkerError::ResourceUnavailable {
                 detail: format!(
@@ -1599,24 +1667,7 @@ impl Session {
                 paste,
                 authority_deadline_boot_ms: admitted,
             };
-            // A managed session asks the root editor's machine what becomes of this batch. It is
-            // written now, held for at most 250 ms while a reader transition resolves, or dropped
-            // because its lease has moved; none of those three is decided here.
-            match self.fence.as_mut() {
-                Some(driver) => {
-                    let effects = driver.input_arrived(
-                        attachment_id,
-                        kr_protocol::ids::InputLeaseEpoch::new(epoch),
-                        batch,
-                    );
-                    if let Some(refusal) = effects.input_refused {
-                        let _ = refusal;
-                        return Err(WorkerError::SessionClosed);
-                    }
-                    let _ = self.apply_fence_effects(effects);
-                }
-                None => self.queue_input(batch),
-            }
+            self.offer_input(attachment_id, epoch, batch)?;
         }
         // What is still held is a suffix of the prefix that was held and the bytes this write
         // added. Longer than this write means it still carries bytes an earlier one handed over,
@@ -1641,6 +1692,39 @@ impl Session {
         })
     }
 
+    /// Offers one batch of a client's bytes to the terminal.
+    ///
+    /// Every client byte goes through here, whether it arrived in a frame or was released by the
+    /// paste recogniser's own timer. A managed session asks the root editor's machine what becomes
+    /// of it: written now, held for at most 250 ms while a reader transition resolves, or dropped
+    /// because its lease has moved. Queueing one of them anywhere else would let a later byte reach
+    /// the application in front of an earlier one the machine is still holding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::SessionClosed`] when the machine refuses the batch outright.
+    fn offer_input(
+        &mut self,
+        attachment_id: AttachmentId,
+        epoch: u64,
+        batch: InputBatch,
+    ) -> Result<()> {
+        let Some(driver) = self.fence.as_mut() else {
+            self.queue_input(batch);
+            return Ok(());
+        };
+        let effects = driver.input_arrived(
+            attachment_id,
+            kr_protocol::ids::InputLeaseEpoch::new(epoch),
+            batch,
+        );
+        if effects.input_refused.is_some() {
+            return Err(WorkerError::SessionClosed);
+        }
+        let _ = self.apply_fence_effects(effects);
+        Ok(())
+    }
+
     /// Forwards a held delimiter prefix whose deadline has passed.
     ///
     /// The timer runs whether or not more input arrives, so a lone Escape is never waiting for
@@ -1652,13 +1736,21 @@ impl Session {
                 let len = bytes.len();
                 // The prefix was accepted when it arrived and counted against the budget then, so
                 // it goes through whatever the budget says now: forwarding it unchanged is what
-                // the recogniser promised, and it is at most one delimiter long.
-                self.queue_input(InputBatch::Lease {
-                    epoch,
-                    bytes,
-                    paste: PasteTransition::default(),
-                    authority_deadline_boot_ms: self.held_input_deadline,
-                });
+                // the recogniser promised, and it is at most one delimiter long. It still goes
+                // through the machine, because a reader transition that is holding what came before
+                // it must hold this too, and it still carries the authority it was accepted under.
+                if let Some(holder) = self.lease.holder() {
+                    let _ = self.offer_input(
+                        holder,
+                        epoch,
+                        InputBatch::Lease {
+                            epoch,
+                            bytes,
+                            paste: PasteTransition::default(),
+                            authority_deadline_boot_ms: self.held_input_deadline,
+                        },
+                    );
+                }
                 self.held_input_deadline = None;
                 len
             }
@@ -1698,12 +1790,19 @@ impl Session {
             self.held_input_deadline = None;
             return;
         }
-        self.queue_input(InputBatch::Lease {
-            epoch: self.lease.epoch(),
-            bytes: released,
-            paste: PasteTransition::default(),
-            authority_deadline_boot_ms: self.held_input_deadline,
-        });
+        let epoch = self.lease.epoch();
+        if let Some(holder) = self.lease.holder() {
+            let _ = self.offer_input(
+                holder,
+                epoch,
+                InputBatch::Lease {
+                    epoch,
+                    bytes: released,
+                    paste: PasteTransition::default(),
+                    authority_deadline_boot_ms: self.held_input_deadline,
+                },
+            );
+        }
         self.held_input_deadline = None;
         // The held prefix has gone, so a frame that was open is closed and the response lane's
         // gate is open again.
@@ -1748,10 +1847,15 @@ impl Session {
                     }
                 });
             }
-            return if interrupt.is_some() {
-                Ok(())
-            } else {
-                Err(WorkerError::LeaseLost)
+            if interrupt.is_none() {
+                return Err(WorkerError::LeaseLost);
+            }
+            // The machine admitted it; whether the signal reached the foreground group is the
+            // operating system's answer, and a caller that is told nothing would read a failure as
+            // an interrupt that happened.
+            return match self.interrupt_failed.take() {
+                None => Ok(()),
+                Some(detail) => Err(WorkerError::ResourceUnavailable { detail }),
             };
         }
         if self.lease.holder() != Some(attachment_id) || self.lease.epoch() != epoch {

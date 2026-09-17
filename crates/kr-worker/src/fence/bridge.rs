@@ -103,10 +103,15 @@ impl BridgeServer {
             let Some(observed) = observe(&peer).process else {
                 continue;
             };
+            // The socket's writer is a task of its own. A reader that has stopped reading its own
+            // socket must not be able to stop the 250 ms timer: the hold belongs to the clock, not
+            // to whether the peer is keeping up.
+            let (outbound, receiving) = tokio::sync::mpsc::unbounded_channel();
             {
                 let mut session = self.runtime.session();
                 if let Some(driver) = session.fence_mut() {
                     let _ = driver.registered(hello.shell.kind);
+                    driver.send_through(outbound);
                 }
                 session.record_root_integration(Registration::new(
                     accepted.clone(),
@@ -114,30 +119,32 @@ impl BridgeServer {
                     observed,
                 ));
             }
-            self.pump(&mut reader, &mut writer).await;
-            let effects = {
+            let writing = tokio::spawn(write_outbound(writer, receiving));
+            self.pump(&mut reader).await;
+            // The connection has ended. The driver stops queueing for it, the writer task finishes
+            // whatever it had, and the session hears that its integration has gone.
+            {
                 let mut session = self.runtime.session();
-                session
-                    .fence_mut()
-                    .map(|driver| driver.integration_lost(IntegrationLoss::BridgeDisconnected))
-            };
-            if let Some(effects) = effects {
-                let _ = self.runtime.apply_fence_effects(effects);
+                if let Some(driver) = session.fence_mut() {
+                    driver.stop_sending();
+                }
             }
-            self.flush(&mut writer).await;
+            let _ = writing.await;
+            let _ = self
+                .runtime
+                .drive_fence(|driver| driver.integration_lost(IntegrationLoss::BridgeDisconnected));
             if self.runtime.state() == kr_protocol::session::SessionState::Closed {
                 return;
             }
         }
     }
 
-    /// Reads, writes and times one registered connection.
-    async fn pump(&self, reader: &mut BridgeReader, writer: &mut BridgeWriter) {
+    /// Reads and times one registered connection.
+    ///
+    /// Two things happen here and nothing else: a frame arrives, or the machine's one timer fires.
+    /// Writing is the other task's, so neither can hold the other up.
+    async fn pump(&self, reader: &mut BridgeReader) {
         loop {
-            self.flush(writer).await;
-            if !writer.is_live() {
-                return;
-            }
             let (wake, deadline) = {
                 let session = self.runtime.session();
                 let Some(driver) = session.fence() else {
@@ -145,6 +152,8 @@ impl BridgeServer {
                 };
                 (driver.waker(), driver.deadline())
             };
+            // The wait is created before the deadline is read, and a stimulus stores a permit
+            // rather than broadcasting, so a deadline that moved between the two is not missed.
             let notified = wake.notified();
             let frame = match deadline {
                 Some(left) => tokio::select! {
@@ -159,64 +168,52 @@ impl BridgeServer {
                     () = notified => continue,
                 },
             };
-            let effects = {
-                let mut session = self.runtime.session();
-                let Some(driver) = session.fence_mut() else {
-                    return;
-                };
-                match frame {
-                    // The timer fired. A deadline is a fact about the clock rather than about which
-                    // message arrives next, so the sweep happens here whether or not the reader is
-                    // saying anything.
-                    None => driver.expire(),
-                    Some(Ok(FromBridge::Event { id, event })) => driver.bridge_event(id, &event),
-                    Some(Ok(FromBridge::Answer { answer, .. })) => driver.bridge_answer(&answer),
-                    // A second hello on a registered connection, or a frame a bridge does not send,
-                    // or a connection that ended. All three end the connection.
-                    Some(Ok(FromBridge::Hello(_))) | Some(Err(_)) => {
-                        reader.finish();
-                        return;
-                    }
+            let mut ended = false;
+            let _ = self.runtime.drive_fence(|driver| match frame {
+                // The timer fired. A deadline is a fact about the clock rather than about which
+                // message arrives next, so the sweep happens here whether or not the reader is
+                // saying anything.
+                None => driver.expire(),
+                Some(Ok(FromBridge::Event { id, event })) => driver.bridge_event(id, &event),
+                Some(Ok(FromBridge::Answer { answer, .. })) => driver.bridge_answer(&answer),
+                // A second hello on a registered connection, or a frame a bridge does not send, or
+                // a connection that ended. All three end the connection.
+                Some(Ok(FromBridge::Hello(_))) | Some(Err(_)) => {
+                    ended = true;
+                    crate::fence::Effects::default()
                 }
-            };
-            let _ = self.runtime.apply_fence_effects(effects);
-        }
-    }
-
-    /// Writes whatever the driver has queued for the bridge.
-    async fn flush(&self, writer: &mut BridgeWriter) {
-        loop {
-            let queued = {
-                let mut session = self.runtime.session();
-                session
-                    .fence_mut()
-                    .map(crate::fence::FenceDriver::take_outbound)
-                    .unwrap_or_default()
-            };
-            if queued.is_empty() {
+            });
+            if ended {
+                reader.finish();
                 return;
             }
-            for frame in queued {
-                let sent = match frame {
-                    Outbound::Request(request) => {
-                        let id = writer.next_request_id();
-                        writer.send_request(id, *request).await
-                    }
-                    Outbound::EventResult { id, result } => {
-                        writer.send_event_result(id, *result).await
-                    }
-                    Outbound::Publication(publication) => {
-                        writer.send_publication(publication).await
-                    }
-                    Outbound::Revocation {
-                        transaction,
-                        reason,
-                    } => writer.send_revocation(transaction, reason).await,
-                };
-                if sent.is_err() {
-                    return;
-                }
+        }
+    }
+}
+
+/// Writes what the driver queues, for as long as the connection lasts.
+async fn write_outbound(
+    mut writer: BridgeWriter,
+    mut queued: tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+) {
+    while let Some(frame) = queued.recv().await {
+        let sent = match frame {
+            Outbound::Request(request) => {
+                let id = writer.next_request_id();
+                writer.send_request(id, *request).await
             }
+            Outbound::EventResult { id, result } => writer.send_event_result(id, *result).await,
+            Outbound::Publication(publication) => writer.send_publication(publication).await,
+            Outbound::Revocation {
+                transaction,
+                reason,
+            } => writer.send_revocation(transaction, reason).await,
+        };
+        if sent.is_err() {
+            // The peer has gone or the frame was cut in half. Either way this connection is over,
+            // and the reader's side finds out on its own next read.
+            writer.finish();
+            return;
         }
     }
 }

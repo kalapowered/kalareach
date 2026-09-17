@@ -282,7 +282,10 @@ pub struct NewArguments {
     /// The shell to launch. The environment's configured default is used when this is absent.
     #[arg(long)]
     pub shell: Option<String>,
-    /// The shell integration mode. This build implements `native_compat`.
+    /// The shell integration mode: `managed` or `native_compat`.
+    ///
+    /// `managed` launches a KalaReach-qualified shell package, with empty-prompt Ctrl-D and the
+    /// fenced launch. `native_compat` launches the selected stock shell and claims neither.
     #[arg(long, default_value = "native_compat")]
     pub shell_mode: String,
     /// The palette the session starts with: `light`, `dark`, or `probe` to adopt this terminal's

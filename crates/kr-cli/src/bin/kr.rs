@@ -90,12 +90,18 @@ async fn run(cli: Cli) -> Result<Completion> {
     match cli.command {
         Command::New(arguments) => {
             let presentation = arguments.presentation.resolve(stdio_is_terminal())?;
-            if arguments.shell_mode != ShellMode::NativeCompat.as_str() {
-                return Err(CliError::ShellIntegrationUnsupported(format!(
-                    "this host implements the native_compat shell mode; {} needs a qualified shell package",
-                    arguments.shell_mode
-                )));
-            }
+            // Both modes are real choices, and neither is a substitute for the other: a managed
+            // request the host cannot serve is refused by name rather than created as a stock
+            // session, and the daemon decides that before it reserves anything.
+            let shell_mode = match arguments.shell_mode.as_str() {
+                "managed" => ShellMode::Managed,
+                "native_compat" => ShellMode::NativeCompat,
+                other => {
+                    return Err(CliError::Usage(format!(
+                        "{other} is not a shell mode; choose managed or native_compat"
+                    )));
+                }
+            };
             // The environment the session is created in is the one the caller named, resolved
             // before anything connects. A selector that is ignored would create the session
             // somewhere else and say nothing about it.
@@ -149,7 +155,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 environment_id: environment.environment_id,
                 presentation,
                 shell: Nullable(arguments.shell),
-                shell_mode: ShellMode::NativeCompat,
+                shell_mode,
                 cwd: Nullable(arguments.cwd.or_else(|| {
                     std::env::current_dir()
                         .ok()
@@ -214,11 +220,16 @@ async fn run(cli: Cli) -> Result<Completion> {
                 );
                 // The receipt, not the request: what the session was actually created with.
                 println!("{}", report::desktop_line(&created.session));
-                println!(
-                    "shell mode {}: Ctrl-D at the prompt follows {}'s own behaviour; kr detach always works",
-                    created.session.shell_mode.as_str(),
-                    created.session.shell_path
-                );
+                match created.session.shell_mode {
+                    ShellMode::Managed => println!(
+                        "shell mode managed: Ctrl-D at an empty root prompt detaches this client, and a launch installs a command in {}'s own editor",
+                        created.session.shell_path
+                    ),
+                    ShellMode::NativeCompat => println!(
+                        "shell mode native_compat: Ctrl-D at the prompt follows {}'s own behaviour and can close the session, a launch installs no command, and kr detach always works",
+                        created.session.shell_path
+                    ),
+                }
                 if let Err(error) = presented.as_ref() {
                     eprintln!("kr: the session was created; its terminal was not opened: {error}");
                 }

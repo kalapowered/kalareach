@@ -496,6 +496,26 @@ impl WorkerService {
             // refusal rather than a socket that closed.
             let protected = !withdrawn.is_set();
             let reply = self.handle(&mut state, &peer, message).await;
+            // A launch the reader is still deciding is answered on its own task, so this loop goes
+            // on serving the same client: its next keystroke, its interrupt and its detach do not
+            // wait behind a transaction the reader has not finished.
+            if let Some(pending) = state.pending_launch.take() {
+                let service = Arc::clone(&self);
+                let sender = Arc::clone(&writer);
+                let answering_writable = writable.clone();
+                let answering_withdrawn = Arc::clone(&withdrawn);
+                tokio::spawn(async move {
+                    let answer = service.finish_launch(pending).await;
+                    write_frame(
+                        &answering_writable,
+                        &sender,
+                        &answer,
+                        &answering_withdrawn,
+                        true,
+                    )
+                    .await
+                });
+            }
             if let Some(reply) = reply {
                 // A close that was admitted happens, whether or not its acceptance can be written.
                 // What the two bounds here separate is the write and the delivery: the write gets
@@ -851,18 +871,23 @@ impl WorkerService {
             }
             ControlFrame::Mutation(mutation) => {
                 let caller = Caller::local(state.actor_id.clone());
-                Some(
-                    self.mutation(
+                let reply = self
+                    .mutation(
                         state,
                         &mutation,
                         &caller,
                         Freshness::Window(self.clock.now()),
                         false,
                     )
-                    .await,
-                )
+                    .await;
+                // A launch the reader is deciding has no answer yet, and this request is written
+                // when it has one.
+                state.pending_launch.is_none().then_some(reply)
             }
-            ControlFrame::Forwarded(forwarded) => Some(self.forwarded(state, &forwarded).await),
+            ControlFrame::Forwarded(forwarded) => {
+                let reply = self.forwarded(state, &forwarded).await;
+                state.pending_launch.is_none().then_some(reply)
+            }
             ControlFrame::ForwardedRead(forwarded) => Some(self.forwarded_read(state, &forwarded)),
             _ => Some(failure(
                 RequestId::new(0),
@@ -1780,34 +1805,21 @@ impl WorkerService {
                 transaction,
                 receiver,
             }) => {
-                // The boundary is over and the barrier is released: a 250 ms transaction holds the
-                // input this session accepted, not every other mutation on this worker. What is
-                // awaited is the reader's own word, which the machine's timer bounds; a receiver
-                // that ends without one means the session went, and the caller is owed the outcome
-                // it cannot establish rather than a claim that nothing happened.
-                let answer = receiver.await.unwrap_or(
-                    crate::fence::driver::LaunchAnswer::Refused {
-                        reason:
-                            kr_shell_integration::contract::requests::LaunchRejectionReason::ConfirmationLost,
-                        code: ErrorCode::OutcomeUnknown,
-                    },
-                );
-                self.runtime.forget_launch(transaction);
-                let outcome = match answer {
-                    crate::fence::driver::LaunchAnswer::Installed(result) => encode(&result),
-                    crate::fence::driver::LaunchAnswer::Refused { reason, code } => {
-                        Err(WorkerError::LaunchRefused {
-                            reason: reason.as_str(),
-                            code,
-                        })
-                    }
-                };
-                // A launch's outcome is settled here rather than inside the boundary, because
-                // inside it nobody knew what it would be. The dispatch marker was committed before
-                // the request reached the reader, so a crash in between leaves the receipt
-                // `unknown`, which is exactly what a command that may be in the editor is.
-                self.settle(&caller.actor_id, mutation.action_id, outcome.as_ref());
-                outcome.map(Answered::Performed)
+                // The answer is the reader's, and it arrives later. Waiting for it on this task
+                // would stop the connection reading anything else: the same client's next
+                // keystroke, its interrupt, its detach and its keepalive all travel on this socket.
+                // So the wait, the receipt and the response leave the read loop and happen on their
+                // own task, and this request is answered when the reader answers it.
+                state.pending_launch = Some(PendingLaunch {
+                    request_id: mutation.request_id,
+                    action_id: mutation.action_id,
+                    actor_id: caller.actor_id.clone(),
+                    transaction,
+                    receiver,
+                });
+                // Nothing is written now. The connection's loop finds the pending launch, hands it
+                // to a task of its own and writes nothing for this request until the reader speaks.
+                return ControlFrame::Event(ControlEvent::Keepalive);
             }
             other => other,
         };
@@ -1839,6 +1851,36 @@ impl WorkerService {
         }
     }
 
+    /// Waits for a launch the reader is deciding, records its outcome and answers the caller.
+    ///
+    /// It runs on its own task. The dispatch marker was committed before the request reached the
+    /// reader, so a crash in between leaves the receipt `unknown`, which is exactly what a command
+    /// that may be in the editor is. A receiver that ends without an answer means the session went,
+    /// and the caller is owed the outcome nothing can establish rather than a claim that nothing
+    /// happened.
+    async fn finish_launch(&self, pending: PendingLaunch) -> ControlFrame {
+        let answer = pending
+            .receiver
+            .await
+            .unwrap_or(crate::fence::driver::LaunchAnswer::Refused {
+            reason:
+                kr_shell_integration::contract::requests::LaunchRejectionReason::ConfirmationLost,
+            code: ErrorCode::OutcomeUnknown,
+        });
+        self.runtime.forget_launch(pending.transaction);
+        let outcome = match answer {
+            crate::fence::driver::LaunchAnswer::Installed(result) => encode(&result),
+            crate::fence::driver::LaunchAnswer::Refused { reason, code } => {
+                Err(WorkerError::LaunchRefused {
+                    reason: reason.as_str(),
+                    code,
+                })
+            }
+        };
+        self.settle(&pending.actor_id, pending.action_id, outcome.as_ref());
+        respond(pending.request_id, outcome)
+    }
+
     /// Records the outcome of a mutation that was settled outside the session boundary.
     fn settle(
         &self,
@@ -1863,10 +1905,18 @@ impl WorkerService {
                     now,
                 )
             }
+            // The reader is the authoritative interface for a launch. When it says the buffer had
+            // moved or the transaction was revoked before it installed anything, it has *proved*
+            // the refusal, which is `refused` rather than `unknown`. Only an answer nothing can
+            // give any more leaves the outcome unknown.
             Err(error) => journal.settle(
                 actor_id.clone(),
                 action_id,
-                kr_protocol::receipt::ReceiptState::Unknown,
+                if error.code() == ErrorCode::OutcomeUnknown {
+                    kr_protocol::receipt::ReceiptState::Unknown
+                } else {
+                    kr_protocol::receipt::ReceiptState::Refused
+                },
                 None,
                 Some(error.to_protocol_error()),
                 now,
@@ -3423,8 +3473,10 @@ impl WorkerService {
                         kr_ipc::new_uuid(),
                     );
                 // Registered before the machine is asked, so an answer that arrives from the
-                // bridge's own task the instant the reservation is sent has somewhere to go.
-                let receiver = self.runtime.register_launch(transaction);
+                // bridge's own task the instant the reservation is sent has somewhere to go. It
+                // goes on the session this call already holds: reaching for the lock again here
+                // would be this thread waiting for itself.
+                let receiver = session.register_launch(transaction);
                 let driver = session.fence_mut().ok_or_else(|| {
                     WorkerError::ShellIntegrationUnsupported {
                         detail: "this session has no managed root editor to install into"
@@ -3436,7 +3488,7 @@ impl WorkerService {
                 // A refusal the machine could take on its own arrives here: nothing was sent to the
                 // reader, so there is nothing to wait for.
                 if let Some((_, answer)) = outcome.launch_answers.into_iter().next() {
-                    self.runtime.forget_launch(transaction);
+                    session.forget_launch(transaction);
                     return match answer {
                         crate::fence::driver::LaunchAnswer::Installed(result) => {
                             Ok((encode(&result)?, AfterEffect::None))
@@ -3861,6 +3913,11 @@ pub struct ConnectionState {
     pub input_sequence: u64,
     /// A close that has been admitted and whose acceptance has not yet been written.
     pub close_gate: Option<(kr_protocol::ids::ActionId, crate::runtime::CloseGate)>,
+    /// A launch this connection asked for, whose answer the reader has not given yet.
+    ///
+    /// The connection's own loop takes it and hands it to a task of its own, so the read loop goes
+    /// on serving this client while its launch is with the reader.
+    pub pending_launch: Option<PendingLaunch>,
     /// A close whose acceptance was written and whose delivery a proxy has not yet confirmed.
     pub pending_delivery: Option<(kr_protocol::ids::ActionId, crate::runtime::PendingDelivery)>,
     /// A generation challenge waiting to be sent after the current reply.
@@ -3912,6 +3969,7 @@ impl ConnectionState {
             subscribed: None,
             input_sequence: 0,
             close_gate: None,
+            pending_launch: None,
             pending_delivery: None,
             pending_challenge: None,
             restoration: None,
@@ -4254,6 +4312,23 @@ fn failure(request_id: RequestId, error: &ProtocolError) -> ControlFrame {
         request_id,
         outcome: Outcome::Error(error.clone()),
     })
+}
+
+/// One launch whose answer the reader has not given yet.
+///
+/// Everything the answer needs, carried off the connection's read loop so the wait holds nothing up.
+#[derive(Debug)]
+pub struct PendingLaunch {
+    /// The request the answer belongs to.
+    request_id: RequestId,
+    /// The action its receipt belongs to.
+    action_id: kr_protocol::ids::ActionId,
+    /// The principal that asked.
+    actor_id: ActorId,
+    /// The transaction.
+    transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
+    /// Where the reader's word arrives.
+    receiver: tokio::sync::oneshot::Receiver<crate::fence::driver::LaunchAnswer>,
 }
 
 /// What a mutation left for the caller to do once the session boundary is over.
