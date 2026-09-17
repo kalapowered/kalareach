@@ -1071,7 +1071,10 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
     let declared = bytes.len() as u64;
 
     // Both guards clean up on the way out, including the way out an assertion takes.
-    let _secrets = EnvironmentSecrets(environment_id);
+    let secrets = EnvironmentSecrets {
+        environment_id,
+        secrets: environment.secrets_dir(),
+    };
     let mut first = start_daemon(&program, &host);
     wait_for_daemon(&endpoint).await;
     let transfer_id: TransferId;
@@ -1266,6 +1269,9 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
     drop(control);
     drop(chunks);
     second.stop();
+    // Checked here, rather than left to the guard: a test that cannot clean up after itself says
+    // so instead of leaving an item in the operator's credential store.
+    secrets.remove().expect("removes the daemon's secrets");
 }
 
 /// A daemon this test started, ended when it goes out of scope however that happens.
@@ -1297,28 +1303,80 @@ impl Drop for Daemon {
 
 /// The secrets one environment's daemon created, removed when this goes out of scope.
 ///
-/// A daemon writes its identity to the platform's credential store on its first start. On this
-/// platform that store is the login keychain, which outlives the temporary directories the rest of
-/// this test lives in, so the items are removed explicitly. On the Unix systems whose store is the
-/// file fallback the secrets are inside the temporary root and go with it.
+/// A daemon writes its identity to whichever store `open_store` chooses: the platform's credential
+/// store where there is one, and the owner-only directory fallback otherwise. The platform store
+/// outlives the temporary directories the rest of this test lives in, so the items are removed
+/// through the same store the daemon chose rather than through one platform's command line.
 #[cfg(unix)]
-struct EnvironmentSecrets(EnvironmentId);
+struct EnvironmentSecrets {
+    environment_id: EnvironmentId,
+    /// Where the fallback store keeps them, on the platforms that have one.
+    #[cfg_attr(
+        target_os = "macos",
+        expect(
+            dead_code,
+            reason = "the platform tool works by \
+        service and account, and never reads the directory a fallback store would use"
+        )
+    )]
+    secrets: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl EnvironmentSecrets {
+    /// Removes them, and says whether it managed to.
+    ///
+    /// The daemon created these items, and on macOS an item belongs to the program that created
+    /// it: this test's own process cannot delete them through the same interface, because the
+    /// keychain treats that as a change of owner. The platform's own tool can, and does it by
+    /// service and account without reading the secret, so that is what this uses there. Everywhere
+    /// else the store the daemon chose is the store this removes from.
+    #[cfg(target_os = "macos")]
+    fn remove(&self) -> Result<(), String> {
+        for purpose in kr_protocol::pairing::KeyPurpose::ALL.map(|purpose| purpose.as_str()) {
+            let account = format!("{}/device-key/{purpose}", self.environment_id);
+            let status = std::process::Command::new("security")
+                .arg("delete-generic-password")
+                .arg("-s")
+                .arg(CONTROLLER_SECRET_SERVICE)
+                .arg("-a")
+                .arg(&account)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|error| format!("the platform's keychain tool did not run: {error}"))?;
+            // 44 is what it reports for an item that is not there, which is the outcome this
+            // wanted anyway.
+            if !status.success() && status.code() != Some(44) {
+                return Err(format!("{account} could not be removed: {status}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes them through the store the daemon chose.
+    #[cfg(not(target_os = "macos"))]
+    fn remove(&self) -> Result<(), String> {
+        let store = open_store(CONTROLLER_SECRET_SERVICE, &self.secrets)
+            .map_err(|error| format!("the daemon's secret store could not be opened: {error}"))?;
+        let scope = self.environment_id.to_string();
+        for purpose in kr_protocol::pairing::KeyPurpose::ALL {
+            let name = kr_crypto::store::SecretName::device_key(&scope, purpose)
+                .map_err(|error| format!("{purpose:?} is not a name this store takes: {error}"))?;
+            store
+                .store
+                .delete(&name)
+                .map_err(|error| format!("{purpose:?} could not be removed: {error}"))?;
+        }
+        Ok(())
+    }
+}
 
 #[cfg(unix)]
 impl Drop for EnvironmentSecrets {
     fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
-        for purpose in kr_protocol::pairing::KeyPurpose::ALL.map(|purpose| purpose.as_str()) {
-            let _ = std::process::Command::new("security")
-                .arg("delete-generic-password")
-                .arg("-s")
-                .arg("KalaReach")
-                .arg("-a")
-                .arg(format!("{}/device-key/{purpose}", self.0))
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+        // Best effort on the way out an assertion takes. The successful path checks the result.
+        let _ = self.remove();
     }
 }
 
