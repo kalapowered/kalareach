@@ -118,6 +118,11 @@ pub struct Comparison {
 
 impl Comparison {
     /// Whether the destination is showing the whole of what the session holds.
+    ///
+    /// Two fields are counts of another field's loss rather than losses of their own, and are not
+    /// read here: a row is only clipped when cells of it were clipped, and a cell is only outside
+    /// the window when the row holding it is. Each travels with the field that reports it, so
+    /// reading them here would make a frame incomplete for a reason nothing could put into words.
     #[must_use]
     pub const fn complete(&self) -> bool {
         self.runs_replaced == 0
@@ -128,7 +133,6 @@ impl Comparison {
             && self.soft_wraps == 0
             && self.truncated_rows == 0
             && self.rows_outside == 0
-            && self.cells_outside == 0
             && !self.keyboard_withheld
             && self.keyboard_stack == 0
             && self.controls_dropped == 0

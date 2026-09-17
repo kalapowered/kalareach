@@ -209,88 +209,99 @@ impl ProjectedDisplay {
     /// a person told that something was clipped can ask for a wider window.
     #[must_use]
     pub fn degradation(&self) -> Option<String> {
-        if self.losses.complete() && !self.session_degraded() {
+        report(self.losses, self.session_degraded())
+    }
+}
+
+/// The sentence one comparison deserves, if any.
+///
+/// Every field of a comparison has a phrase here. A comparison that is not complete and produces
+/// no phrase would print an empty report, which tells a person that something is wrong and not
+/// what, so the mapping is total by construction and checked by a test that walks it.
+fn report(losses: Comparison, degraded: bool) -> Option<String> {
+    {
+        if losses.complete() && !degraded {
             return None;
         }
         let mut parts = Vec::new();
-        if self.session_degraded() {
+        if degraded {
             // The session's own answer, not this terminal's: content it had to shorten to stay
             // inside a resident-state bound is content no window size can show.
             parts.push("content the session shortened to stay inside its own bounds".to_owned());
         }
-        if self.losses.cells_clipped > 0 {
-            let cells = usize::try_from(self.losses.cells_clipped).unwrap_or(usize::MAX);
+        if losses.cells_clipped > 0 {
+            let cells = usize::try_from(losses.cells_clipped).unwrap_or(usize::MAX);
             parts.push(format!(
                 "{} outside this window",
                 plural(cells, "cell", "cells")
             ));
         }
-        if self.losses.clusters_replaced > 0 {
+        if losses.clusters_replaced > 0 {
             parts.push(format!(
                 "{} the window's edge fell inside",
-                plural(self.losses.clusters_replaced, "character", "characters")
+                plural(losses.clusters_replaced, "character", "characters")
             ));
         }
-        if self.losses.runs_replaced > 0 {
+        if losses.runs_replaced > 0 {
             parts.push(format!(
                 "{} this terminal cannot place",
-                plural(self.losses.runs_replaced, "run", "runs")
+                plural(losses.runs_replaced, "run", "runs")
             ));
         }
-        if self.losses.rows_outside > 0 {
+        if losses.rows_outside > 0 {
             parts.push(format!(
                 "{} of the session's rows outside this window, holding {}",
-                self.losses.rows_outside,
+                losses.rows_outside,
                 plural(
-                    usize::try_from(self.losses.cells_outside).unwrap_or(usize::MAX),
+                    usize::try_from(losses.cells_outside).unwrap_or(usize::MAX),
                     "cell",
                     "cells"
                 )
             ));
         }
-        if self.losses.keyboard_withheld {
+        if losses.keyboard_withheld {
             parts.push(
                 "the session's keyboard protocols, which this terminal was never asked about"
                     .to_owned(),
             );
         }
-        if self.losses.keyboard_stack > 0 {
+        if losses.keyboard_stack > 0 {
             parts.push(format!(
                 "{} the session holds, installed as a state rather than a stack",
-                plural(
-                    self.losses.keyboard_stack,
-                    "keyboard entry",
-                    "keyboard entries"
-                )
+                plural(losses.keyboard_stack, "keyboard entry", "keyboard entries")
             ));
         }
-        if self.losses.controls_dropped > 0 {
+        if losses.controls_dropped > 0 {
             parts.push(format!(
                 "{} whose control bytes were dropped",
-                plural(
-                    self.losses.controls_dropped,
-                    "title or link",
-                    "titles or links"
-                )
+                plural(losses.controls_dropped, "title or link", "titles or links")
             ));
         }
-        if self.losses.soft_wraps > 0 {
+        if losses.soft_wraps > 0 {
             parts.push(format!(
                 "{} drawn as separate rows",
-                plural(self.losses.soft_wraps, "wrapped line", "wrapped lines")
+                plural(losses.soft_wraps, "wrapped line", "wrapped lines")
             ));
         }
-        if self.losses.truncated_rows > 0 {
+        if losses.truncated_rows > 0 {
             parts.push(format!(
                 "{} the session had already shortened",
-                plural(self.losses.truncated_rows, "row", "rows")
+                plural(losses.truncated_rows, "row", "rows")
             ));
         }
-        if self.losses.pending_wrap {
+        if losses.pending_wrap {
             parts.push("a pending wrap".to_owned());
         }
-        if self.losses.cursor_outside {
+        if losses.cursor_outside {
             parts.push("the cursor outside this window".to_owned());
+        }
+        if losses.geometry_withheld {
+            // A margin is a row and a column of the canonical grid, so a window showing part of
+            // the grid has nowhere to put one. Everything drawn here is addressed absolutely and
+            // is unaffected; what is affected is an application that writes to this terminal
+            // itself, which is why it is reported rather than passed over.
+            parts
+                .push("the session's own scroll region, which this window cannot carry".to_owned());
         }
         Some(parts.join(", "))
     }
@@ -312,4 +323,69 @@ pub const fn discards_the_screen(refusal: Refusal) -> bool {
         refusal,
         Refusal::BaseMismatch | Refusal::WrongGeneration | Refusal::NoScreen
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// KR-ACC-023: a projection that could not carry something says what, in words, always.
+    #[test]
+    fn every_loss_a_comparison_can_hold_has_a_phrase() {
+        assert_eq!(
+            report(Comparison::default(), false),
+            None,
+            "a frame that carried everything says nothing"
+        );
+        assert_eq!(
+            report(Comparison::default(), true).as_deref(),
+            Some("content the session shortened to stay inside its own bounds"),
+            "and the session's own shortening is this terminal's to report"
+        );
+        // One field at a time, because the interesting failure is a field nothing describes: the
+        // report would be an empty sentence, which says that something is wrong and not what.
+        let each: [(&str, fn(&mut Comparison)); 10] = [
+            ("cells_clipped", |losses| losses.cells_clipped = 3),
+            ("clusters_replaced", |losses| losses.clusters_replaced = 1),
+            ("runs_replaced", |losses| losses.runs_replaced = 2),
+            ("rows_outside", |losses| losses.rows_outside = 4),
+            ("soft_wraps", |losses| losses.soft_wraps = 1),
+            ("truncated_rows", |losses| losses.truncated_rows = 1),
+            ("pending_wrap", |losses| losses.pending_wrap = true),
+            ("cursor_outside", |losses| losses.cursor_outside = true),
+            ("keyboard_withheld", |losses| {
+                losses.keyboard_withheld = true;
+            }),
+            ("geometry_withheld", |losses| {
+                losses.geometry_withheld = true;
+            }),
+        ];
+        for (name, set) in each {
+            let mut losses = Comparison::default();
+            set(&mut losses);
+            assert!(!losses.complete(), "{name} is a loss");
+            let sentence = report(losses, false)
+                .unwrap_or_else(|| panic!("{name} is reported rather than passed over"));
+            assert!(!sentence.trim().is_empty(), "{name} has words of its own");
+        }
+        // Two fields are counts of something else's loss rather than losses of their own: a row is
+        // only clipped when cells of it were, and a cell is only outside when its row is. They
+        // travel with the field that reports them, so neither makes a frame incomplete by itself.
+        for (name, set) in [
+            (
+                "rows_clipped",
+                (|losses: &mut Comparison| losses.rows_clipped = 1) as fn(&mut _),
+            ),
+            ("cells_outside", |losses: &mut Comparison| {
+                losses.cells_outside = 40;
+            }),
+        ] {
+            let mut losses = Comparison::default();
+            set(&mut losses);
+            assert!(
+                losses.complete(),
+                "{name} counts another field's loss and reports nothing alone"
+            );
+        }
+    }
 }
