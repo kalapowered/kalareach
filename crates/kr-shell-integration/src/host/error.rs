@@ -33,6 +33,9 @@ pub enum HostError {
         /// The frame's variant name.
         frame: &'static str,
     },
+    /// The connection has ended, so nothing more travels on it.
+    #[error("this bridge connection has ended")]
+    ConnectionFinished,
     /// The bridge was refused registration.
     #[error("the bridge was refused: {}", .0.as_str())]
     Refused(QualificationReason),
@@ -57,6 +60,7 @@ impl HostError {
             Self::Endpoint(_) | Self::Frame(_) | Self::WrongDirection { .. } => {
                 ErrorCode::InvalidArgument
             }
+            Self::ConnectionFinished => ErrorCode::SessionClosed,
         }
     }
 

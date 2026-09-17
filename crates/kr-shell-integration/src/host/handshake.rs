@@ -1,18 +1,22 @@
 //! The worker's half of the `kr-shell-bridge/1` handshake.
 //!
-//! Three questions are answered here, in this order, and the order is the point.
+//! Three things happen here, and only the last of them decides anything.
 //!
-//! 1. **Who is calling?** The kernel's answer, never the hello's. The listener has already refused
-//!    another user; this reads the connecting process and its start identity, so a child that
-//!    inherited the bootstrap values and names its parent's identifier is refused as a different
-//!    process rather than accepted as its parent.
-//! 2. **Does it hold the secret?** The proof is HMAC-SHA-256 over
-//!    [`bootstrap_transcript`](crate::contract::transport::bootstrap_transcript) under the
-//!    one-time bootstrap secret, compared in constant time.
-//! 3. **Is it qualified?** [`decide_handshake`] decides the rest, and the contract owns those
-//!    rules so a package and the worker cannot drift apart.
+//! 1. **The kernel is asked who is calling.** The listener has already refused another user;
+//!    [`observe`] reads the connecting process and its start identity from the operating system.
+//!    Nothing in the hello contributes to that answer.
+//! 2. **The proof is verified.** [`verify`] rebuilds the transcript from what the *worker* knows:
+//!    its own session, its own endpoint and the root process it launched. Only the integration
+//!    version comes from the hello, because a package computes its proof over the version it was
+//!    built as and the contract checks that version separately. The comparison is HMAC-SHA-256 in
+//!    constant time, and a tag that is not exactly 32 bytes fails without one.
+//! 3. **The contract decides.** [`decide_handshake`] compares the observed process with the
+//!    launched root shell and with the hello's own claim, then reads the verdict above, then the
+//!    declaration. Its order is what names the refusal: a child that inherited the bootstrap
+//!    values is refused as a different process rather than as a bad proof, whichever identity it
+//!    claims.
 //!
-//! The secret never leaves this module's caller: the contract takes a [`ProofVerdict`], not bytes.
+//! The secret never leaves this module: the contract takes a [`ProofVerdict`], not bytes.
 
 use kr_crypto::kdf::{hmac_sha256, verify_hmac_sha256};
 use kr_crypto::secret::SymmetricKey;
@@ -62,26 +66,27 @@ pub fn proof(
     Ok(hmac_sha256(secret, &transcript))
 }
 
-/// Verifies the proof a hello carried.
+/// Verifies the proof a hello carried, against the root shell the worker launched.
 ///
-/// The transcript is rebuilt from what the *worker* knows, not from what the hello says, except
-/// for the shell's own process identity, which the caller has already checked against the kernel's
-/// view. A hello whose proof is not exactly the tag length fails without a comparison, so a short
-/// tag cannot be extended by the verifier.
+/// The transcript is rebuilt from the worker's own values: its session, its endpoint and the
+/// process identity it recorded when it started the root shell. The hello supplies only the
+/// integration version, which a package computes its proof over and the contract checks against
+/// what this build supports. So a proof taken over another process's identity fails here even
+/// before the contract compares identities, and a short or long tag fails without a comparison.
 ///
 /// # Errors
 ///
 /// Returns [`crate::host::HostError::Frame`] when the transcript cannot be encoded canonically.
 pub fn verify(
     secret: &SymmetricKey,
-    session_id: kr_protocol::ids::SessionId,
+    expectation: &WorkerExpectation,
     endpoint: &BridgeEndpoint,
     hello: &BridgeHello,
 ) -> Result<ProofVerdict> {
     let transcript = bootstrap_transcript(
-        session_id,
+        expectation.session_id,
         endpoint,
-        &hello.shell_process,
+        &expectation.root_process,
         &hello.shell.integration_version,
     )?;
     let Ok(tag) = <[u8; Mac256::LEN]>::try_from(hello.proof.as_slice()) else {
@@ -125,7 +130,7 @@ pub fn admit_observed(
     observed: &ObservedPeer,
     hello: &BridgeHello,
 ) -> Result<HandshakeOutcome> {
-    let verdict = verify(secret, expectation.session_id, endpoint, hello)?;
+    let verdict = verify(secret, expectation, endpoint, hello)?;
     Ok(decide_handshake(expectation, observed, hello, verdict))
 }
 
@@ -247,28 +252,44 @@ mod tests {
         let secret = Secret::random().expect("a secret");
         let hello = hello(&secret, root());
         assert_eq!(
-            verify(&secret, session(), &address(), &hello).expect("verifies"),
+            verify(&secret, &expectation(), &address(), &hello).expect("verifies"),
             ProofVerdict::Verified
         );
-        // Another session's endpoint, another endpoint's path and another secret each break it.
-        let other_session = kr_protocol::ids::SessionId::new(Uuid::from_bytes([0x44; 16]));
+        // Another session, another endpoint path, another root process and another secret each
+        // break it.
+        let other_session = WorkerExpectation {
+            session_id: kr_protocol::ids::SessionId::new(Uuid::from_bytes([0x44; 16])),
+            ..expectation()
+        };
         assert_eq!(
-            verify(&secret, other_session, &address(), &hello).expect("verifies"),
+            verify(&secret, &other_session, &address(), &hello).expect("verifies"),
             ProofVerdict::Failed
         );
         assert_eq!(
             verify(
                 &secret,
-                session(),
+                &expectation(),
                 &BridgeEndpoint::unix("/tmp/kalareach/t/shell-bridge"),
                 &hello
             )
             .expect("verifies"),
             ProofVerdict::Failed
         );
+        let other_root = WorkerExpectation {
+            root_process: ProcessStartIdentity::new(
+                3132,
+                ProcessStartSource::MacosProcBsdInfo,
+                4243,
+            ),
+            ..expectation()
+        };
+        assert_eq!(
+            verify(&secret, &other_root, &address(), &hello).expect("verifies"),
+            ProofVerdict::Failed
+        );
         let elsewhere = Secret::random().expect("a secret");
         assert_eq!(
-            verify(&elsewhere, session(), &address(), &hello).expect("verifies"),
+            verify(&elsewhere, &expectation(), &address(), &hello).expect("verifies"),
             ProofVerdict::Failed
         );
     }
@@ -279,7 +300,15 @@ mod tests {
         let mut hello = hello(&secret, root());
         hello.proof = Bytes::new(hello.proof.as_slice()[..16].to_vec());
         assert_eq!(
-            verify(&secret, session(), &address(), &hello).expect("verifies"),
+            verify(&secret, &expectation(), &address(), &hello).expect("verifies"),
+            ProofVerdict::Failed
+        );
+        let mut padded = self::hello(&secret, root());
+        let mut bytes = padded.proof.as_slice().to_vec();
+        bytes.push(0);
+        padded.proof = Bytes::new(bytes);
+        assert_eq!(
+            verify(&secret, &expectation(), &address(), &padded).expect("verifies"),
             ProofVerdict::Failed
         );
     }
@@ -311,6 +340,21 @@ mod tests {
         .expect("decides");
         assert_eq!(
             refused.refusal(),
+            Some(QualificationReason::ProcessMismatch)
+        );
+        // A child that names its *parent's* identity is refused the same way: it can compute the
+        // matching proof from the inherited secret, and it is still not the process the worker
+        // launched.
+        let claims_its_parent = admit_observed(
+            &secret,
+            &expectation(),
+            &address(),
+            &seen(&child),
+            &root_hello,
+        )
+        .expect("decides");
+        assert_eq!(
+            claims_its_parent.refusal(),
             Some(QualificationReason::ProcessMismatch)
         );
         // And a platform that will not name the caller is no basis for registering anything.

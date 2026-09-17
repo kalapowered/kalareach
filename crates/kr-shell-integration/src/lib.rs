@@ -17,13 +17,19 @@
 //! | [`contract::fence`] | The pure state machine over `outside`, `unfenced`, `fenced`, `launch_reserved` and `closing` |
 //! | [`contract::qualification`] | Which mechanisms qualify each package, which can never stand in for a delivery fence, the exact detach condition and the phases a session passes through |
 //! | [`contract::fixtures`] | The cross-shell scenarios under `fixtures/shell-bridge/`, which every package replays |
-//! | [`host`] | The worker's side: the owner-only endpoint, the handshake, the phase gate, the shell packages and the guarded startup entries |
+//! | [`host`] | The worker's side: the owner-only endpoint, the handshake and the phase gate |
 //!
-//! # What it does not do
+//! # Where the line is
 //!
-//! It performs no input and output. The state machine is pure and takes its clock readings as
-//! arguments, so the worker drives it with its own continuous clock and its own sockets, and a test
-//! drives it with numbers. Nothing here opens a socket, spawns a shell or writes to a terminal.
+//! [`contract`] performs no input and output. The state machine is pure and takes its clock
+//! readings as arguments, so the worker drives it with its own continuous clock and its own
+//! sockets, and a test drives it with numbers. Nothing in it opens a socket, spawns a shell or
+//! writes to a terminal.
+//!
+//! [`host`] is where those rules meet the operating system: it binds the session's endpoint, reads
+//! the kernel's answer about who connected, and computes the proof over the bootstrap transcript.
+//! It still spawns nothing and writes to no terminal, and it holds no second copy of the state
+//! machine's rules.
 //!
 //! # Example
 //!

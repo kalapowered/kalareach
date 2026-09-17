@@ -9,14 +9,16 @@
 //! process the worker starts. It is not written to the journal, not put in a diagnostic and not
 //! copied into a descriptor.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use kr_crypto::secret::{Secret, SymmetricKey};
 use kr_ipc::endpoint::Listener;
-use kr_ipc::paths::{Endpoint, OWNER_ONLY_DIRECTORY_MODE};
+use kr_ipc::paths::Endpoint;
 use kr_protocol::ids::SessionId;
 use kr_protocol::scalars::Bytes;
 
+#[cfg(not(unix))]
+use crate::contract::transport::WINDOWS_PIPE_PREFIX;
 use crate::contract::transport::{Bootstrap, BridgeEndpoint, ENDPOINT_BASENAME, EndpointKind};
 use crate::host::error::{HostError, Result};
 
@@ -30,47 +32,75 @@ pub struct HostEndpoint {
     session_id: SessionId,
     listener: Listener,
     address: BridgeEndpoint,
-    path: Option<PathBuf>,
     secret: SymmetricKey,
 }
 
 impl HostEndpoint {
     /// Creates the endpoint inside a directory this user alone can open.
     ///
-    /// The directory is checked rather than repaired: one that is group-readable, owned by
-    /// somebody else or reached through a symbolic link cannot be made trustworthy by changing its
-    /// mode, because the host cannot tell who looked inside it first.
+    /// On Unix the endpoint is a socket file in that directory, and the directory is checked rather
+    /// than repaired: one that is group-readable, owned by somebody else or reached through a
+    /// symbolic link cannot be made trustworthy by changing its mode, because the host cannot tell
+    /// who looked inside it first. On Windows the endpoint is a named pipe, whose namespace has no
+    /// directory permissions to inherit; the directory is still where the session's other private
+    /// state lives, so it is checked for existence there and the pipe carries an owner-only
+    /// access-control list of its own.
+    ///
+    /// What the check establishes is the directory itself, not the path that reaches it: an
+    /// installation is responsible for the runtime root its sessions live under, which is what
+    /// [`kr_ipc::paths::create_private_tree`] builds and verifies component by component.
     ///
     /// # Errors
     ///
     /// Returns [`HostError::Directory`] when the directory is not owner-only, [`HostError::Endpoint`]
-    /// when the resulting path does not fit a socket address, [`HostError::Crypto`] when the
+    /// when the resulting address does not fit a socket address, [`HostError::Crypto`] when the
     /// secret cannot be generated, and [`HostError::Ipc`] when the endpoint cannot be bound.
     pub fn open(session_id: SessionId, directory: &Path) -> Result<Self> {
         check_owner_only(directory)?;
-        let path = directory.join(ENDPOINT_BASENAME);
-        let address = BridgeEndpoint {
-            kind: native_kind(),
-            path: path
-                .to_str()
-                .map(str::to_owned)
-                .ok_or_else(|| HostError::Directory {
-                    path: directory.display().to_string(),
-                    detail: "a bridge endpoint path must be valid UTF-8".to_owned(),
-                })?,
-        };
+        let (address, bound) = Self::address_in(session_id, directory)?;
         address.validate()?;
-        // The listener replaces a socket file a dead process left behind and sets the file to 0600
-        // as it binds, so the address the shell is given is owner-only from the moment it exists.
-        let endpoint = Endpoint::from_path(&path)?;
-        let listener = Listener::bind(&endpoint)?;
+        // The listener replaces an address a dead process left behind, sets a Unix socket file to
+        // 0600 as it binds, and removes it again when this endpoint is dropped: it compares the
+        // socket's own identity first, so a replacement bound by somebody else is left alone.
+        let listener = Listener::bind(&bound)?;
         Ok(Self {
             session_id,
             listener,
             address,
-            path: (native_kind() == EndpointKind::UnixSocket).then_some(path),
             secret: Secret::random()?,
         })
+    }
+
+    #[cfg(unix)]
+    fn address_in(_session_id: SessionId, directory: &Path) -> Result<(BridgeEndpoint, Endpoint)> {
+        let path = directory.join(ENDPOINT_BASENAME);
+        let text = path
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| HostError::Directory {
+                path: directory.display().to_string(),
+                detail: "a bridge endpoint path must be valid UTF-8".to_owned(),
+            })?;
+        let bound = Endpoint::from_path(&path)?;
+        Ok((BridgeEndpoint::unix(text), bound))
+    }
+
+    #[cfg(not(unix))]
+    fn address_in(session_id: SessionId, _directory: &Path) -> Result<(BridgeEndpoint, Endpoint)> {
+        // A named pipe lives in the pipe namespace rather than the filesystem, so the address is a
+        // name. It is scoped by the user and the session for the same reason the Unix socket lives
+        // in a per-user, per-session directory. The shell is given the full `\\.\pipe\` form,
+        // because that is what an ordinary client opens; kr-ipc takes the namespaced name and adds
+        // the prefix itself.
+        let name = format!(
+            "kalareach-{}-{session_id}-{ENDPOINT_BASENAME}",
+            kr_ipc::paths::current_uid()
+        );
+        let bound = Endpoint::from_name(name.clone())?;
+        Ok((
+            BridgeEndpoint::windows_pipe(format!("{WINDOWS_PIPE_PREFIX}{name}")),
+            bound,
+        ))
     }
 
     /// Returns the session this endpoint belongs to.
@@ -101,20 +131,16 @@ impl HostEndpoint {
         &self.secret
     }
 
-    /// Returns the two variables the worker exports when it launches the root shell.
+    /// Returns the bootstrap values the worker exports when it launches the root shell.
+    ///
+    /// Exporting them is the launch's job and removing them again is the integration's: the
+    /// accepted handshake names the variables to unexport, and the shell drops them from its own
+    /// exported environment before it returns. Nothing here reaches into a running process.
     #[must_use]
     pub fn bootstrap(&self) -> Bootstrap {
         Bootstrap {
             endpoint: self.address.clone(),
             secret: Bytes::new(self.secret.expose().to_vec()),
-        }
-    }
-}
-
-impl Drop for HostEndpoint {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.as_ref() {
-            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -130,6 +156,12 @@ pub const fn native_kind() -> EndpointKind {
 }
 
 /// Checks that a directory admits the owning user alone.
+///
+/// The check is of the directory this path resolves to: its type, its owner and its mode bits. It
+/// is not a check of every component above it, and it does not read an access-control list. The
+/// runtime root a session's directory lives under is the installation's own, created and verified
+/// component by component by [`kr_ipc::paths::create_private_tree`]; this is the last check before
+/// an endpoint is bound inside one, not a substitute for it.
 ///
 /// # Errors
 ///
@@ -153,6 +185,7 @@ pub fn check_owner_only(directory: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn owner_only_mode(metadata: &std::fs::Metadata, fault: &dyn Fn(&str) -> HostError) -> Result<()> {
+    use kr_ipc::paths::OWNER_ONLY_DIRECTORY_MODE;
     use std::os::unix::fs::MetadataExt as _;
 
     if metadata.uid() != kr_ipc::paths::current_uid() {
@@ -168,12 +201,13 @@ fn owner_only_mode(metadata: &std::fs::Metadata, fault: &dyn Fn(&str) -> HostErr
 }
 
 #[cfg(not(unix))]
-fn owner_only_mode(
+const fn owner_only_mode(
     _metadata: &std::fs::Metadata,
     _fault: &dyn Fn(&str) -> HostError,
 ) -> Result<()> {
-    // Windows has no mode bits to read. The pipe carries an owner-only access-control list of its
-    // own, which is what the endpoint is protected by there.
+    // Windows has no mode bits to read, and the endpoint is not in this directory anyway: a named
+    // pipe lives in the pipe namespace and carries an owner-only access-control list of its own,
+    // which is what keeps another user off it there.
     Ok(())
 }
 
@@ -193,6 +227,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary directory");
         #[cfg(unix)]
         {
+            use kr_ipc::paths::OWNER_ONLY_DIRECTORY_MODE;
             use std::os::unix::fs::PermissionsExt as _;
 
             std::fs::set_permissions(
@@ -237,6 +272,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_socket_goes_when_the_session_does() {
         let directory = owner_only_directory();
@@ -247,6 +283,26 @@ mod tests {
         assert!(
             !std::path::Path::new(&path).exists(),
             "a closed session leaves no address behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_address_that_was_taken_over_is_left_alone() {
+        let directory = owner_only_directory();
+        let path = {
+            let endpoint = HostEndpoint::open(session(), directory.path()).expect("binds");
+            let path = std::path::PathBuf::from(&endpoint.address().path);
+            // Something else takes the address over while this endpoint is still alive. Removing
+            // it on the way out would delete a file this session never bound.
+            std::fs::remove_file(&path).expect("removes the socket");
+            std::fs::write(&path, b"somebody else's").expect("writes in its place");
+            path
+        };
+        assert_eq!(
+            std::fs::read(&path).expect("still there"),
+            b"somebody else's",
+            "a closing session removes its own address and nothing else"
         );
     }
 

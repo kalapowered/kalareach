@@ -11,7 +11,7 @@
 //! | [`handshake`] | The proof over the bootstrap secret, the kernel-observed peer and the accepted registration |
 //! | [`phase`] | The integration phase, what each phase permits, and which methods are root methods |
 //! | [`link`] | One bridge connection, with the direction of every frame enforced |
-//! | [`scripted`] | The reference bridge: what a package must reproduce, driven from the committed scenarios |
+//! | [`scripted`] | The reference bridge: the client half of the endpoint, driven frame by frame by its caller |
 
 pub mod endpoint;
 pub mod error;

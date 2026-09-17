@@ -69,6 +69,7 @@ pub struct ScriptedBridge {
     reader: FrameReader,
     writer: FrameWriter,
     next_event: u64,
+    live: bool,
 }
 
 impl ScriptedBridge {
@@ -92,6 +93,7 @@ impl ScriptedBridge {
             reader,
             writer,
             next_event: 0,
+            live: true,
         };
         bridge
             .writer
@@ -99,6 +101,7 @@ impl ScriptedBridge {
             .await?;
         let frame: BridgeFrame = bridge.reader.read_message().await?;
         let BridgeFrame::Handshake(outcome) = frame else {
+            bridge.live = false;
             return Err(HostError::WrongDirection {
                 frame: "something other than the handshake",
             });
@@ -112,11 +115,10 @@ impl ScriptedBridge {
     ///
     /// Returns [`HostError::Ipc`] when the frame cannot be written.
     pub async fn send_event(&mut self, event: BridgeEvent) -> Result<RequestId> {
+        self.check()?;
         self.next_event += 1;
         let id = RequestId::new(self.next_event);
-        self.writer
-            .write_message(&BridgeFrame::Event { id, event })
-            .await?;
+        self.send(&BridgeFrame::Event { id, event }).await?;
         Ok(id)
     }
 
@@ -126,10 +128,31 @@ impl ScriptedBridge {
     ///
     /// Returns [`HostError::Ipc`] when the frame cannot be written.
     pub async fn answer(&mut self, id: RequestId, answer: BridgeAnswer) -> Result<()> {
-        self.writer
-            .write_message(&BridgeFrame::Answer { id, answer })
-            .await?;
-        Ok(())
+        self.send(&BridgeFrame::Answer { id, answer }).await
+    }
+
+    /// Returns true while this connection is still usable.
+    #[must_use]
+    pub const fn is_live(&self) -> bool {
+        self.live
+    }
+
+    const fn check(&self) -> Result<()> {
+        if self.live {
+            return Ok(());
+        }
+        Err(HostError::ConnectionFinished)
+    }
+
+    async fn send(&mut self, frame: &BridgeFrame) -> Result<()> {
+        self.check()?;
+        match self.writer.write_message(frame).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.live = false;
+                Err(error.into())
+            }
+        }
     }
 
     /// Reads the next frame the worker may send.
@@ -139,7 +162,15 @@ impl ScriptedBridge {
     /// Returns [`HostError::WrongDirection`] for a frame only a bridge sends, and
     /// [`HostError::Ipc`] when the connection ends.
     pub async fn recv(&mut self) -> Result<ToBridge> {
-        let frame: BridgeFrame = self.reader.read_message().await?;
+        self.check()?;
+        let frame: BridgeFrame = match self.reader.read_message().await {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.live = false;
+                return Err(error.into());
+            }
+        };
+        let wrong = |frame: &'static str| HostError::WrongDirection { frame };
         match frame {
             BridgeFrame::EventResult { id, result } => Ok(ToBridge::EventResult {
                 id,
@@ -157,12 +188,22 @@ impl ScriptedBridge {
                 transaction,
                 reason,
             }),
-            BridgeFrame::Hello(_) => Err(HostError::WrongDirection { frame: "hello" }),
-            BridgeFrame::Handshake(_) => Err(HostError::WrongDirection {
-                frame: "a second handshake",
-            }),
-            BridgeFrame::Event { .. } => Err(HostError::WrongDirection { frame: "event" }),
-            BridgeFrame::Answer { .. } => Err(HostError::WrongDirection { frame: "answer" }),
+            BridgeFrame::Hello(_) => {
+                self.live = false;
+                Err(wrong("hello"))
+            }
+            BridgeFrame::Handshake(_) => {
+                self.live = false;
+                Err(wrong("a second handshake"))
+            }
+            BridgeFrame::Event { .. } => {
+                self.live = false;
+                Err(wrong("event"))
+            }
+            BridgeFrame::Answer { .. } => {
+                self.live = false;
+                Err(wrong("answer"))
+            }
         }
     }
 }
@@ -268,11 +309,11 @@ mod tests {
     use crate::contract::events::{EofGesture, HooksActivated};
     use crate::contract::qualification::QualificationReason;
     use crate::contract::transport::{
-        BridgeFrame, HandshakeOutcome, SecretLocation, WorkerExpectation,
+        BridgeFrame, BridgeRefused, HandshakeOutcome, SecretLocation, WorkerExpectation,
     };
     use crate::host::endpoint::HostEndpoint;
     use crate::host::handshake::admit;
-    use crate::host::link::{BridgeLink, FromBridge};
+    use crate::host::link::{BridgeReader, BridgeWriter, FromBridge, accept as accept_bridge};
 
     fn zsh() -> ReferenceShell {
         ReferenceShell::new(
@@ -313,10 +354,10 @@ mod tests {
     async fn accept(
         endpoint: &HostEndpoint,
         expectation: &WorkerExpectation,
-    ) -> (BridgeLink, HandshakeOutcome) {
+    ) -> (BridgeReader, BridgeWriter, HandshakeOutcome) {
         let (connection, peer) = endpoint.listener().accept().await.expect("accepts");
-        let mut link = BridgeLink::new(connection);
-        let FromBridge::Hello(hello) = link.recv().await.expect("a hello") else {
+        let (mut reader, mut writer) = accept_bridge(connection);
+        let FromBridge::Hello(hello) = reader.recv().await.expect("a hello") else {
             panic!("the opening frame is a hello");
         };
         let outcome = admit(
@@ -327,8 +368,8 @@ mod tests {
             &hello,
         )
         .expect("decides");
-        link.send_handshake(&outcome).await.expect("answers");
-        (link, outcome)
+        writer.send_handshake(&outcome).await.expect("answers");
+        (reader, writer, outcome)
     }
 
     #[tokio::test]
@@ -350,7 +391,7 @@ mod tests {
         let address = endpoint.address().clone();
         let connecting =
             tokio::spawn(async move { ScriptedBridge::connect(&address, &hello).await });
-        let (mut link, outcome) = accept(&endpoint, &expectation).await;
+        let (mut reader, mut writer, outcome) = accept(&endpoint, &expectation).await;
         let (mut bridge, answer) = connecting.await.expect("joins").expect("connects");
         assert_eq!(outcome.refusal(), None);
         let HandshakeOutcome::Accepted(accepted) = answer else {
@@ -372,11 +413,12 @@ mod tests {
             }))
             .await
             .expect("reports");
-        let FromBridge::Event { id: seen, .. } = link.recv().await.expect("an event") else {
+        let FromBridge::Event { id: seen, .. } = reader.recv().await.expect("an event") else {
             panic!("an event");
         };
         assert_eq!(seen, id);
-        link.send_event_result(seen, EventOutcome::Received)
+        writer
+            .send_event_result(seen, EventOutcome::Received)
             .await
             .expect("answers");
         let ToBridge::EventResult {
@@ -414,7 +456,7 @@ mod tests {
         let address = endpoint.address().clone();
         let connecting =
             tokio::spawn(async move { ScriptedBridge::connect(&address, &hello).await });
-        let (_link, outcome) = accept(&endpoint, &expectation).await;
+        let (_reader, _writer, outcome) = accept(&endpoint, &expectation).await;
         let (_bridge, answer) = connecting.await.expect("joins").expect("connects");
         assert_eq!(outcome.refusal(), Some(QualificationReason::ProofMismatch));
         assert_eq!(answer.refusal(), Some(QualificationReason::ProofMismatch));
@@ -445,8 +487,8 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         });
         let (connection, _peer) = endpoint.listener().accept().await.expect("accepts");
-        let mut link = BridgeLink::new(connection);
-        let error = link.recv().await.expect_err("refused");
+        let (mut reader, mut writer) = accept_bridge(connection);
+        let error = reader.recv().await.expect_err("refused");
         assert!(
             matches!(
                 error,
@@ -456,6 +498,23 @@ mod tests {
             ),
             "{error}"
         );
+        // Both halves are finished: a peer that misunderstood the direction is not one to carry on
+        // a conversation with, in either direction.
+        assert!(!writer.is_live());
+        assert!(matches!(
+            reader.recv().await.expect_err("finished"),
+            HostError::ConnectionFinished
+        ));
+        assert!(matches!(
+            writer
+                .send_handshake(&HandshakeOutcome::Refused(BridgeRefused::new(
+                    QualificationReason::ProtocolMismatch,
+                    "finished",
+                )))
+                .await
+                .expect_err("finished"),
+            HostError::ConnectionFinished
+        ));
         connecting.await.expect("joins");
     }
 
@@ -477,13 +536,14 @@ mod tests {
         let address = endpoint.address().clone();
         let connecting =
             tokio::spawn(async move { ScriptedBridge::connect(&address, &hello).await });
-        let (mut link, _) = accept(&endpoint, &expectation).await;
+        let (_reader, mut writer, _) = accept(&endpoint, &expectation).await;
         let (mut bridge, _) = connecting.await.expect("joins").expect("connects");
         let withheld = FencePublication::Withheld {
             reason: kr_protocol::root::WithheldReason::ExchangeTimedOut,
             state: kr_protocol::root::FenceState::Unfenced,
         };
-        link.send_publication(withheld.clone())
+        writer
+            .send_publication(withheld.clone())
             .await
             .expect("sends");
         assert_eq!(
@@ -491,7 +551,8 @@ mod tests {
             ToBridge::FencePublished(withheld)
         );
         let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x65; 16]));
-        link.send_revocation(transaction, LaunchRejectionReason::Timeout)
+        writer
+            .send_revocation(transaction, LaunchRejectionReason::Timeout)
             .await
             .expect("sends");
         assert_eq!(
@@ -502,7 +563,7 @@ mod tests {
             }
         );
         // The worker allocates request identifiers on its own side of the connection.
-        assert_eq!(link.next_request_id(), RequestId::new(1));
-        assert_eq!(link.next_request_id(), RequestId::new(2));
+        assert_eq!(writer.next_request_id(), RequestId::new(1));
+        assert_eq!(writer.next_request_id(), RequestId::new(2));
     }
 }

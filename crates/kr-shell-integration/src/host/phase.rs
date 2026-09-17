@@ -12,23 +12,40 @@
 //! device, from a plugin, from another local client of the same user, or from a second connection
 //! on the bridge endpoint itself.
 
+use kr_protocol::method::{Method, MethodGroup};
+
 use crate::contract::qualification::{
     IntegrationLoss, IntegrationPhase, LossOutcome, ShellKind, phase_after,
 };
 
-/// The five root methods, exactly as section 23 lists them.
-pub const ROOT_METHODS: &[&str] = &[
-    "root.editor.enter",
-    "root.editor.leave",
-    "root.editor.fence",
-    "root.eof.detach",
-    "root.command.accepted",
-];
-
-/// Returns true when a method is one of the root-integration methods.
+/// Returns the root-integration methods, read from the protocol's own registry.
+///
+/// The list is not written out here. Section 23 puts each method in exactly one group, and the
+/// registry is where that is recorded; a second copy of the five names would be a second answer to
+/// a question the protocol has already settled, and it would go stale the first time a method
+/// joined the group.
 #[must_use]
-pub fn is_root_method(method: &str) -> bool {
-    ROOT_METHODS.contains(&method)
+pub fn root_methods() -> Vec<Method> {
+    Method::ALL
+        .iter()
+        .copied()
+        .filter(|method| is_root_method(*method))
+        .collect()
+}
+
+/// Returns true when a method belongs to the root-integration group.
+#[must_use]
+pub fn is_root_method(method: Method) -> bool {
+    method.entry().group == MethodGroup::RootIntegration
+}
+
+/// Returns true when a method name belongs to the root-integration group.
+///
+/// An unlisted name is not a root method; it is not a method at all, and the registry refuses it
+/// before this question is asked.
+#[must_use]
+pub fn is_root_method_name(name: &str) -> bool {
+    Method::from_wire(name).is_some_and(is_root_method)
 }
 
 /// What a session lost, and what the worker does about it.
@@ -68,6 +85,8 @@ impl PhaseGate {
     ///
     /// A `native_compat` session is terminal-only from the start: it never registers a root
     /// integration, so its input forwards like any application's and its Ctrl-D is the shell's own.
+    /// [`Self::reports_ready`] stays false for it, because what it reports is managed
+    /// qualification; such a session is created and reported ready by its own launch path.
     #[must_use]
     pub const fn terminal_only() -> Self {
         Self {
@@ -95,19 +114,30 @@ impl PhaseGate {
         &self.history
     }
 
-    /// Records an accepted handshake.
+    /// Records an accepted handshake, and returns whether it moved the session forward.
     ///
     /// The bridge is now authenticated and ABI-checked, which is what lets external input reach the
     /// terminal. Rich launch, attribution and a create success wait for qualification.
-    pub const fn authenticated(&mut self, kind: ShellKind) {
-        self.phase = IntegrationPhase::Authenticated;
-        self.kind = Some(kind);
+    ///
+    /// Only a session that has not authenticated one yet. A session that has already lost its
+    /// hooks or its root shell does not recover by registering again: section 7 makes an explicit
+    /// compatibility retry a new create request, and promoting a degraded session here would let a
+    /// second bridge undo that.
+    #[must_use]
+    pub const fn authenticated(&mut self, kind: ShellKind) -> bool {
+        if matches!(self.phase, IntegrationPhase::Unauthenticated) {
+            self.phase = IntegrationPhase::Authenticated;
+            self.kind = Some(kind);
+            return true;
+        }
+        false
     }
 
     /// Records the activation that follows the user's startup files.
     ///
     /// Only an authenticated session qualifies. A `hooks_activated` report from a session that has
     /// already lost its hooks does not promote it back: recovery is a new create request.
+    #[must_use]
     pub const fn qualified(&mut self) -> bool {
         if matches!(self.phase, IntegrationPhase::Authenticated) {
             self.phase = IntegrationPhase::Qualified;
@@ -117,6 +147,11 @@ impl PhaseGate {
     }
 
     /// Applies a loss and says what the session does about it.
+    ///
+    /// A [`LossDecision`] whose `closes_session` is set leaves the phase where it was: there is no
+    /// phase for "closing", and the caller closes the session rather than recording a demotion it
+    /// would then have to explain. So the answer has to be acted on, not read and dropped.
+    #[must_use]
     pub fn lost(&mut self, loss: IntegrationLoss) -> LossDecision {
         self.history.push(loss);
         match phase_after(self.phase, loss) {
@@ -140,7 +175,11 @@ impl PhaseGate {
         self.phase.accepts_external_input()
     }
 
-    /// Returns true when the session may report itself ready and a create may succeed.
+    /// Returns true when the *managed* contract is complete enough to report the session ready.
+    ///
+    /// Only a qualified session. It is not the whole of "may this create succeed?": a
+    /// `native_compat` session claims none of this contract and never qualifies, and whether its
+    /// creation succeeded is decided by its own launch rather than here.
     #[must_use]
     pub const fn reports_ready(&self) -> bool {
         self.phase.reports_ready()
@@ -207,7 +246,7 @@ mod tests {
     #[test]
     fn a_live_session_that_loses_its_hooks_keeps_the_fail_safe_gesture() {
         let mut gate = PhaseGate::unauthenticated();
-        gate.authenticated(ShellKind::Zsh);
+        assert!(gate.authenticated(ShellKind::Zsh));
         assert!(gate.accepts_external_input());
         assert!(!gate.permits_launch());
         assert!(!gate.reports_ready());
@@ -225,7 +264,7 @@ mod tests {
     #[test]
     fn an_unqualified_replacement_is_visibly_terminal_only() {
         let mut gate = PhaseGate::unauthenticated();
-        gate.authenticated(ShellKind::Bash);
+        assert!(gate.authenticated(ShellKind::Bash));
         assert!(gate.qualified());
         let decision = gate.lost(IntegrationLoss::UnqualifiedRootReplacement);
         assert_eq!(decision.phase, IntegrationPhase::TerminalOnly);
@@ -238,12 +277,46 @@ mod tests {
     }
 
     #[test]
-    fn only_the_five_root_methods_are_root_methods() {
-        assert_eq!(ROOT_METHODS.len(), 5);
-        for method in ROOT_METHODS {
-            assert!(is_root_method(method));
+    fn the_root_methods_are_the_registrys_own_group() {
+        let names: Vec<&str> = root_methods()
+            .iter()
+            .map(|method| method.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "root.editor.enter",
+                "root.editor.leave",
+                "root.editor.fence",
+                "root.eof.detach",
+                "root.command.accepted",
+            ]
+        );
+        for name in &names {
+            assert!(is_root_method_name(name));
         }
-        assert!(!is_root_method("shell.launch"));
-        assert!(!is_root_method("input.write"));
+        // The launch is authorised by the host and reaches the worker from a client, so it is not
+        // in this group however closely it is bound to the same fence.
+        assert!(!is_root_method_name("shell.launch"));
+        assert!(!is_root_method_name("input.write"));
+        // An unlisted name is not a method at all.
+        assert!(!is_root_method_name("root.editor.something"));
+    }
+
+    #[test]
+    fn a_degraded_session_does_not_recover_by_registering_again() {
+        let mut gate = PhaseGate::unauthenticated();
+        assert!(gate.authenticated(ShellKind::Fish));
+        assert!(gate.qualified());
+        assert!(
+            !gate
+                .lost(IntegrationLoss::BridgeDisconnected)
+                .closes_session
+        );
+        assert_eq!(gate.phase(), IntegrationPhase::Degraded);
+        assert!(!gate.authenticated(ShellKind::Fish));
+        assert!(!gate.qualified());
+        assert_eq!(gate.phase(), IntegrationPhase::Degraded);
+        assert!(!gate.permits_launch());
     }
 }
