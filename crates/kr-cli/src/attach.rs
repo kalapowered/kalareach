@@ -56,17 +56,19 @@ pub const GUARD_READY: u8 = b'A';
 /// is running and has not answered, and it is set above what starting one actually costs rather
 /// than above what the guard does after it has started.
 ///
-/// What it costs, measured from the spawn returning to the byte arriving, which is the interval
-/// this bounds: a guard that has been run before answers in 3 to 5 milliseconds, and reached 3.1
-/// seconds once in forty rounds on a loaded machine. The **first** run of a newly written copy
-/// answers in 0.15 to 3.3 seconds. The likeliest reading of that difference is the operating system
+/// What it costs, measured. From starting a guard to its byte arriving: 3 to 5 milliseconds for one
+/// that has been run before, once reaching 3.1 seconds in forty rounds on a loaded machine, and
+/// 0.34 to 3.3 seconds for the **first** run of a newly written copy. Measured again with the spawn
+/// separated from the wait, which is the part this bounds: the spawn takes 1 to 5 milliseconds and
+/// a first run's wait takes 0.15 to 1.7 seconds, so what a first run costs is spent waiting rather
+/// than starting. The likeliest reading of a first run costing more at all is the operating system
 /// checking a binary it has not seen before, once, and remembering it afterwards, which would make
 /// it every first attach after an install or an upgrade; what is measured is the cost, not the
 /// reason for it.
 ///
-/// Two seconds sat inside both of those ranges. The bound is a minute: clear of every reading by
-/// more than an order of magnitude, and still a bound, because a guard that is alive and silent for
-/// a minute is not going to answer.
+/// Two seconds sat inside those readings. The bound is a minute: clear of every one of them by more
+/// than an order of magnitude, and still a bound, because a guard that is alive and silent for a
+/// minute is not going to answer.
 pub const GUARD_ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The out-of-process restoration guard.
