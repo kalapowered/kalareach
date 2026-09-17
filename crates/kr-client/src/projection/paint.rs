@@ -705,7 +705,7 @@ impl Destination {
                     match chars.next() {
                         Some('[') => {
                             let mut body = String::new();
-                            while let Some(next) = chars.next() {
+                            for next in chars.by_ref() {
                                 body.push(next);
                                 if next.is_ascii_alphabetic() || next == '@' || next == '`' {
                                     break;
@@ -717,7 +717,7 @@ impl Destination {
                             // A string, consumed to its terminator. Nothing a colour or a title
                             // command does can move a cell.
                             let mut previous = '\0';
-                            while let Some(next) = chars.next() {
+                            for next in chars.by_ref() {
                                 if next == '\u{7}' || (previous == '\u{1b}' && next == '\\') {
                                     break;
                                 }

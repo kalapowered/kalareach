@@ -558,6 +558,55 @@ rather than all at once: the rows that do not fit are rows nobody asked to have 
 carrying long hyperlink targets can cost many times the page bound before the first byte is
 counted.
 
+### What a projected client receives
+
+A projected attachment is not sent the application's bytes. It is sent the canonical grid as state,
+in four kinds of event and always in this order:
+
+| Event | What it carries |
+| --- | --- |
+| `session.projection.reset` | Discard what is on the screen; a snapshot follows. It names the generation and why |
+| `session.projection.snapshot` | Everything a screen is apart from its rows, at one output cursor |
+| `session.projection.rows` | One page of rows, for a named buffer, with the oldest retained row and the eviction marker. The last page clears `more` |
+| `session.projection.delta` | The rows that changed since a named base, and the state that changed with them |
+
+The reset reasons are the facts a client would otherwise have to guess: the attachment has just
+joined, the screen buffer changed, the geometry changed, the client's base fell outside the replay
+window, retained rows were evicted, or what changed is larger than one bounded update.
+
+A page carries at most 1,000 rows and at most 1 MiB, which are the bounds section 8 puts on a
+history page. Both buffers are paged, the one that is not showing first, so a client that later
+leaves a full-screen application finds what the shell left behind. A client that has not received a
+page with `more` cleared does not hold a whole screen and does not draw one: mixing live output with
+an incomplete repaint is the thing the paging exists to prevent.
+
+Ordinary output is one delta per batch, and never a repaint. A row larger than a page bound is cut
+and marked truncated rather than dropped, so a reader can get past it, and the marker is what makes
+the degradation explicit rather than a short row that looks like the application's.
+
+### The projected renderer
+
+The renderer lives in the client, shared between the command and the companion application, so a
+canonical cell goes to the same place wherever it is drawn. Three things together stop a glyph the
+destination measures differently from moving anything:
+
+1. **Autowrap is off while anything is drawn.** The renderer clears DEC mode 7 before its first cell
+   and puts the session's own value back after its last, so nothing it writes can wrap. Repositioning
+   after the damage is not enough: a scroll has already moved every row by then.
+2. **Every run is placed absolutely.** A run begins with a cursor address, so a glyph measured
+   differently moves nothing after it.
+3. **A span the destination cannot reproduce is replaced rather than drawn.** The width of a run's
+   text is measured against the profile's pinned model and compared with the cell span the session
+   gave it. A disagreement means the text cannot be placed at canonical positions, so the span is
+   filled with spaces and counted.
+
+A cluster the window's edge falls inside is never half drawn: it becomes one space for each of its
+cells that is inside, which keeps every later cell on its own column. A cursor outside the window is
+hidden rather than misplaced, because a person types where the cursor appears to be. What a frame
+could not carry is counted rather than hidden: cells outside the window, clusters the edge fell
+inside, runs the destination cannot place, soft-wrap markers a drawn row cannot carry, rows the
+session had already shortened, and the pending wrap, which no cursor placement can reproduce.
+
 ### Bounds
 
 | Bound | Value |
@@ -900,13 +949,20 @@ keyboard reply carries flags the profile advertises, and a version reply is not 
 does not fit its form is not an answer, so the question stays unanswered and the attach fails: a
 capability record built from a reply nobody can read outlives the attach that built it.
 
-`PROBE_SET` lists every question a probe may ask: terminal identity, foreground, background, Kitty
-keyboard flags, synchronised output, and then primary device attributes. DA1 is last because every
-qualified terminal answers it and answers it last, which makes it the terminator: once it arrives,
-every earlier answer has either arrived or is never coming.
+`PROBE_SET` lists the questions this build's own profile asks: terminal identity, foreground,
+background, Kitty keyboard flags, synchronised output, and then primary device attributes. A caller
+may ask any subset of `ProbeItem`, which also carries the `modifyOtherKeys` level. DA1 is last
+because every qualified terminal answers it and answers it last, which makes it the terminator: once
+it arrives, every earlier answer has either arrived or is never coming.
 
-A caller passes the questions its qualified profile actually needs, and DA1 is appended whether or
-not it asked. **Every question the probe asks must be answered.** Silence is not evidence: a
+A reply to something the caller did not ask is still recorded. A terminal that volunteers one has
+told the truth about itself either way, and this is how the command learns the optional state of a
+terminal it cannot require an answer from: `kr attach` requires only the terminator, writes the rest
+of the questions ahead of it, and records whatever came back. What a terminal chose not to answer is
+absent rather than assumed, and nothing is installed on its behalf.
+
+A caller passes the questions its qualified profile actually requires, and DA1 is appended whether
+or not it asked. **Every question the probe asks must be answered.** Silence is not evidence: a
 terminal that ignores a question may be an old build, a multiplexer in the middle, or a terminal
 that would have answered a moment later. Treating silence as "this feature is absent" writes a
 capability record from an absence of information, and the record then outlives the attach. So the
@@ -935,6 +991,12 @@ Where the palette came from is recorded, because "the user's terminal told us du
 "the profile default" are different facts and the session has to be able to say which. The sources
 are the profile default, a client preference shared during the probe, the light or dark preset
 chosen for a no-probe or invisible creation, and an authorised explicit change made later.
+
+The provenance travels with every snapshot and with any delta that moves the palette, so a client
+can say where the colours it is drawing came from. It is fixed at creation: the choice is made
+before the session has produced anything, and an attachment joining later is shown the session's
+palette rather than its own. Attachment succession therefore changes neither the colours nor their
+source, and a second attachment from a differently themed terminal is shown what the first one was.
 
 ## Diagnostics
 

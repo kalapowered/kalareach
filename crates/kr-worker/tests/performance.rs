@@ -663,7 +663,10 @@ async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
         "  conditions: a local attachment to a live session at 120x40, a release build, measured \
          from the connection to the moment the host has delivered the screen: the connection, the \
          worker's proof, the attachment, the input lease, the subscription, and the screen itself \
-         arriving and decoding. Drawing it is the terminal's own work and is not in these numbers."
+         arriving and decoding. A terminal of the session's own size reaches that when the bytes \
+         that put it into the session's state arrive; a projected one reaches it when the last row \
+         page of its snapshot does, because a client holding part of a screen is not holding a \
+         screen. Drawing it is the client's own work and is not in these numbers."
     );
     println!(
         "  direct, a terminal of the session's own size: {}",

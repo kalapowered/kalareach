@@ -149,10 +149,9 @@ async fn hosted(script: &str) -> Hosted {
             program: "/bin/sh".to_owned(),
             arguments: vec!["-c".to_owned(), script.to_owned()],
             cwd: "/".to_owned(),
-            environment: vec![
-                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-                ("PS1".to_owned(), String::new()),
-            ],
+            // The host's own directories, so a command run *inside* the session reaches the same
+            // host: that is how a person's session behaves, and it is what nesting needs.
+            environment: session_environment(&temp),
         },
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
@@ -253,6 +252,140 @@ async fn session_retained(hosted: &Hosted, marker: &[u8], within: Duration) -> V
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+/// The environment a session's own shell runs in.
+///
+/// It carries the host's directories, because a command run inside a session has to reach the same
+/// host: that is what makes a nested attach possible, and it is how a real session is arranged.
+fn session_environment(temp: &kr_ipc::testing::TempHost) -> Vec<(String, String)> {
+    vec![
+        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ("PS1".to_owned(), String::new()),
+        ("TERM".to_owned(), "xterm-256color".to_owned()),
+        (
+            "HOME".to_owned(),
+            temp.paths().state_root().display().to_string(),
+        ),
+        (
+            "KR_RUNTIME_DIR".to_owned(),
+            temp.paths().runtime_root().display().to_string(),
+        ),
+        (
+            "KR_STATE_DIR".to_owned(),
+            temp.paths().state_root().display().to_string(),
+        ),
+    ]
+}
+
+/// Hosts a second session in the same environment, on its own display.
+///
+/// Nesting needs two: a terminal attached to one session, and a `kr attach` to the other running
+/// inside it. Both live in one environment, because that is how a person's own host is arranged and
+/// because the inner command finds its session through the same published descriptors.
+async fn second_session(hosted: &Hosted, script: &str) -> (DisplayNumber, Arc<SessionRuntime>) {
+    let environment = hosted.temp.environment();
+    let environment_id = hosted.temp.environment_id();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let display = DisplayNumber::new(2);
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let identity = Arc::new(
+        WorkerIdentity::generate(
+            session_id,
+            SessionEpoch::V1,
+            boot.clone(),
+            process.clone(),
+            PROTOCOL_VERSION,
+        )
+        .expect("a session key"),
+    );
+    let store = kr_crypto::store::open_store("KalaReachAttachTest", &environment.secrets_dir())
+        .expect("a secret store");
+    // The environment already has one: this is the second session in it, not a second environment.
+    let controller =
+        kr_ipc::verify::ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+            .expect("a controller identity");
+    let config = SessionConfig {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id,
+        display_number: display,
+        shell: ShellCommand {
+            program: "/bin/sh".to_owned(),
+            arguments: vec!["-c".to_owned(), script.to_owned()],
+            cwd: "/".to_owned(),
+            environment: session_environment(&hosted.temp),
+        },
+        shell_mode: ShellMode::NativeCompat,
+        worker_profile: WorkerProfile::HeadlessUser,
+        desktop: DesktopBinding::none(),
+        dimensions: Dimensions::new(80, 24),
+        journal_path: Some(environment.journal_database(session_id)),
+        spool_directory: Some(environment.session_spool(session_id)),
+        send_queue_bytes: 1024 * 1024,
+        resident_bytes: 256 * 1024,
+    };
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+    let runtime = Arc::new(SessionRuntime::start(session).expect("starts the runtime"));
+    let endpoint = environment.worker_endpoint(display).expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let service = Arc::new(
+        WorkerService::new(
+            Arc::clone(&runtime),
+            Arc::clone(&identity),
+            endpoint.clone(),
+            ServiceBinding {
+                environment_id,
+                boot_identity: boot.clone(),
+                controller_public_key: *controller.public_key(),
+                controller_generation: ControllerGeneration::new(1),
+                build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            },
+        )
+        .expect("a worker service"),
+    );
+    tokio::spawn(Arc::clone(&service).serve(listener));
+    let descriptor = WorkerDescriptor {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id,
+        display_number: display,
+        boot_identity: boot,
+        process_start_identity: process,
+        protocol_version: PROTOCOL_VERSION,
+        endpoint: endpoint.as_text(),
+        worker_public_key: *identity.public_key(),
+        worker_profile: WorkerProfile::HeadlessUser,
+        published_at_ms: TimestampMs::new(0),
+    };
+    kr_ipc::descriptor::publish(&environment, &descriptor).expect("publishes the descriptor");
+    // The service is kept alive by the task above for as long as the runtime is.
+    std::mem::forget(service);
+    (display, runtime)
+}
+
+/// Reads everything one session's application received.
+fn application_saw(runtime: &SessionRuntime) -> Vec<u8> {
+    let session = runtime.session();
+    let mut seen = Vec::new();
+    let mut cursor = 0_u64;
+    loop {
+        let page = session
+            .history_page(cursor, 1024 * 1024)
+            .expect("reads the retained output");
+        if page.bytes.as_slice().is_empty() {
+            break;
+        }
+        seen.extend_from_slice(page.bytes.as_slice());
+        cursor = page.next_cursor.get();
+    }
+    seen
+}
+
+fn saw(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// Runs a shell on the terminal, with `kr` inside it.
@@ -1155,6 +1288,136 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
         output.text().escape_debug()
     );
     let _ = before;
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
+
+/// KR-REQ-08.85: a nested attach is an ordinary foreground application to the outer session.
+///
+/// A terminal is attached to one session, and inside it a second `kr attach` runs against another.
+/// Three things follow from the outer worker treating the inner command as an ordinary application,
+/// and each is checked here: the inner attachment is established at all, what the person types
+/// reaches the *inner* session's application rather than the outer one's, and the end-of-file byte
+/// is among what it reaches, so no outer root-only interception is in the way of it.
+///
+/// SSH loopback is the other half of this row and is not run here: this Mac has Remote Login
+/// listening, and public-key authentication for this account is not set up, so an unattended run
+/// cannot authenticate and this task does not change the operator's account to make it. The command
+/// the matrix run uses is recorded in the handoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
+    // The outer session runs a shell that stays as the session leader; the inner one echoes what
+    // it reads, so what the person typed is visible from outside the process.
+    let outer = hosted("stty raw -echo; printf 'kr-outer.'; exec /bin/sh").await;
+    let (inner_display, inner) =
+        second_session(&outer, "stty raw -echo; printf 'kr-inner.'; exec cat").await;
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let display = outer.display.get().to_string();
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &outer,
+            &format!(
+                "{} attach {display}; printf 'outer-finished-%s\\n' \"$?\"",
+                env!("CARGO_BIN_EXE_kr")
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    // A pseudo-terminal hands out its writer once, and two things need it here: the thread that
+    // answers the outer command's handshake, and this test typing afterwards.
+    let keyboard = Arc::new(std::sync::Mutex::new(
+        pty.master.take_writer().expect("a writer"),
+    ));
+    {
+        let output = output.clone();
+        let keyboard = Arc::clone(&keyboard);
+        std::thread::spawn(move || {
+            if !output.wait_for(b"\x1b[?u", Duration::from_secs(20)) {
+                return;
+            }
+            if let Ok(mut writer) = keyboard.lock() {
+                let _ = writer.write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+                let _ = writer.flush();
+            }
+        });
+    }
+    let types = |bytes: &[u8]| {
+        let mut writer = keyboard.lock().expect("the writer is not poisoned");
+        writer.write_all(bytes).expect("types");
+        writer.flush().expect("flushes");
+    };
+    assert!(
+        output.wait_for(b"kr-outer.", Duration::from_secs(30)),
+        "the outer session's screen reached the terminal: {}",
+        output.text().escape_debug()
+    );
+
+    // The inner attach, typed into the outer session's shell. Its own probe asks the outer KR
+    // terminal, which answers as the sole responder for that session.
+    let inner_command = format!(
+        "{} attach {}\n",
+        env!("CARGO_BIN_EXE_kr"),
+        inner_display.get()
+    );
+    types(inner_command.as_bytes());
+    assert!(
+        output.wait_for(b"kr-inner.", Duration::from_secs(40)),
+        "the inner session's screen reached the same terminal: {}",
+        output.text().escape_debug()
+    );
+
+    // Typed with the inner command in the foreground. It reaches the inner session's application,
+    // including the end-of-file byte: the outer worker treats the inner command as an ordinary
+    // foreground application, so no root-only interception of its own is in the way.
+    types(b"kr-nested-typing\x04");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        seen = application_saw(&inner);
+        if saw(&seen, b"kr-nested-typing") && seen.contains(&0x04) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw(&seen, b"kr-nested-typing"),
+        "what the person typed reached the inner session's application: {}",
+        String::from_utf8_lossy(&seen).escape_debug()
+    );
+    assert!(
+        seen.contains(&0x04),
+        "and so did the end-of-file byte, which nothing outer intercepted: {}",
+        String::from_utf8_lossy(&seen).escape_debug()
+    );
+    // The outer session's own shell did not receive it. Its output carries the typed word only
+    // because the inner command *drew* it there, which is what a foreground application does with
+    // the terminal it is holding; what it must not carry is the outer shell reacting to it as a
+    // line of its own, and it must not have ended on the end-of-file byte.
+    let outer_saw = application_saw(&outer.runtime);
+    assert!(
+        !saw(&outer_saw, b"kr-nested-typing: "),
+        "the outer session's shell did not read the typed line as a command of its own: {}",
+        String::from_utf8_lossy(&outer_saw).escape_debug()
+    );
+    assert!(
+        !saw(&outer_saw, b"not found"),
+        "and reported nothing about it: {}",
+        String::from_utf8_lossy(&outer_saw).escape_debug()
+    );
+    assert!(
+        !output.contains(b"outer-finished-"),
+        "the outer attachment is still running, so nothing outer took the end-of-file byte: {}",
+        output.text().escape_debug()
+    );
     let _ = shell.kill();
     let _ = shell.wait();
 }

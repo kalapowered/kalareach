@@ -98,11 +98,32 @@ the one attachment holding the input lease, so two attached terminals can never 
 question and a secret can never land on every device that happens to be watching.
 
 `--no-probe` withholds this terminal's own declaration of what it is. The host then serves this
-attachment a rendering of the session's screen rather than the byte stream, because it has not been
-told what those bytes would do here. It is the conservative choice, not a faster one.
+attachment the canonical grid rather than the byte stream, because it has not been told what those
+bytes would do here. It is the conservative choice, not a faster one.
 
-Attaching shows the session's screen immediately, drawn from the host's canonical grid. It is never
-the replayed history: replaying those bytes would replay whatever they contained.
+Attaching shows the session's screen immediately, from the host's canonical grid. It is never the
+replayed history: replaying those bytes would replay whatever they contained.
+
+### Projected mode
+
+A terminal of any other size, or one the host will not hand the stream to, is projected: it receives
+the canonical grid as state and draws it itself. What arrives is one snapshot, its rows in bounded
+pages, and then one bounded update per batch of output, each naming the base it continues from. The
+command draws each change at canonical cell positions, with autowrap off and an absolute cursor
+address for every run, so a glyph this terminal measures differently cannot wrap or scroll anything.
+A cluster the window's edge falls inside becomes a space rather than half a character.
+
+A window narrower or shorter than the session shows the part it has room for. Nothing is reflowed:
+what is outside the window is not drawn, and a line the application wrapped is drawn as two rows,
+which is what a destination told about a row it has drawn itself can carry.
+
+An update this terminal cannot apply — one continuing from a screen it does not hold, or from
+another projection generation — is not drawn. The command asks the session for a fresh screen
+instead, which is what the contract says to do and is cheaper than reasoning about what was missed.
+
+Two things are drawn only when they exist: the outer terminal keeps whatever it was showing while a
+snapshot's pages are still arriving, because a screen half installed is not the session's screen,
+and a pending wrap is reported rather than reproduced, because every cursor placement clears one.
 
 `--take-geometry` makes this terminal the size owner. Ordinary attach never moves size ownership,
 and taking input never moves it either.
@@ -116,12 +137,20 @@ So the saved state lives in another process. `kr attach` starts `kr-attach-guard
 touches the terminal and gives it one end of a pipe, its own handle on the terminal and the
 terminal's complete mode state.
 
-Only then does it ask the terminal anything. The capability handshake is bounded and synchronous: it
-asks which keyboard protocols the terminal has negotiated (the Kitty protocol's flags and xterm's
-`modifyOtherKeys` level, neither of which termios describes) and ends with the device-attributes
-request every terminal answers. Reading the answers means putting the terminal into a mode where
-they arrive, which is why the guard exists first. The answers then reach the guard over the same
-pipe.
+Only then does it ask the terminal anything. The capability handshake is bounded and synchronous. It
+asks the terminal's identity, its default foreground and background, which keyboard protocols it has
+negotiated (the Kitty protocol's flags and xterm's `modifyOtherKeys` level, neither of which termios
+describes) and whether it reports synchronised output, and it ends with the device-attributes request
+every terminal answers. Only that last reply is required: a terminal that does not implement the
+Kitty protocol answers nothing about it, and silence there is not a failure. Silence about the
+terminator is, because the terminator is the only thing that proves no earlier answer is still in
+flight. Reading the answers means putting the terminal into a mode where they arrive, which is why
+the guard exists first. The answers then reach the guard over the same pipe.
+
+Nothing the terminal replies reaches the application. What the person typed during the exchange is
+kept apart from the answers, in the order they typed it, and is the first input the attachment
+forwards. Outside the handshake the command does not scan input for anything reply-shaped: after it,
+every byte from the terminal is the person's.
 
 A terminal that does not finish the handshake within a second fails this attach with
 `TERMINAL_PROBE_FAILED` and exit code 6; it does not begin forwarding input on a stream that may
@@ -137,6 +166,21 @@ have changed them.
 `--no-probe` asks the terminal nothing at all, which is what makes it the choice for a terminal that
 does not answer. The session's own keyboard modes are still cleared when the attachment ends, since
 the session could have set them, but nothing comes back afterwards: that is what never asking costs.
+
+The choice is made before the first byte goes out, which is the only time it can be made honestly.
+After a failed handshake the stream is not clean any more: a late reply could still arrive on it, so
+a retry needs a fresh terminal and `--no-probe` on the same one is refused rather than treated as a
+purge. Calling it afterwards would not unsend the questions.
+
+### Nesting
+
+`kr attach` inside a KalaReach session works, and the outer session treats the inner command as an
+ordinary foreground application. Everything the person types while it is in the foreground goes to
+the inner attachment, the end-of-file byte included: there is no outer interception in the way of
+it, and the outer session's own shell never sees it. The inner command probes the terminal it is in,
+which is the outer KalaReach terminal, and that worker answers as the sole responder for its own
+session. `TERM_PROGRAM` is a hint about what the terminal is, never authentication and never proof
+of compatibility.
 
 * A clean exit restores the terminal and sends the guard a byte, and the guard leaves without
   acting.
