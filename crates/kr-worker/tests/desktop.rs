@@ -860,14 +860,19 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     } else {
         None
     };
-    // The endpoints are kept so this test can end what it started: the workers themselves are
-    // still running afterwards, because this test moved a record rather than a machine.
-    let mut endpoints = Vec::new();
+    // Each worker's endpoint and recorded process are kept so this test can end what it started
+    // and see that it ended: the workers themselves are still running afterwards, because this
+    // test moved a record rather than a machine.
+    let mut workers = Vec::new();
     for entry in kr_ipc::descriptor::read_all(&host.paths()).expect("reads the descriptors") {
         let descriptor = entry.descriptor.expect("a descriptor");
-        endpoints.push((descriptor.session_id, descriptor.endpoint.clone()));
+        workers.push((
+            descriptor.session_id,
+            descriptor.endpoint.clone(),
+            descriptor.process_start_identity.clone(),
+        ));
     }
-    assert!(!endpoints.is_empty(), "the sessions published descriptors");
+    assert!(!workers.is_empty(), "the sessions published descriptors");
     drop(client);
     first.stop().await;
 
@@ -941,44 +946,61 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     drop(client);
     second.stop().await;
 
-    for (session_id, endpoint) in &endpoints {
+    for (session_id, endpoint, _) in &workers {
         let session_id = *session_id;
         let Ok(endpoint) = kr_ipc::paths::Endpoint::from_path(endpoint) else {
             continue;
         };
-        let Ok(mut worker) = LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
-        else {
+        let connected = tokio::time::timeout(
+            WORKER_CALL_BOUND,
+            LocalClient::connect(&endpoint, LocalClientKind::Cli, build()),
+        )
+        .await;
+        let Ok(Ok(mut worker)) = connected else {
             continue;
         };
-        let _ = worker
-            .mutate(
+        let _ = tokio::time::timeout(
+            WORKER_CALL_BOUND,
+            worker.mutate(
                 Method::SessionClose,
                 ActionId::new(kr_ipc::new_uuid()),
                 session_target(host.environment_id, session_id),
                 &SessionCloseParams { session_id },
-            )
-            .await;
+            ),
+        )
+        .await;
     }
-    // A worker ends itself once it has accepted the close, and an endpoint that stops answering is
-    // what says it has. Waiting for that leaves nothing of this run behind; a fixed pause would
-    // have hidden a worker that stayed.
+    // What says a worker has gone is the kernel's answer about the process the descriptor recorded,
+    // not an endpoint that stopped answering: a worker that dropped its socket and stayed would
+    // pass that. This run started these processes, so it waits for each of them and says which
+    // ones are left if they outlast the bound.
     let deadline = std::time::Instant::now() + WORKER_EXIT_DEADLINE;
-    for (_, endpoint) in &endpoints {
-        let Ok(endpoint) = kr_ipc::paths::Endpoint::from_path(endpoint) else {
-            continue;
-        };
-        while std::time::Instant::now() < deadline
-            && LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-                .await
-                .is_ok()
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut running: Vec<String> = Vec::new();
+    loop {
+        running.clear();
+        for (session_id, _, process) in &workers {
+            if kr_ipc::identity::process_state(process) == kr_ipc::identity::ProcessState::Running {
+                running.push(format!("{session_id} as {}", process.pid.get()));
+            }
         }
+        if running.is_empty() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        running.is_empty(),
+        "workers this test started were still running {WORKER_EXIT_DEADLINE:?} after they were \
+         asked to close: {}",
+        running.join(", ")
+    );
 }
 
 /// How long a worker this test closed is given to end.
 const WORKER_EXIT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one call to a worker this test is ending may take.
+const WORKER_CALL_BOUND: Duration = Duration::from_secs(10);
 
 /// KR-REQ-03.23: the desktop a session was created on outlives its worker, so a host that finds
 /// the worker gone can say whether the desktop went with it.
