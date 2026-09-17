@@ -199,6 +199,30 @@ async fn hosted(script: &str) -> Hosted {
     }
 }
 
+/// Says what a session did, for an attachment that was refused.
+///
+/// A refusal names the rule, not the history: `SessionClosed` says the session is closed and
+/// nothing about whether its shell exited, was signalled, or was told to stop. The record is where
+/// that is, so a measurement that cannot attach reports it rather than leaving the next reader to
+/// guess.
+fn why(hosted: &Hosted) -> String {
+    let state = hosted.runtime.state();
+    let session = hosted.runtime.session();
+    match session.closure() {
+        Some(record) => format!(
+            ", and the session is {state:?}: closed for {:?}, root exit {:?}, root signal {:?}, \
+             coverage {:?}, terminated {:?}, surviving {:?}",
+            record.reason,
+            record.root_exit_code,
+            record.root_signal,
+            record.ownership_coverage,
+            record.terminated,
+            record.surviving
+        ),
+        None => format!(", and the session is {state:?} with no record written"),
+    }
+}
+
 /// Attaches a terminal that may type, and returns its client, identifier and lease epoch.
 async fn controlling(
     hosted: &Hosted,
@@ -225,7 +249,7 @@ async fn controlling(
         )
         .await
         .expect("reaches the worker")
-        .expect("attaches")
+        .unwrap_or_else(|refusal| panic!("attaches: {refusal:?}{}", why(hosted)))
         .to_typed()
         .expect("decodes");
     let attachment_id = attached.attachment.attachment_id;
@@ -298,7 +322,7 @@ async fn background() -> (Vec<Hosted>, Vec<LocalClient>) {
             )
             .await
             .expect("reaches the worker")
-            .expect("attaches")
+            .unwrap_or_else(|refusal| panic!("attaches: {refusal:?}{}", why(session)))
             .to_typed()
             .expect("decodes");
         let mut streams = CanonicalSet::new();
