@@ -1615,10 +1615,17 @@ async fn collect_until(client: &mut LocalClient, marker: &[u8], window: Duration
                     seen.extend_from_slice(event.bytes.as_slice());
                 }
             }
-            // A quiet moment is a busy machine; a connection that has gone is not something to
-            // wait out.
+            // A quiet moment is a busy machine, so the loop keeps looking; a connection that has
+            // gone can never deliver the marker, and that is this wait's failure rather than a
+            // partial answer for the caller to puzzle over.
             Ok(Ok(_)) | Err(_) => {}
-            Ok(Err(_)) => break,
+            Ok(Err(error)) => panic!(
+                "waited {:?} for {:?} to reach this terminal and the connection ended ({error}): \
+                 {:?}",
+                started.elapsed(),
+                String::from_utf8_lossy(marker),
+                String::from_utf8_lossy(&seen)
+            ),
         }
     }
     seen.extend_from_slice(&collect(client, window).await);

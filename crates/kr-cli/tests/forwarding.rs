@@ -268,15 +268,33 @@ impl Keyboard {
     ///
     /// The command asks the outer terminal what it has negotiated before it changes anything.
     /// Without an answer the bounded handshake fails and there is no attachment to test.
-    fn answers_the_probe(&self, output: &TerminalOutput) {
+    fn answers_the_probe(&self, output: &TerminalOutput) -> std::thread::JoinHandle<()> {
         let output = output.clone();
         let keyboard = self.clone();
         std::thread::spawn(move || {
-            if !output.wait_for(b"\x1b[?u", LIVENESS_DEADLINE) {
-                return;
-            }
+            output.expect_within(
+                b"\x1b[?u",
+                LIVENESS_DEADLINE,
+                "the command asked this terminal what keyboard protocol it had",
+            );
             keyboard.types(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
-        });
+        })
+    }
+}
+
+/// Waits for the thread that answers this terminal's queries, and gives the test what it found.
+///
+/// Without an answer the bounded handshake fails and there is no attachment to test, so the query
+/// is a required wait. A thread whose panic nobody joins would leave that as a timeout somewhere
+/// else, so the failure is brought back here with its own message.
+fn answered(probe: std::thread::JoinHandle<()>) {
+    if let Err(panic) = probe.join() {
+        let detail = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("the thread answering this terminal's queries failed");
+        panic!("{detail}");
     }
 }
 
@@ -422,12 +440,13 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
-    keyboard.answers_the_probe(&output);
+    let probe = keyboard.answers_the_probe(&output);
     output.expect_within(
         b"kr-ready.",
         LIVENESS_DEADLINE,
         "the session's screen reached the terminal",
     );
+    answered(probe);
     let mut previous = 0_usize;
     for sequence in SEQUENCES {
         keyboard.types(sequence.bytes);
@@ -518,12 +537,13 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
-    keyboard.answers_the_probe(&output);
+    let probe = keyboard.answers_the_probe(&output);
     output.expect_within(
         b"kr-ready.",
         LIVENESS_DEADLINE,
         "the session's screen reached the terminal",
     );
+    answered(probe);
     // Everything the terminal was sent while the attachment was being set up. What matters after
     // this point is what the command draws while output flows.
     let settled = output.snapshot();
@@ -600,12 +620,13 @@ async fn mouse_reports_pass_through_and_a_wheel_event_is_never_an_arrow_key() {
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
-    keyboard.answers_the_probe(&output);
+    let probe = keyboard.answers_the_probe(&output);
     output.expect_within(
         b"kr-ready.",
         LIVENESS_DEADLINE,
         "the session's screen reached the terminal",
     );
+    answered(probe);
 
     // Every mouse encoding an advertised protocol produces: the wheel, a press and release in SGR,
     // and the original X10 report whose coordinate bytes are not valid UTF-8.

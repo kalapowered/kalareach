@@ -221,6 +221,56 @@ async fn collect_payloads(client: &mut LocalClient, window: Duration) -> Vec<Vec
     seen
 }
 
+/// Collects payloads until one of them carries `marker`, and then for `window` longer.
+///
+/// The same two halves as [`collect_until`], kept apart for the same reason, with the payload
+/// boundaries preserved: a test that asks what a repaint carried needs the repaints themselves and
+/// not one run-together stream.
+async fn collect_payloads_until(
+    client: &mut LocalClient,
+    marker: &[u8],
+    window: Duration,
+) -> Vec<Vec<u8>> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    while !seen
+        .iter()
+        .any(|payload| payload.windows(marker.len()).any(|slice| slice == marker))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {:?} for a payload carrying {:?}: {:?}",
+            started.elapsed(),
+            String::from_utf8_lossy(marker),
+            seen.iter()
+                .map(|payload| String::from_utf8_lossy(payload).into_owned())
+                .collect::<Vec<_>>()
+        );
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining.min(Duration::from_secs(1)), client.recv()).await {
+            Ok(Ok(ControlFrame::Notification(notification)))
+                if notification.event_type.as_str() == "session.output" =>
+            {
+                if let Ok(event) = notification
+                    .payload
+                    .to_typed::<kr_protocol::recovery::OutputEvent>()
+                {
+                    seen.push(event.bytes.as_slice().to_vec());
+                }
+            }
+            Ok(Ok(_)) | Err(_) => {}
+            Ok(Err(error)) => panic!(
+                "waited {:?} for a payload carrying {:?} and the connection ended ({error})",
+                started.elapsed(),
+                String::from_utf8_lossy(marker)
+            ),
+        }
+    }
+    seen.extend(collect_payloads(client, window).await);
+    seen
+}
+
 /// Collects until `marker` has arrived, and then for `window` longer.
 ///
 /// The two halves answer different questions. Whether the marker arrives at all is a liveness wait,
@@ -253,10 +303,17 @@ async fn collect_until(client: &mut LocalClient, marker: &[u8], window: Duration
                     seen.extend_from_slice(event.bytes.as_slice());
                 }
             }
-            // A quiet moment is a busy machine; a connection that has gone is not something to
-            // wait out.
+            // A quiet moment is a busy machine, so the loop keeps looking; a connection that has
+            // gone can never deliver the marker, and that is this wait's failure rather than a
+            // partial answer for the caller to puzzle over.
             Ok(Ok(_)) | Err(_) => {}
-            Ok(Err(_)) => break,
+            Ok(Err(error)) => panic!(
+                "waited {:?} for {:?} to reach this terminal and the connection ended ({error}): \
+                 {:?}",
+                started.elapsed(),
+                String::from_utf8_lossy(marker),
+                String::from_utf8_lossy(&seen)
+            ),
         }
     }
     seen.extend_from_slice(&collect(client, window).await);
@@ -427,7 +484,7 @@ async fn a_screen_a_restoration_cannot_carry_is_never_continued_as_a_raw_stream(
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (mut client, _, _) = attached(&host, Dimensions::new(4, 5)).await;
 
-    let payloads = collect_payloads(&mut client, Duration::from_secs(4)).await;
+    let payloads = collect_payloads_until(&mut client, b"X", Duration::from_secs(4)).await;
     let text: Vec<String> = payloads
         .iter()
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
