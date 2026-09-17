@@ -17,6 +17,15 @@
 //! The identity the launcher reports is recorded against the reservation before the worker
 //! connects, and the rendezvous compares it with the connecting peer. That is what stops another
 //! process from claiming a reservation it was not started for.
+//!
+//! # Services that are not workers
+//!
+//! A session worker is not the only thing whose lifetime must not belong to the daemon. The plugin
+//! runtime is another: a component fault must not reach a session, and a daemon restart must not
+//! invalidate every rich binding on the host. So the platform paths above are expressed over
+//! [`ServiceLaunch`], which is a label, a program, an argument vector and somewhere to write a job
+//! definition, and a worker launch is one of those with a worker's arguments in it. Everything a
+//! worker gets from being its own job, a service gets the same way.
 
 use std::path::{Path, PathBuf};
 
@@ -89,6 +98,45 @@ impl WorkerLaunch {
     pub fn label(&self) -> String {
         format!("kr-worker-{}", self.reservation_id)
     }
+
+    /// Returns this launch as the job description a supervisor starts.
+    #[must_use]
+    pub fn service(&self) -> ServiceLaunch {
+        ServiceLaunch {
+            label: self.label(),
+            program: self.program.clone(),
+            arguments: self.arguments(),
+            jobs_directory: self.jobs_directory.clone(),
+            working_directory: self.working_directory.clone(),
+        }
+    }
+}
+
+/// What any service needs to be told through its job definition.
+///
+/// A label to find the job by, a program, the argument vector it is started with, and somewhere to
+/// write a generated job definition. Nothing here is a secret: a process that has to prove who it
+/// is generates its own key and presents a signature, rather than being handed one through a job
+/// definition that the platform may log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceLaunch {
+    /// The job label.
+    pub label: String,
+    /// The executable.
+    pub program: PathBuf,
+    /// The arguments, passed as a vector rather than interpolated into a command line.
+    pub arguments: Vec<String>,
+    /// Where a generated job definition is written.
+    pub jobs_directory: PathBuf,
+    /// The directory the process runs in.
+    ///
+    /// Set explicitly on every platform, for every service and not only for workers: a process
+    /// started through a service manager would otherwise run in whatever directory that manager
+    /// happens to be in, and one started by this daemon directly would run in the daemon's, which
+    /// is the directory of whoever started the daemon. Neither is a directory the process has any
+    /// claim on, and either can be a volume the person at the machine expects to be able to
+    /// unmount.
+    pub working_directory: PathBuf,
 }
 
 /// What asking the platform to start a worker produced.
@@ -129,13 +177,28 @@ impl LaunchOutcome {
     }
 }
 
-/// How this host starts workers.
+/// How this host starts things whose lifetime must not belong to the daemon.
 pub trait WorkerSupervisor: Send + Sync + std::fmt::Debug {
     /// Starts a worker and says what happened.
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome;
 
     /// Names this supervisor for diagnostics.
     fn describe(&self) -> String;
+
+    /// Starts a service that is not a worker, and says what happened.
+    ///
+    /// The plugin runtime is the first of these: a component fault must not reach a session, and a
+    /// daemon restart must not invalidate every rich binding on the host, so it is its own job for
+    /// the same reasons a worker is.
+    ///
+    /// The default refuses by name. A supervisor that can start a worker can start a service, and
+    /// the three platform supervisors below do; one that cannot says so rather than pretending to
+    /// have started something.
+    fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+        LaunchOutcome::NotStarted {
+            detail: format!("{} does not start {}", self.describe(), launch.label),
+        }
+    }
 }
 
 /// Chooses the supervisor this host can actually use.
@@ -185,12 +248,12 @@ impl LaunchdSupervisor {
             .is_ok_and(|status| status.success())
     }
 
-    fn write_job(launch: &WorkerLaunch) -> Result<PathBuf> {
-        let label = launch.label();
+    fn write_job(launch: &ServiceLaunch) -> Result<PathBuf> {
+        let label = launch.label.clone();
         let path = launch.jobs_directory.join(format!("{label}.plist"));
         let mut arguments = String::new();
         arguments.push_str(&plist_string(&launch.program.display().to_string()));
-        for argument in launch.arguments() {
+        for argument in launch.arguments.clone() {
             arguments.push_str(&plist_string(&argument));
         }
         let document = format!(
@@ -239,8 +302,12 @@ fn plist_string(value: &str) -> String {
 #[cfg(target_os = "macos")]
 impl WorkerSupervisor for LaunchdSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        self.start_service(&launch.service())
+    }
+
+    fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
         let domain = format!("gui/{}", kr_ipc::paths::current_uid());
-        let label = launch.label();
+        let label = launch.label.clone();
         // Writing the job definition and loading it start nothing: `RunAtLoad` is false, so until
         // the kickstart there is no process to be uncertain about.
         let job = match Self::write_job(launch) {
@@ -325,7 +392,11 @@ impl SystemdSupervisor {
 #[cfg(target_os = "linux")]
 impl WorkerSupervisor for SystemdSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
-        let unit = launch.label();
+        self.start_service(&launch.service())
+    }
+
+    fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+        let unit = launch.label.clone();
         // A transient *service*, not a scope: `MainPID` is defined for a service, so the launcher
         // has an identity to record. A scope would leave the controller guessing.
         let mut arguments = vec![
@@ -340,7 +411,7 @@ impl WorkerSupervisor for SystemdSupervisor {
             "--quiet".to_owned(),
             launch.program.display().to_string(),
         ];
-        arguments.extend(launch.arguments());
+        arguments.extend(launch.arguments.clone());
         let borrowed: Vec<&str> = arguments.iter().map(String::as_str).collect();
         match run("systemd-run", &borrowed) {
             Ok(_) => {}
@@ -399,9 +470,13 @@ impl DetachedSupervisor {
 
 impl WorkerSupervisor for DetachedSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        self.start_service(&launch.service())
+    }
+
+    fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
         match detached_command(
             &launch.program,
-            &launch.arguments(),
+            &launch.arguments,
             &launch.working_directory,
         ) {
             Ok(child) => settle(child),
@@ -602,6 +677,83 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_launch_is_a_service_launch_with_a_worker_in_it() {
+        let launch = launch();
+        let service = launch.service();
+        assert_eq!(service.label, launch.label());
+        assert_eq!(service.program, launch.program);
+        assert_eq!(service.arguments, launch.arguments());
+        assert_eq!(service.jobs_directory, launch.jobs_directory);
+    }
+
+    #[test]
+    fn a_platform_supervisor_starts_a_worker_through_the_service_path() {
+        // Every platform supervisor's `start` is its `start_service` with a worker's job
+        // description, so the two paths cannot diverge.
+        #[derive(Debug, Default)]
+        struct Recording(std::sync::Mutex<Vec<ServiceLaunch>>);
+
+        impl WorkerSupervisor for Recording {
+            fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+                self.start_service(&launch.service())
+            }
+
+            fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+                if let Ok(mut recorded) = self.0.lock() {
+                    recorded.push(launch.clone());
+                }
+                LaunchOutcome::NotStarted {
+                    detail: "this supervisor records rather than starts".to_owned(),
+                }
+            }
+
+            fn describe(&self) -> String {
+                "a recording supervisor".to_owned()
+            }
+        }
+
+        let supervisor = Recording::default();
+        let launch = launch();
+        let outcome = supervisor.start(&launch);
+        assert!(matches!(outcome, LaunchOutcome::NotStarted { .. }));
+        let recorded = supervisor.0.lock().expect("the recording");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].label, launch.label());
+        assert_eq!(recorded[0].arguments, launch.arguments());
+    }
+
+    #[test]
+    fn a_supervisor_that_cannot_start_a_service_says_which_one() {
+        #[derive(Debug)]
+        struct WorkersOnly;
+
+        impl WorkerSupervisor for WorkersOnly {
+            fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+                LaunchOutcome::NotStarted {
+                    detail: "not in this test".to_owned(),
+                }
+            }
+
+            fn describe(&self) -> String {
+                "a supervisor for workers only".to_owned()
+            }
+        }
+
+        let outcome = WorkersOnly.start_service(&ServiceLaunch {
+            label: "kr-plugin-host-1".to_owned(),
+            program: PathBuf::from("/usr/local/bin/kr-plugin-host"),
+            arguments: Vec::new(),
+            jobs_directory: PathBuf::from("/var/lib/kr/jobs"),
+            working_directory: PathBuf::from("/var/lib/kr/services/kr-plugin-host-1"),
+        });
+        let LaunchOutcome::NotStarted { detail } = outcome else {
+            panic!("a supervisor that cannot start a service started one");
+        };
+        assert!(detail.contains("kr-plugin-host-1"));
+        assert!(detail.contains("workers only"));
+    }
+
+    #[test]
     fn the_job_label_names_the_reservation() {
         assert_eq!(
             launch().label(),
@@ -609,17 +761,20 @@ mod tests {
         );
     }
 
-    /// The job definition a service manager reads names the directory the worker runs in.
+    /// The job definition a service manager reads names the directory the process runs in.
     ///
-    /// A worker inheriting a directory is the thing this prevents: the launcher's directory is
-    /// whoever started the daemon's, and a service manager's is the system's.
+    /// A launched process inheriting a directory is the thing this prevents: the launcher's
+    /// directory is whoever started the daemon's, and a service manager's is the system's. It holds
+    /// for every service this host starts, not only for workers, which is why the job is written
+    /// from a service launch.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_job_definition_names_the_directory_the_worker_runs_in() {
         let host = kr_ipc::testing::TempHost::create();
         let mut launch = launch();
         launch.jobs_directory = host.environment().jobs_dir();
-        let job = LaunchdSupervisor::write_job(&launch).expect("writes the job definition");
+        let job =
+            LaunchdSupervisor::write_job(&launch.service()).expect("writes the job definition");
         let document = std::fs::read_to_string(job).expect("reads it back");
         assert!(
             document.contains(
