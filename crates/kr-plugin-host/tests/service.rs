@@ -413,9 +413,34 @@ struct WorkerSession {
     endpoint: kr_ipc::paths::Endpoint,
 }
 
+/// A shell that prints a numbered line and then sleeps, so its output is observable and ordered.
+///
+/// The number is what makes output fresh rather than merely present: a test that waited during a
+/// component call and saw a line could have been seeing what was already buffered, and a line whose
+/// number is higher than the last one seen before the call could not have been.
+const COUNTING_SHELL: &str =
+    "i=0; while [ $i -lt 900 ]; do echo kalareach-$i; i=$((i+1)); sleep 0.02; done";
+
+/// The same, and it asks the terminal a question every time round and waits for the answer.
+///
+/// `ESC [ c` is a device-attributes query. Section 11 says the host answers it into the
+/// application's own input and that answering never waits for a component, so a shell that stops
+/// until it is answered is a shell whose output continuing is proof the answer arrived. The line
+/// discipline is put in raw mode first, because a reply with no newline in it would otherwise sit
+/// in the terminal's line buffer unread.
+const ASKING_SHELL: &str = "stty -icanon -echo min 1 time 0 2>/dev/null; i=0; \
+     while [ $i -lt 900 ]; do echo kalareach-$i; printf '\\033[c'; \
+     answer=$(dd bs=1 count=9 2>/dev/null | tr -d '\\033'); echo \"answered-$i-$answer\"; \
+     i=$((i+1)); sleep 0.02; done";
+
 impl WorkerSession {
-    /// Opens a session whose shell prints a line a second, so its output is observable.
+    /// Opens a session whose shell prints a numbered line and then sleeps.
     fn open(host: &Host) -> Self {
+        Self::running(host, COUNTING_SHELL)
+    }
+
+    /// Opens a session running one shell command.
+    fn running(host: &Host, script: &str) -> Self {
         let environment = host.environment();
         let environment_id = host.temp.environment_id();
         let session_id = SessionId::new(kr_ipc::new_uuid());
@@ -445,11 +470,7 @@ impl WorkerSession {
             display_number: DisplayNumber::new(1),
             shell: ShellCommand {
                 program: "/bin/sh".to_owned(),
-                arguments: vec![
-                    "-c".to_owned(),
-                    "i=0; while [ $i -lt 900 ]; do echo kalareach-$i; i=$((i+1)); sleep 0.02; done"
-                        .to_owned(),
-                ],
+                arguments: vec!["-c".to_owned(), script.to_owned()],
                 cwd: "/".to_owned(),
                 environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
             },
@@ -706,8 +727,10 @@ async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request()
         .await
         .expect("the stuck binding registers");
 
-    // KR-REQ-11.39. The component is now spending every call running past its deadline. The
-    // terminal must not notice.
+    // The component is now spending every call running past its deadline, and the worker's terminal
+    // keeps producing. What this shows is process isolation: the stuck component is in another
+    // process and the session is unaffected by it. The measured claim about the terminal path is
+    // the test below this one.
     for index in 0..8 {
         plugin
             .deliver(stuck_binding, &scrape(&format!("se-{index}"), "output"))
@@ -820,4 +843,113 @@ async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request()
 
     replacement.kill();
     let _ = launcher::retire_descriptor(&environment);
+}
+
+// KR-REQ-11.39: the terminal path is never behind a component.
+//
+// Three things, all of them measured and all of them while the component is running rather than
+// merely after it has been asked to: output the shell produced after the call began, a device
+// query the host answered while the call was running, and handing observations to the runtime by
+// the path a worker's terminal loop actually uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs() {
+    let Some(stuck) = component("infinite-loop") else {
+        return;
+    };
+    let host = Host::create();
+    let environment = host.environment();
+
+    // A shell that asks the terminal a question every time round and stops until it is answered.
+    let session = WorkerSession::running(&host, ASKING_SHELL);
+    let mut terminal = session.attach().await;
+
+    let started = host.start_plugin_host().await;
+    let plugin = host.plugin_client().await;
+    let stuck_component = host.install("infinite-loop", &stuck);
+    let binding = new_binding_id();
+    plugin
+        .register(
+            binding,
+            &identity("infinite-loop", stuck_component.digest),
+            &facts("infinite-loop"),
+            "/bin/sh",
+            &stuck_component,
+        )
+        .await
+        .expect("the stuck binding registers");
+
+    // Where the session had got to before the component was given anything to do. Everything
+    // asserted below has to be newer than this.
+    let before = collect(&mut terminal, Duration::from_millis(400)).await;
+    let before = String::from_utf8_lossy(&before).into_owned();
+    let high_water = highest_line(&before).expect("the shell is producing numbered output");
+    let answers_before = before.matches("answered-").count();
+
+    // Enough observations that the binding's thread is inside the component for the whole window
+    // below: this component never returns, so every one of them runs until its own deadline stops
+    // it. They are handed over by the path a worker's terminal loop uses, which waits for nothing.
+    let mut handed = Vec::new();
+    for index in 0..200 {
+        let offered = std::time::Instant::now();
+        let handoff = plugin.offer(binding, &scrape(&format!("se-{index}"), "output"));
+        handed.push(offered.elapsed());
+        assert!(
+            matches!(
+                handoff,
+                kr_plugin_runtime::service::client::Handoff::Accepted
+                    | kr_plugin_runtime::service::client::Handoff::Refused { .. }
+            ),
+            "the handoff was {handoff:?}"
+        );
+    }
+    let slowest = handed.iter().max().copied().unwrap_or_default();
+    assert!(
+        slowest < Duration::from_millis(50),
+        "handing an observation over took {slowest:?}, so the terminal path waited on the runtime"
+    );
+
+    // Now, while the component is running, the session has to keep producing and the host has to
+    // keep answering the shell's questions. A shell that was not answered would stop at its `dd`
+    // and produce no higher-numbered line at all.
+    let during = collect(&mut terminal, Duration::from_millis(1_500)).await;
+    let during = String::from_utf8_lossy(&during).into_owned();
+    let after = highest_line(&during).unwrap_or(0);
+    assert!(
+        after > high_water,
+        "the terminal produced nothing new while a component was running: it was at \
+         {high_water} before and {after} after"
+    );
+    let answers = during.matches("answered-").count();
+    assert!(
+        answers > 0 && during.contains("[?6"),
+        "the host answered no device query while a component was running ({answers} answers, \
+         {} before)",
+        answers_before
+    );
+
+    // And what the terminal produced goes to the runtime by the same handoff, which is what a
+    // worker's observation path does with its output.
+    let handed_back = plugin.offer(binding, &scrape("se-drained", &during));
+    assert!(
+        matches!(
+            handed_back,
+            kr_plugin_runtime::service::client::Handoff::Accepted
+                | kr_plugin_runtime::service::client::Handoff::Refused { .. }
+        ),
+        "the drained output could not be handed to the runtime: {handed_back:?}"
+    );
+
+    started.kill();
+    let _ = launcher::retire_descriptor(&environment);
+}
+
+/// Returns the highest `kalareach-N` in `text`, if there is one.
+fn highest_line(text: &str) -> Option<u64> {
+    text.match_indices("kalareach-")
+        .filter_map(|(at, _)| {
+            let rest = &text[at + "kalareach-".len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u64>().ok()
+        })
+        .max()
 }
