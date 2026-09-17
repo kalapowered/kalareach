@@ -70,6 +70,19 @@ pub const LAUNCH_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// How long a create waits for its worker to report itself.
 pub const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a close waits for the worker that owns the session.
+///
+/// Section 7's own timing for a closure: five seconds for the processes to stop and two more to
+/// drain their output. A worker that has not answered a close by then has taken longer than the
+/// whole closure is allowed to take, so this daemon stops waiting for it rather than holding the
+/// one connection it has to that worker for whoever asks next. The bound covers acquiring that
+/// connection as well as the exchange over it, because a caller queueing behind a worker that
+/// stopped answering waits exactly as long as one talking to it.
+pub const CLOSE_EXCHANGE: std::time::Duration = std::time::Duration::from_millis(
+    kr_worker::session::GRACE_PERIOD.as_millis() as u64
+        + kr_worker::session::DRAIN_PERIOD.as_millis() as u64,
+);
+
 /// How often the daemon replaces a live connection's action window.
 ///
 /// Half the window's validity, which is the schedule the transport uses: a client is never left
@@ -1914,11 +1927,28 @@ impl Controller {
                 }),
             };
         };
+        // One budget for the whole exchange, started before the wait for the connection. Section 7
+        // gives a closure five seconds to stop its processes and two more to drain them, and this
+        // daemon holds one connection per worker: a worker that stops answering would otherwise
+        // hold that connection for every later caller, and the wait for it would be unbounded on
+        // both sides of the handover.
+        let budget = tokio::time::Instant::now() + CLOSE_EXCHANGE;
         let result = {
             // The connection comes first. Waiting for it can take as long as whatever else is using
             // it, and a deadline computed before that wait would hand the worker time that had
             // already been spent queueing.
-            let mut held = self.worker_client(&worker).await?;
+            let mut held = tokio::time::timeout_at(budget, self.worker_client(&worker))
+                .await
+                .map_err(|_| {
+                    // Nothing was dispatched: this close never reached the worker. The caller can
+                    // ask again, and the operation that is holding the connection is bounded by
+                    // this same budget, so the next attempt is not queueing behind something
+                    // without end.
+                    ControllerError::supervision(
+                        "the connection to the worker that owns this session did not come free in \
+                         time, so nothing was closed",
+                    )
+                })??;
             // Remote dispatch additionally needs a live lease, taken at the moment the dispatch
             // runs rather than one that was valid when the request arrived. Its own remaining time
             // then bounds the deadline the worker is given.
@@ -1937,14 +1967,31 @@ impl Controller {
                 detail: "the deadline this action was admitted under has passed".to_owned(),
             })?;
             let client = held.as_mut().expect("the connection is open");
-            match client
-                .forward(mutation, actor, accepted_deadline_boot_ms)
-                .await
+            match tokio::time::timeout_at(
+                budget,
+                client.forward(mutation, actor, accepted_deadline_boot_ms),
+            )
+            .await
             {
-                Ok(result) => result,
-                Err(error) => {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
                     *held = None;
                     return Err(error.into());
+                }
+                // The close was written and no answer came back inside the time a closure is
+                // allowed to take. The client is retired rather than returned to the shared slot:
+                // its exchange was abandoned part way through, so the next caller to pick it up
+                // would read this close's reply as the answer to its own request. Whether the
+                // worker acted on it is not known, which is what the caller is told: section 9
+                // does not let an interrupted dispatch be reported as a refusal.
+                Err(_) => {
+                    *held = None;
+                    return Err(ControllerError::Uncertain {
+                        detail:
+                            "the worker did not answer this close within the time a closure is \
+                                 given, so whether the session is stopping is not known"
+                                .to_owned(),
+                    });
                 }
             }
         };
@@ -2697,5 +2744,291 @@ mod create_across_a_revocation {
             0,
             "the reservation it made is released"
         );
+    }
+}
+
+/// A close to a worker that stops answering.
+///
+/// The daemon holds one connection per worker, and a close is the operation most likely to meet a
+/// worker that has stopped answering: it is asking that worker to stop. What this covers is the
+/// connection afterwards — that the caller is told, that the link is not put back in the shared
+/// slot part way through an exchange, and that the next caller is not waiting behind the first.
+#[cfg(test)]
+mod a_close_a_worker_never_answers {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use kr_crypto::store::MemoryStore;
+    use kr_ipc::endpoint::Listener;
+    use kr_ipc::framed::split;
+    use kr_ipc::verify::WorkerIdentity;
+    use kr_protocol::envelope::{ActionTarget, ControlFrame, MutationRequest, ParamsValue};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::frame::StreamKind;
+    use kr_protocol::hello::{ActionWindow, ReceiveLimits};
+    use kr_protocol::identity::WorkerProfile;
+    use kr_protocol::ids::{
+        ActionId, ActionWindowId, BuildId, ConnectionId, RequestId, SessionEpoch, SessionId,
+    };
+    use kr_protocol::local::{LocalHelloAck, LocalRole};
+    use kr_protocol::method::{Method, MethodVersion};
+    use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable};
+    use kr_protocol::session::{DisplayNumber, SessionCloseParams};
+    use kr_protocol::worker::{GenerationAccepted, GenerationChallenge, WorkerDescriptor};
+    use kr_transport::window::{AcceptedDeadline, DeadlineBound};
+
+    use crate::directory::KnownWorker;
+    use crate::error::ControllerError;
+    use crate::service::{CLOSE_EXCHANGE, Controller, ControllerSetup};
+    use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
+    use kr_transport::clock::ContinuousClock as _;
+
+    #[derive(Debug)]
+    struct RefusingSupervisor;
+
+    impl WorkerSupervisor for RefusingSupervisor {
+        fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+            LaunchOutcome::NotStarted {
+                detail: "this test starts no workers".to_owned(),
+            }
+        }
+
+        fn describe(&self) -> String {
+            "a supervisor that starts nothing".to_owned()
+        }
+    }
+
+    /// An endpoint that proves itself as a worker and then answers nothing.
+    ///
+    /// It completes the handshake the daemon makes before it will speak to a worker at all — the
+    /// version exchange, the challenge over the descriptor's key and the controller generation —
+    /// and then reads whatever arrives without replying. That is a worker that has stopped
+    /// answering, which is different from one that has gone: the connection stays open.
+    fn serve_silent_worker(
+        listener: Listener,
+        identity: Arc<WorkerIdentity>,
+        endpoint_text: String,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((connection, peer)) = listener.accept().await else {
+                    return;
+                };
+                let identity = Arc::clone(&identity);
+                let endpoint_text = endpoint_text.clone();
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = split(connection, StreamKind::Control);
+                    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+                    while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                        let answers = match frame {
+                            ControlFrame::Hello(_) => vec![
+                                ControlFrame::HelloAck(Box::new(LocalHelloAck {
+                                    selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+                                    role: LocalRole::Worker,
+                                    connection_id,
+                                    environment_id: identity_environment(),
+                                    boot_identity: kr_ipc::identity::boot_identity()
+                                        .expect("a boot identity"),
+                                    peer: peer.to_wire(),
+                                    action_window: ActionWindow {
+                                        action_window_id: ActionWindowId::new("worker:test")
+                                            .expect("a window"),
+                                        connection_id,
+                                        boot_epoch: kr_protocol::ids::BootEpoch::new(1),
+                                        issued_at_ms: kr_ipc::now_ms(),
+                                        valid_for_ms: DurationMs::new(60_000),
+                                    },
+                                    capabilities: CanonicalSet::new(),
+                                    max_receive: ReceiveLimits::default(),
+                                })),
+                                ControlFrame::GenerationChallenge(GenerationChallenge {
+                                    nonce: kr_ipc::verify::fresh_challenge()
+                                        .expect("a challenge")
+                                        .nonce,
+                                }),
+                            ],
+                            ControlFrame::VerifyChallenge(challenge) => {
+                                vec![ControlFrame::VerifyProof(
+                                    identity
+                                        .answer(&challenge, &endpoint_text)
+                                        .expect("answers its own challenge"),
+                                )]
+                            }
+                            ControlFrame::GenerationToken(token) => {
+                                vec![ControlFrame::GenerationAccepted(GenerationAccepted {
+                                    generation: token.generation,
+                                    fenced_previous: false,
+                                })]
+                            }
+                            // The close arrives here and is never answered.
+                            _ => Vec::new(),
+                        };
+                        for answer in answers {
+                            if writer.write_message(&answer).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// The environment the fake worker's acknowledgement names.
+    ///
+    /// The daemon does not compare it with its own, so any identity does; this keeps one value in
+    /// one place rather than inventing a second.
+    fn identity_environment() -> kr_protocol::ids::EnvironmentId {
+        kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::NIL)
+    }
+
+    fn close_request(
+        environment_id: kr_protocol::ids::EnvironmentId,
+        session_id: SessionId,
+    ) -> MutationRequest {
+        MutationRequest {
+            request_id: RequestId::new(1),
+            method: Method::SessionClose.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: ActionTarget {
+                environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            expected: ParamsValue::empty(),
+            action_window_id: ActionWindowId::new("local:test").expect("a window"),
+            requested_ttl_ms: DurationMs::new(30_000),
+            params: ParamsValue::from_typed(&SessionCloseParams { session_id }).expect("encodes"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_client_is_retired_rather_than_held_for_the_next_caller() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let controller = Controller::start(ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    &MemoryStore::new(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(RefusingSupervisor),
+            worker_program: temp.root().join("kr-worker"),
+            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            release: "0".to_owned(),
+        })
+        .await
+        .expect("the daemon starts");
+
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let worker_endpoint = environment
+            .worker_endpoint(DisplayNumber::new(1))
+            .expect("an endpoint");
+        let identity = Arc::new(
+            WorkerIdentity::generate(
+                session_id,
+                SessionEpoch::V1,
+                kr_ipc::identity::boot_identity().expect("a boot identity"),
+                kr_ipc::identity::process_start_identity(std::process::id())
+                    .expect("this process's start identity"),
+                kr_protocol::hello::PROTOCOL_VERSION,
+            )
+            .expect("generates a worker identity"),
+        );
+        let descriptor = WorkerDescriptor {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id,
+            display_number: DisplayNumber::new(1),
+            boot_identity: identity.boot_identity().clone(),
+            process_start_identity: identity.process_start_identity().clone(),
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            endpoint: worker_endpoint.as_text(),
+            worker_public_key: *identity.public_key(),
+            worker_profile: WorkerProfile::HeadlessUser,
+            published_at_ms: kr_ipc::now_ms(),
+        };
+        let listener = Listener::bind(&worker_endpoint).expect("binds the worker endpoint");
+        let serving =
+            serve_silent_worker(listener, Arc::clone(&identity), worker_endpoint.as_text());
+        controller.directory.lock().await.verified.insert(
+            session_id,
+            KnownWorker {
+                descriptor,
+                endpoint: worker_endpoint.clone(),
+            },
+        );
+
+        let actor = crate::service::local_actor(
+            kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
+            ConnectionId::new(kr_ipc::new_uuid()),
+            controller.generation,
+        );
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(300))
+                .expect("a deadline five minutes out"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+
+        let started = tokio::time::Instant::now();
+        let first = controller
+            .session_close(&close_request(environment_id, session_id), &actor, accepted)
+            .await
+            .expect_err("a worker that never answers produces no closure");
+        assert_eq!(
+            first.code(),
+            ErrorCode::OutcomeUnknown,
+            "a close that was written and never answered is uncertain, not refused: {first}"
+        );
+        assert!(
+            matches!(first, ControllerError::Uncertain { .. }),
+            "the caller is told the outcome is not known: {first}"
+        );
+
+        // The slot this daemon keeps for that worker is free, and what was in it has gone. A
+        // client whose exchange was abandoned part way through would answer the next caller's
+        // request with this close's reply, so it is retired rather than put back.
+        let link = controller
+            .connections
+            .lock()
+            .await
+            .get(&session_id)
+            .map(Arc::clone)
+            .expect("the daemon opened a connection to this worker");
+        let held = link
+            .try_lock()
+            .expect("the shared slot is free for the next caller");
+        assert!(
+            held.is_none(),
+            "an interrupted client is retired rather than returned to the shared slot"
+        );
+        drop(held);
+
+        // The second caller is not waiting behind the first. It opens its own connection to the
+        // same silent worker and is bounded in its own right.
+        let second = controller
+            .session_close(&close_request(environment_id, session_id), &actor, accepted)
+            .await
+            .expect_err("the second close meets the same silent worker");
+        assert_eq!(second.code(), ErrorCode::OutcomeUnknown);
+        assert!(
+            started.elapsed() < CLOSE_EXCHANGE * 3,
+            "two closes against a silent worker cost two bounded waits, not an unbounded one"
+        );
+        serving.abort();
     }
 }
