@@ -1945,10 +1945,6 @@ impl Controller {
         // hold that connection for every later caller, and the wait for it would be unbounded on
         // both sides of the handover.
         let budget = tokio::time::Instant::now() + CLOSE_EXCHANGE;
-        // Taken before the exchange begins, so an acknowledgement that arrives over a control path
-        // this daemon has already given up on lifts nothing. Losing the path is what stops the
-        // renewal, and the path is lost the moment this daemon retires the link.
-        let binding = self.leases.binding(params.session_id);
         let result = {
             // The connection comes first. Waiting for it can take as long as whatever else is using
             // it, and a deadline computed before that wait would hand the worker time that had
@@ -1963,6 +1959,11 @@ impl Controller {
                          time, so nothing was closed",
                     )
                 })??;
+            // Taken with the link in hand, not before the wait for it: another operation can lose
+            // this worker's control path and a replacement can be established and acknowledged
+            // while this close is still queueing, and fencing the binding that was current then
+            // would lift nothing. This is the path the exchange below actually runs over.
+            let binding = self.leases.binding(params.session_id);
             // Remote dispatch additionally needs a live lease, taken at the moment the dispatch
             // runs rather than one that was valid when the request arrived. Its own remaining time
             // then bounds the deadline the worker is given.
@@ -3015,8 +3016,19 @@ mod a_close_a_worker_never_answers {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_client_is_retired_rather_than_held_for_the_next_caller() {
+    /// A daemon with one silent worker in its directory, and everything a close needs.
+    struct Silent {
+        _temp: kr_ipc::testing::TempHost,
+        controller: Arc<Controller>,
+        environment_id: kr_protocol::ids::EnvironmentId,
+        session_id: SessionId,
+        worker: KnownWorker,
+        actor: kr_protocol::actor::ActorEnvelope,
+        accepted: AcceptedDeadline,
+        serving: tokio::task::JoinHandle<()>,
+    }
+
+    async fn silent_worker() -> Silent {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -3071,13 +3083,16 @@ mod a_close_a_worker_never_answers {
         let listener = Listener::bind(&worker_endpoint).expect("binds the worker endpoint");
         let serving =
             serve_silent_worker(listener, Arc::clone(&identity), worker_endpoint.as_text());
-        controller.directory.lock().await.verified.insert(
-            session_id,
-            KnownWorker {
-                descriptor,
-                endpoint: worker_endpoint.clone(),
-            },
-        );
+        let worker = KnownWorker {
+            descriptor,
+            endpoint: worker_endpoint,
+        };
+        controller
+            .directory
+            .lock()
+            .await
+            .verified
+            .insert(session_id, worker.clone());
 
         let actor = crate::service::local_actor(
             kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
@@ -3092,12 +3107,41 @@ mod a_close_a_worker_never_answers {
                 .expect("a deadline five minutes out"),
             bound: DeadlineBound::RequestedTtl,
         };
+        Silent {
+            _temp: temp,
+            controller,
+            environment_id,
+            session_id,
+            worker,
+            actor,
+            accepted,
+            serving,
+        }
+    }
 
-        // The worker holds this environment's authority revision, so its dispatch leases renew.
+    /// Records that this worker has acknowledged the revision in force, so its leases renew.
+    fn acknowledged(controller: &Controller, session_id: SessionId) {
         let binding = controller.leases.binding(session_id);
         controller
             .leases
             .acknowledge(session_id, binding, controller.leases.authority_revision());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_client_is_retired_rather_than_held_for_the_next_caller() {
+        let Silent {
+            _temp,
+            controller,
+            environment_id,
+            session_id,
+            actor,
+            accepted,
+            serving,
+            ..
+        } = silent_worker().await;
+
+        // The worker holds this environment's authority revision, so its dispatch leases renew.
+        acknowledged(&controller, session_id);
         assert!(
             matches!(
                 controller
@@ -3171,6 +3215,66 @@ mod a_close_a_worker_never_answers {
         assert!(
             started.elapsed() < CLOSE_EXCHANGE * 3,
             "two closes against a silent worker cost two bounded waits, not an unbounded one"
+        );
+        serving.abort();
+    }
+
+    /// The link a close fences is the link it actually ran over.
+    ///
+    /// A close can queue for this daemon's one connection to a worker while another operation
+    /// loses that connection and a replacement is established and acknowledged. Fencing the
+    /// control path that was current when the close arrived would lift nothing: that path has
+    /// already been given up on, and the renewal the close means to stop belongs to the one it
+    /// used.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_link_a_close_fences_is_the_one_it_ran_over() {
+        let Silent {
+            _temp,
+            controller,
+            environment_id,
+            session_id,
+            worker,
+            actor,
+            accepted,
+            serving,
+            ..
+        } = silent_worker().await;
+        acknowledged(&controller, session_id);
+
+        // The slot is held, so the close below waits for it.
+        let occupied = controller
+            .worker_client(&worker)
+            .await
+            .expect("the daemon opens its link to the worker");
+
+        let close = tokio::spawn({
+            let controller = Arc::clone(&controller);
+            let actor = actor.clone();
+            let mutation = close_request(environment_id, session_id);
+            async move { controller.session_close(&mutation, &actor, accepted).await }
+        });
+        // Long enough for the close to be queueing for the slot.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Meanwhile the control path this worker was acknowledged over is lost, and a replacement
+        // is established and acknowledged.
+        let lost = controller.leases.binding(session_id);
+        controller.leases.stop_renewal(session_id, lost);
+        acknowledged(&controller, session_id);
+        assert!(
+            !controller.leases.is_fenced(session_id),
+            "the replacement path renews before the close reaches the worker"
+        );
+        drop(occupied);
+
+        let error = close
+            .await
+            .expect("the close finishes")
+            .expect_err("a worker that never answers produces no closure");
+        assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+        assert!(
+            controller.leases.is_fenced(session_id),
+            "the close fences the path it used, not the one it was queued behind"
         );
         serving.abort();
     }
