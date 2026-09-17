@@ -1087,13 +1087,21 @@ impl<'a> GitRequest<'a> {
         self
     }
 
-    /// Returns the invocation as a person reads it, with no credential in it.
+    /// Returns the invocation as a person reads it.
+    ///
+    /// The arguments are repeated as they are, and that is deliberate rather than an omission.
+    /// Every one of them is either a literal this host chose or a path, a revision or a remote the
+    /// caller supplied, and a remote reaching an argument has already been through
+    /// [`crate::credential::parse_remote`], which refuses a password, an https user name, a query
+    /// and a fragment before anything runs. So there is no repository text here to redact, and
+    /// putting it through [`redact`] would take away the one thing this string is for: a person
+    /// reading which invocation failed, on which path, with which revision.
     #[must_use]
     pub fn describe(&self) -> String {
         let arguments: Vec<String> = self
             .arguments
             .iter()
-            .map(|argument| redact(&argument.to_string_lossy()))
+            .map(|argument| argument.to_string_lossy().into_owned())
             .collect();
         format!("git {}", arguments.join(" "))
     }
@@ -1464,10 +1472,15 @@ fn key_for_diagnostic(key: &str) -> String {
 /// by its length and a fingerprint of its bytes: a person can still tell two keys apart and find
 /// the one the message is about, and nothing the repository chose is echoed.
 fn subsection_for_diagnostic(subsection: &str) -> String {
-    let unsafe_to_echo = subsection.chars().any(|character| {
-        matches!(character, ':' | '@' | '?' | '#' | '"' | '\'') || character.is_control()
-    });
-    if !unsafe_to_echo {
+    // Repeated only when it is a *name*: ASCII letters, digits and the three characters a name
+    // uses. A remote, a driver and a filter are all named that way; a URL, a query and anything
+    // holding a credential are not. An allowlist rather than a list of characters to look out for,
+    // because the list of characters to look out for is what thirteen reviews kept extending.
+    let is_a_name = !subsection.is_empty()
+        && subsection.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        });
+    if is_a_name {
         return subsection.to_owned();
     }
     let digest = kr_cbor::sha256(subsection.as_bytes());
@@ -1489,62 +1502,58 @@ fn names_of(key: &str) -> &'static str {
         .map_or("a program", |rule| rule.names)
 }
 
-/// Removes anything a message says that this host cannot vouch for.
+/// Removes anything Git said that this host cannot vouch for, whole.
 ///
 /// Git's own standard error reaches a caller and a journal, and what it holds is the repository's
-/// text: a URL, a configuration key, a configuration value, a configuration key with a URL inside
-/// it, with or without whitespace inside the quotes Git puts round it. Twelve reviews of this
-/// service tried to find the credential in that text by its shape, and every one of them found one
-/// more shape the search read wrongly. The shapes were never the problem. Searching was.
+/// text: a URL, a configuration key, a configuration value, a key with a URL and a space inside
+/// the quotes Git puts round it, or the first four kilobytes of any of those, because Git truncates
+/// its own diagnostics. Thirteen reviews of this service looked for the credential in that text and
+/// each found one more place it was not: past a space, past a tab, past the truncation, in the
+/// half of a word the search had already approved.
 ///
-/// So this does not search. A word is repeated only when **every character in it** is one this
-/// host is willing to repeat: a letter, a digit, or one of `- _ . , ; : ( ) ! ' * + ~ /`. What is
-/// deliberately absent is every character a credential travels in or beside: `@` for user
-/// information, `?` `&` `=` `#` for a query and a fragment, `%` for an escape, and the quotes and
-/// brackets that let one piece of text pose as another. A word holding any of them is replaced by
-/// its length and a fingerprint of its bytes, whole, however it is punctuated and whichever side
-/// of a space it falls on.
+/// The lesson is the one those thirteen findings have in common. **A fragment that holds no
+/// credential punctuation is not evidence that the text is safe**, because the punctuation may be
+/// in the next word or in the part Git cut off. So the decision is taken over the whole text, and
+/// it is one question: does this text hold anything a URL or a credential is made of? A `://`
+/// anywhere, or any character outside the set below, and the **whole** text is replaced by its
+/// length and a fingerprint of its bytes. Otherwise it is repeated as Git wrote it.
 ///
-/// What survives is what a person reads: `fatal: unable to access
-/// 'https://github.com/user/repo.git/': Failed to connect to github.com port 443`, paths, exit
-/// codes, Git's own words. What does not survive is any word with a credential's punctuation in
-/// it, including ones that never held a credential.
+/// The set is a letter, a digit, whitespace, or one of `- _ . , ; : ( ) ! ' * + ~ /`. So
+/// `fatal: not a git repository (or any of the parent directories): .git`,
+/// `fatal: bad boolean config value 'invalid' for 'diff.review.binary'` and
+/// `fatal: could not open '/Users/someone/work/x/.git/config'` all come back as Git wrote them,
+/// and any message with a URL in it does not. What a person loses in that case is Git's own words
+/// about a remote; what they keep is this host's own description of the invocation and the remote
+/// on the operation's record, which is a remote validated to carry no credential.
 ///
 /// The limit, stated rather than implied: a secret that is *itself* an ordinary word — a bare
 /// token with no punctuation, echoed as a configuration value — is indistinguishable from an
 /// ordinary word, and this repeats it. Nothing short of repeating none of Git's text would not.
 #[must_use]
 pub fn redact(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    // `split_inclusive` keeps each separator with the word before it, so the text is reassembled
-    // exactly: every space, tab and newline comes back where it was.
-    for word in text.split_inclusive(char::is_whitespace) {
-        let trailing = word.len() - word.trim_end().len();
-        let (body, space) = word.split_at(word.len() - trailing);
-        if body.chars().all(repeatable) {
-            out.push_str(body);
-        } else {
-            out.push_str(&replacement(body));
-        }
-        out.push_str(space);
+    if text.contains("://") || !text.chars().all(repeatable) {
+        // The whole text, because the part that looks harmless may be the half of a credential
+        // whose `@` is in the next word or past Git's own truncation.
+        return replacement(text);
     }
-    out
+    text.to_owned()
 }
 
-/// Returns whether one character is one this host repeats from a message Git wrote.
+/// Returns whether one character is one this host repeats from text Git wrote.
 ///
-/// A letter, a digit, or punctuation that cannot carry a credential or make one piece of text pose
-/// as another. Anything else, including every character of user information, a query, a fragment
-/// and an escape, is not repeatable, and the word it is in is replaced.
+/// A letter, a digit, whitespace, or punctuation that cannot carry a credential or make one piece
+/// of text pose as another. Anything else, including every character of user information, a query,
+/// a fragment and an escape, and every non-ASCII letter, means the text it is in is replaced.
 fn repeatable(character: char) -> bool {
     character.is_ascii_alphanumeric()
+        || character.is_whitespace()
         || matches!(
             character,
             '-' | '_' | '.' | ',' | ';' | ':' | '(' | ')' | '!' | '\'' | '*' | '+' | '~' | '/'
         )
 }
 
-/// Returns the stand-in for one piece of text this host will not repeat.
+/// Returns the stand-in for text this host will not repeat.
 fn replacement(text: &str) -> String {
     let digest = kr_cbor::sha256(text.as_bytes());
     let mut fingerprint = String::with_capacity(16);
@@ -1552,7 +1561,7 @@ fn replacement(text: &str) -> String {
         fingerprint.push_str(&format!("{byte:02x}"));
     }
     format!(
-        "<a value of {} characters this host does not repeat, {fingerprint}>",
+        "<{} characters of what Git said, which this host does not repeat, {fingerprint}>",
         text.chars().count()
     )
 }
@@ -1726,10 +1735,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nothing_with_a_credentials_punctuation_in_it_survives_a_message() {
-        // Twelve reviews of this service each found one more shape a search for a credential read
-        // wrongly. What replaced the search is a decision about characters: a word is repeated
-        // only when every character in it is one this host repeats.
+    fn no_text_holding_what_a_url_is_made_of_survives_a_message() {
+        // Thirteen reviews of this service each found one more place the credential was not: past
+        // a space, past a tab, past Git's own truncation, in the half of a word a search had
+        // already approved. So the decision is taken over the whole text.
         let shapes = [
             "url.https://a.invalid/p,https://user:VERYSECRET@b.invalid/x.insteadof",
             "https://a.invalid/p?access_token=VERYSECRET",
@@ -1741,51 +1750,51 @@ mod tests {
             "ssh://user:VERYSECRET@b.invalid/x",
             "https://VERYSECRET@b.invalid/x",
             "https://VERYSECRET:x-oauth-basic@b.invalid/x",
-            // A configuration key Git itself prints, quoted, with a URL inside it.
             "fatal: bad boolean config value 'invalid' for \
              'diff.https://b.invalid/x?next=\"quoted\"&access_token=VERYSECRET.binary'",
-            // The same key with a space inside the quotes, so the secret is in a word of its own
-            // with no scheme in it at all.
             "fatal: bad boolean config value 'invalid' for \
              'diff.https://b.invalid/x?next=\"two words\"&access_token=VERYSECRET.binary'",
-            // A value whose path a URL parser would normalise away, which is how a credential
-            // hid from the parser this replaced.
             "fatal: bad boolean config value 'ssh:///user:VERYSECRET@b.invalid/../safe' for \
              'diff.review.binary'",
             "fatal: bad boolean config value 'ssh:///user:VERYSECRET@b.invalid/%2e%2e/safe'",
+            // The two review 13 found: the `@` in the *next* word, and a diagnostic Git cut off
+            // before it reached the `@` at all.
+            "fatal: bad boolean config value 'https://user:VERYSECRET+123\t@b.invalid/x'",
+            "fatal: bad boolean config value 'https://VERYSECRET:aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ];
         for shape in shapes {
             let redacted = redact(shape);
             assert!(
                 !redacted.contains("VERYSECRET"),
-                "no word with a credential's punctuation in it survives: {shape} became {redacted}"
+                "no text holding what a URL is made of survives: {shape} became {redacted}"
             );
             assert!(
                 redacted.contains("this host does not repeat"),
                 "and what it replaced is named: {shape} became {redacted}"
             );
         }
-        // What a person reads survives: Git's own words, a path, a port, and a URL that holds
-        // none of a credential's punctuation, quoted or not.
+        // What a person reads survives whole: Git's own words, a path, a quoted configuration key.
+        // A message naming a URL does not, and the invocation's own description carries the remote
+        // instead.
         for plain in [
-            "https://github.com/user/repo.git",
-            "fatal: repository 'https://github.com/user/repo.git' not found",
-            "fatal: unable to access 'https://github.com/user/repo.git/': Failed to connect to \
-             github.com port 443 after 75 ms: Couldn't connect to server",
             "fatal: not a git repository (or any of the parent directories): .git",
             "fatal: bad boolean config value 'invalid' for 'diff.review.binary'",
             "error: pathspec 'x' did not match any file(s) known to git",
             "fatal: could not open '/Users/someone/work/repository/.git/config'",
+            "Couldn't connect to server",
+            "no url here",
+            "  spaced\tout\n",
         ] {
             assert_eq!(
                 redact(plain),
                 plain,
-                "a message with nothing in it to hide is repeated"
+                "a message with nothing in it a URL is made of is repeated whole"
             );
         }
-        // Text that holds no URL is returned as it is, whitespace and all.
-        assert_eq!(redact("no url here"), "no url here");
-        assert_eq!(redact("  spaced\tout\n"), "  spaced\tout\n");
+        // And a message that does name a URL is replaced whole, credential or not, because a
+        // fragment that looks harmless may be half of one.
+        let redacted = redact("fatal: unable to access 'https://github.com/user/repo.git/'");
+        assert!(redacted.starts_with('<'), "{redacted}");
     }
 
     #[test]
@@ -2062,42 +2071,34 @@ mod tests {
 
     #[test]
     fn a_credential_in_a_diagnostic_is_removed_rather_than_shown() {
-        // What a message may repeat is what a parser can vouch for. Everything else is replaced
-        // whole, so the shape it was in does not matter.
+        // The shapes a remote's own diagnostic carries. Each is replaced whole, so the shape it
+        // was in does not matter, and nothing of the message survives to be pieced together.
         for carrying in [
             "fatal: could not read https://user:secret@example.invalid/x.git",
-            // A token is often the *user* of an https URL, so user information goes whether or not
-            // it has a password half.
+            // A token is often the *user* of an https URL, so it goes whether or not it has a
+            // password half.
             "fatal: https://ghp_TOKEN:x-oauth-basic@example.invalid/x.git",
             "fatal: https://ghp_TOKEN@example.invalid/x.git",
-            // An ssh user name that carries a secret.
             "ssh://git:secret@example.invalid/x.git",
+            "first https://one:SECRETA@one.invalid/x then https://two:SECRETB@two.invalid/y",
+            // An ssh login name is not a secret and it goes anyway, because this host does not
+            // decide from a shape which user information is a login name and which is a token.
+            // What a caller keeps instead is this host's own description of the invocation, which
+            // names the remote it validated.
+            "ssh://git@example.invalid/x.git",
         ] {
             let redacted = redact(carrying);
-            for secret in ["secret", "ghp_TOKEN"] {
+            for secret in [
+                "secret",
+                "ghp_TOKEN",
+                "SECRETA",
+                "SECRETB",
+                "example.invalid",
+            ] {
                 assert!(!redacted.contains(secret), "{carrying} became {redacted}");
             }
             assert!(redacted.contains("this host does not repeat"), "{redacted}");
-            assert!(
-                redacted.starts_with("fatal") || redacted.starts_with('<'),
-                "the rest of the message is still there: {redacted}"
-            );
         }
-        // Two credentials on one line are both covered, and the words between them are not.
-        let redacted = redact(
-            "first https://one:SECRETA@one.invalid/x then https://two:SECRETB@two.invalid/y",
-        );
-        assert!(!redacted.contains("SECRETA"), "{redacted}");
-        assert!(!redacted.contains("SECRETB"), "{redacted}");
-        assert!(redacted.starts_with("first "), "{redacted}");
-        assert!(redacted.contains(" then "), "{redacted}");
-        // An ssh login name is not a secret, and it goes anyway: `@` is user information's own
-        // character, and this host does not decide from a shape which user information is a login
-        // name and which is a token. What the caller loses is the login name; what it keeps is the
-        // rest of the message and this host's own description of the invocation, which names the
-        // remote.
-        let redacted = redact("ssh://git@example.invalid/x.git");
-        assert!(redacted.contains("this host does not repeat"), "{redacted}");
         assert_eq!(redact("nothing to redact"), "nothing to redact");
     }
 
@@ -2147,9 +2148,15 @@ mod tests {
         let refusal = audit
             .require_neutralised()
             .expect_err("a name this host cannot carry is refused");
+        // The refusal names the section and the leaf. It does not repeat the name itself, which
+        // is the whole point: a name this host cannot express is a name it will not echo either.
+        let refusal = refusal.to_string();
+        assert!(refusal.contains("filter."), "{refusal}");
+        assert!(refusal.contains(".clean"), "{refusal}");
+        assert!(refusal.contains("cannot express"), "{refusal}");
         assert!(
-            refusal.to_string().contains("control character"),
-            "the refusal says why: {refusal}"
+            !refusal.contains("badname") && !refusal.contains('\u{1}'),
+            "and nothing of the name is in it: {refusal}"
         );
     }
 

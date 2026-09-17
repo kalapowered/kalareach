@@ -167,8 +167,11 @@ impl BrokerRegistry {
             .find(|broker| broker.name == name)
             .ok_or_else(|| ProjectError::RemoteRejected {
                 detail: format!(
-                    "{name} is not an approved credential broker on this host; the approved ones \
+                    "{} is not an approved credential broker on this host; the approved ones \
                      are {}",
+                    // The name is whatever the request carried, and this message is kept, so it
+                    // goes through the same rule as any other text this host did not choose.
+                    crate::git::redact(name),
                     if self.brokers.is_empty() {
                         "none".to_owned()
                     } else {

@@ -2440,7 +2440,10 @@ impl ProjectService {
         output.require_complete()?;
         if !output.success {
             return Err(ProjectError::InvalidArgument(format!(
-                "{revision} is not a revision this repository holds"
+                "{} is not a revision this repository holds",
+                // The revision is the caller's own text, and it goes into a message a journal
+                // keeps and another actor can read, so it goes through the same rule.
+                crate::git::redact(revision)
             )));
         }
         Ok(output.text().trim().to_owned())

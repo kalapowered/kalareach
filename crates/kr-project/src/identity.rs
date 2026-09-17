@@ -260,8 +260,10 @@ impl OpenedRepository {
                      read was read somewhere else",
                     self.git_dir_path.display(),
                     self.top_level.display(),
-                    git_dir_path.display(),
-                    top_level.display()
+                    // The two paths on the right came out of Git rather than out of this host, so
+                    // they go through the rule that covers everything Git said.
+                    crate::git::redact(&git_dir_path.display().to_string()),
+                    crate::git::redact(&top_level.display().to_string())
                 ),
             });
         }

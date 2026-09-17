@@ -822,19 +822,50 @@ fn a_credential_git_itself_prints_does_not_reach_a_caller() {
         "and what was taken out is named: {}",
         output.stderr
     );
-    // The same through the service's own error, which is what a caller and the journal hold.
-    let refusal = kr_project::identity::OpenedRepository::open(
-        fixture.service().profile(),
-        fixture.environment_id(),
-        &path,
-    )
-    .err()
-    .map(|error| error.to_string())
-    .unwrap_or_default();
-    for secret in ["GITSAIDSECRET", "access_token"] {
+    // The same through a real service call that reaches that status, whose error is what a caller
+    // and the journal hold. Adoption succeeds — Git only objects to the value when it reads the
+    // key for a diff — and the preview is what takes the status.
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "git-said-it"),
+                label: "git-said-it".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 90)),
+        )
+        .expect("the repository is adopted")
+        .project
+        .project_repository_id;
+    let refusal = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &kr_protocol::project::WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "git-said-it".to_owned(),
+                kind: WorkspaceKind::SharedExisting,
+                isolation: kr_protocol::scalars::Nullable(None),
+                policy: include_everything(),
+                base_revision: kr_protocol::scalars::Nullable(None),
+                base_change_set_id: kr_protocol::scalars::Nullable(None),
+                destination: kr_protocol::scalars::Nullable(None),
+                preview_only: true,
+            },
+            None,
+        )
+        .expect_err("Git refuses the value while taking the status")
+        .to_string();
+    for secret in ["GITSAIDSECRET", "access_token", "two words"] {
         assert!(
             !refusal.contains(secret),
-            "nor through the service's own error: {refusal}"
+            "nor through the service's own error ({secret}): {refusal}"
         );
     }
+    assert!(
+        refusal.contains("this host does not repeat"),
+        "and that error says what it took out: {refusal}"
+    );
 }

@@ -367,25 +367,32 @@ The keys that remain are dealt with in one of three ways, and never ignored:
 
 A configuration key can itself carry a credential: `[url "https://token@host/"]` puts one in the
 subsection. A key on its way into a limitation or a refusal is therefore not parsed as a URL, which
-is what a subsection is not. A subsection that holds none of `:`, `@`, `?`, `#`, `"`, `'` or a
-control character is repeated as it is, because naming the remote or the driver is the whole use of
-the message. Anything else is replaced by its length and a fingerprint of its bytes: a person can
+is what a subsection is not. A subsection is repeated only when it is a *name*: ASCII
+letters, digits and `-`, `_`, `.`. A remote, a driver and a filter are all named that way, and
+naming them is the whole use of the message; a URL, a query and anything holding a credential are
+not names. Anything else is replaced by its length and a fingerprint of its bytes: a person can
 still find the key in the file and tell two keys apart, and nothing the repository chose is echoed.
 Git's own standard error is the harder case, because Git prints the configuration key and the value
-it objected to, quotes and spaces and all. So a message is not searched for a credential either. A
-word in it is repeated only when **every character in it** is a letter, a digit, or one of
-`- _ . , ; : ( ) ! ' * + ~ /`. Absent from that set is every character a credential travels in or
-beside: `@`, `?`, `&`, `=`, `#`, `%`, and the quotes and brackets that let one piece of text pose as
-another. A word with any of them is replaced whole, whichever side of a space it falls on, and
-carries its length and a fingerprint instead.
+it objected to, quotes and spaces and all, and cuts its own diagnostics off at four kilobytes. So a
+message is not searched for a credential, and it is not judged word by word either: **a fragment
+that holds no credential punctuation is not evidence that the text is safe**, because the
+punctuation can be in the next word or in the part Git cut off. The decision is taken over the
+whole text, and it is one question. Does this text hold anything a URL or a credential is made of:
+a `://` anywhere, or any character outside a letter, a digit, whitespace and
+`- _ . , ; : ( ) ! ' * + ~ /`? Then the whole text is replaced by its length and a fingerprint of
+its bytes. Otherwise it is repeated exactly as Git wrote it.
 
-`fatal: unable to access 'https://github.com/user/repo.git/': Failed to connect to github.com port
-443` therefore reads as Git wrote it, and so do paths and Git's own words. A key with a URL inside
-it does not, nor does an `ssh://git@host/x` login name, because `@` is user information's own
-character and this host does not decide from a shape which user information is a login and which is
-a token. What it cannot catch is a secret that is *itself* an ordinary word, echoed as a
-configuration value: nothing distinguishes it from an ordinary word, and only repeating none of
-Git's text would.
+So `fatal: not a git repository (or any of the parent directories): .git`,
+`fatal: bad boolean config value 'invalid' for 'diff.review.binary'` and
+`fatal: could not open '/Users/someone/work/x/.git/config'` all come back whole, and any message
+naming a URL does not. What a person loses there is Git's own words about a remote; what they keep
+is this host's own description of the invocation, which repeats its arguments as they are because
+every one of them is a literal this host chose or a path, a revision or a remote the caller
+supplied, and a credential-bearing remote is refused before any invocation runs.
+
+The limit, stated rather than implied: a secret that is *itself* an ordinary word, echoed as a
+configuration value, is indistinguishable from an ordinary word and is repeated. Only repeating
+none of Git's text would change that.
 
 Nothing here rewrites the user's Git configuration. The overrides live on one child process's
 command line and in its environment. A terminal command under broad shell access keeps normal Git

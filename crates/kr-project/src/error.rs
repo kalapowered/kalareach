@@ -210,7 +210,10 @@ impl From<ProjectError> for ProtocolError {
 impl From<kr_transfer::Escape> for ProjectError {
     fn from(error: kr_transfer::Escape) -> Self {
         Self::Destination {
-            detail: error.to_string(),
+            // The refusal names the component it refused, which is text the caller supplied, so it
+            // goes through the same rule as anything else this host did not choose. An ordinary
+            // path comes back as it is; anything a credential is made of does not.
+            detail: crate::git::redact(&error.to_string()),
         }
     }
 }
