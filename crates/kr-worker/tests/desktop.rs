@@ -988,21 +988,31 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     }
     // What says a worker has gone is the kernel's answer about the process the descriptor recorded,
     // not an endpoint that stopped answering: a worker that dropped its socket and stayed would
-    // pass that. Only an ended process is gone. A query the operating system would not answer
-    // establishes nothing either way, so it keeps waiting and is named with what it said if the
-    // bound passes.
+    // pass that. A worker is a child of whatever process runs the daemon, which here is this test,
+    // so each one is collected here as well: until a child is collected the operating system keeps
+    // its entry, and on Linux that entry still carries the start value the descriptor recorded, so
+    // the identity alone would go on answering that the worker is running. Collecting is what
+    // establishes the end; the identity is what answers for a process this test is not the parent
+    // of. A query the operating system would not answer establishes nothing either way, so it
+    // keeps waiting and is named with what it said if the bound passes.
     let deadline = std::time::Instant::now() + WORKER_EXIT_DEADLINE;
+    let mut ended = vec![false; workers.len()];
     let mut waiting: Vec<String> = Vec::new();
     loop {
         waiting.clear();
-        for (session_id, _, process) in &workers {
+        for (index, (session_id, _, process)) in workers.iter().enumerate() {
+            if ended[index] {
+                continue;
+            }
             let pid = process.pid.get();
+            if collected(pid) {
+                ended[index] = true;
+                continue;
+            }
             match kr_ipc::identity::process_state(process) {
-                kr_ipc::identity::ProcessState::Ended => {}
+                kr_ipc::identity::ProcessState::Ended => ended[index] = true,
                 kr_ipc::identity::ProcessState::Running => {
-                    if !has_exited_unreaped(process) {
-                        waiting.push(format!("{session_id} as {pid}, still running"));
-                    }
+                    waiting.push(format!("{session_id} as {pid}, still running"));
                 }
                 kr_ipc::identity::ProcessState::Unknown { detail } => {
                     waiting.push(format!("{session_id} as {pid}, unanswered: {detail}"));
@@ -1022,28 +1032,28 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     );
 }
 
-/// Returns whether a process has run to its end and is only waiting to be collected.
+/// Collects one child of this test process, without waiting for it.
 ///
-/// A worker is started by the supervision as a child of whatever process runs the daemon, which
-/// here is this test, and nothing collects it. On Linux such a process keeps its entry, and with it
-/// the start value it was recorded under, until its parent goes, so the recorded identity still
-/// matches and the kernel still describes it. Its own state is what separates that from a worker
-/// that is still working. No other platform this suite runs on describes a process that has ended.
-#[cfg(target_os = "linux")]
-fn has_exited_unreaped(process: &kr_protocol::identity::ProcessStartIdentity) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", process.pid.get())) else {
+/// Returns whether that child has run to its end and was collected here. It never blocks: a child
+/// that is still running is reported as one, and so is a process this test is not the parent of,
+/// which the caller then asks the identity reader about instead. Only a child that ended is
+/// reported, because nothing here asks to hear about one that merely stopped.
+#[cfg(unix)]
+fn collected(pid: u64) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
         return false;
     };
-    // The command is free text in brackets and can hold brackets and spaces of its own, so the
-    // state is the first field after the last bracket rather than the third field of the line.
-    let Some((_, after_command)) = stat.rsplit_once(')') else {
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
         return false;
     };
-    after_command.split_whitespace().next() == Some("Z")
+    matches!(
+        rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG),
+        Ok(Some(_))
+    )
 }
 
-#[cfg(not(target_os = "linux"))]
-const fn has_exited_unreaped(_process: &kr_protocol::identity::ProcessStartIdentity) -> bool {
+#[cfg(not(unix))]
+const fn collected(_pid: u64) -> bool {
     false
 }
 
