@@ -2027,7 +2027,9 @@ impl ProjectService {
             Ok(paths) => DirtyCount::Unmeasurable(format!(
                 "{} holds submodules whose own working trees this host does not look inside ({})",
                 row.display_path,
-                paths.join(", ")
+                // The paths came out of the repository's index, so they go through the rule before
+                // they reach a retained record a reader keeps.
+                crate::git::redact(&paths.join(", "))
             )),
             Err(error) => DirtyCount::Unmeasurable(error.to_string()),
         }
@@ -2654,7 +2656,8 @@ fn check_branch(branch: &str) -> Result<()> {
         })
     {
         return Err(ProjectError::InvalidArgument(format!(
-            "{branch} is not a branch name"
+            "{} is not a branch name",
+            crate::git::redact(branch)
         )));
     }
     Ok(())
@@ -2668,7 +2671,8 @@ fn check_revision(revision: &str) -> Result<()> {
             .any(|character| character.is_control() || character == ' ')
     {
         return Err(ProjectError::InvalidArgument(format!(
-            "{revision} is not a revision"
+            "{} is not a revision",
+            crate::git::redact(revision)
         )));
     }
     Ok(())

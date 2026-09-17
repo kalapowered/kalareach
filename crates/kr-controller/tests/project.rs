@@ -595,6 +595,63 @@ async fn a_repeated_creation_action_is_answered_from_the_record() {
     let _ = host.stop().await;
 }
 
+/// KR-REQ-14.19: a failure a caller's own text produced is answered, and retained, with none of
+/// that text in it. The retry reads the retained record back, which is the copy that would outlive
+/// the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retained_failure_carries_none_of_what_the_caller_sent() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let carrying = "https://user:RETAINEDSECRET@b.invalid/x";
+    let params = ProjectInitParams {
+        destination: host.destination("retained"),
+        label: "retained".to_owned(),
+        // A branch name a caller can send and this host refuses: it holds a colon.
+        initial_branch: Nullable(Some(carrying.to_owned())),
+    };
+    let refusal = failure(
+        control
+            .mutate(
+                Method::ProjectInit,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert!(
+        !refusal.message.contains("RETAINEDSECRET"),
+        "the answer carries none of it: {}",
+        refusal.message
+    );
+    // The same action again. A retry is answered from the retained record rather than run twice,
+    // so this is the copy of the message the journal kept.
+    let repeated = failure(
+        control
+            .mutate(
+                Method::ProjectInit,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert!(
+        !repeated.message.contains("RETAINEDSECRET"),
+        "and neither does the record it was retained as: {}",
+        repeated.message
+    );
+    assert!(
+        repeated.message.contains("this host does not repeat"),
+        "which says what was taken out: {}",
+        repeated.message
+    );
+    let _ = host.stop().await;
+}
+
 /// KR-REQ-24.08: a workspace, its policy and its pins survive the daemon's death, and cleanup
 /// still respects them afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

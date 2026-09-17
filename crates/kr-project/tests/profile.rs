@@ -869,3 +869,97 @@ fn a_credential_git_itself_prints_does_not_reach_a_caller() {
         "and that error says what it took out: {refusal}"
     );
 }
+
+#[test]
+fn nothing_a_caller_or_a_repository_supplied_reaches_a_refusal() {
+    // A refusal names the rule it is applying, not the text it refused. A caller can put anything
+    // in a branch name, a revision or a destination, and a refusal is kept: it is answered to the
+    // caller and written into the journal beside the action.
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "refusals");
+    let carrying = "https://user:REFUSALSECRET@b.invalid/x";
+    let mut refusals: Vec<String> = Vec::new();
+    // A branch name, through `project.init`.
+    refusals.push(
+        fixture
+            .service()
+            .project_init(
+                &actor(),
+                &kr_protocol::project::ProjectInitParams {
+                    destination: destination(fixture.environment_id(), fixture.work(), "named"),
+                    label: "named".to_owned(),
+                    initial_branch: kr_protocol::scalars::Nullable(Some(carrying.to_owned())),
+                },
+                None,
+            )
+            .expect_err("a branch name with a colon in it is refused")
+            .to_string(),
+    );
+    // A revision, through a workspace creation.
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "refusals"),
+                label: "refusals".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 91)),
+        )
+        .expect("it is adopted")
+        .project
+        .project_repository_id;
+    refusals.push(
+        fixture
+            .service()
+            .workspace_create(
+                &actor(),
+                &kr_protocol::project::WorkspaceCreateParams {
+                    project_repository_id: project,
+                    label: "refused".to_owned(),
+                    kind: WorkspaceKind::SharedExisting,
+                    isolation: kr_protocol::scalars::Nullable(None),
+                    policy: include_everything(),
+                    base_revision: kr_protocol::scalars::Nullable(Some(carrying.to_owned())),
+                    base_change_set_id: kr_protocol::scalars::Nullable(None),
+                    destination: kr_protocol::scalars::Nullable(None),
+                    preview_only: true,
+                },
+                None,
+            )
+            .expect_err("a revision this repository does not hold is refused")
+            .to_string(),
+    );
+    // A destination's parent, which is not absolute.
+    refusals.push(
+        fixture
+            .service()
+            .project_init(
+                &actor(),
+                &kr_protocol::project::ProjectInitParams {
+                    destination: kr_protocol::project::DestinationRequest {
+                        environment_id: fixture.environment_id(),
+                        parent_path: carrying.to_owned(),
+                        name: "x".to_owned(),
+                    },
+                    label: "relative".to_owned(),
+                    initial_branch: kr_protocol::scalars::Nullable(None),
+                },
+                None,
+            )
+            .expect_err("a parent that is not an absolute path is refused")
+            .to_string(),
+    );
+    for refusal in &refusals {
+        assert!(
+            !refusal.contains("REFUSALSECRET"),
+            "no refusal repeats what it refused: {refusal}"
+        );
+        assert!(
+            refusal.contains("this host does not repeat"),
+            "and each says what it took out: {refusal}"
+        );
+    }
+    let _ = path;
+}

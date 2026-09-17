@@ -1760,9 +1760,15 @@ impl Store {
     ) -> Result<Option<RetainedOutcome>> {
         let (result, code, detail) = match outcome {
             RetainedOutcome::Ok(result) => (Some(result.clone()), None, None),
-            RetainedOutcome::Error { code, detail } => {
-                (None, Some(code.as_str().to_owned()), Some(detail.clone()))
-            }
+            RetainedOutcome::Error { code, detail } => (
+                None,
+                Some(code.as_str().to_owned()),
+                // A retained failure is read back by whoever repeats the action, and it is kept,
+                // so the rule is applied here as well as where the message was composed. Two bars
+                // rather than one, because fourteen reviews each found one producer that had been
+                // missed and the journal is the place a miss is permanent.
+                Some(crate::git::redact(detail)),
+            ),
         };
         let inserted = self
             .connection

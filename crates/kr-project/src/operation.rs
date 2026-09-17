@@ -88,7 +88,7 @@ impl Destination {
                 detail: format!(
                     "{} is not an absolute path; a destination's parent is named absolutely and \
                      resolved once",
-                    parent_path.display()
+                    crate::git::redact(&parent_path.display().to_string())
                 ),
             });
         }

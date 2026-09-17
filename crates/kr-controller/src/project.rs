@@ -383,15 +383,20 @@ fn frame(request_id: RequestId, outcome: Answer<ParamsValue>) -> ControlFrame {
 }
 
 fn parse<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Result<T> {
-    params
-        .to_typed()
-        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    params.to_typed().map_err(|error| {
+        ControllerError::InvalidArgument(kr_project::git::redact(&error.to_string()))
+    })
 }
 
 fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Answer<T> {
-    params
-        .to_typed()
-        .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))
+    params.to_typed().map_err(|error| {
+        // A decoding refusal quotes what it could not decode, which is whatever the request
+        // carried, so it goes through the project service's own rule before it is answered with.
+        ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            kr_project::git::redact(&error.to_string()),
+        )
+    })
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {

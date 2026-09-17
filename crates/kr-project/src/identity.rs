@@ -174,7 +174,7 @@ impl OpenedRepository {
                      recorded identity is the object rather than the path, so nothing is served \
                      from it",
                     expected.git_dir,
-                    self.top_level.display(),
+                    crate::git::redact(&self.top_level.display().to_string()),
                     self.identity.git_dir
                 ),
             });
@@ -185,7 +185,7 @@ impl OpenedRepository {
                     "this record names the working tree {}, and {} is the working tree {}; a \
                      linked worktree is its own object and a record of one never covers another",
                     expected.work_tree,
-                    self.top_level.display(),
+                    crate::git::redact(&self.top_level.display().to_string()),
                     self.identity.work_tree
                 ),
             });
@@ -258,10 +258,11 @@ impl OpenedRepository {
                 detail: format!(
                     "this repository reported {} and {} and now reports {} and {}; what the host \
                      read was read somewhere else",
-                    self.git_dir_path.display(),
-                    self.top_level.display(),
-                    // The two paths on the right came out of Git rather than out of this host, so
-                    // they go through the rule that covers everything Git said.
+                    // All four came out of Git: two when the repository was opened and two now.
+                    // A path is repeated as it is unless it holds something a URL is made of,
+                    // which is what the rule decides.
+                    crate::git::redact(&self.git_dir_path.display().to_string()),
+                    crate::git::redact(&self.top_level.display().to_string()),
                     crate::git::redact(&git_dir_path.display().to_string()),
                     crate::git::redact(&top_level.display().to_string())
                 ),

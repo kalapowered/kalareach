@@ -280,9 +280,10 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
                     .any(|long| long.starts_with(head) || head.starts_with(long)));
         if refused {
             return Err(ProjectError::InvalidArgument(format!(
-                "{text} is not an argument this service passes: a forced command discards what is \
-                 in the way, and the configuration, the programs and the directories are the \
-                 profile's rather than the caller's"
+                "{} is not an argument this service passes: a forced command discards what is in \
+                 the way, and the configuration, the programs and the directories are the \
+                 profile's rather than the caller's",
+                redact(&text)
             )));
         }
         // A combined short option hides its members: `-qf` is `-q` and `-f`, and the second is
@@ -297,7 +298,8 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
             })
         {
             return Err(ProjectError::InvalidArgument(format!(
-                "{text} combines a short option this service never passes"
+                "{} combines a short option this service never passes",
+                redact(&text)
             )));
         }
         // The one template directory an invocation may name is the empty one the profile already
@@ -305,8 +307,9 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
         // same option, so only the exact empty form is allowed through.
         if "--template".starts_with(head) && head.len() > 2 && text != "--template=" {
             return Err(ProjectError::InvalidArgument(format!(
-                "{text} names a template directory whose hooks would be copied into the new \
-                 repository"
+                "{} names a template directory whose hooks would be copied into the new \
+                 repository",
+                redact(&text)
             )));
         }
     }
@@ -632,14 +635,14 @@ impl RestrictedProfile {
         };
         let out = join(out, request)?;
         let err = join(err, request)?;
-        let stderr = redact(&String::from_utf8_lossy(&err.bytes));
+        let stderr = git_said(&String::from_utf8_lossy(&err.bytes));
         Ok(GitOutput {
             status: status.code(),
             success: status.success(),
             stdout: out.bytes,
             stdout_truncated: out.truncated,
             stderr: if err.truncated {
-                format!("{stderr} (this host read part of what was said)")
+                format!("{stderr}, of which this host read part")
             } else {
                 stderr
             },
@@ -1087,23 +1090,30 @@ impl<'a> GitRequest<'a> {
         self
     }
 
-    /// Returns the invocation as a person reads it.
+    /// Returns the invocation as a person reads it: the subcommand, and how much followed it.
     ///
-    /// The arguments are repeated as they are, and that is deliberate rather than an omission.
-    /// Every one of them is either a literal this host chose or a path, a revision or a remote the
-    /// caller supplied, and a remote reaching an argument has already been through
-    /// [`crate::credential::parse_remote`], which refuses a password, an https user name, a query
-    /// and a fragment before anything runs. So there is no repository text here to redact, and
-    /// putting it through [`redact`] would take away the one thing this string is for: a person
-    /// reading which invocation failed, on which path, with which revision.
+    /// Not the arguments. An argument is a path, a revision, a branch name or a remote the caller
+    /// supplied, and a caller can put anything in one; `--initial-branch=access_token=…` is a
+    /// branch name Git will reject and this string would otherwise carry. The subcommand is this
+    /// host's own, checked against [`PERMITTED_SUBCOMMANDS`] before anything runs, so it is the
+    /// one part of an invocation this host can vouch for.
+    ///
+    /// What a person needs beyond it comes from this host's own records rather than from the
+    /// argument vector: which repository, which workspace, which destination, which remote as it
+    /// was validated.
     #[must_use]
     pub fn describe(&self) -> String {
-        let arguments: Vec<String> = self
+        let subcommand = self
             .arguments
-            .iter()
+            .first()
             .map(|argument| argument.to_string_lossy().into_owned())
-            .collect();
-        format!("git {}", arguments.join(" "))
+            .filter(|argument| PERMITTED_SUBCOMMANDS.contains(&argument.as_str()))
+            .unwrap_or_else(|| "no subcommand".to_owned());
+        match self.arguments.len().saturating_sub(1) {
+            0 => format!("git {subcommand}"),
+            1 => format!("git {subcommand} with one argument"),
+            rest => format!("git {subcommand} with {rest} arguments"),
+        }
     }
 }
 
@@ -1502,7 +1512,40 @@ fn names_of(key: &str) -> &'static str {
         .map_or("a program", |rule| rule.names)
 }
 
-/// Removes anything Git said that this host cannot vouch for, whole.
+/// Returns what this host says about text Git wrote, which is never the text.
+///
+/// Git's standard error is a configuration *value* as often as a message, and a value is
+/// unconstrained: `bad boolean config value 'user:TOKEN+1<tab>@host:x'`, and Git cuts its own
+/// diagnostics off at four kilobytes, so the part that reaches this host can be a credential with
+/// every character of punctuation removed by the truncation. Fourteen reviews of this service each
+/// found one more shape a rule over that text read wrongly, and the last two found shapes with no
+/// URL and no punctuation in them at all. There is no rule over unconstrained text that tells a
+/// secret from a message.
+///
+/// So this host does not repeat it. What it says instead is the class Git itself names in its
+/// first word — `fatal`, `error`, `warning`, `hint` — with how much text there was and a
+/// fingerprint of it, so two failures can be told apart and one can be recognised again. What
+/// carries the *meaning* of a failure is this host's own text: which invocation, which exit code,
+/// which repository and workspace, which destination, all from its own records rather than from
+/// Git's mouth.
+#[must_use]
+pub fn git_said(text: &str) -> String {
+    let trimmed = text.trim();
+    let class = ["fatal", "error", "warning", "hint"]
+        .into_iter()
+        .find(|class| trimmed.starts_with(&format!("{class}:")))
+        .unwrap_or("nothing this host recognises");
+    if trimmed.is_empty() {
+        return "nothing".to_owned();
+    }
+    format!(
+        "{class}, in {} characters this host does not repeat, {}",
+        trimmed.chars().count(),
+        fingerprint(trimmed)
+    )
+}
+
+/// Removes anything a caller or a repository supplied that this host cannot vouch for, whole.
 ///
 /// Git's own standard error reaches a caller and a journal, and what it holds is the repository's
 /// text: a URL, a configuration key, a configuration value, a key with a URL and a space inside
@@ -1555,15 +1598,24 @@ fn repeatable(character: char) -> bool {
 
 /// Returns the stand-in for text this host will not repeat.
 fn replacement(text: &str) -> String {
-    let digest = kr_cbor::sha256(text.as_bytes());
-    let mut fingerprint = String::with_capacity(16);
-    for byte in &digest[..8] {
-        fingerprint.push_str(&format!("{byte:02x}"));
-    }
     format!(
-        "<{} characters of what Git said, which this host does not repeat, {fingerprint}>",
-        text.chars().count()
+        "<{} characters this host does not repeat, {}>",
+        text.chars().count(),
+        fingerprint(text)
     )
+}
+
+/// Returns the first eight bytes of one piece of text's digest, as hexadecimal.
+///
+/// Enough to tell two replaced pieces of text apart and to recognise one again, and not enough to
+/// be the text.
+fn fingerprint(text: &str) -> String {
+    let digest = kr_cbor::sha256(text.as_bytes());
+    let mut out = String::with_capacity(16);
+    for byte in &digest[..8] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// What a bounded read produced.
@@ -1795,6 +1847,47 @@ mod tests {
         // fragment that looks harmless may be half of one.
         let redacted = redact("fatal: unable to access 'https://github.com/user/repo.git/'");
         assert!(redacted.starts_with('<'), "{redacted}");
+    }
+
+    #[test]
+    fn what_git_said_is_named_by_its_class_and_never_repeated() {
+        // A configuration value is unconstrained text, and Git cuts its own diagnostics off at
+        // four kilobytes, so the part that reaches this host can be a credential with every
+        // character of punctuation removed by the truncation. There is no rule over that text
+        // that tells a secret from a message, so none is repeated.
+        let truncated = format!(
+            "fatal: bad boolean config value 'user:VERYSECRET+123{}",
+            "a".repeat(4000)
+        );
+        for said in [
+            truncated.as_str(),
+            "fatal: bad boolean config value 'user:VERYSECRET+123\t@b.invalid:x' for 'd.r.binary'",
+            "error: something VERYSECRET happened",
+            "warning: VERYSECRET",
+            "hint: VERYSECRET",
+            "VERYSECRET with no class at all",
+        ] {
+            let told = git_said(said);
+            assert!(
+                !told.contains("VERYSECRET"),
+                "nothing Git said is repeated: {said} became {told}"
+            );
+            assert!(
+                told.contains("this host does not repeat"),
+                "and what it stands for is named: {told}"
+            );
+        }
+        // The class Git names is the one thing repeated, because Git chose it rather than the
+        // repository, and it is what a person reads first.
+        assert!(git_said("fatal: x").starts_with("fatal,"));
+        assert!(git_said("error: x").starts_with("error,"));
+        assert!(git_said("warning: x").starts_with("warning,"));
+        assert!(git_said("hint: x").starts_with("hint,"));
+        assert!(git_said("something else").starts_with("nothing this host recognises,"));
+        assert_eq!(git_said("   "), "nothing");
+        // Two different messages are two different fingerprints, so a failure can be recognised
+        // again and two can be told apart.
+        assert_ne!(git_said("fatal: one"), git_said("fatal: two"));
     }
 
     #[test]

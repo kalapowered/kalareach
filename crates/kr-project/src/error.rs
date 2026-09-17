@@ -202,8 +202,17 @@ impl ProjectError {
 }
 
 impl From<ProjectError> for ProtocolError {
+    /// Every project error becomes a wire error here, and this is where the rule is applied to the
+    /// whole of it.
+    ///
+    /// Each place that composes a message also puts the untrusted part of it through
+    /// [`crate::git::redact`], which is what keeps this host's own words legible: a message whose
+    /// fragments are already safe passes through unchanged. This is the bar underneath that, for
+    /// the message nobody thought about: fourteen reviews of this service each found one more
+    /// producer that had been missed, and a bar at the one place every error passes through does
+    /// not depend on anybody remembering.
     fn from(error: ProjectError) -> Self {
-        Self::new(error.code(), error.to_string())
+        Self::new(error.code(), crate::git::redact(&error.to_string()))
     }
 }
 

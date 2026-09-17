@@ -372,27 +372,33 @@ letters, digits and `-`, `_`, `.`. A remote, a driver and a filter are all named
 naming them is the whole use of the message; a URL, a query and anything holding a credential are
 not names. Anything else is replaced by its length and a fingerprint of its bytes: a person can
 still find the key in the file and tell two keys apart, and nothing the repository chose is echoed.
-Git's own standard error is the harder case, because Git prints the configuration key and the value
-it objected to, quotes and spaces and all, and cuts its own diagnostics off at four kilobytes. So a
-message is not searched for a credential, and it is not judged word by word either: **a fragment
-that holds no credential punctuation is not evidence that the text is safe**, because the
-punctuation can be in the next word or in the part Git cut off. The decision is taken over the
-whole text, and it is one question. Does this text hold anything a URL or a credential is made of:
-a `://` anywhere, or any character outside a letter, a digit, whitespace and
-`- _ . , ; : ( ) ! ' * + ~ /`? Then the whole text is replaced by its length and a fingerprint of
-its bytes. Otherwise it is repeated exactly as Git wrote it.
+**Git's own standard error is not repeated at all.** Git prints the configuration key *and the
+value* it objected to, and a value is unconstrained text; Git also cuts its own diagnostics off at
+four kilobytes, so what reaches this host can be a credential whose every character of punctuation
+the truncation removed. Fourteen reviews of this service each found one more shape a rule over that
+text read wrongly, and the last two found shapes with no URL and no punctuation in them at all.
+There is no rule over unconstrained text that tells a secret from a message.
 
-So `fatal: not a git repository (or any of the parent directories): .git`,
-`fatal: bad boolean config value 'invalid' for 'diff.review.binary'` and
-`fatal: could not open '/Users/someone/work/x/.git/config'` all come back whole, and any message
-naming a URL does not. What a person loses there is Git's own words about a remote; what they keep
-is this host's own description of the invocation, which repeats its arguments as they are because
-every one of them is a literal this host chose or a path, a revision or a remote the caller
-supplied, and a credential-bearing remote is refused before any invocation runs.
+So what a failure says is: the class Git named in its first word (`fatal`, `error`, `warning`,
+`hint`), how many characters there were, and a fingerprint of them. Two failures can be told apart
+and one can be recognised again. What carries the *meaning* is this host's own text: which
+subcommand, which exit code, which repository, which workspace, which destination, which remote as
+it was validated, all from its own records.
 
-The limit, stated rather than implied: a secret that is *itself* an ordinary word, echoed as a
-configuration value, is indistinguishable from an ordinary word and is repeated. Only repeating
-none of Git's text would change that.
+The invocation's description is the subcommand and how many arguments followed it, not the
+arguments: a caller can put anything in a branch name, a revision or a path, and
+`--initial-branch=access_token=…` is a branch name Git rejects and a description would otherwise
+carry.
+
+Everything else this service says that it did not write itself goes through one rule: a whole
+piece of text is repeated only when it holds no `://` and no character outside a letter, a digit,
+whitespace and `- _ . , ; : ( ) ! ' * + ~ /`. Otherwise it becomes its length and a fingerprint.
+That covers a branch name, a revision, a broker name, a destination's parent, the paths `rev-parse`
+reports, a malformed status record (whole, before it is shortened), a submodule path from the
+index, and a decoding refusal from the wire. It is applied where each message is composed, so this
+host's own words stay legible, **and** again at the two places every message passes through: the
+conversion into a wire error, and the write that retains a failure in the journal. A bar at the
+place everything passes does not depend on anybody remembering.
 
 Nothing here rewrites the user's Git configuration. The overrides live on one child process's
 command line and in its environment. A terminal command under broad shell access keeps normal Git
