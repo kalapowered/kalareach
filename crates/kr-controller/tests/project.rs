@@ -645,7 +645,7 @@ async fn a_retained_failure_carries_none_of_what_the_caller_sent() {
         repeated.message
     );
     assert!(
-        repeated.message.contains("this host does not repeat"),
+        repeated.message.contains("does-not-repeat"),
         "which says what was taken out: {}",
         repeated.message
     );

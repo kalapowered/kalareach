@@ -600,7 +600,9 @@ impl Store {
                 params![
                     action_id.get().as_bytes().to_vec(),
                     operation_state_text(state),
-                    detail,
+                    // A reason is free text a caller reads back, so it goes through the rule at
+                    // the write, as every other retained diagnostic does.
+                    detail.map(crate::git::redact),
                     ended_at_ms.map(|stamp| i64_of(stamp.get())),
                     staged_identity.map(|staged| i64_of(staged.identity.device)),
                     staged_identity.map(|staged| i64_of(staged.identity.file_id)),
@@ -955,7 +957,7 @@ impl Store {
                     staging_name,
                     staging_identity.map(|identity| i64_of(identity.device)),
                     staging_identity.map(|identity| i64_of(identity.file_id)),
-                    detail,
+                    detail.map(crate::git::redact),
                 ],
             )
             .map_err(ProjectError::store)?;
@@ -1580,7 +1582,9 @@ impl Store {
                 params![
                     workspace_id.get().as_bytes().to_vec(),
                     retained_kind_text(item.kind),
-                    item.detail,
+                    // What is held is read back in a *successful* answer as well as a failure, so
+                    // it goes through the rule at the write like any other retained diagnostic.
+                    crate::git::redact(&item.detail),
                     item.change_set_id.map(|id| id.get().as_bytes().to_vec()),
                 ],
             )
@@ -1628,7 +1632,7 @@ impl Store {
                     params![
                         workspace_id.get().as_bytes().to_vec(),
                         retained_kind_text(item.kind),
-                        item.detail,
+                        crate::git::redact(&item.detail),
                         item.change_set_id.map(|id| id.get().as_bytes().to_vec()),
                     ],
                 )
@@ -2008,7 +2012,11 @@ fn settle_claim_on(
                 action.payload_digest.as_bytes().to_vec(),
                 result.map(<[u8]>::to_vec),
                 failure.map(|(code, _)| code.as_str().to_owned()),
-                failure.map(|(_, detail)| detail.to_owned()),
+                // A settled failure is read back by whoever repeats the action, and it is kept, so
+                // the rule is applied at the write. The rule leaves its own output alone, so a
+                // message whose untrusted part was already replaced where it was composed comes
+                // through here unchanged, and what the journal keeps is what the caller was told.
+                failure.map(|(_, detail)| crate::git::redact(detail)),
             ],
         )
         .map_err(ProjectError::store)
@@ -2125,7 +2133,7 @@ fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result
                 row.staged_identity
                     .and_then(|staged| staged.created_at_ms)
                     .map(i64_of),
-                row.detail,
+                row.detail.as_deref().map(crate::git::redact),
                 i64_of(row.started_at_ms.get()),
                 row.ended_at_ms.map(|stamp| i64_of(stamp.get())),
             ],
@@ -2303,7 +2311,7 @@ fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result
                 row.identity.map(|id| i64_of(id.file_id)),
                 row.display_path,
                 row.staging_name,
-                row.detail,
+                row.detail.as_deref().map(crate::git::redact),
                 row.retention.map(retention_text),
                 i64_of(row.created_at_ms.get()),
                 row.removed_at_ms.map(|stamp| i64_of(stamp.get())),

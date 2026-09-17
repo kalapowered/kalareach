@@ -690,7 +690,7 @@ fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic
     // credential is not parsed and not echoed, and what a person gets is the section, the leaf and
     // a fingerprint that tells two keys apart.
     assert!(
-        limitations.contains("url.<a name of") && limitations.contains("this host does not repeat"),
+        limitations.contains("url...a-name-of") && limitations.contains("does-not-repeat"),
         "an unsafe subsection is replaced rather than parsed: {limitations}"
     );
     assert!(
@@ -700,9 +700,9 @@ fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic
     // The fingerprint is what tells two replaced names apart, so it has to be there and the two
     // url keys' replacements have to differ.
     let fingerprints: Vec<&str> = limitations
-        .split("does not repeat, ")
+        .split("does-not-repeat-")
         .skip(1)
-        .filter_map(|tail| tail.split('>').next())
+        .filter_map(|tail| tail.split("..").next())
         .collect();
     assert!(
         fingerprints.len() >= 3,
@@ -726,7 +726,7 @@ fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic
         "and two different names are two different fingerprints: {fingerprints:?}"
     );
     assert!(
-        limitations.contains("the filter driver <a name of"),
+        limitations.contains("the filter driver ..a-name-of"),
         "a driver's own name is a subsection too: {limitations}"
     );
     for secret in [
@@ -818,7 +818,7 @@ fn a_credential_git_itself_prints_does_not_reach_a_caller() {
         );
     }
     assert!(
-        output.stderr.contains("this host does not repeat"),
+        output.stderr.contains("does-not-repeat"),
         "and what was taken out is named: {}",
         output.stderr
     );
@@ -865,7 +865,7 @@ fn a_credential_git_itself_prints_does_not_reach_a_caller() {
         );
     }
     assert!(
-        refusal.contains("this host does not repeat"),
+        refusal.contains("does-not-repeat"),
         "and that error says what it took out: {refusal}"
     );
 }
@@ -957,7 +957,7 @@ fn nothing_a_caller_or_a_repository_supplied_reaches_a_refusal() {
             "no refusal repeats what it refused: {refusal}"
         );
         assert!(
-            refusal.contains("this host does not repeat"),
+            refusal.contains("does-not-repeat"),
             "and each says what it took out: {refusal}"
         );
     }

@@ -2026,9 +2026,9 @@ impl ProjectService {
             Ok(paths) if paths.is_empty() => DirtyCount::Clean,
             Ok(paths) => DirtyCount::Unmeasurable(format!(
                 "{} holds submodules whose own working trees this host does not look inside ({})",
-                row.display_path,
-                // The paths came out of the repository's index, so they go through the rule before
-                // they reach a retained record a reader keeps.
+                // Both the workspace's own path and the paths out of the index are text this host
+                // did not choose, and this reason is kept and read back in a successful answer.
+                crate::git::redact(&row.display_path),
                 crate::git::redact(&paths.join(", "))
             )),
             Err(error) => DirtyCount::Unmeasurable(error.to_string()),

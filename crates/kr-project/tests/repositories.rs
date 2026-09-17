@@ -1517,3 +1517,105 @@ fn a_claim_whose_publication_is_still_undecided_is_left_open_for_the_next_recove
     assert_eq!(again.unresolved, 1);
     assert_eq!(again.claims_settled, 0);
 }
+
+#[test]
+fn a_destination_a_caller_named_does_not_reach_the_journal() {
+    // A destination's own name is text a caller sent, and a failure about it is written into the
+    // operation row, into the claim and into every later answer. So the journal holds what the
+    // caller was told rather than what the caller sent.
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "journal-source");
+    let carrying = "access_token=JOURNALSECRET";
+    let submitted = action("project.clone", 80);
+    let cloned = fixture
+        .service()
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(fixture.environment_id(), fixture.work(), carrying),
+                label: "journal".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
+            Some(&submitted),
+        )
+        .expect("the clone completes");
+    // The state a daemon that died before it recorded a witness leaves. Recovery closes the
+    // operation with a reason that names the destination.
+    let journal_path = kr_project::ProjectService::root_of(&fixture.host().environment())
+        .join(kr_project::store::STORE_FILE_NAME);
+    let journal = rusqlite::Connection::open(&journal_path).expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE operations SET state = 'staging', ended_at_ms = NULL, staged_device = NULL,
+                    staged_file_id = NULL, detail = NULL WHERE action_id = ?1",
+            rusqlite::params![cloned.operation.action_id.get().as_bytes().to_vec()],
+        )
+        .expect("the row moves back to staging");
+    journal
+        .execute(
+            "UPDATE actions SET result = NULL, error_code = NULL, error_detail = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![submitted.action_id.as_bytes().to_vec()],
+        )
+        .expect("the claim is open again");
+    drop(journal);
+    let replacement = fixture.reopen();
+    replacement.recover().expect("recovery runs");
+    // Every place that reason is kept, and the answer a repeat of the action gets.
+    let journal = rusqlite::Connection::open(&journal_path).expect("the journal opens again");
+    let kept: Vec<String> = [
+        "SELECT detail FROM operations",
+        "SELECT error_detail FROM actions",
+    ]
+    .iter()
+    .flat_map(|query| {
+        let mut statement = journal.prepare(query).expect("the column reads");
+        let rows: Vec<String> = statement
+            .query_map([], |row| {
+                Ok(row.get::<_, Option<String>>(0)?.unwrap_or_default())
+            })
+            .expect("the rows map")
+            .map(|row| row.expect("a row"))
+            .collect();
+        rows
+    })
+    .collect();
+    assert!(
+        kept.iter().any(|text| text.contains("does-not-repeat")),
+        "the reason was written and something was taken out of it: {kept:?}"
+    );
+    for text in &kept {
+        assert!(
+            !text.contains("JOURNALSECRET"),
+            "nothing the caller sent is in the journal: {text}"
+        );
+    }
+    let refusal = replacement
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(fixture.environment_id(), fixture.work(), carrying),
+                label: "journal".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
+            Some(&submitted),
+        )
+        .expect_err("the repeat is answered from the record")
+        .to_string();
+    assert!(
+        !refusal.contains("JOURNALSECRET"),
+        "nor in what a repeat is told: {refusal}"
+    );
+}

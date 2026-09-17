@@ -1493,14 +1493,10 @@ fn subsection_for_diagnostic(subsection: &str) -> String {
     if is_a_name {
         return subsection.to_owned();
     }
-    let digest = kr_cbor::sha256(subsection.as_bytes());
-    let mut fingerprint = String::with_capacity(16);
-    for byte in &digest[..8] {
-        fingerprint.push_str(&format!("{byte:02x}"));
-    }
     format!(
-        "<a name of {} characters this host does not repeat, {fingerprint}>",
-        subsection.chars().count()
+        "..a-name-of-{}-characters-this-host-does-not-repeat-{}..",
+        subsection.chars().count(),
+        fingerprint(subsection)
     )
 }
 
@@ -1539,7 +1535,7 @@ pub fn git_said(text: &str) -> String {
         return "nothing".to_owned();
     }
     format!(
-        "{class}, in {} characters this host does not repeat, {}",
+        "{class}, in ..{}-characters-this-host-does-not-repeat-{}..",
         trimmed.chars().count(),
         fingerprint(trimmed)
     )
@@ -1597,9 +1593,16 @@ fn repeatable(character: char) -> bool {
 }
 
 /// Returns the stand-in for text this host will not repeat.
+///
+/// Every character of it is one [`repeatable`] allows, which makes the rule idempotent: a message
+/// whose untrusted fragment has already been replaced passes the next application unchanged. That
+/// matters because the rule is applied twice on purpose, once where a message is composed and
+/// again where every message leaves, and a second pass that fingerprinted the first one's output
+/// would take away the host's own words and make a retained copy differ from the answer the caller
+/// already had.
 fn replacement(text: &str) -> String {
     format!(
-        "<{} characters this host does not repeat, {}>",
+        "..{}-characters-this-host-does-not-repeat-{}..",
         text.chars().count(),
         fingerprint(text)
     )
@@ -1821,7 +1824,7 @@ mod tests {
                 "no text holding what a URL is made of survives: {shape} became {redacted}"
             );
             assert!(
-                redacted.contains("this host does not repeat"),
+                redacted.contains("does-not-repeat"),
                 "and what it replaced is named: {shape} became {redacted}"
             );
         }
@@ -1846,7 +1849,8 @@ mod tests {
         // And a message that does name a URL is replaced whole, credential or not, because a
         // fragment that looks harmless may be half of one.
         let redacted = redact("fatal: unable to access 'https://github.com/user/repo.git/'");
-        assert!(redacted.starts_with('<'), "{redacted}");
+        assert!(redacted.starts_with(".."), "{redacted}");
+        assert!(redacted.contains("does-not-repeat"), "{redacted}");
     }
 
     #[test]
@@ -1873,7 +1877,7 @@ mod tests {
                 "nothing Git said is repeated: {said} became {told}"
             );
             assert!(
-                told.contains("this host does not repeat"),
+                told.contains("does-not-repeat"),
                 "and what it stands for is named: {told}"
             );
         }
@@ -1888,6 +1892,36 @@ mod tests {
         // Two different messages are two different fingerprints, so a failure can be recognised
         // again and two can be told apart.
         assert_ne!(git_said("fatal: one"), git_said("fatal: two"));
+        // And what it says survives the rule, because the rule is applied again at every boundary
+        // a message crosses.
+        let told = git_said("fatal: bad boolean config value 'https://user:VERYSECRET@b/x'");
+        assert_eq!(
+            redact(&told),
+            told,
+            "what Git said is already safe to repeat"
+        );
+    }
+
+    #[test]
+    fn the_rule_leaves_its_own_output_alone() {
+        // The rule is applied twice on purpose: where a message is composed, and again where every
+        // message leaves. A second pass that replaced the first one's output would take away this
+        // host's own words and make a retained copy differ from the answer the caller already had.
+        for text in [
+            "https://user:VERYSECRET@b.invalid/x",
+            "access_token=VERYSECRET",
+            "a message with no secret in it",
+            "",
+        ] {
+            let once = redact(text);
+            assert_eq!(redact(&once), once, "{text} became {once} and then changed");
+        }
+        // A whole message keeps this host's own words when the untrusted part of it is already
+        // replaced, which is the point of making the stand-in repeatable.
+        let composed = format!("{} is not a branch name", redact("access_token=VERYSECRET"));
+        assert_eq!(redact(&composed), composed, "{composed}");
+        assert!(composed.ends_with(" is not a branch name"), "{composed}");
+        assert!(!composed.contains("VERYSECRET"), "{composed}");
     }
 
     #[test]
@@ -2190,7 +2224,7 @@ mod tests {
             ] {
                 assert!(!redacted.contains(secret), "{carrying} became {redacted}");
             }
-            assert!(redacted.contains("this host does not repeat"), "{redacted}");
+            assert!(redacted.contains("does-not-repeat"), "{redacted}");
         }
         assert_eq!(redact("nothing to redact"), "nothing to redact");
     }
