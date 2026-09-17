@@ -1950,15 +1950,34 @@ fn two_concurrent_copies_of_one_finish_action_publish_once() {
             .collect()
     });
 
-    let answers: Vec<_> = outcomes
-        .into_iter()
-        .map(|outcome| outcome.expect("both copies of one action are answered"))
-        .collect();
-    assert_eq!(
-        answers[0].handle, answers[1].handle,
-        "both copies name the same attachment"
-    );
+    // A publication is two commits and the claim belongs to the first, so a copy that arrives
+    // between them is owed `OUTCOME_UNKNOWN` rather than a guess. What must never happen is two
+    // different answers, or two published files.
+    let mut answers = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            Ok(answer) => answers.push(answer),
+            Err(error) => assert_eq!(
+                error.code(),
+                ErrorCode::OutcomeUnknown,
+                "a copy that lost the claim is told the outcome is not recorded yet, not {error}"
+            ),
+        }
+    }
+    assert!(!answers.is_empty(), "one copy of the action published it");
+    for answer in &answers {
+        assert_eq!(
+            answer, &answers[0],
+            "every copy that was answered got the same answer"
+        );
+    }
     assert_eq!(answers[0].handle.content_digest, digest(&bytes));
+
+    // And the action is settled: a repeat now is answered from the record, with the same result.
+    let repeated = harness
+        .finish_as(begun.transfer_id, &bytes, Some(&action))
+        .expect("the repeat is answered");
+    assert_eq!(repeated, answers[0], "one action, one answer");
     assert_eq!(
         std::fs::read_dir(harness.service.staging().complete().display_path())
             .expect("reads the completed area")
@@ -2002,19 +2021,33 @@ fn two_concurrent_copies_of_one_cancel_action_release_once() {
             .collect()
     });
 
-    let answers: Vec<_> = outcomes
-        .into_iter()
-        .map(|outcome| outcome.expect("both copies of one action are answered"))
-        .collect();
-    assert_eq!(
-        answers[0], answers[1],
-        "one action, one answer: {answers:?}"
-    );
+    // A cancellation closes the row and then removes the payload, and its result is recorded only
+    // once the bytes are actually released. A copy that arrives in between is owed
+    // `OUTCOME_UNKNOWN`.
+    let mut answers = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            Ok(answer) => answers.push(answer),
+            Err(error) => assert_eq!(
+                error.code(),
+                ErrorCode::OutcomeUnknown,
+                "a copy that lost the claim is told the outcome is not recorded yet, not {error}"
+            ),
+        }
+    }
+    assert!(!answers.is_empty(), "one copy of the action cancelled it");
+    for answer in &answers {
+        assert_eq!(answer, &answers[0], "one action, one answer");
+    }
     assert_eq!(
         answers[0].released_byte_len,
         U64::new(bytes.len() as u64),
         "the reservation is reported released once, not twice"
     );
+    let repeated = harness
+        .cancel_as(begun.transfer_id, Some(&action))
+        .expect("the repeat is answered");
+    assert_eq!(repeated, answers[0], "and the repeat is answered the same");
     assert_eq!(
         harness.service.staged_byte_len().expect("reads the total"),
         0,

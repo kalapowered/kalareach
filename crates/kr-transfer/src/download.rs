@@ -504,10 +504,17 @@ impl TransferService {
                 match closed {
                     Ok(_) => {
                         let _ = self.discard_snapshot_payload(&reserved);
+                        Err(error)
                     }
-                    Err(_) => return Err(error),
+                    // The journal failed, which is the failure that leaves something behind: the
+                    // row still says this snapshot holds bytes and the payload is still there for
+                    // recovery. It is reported instead of the one that started this, which it
+                    // carries as the reason the snapshot was being failed at all.
+                    Err(close) => Err(TransferError::store(format!(
+                        "{close}, while recording that {} failed: {error}",
+                        reserved.source_label
+                    ))),
                 }
-                Err(error)
             }
         }
     }

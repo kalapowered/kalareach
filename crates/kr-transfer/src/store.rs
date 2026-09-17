@@ -315,6 +315,11 @@ pub struct RetainedAction {
     pub method: String,
     /// The digest of the payload it was performed with.
     pub payload_digest: Digest256,
+    /// The transfer this action acts on, where it acts on one.
+    ///
+    /// A claim recorded without a result is resolvable only if something says which object it was
+    /// for. This is that.
+    pub subject: Option<TransferId>,
     /// The canonically encoded result, where the effect produces one in the same transaction.
     ///
     /// A publication is two commits, and the claim belongs to the first of them: there is no
@@ -348,6 +353,19 @@ pub struct Publication<'bytes> {
     pub preview: Option<&'bytes [u8]>,
     /// Why no preview was produced, where none was.
     pub preview_unavailable: Option<&'bytes str>,
+}
+
+/// One action claim whose outcome is not recorded yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenClaim {
+    /// The actor that claimed it.
+    pub actor_id: ActorId,
+    /// The action identifier.
+    pub action_id: Uuid,
+    /// The method it was claimed for.
+    pub method: String,
+    /// The transfer it acts on, where it names one.
+    pub transfer: Option<TransferId>,
 }
 
 /// A retained mutation result.
@@ -560,6 +578,7 @@ impl Store {
                      action_id      BLOB NOT NULL,
                      method         TEXT NOT NULL,
                      payload_digest BLOB NOT NULL,
+                     subject        BLOB,
                      result         BLOB,
                      error_code     TEXT,
                      error_detail   TEXT,
@@ -2009,6 +2028,41 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Returns every claim that has neither a result nor a failure recorded.
+    ///
+    /// These are two-commit effects that were interrupted between their commits. Each names the
+    /// transfer it acts on, which is what makes it resolvable from that transfer's state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the read fails.
+    pub fn unfinished_claims(&self) -> Result<Vec<OpenClaim>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT actor_id, action_id, method, subject FROM actions
+                 WHERE result IS NULL AND error_code IS NULL",
+            )
+            .map_err(TransferError::store)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(OpenClaim {
+                    actor_id: ActorId::new(row.get::<_, String>(0)?).unwrap_or_else(|_| {
+                        ActorId::new("local").expect("a valid fallback principal")
+                    }),
+                    action_id: uuid_column(row, 1)?,
+                    method: row.get(2)?,
+                    transfer: optional_uuid(row, 3)?.map(TransferId::new),
+                })
+            })
+            .map_err(TransferError::store)?;
+        let mut claims = Vec::new();
+        for row in rows {
+            claims.push(row.map_err(TransferError::store)?);
+        }
+        Ok(claims)
+    }
+
     /// Fills in the result of an action that was claimed without one.
     ///
     /// The claim happens in the transaction that makes the effect durable; for a two-commit effect
@@ -2133,9 +2187,9 @@ fn claim_action(
     let changed = transaction
         .execute(
             "INSERT INTO actions
-                 (actor_id, action_id, method, payload_digest, result, error_code, error_detail,
-                  recorded_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)
+                 (actor_id, action_id, method, payload_digest, subject, result, error_code,
+                  error_detail, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?7, ?5, NULL, NULL, ?6)
              ON CONFLICT (actor_id, action_id) DO NOTHING",
             params![
                 action.actor_id.as_str(),
@@ -2144,6 +2198,7 @@ fn claim_action(
                 action.payload_digest.as_bytes().as_slice(),
                 action.result,
                 as_i64(action.recorded_at_ms.get()),
+                action.subject.map(|subject| uuid_sql(subject.get())),
             ],
         )
         .map_err(TransferError::store)?;

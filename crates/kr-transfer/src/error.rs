@@ -101,6 +101,16 @@ pub enum TransferError {
         /// The method it was first used for.
         method: String,
     },
+    /// An action was claimed and its outcome is not recorded yet.
+    ///
+    /// A two-commit effect claims its action with the first commit and records its result with the
+    /// second. A repeat that arrives between the two is owed this answer and not a guess: the
+    /// caller asks again, and the host completes the record when the effect does.
+    #[error("action {action} is under way and its outcome is not recorded yet")]
+    OutcomeUnknown {
+        /// The action that is under way.
+        action: String,
+    },
     /// A path escaped, or could have escaped, the directory that authorised it.
     #[error("{0}")]
     Escape(#[from] crate::authority::Escape),
@@ -179,6 +189,7 @@ impl TransferError {
             Self::Concurrency { .. } => ErrorCode::ResourceUnavailable,
             Self::DraftConflict { .. } => ErrorCode::DraftConflict,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
+            Self::OutcomeUnknown { .. } => ErrorCode::OutcomeUnknown,
             Self::Ipc(error) => error.code(),
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
         }
