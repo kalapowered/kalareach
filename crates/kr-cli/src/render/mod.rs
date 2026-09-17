@@ -26,47 +26,9 @@
 
 use kr_client::projection::paint::{Comparison, Keyboard, Window};
 use kr_client::projection::{Applied, Projection, Refusal};
-use kr_protocol::projection::{
-    PROJECTION_DELTA_EVENT, PROJECTION_RESET_EVENT, PROJECTION_ROWS_EVENT,
-    PROJECTION_SNAPSHOT_EVENT, ProjectionEvent,
-};
+use kr_protocol::projection::ProjectionEvent;
 
-/// Whether an event type belongs to the projection stream.
-#[must_use]
-pub const fn is_projection_event(event_type: &str) -> bool {
-    matches!(
-        event_type.as_bytes(),
-        b"session.projection.reset"
-            | b"session.projection.snapshot"
-            | b"session.projection.rows"
-            | b"session.projection.delta"
-    )
-}
-
-/// Decodes one projection notification.
-///
-/// Returns `None` when the event type is not one of the four, or when its payload does not decode.
-/// A payload that does not decode is not drawn and not guessed at: the caller asks for a fresh
-/// screen, which is what it would do for any other update it cannot apply.
-#[must_use]
-pub fn decode(
-    event_type: &str,
-    payload: &kr_protocol::envelope::ParamsValue,
-) -> Option<ProjectionEvent> {
-    match event_type {
-        PROJECTION_RESET_EVENT => payload.to_typed().ok().map(ProjectionEvent::Reset),
-        PROJECTION_SNAPSHOT_EVENT => payload
-            .to_typed()
-            .ok()
-            .map(|header| ProjectionEvent::Snapshot(Box::new(header))),
-        PROJECTION_ROWS_EVENT => payload.to_typed().ok().map(ProjectionEvent::Rows),
-        PROJECTION_DELTA_EVENT => payload
-            .to_typed()
-            .ok()
-            .map(|delta| ProjectionEvent::Delta(Box::new(delta))),
-        _ => None,
-    }
-}
+pub use kr_client::projection::{decode, is_projection_event};
 
 /// What applying one event means for the terminal.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -295,6 +257,12 @@ fn report(losses: Comparison, degraded: bool) -> Option<String> {
         if losses.cursor_outside {
             parts.push("the cursor outside this window".to_owned());
         }
+        if losses.rows_unreachable > 0 {
+            parts.push(format!(
+                "{} of the session this window is too short to show",
+                plural(losses.rows_unreachable, "row", "rows")
+            ));
+        }
         if losses.geometry_withheld {
             // A margin is a row and a column of the canonical grid, so a window showing part of
             // the grid has nowhere to put one. Everything drawn here is addressed absolutely and
@@ -347,7 +315,7 @@ mod tests {
         );
         // One field at a time, because the interesting failure is a field nothing describes: the
         // report would be an empty sentence, which says that something is wrong and not what.
-        let each: [Loss; 10] = [
+        let each: [Loss; 11] = [
             ("cells_clipped", |losses| losses.cells_clipped = 3),
             ("clusters_replaced", |losses| losses.clusters_replaced = 1),
             ("runs_replaced", |losses| losses.runs_replaced = 2),
@@ -362,6 +330,7 @@ mod tests {
             ("geometry_withheld", |losses| {
                 losses.geometry_withheld = true;
             }),
+            ("rows_unreachable", |losses| losses.rows_unreachable = 26),
         ];
         for (name, set) in each {
             let mut losses = Comparison::default();

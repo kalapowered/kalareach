@@ -107,6 +107,14 @@ pub struct Comparison {
     pub keyboard_stack: usize,
     /// Control bytes dropped from a title or a link target so that it could not end its own string.
     pub controls_dropped: usize,
+    /// Rows of the session's own screen this window has no room for at all.
+    ///
+    /// Not the same as `rows_outside`, which counts rows of one frame: the session anchors a
+    /// shorter attachment's viewport to part of its screen, so the rows outside that viewport never
+    /// arrive and cannot be drawn. They are still rows of the screen the person believes they are
+    /// looking at, which is why this is a fact about the window rather than about a frame, and why
+    /// two frames do not add up to twice as many.
+    pub rows_unreachable: usize,
     /// Whether the session's scroll region, margins or origin mode could not be installed.
     ///
     /// They are rows and columns of the canonical grid, so a destination showing only part of the
@@ -133,6 +141,7 @@ impl Comparison {
             && self.soft_wraps == 0
             && self.truncated_rows == 0
             && self.rows_outside == 0
+            && self.rows_unreachable == 0
             && !self.keyboard_withheld
             && self.keyboard_stack == 0
             && self.controls_dropped == 0
@@ -157,6 +166,9 @@ impl Comparison {
         self.keyboard_withheld |= other.keyboard_withheld;
         self.keyboard_stack += other.keyboard_stack;
         self.controls_dropped += other.controls_dropped;
+        // A fact about the window, not about a frame: the larger of the two answers, never their
+        // sum, or a session of a thousand frames would report a thousand times the rows.
+        self.rows_unreachable = self.rows_unreachable.max(other.rows_unreachable);
         self.geometry_withheld |= other.geometry_withheld;
     }
 }
@@ -198,6 +210,7 @@ pub fn install(screen: &Screen, window: Window, keyboard: Keyboard) -> Painted {
     writer.clear();
     let rows = screen.visible_rows();
     writer.rows(&rows);
+    writer.short();
     writer.finish();
     writer.done()
 }
@@ -226,12 +239,19 @@ pub fn update(
         writer.state();
     }
     writer.rows(rows);
+    writer.short();
     writer.finish();
     writer.done()
 }
 
 /// The escape introducer.
 const ESC: u8 = 0x1B;
+
+/// Shift in: the G0 set, which is where this renderer draws.
+const SHIFT_IN: u8 = 0x0F;
+
+/// Shift out: the G1 set, which only the session's own designation puts a destination into.
+const SHIFT_OUT: u8 = 0x0E;
 
 /// The string terminator every profile in the repertoire accepts.
 const ST: &[u8] = b"\x1b\\";
@@ -325,6 +345,14 @@ impl<'a> Writer<'a> {
         self.csi(b"r");
         self.mode_of(super::ProjectedModeSpelling::Ansi, INSERT_MODE, false);
         self.mode(AUTOWRAP, false);
+        // And the plain character set, because a canonical cell is already the character the
+        // engine decided it was. An application that selected DEC graphics and printed a `q` has
+        // a horizontal line in its grid; this frame carries that line as the character it is, and
+        // a destination still in the graphics set would draw the *text* of this frame through it,
+        // turning ordinary ASCII into box drawing. The session's own designation goes back after
+        // the last row, for the application that may write to this terminal itself.
+        self.out.extend_from_slice(b"\x1b(B\x1b)B");
+        self.out.push(SHIFT_IN);
     }
 
     /// Puts the session's own autowrap and geometry back and places the cursor.
@@ -337,6 +365,7 @@ impl<'a> Writer<'a> {
         // be drawn through the pen of whichever run happened to be last.
         self.rendition(self.screen.rendition);
         self.mode(AUTOWRAP, self.screen.autowrap());
+        self.charsets();
         let region = self.geometry();
         self.cursor(region);
     }
@@ -353,6 +382,33 @@ impl<'a> Writer<'a> {
     /// destination that shows the whole grid. A window showing part of it says so through the
     /// comparison instead of installing something approximate, and a projection that cannot carry
     /// the geometry is also one that will not be handed the stream.
+    fn charsets(&mut self) {
+        // What the *application* is writing under, installed after the last row for the same
+        // reason as the scroll region: a presentation that becomes a direct one hands the
+        // application the terminal it is writing for. Nothing this frame drew went through it.
+        let charsets = self.screen.charsets.clone();
+        let designation = |name: &str| -> &'static [u8] {
+            match name {
+                "DecLineDrawing" => b"0",
+                "UkIso646" => b"A",
+                _ => b"B",
+            }
+        };
+        self.out.push(ESC);
+        self.out.push(b'(');
+        self.out
+            .extend_from_slice(designation(charsets.g0.as_str()));
+        self.out.push(ESC);
+        self.out.push(b')');
+        self.out
+            .extend_from_slice(designation(charsets.g1.as_str()));
+        self.out.push(if charsets.shift_out {
+            SHIFT_OUT
+        } else {
+            SHIFT_IN
+        });
+    }
+
     fn geometry(&mut self) -> Option<Region> {
         let margins = self.screen.margins;
         let rows = self.screen.dimensions.rows.get();
@@ -449,26 +505,6 @@ impl<'a> Writer<'a> {
     fn state(&mut self) {
         self.palette();
         self.title();
-        // The character sets the cells were written under. A destination left in a graphics set
-        // would draw line-drawing characters where the session holds ASCII.
-        let charsets = self.screen.charsets.clone();
-        let designation = |name: &str| -> &'static [u8] {
-            match name {
-                "DecLineDrawing" => b"0",
-                "UkIso646" => b"A",
-                _ => b"B",
-            }
-        };
-        self.out.push(ESC);
-        self.out.push(b'(');
-        self.out
-            .extend_from_slice(designation(charsets.g0.as_str()));
-        self.out.push(ESC);
-        self.out.push(b')');
-        self.out
-            .extend_from_slice(designation(charsets.g1.as_str()));
-        self.out.push(if charsets.shift_out { 0x0E } else { 0x0F });
-
         for ((spelling, mode), enabled) in self.screen.modes.clone() {
             let Ok(number) = u16::try_from(mode) else {
                 continue;
@@ -597,6 +633,20 @@ impl<'a> Writer<'a> {
         // saved for itself.
         self.osc(b"1", self.screen.title.icon.clone().as_bytes());
         self.osc(b"2", self.screen.title.window.clone().as_bytes());
+    }
+
+    /// Counts the rows of the session's screen this window has no room for at all.
+    ///
+    /// The session anchors a shorter attachment's viewport to part of its screen, so those rows are
+    /// never sent and cannot be drawn. A person looking at sixteen lines of a thirty-line session
+    /// is not looking at the session, and nothing else would tell them so.
+    fn short(&mut self) {
+        let screen = self.screen.dimensions.rows.get();
+        let shown = self.screen.viewport.rows.get();
+        let missing = screen.saturating_sub(shown);
+        if missing > 0 {
+            self.comparison.rows_unreachable = usize::try_from(missing).unwrap_or(usize::MAX);
+        }
     }
 
     fn rows(&mut self, rows: &[u64]) {
@@ -772,10 +822,24 @@ impl<'a> Writer<'a> {
         let column = cursor.column.get();
         let left = self.window.left_column;
         let right = left.saturating_add(u64::from(self.window.columns));
-        let line = u32::try_from(cursor.row.get()).unwrap_or(u32::MAX);
-        if column < left || column >= right || line >= self.window.rows {
+        // The cursor's row is a line of the session's screen, and the window says which canonical
+        // rows it shows. Going through the window's own mapping is what keeps the cursor on the
+        // right line when the window is panned: taking the screen line as a destination line would
+        // put it one line out for every row the window has scrolled past.
+        let stable = self
+            .screen
+            .viewport
+            .top_row
+            .get()
+            .saturating_add(cursor.row.get());
+        let Some(line) = self.window.line_of(stable) else {
             // A cursor drawn in the wrong cell is worse than no cursor: a person would type where
             // it appears to be. It is hidden and the fact is reported.
+            self.comparison.cursor_outside = true;
+            self.mode(CURSOR_VISIBLE, false);
+            return;
+        };
+        if column < left || column >= right {
             self.comparison.cursor_outside = true;
             self.mode(CURSOR_VISIBLE, false);
             return;
@@ -1149,6 +1213,12 @@ struct Destination {
     insert: bool,
     /// Whether a wrap is pending: the last column holds a cell and the next one would wrap.
     pending: bool,
+    /// The character set designated as G0, as the byte that designated it.
+    g0: char,
+    /// The character set designated as G1.
+    g1: char,
+    /// Whether G1 is the set in use.
+    shifted: bool,
 }
 
 #[cfg(test)]
@@ -1170,6 +1240,9 @@ impl Destination {
             margins_allowed: false,
             insert: false,
             pending: false,
+            g0: 'B',
+            g1: 'B',
+            shifted: false,
         }
     }
 
@@ -1220,8 +1293,22 @@ impl Destination {
                             }
                         }
                         Some('D') | Some('E') | Some('M') => self.scrolled = true,
+                        Some('(') => {
+                            self.g0 = chars.next().unwrap_or('B');
+                        }
+                        Some(')') => {
+                            self.g1 = chars.next().unwrap_or('B');
+                        }
                         _ => {}
                     }
+                }
+                '\u{0e}' => {
+                    self.print(&core::mem::take(&mut pending));
+                    self.shifted = true;
+                }
+                '\u{0f}' => {
+                    self.print(&core::mem::take(&mut pending));
+                    self.shifted = false;
                 }
                 '\n' | '\u{b}' | '\u{c}' => {
                     self.print(&core::mem::take(&mut pending));
@@ -1350,11 +1437,41 @@ impl Destination {
         out
     }
 
+    /// What this destination actually draws for a character, through the set it is in.
+    ///
+    /// A terminal in the DEC graphics set draws a line where the byte says `q`. That is the whole
+    /// reason a projected frame establishes the plain set before it draws: the canonical cell
+    /// already *is* the line, carried as the character it is.
+    fn glyph(&self, cluster: &str) -> String {
+        let set = if self.shifted { self.g1 } else { self.g0 };
+        if set != '0' {
+            return cluster.to_owned();
+        }
+        cluster
+            .chars()
+            .map(|scalar| match scalar {
+                'j' => '\u{2518}',
+                'k' => '\u{2510}',
+                'l' => '\u{250c}',
+                'm' => '\u{2514}',
+                'n' => '\u{253c}',
+                'q' => '\u{2500}',
+                't' => '\u{251c}',
+                'u' => '\u{2524}',
+                'v' => '\u{2534}',
+                'w' => '\u{252c}',
+                'x' => '\u{2502}',
+                other => other,
+            })
+            .collect()
+    }
+
     fn print(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
         for (cluster, width) in self.segment(text) {
+            let cluster = self.glyph(&cluster);
             if self.pending {
                 // A cell was already written into the last column and this one wraps.
                 self.overflowed = true;
@@ -1707,6 +1824,100 @@ mod fixtures {
             .modes
             .insert((super::super::ProjectedModeSpelling::Dec, 6), true);
         (screen, window)
+    }
+
+    /// KR-REQ-08.40: a frame draws through the plain character set, whatever the session selected.
+    ///
+    /// A canonical cell is already the character the engine decided it was: an application that
+    /// selected DEC graphics and printed `q` has a horizontal line in its grid, and the frame
+    /// carries that line. A destination left in the graphics set would draw the frame's own ASCII
+    /// through it and turn the text into box drawing.
+    #[test]
+    fn a_frame_draws_through_the_plain_character_set() {
+        let case = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 0, "rows": 1, "columns": 6},
+            "rows": [{"row": 0, "soft_wrapped": false, "runs": [
+                {"column": 0, "cells": 6, "text": "qwerty"}
+            ]}],
+            "cursor": {"column": 0, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (mut screen, window) = screen_of(&case);
+        // The session is in the graphics set, and stays in it: the application is the one writing
+        // through it, and a direct presentation of this session would.
+        screen.charsets = CharsetState {
+            g0: "DecLineDrawing".to_owned(),
+            g1: "Ascii".to_owned(),
+            shift_out: false,
+        };
+        let painted = install(&screen, window, Keyboard::Install);
+        let mut destination = Destination::new(1, 6);
+        // A destination a previous direct presentation left in the graphics set.
+        destination.g0 = '0';
+        destination.feed(&painted.bytes);
+        assert_eq!(
+            destination.cells[0],
+            ["q", "w", "e", "r", "t", "y"],
+            "the canonical characters are drawn as the characters they are"
+        );
+        assert_eq!(
+            destination.g0, '0',
+            "and the session's own designation is left in force for the application"
+        );
+    }
+
+    /// KR-ACC-023: a window too short for the session says how much of it it cannot show.
+    #[test]
+    fn a_window_shorter_than_the_session_reports_the_rows_it_cannot_show() {
+        let case = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 0, "rows": 4, "columns": 8},
+            "rows": [{"row": 0, "soft_wrapped": false, "runs": [
+                {"column": 0, "cells": 4, "text": "here"}
+            ]}],
+            "cursor": {"column": 0, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (mut screen, window) = screen_of(&case);
+        // The session's screen is thirty rows and this attachment was anchored to four of them.
+        screen.dimensions = kr_protocol::session::Dimensions::new(8, 30);
+        let painted = install(&screen, window, Keyboard::Install);
+        assert_eq!(
+            painted.comparison.rows_unreachable, 26,
+            "the rows this window has no room for are counted"
+        );
+        assert!(
+            !painted.comparison.complete(),
+            "and a window that cannot show the session is not showing all of it"
+        );
+        let mut both = painted.comparison;
+        both.absorb(painted.comparison);
+        assert_eq!(
+            both.rows_unreachable, 26,
+            "two frames of the same window are not twice as many rows"
+        );
+    }
+
+    /// KR-REQ-08.40: a panned window places the cursor on the line that holds its row.
+    #[test]
+    fn a_panned_window_places_the_cursor_on_the_right_line() {
+        let case = serde_json::json!({
+            "window": {"top_row": 100, "left_column": 0, "rows": 3, "columns": 8},
+            "rows": [
+                {"row": 100, "soft_wrapped": false, "runs": [
+                    {"column": 0, "cells": 3, "text": "one"}]},
+                {"row": 101, "soft_wrapped": false, "runs": [
+                    {"column": 0, "cells": 3, "text": "two"}]}
+            ],
+            "cursor": {"column": 2, "row": 1, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (screen, window) = screen_of(&case);
+        let painted = install(&screen, window, Keyboard::Install);
+        let mut destination = Destination::new(3, 8);
+        destination.feed(&painted.bytes);
+        assert_eq!(
+            (destination.line, destination.column),
+            (1, 2),
+            "screen line one is the window's second line, because the window starts at row 100"
+        );
+        assert!(destination.cursor_visible, "and the cursor is shown there");
     }
 
     /// KR-REQ-08.40 and KR-REQ-08.84: the session's own coordinate system is put back after the

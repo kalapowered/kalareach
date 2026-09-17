@@ -49,7 +49,51 @@ pub struct Base {
 /// One screen, as a client holds it.
 ///
 /// The rows are held per buffer and keyed by their stable identifiers, because that is what every
-/// update names. A scroll moves which identifiers the viewport holds without changing a row, so
+/// update names. A scroll moves which identifiers the viewport holds without changing a row, so/// Whether an event type belongs to the projection stream.
+#[must_use]
+pub const fn is_projection_event(event_type: &str) -> bool {
+    matches!(
+        event_type.as_bytes(),
+        b"session.projection.reset"
+            | b"session.projection.snapshot"
+            | b"session.projection.rows"
+            | b"session.projection.delta"
+    )
+}
+
+/// Decodes one projection notification.
+///
+/// Returns `None` when the event type is not one of the four, or when its payload does not decode.
+/// A payload that does not decode is not drawn and not guessed at: the caller asks for a fresh
+/// screen, which is what it would do for any other update it cannot apply.
+///
+/// Here rather than in a client, because every client that holds a projection decodes the same four
+/// events, and two answers to "is this payload a snapshot" would be one answer too many.
+#[must_use]
+pub fn decode(
+    event_type: &str,
+    payload: &kr_protocol::envelope::ParamsValue,
+) -> Option<kr_protocol::projection::ProjectionEvent> {
+    use kr_protocol::projection::{
+        PROJECTION_DELTA_EVENT, PROJECTION_RESET_EVENT, PROJECTION_ROWS_EVENT,
+        PROJECTION_SNAPSHOT_EVENT, ProjectionEvent,
+    };
+
+    match event_type {
+        PROJECTION_RESET_EVENT => payload.to_typed().ok().map(ProjectionEvent::Reset),
+        PROJECTION_SNAPSHOT_EVENT => payload
+            .to_typed()
+            .ok()
+            .map(|header| ProjectionEvent::Snapshot(Box::new(header))),
+        PROJECTION_ROWS_EVENT => payload.to_typed().ok().map(ProjectionEvent::Rows),
+        PROJECTION_DELTA_EVENT => payload
+            .to_typed()
+            .ok()
+            .map(|delta| ProjectionEvent::Delta(Box::new(delta))),
+        _ => None,
+    }
+}
+
 /// the two are kept apart: [`Screen::rows`] is what exists, [`Screen::viewport`] is what is shown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Screen {
