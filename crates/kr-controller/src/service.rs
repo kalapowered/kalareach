@@ -73,8 +73,9 @@ pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from
 
 /// The file this environment's capability revision is recorded in.
 ///
-/// It is durable because a revision must never repeat: an action binds to one, and a revision that
-/// came round again would make a stale binding look current.
+/// It is durable because a revision must never repeat: a caller compares the revision a record
+/// carried with the one it is given now, and a revision that came round again would make a stale
+/// record look current.
 pub const CAPABILITY_REVISION_FILE: &str = "capabilities";
 
 /// The longest capability-revision record this host reads.
@@ -288,8 +289,8 @@ struct DesktopReading {
     ///
     /// It advances whenever the evidence changes: a new login, a tool installed or replaced, a
     /// permission that now answers differently, a screen that is now locked. Section 11 requires
-    /// evidence to be invalidated when any of those move, and an advancing revision is how an
-    /// action that bound to the old answer notices.
+    /// evidence to be invalidated when any of those move, and an advancing revision is how a
+    /// caller holding the old answer can see that it has been superseded.
     ///
     /// It starts at the moment this daemon began serving rather than at one, so a daemon that
     /// restarts does not hand out a revision it has used before.
@@ -2297,9 +2298,9 @@ impl Controller {
     /// in the evidence, and the revision advances with it: a new login, a tool installed or
     /// replaced, a permission that now answers differently, a desktop that is now locked. A
     /// revision that has moved is how a caller holding an earlier record can tell that the answer
-    /// it read has gone stale, which is what section 11 requires of evidence. No method in this
-    /// build dispatches a desktop operation, so nothing here refuses one on that ground yet: what
-    /// this publishes is the evidence and the revision to compare against.
+    /// it read has gone stale, which is what section 11 requires of evidence. What this publishes
+    /// is the evidence and the revision to compare it against; nothing here refuses an operation,
+    /// because no method this daemon serves performs one on a desktop.
     ///
     /// # Errors
     ///
@@ -2325,8 +2326,8 @@ impl Controller {
         } else {
             let advanced = CapabilityRevision::new(reading.revision.get().saturating_add(1));
             // The revision outlives this daemon, so a replacement never hands out one it has used
-            // before, and a revision that came round again would make an action's stale binding
-            // look current. It is therefore published only once it is stored.
+            // before, and a revision that came round again would make a stale record look
+            // current. It is therefore published only once it is stored.
             let path = self.paths.state_dir().join(CAPABILITY_REVISION_FILE);
             match kr_ipc::paths::write_owner_only_file(&path, advanced.get().to_string().as_bytes())
             {
@@ -2494,9 +2495,17 @@ impl Controller {
                 .read_from_worker_within(&worker, Some(DEMAND_PATIENCE.min(left)))
                 .await
                 .ok();
-            // A worker that did not answer has not said its work ended, so what it last said
-            // stands until it says otherwise or its session leaves the directory.
             let Some(summary) = summary else {
+                // A worker that did not answer has not said its work ended, so what it last said
+                // stands. A worker whose process the kernel says is gone has ended, though, and
+                // what it last said goes with it: an assertion that outlived the session it was
+                // taken for would keep the machine awake until something else noticed.
+                if matches!(
+                    kr_ipc::identity::process_state(&worker.descriptor.process_start_identity),
+                    kr_ipc::identity::ProcessState::Ended
+                ) {
+                    scan.seen.remove(&worker.descriptor.session_id);
+                }
                 continue;
             };
             let mut observed = SessionDemand::default();
@@ -2530,7 +2539,9 @@ impl Controller {
     /// Reports what this environment can currently do.
     ///
     /// Capability evidence, never authority: every record says what produced it and what makes it
-    /// stale, and an action still checks its own grant and rechecks the revision here.
+    /// stale. Nothing here grants anything, and a caller that acts on one of these answers still
+    /// needs its own authority for whatever it does and the permissions the operating system
+    /// actually granted the tool it uses.
     async fn environment_capabilities(
         self: &Arc<Self>,
         params: &ParamsValue,
