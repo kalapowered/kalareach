@@ -1070,7 +1070,9 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
     let bytes = pattern(UPLOAD_CHUNK_LEN + 4096);
     let declared = bytes.len() as u64;
 
-    let first = start_daemon(&program, &host);
+    // Both guards clean up on the way out, including the way out an assertion takes.
+    let _secrets = EnvironmentSecrets(environment_id);
+    let mut first = start_daemon(&program, &host);
     wait_for_daemon(&endpoint).await;
     let transfer_id: TransferId;
     {
@@ -1115,9 +1117,9 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
     }
 
     // The daemon dies where it stands.
-    kill_daemon(first);
+    first.stop();
 
-    let second = start_daemon(&program, &host);
+    let mut second = start_daemon(&program, &host);
     wait_for_daemon(&endpoint).await;
     let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
@@ -1159,6 +1161,28 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
             "the chunk that never arrived is not a duplicate"
         );
     }
+
+    // Nothing serves an upload that is not published, however complete its chunks are.
+    let refusal = failure(
+        control
+            .request(
+                Method::DownloadBegin,
+                &DownloadBeginParams {
+                    environment_id,
+                    resume_transfer_id: Nullable::null(),
+                    source: Nullable::some(DownloadSource::Attachment { transfer_id }),
+                    device_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the replacement"),
+    );
+    assert_eq!(
+        refusal.code,
+        ErrorCode::ResourceUnavailable,
+        "an unpublished upload serves nothing: {}",
+        refusal.message
+    );
 
     let finished: UploadFinishResult = typed(
         &control
@@ -1225,19 +1249,82 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
     );
     assert_eq!(download.byte_len, U64::new(declared));
     assert_eq!(download.content_digest, digest(&bytes));
+    let mut served = Vec::new();
+    for index in 0..download.layout.chunk_count.get() {
+        let chunk = chunks
+            .read_chunk(download.transfer_id, index)
+            .await
+            .expect("the replacement serves the attachment's chunks");
+        assert_eq!(chunk.chunk.digest, digest(chunk.bytes.as_slice()));
+        served.extend_from_slice(chunk.bytes.as_slice());
+    }
+    assert_eq!(
+        served, bytes,
+        "the bytes that come back are the bytes that went in, across the kill"
+    );
 
     drop(control);
     drop(chunks);
-    kill_daemon(second);
-    forget_environment_secrets(environment_id);
+    second.stop();
+}
+
+/// A daemon this test started, ended when it goes out of scope however that happens.
+#[cfg(unix)]
+struct Daemon(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl Daemon {
+    /// Ends it now, without giving it a chance to tidy up.
+    fn stop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        if let Ok(pid) = i32::try_from(child.id())
+            && let Some(pid) = rustix::process::Pid::from_raw(pid)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+        let _ = child.wait();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The secrets one environment's daemon created, removed when this goes out of scope.
+///
+/// A daemon writes its identity to the platform's credential store on its first start. On this
+/// platform that store is the login keychain, which outlives the temporary directories the rest of
+/// this test lives in, so the items are removed explicitly. On the Unix systems whose store is the
+/// file fallback the secrets are inside the temporary root and go with it.
+#[cfg(unix)]
+struct EnvironmentSecrets(EnvironmentId);
+
+#[cfg(unix)]
+impl Drop for EnvironmentSecrets {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        for purpose in kr_protocol::pairing::KeyPurpose::ALL.map(|purpose| purpose.as_str()) {
+            let _ = std::process::Command::new("security")
+                .arg("delete-generic-password")
+                .arg("-s")
+                .arg("KalaReach")
+                .arg("-a")
+                .arg(format!("{}/device-key/{purpose}", self.0))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
 }
 
 /// Starts the copied daemon on this test's own directories, with no worker program.
 #[cfg(unix)]
-fn start_daemon(
-    program: &std::path::Path,
-    host: &kr_ipc::testing::TempHost,
-) -> std::process::Child {
+fn start_daemon(program: &std::path::Path, host: &kr_ipc::testing::TempHost) -> Daemon {
     let logs = host.root().join("daemon.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -1257,6 +1344,7 @@ fn start_daemon(
         .stdout(log.try_clone().expect("duplicates the log"))
         .stderr(log)
         .spawn()
+        .map(|child| Daemon(Some(child)))
         .expect("starts the daemon")
 }
 
@@ -1277,30 +1365,5 @@ async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint) {
             endpoint.as_text()
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
-
-/// Ends a daemon this test started, without giving it a chance to tidy up.
-#[cfg(unix)]
-fn kill_daemon(mut child: std::process::Child) {
-    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a process id"))
-        .expect("a process identifier");
-    rustix::process::kill_process(pid, rustix::process::Signal::KILL).expect("kills the daemon");
-    child.wait().expect("reaps the daemon");
-}
-
-/// Removes the secrets this environment's daemon created, so a test leaves none behind.
-#[cfg(unix)]
-fn forget_environment_secrets(environment_id: EnvironmentId) {
-    for purpose in kr_protocol::pairing::KeyPurpose::ALL.map(|purpose| purpose.as_str()) {
-        let _ = std::process::Command::new("security")
-            .arg("delete-generic-password")
-            .arg("-s")
-            .arg("KalaReach")
-            .arg("-a")
-            .arg(format!("{environment_id}/device-key/{purpose}"))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
     }
 }
