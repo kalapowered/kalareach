@@ -125,11 +125,15 @@ pub enum WorkerError {
         /// Which part of the contract is missing.
         detail: String,
     },
-    /// The reader did not install the launch, and this is the reason it named.
+    /// The launch did not install a command, or nothing can say whether it did.
     ///
     /// The code is the contract's own, so a caller reads the difference between an editor that was
-    /// busy, a buffer that had moved under it and an outcome nothing can establish.
-    #[error("the launch was not installed: {reason}")]
+    /// busy, a buffer that had moved under it and an outcome nothing can establish. The message
+    /// follows the code rather than claiming a non-installation the host cannot see.
+    #[error("{}: {reason}", match code {
+        ErrorCode::OutcomeUnknown => "nothing can say whether the launch installed a command",
+        _ => "the launch installed no command",
+    })]
     LaunchRefused {
         /// The contract's reason.
         reason: &'static str,

@@ -69,11 +69,11 @@ Section 7 separates authentication from qualification, and the difference decide
 | `terminal_only` | yes | no | no | no | the shell's own | no |
 
 A session is `authenticated` from the moment its bridge registers and `qualified` from the moment
-the integration reports its hooks live, which is after the user's startup files have run. No fence
-is held below `qualified`, so a startup profile that asks a question is never held up by one: its
-input reaches the terminal the moment it arrives. The worker's own endpoint is serving from before
-that wait, so such a prompt is reachable; what is not yet reachable is a session the daemon has not
-published a descriptor for, which is a limit of the create flow rather than of the fence.
+the integration reports its hooks live, which is after the user's startup files have run. The input
+column is enforced where input is accepted: an `unauthenticated` managed session refuses a client's
+bytes outright, and from `authenticated` onwards they reach the terminal the moment they arrive,
+because no fence is held below `qualified`. That is what keeps a startup profile that asks a question
+from waiting for anything.
 
 Before qualification every loss closes the session that was being created and records why: a create
 that cannot deliver the managed contract fails rather than succeeding with less. After it, a lost
@@ -102,8 +102,10 @@ reader the bridge last reported, so the machine deregisters it. Without that the
 a registered editor and start another exchange at the next lease change, and a session the phase says
 is degraded would publish a fence and hand out a detach proof it cannot stand behind.
 
-The stimulus and everything that came of it happen under one session lock. Releasing it between the
-two would let another writer put a batch in front of one the machine had just released.
+The stimulus and everything that came of it happen under one session lock, and the frames for the
+bridge go out at the end of it. Releasing the lock between the two would let another writer put a
+batch in front of one the machine had just released, and sending a frame in the middle would tell
+the bridge a detach had happened before the attachment was gone.
 
 | Action | What the worker does |
 | --- | --- |
@@ -115,7 +117,7 @@ two would let another writer put a batch in front of one the machine had just re
 | `remove_attachment`, `acknowledge_detach`, `reject_detach` | The empty-prompt gesture's outcome |
 | `install_launch`, `reject_launch`, `revoke_launch`, `late_installation` | The launch transaction's outcome, and what is recorded beside it |
 | `interrupt`, `refuse_interrupt` | The configured native interrupt, which bypasses the hold |
-| `record_acceptance` | The origin an unqualified `kr detach` later resolves against |
+| `record_acceptance` | The origin a detach with no attachment identifier resolves against |
 
 ## The takeover receipt
 
@@ -125,9 +127,10 @@ A takeover reports two counts, because they are two different things.
   machine was holding, and an incomplete paste delimiter. This is the `discarded_bytes` of the
   `input.acquire` answer.
 * What the **reader** discarded from its own queues when its incomplete operation was cancelled.
-  That answer arrives later, so the receipt records `pending` while the reader has been asked,
-  `known` with the count when it answered inside the hold, and `unknown` when the hold ended first
-  or a departure superseded the cancellation. It is never a zero nobody measured.
+  That answer arrives later, so the session's own receipt records `pending` while the reader has
+  been asked, `known` with the count when it answered inside the hold, and `unknown` when the hold
+  ended first or a departure superseded the cancellation. It is never a zero nobody measured, and it
+  is the session's record rather than a field of the `input.acquire` answer.
 
 ## `shell.launch`
 
@@ -206,10 +209,9 @@ manifest's own directory, so a package that was copied elsewhere is still the sa
 | `modules` | The module tree, with each module's search path and ABI |
 | `startup_entry` | The file the guarded startup entry sources |
 
-The worker checks a hello against the package's editor ABI and integration version. The rest of the
-identity — the executable, the upstream revision, the patches and the module tree — is recorded with
-the session for diagnostics rather than compared, and comparing it whole is the next step named in
-this task's handoff.
+A hello is checked against the package's editor ABI and integration version, and the rest of the
+identity it carries — the executable, the upstream revision, the patches and the module tree — is
+recorded whole with the session, which is what its diagnostics report.
 
 ## Setup
 
@@ -223,7 +225,7 @@ and mode, and where each guarded entry goes and whether it is there. It writes n
 | Zsh | `.zshrc` inside the configured `ZDOTDIR` when there is one |
 | Bash | `.bashrc`, plus the first login file this user has when it does not already source `.bashrc` |
 | Fish | a guarded `conf.d` entry; it loads before `config.fish` and its own activation is deferred until after it |
-| PowerShell | the user's own profile, added to rather than replaced. The path this build writes is the Unix profile location; the Windows one is named in this task's handoff |
+| PowerShell | the user's own profile, added to rather than replaced |
 
 The entry is delimited by `# >>> KalaReach shell integration >>>` and `# <<< KalaReach shell
 integration <<<`, and its body is one line that sources the package's own file. Nothing of the
@@ -236,19 +238,6 @@ runs without rewriting anything they own. Nothing replaces `.bashrc`, points a s
 It changes no other setting of that tool and affects no ordinary terminal.
 
 `kr shell remove` deletes exactly the marked entry. Everything the user wrote stays as they left it.
-
-## What is not here yet
-
-Three things this document would otherwise be read as promising, and are not true at this commit.
-
-* `kr detach` without an attachment identifier still resolves through the CLI's own rule rather than
-  through the recorded origin. The host knows the origin — the machine records it at acceptance and
-  `FenceDriver::detach_target()` returns it, with `AMBIGUOUS_ATTACHMENT` for a mixed or unverifiable
-  one — and no wire field carries it to the caller yet.
-* The opt-in command integration and the command blocks are typed and tested, and nothing produces
-  or consumes them: no agent gateway establishes a worker-owned backend, and no hook reports a
-  block.
-* The terminal selection order is decided here and the CLI still opens its terminal its own way.
 
 ## Section 23's private group
 

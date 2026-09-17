@@ -23,7 +23,7 @@ use kr_shell_integration::contract::events::{BridgeEvent, ReaderIdle};
 use kr_shell_integration::contract::fence::{
     Action, ContinuousMs, DetachRejection, DetachTarget, EditorEntered, FenceInvalidation,
     FenceMachine, InputArrived, InputRef, InputRefusal, InterruptRequested, LaunchRequested,
-    LeaseAcknowledgement, LeaseFault, LeaseView, ReaderIdled, Stimulus,
+    LeaseAcknowledgement, LeaseFault, LeaseView, ReaderIdled, StaleMessage, Stimulus,
 };
 use kr_shell_integration::contract::qualification::{IntegrationLoss, ShellKind};
 use kr_shell_integration::contract::requests::{
@@ -111,7 +111,13 @@ impl LaunchAnswer {
             Self::Installed(_) => None,
             Self::Refused { reason, code } => Some(ProtocolError::new(
                 *code,
-                format!("the launch was not installed: {}", reason.as_str()),
+                match *code {
+                    ErrorCode::OutcomeUnknown => format!(
+                        "nothing can say whether the launch installed a command: {}",
+                        reason.as_str()
+                    ),
+                    _ => format!("the launch installed no command: {}", reason.as_str()),
+                },
             )),
         }
     }
@@ -154,6 +160,12 @@ pub struct Effects {
     pub receipts: Vec<TakeoverReceipt>,
     /// The loss that closes the creating session, when one does.
     pub close_session: Option<IntegrationLoss>,
+    /// The frames for the bridge, in the order the machine produced them.
+    ///
+    /// They travel with the rest rather than going straight to the connection, because some of them
+    /// answer something the session has still to do: a detach is acknowledged after the attachment
+    /// is removed, not before, and the bridge must not be told otherwise.
+    pub outbound: Vec<Outbound>,
 }
 
 impl Effects {
@@ -175,6 +187,7 @@ impl Effects {
             .or_else(|| self.lease_acknowledged.take());
         self.receipts.extend(other.receipts);
         self.close_session = other.close_session.or(self.close_session);
+        self.outbound.extend(other.outbound);
     }
 }
 
@@ -228,9 +241,12 @@ pub struct FenceDriver {
     receipt: Option<TakeoverReceipt>,
     /// The bridge event being answered, while one is.
     answering: Option<RequestId>,
-    /// The reader the bridge last reported, so a loss that costs the fence can say which reader
-    /// went. It is what the bridge said, kept to be quoted back, not a second view of the machine.
+    /// The reader the machine last accepted, so a loss that costs the fence can say which reader
+    /// went. It is updated only when the machine acted on the event that named it, so a stale
+    /// report cannot replace it with a reader that is not running.
     reader: Option<(PromptGeneration, ReaderRevision)>,
+    /// Whether the last stimulus was one the machine ignored as belonging to something that ended.
+    ignored: bool,
     /// What the connection's own task waits on when the deadline or the queue may have moved.
     waker: std::sync::Arc<tokio::sync::Notify>,
 }
@@ -271,6 +287,7 @@ impl FenceDriver {
             receipt: None,
             answering: None,
             reader: None,
+            ignored: false,
             waker: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -331,8 +348,11 @@ impl FenceDriver {
         self.outbound = None;
     }
 
-    /// Queues one frame for the bridge, when a connection is there to carry it.
-    fn send(&self, frame: Outbound) {
+    /// Puts one frame on the connection, once everything before it has happened.
+    ///
+    /// Called by the session at the end of the step that produced it, never by the machine's own
+    /// translation, so a frame can never overtake the session action it answers.
+    pub fn send(&self, frame: Outbound) {
         if let Some(outbound) = self.outbound.as_ref() {
             let _ = outbound.send(frame);
         }
@@ -546,18 +566,26 @@ impl FenceDriver {
             BridgeEvent::CommandAccepted(params) => self.command_accepted(params),
             BridgeEvent::HooksActivated(_) => {
                 let _ = self.phase.qualified();
-                self.answer(EventOutcome::Received);
-                Effects::default()
+                self.received()
             }
-            BridgeEvent::GestureChanged(_) | BridgeEvent::PreEofConsumed(_) => {
-                self.answer(EventOutcome::Received);
-                Effects::default()
-            }
+            BridgeEvent::GestureChanged(_) | BridgeEvent::PreEofConsumed(_) => self.received(),
             BridgeEvent::IntegrationLost(report) => {
-                self.answer(EventOutcome::Received);
-                self.integration_lost(report.loss)
+                let mut effects = self.integration_lost(report.loss);
+                self.answer(&mut effects, EventOutcome::Received);
+                effects
             }
         }
+    }
+
+    /// Answers an event the machine has no stimulus for, sweeping the clock on the way.
+    ///
+    /// The sweep is the point: a deadline is a fact about the clock rather than about which message
+    /// arrives next, and a reader that keeps sending events the machine does not act on must not be
+    /// able to postpone a hold's expiry by keeping this task busy.
+    fn received(&mut self) -> Effects {
+        let mut effects = self.apply(&Stimulus::HoldExpired, Context::Other);
+        self.answer(&mut effects, EventOutcome::Received);
+        effects
     }
 
     /// Feeds one answer the reader thread gave.
@@ -589,58 +617,75 @@ impl FenceDriver {
             // Below a qualified session there is no fence to hold. The reader is answered so it
             // does not wait, and nothing starts an exchange: a startup profile that asks a question
             // reads its input in its own context, exactly as section 7 paragraph 4 requires.
-            self.answer(EventOutcome::EditorEntered(RootEditorEnterResult {
-                state: self.machine.state(),
-                fence_exchange: Nullable::null(),
-            }));
-            return Effects::default();
+            let mut effects = self.apply(&Stimulus::HoldExpired, Context::Other);
+            self.answer(
+                &mut effects,
+                EventOutcome::EditorEntered(RootEditorEnterResult {
+                    state: self.machine.state(),
+                    fence_exchange: Nullable::null(),
+                }),
+            );
+            return effects;
         }
-        self.reader = Some((params.prompt_generation, params.reader_revision));
         let candidate_fence = FenceId::new(kr_ipc::new_uuid());
-        let effects = self.apply(
+        let mut effects = self.apply(
             &Stimulus::EditorEntered(EditorEntered {
                 params: params.clone(),
                 candidate_fence,
             }),
             Context::Other,
         );
+        // The reader the machine accepted, remembered so a loss that costs the fence can name the
+        // reader it deregisters. An event the machine ignored as stale leaves it alone.
+        if !self.ignored {
+            self.reader = Some((params.prompt_generation, params.reader_revision));
+        }
         // The exchange the entry started, when the machine started one: a fence a client is told
         // about is one the reader has actually been asked for.
         let started = self.machine.deadline().is_some();
-        self.answer(EventOutcome::EditorEntered(RootEditorEnterResult {
-            state: self.machine.state(),
-            fence_exchange: if started {
-                Nullable::some(candidate_fence)
-            } else {
-                Nullable::null()
-            },
-        }));
+        self.answer(
+            &mut effects,
+            EventOutcome::EditorEntered(RootEditorEnterResult {
+                state: self.machine.state(),
+                fence_exchange: if started {
+                    Nullable::some(candidate_fence)
+                } else {
+                    Nullable::null()
+                },
+            }),
+        );
         effects
     }
 
     fn editor_left(&mut self, params: &RootEditorLeaveParams) -> Effects {
-        self.reader = None;
-        let effects = self.apply(&Stimulus::EditorLeft(params.clone()), Context::Other);
-        self.answer(EventOutcome::EditorLeft(RootEditorLeaveResult {
-            state: self.machine.state(),
-        }));
+        let mut effects = self.apply(&Stimulus::EditorLeft(params.clone()), Context::Other);
+        if !self.ignored {
+            self.reader = None;
+        }
+        self.answer(
+            &mut effects,
+            EventOutcome::EditorLeft(RootEditorLeaveResult {
+                state: self.machine.state(),
+            }),
+        );
         effects
     }
 
     fn reader_idled(&mut self, idle: &ReaderIdle) -> Effects {
         if !self.phase.retains_fence() {
-            self.answer(EventOutcome::Received);
-            return Effects::default();
+            return self.received();
         }
-        self.reader = Some((idle.prompt_generation, idle.reader_revision));
-        let effects = self.apply(
+        let mut effects = self.apply(
             &Stimulus::ReaderIdled(ReaderIdled {
                 idle: idle.clone(),
                 candidate_fence: FenceId::new(kr_ipc::new_uuid()),
             }),
             Context::Other,
         );
-        self.answer(EventOutcome::Received);
+        if !self.ignored {
+            self.reader = Some((idle.prompt_generation, idle.reader_revision));
+        }
+        self.answer(&mut effects, EventOutcome::Received);
         effects
     }
 
@@ -669,9 +714,9 @@ impl FenceDriver {
     /// acknowledged or refused because a detach arrived, and an acceptance is recorded because an
     /// acceptance arrived. Outside that there is nothing to correlate an answer with, and none is
     /// sent.
-    fn answer(&mut self, outcome: EventOutcome) {
+    fn answer(&mut self, effects: &mut Effects, outcome: EventOutcome) {
         if let Some(id) = self.answering {
-            self.send(Outbound::EventResult {
+            effects.outbound.push(Outbound::EventResult {
                 id,
                 result: Box::new(outcome),
             });
@@ -682,6 +727,13 @@ impl FenceDriver {
         let at = self.reading();
         let outcome = self.machine.apply(at, stimulus);
         let mut effects = Effects::default();
+        // What the machine did with it. A reader event it ignored belongs to something that has
+        // ended, and nothing this driver remembers may be updated from one.
+        self.ignored = outcome.actions.len() == 1
+            && matches!(
+                outcome.actions.first(),
+                Some(Action::IgnoreStale(StaleMessage::ReaderEvent))
+            );
         for action in &outcome.actions {
             let produced = self.carry_out(action, context, outcome.state);
             effects.merge(produced);
@@ -695,9 +747,11 @@ impl FenceDriver {
         let mut effects = Effects::default();
         match action {
             Action::AskFence(params) => {
-                self.send(Outbound::Request(Box::new(WorkerRequest::Fence(
-                    params.clone(),
-                ))));
+                effects
+                    .outbound
+                    .push(Outbound::Request(Box::new(WorkerRequest::Fence(
+                        params.clone(),
+                    ))));
             }
             Action::Hold(input) => {
                 if let Some(held) = self.hold.get_mut(input) {
@@ -735,29 +789,37 @@ impl FenceDriver {
             }
             Action::RefuseInput(refusal) => effects.input_refused = Some(*refusal),
             Action::CancelNativeOperations(cancel) => {
-                self.send(Outbound::Request(Box::new(WorkerRequest::Cancel(
-                    cancel.clone(),
-                ))));
+                effects
+                    .outbound
+                    .push(Outbound::Request(Box::new(WorkerRequest::Cancel(
+                        cancel.clone(),
+                    ))));
             }
             Action::PublishFence(fence) => {
                 self.published = Some(fence.fence_id);
-                self.send(Outbound::Publication(FencePublication::Published(
-                    fence.clone(),
-                )));
+                effects
+                    .outbound
+                    .push(Outbound::Publication(FencePublication::Published(
+                        fence.clone(),
+                    )));
             }
             Action::WithholdFence(reason) => {
-                self.send(Outbound::Publication(FencePublication::Withheld {
-                    reason: *reason,
-                    state,
-                }));
+                effects
+                    .outbound
+                    .push(Outbound::Publication(FencePublication::Withheld {
+                        reason: *reason,
+                        state,
+                    }));
             }
             Action::InvalidateFence(reason) => {
                 if let Some(fence_id) = self.published.take() {
-                    self.send(Outbound::Publication(FencePublication::Invalidated {
-                        fence_id,
-                        reason: withheld_for(*reason),
-                        state,
-                    }));
+                    effects
+                        .outbound
+                        .push(Outbound::Publication(FencePublication::Invalidated {
+                            fence_id,
+                            reason: withheld_for(*reason),
+                            state,
+                        }));
                 }
             }
             Action::EmitEditorBusy(event) => effects.editor_busy.push(event.clone()),
@@ -775,16 +837,21 @@ impl FenceDriver {
             }
             Action::RemoveAttachment(attachment) => effects.remove_attachments.push(*attachment),
             Action::AcknowledgeDetach(result) => {
-                self.answer(EventOutcome::Detached(result.clone()));
+                self.answer(&mut effects, EventOutcome::Detached(result.clone()));
             }
             Action::RejectDetach(rejection) => {
-                self.answer(EventOutcome::Refused(detach_error(*rejection)));
+                self.answer(
+                    &mut effects,
+                    EventOutcome::Refused(detach_error(*rejection)),
+                );
             }
             Action::SendLaunch(request) => {
                 self.live_launch = Some(request.transaction);
-                self.send(Outbound::Request(Box::new(WorkerRequest::Launch(
-                    request.clone(),
-                ))));
+                effects
+                    .outbound
+                    .push(Outbound::Request(Box::new(WorkerRequest::Launch(
+                        request.clone(),
+                    ))));
             }
             Action::RevokeLaunch {
                 transaction,
@@ -794,7 +861,7 @@ impl FenceDriver {
                     self.live_launch = None;
                 }
                 self.awaiting.push_back(*transaction);
-                self.send(Outbound::Revocation {
+                effects.outbound.push(Outbound::Revocation {
                     transaction: *transaction,
                     reason: *reason,
                 });
@@ -821,10 +888,13 @@ impl FenceDriver {
             Action::RefuseInterrupt(fault) => effects.interrupt_refused = Some(*fault),
             Action::RecordAcceptance(origin) => {
                 effects.acceptance = Some(origin.clone());
-                self.answer(EventOutcome::CommandRecorded(RootCommandAcceptedResult {
-                    origin: origin.clone(),
-                    state,
-                }));
+                self.answer(
+                    &mut effects,
+                    EventOutcome::CommandRecorded(RootCommandAcceptedResult {
+                        origin: origin.clone(),
+                        state,
+                    }),
+                );
             }
             Action::CloseTakeoverReceipt {
                 epoch,

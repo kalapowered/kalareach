@@ -605,6 +605,13 @@ impl Session {
                 let _ = sender.send(answer.clone());
             }
         }
+        // The frames go last, on the step that produced them: the bridge is told a detach happened
+        // after the attachment is gone, never before.
+        if let Some(driver) = self.fence.as_ref() {
+            for frame in effects.outbound {
+                driver.send(frame);
+            }
+        }
         self.pump_replies();
         FenceOutcome {
             launch_answers: effects.launch_answers,
@@ -1713,6 +1720,18 @@ impl Session {
             self.queue_input(batch);
             return Ok(());
         };
+        if !driver.phase().accepts_external_input() {
+            // Section 7 paragraph 4: in managed mode nothing external reaches the terminal until the
+            // private reader and pre-EOF bridge are authenticated and ABI-checked. The endpoint is
+            // open before then so a session that is still being created is reachable; what it
+            // serves is everything but this.
+            return Err(WorkerError::PreconditionFailed {
+                detail:
+                    "this session's root integration has not been authenticated, so it accepts \
+                         no external input yet"
+                        .to_owned(),
+            });
+        }
         let effects = driver.input_arrived(
             attachment_id,
             kr_protocol::ids::InputLeaseEpoch::new(epoch),
@@ -2170,9 +2189,12 @@ impl Session {
             let held = queued.saturating_sub(self.queued_lease_bytes.load());
             // Two bounds, both of them this reply's: its own share, so an application that asks
             // questions without reading the answers cannot fill the terminal by itself, and the
-            // whole budget, so its share cannot be spent on top of a full queue.
+            // whole budget, so its share cannot be spent on top of a full queue. What the root
+            // editor's machine is holding counts towards the second, because it is accepted input
+            // on its way to the same terminal.
+            let outstanding = queued.saturating_add(self.held_input_bytes);
             if held.saturating_add(reply.len()) > MAX_PENDING_REPLY_BYTES
-                || queued.saturating_add(reply.len()) > MAX_QUEUED_INPUT_BYTES
+                || outstanding.saturating_add(reply.len()) > MAX_QUEUED_INPUT_BYTES
             {
                 return;
             }

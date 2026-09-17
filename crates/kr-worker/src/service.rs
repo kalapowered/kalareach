@@ -2286,11 +2286,20 @@ impl WorkerService {
             }
             (Err(error), Some(journal)) => {
                 // Past the marker there is no rejection. Whether the effect happened cannot be
-                // established from here, so the outcome is recorded as unknown.
+                // established from here, so the outcome is recorded as unknown — except where the
+                // failure itself proves the effect did not happen, which a launch the machine
+                // refused before it reached the reader does.
+                let state = if matches!(error, WorkerError::LaunchRefused { code, .. }
+                    if *code != ErrorCode::OutcomeUnknown)
+                {
+                    kr_protocol::receipt::ReceiptState::Refused
+                } else {
+                    kr_protocol::receipt::ReceiptState::Unknown
+                };
                 let settled = journal.settle(
                     actor_id,
                     mutation.action_id,
-                    kr_protocol::receipt::ReceiptState::Unknown,
+                    state,
                     None,
                     Some(error.to_protocol_error()),
                     now,

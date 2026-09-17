@@ -401,14 +401,11 @@ fn script_invocation(requested: &str) -> Option<String> {
     if requested.contains(['<', '>', '|', ';', '&', '`', '$']) {
         return script("a command line");
     }
-    let mut words = requested.split_whitespace();
-    let _ = words.next();
-    if words.any(|word| word.starts_with('-')) {
-        return script("an invocation with arguments");
+    if requested.split_whitespace().count() > 1 {
+        // The whole string does not name a file, so the spaces separate words rather than being
+        // part of one path: `bash script.sh` is somebody asking for a script to be run.
+        return script("a command line");
     }
-    // Several words and none of them an option: a path with spaces that this host does not have.
-    // It is still not a command line, so it is refused as an unqualified shell rather than as a
-    // script, which names the right thing.
     None
 }
 

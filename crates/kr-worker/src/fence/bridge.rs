@@ -121,18 +121,20 @@ impl BridgeServer {
             }
             let writing = tokio::spawn(write_outbound(writer, receiving));
             self.pump(&mut reader).await;
-            // The connection has ended. The driver stops queueing for it, the writer task finishes
-            // whatever it had, and the session hears that its integration has gone.
+            // The connection has ended. The driver stops queueing for it and the session hears that
+            // its integration has gone, before the writer is waited on at all: a peer that has
+            // stopped reading its own socket must not be able to hold up the loss that releases
+            // held input and answers the callers waiting on a launch.
             {
                 let mut session = self.runtime.session();
                 if let Some(driver) = session.fence_mut() {
                     driver.stop_sending();
                 }
             }
-            let _ = writing.await;
             let _ = self
                 .runtime
                 .drive_fence(|driver| driver.integration_lost(IntegrationLoss::BridgeDisconnected));
+            writing.abort();
             if self.runtime.state() == kr_protocol::session::SessionState::Closed {
                 return;
             }
@@ -152,8 +154,8 @@ impl BridgeServer {
                 };
                 (driver.waker(), driver.deadline())
             };
-            // The wait is created before the deadline is read, and a stimulus stores a permit
-            // rather than broadcasting, so a deadline that moved between the two is not missed.
+            // A stimulus stores a permit rather than broadcasting, so a deadline that moved
+            // between the reading above and this wait is not missed: the permit is waiting here.
             let notified = wake.notified();
             let frame = match deadline {
                 Some(left) => tokio::select! {

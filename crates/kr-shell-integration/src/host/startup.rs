@@ -235,7 +235,7 @@ pub fn install(path: &Path, body: &str) -> std::io::Result<Change> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, updated)?;
+        replace(path, &updated)?;
     }
     Ok(change)
 }
@@ -253,14 +253,10 @@ pub fn remove(path: &Path) -> std::io::Result<Change> {
     let rebuilt = format!("{before}{after}");
     // A file this entry created and nothing else ever wrote to goes with it. One the user owns
     // stays, with their own lines exactly as they left them.
-    if rebuilt.trim().is_empty() && !before.trim().is_empty() {
-        std::fs::write(path, rebuilt)?;
-        return Ok(Change::Removed);
-    }
-    if rebuilt.trim().is_empty() {
+    if rebuilt.trim().is_empty() && before.trim().is_empty() {
         std::fs::remove_file(path)?;
     } else {
-        std::fs::write(path, rebuilt)?;
+        replace(path, &rebuilt)?;
     }
     Ok(Change::Removed)
 }
@@ -280,6 +276,31 @@ fn strip(contents: &str) -> Option<(String, String)> {
         .strip_prefix('\n')
         .map_or(&contents[after..], |rest| rest);
     Some((contents[..begin].to_owned(), after.to_owned()))
+}
+
+/// Writes a startup file by replacing it, never by truncating it.
+///
+/// A short write, a full disk or a crash between the truncation and the write would otherwise take
+/// the user's own configuration with it. The new contents are written beside the file and renamed
+/// over it, which on every platform this host runs on is one step: the file is either what it was
+/// or what it is going to be, and never half of either.
+fn replace(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(".kalareach-new");
+    let temporary = std::path::PathBuf::from(temporary);
+    // The permissions of the file being replaced, so a profile that was owner-only stays so.
+    let permissions = std::fs::metadata(path).ok().map(|data| data.permissions());
+    std::fs::write(&temporary, contents)?;
+    if let Some(permissions) = permissions {
+        std::fs::set_permissions(&temporary, permissions)?;
+    }
+    match std::fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
 }
 
 fn read_or_empty(path: &Path) -> std::io::Result<String> {

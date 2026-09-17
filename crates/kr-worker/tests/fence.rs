@@ -1158,11 +1158,26 @@ async fn a_live_session_that_loses_its_hooks_stops_attributing_and_stops_install
             .acquire_input(second, ConnectionId::new(kr_ipc::new_uuid()), None)
             .expect("takes the keys");
     }
-    let quiet = tokio::time::timeout(Duration::from_millis(500), wired.bridge.recv()).await;
-    assert!(
-        quiet.is_err(),
-        "a degraded session asks the reader for nothing: {quiet:?}"
-    );
+    // The loss itself tells the bridge its fence has gone, which is a frame. What must not appear
+    // is another exchange or another published fence.
+    while let Ok(Ok(frame)) =
+        tokio::time::timeout(Duration::from_millis(400), wired.bridge.recv()).await
+    {
+        match frame {
+            ToBridge::Request { request, .. } => assert!(
+                !matches!(*request, WorkerRequest::Fence(_)),
+                "a degraded session asks the reader for no fence"
+            ),
+            ToBridge::FencePublished(publication) => assert!(
+                !matches!(
+                    publication,
+                    kr_protocol::root::FencePublication::Published(_)
+                ),
+                "and publishes none"
+            ),
+            ToBridge::EventResult { .. } | ToBridge::LaunchRevoked { .. } => {}
+        }
+    }
     assert!(
         wired
             .runtime
@@ -1403,9 +1418,9 @@ async fn a_reader_that_never_answers_leaves_the_takeover_receipt_unknown() {
     wired.close().await;
 }
 
-/// KR-REQ-07.83: two callers waiting at once are each answered, in the order they were revoked.
+/// KR-REQ-07.83: a reader that answers after the revocation is believed, and the record kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_outstanding_confirmations_are_each_answered() {
+async fn a_launch_answered_after_its_revocation_is_reported_and_recorded() {
     let mut wired = wired().await;
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
