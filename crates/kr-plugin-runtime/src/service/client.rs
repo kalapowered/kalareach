@@ -231,6 +231,32 @@ impl Pending {
     }
 }
 
+/// One frame on its way out, and what happens if it does not get there.
+///
+/// A frame that is abandoned part way -- by a failure, by a deadline, or by a caller that stopped
+/// polling -- is the end of this connection: the writer it was using is dropped where it stands,
+/// and this closes the rest, so the reader stops, everyone waiting is told, and the socket goes with
+/// the last of its halves. Without this, a cancelled write would leave a host waiting for bytes
+/// that are never coming and a client waiting for an answer it can never get.
+struct Framing<'a> {
+    pending: &'a Pending,
+    finished: bool,
+}
+
+impl Framing<'_> {
+    fn finished(mut self, wrote: bool) {
+        self.finished = wrote;
+    }
+}
+
+impl Drop for Framing<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.pending.close();
+        }
+    }
+}
+
 /// One request's place in the waiting set, removed however the caller leaves.
 ///
 /// A timeout, a write failure and a cancelled future all end the same way: the entry goes. Without
@@ -711,19 +737,34 @@ impl PluginClient {
                 // half written and then abandoned -- by a failure, by a deadline, or by a caller
                 // that stopped polling -- leaves a writer that refuses every later frame, and there
                 // is no way back from that on this connection. Holding the writer here means the
-                // abandoning drops it, which closes the socket's write half; nothing has to be
-                // scheduled, and nothing has to run on an executor that may not exist.
+                // abandoning drops it; nothing has to be scheduled and nothing has to run on an
+                // executor that may not exist. A writer found in the slot after the connection
+                // closed is dropped rather than used, which is what makes the one narrow order --
+                // a frame put back at the instant of closure -- harmless.
                 let Some(mut writer) = held.take() else {
                     return Err(RuntimeError::ServiceUnavailable {
                         detail: "the plugin host closed the connection".to_owned(),
                     });
                 };
+                if self.pending.is_closed() {
+                    drop(writer);
+                    return Err(RuntimeError::ServiceUnavailable {
+                        detail: "the plugin host closed the connection".to_owned(),
+                    });
+                }
+                // The connection ends unless the frame finishes. Dropping the writer stops this
+                // side sending; closing the rest stops this side reading and tells everyone
+                // waiting, which is what makes a cancelled write the end of a connection rather
+                // than one silent call.
+                let frame = Framing {
+                    pending: &self.pending,
+                    finished: false,
+                };
                 let written = writer.write_message(&Request { request_id, body }).await;
+                frame.finished(written.is_ok());
                 if written.is_ok() && !self.pending.is_closed() {
                     *held = Some(writer);
                 } else {
-                    // The frame did not arrive, or this connection ended while it was being
-                    // written. Either way the writer goes, and with it the write half.
                     drop(writer);
                     self.pending.close();
                 }
@@ -846,6 +887,10 @@ async fn write_offered(
             let Some(mut owned) = held.take() else {
                 return Err(kr_ipc::IpcError::PeerClosed);
             };
+            if pending.is_closed() {
+                drop(owned);
+                return Err(kr_ipc::IpcError::PeerClosed);
+            }
             let written = owned.write_message(&request).await;
             if written.is_ok() && !pending.is_closed() {
                 *held = Some(owned);

@@ -513,12 +513,17 @@ impl PluginHost {
                 if matches!(removed, Unbound::Stopped) {
                     served.bindings.give_back();
                 }
-                if let Ok(mut held) = served.registered.lock() {
-                    if let Some(removing) = removing {
-                        held.parted(binding_id, &removing);
-                    }
-                    held.gave_up(binding_id);
+                if let Ok(mut held) = served.registered.lock()
+                    && let Some(removing) = removing
+                {
+                    // By identity, and nothing else: a registration that started while this unbind
+                    // was joining the old thread owns the identifier now, and its state is not this
+                    // removal's to clear.
+                    held.parted(binding_id, &removing);
                 }
+                // The binding has gone, so what the notice queue was holding for it has nothing
+                // left to catch, and the identifier's next incarnation starts clean.
+                served.notices.forget(binding_id);
                 Ok(ResponseBody::Unbound {
                     existed: removed.existed(),
                 })
@@ -633,12 +638,14 @@ impl PluginHost {
         // Recorded before the forwarder starts, because what `bind` draws reaches the notice queue
         // before this registration returns: a document lost in that moment has to be an obligation
         // this connection can still discharge.
-        if let Ok(mut held) = served.registered.lock() {
-            held.preparing(binding_id);
-        }
+        let attempt = served
+            .registered
+            .lock()
+            .map_or(0, |mut held| held.preparing(binding_id));
         let started_registering = Registering {
             registered: &served.registered,
             binding_id,
+            attempt,
             kept: false,
         };
         let events = Self::forward_notices(
@@ -653,7 +660,7 @@ impl PluginHost {
             .await
             .map_err(refusal)?;
         if let Ok(mut held) = served.registered.lock() {
-            held.joined(binding_id, bound);
+            held.joined(binding_id, attempt, bound);
         }
         started_registering.keep();
         admitted.keep();
@@ -728,11 +735,13 @@ type Registered = Arc<std::sync::Mutex<Held>>;
 #[derive(Debug, Default)]
 struct Held {
     live: std::collections::HashMap<Uuid, Arc<BindingHandle>>,
-    /// Bindings this connection is registering, whose handles do not exist yet.
+    /// Bindings this connection is registering, by the attempt that is registering each.
     ///
     /// What `bind` draws reaches the notice queue before the registration that started it has
-    /// returned, so a document lost in that moment has no handle to ask.
-    preparing: std::collections::HashSet<Uuid>,
+    /// returned, so a document lost in that moment has no handle to ask. The attempt is what keeps
+    /// one registration's cleanup from clearing another's: an identifier can be registered twice,
+    /// and the one that fails must not take the other's state with it.
+    preparing: std::collections::HashMap<Uuid, u64>,
     /// Redraws owed to bindings that were still being registered when the loss was reported.
     ///
     /// Only for identifiers in `preparing`: a loss reported for a binding that has already gone is
@@ -741,25 +750,32 @@ struct Held {
     owed: std::collections::HashSet<Uuid>,
 }
 
+/// The source of registration attempt numbers, which are never reused inside a process.
+static NEXT_REGISTRATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl Held {
-    /// Records that this connection has started registering a binding.
-    fn preparing(&mut self, binding_id: Uuid) {
-        self.preparing.insert(binding_id);
+    /// Records that this connection has started registering a binding, and returns the attempt.
+    fn preparing(&mut self, binding_id: Uuid) -> u64 {
+        let attempt = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
+        self.preparing.insert(binding_id, attempt);
+        attempt
     }
 
     /// Records a binding, and discharges any redraw it owed from before it existed.
-    fn joined(&mut self, binding_id: Uuid, handle: Arc<BindingHandle>) {
-        self.preparing.remove(&binding_id);
+    fn joined(&mut self, binding_id: Uuid, attempt: u64, handle: Arc<BindingHandle>) {
+        self.gave_up(binding_id, attempt);
         if self.owed.remove(&binding_id) {
             handle.require_snapshot();
         }
         self.live.insert(binding_id, handle);
     }
 
-    /// Forgets a registration that did not finish.
-    fn gave_up(&mut self, binding_id: Uuid) {
-        self.preparing.remove(&binding_id);
-        self.owed.remove(&binding_id);
+    /// Forgets one registration attempt, if it is still the attempt this identifier is on.
+    fn gave_up(&mut self, binding_id: Uuid, attempt: u64) {
+        if self.preparing.get(&binding_id) == Some(&attempt) {
+            self.preparing.remove(&binding_id);
+            self.owed.remove(&binding_id);
+        }
     }
 
     /// Asks one binding to draw again, or remembers that it owes a drawing.
@@ -770,7 +786,7 @@ impl Held {
         match self.live.get(&binding_id) {
             Some(handle) => handle.require_snapshot(),
             None => {
-                if self.preparing.contains(&binding_id) {
+                if self.preparing.contains_key(&binding_id) {
                     self.owed.insert(binding_id);
                 }
             }
@@ -847,6 +863,7 @@ struct BindingPlaces {
 struct Registering<'a> {
     registered: &'a Registered,
     binding_id: Uuid,
+    attempt: u64,
     kept: bool,
 }
 
@@ -861,7 +878,7 @@ impl Drop for Registering<'_> {
         if !self.kept
             && let Ok(mut held) = self.registered.lock()
         {
-            held.gave_up(self.binding_id);
+            held.gave_up(self.binding_id, self.attempt);
         }
     }
 }

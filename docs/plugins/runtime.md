@@ -191,8 +191,11 @@ per connection, one in the worker's client -- are bounded in bytes, and that bou
 of what has already been dropped as well as what is waiting. In those two, losses coalesce into one
 record per binding, so a reader that stopped reading cannot be given a backlog of gaps either, and a
 document is dropped whole: every piece of it that is waiting goes together, and the pieces of it that
-have not arrived yet are dropped as they arrive. Half a document would tell a reader it had a whole
-one. A fault and a disabling are never dropped; if even those will not fit once every document has
+have not arrived yet are dropped as they arrive, whether they were dropped to make room or refused
+for want of it. Half a document would tell a reader it had a whole one. The queue remembers which
+documents went until their last piece has been accounted for, until their binding goes, or -- if a
+producer somehow made more of those records than the queue will keep -- until the oldest is made way
+for. A fault and a disabling are never dropped; if even those will not fit once every document has
 gone, the connection is over, because a connection whose reliable news cannot be delivered is not one
 worth keeping open.
 
@@ -335,7 +338,11 @@ the strength of a signature. Each launch also has a rendezvous address of its ow
 reservation, so a claim can never arrive on an address two launches meant.
 
 The deadline covers receiving and checking the claim, publishing the descriptor and acknowledging
-it -- not merely accepting a connection. A peer that connects and then says nothing does not hold a
+it -- not merely accepting a connection. Publication is the one step a timer cannot interrupt: a
+write, a flush and a rename finish whether or not anybody is still waiting. So it is fenced as well
+as bounded. Each launch takes its environment's publication turn, holds it from the check to the
+rename, and writes nothing if a later launch has taken it; a publication this launcher gave up on
+therefore cannot replace the descriptor its successor published. A peer that connects and then says nothing does not hold a
 startup open, and a refused claim does not end the wait: the launcher keeps listening until its
 deadline and reports the last refusal if nothing better arrives.
 

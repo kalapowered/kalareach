@@ -60,14 +60,31 @@ impl Served {
             )
             .expect("a plugin host"),
         );
+        let endpoint_for_wait =
+            kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
         let serving = tokio::spawn({
             let host = Arc::clone(&host);
             async move {
                 let _ = host.serve(core::future::pending::<()>()).await;
             }
         });
-        // The endpoint is bound inside `serve`, so a client that connects at once may arrive first.
-        tokio::time::sleep(core::time::Duration::from_millis(50)).await;
+        // The endpoint is bound inside `serve`, so a client that connects at once may arrive
+        // first. Waited for rather than slept through: a fixed delay is a guess about a machine,
+        // and this machine runs other work.
+        let ready = std::time::Instant::now();
+        loop {
+            if kr_ipc::endpoint::Connection::connect(&endpoint_for_wait)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                ready.elapsed() < core::time::Duration::from_secs(10),
+                "the host never bound its endpoint"
+            );
+            tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+        }
         Self {
             _temp: temp,
             packages,

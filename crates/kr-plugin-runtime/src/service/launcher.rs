@@ -59,34 +59,65 @@ use crate::service::protocol::{
 /// The largest descriptor this host writes or reads.
 const MAX_DESCRIPTOR_BYTES: u64 = 8 * 1024;
 
-/// Which launch's publication is the current one, per environment.
+/// One environment's publication turn.
 ///
 /// Writing a descriptor is a file write, a flush and a rename, and a timer cannot interrupt any of
 /// it: a publication this launcher stopped waiting for still finishes. What must not happen is that
-/// it finishes *after* a later launch published its own and replaces it. Each attempt takes a
-/// number, and a publication that is no longer the newest writes nothing. One entry per
-/// environment, which is a number this host has one of per environment it serves.
+/// it finishes *after* a later launch published its own, and replaces it.
+///
+/// So a publication is not merely checked before it starts: it holds this environment's turn from
+/// the check to the rename. Each attempt takes a number, and a publication that finds a newer
+/// number when its turn comes writes nothing and says so. Two launches for one environment
+/// therefore publish in order, and the older one never wins.
 static PUBLICATIONS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<EnvironmentId, u64>>,
+    std::sync::Mutex<std::collections::HashMap<EnvironmentId, Arc<std::sync::Mutex<u64>>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// The source of publication numbers, which are never reused inside a process.
 static NEXT_PUBLICATION: AtomicU64 = AtomicU64::new(1);
 
 /// Takes the next publication number for one environment, superseding any earlier attempt.
-fn claim_publication(environment_id: EnvironmentId) -> u64 {
+///
+/// Returns the number and the turn to hold while publishing.
+fn claim_publication(environment_id: EnvironmentId) -> (u64, Arc<std::sync::Mutex<u64>>) {
     let attempt = NEXT_PUBLICATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut current) = PUBLICATIONS.lock() {
-        current.insert(environment_id, attempt);
+    let turn = PUBLICATIONS.lock().map_or_else(
+        |_poisoned| Arc::new(std::sync::Mutex::new(attempt)),
+        |mut environments| {
+            Arc::clone(
+                environments
+                    .entry(environment_id)
+                    .or_insert_with(|| Arc::new(std::sync::Mutex::new(0))),
+            )
+        },
+    );
+    if let Ok(mut newest) = turn.lock() {
+        *newest = attempt;
     }
-    attempt
+    (attempt, turn)
 }
 
-/// Returns whether this attempt is still the newest publication for its environment.
-fn is_current_publication(environment_id: EnvironmentId, attempt: u64) -> bool {
-    PUBLICATIONS
-        .lock()
-        .is_ok_and(|current| current.get(&environment_id) == Some(&attempt))
+/// Publishes a descriptor if this attempt is still the newest for its environment.
+///
+/// The turn is held across the whole publication, so the check and the rename cannot be separated
+/// by a later launch's success.
+fn publish_if_current(
+    turn: &std::sync::Mutex<u64>,
+    attempt: u64,
+    environment: &EnvironmentPaths,
+    descriptor: &HostDescriptor,
+) -> LaunchResult<()> {
+    let Ok(newest) = turn.lock() else {
+        return Err(LaunchError::Refused {
+            detail: "this environment's publication turn is unusable".to_owned(),
+        });
+    };
+    if *newest != attempt {
+        return Err(LaunchError::Refused {
+            detail: "a later launch has published this environment's descriptor".to_owned(),
+        });
+    }
+    publish_descriptor(environment, descriptor)
 }
 
 /// What can go wrong starting or verifying a plugin host.
@@ -710,20 +741,13 @@ impl HostReservation {
                     // finishes. So it is fenced rather than merely bounded -- it writes nothing once
                     // a later launch has taken the environment's publication -- and the wait for it
                     // is inside the deadline like every other stage.
-                    let attempt = claim_publication(self.environment_id);
+                    let (attempt, turn) = claim_publication(self.environment_id);
                     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                     let publishing = {
                         let paths = environment.clone();
                         let descriptor = descriptor.clone();
-                        let environment_id = self.environment_id;
                         tokio::task::spawn_blocking(move || {
-                            if is_current_publication(environment_id, attempt) {
-                                publish_descriptor(&paths, &descriptor)
-                            } else {
-                                // A later launch has published, or is publishing. Its descriptor is
-                                // the one that should be there.
-                                Ok(())
-                            }
+                            publish_if_current(&turn, attempt, &paths, &descriptor)
                         })
                     };
                     match tokio::time::timeout(left, publishing).await {
@@ -1117,21 +1141,44 @@ mod tests {
 
     #[test]
     fn a_publication_a_later_launch_superseded_writes_nothing() {
-        let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
-        let first = claim_publication(environment_id);
-        assert!(is_current_publication(environment_id, first));
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let identity =
+            HostIdentity::generate(host.environment_id()).expect("this host can describe itself");
+        let descriptor = descriptor_of(&identity, "/run/kr/first.sock");
 
-        // A second launch for the same environment. The first one's publication, if it is still
-        // running, is no longer the one that should be on disk.
-        let second = claim_publication(environment_id);
-        assert!(!is_current_publication(environment_id, first));
-        assert!(is_current_publication(environment_id, second));
+        let (first, first_turn) = claim_publication(host.environment_id());
+        // A second launch for the same environment, which is what supersedes the first.
+        let (second, second_turn) = claim_publication(host.environment_id());
+        assert_ne!(first, second);
+
+        let later = descriptor_of(&identity, "/run/kr/second.sock");
+        publish_if_current(&second_turn, second, &environment, &later)
+            .expect("the newest publication writes");
+
+        // The first launch's publication finishing late writes nothing: its turn has passed, and
+        // replacing the newer descriptor is the one thing it must not do.
+        let refused = publish_if_current(&first_turn, first, &environment, &descriptor)
+            .expect_err("a superseded publication is refused");
+        assert!(matches!(refused, LaunchError::Refused { .. }), "{refused}");
+        let published = read_descriptor(&environment)
+            .expect("a read")
+            .expect("a descriptor");
+        assert_eq!(published.endpoint, "/run/kr/second.sock");
 
         // Another environment's publications are its own.
-        let elsewhere = EnvironmentId::new(kr_ipc::new_uuid());
-        let theirs = claim_publication(elsewhere);
-        assert!(is_current_publication(elsewhere, theirs));
-        assert!(is_current_publication(environment_id, second));
+        let elsewhere = kr_ipc::testing::TempHost::create();
+        let (theirs, their_turn) = claim_publication(elsewhere.environment_id());
+        let mine = descriptor_of(&identity, "/run/kr/third.sock");
+        let mut theirs_descriptor = mine.clone();
+        theirs_descriptor.environment_id = elsewhere.environment_id();
+        publish_if_current(
+            &their_turn,
+            theirs,
+            &elsewhere.environment(),
+            &theirs_descriptor,
+        )
+        .expect("another environment is unaffected");
     }
 
     #[tokio::test]

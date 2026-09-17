@@ -51,6 +51,15 @@ const NOTICE_OVERHEAD_BYTES: u64 = 64;
 /// that fitted that budget fits this queue's accounting too.
 const NODE_OVERHEAD_BYTES: u64 = crate::runtime::host::NODE_OVERHEAD_BYTES;
 
+/// How many dropped documents this queue remembers the identity of at once.
+///
+/// One per binding with an unfinished dropped document is what it takes in practice: a document's
+/// pieces are produced by one call and offered one after another, so a record is made and released
+/// within one pass. The bound is what keeps a pathological producer from making the record itself
+/// the thing that grows, and the oldest goes first because the newest is the one whose pieces are
+/// still arriving.
+const MAX_DROPPED_REMEMBERED: usize = 256;
+
 /// What became of a notice this queue was offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Offered {
@@ -108,14 +117,17 @@ struct Queued {
     lost: HashMap<Uuid, Loss>,
     /// The order the losses are reported in, so the oldest loss is the first a reader hears about.
     lost_order: VecDeque<Uuid>,
-    /// The highest document number this queue has dropped, per binding.
+    /// The documents this queue has dropped whose last piece it has not seen.
     ///
     /// A document is dropped whole, and its later pieces have not all arrived yet: a component
     /// draws a document in one call, but the pieces reach this queue one at a time. Remembering
     /// which document went is what keeps a straggler from being queued after its own document was
-    /// dropped, which would show a reader a last piece of something it never received the rest of.
-    /// One number per binding is enough, because a binding's documents are numbered in order.
-    dropped_through: HashMap<Uuid, u64>,
+    /// dropped, which would show a reader the last piece of something it never received the rest
+    /// of. An entry goes when that document's last piece is seen, when its binding goes, or when
+    /// there are more of them than this queue will keep.
+    gone: std::collections::HashSet<(Uuid, u64)>,
+    /// The order those were recorded in, so the oldest is the first to go if there are too many.
+    gone_order: VecDeque<(Uuid, u64)>,
     closed: bool,
     /// Set when what must arrive would not fit. The connection is over.
     overflowed: bool,
@@ -166,6 +178,20 @@ impl NoticeSink {
         // queue and the reader waiting on it.
         self.shared.wake.notify_one();
         offered
+    }
+
+    /// Forgets everything this queue was holding for one binding.
+    ///
+    /// Called when a binding goes. A binding that has gone sends nothing more, so the record of a
+    /// document it lost has nothing left to catch, and an identifier used again starts with a queue
+    /// that knows nothing about its predecessor.
+    pub fn forget(&self, binding_id: Uuid) {
+        if let Ok(mut queue) = self.shared.queue.lock() {
+            queue.gone.retain(|(held, _document)| *held != binding_id);
+            queue
+                .gone_order
+                .retain(|(held, _document)| *held != binding_id);
+        }
     }
 
     /// Closes the queue, so a reader waiting on it stops waiting.
@@ -255,7 +281,8 @@ impl Drop for NoticeStream {
             queue.waiting.clear();
             queue.lost.clear();
             queue.lost_order.clear();
-            queue.dropped_through.clear();
+            queue.gone.clear();
+            queue.gone_order.clear();
             queue.held = 0;
         }
     }
@@ -286,6 +313,15 @@ impl Queued {
         // A piece of a document this queue has already dropped. Queueing it would leave a reader
         // with part of a document and no way to tell; it belongs to the loss that took the rest.
         if self.already_dropped(&notice) {
+            if let Notice::Document {
+                binding_id,
+                document,
+                last,
+                ..
+            } = &notice
+            {
+                self.gave_up_on(*binding_id, *document, *last);
+            }
             return Offered::Dropped;
         }
 
@@ -295,12 +331,32 @@ impl Queued {
         // Making room can drop the very document this piece belongs to, and a piece admitted after
         // its own document went would be the one thing this record exists to prevent.
         if self.already_dropped(&notice) {
+            if let Notice::Document {
+                binding_id,
+                document,
+                last,
+                ..
+            } = &notice
+            {
+                self.gave_up_on(*binding_id, *document, *last);
+            }
             return Offered::Dropped;
         }
         if self.held + cost > MAX_NOTICE_BYTES {
             if droppable {
                 // Nothing left to make room with, and this is presentation. It goes, and the
-                // reader is told so it expects a fresh document.
+                // reader is told so it expects a fresh document. The document is remembered like
+                // any other that went, so the pieces of it that follow go too: a reader given a
+                // final piece whose beginning never arrived would be told a document was whole.
+                if let Notice::Document {
+                    binding_id,
+                    document,
+                    last,
+                    ..
+                } = &notice
+                {
+                    self.gave_up_on(*binding_id, *document, *last);
+                }
                 return self.absorb(
                     notice.binding_id(),
                     Loss {
@@ -315,24 +371,34 @@ impl Queued {
             self.overflowed = true;
             return Offered::Overflowed;
         }
-        // A document later than the last one dropped for this binding is proof that the dropped
-        // one is finished: a binding's documents are numbered in order, and one call draws one.
-        // The record has done its work and goes.
-        if let Notice::Document {
-            binding_id,
-            document,
-            ..
-        } = &notice
-            && self
-                .dropped_through
-                .get(binding_id)
-                .is_some_and(|through| *document > *through)
-        {
-            self.dropped_through.remove(binding_id);
-        }
         self.held += cost;
         self.waiting.push_back(notice);
         Offered::Kept
+    }
+
+    /// Records that one document has gone, and forgets the record once the document has ended.
+    ///
+    /// The record exists to catch the pieces of a dropped document that have not arrived yet. Its
+    /// last piece is where that duty ends, so seeing that piece -- queued or rejected -- is what
+    /// releases it. Without a release the record would outlive its binding, and an identifier used
+    /// again would find its first documents refused by a loss that belonged to somebody else.
+    fn gave_up_on(&mut self, binding_id: Uuid, document: u64, last: bool) {
+        if last {
+            // Its last piece. Whatever this queue was watching for has now been accounted for.
+            if self.gone.remove(&(binding_id, document)) {
+                self.gone_order
+                    .retain(|held| *held != (binding_id, document));
+            }
+            return;
+        }
+        if self.gone.insert((binding_id, document)) {
+            self.gone_order.push_back((binding_id, document));
+            while self.gone_order.len() > MAX_DROPPED_REMEMBERED {
+                if let Some(oldest) = self.gone_order.pop_front() {
+                    self.gone.remove(&oldest);
+                }
+            }
+        }
     }
 
     /// Returns true when this notice is a piece of a document this queue has already dropped.
@@ -345,9 +411,7 @@ impl Queued {
         else {
             return false;
         };
-        self.dropped_through
-            .get(binding_id)
-            .is_some_and(|through| *document <= *through)
+        self.gone.contains(&(*binding_id, *document))
     }
 
     /// Folds one loss into what its binding has already lost.
@@ -417,6 +481,7 @@ impl Queued {
             return false;
         };
         let mut freed = 0;
+        let mut ended = false;
         self.waiting.retain(|notice| {
             let theirs = matches!(
                 notice,
@@ -428,15 +493,17 @@ impl Queued {
             );
             if theirs {
                 freed += notice_bytes(notice);
+                if matches!(notice, Notice::Document { last: true, .. }) {
+                    ended = true;
+                }
             }
             !theirs
         });
         self.held = self.held.saturating_sub(freed);
         // Remembered, so the pieces of this document that have not arrived yet are dropped with
-        // the ones that had. A reader that received a document's last piece and not its first
-        // could not tell that it was missing anything.
-        let through = self.dropped_through.entry(binding_id).or_insert(document);
-        *through = (*through).max(document);
+        // the ones that had -- unless the piece that ended it was among the ones removed, in which
+        // case there is nothing more of it to come and nothing to remember.
+        self.gave_up_on(binding_id, document, ended);
         // Counted here rather than through `absorb`, which would try to make room again while it
         // is making room.
         let one = Loss {
@@ -734,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn the_next_document_clears_the_record_of_the_one_before_it() {
+    fn a_document_nothing_dropped_is_delivered_whatever_went_before_it() {
         let (sink, mut stream) = channel();
         let big = 512 * 1024;
         let piece = |number: u64| Notice::Document {
@@ -751,7 +818,9 @@ mod tests {
         for number in 1..12 {
             sink.send(piece(number));
         }
-        // Whatever was dropped is behind the newest document, so the newest one is delivered.
+        // What was dropped was other documents. This one is not one of them, so it is delivered:
+        // the record is of documents rather than of bindings, and a binding that lost one is not a
+        // binding whose later drawings are refused.
         let newest = 99;
         assert_eq!(sink.send(piece(newest)), Offered::Kept);
         let mut seen = false;
