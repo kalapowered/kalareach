@@ -202,6 +202,28 @@ impl TerminalOutput {
         contains(&self.snapshot(), marker)
     }
 
+    /// Waits for the marker, and fails with how long it waited when it never arrives.
+    ///
+    /// `what` says what the marker means to the caller, so a failure names both the wait and the
+    /// thing waited for.
+    fn expect_within(&self, marker: &[u8], within: Duration, what: &str) {
+        let started = Instant::now();
+        let deadline = started + within;
+        loop {
+            if contains(&self.snapshot(), marker) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: waited {:?} for {:?} in the terminal's output: {}",
+                started.elapsed(),
+                String::from_utf8_lossy(marker),
+                self.text().escape_debug()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.snapshot()).into_owned()
     }
@@ -286,16 +308,25 @@ fn retained(runtime: &SessionRuntime) -> Vec<u8> {
 /// they are: they are not waiting for anything.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
+/// Waits for `marker` to appear in the session's retained output.
+///
+/// A marker that never appears is a failure here rather than partial output a caller has to make
+/// sense of, and the failure says how long it waited and what for.
 fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
-    let deadline = Instant::now() + within;
+    let started = Instant::now();
+    let deadline = started + within;
     loop {
         let seen = retained(runtime);
         if contains(&seen, marker) {
             return seen;
         }
-        if Instant::now() >= deadline {
-            return seen;
-        }
+        assert!(
+            Instant::now() < deadline,
+            "waited {:?} for {:?} in the session's retained output: {:?}",
+            started.elapsed(),
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&seen)
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -392,10 +423,10 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
     keyboard.answers_the_probe(&output);
-    assert!(
-        output.wait_for(b"kr-ready.", LIVENESS_DEADLINE),
-        "the session's screen reached the terminal: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"kr-ready.",
+        LIVENESS_DEADLINE,
+        "the session's screen reached the terminal",
     );
     let mut previous = 0_usize;
     for sequence in SEQUENCES {
@@ -488,19 +519,19 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
     keyboard.answers_the_probe(&output);
-    assert!(
-        output.wait_for(b"kr-ready.", LIVENESS_DEADLINE),
-        "the session's screen reached the terminal: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"kr-ready.",
+        LIVENESS_DEADLINE,
+        "the session's screen reached the terminal",
     );
     // Everything the terminal was sent while the attachment was being set up. What matters after
     // this point is what the command draws while output flows.
     let settled = output.snapshot();
 
-    assert!(
-        output.wait_for(b"kr-batch-3.", LIVENESS_DEADLINE),
-        "three separate output batches reached the terminal: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"kr-batch-3.",
+        LIVENESS_DEADLINE,
+        "three separate output batches reached the terminal",
     );
     let after = output.snapshot();
     let during = &after[settled.len().min(after.len())..];
@@ -570,10 +601,10 @@ async fn mouse_reports_pass_through_and_a_wheel_event_is_never_an_arrow_key() {
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
     keyboard.answers_the_probe(&output);
-    assert!(
-        output.wait_for(b"kr-ready.", LIVENESS_DEADLINE),
-        "the session's screen reached the terminal: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"kr-ready.",
+        LIVENESS_DEADLINE,
+        "the session's screen reached the terminal",
     );
 
     // Every mouse encoding an advertised protocol produces: the wheel, a press and release in SGR,
@@ -653,10 +684,10 @@ async fn a_view_without_the_lease_cannot_change_the_applications_focus_state() {
         ))
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    assert!(
-        output.wait_for(b"kr-ready.", LIVENESS_DEADLINE),
-        "it watches the session it may not type into: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"kr-ready.",
+        LIVENESS_DEADLINE,
+        "it watches the session it may not type into",
     );
     assert!(
         !hosted.runtime.session().lease().holder.is_present(),

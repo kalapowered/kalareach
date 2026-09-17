@@ -152,16 +152,25 @@ fn retained(session: &Session) -> Vec<u8> {
 /// samples what arrives inside it: those are not waiting for anything.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
+/// Waits for `marker` to appear in the session's retained output.
+///
+/// A marker that never appears is a failure here rather than partial output a caller has to make
+/// sense of, and the failure says how long it waited and what for.
 async fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + within;
+    let started = tokio::time::Instant::now();
+    let deadline = started + within;
     loop {
         let seen = retained(&runtime.session());
         if contains(&seen, marker) {
             return seen;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return seen;
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {:?} for {:?} in the session's retained output: {:?}",
+            started.elapsed(),
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&seen)
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -675,14 +684,13 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
 
     // Both attachments learn, and they learn the same thing: the size changed under all of them,
     // so each is told its view is no longer continuous.
-    assert!(
-        resynchronised(&mut desk, LIVENESS_DEADLINE).await,
-        "the desk's view of a session at another size is not continuous with what it had"
-    );
-    assert!(
-        resynchronised(&mut phone, LIVENESS_DEADLINE).await,
-        "and neither is the phone's"
-    );
+    expect_resynchronised(
+        &mut desk,
+        LIVENESS_DEADLINE,
+        "the desk's view of a session at another size is not continuous with what it had",
+    )
+    .await;
+    expect_resynchronised(&mut phone, LIVENESS_DEADLINE, "and neither is the phone's").await;
     let seen = retained_within(&wired.runtime, b"kr-size:16 48", LIVENESS_DEADLINE).await;
     assert!(
         contains(&seen, b"kr-size:16 48"),
@@ -940,14 +948,18 @@ async fn a_transfer_that_moves_no_dimension_still_notifies_every_attachment() {
     );
     // Both are told their view is no longer continuous, in the same locked step that moved the
     // ownership. The snapshot each then asks for carries the committed owner and epoch.
-    assert!(
-        resynchronised(&mut desk, LIVENESS_DEADLINE).await,
-        "the desk is told it no longer owns the size"
-    );
-    assert!(
-        resynchronised(&mut watching, LIVENESS_DEADLINE).await,
-        "and so is a window that owns nothing and asked for nothing"
-    );
+    expect_resynchronised(
+        &mut desk,
+        LIVENESS_DEADLINE,
+        "the desk is told it no longer owns the size",
+    )
+    .await;
+    expect_resynchronised(
+        &mut watching,
+        LIVENESS_DEADLINE,
+        "and so is a window that owns nothing and asked for nothing",
+    )
+    .await;
     let snapshot: kr_protocol::recovery::EventsSnapshotResult = desk
         .request(
             Method::EventsSnapshot,
@@ -1108,10 +1120,12 @@ async fn a_window_that_changed_presentation_is_told_while_the_application_is_idl
         reported.geometry.dimensions, CANONICAL,
         "and the canonical geometry did not move"
     );
-    assert!(
-        resynchronised(&mut client, LIVENESS_DEADLINE).await,
-        "it is told at once that what it holds is no longer continuous"
-    );
+    expect_resynchronised(
+        &mut client,
+        LIVENESS_DEADLINE,
+        "it is told at once that what it holds is no longer continuous",
+    )
+    .await;
 
     // And back again, with the application still writing nothing.
     let reported: AttachmentViewportResult = client
@@ -1130,10 +1144,12 @@ async fn a_window_that_changed_presentation_is_told_while_the_application_is_idl
         .to_typed()
         .expect("decodes");
     assert_eq!(reported.presentation, TerminalPresentationMode::Direct);
-    assert!(
-        resynchronised(&mut client, LIVENESS_DEADLINE).await,
-        "and told again on the way back"
-    );
+    expect_resynchronised(
+        &mut client,
+        LIVENESS_DEADLINE,
+        "and told again on the way back",
+    )
+    .await;
 
     drop(client);
     wired
@@ -1537,6 +1553,17 @@ fn presentation_of(wired: &Wired, attachment_id: AttachmentId) -> Option<Termina
         .into_iter()
         .find(|summary| summary.attachment_id == attachment_id)
         .and_then(|summary| summary.presentation.as_ref().copied())
+}
+
+/// Waits for a client to be told its view is no longer continuous, and fails with how long it
+/// waited when it never is.
+async fn expect_resynchronised(client: &mut LocalClient, within: Duration, what: &str) {
+    let started = tokio::time::Instant::now();
+    assert!(
+        resynchronised(client, within).await,
+        "{what}: waited {:?} for a session.resync notification",
+        started.elapsed()
+    );
 }
 
 /// Waits for this client to be told that its view is no longer continuous.

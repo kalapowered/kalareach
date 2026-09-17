@@ -572,10 +572,12 @@ async fn a_subscription_on_a_fenced_connection_stops_delivering() {
         .await
         .expect("the call reaches the worker")
         .expect("the subscription succeeds");
-    assert!(
-        output_within(&mut first, LIVENESS_DEADLINE).await,
-        "the subscription is delivering before anything is fenced"
-    );
+    expect_output_within(
+        &mut first,
+        LIVENESS_DEADLINE,
+        "the subscription is delivering before anything is fenced",
+    )
+    .await;
 
     // A replacement daemon binds the authority. The first connection is fenced.
     let mut second = controller_client(&host, 2).await;
@@ -607,6 +609,16 @@ async fn a_subscription_on_a_fenced_connection_stops_delivering() {
 /// that succeeds costs what it always did. The short windows that assert output *never* arrives are
 /// deliberately left as they are: they are not waiting for anything.
 const LIVENESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Waits for session output to reach this client, and fails with how long it waited when none does.
+async fn expect_output_within(client: &mut LocalClient, window: std::time::Duration, what: &str) {
+    let started = tokio::time::Instant::now();
+    assert!(
+        output_within(client, window).await,
+        "{what}: waited {:?} for a session.output notification",
+        started.elapsed()
+    );
+}
 
 /// Returns whether any session output reaches this client inside `window`.
 async fn output_within(client: &mut LocalClient, window: std::time::Duration) -> bool {
@@ -718,10 +730,12 @@ async fn withdrawal_completes_while_the_peer_has_stopped_reading() {
         .await
         .expect("the call reaches the worker")
         .expect("the subscription succeeds");
-    assert!(
-        output_within(&mut first, LIVENESS_DEADLINE).await,
-        "the subscription is delivering before anything is withdrawn"
-    );
+    expect_output_within(
+        &mut first,
+        LIVENESS_DEADLINE,
+        "the subscription is delivering before anything is withdrawn",
+    )
+    .await;
     assert_eq!(
         host.service.runtime().session().attachments().len(),
         1,

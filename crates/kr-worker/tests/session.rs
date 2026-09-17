@@ -10,7 +10,8 @@ use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{AttachmentId, ConnectionId, EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::scalars::{CanonicalSet, Nullable, Uuid};
 use kr_protocol::session::{
-    ClosureReason, Dimensions, DisplayNumber, OwnershipCoverage, SessionState, ShellMode,
+    ClosureReason, ClosureRecord, Dimensions, DisplayNumber, OwnershipCoverage, SessionState,
+    ShellMode,
 };
 use kr_worker::output::OutputDelivery;
 use kr_worker::pty::ShellCommand;
@@ -70,9 +71,28 @@ fn terminal_attachment(session_id: SessionId) -> SessionAttachParams {
     }
 }
 
+/// Waits for a session's closure record, and fails with how long it waited when none arrives.
+///
+/// `what` says which closure the caller is waiting for.
+async fn closure_record(runtime: &SessionRuntime, what: &str) -> ClosureRecord {
+    let started = tokio::time::Instant::now();
+    match tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed()).await {
+        Ok(record) => record,
+        Err(_) => panic!(
+            "waited {:?} for the closure record: {what}",
+            started.elapsed()
+        ),
+    }
+}
+
+/// Collects a session's output until `marker` arrives.
+///
+/// A marker that never arrives is a failure here rather than partial output a caller has to make
+/// sense of, and the failure says how long it waited and what for.
 async fn collect(stream: &mut kr_worker::output::OutputStream, marker: &[u8]) -> Vec<u8> {
     let mut seen = Vec::new();
-    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
     while tokio::time::Instant::now() < deadline {
         // A quiet moment is not an answer. What ends this is the marker, a stream that has closed,
         // or the deadline; a gap between deliveries is a busy machine rather than a host that has
@@ -88,6 +108,13 @@ async fn collect(stream: &mut kr_worker::output::OutputStream, marker: &[u8]) ->
             Ok(None) => break,
         }
     }
+    assert!(
+        seen.windows(marker.len()).any(|window| window == marker),
+        "waited {:?} for {:?} in the session's output: {:?}",
+        started.elapsed(),
+        String::from_utf8_lossy(marker),
+        String::from_utf8_lossy(&seen)
+    );
     seen
 }
 
@@ -173,9 +200,7 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
         "the acceptance comes before the record"
     );
     gate.release();
-    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
-        .await
-        .expect("the closure finishes");
+    let record = closure_record(&runtime, "the closure finishes").await;
     assert_eq!(record.session_id, session_id);
     assert_eq!(record.reason, ClosureReason::CloseRequested);
     assert_eq!(record.terminated.len(), 1);
@@ -194,9 +219,7 @@ async fn a_root_shell_that_exits_closes_the_session_and_nothing_restarts_it() {
         )
         .expect("starts a session"),
     );
-    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
-        .await
-        .expect("the session closes on its own");
+    let record = closure_record(&runtime, "the session closes on its own").await;
     assert!(
         matches!(
             record.reason,
@@ -254,9 +277,7 @@ async fn a_closed_session_refuses_input_and_a_second_close_joins_the_first() {
     assert_eq!(second.state, SessionState::Closing);
     second_gate.release();
     gate.release();
-    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
-        .await
-        .expect("the closure finishes");
+    let record = closure_record(&runtime, "the closure finishes").await;
     assert_eq!(record.session_id, session_id);
     assert!(matches!(
         record.ownership_coverage,
@@ -420,9 +441,7 @@ async fn a_root_shell_that_exits_mid_paste_publishes_the_fence_and_closes_the_pa
             .expect("writes end of transmission");
         runtime.flush_locked(&mut session);
     }
-    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
-        .await
-        .expect("the session closes when its root shell exits");
+    let record = closure_record(&runtime, "the session closes when its root shell exits").await;
     assert!(matches!(
         record.reason,
         ClosureReason::RootExit | ClosureReason::RootSignal
@@ -456,9 +475,7 @@ async fn a_desktop_that_ends_mid_paste_publishes_the_fence_and_closes_the_paste(
     };
     let (runtime, _attachment_id, epoch) = mid_paste(&host, config).await;
 
-    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
-        .await
-        .expect("the session closes when its desktop ends");
+    let record = closure_record(&runtime, "the session closes when its desktop ends").await;
     assert_eq!(record.reason, ClosureReason::DesktopLost);
     let session = runtime.session();
     assert!(
@@ -515,16 +532,24 @@ fn retained(runtime: &SessionRuntime) -> Vec<u8> {
 }
 
 /// Waits for `marker` to appear in the session's retained output.
+///
+/// A marker that never appears is a failure here rather than an empty answer a caller has to make
+/// sense of, and the failure says how long it waited and what for.
 async fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + within;
+    let started = tokio::time::Instant::now();
+    let deadline = started + within;
     loop {
         let seen = retained(runtime);
         if seen.windows(marker.len()).any(|window| window == marker) {
             return seen;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return seen;
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {:?} for {:?} in the session's retained output: {:?}",
+            started.elapsed(),
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&seen)
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -717,11 +742,13 @@ async fn takeover_mid_paste(one_frame: bool) {
     // notice when it takes it, and it is queued ahead of the paste, so a cleared notice means the
     // writer has moved on to the batch that opens the paste.
     let notice = runtime.session().lease_change_queued();
-    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
     while notice.load(std::sync::atomic::Ordering::Acquire) {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the writer began the batch that opens the paste"
+            "waited {:?} for the writer to begin the batch that opens the paste",
+            started.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -831,7 +858,8 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
     // application and the rest is waiting for a terminal that has no room.
     let total = batch.len();
     let queued = runtime.session().queued_lease_bytes();
-    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
     loop {
         let waiting = queued.load();
         if waiting > 0 && waiting < total {
@@ -839,7 +867,9 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the writer delivered some of the batch and is waiting with the rest: {waiting}"
+            "waited {:?} for the writer to deliver some of the batch and wait with the rest: \
+             {waiting} of {total} bytes queued",
+            started.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -980,7 +1010,8 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
     // application and the rest is waiting for a terminal that has no room.
     let total = batch.len();
     let queued = runtime.session().queued_lease_bytes();
-    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
     loop {
         let waiting = queued.load();
         if waiting > 0 && waiting < total {
@@ -988,7 +1019,9 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the writer delivered some of the batch and is waiting with the rest: {waiting}"
+            "waited {:?} for the writer to deliver some of the batch and wait with the rest: \
+             {waiting} of {total} bytes queued",
+            started.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1365,9 +1398,7 @@ async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
         )
         .expect("starts a session"),
     );
-    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
-        .await
-        .expect("the session closes on its own");
+    let record = closure_record(&runtime, "the session closes on its own").await;
     let taken = started.elapsed();
 
     assert_eq!(record.reason, ClosureReason::RootExit);
@@ -1398,9 +1429,7 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
         )
         .expect("starts a session"),
     );
-    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
-        .await
-        .expect("the session closes on its own");
+    let record = closure_record(&runtime, "the session closes on its own").await;
     let taken = started.elapsed();
 
     assert_eq!(record.reason, ClosureReason::RootExit);
@@ -1467,9 +1496,7 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
     );
 
     runtime.close(ClosureReason::CloseRequested).1.release();
-    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
-        .await
-        .expect("the closure finishes");
+    let record = closure_record(&runtime, "the closure finishes").await;
 
     assert_eq!(record.reason, ClosureReason::CloseRequested);
     assert!(
@@ -1502,9 +1529,7 @@ async fn a_shell_that_has_already_ended_is_a_closed_session_rather_than_a_failed
     let runtime = std::sync::Arc::new(
         kr_worker::runtime::start(config).expect("the shell ran, so the session was created"),
     );
-    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
-        .await
-        .expect("the session closes on the root shell's exit");
+    let record = closure_record(&runtime, "the session closes on the root shell's exit").await;
 
     assert_eq!(record.reason, ClosureReason::RootExit);
     assert_eq!(
@@ -1599,9 +1624,7 @@ async fn a_shell_the_host_described_keeps_the_identity_the_kernel_gave_it() {
         runtime.flush_locked(&mut session);
     }
 
-    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
-        .await
-        .expect("the session closes on the root shell's exit");
+    let record = closure_record(&runtime, "the session closes on the root shell's exit").await;
 
     assert_eq!(record.reason, ClosureReason::RootExit);
     assert_eq!(

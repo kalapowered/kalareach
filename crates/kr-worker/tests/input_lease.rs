@@ -144,16 +144,25 @@ fn retained(session: &Session) -> Vec<u8> {
 /// samples what arrives inside it: those are not waiting for anything.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
+/// Waits for `marker` to appear in the session's retained output.
+///
+/// A marker that never appears is a failure here rather than partial output a caller has to make
+/// sense of, and the failure says how long it waited and what for.
 async fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + within;
+    let started = tokio::time::Instant::now();
+    let deadline = started + within;
     loop {
         let seen = retained(&runtime.session());
         if contains(&seen, marker) {
             return seen;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return seen;
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {:?} for {:?} in the session's retained output: {:?}",
+            started.elapsed(),
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&seen)
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
