@@ -204,8 +204,12 @@ pub fn process_state(identity: &ProcessStartIdentity) -> ProcessState {
         // The identifier and the start value are the process that was recorded. Whether it is
         // still running is a second question on a platform that describes a process after it has
         // exited: Linux keeps the `/proc` entry of a process whose status nobody has collected, and
-        // a process waiting to be collected has ended.
-        Ok(current) if current.matches(identity) => platform::liveness(pid),
+        // a process waiting to be collected has ended. The recorded start value goes with the
+        // question, because a platform that has to look again has to know whether what it is
+        // looking at is still the same process.
+        Ok(current) if current.matches(identity) => {
+            platform::liveness(pid, identity.start_value.get())
+        }
         Ok(_) => ProcessState::Ended,
         Err(error) if platform::is_absent(&error) => ProcessState::Ended,
         Err(error) => ProcessState::Unknown {
@@ -248,12 +252,22 @@ mod platform {
     /// status, and the state character says so: `Z` is a process that has ended and whose exit
     /// status nobody has taken. Reporting it as running would put it in a closure record as a
     /// surviving resource, and it is not surviving; it is waiting.
-    pub(super) fn liveness(pid: u32) -> super::ProcessState {
+    ///
+    /// The state and the start value are taken from one reading of one line, so the answer is about
+    /// one process. Reading them separately would leave room for the identifier to be collected and
+    /// given to something else in between, and the state of that something else is not an answer
+    /// about this process.
+    pub(super) fn liveness(pid: u32, start_value: u64) -> super::ProcessState {
         let path = format!("/proc/{pid}/stat");
         let Ok(text) = std::fs::read_to_string(&path) else {
-            // It left between the reading above and this one.
+            // It left between the reading that matched and this one.
             return super::ProcessState::Ended;
         };
+        if parse_start_ticks(&text) != Some(start_value) {
+            // The identifier belongs to something else now, which means the process that was
+            // recorded has gone.
+            return super::ProcessState::Ended;
+        }
         match state_character(&text) {
             Some('Z') => super::ProcessState::Ended,
             // A state this reader does not recognise is not a death. The entry is there and the
@@ -477,7 +491,7 @@ mod platform {
     /// On this platform the question is already answered by the reading that matched: the kernel
     /// refuses to describe a process that has exited, collected or not, so an identity that still
     /// matches belongs to a process that is still there.
-    pub(super) const fn liveness(_pid: u32) -> super::ProcessState {
+    pub(super) const fn liveness(_pid: u32, _start_value: u64) -> super::ProcessState {
         super::ProcessState::Running
     }
 
@@ -554,7 +568,7 @@ mod platform {
     ///
     /// The reading that matched came from the process table, which does not keep a process that
     /// has exited, so there is nothing further to ask.
-    pub(super) const fn liveness(_pid: u32) -> super::ProcessState {
+    pub(super) const fn liveness(_pid: u32, _start_value: u64) -> super::ProcessState {
         super::ProcessState::Running
     }
 
@@ -611,26 +625,42 @@ mod tests {
 
     #[test]
     fn a_process_that_has_ended_is_named_rather_than_left_unavailable() {
-        // The case a host meets when what it started leaves at once. The child has certainly ended
-        // by the time this reads it, and its status has not been collected, which is the state each
-        // platform describes differently: Linux keeps the `/proc` entry, macOS refuses to describe
-        // the process at all. Either way the host has to come away with an identity rather than a
-        // failure, and with the answer that the process has ended.
+        // The case a host meets when what it started leaves at once, and the state each platform
+        // describes differently: a process that has ended and whose status nobody has collected.
+        // Linux keeps its `/proc` entry until the collection; macOS stops describing it at the
+        // exit. Either way the host has to come away with an identity rather than a failure, and
+        // with the answer that the process has ended.
+        //
+        // Nothing here collects the status before the reading, because collecting it is what
+        // removes the case: the loop waits for the platform's own answer instead, which is what
+        // makes this deterministic on both of them.
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "exit 0"])
             .spawn()
             .expect("spawns a child that leaves at once");
         let pid = child.id();
-        while child.try_wait().ok().flatten().is_none() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let named = loop {
+            let named = started_process_identity(pid).expect("the host names what it started");
+            assert_eq!(named.pid.get(), u64::from(pid));
+            if process_state(&named) == ProcessState::Ended {
+                break named;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a shell told to exit does so"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        };
 
-        let named = started_process_identity(pid).expect("the host names what it started");
-        assert_eq!(named.pid.get(), u64::from(pid));
+        // The status is still there to collect, which is what makes the reading above a reading of
+        // an uncollected process rather than of one that had already been reaped.
+        let status = child.wait().expect("the status was still there to collect");
+        assert!(status.success(), "the child exited as it was told to");
         assert_eq!(
             process_state(&named),
             ProcessState::Ended,
-            "a process that has ended reads as ended, however this platform describes it"
+            "and it still reads as ended once its status has been collected"
         );
     }
 
