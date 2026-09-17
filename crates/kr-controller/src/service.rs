@@ -1739,19 +1739,6 @@ impl Controller {
             .await
             .insert(reservation.reservation_id, PendingCreate { ready: sender });
 
-        // The reservation moves to `spawned` before anything is started. A worker can reach the
-        // rendezvous socket the instant the service manager starts it, which is sooner than the
-        // launcher returns, and a reservation still recorded as merely reserved would fence its own
-        // worker. The deadline the host accepted and the registration behind the request are both
-        // checked in the same critical section, and after the durable write rather than before it:
-        // everything from there to the launch runs without waiting for anything, so neither an
-        // action whose life ran out queueing for this lock nor one whose authority was withdrawn
-        // while it queued goes on to start a shell.
-        //
-        // The registration is read with the registry lock already held, which is the order a
-        // revocation takes: a revocation that has installed its revision has already withdrawn the
-        // registrations that revision replaced, so what this reads is never a registration the
-        // revocation is part way through removing.
         // Everything the launch needs is prepared before the checks that admit it, so nothing
         // between the last check and the launch can wait: a directory tree is several filesystem
         // operations, and a slow disk would otherwise spend the rest of an accepted deadline here.
@@ -1766,6 +1753,20 @@ impl Controller {
             self.resolve_failed(reservation.reservation_id).await?;
             return Err(error.into());
         }
+
+        // The reservation moves to `spawned` before anything is started. A worker can reach the
+        // rendezvous socket the instant the service manager starts it, which is sooner than the
+        // launcher returns, and a reservation still recorded as merely reserved would fence its own
+        // worker. The deadline the host accepted and the registration behind the request are both
+        // checked in the same critical section, and after the durable write rather than before it:
+        // everything from there to the launch runs without waiting for anything, so neither an
+        // action whose life ran out queueing for this lock nor one whose authority was withdrawn
+        // while it queued goes on to start a shell.
+        //
+        // The registration is read with the registry lock already held, which is the order a
+        // revocation takes: a revocation that has installed its revision has already withdrawn the
+        // registrations that revision replaced, so what this reads is never a registration the
+        // revocation is part way through removing.
         {
             let mut registry = self.registry.lock().await;
             registry.set_phase(reservation.reservation_id, LaunchPhase::Spawned)?;
