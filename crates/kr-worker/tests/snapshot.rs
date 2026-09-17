@@ -327,6 +327,78 @@ async fn collect_until_installed(client: &mut LocalClient, window: Duration) -> 
     seen
 }
 
+/// Collects until this client is told to resynchronise, so the answer is immediate.
+async fn collect_until_resync(
+    client: &mut LocalClient,
+    window: Duration,
+) -> Option<kr_protocol::recovery::ResyncRequired> {
+    let deadline = tokio::time::Instant::now() + window;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let Ok(Ok(frame)) = tokio::time::timeout(remaining, client.recv()).await else {
+            break;
+        };
+        let ControlFrame::Notification(notification) = frame else {
+            continue;
+        };
+        if notification.event_type.as_str() == "session.resync"
+            && let Ok(required) = notification
+                .payload
+                .to_typed::<kr_protocol::recovery::ResyncRequired>()
+        {
+            return Some(required);
+        }
+    }
+    None
+}
+
+/// Subscribes again from a cursor, which is what a client does when it is told to resynchronise.
+async fn resubscribe(host: &Host, attached: &mut Attached, from: u64) -> EventsSubscribeResult {
+    let mut streams = CanonicalSet::new();
+    streams.insert(EventStream::Output);
+    attached
+        .client
+        .request(
+            Method::EventsSubscribe,
+            &EventsSubscribeParams {
+                session_id: host.session_id,
+                attachment_id: attached.attachment_id,
+                streams,
+                from_cursor: Nullable::some(kr_protocol::scalars::U64::new(from)),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the subscription succeeds")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// Collects the output batches a client receives for `window`, with the cursor each begins at.
+async fn collect_output(client: &mut LocalClient, window: Duration) -> Vec<(u64, Vec<u8>)> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut seen = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let Ok(Ok(frame)) = tokio::time::timeout(remaining, client.recv()).await else {
+            break;
+        };
+        let ControlFrame::Notification(notification) = frame else {
+            continue;
+        };
+        if notification.event_type.as_str() != "session.output" {
+            continue;
+        }
+        if let Ok(event) = notification
+            .payload
+            .to_typed::<kr_protocol::recovery::OutputEvent>()
+        {
+            seen.push((event.cursor.get(), event.bytes.as_slice().to_vec()));
+        }
+    }
+    seen
+}
+
 fn text_of(page: &ProjectionRowPage) -> Vec<String> {
     page.rows
         .iter()
@@ -940,7 +1012,11 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
     // The application leaves the parser inside an incomplete control sequence and waits. A
     // terminal of the session's own size therefore cannot be handed the stream: the next byte it
     // would be given is the middle of that sequence.
-    let host = host("printf 'ready\\033[1'; sleep 1.2; printf 'm-done\\r\\n'; sleep 20").await;
+    let host = host(
+        "printf 'ready\\033[1'; sleep 1.2; printf 'm-done\\r\\n'; sleep 2; \
+         printf 'after-the-handoff\\r\\n'; sleep 20",
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut attached = attach(
         &host,
@@ -969,15 +1045,84 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
 
     let held = collect(&mut attached.client, Duration::from_millis(200)).await;
     assert!(
+        held.iter()
+            .any(|event| matches!(event, Event::Snapshot(_) | Event::Rows(_) | Event::Delta(_))),
+        "it is being sent something, and what it is being sent is the canonical grid: {held:?}"
+    );
+    assert!(
         held.iter().all(|event| !matches!(event, Event::Other(_))),
-        "and what it is being sent is the canonical grid as state, not bytes: {held:?}"
+        "and never bytes, which would assume its terminal is already in the session's state: \
+         {held:?}"
     );
 
-    // The sequence completes. The parser reaches ground, and the attachment may forward from there.
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // The sequence completes. The parser reaches ground, and the attachment may forward from
+    // there: the presentation changes and the subscriber is told to resynchronise, because the
+    // screen it holds and the bytes it is about to be handed have to meet at that boundary.
+    let resync = collect_until_resync(&mut attached.client, Duration::from_secs(3))
+        .await
+        .expect("the transition tells this subscriber to resynchronise");
     assert_eq!(
         reported_presentation(&host, &mut reader, attached.attachment_id).await,
         Some(TerminalPresentationMode::Direct),
         "once the parser is on ground the terminal takes the stream"
     );
+    let boundary = resync.cursor.get();
+
+    // The client answers it the way the command does: it subscribes again. What it is handed is a
+    // screen and a byte cursor that name the same boundary, and the test proves they do by holding
+    // the two apart: the screen carries what the completed sequence left on it, and what the
+    // application writes afterwards arrives as bytes from that cursor on, once.
+    let again = resubscribe(&host, &mut attached, boundary).await;
+    let at = again.from_cursor.get();
+    assert!(
+        at >= boundary,
+        "the subscription starts at the boundary or at the screen the session has reached since: \
+         {at} against {boundary}"
+    );
+    assert!(
+        again.gap.as_ref().is_none(),
+        "with nothing missing: {:?}",
+        again.gap
+    );
+    let batches = collect_output(&mut attached.client, Duration::from_secs(5)).await;
+    let (first_cursor, screen) = batches.first().cloned().unwrap_or_else(|| {
+        panic!("the terminal is handed its screen as bytes now that it is direct: {batches:?}")
+    });
+    assert_eq!(
+        first_cursor, at,
+        "and that screen is the state at the cursor the subscription named"
+    );
+    let rendered = String::from_utf8_lossy(&screen).into_owned();
+    assert!(
+        rendered.contains("m-done"),
+        "the screen carries what the completed sequence left on it: {}",
+        rendered.escape_debug()
+    );
+    assert!(
+        !rendered.contains("after-the-handoff"),
+        "and nothing the application had not written yet: {}",
+        rendered.escape_debug()
+    );
+    let live: Vec<u8> = batches
+        .iter()
+        .skip(1)
+        .flat_map(|(_, bytes)| bytes.clone())
+        .collect();
+    let live = String::from_utf8_lossy(&live).into_owned();
+    assert!(
+        live.contains("after-the-handoff"),
+        "the bytes after it are the live stream from that cursor on: {}",
+        live.escape_debug()
+    );
+    assert!(
+        !live.contains("m-done"),
+        "with nothing the screen already carried sent again: {}",
+        live.escape_debug()
+    );
+    for (cursor, _) in batches.iter().skip(1) {
+        assert!(
+            *cursor >= at,
+            "and every batch after it begins at or after that cursor"
+        );
+    }
 }
