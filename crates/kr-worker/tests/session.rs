@@ -799,13 +799,20 @@ async fn takeover_mid_paste(one_frame: bool) {
         "the paste was closed before the new lease's input reached the application"
     );
     // And the rest of the old lease's batch never arrived: the writer abandoned it at the takeover
-    // rather than finishing it once the application started reading. The comparison is against
-    // what the batch actually held, not its length in bytes, because the line endings are not `a`.
+    // rather than finishing it once the application started reading. What the application is short
+    // of is what the takeover said it discarded, which is the property; how much of the batch the
+    // terminal had already taken before that is the host's own buffer size and differs between
+    // platforms, so it is not what this compares. The count is of what the batch actually held
+    // rather than its length in bytes, because the line endings are not `a`, and the tail is
+    // `a`-and-newline in the same proportion as the whole.
     let sent = start.iter().filter(|byte| **byte == b'a').count();
     let body = seen.iter().filter(|byte| **byte == b'a').count();
+    let missing = sent.saturating_sub(body);
+    let discarded = usize::try_from(taken.discarded_bytes.get()).expect("a count of bytes");
     assert!(
-        body * 2 < sent,
-        "a partly written batch of an ended lease is abandoned, not completed: {body} of {sent}"
+        missing * 2 >= discarded,
+        "a partly written batch of an ended lease is abandoned, not completed: the application \
+         received {body} of {sent}, and the takeover discarded {discarded} bytes"
     );
     let runtime = std::sync::Arc::clone(&runtime);
     runtime.close(ClosureReason::CloseRequested).1.release();
