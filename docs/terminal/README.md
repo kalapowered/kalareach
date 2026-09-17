@@ -567,22 +567,42 @@ in four kinds of event and always in this order:
 | --- | --- |
 | `session.projection.reset` | Discard what is on the screen; a snapshot follows. It names the generation and why |
 | `session.projection.snapshot` | Everything a screen is apart from its rows, at one output cursor |
-| `session.projection.rows` | One page of rows, for a named buffer, with the oldest retained row and the eviction marker. The last page clears `more` |
+| `session.projection.rows` | One page of rows, for a named buffer, with *that buffer's own* oldest retained row and eviction marker. The last page clears `more` |
 | `session.projection.delta` | The rows that changed since a named base, and the state that changed with them |
 
 The reset reasons are the facts a client would otherwise have to guess: the attachment has just
 joined, the screen buffer changed, the geometry changed, the client's base fell outside the replay
 window, retained rows were evicted, or what changed is larger than one bounded update.
 
+A projected client is reset *in band*: the reset and the fresh snapshot arrive on the stream it is
+already reading, so it needs no round trip to ask for what it has been given. That matters most for
+a geometry change, which can happen while nothing is printing: a client told out of band would show
+the old size until it got round to asking. A direct attachment has no such event and is told to
+resynchronise.
+
 A page carries at most 1,000 rows and at most 1 MiB, which are the bounds section 8 puts on a
 history page. Both buffers are paged, the one that is not showing first, so a client that later
-leaves a full-screen application finds what the shell left behind. A client that has not received a
+leaves a full-screen application finds what the shell left behind. Retention belongs to a buffer
+rather than to a session: the primary keeps a scrollback and gives its oldest rows up at the cache
+bound, the alternate keeps none and numbers its rows from its own beginning, and each buffer's pages
+carry its own cutoff. A client that has not received a
 page with `more` cleared does not hold a whole screen and does not draw one: mixing live output with
 an incomplete repaint is the thing the paging exists to prevent.
 
 Ordinary output is one delta per batch, and never a repaint. A row larger than a page bound is cut
 and marked truncated rather than dropped, so a reader can get past it, and the marker is what makes
 the degradation explicit rather than a short row that looks like the application's.
+
+Every message is measured whole before it is sent, rows and state together, against the frame's
+1 MiB and the encoding's 65,536 values. A delta carries the state that changed with its rows - a
+hyperlink change repeats its target, a title stack can hold twenty of them - so rows that fit a page
+say nothing about what the rest of the message adds. One that does not fit is not sent: the client is
+given a fresh snapshot instead, which pages.
+
+A whole screen is the one message a client cannot use part of, because a client holding some of the
+pages holds no screen. So the installation is measured against that subscriber's own send queue, and
+a screen larger than the queue it has to cross is cut to it and marked degraded rather than refused,
+resynchronised and refused again.
 
 ### The projected renderer
 

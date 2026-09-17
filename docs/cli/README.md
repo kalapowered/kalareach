@@ -181,6 +181,17 @@ truth about itself either way, and what it reported is what a cleanup puts back.
 means putting the terminal into a mode where they arrive, which is why the guard exists first. The
 answers then reach the guard over the same pipe.
 
+An answer may arrive in pieces. A terminal is free to send half a reply, and the exchange keeps its
+place between reads rather than treating the first half as something the person typed. The terminal
+is put into a mode where a read waits for nothing at all, and the clock is checked between reads, so
+the exchange ends within a millisecond of its one second rather than a tenth of a second past it.
+What the person typed around the answers is theirs: before the terminator, after it, and the half of
+a key they were part way through pressing when it arrived.
+
+The record that makes a retry require a fresh terminal is written **before the first question**, and
+removed only when the terminator arrives. A process killed in the middle of asking runs no cleanup
+at all, and the terminal it was asking is exactly the one whose stream may still deliver a reply.
+
 Nothing the terminal replies reaches the application. What the person typed during the exchange is
 kept apart from the answers, in the order they typed it, and is the first input the attachment
 forwards. Outside the handshake the command does not scan input for anything reply-shaped: after it,
@@ -201,6 +212,12 @@ have changed them.
 `--no-probe` asks the terminal nothing at all, which is what makes it the choice for a terminal that
 does not answer. The session's own keyboard modes are still cleared when the attachment ends, since
 the session could have set them, but nothing comes back afterwards: that is what never asking costs.
+
+A projection installs the session's keyboard negotiation only on a terminal that reported its own.
+That follows from the same rule: what a cleanup writes back is what the terminal *said*, so a
+terminal nobody asked is left with its own protocols rather than put into a state nothing could put
+back. It applies to `--no-probe` and equally to a profile whose questions do not include the
+keyboard.
 
 The choice is made before the first byte goes out, which is the only time it can be made honestly.
 After a failed handshake the stream is not clean any more: a late reply could still arrive on it, so

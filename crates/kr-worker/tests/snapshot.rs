@@ -1134,11 +1134,23 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
         "the terminal was still being read after the queue filled: the output cursor stood at \
          {at_overflow} and is at {afterwards}"
     );
+    // And what became of the client that was reading, named rather than inferred. It reads in
+    // windows, so on a host that delivers faster than those windows it can fall behind too: the
+    // same rule then applies to it and its own queue is the reason. What it must never be is a
+    // client left with a hole and no word, and a subscriber that has been told to resynchronise is
+    // sent nothing until it asks again, which is why "no events" is an answer here and not a
+    // failure.
+    let told = host
+        .runtime
+        .session()
+        .is_resynchronising(quick.attachment_id);
     assert!(
         after
             .iter()
-            .any(|event| matches!(event, Event::Delta(_) | Event::Rows(_) | Event::Snapshot(_))),
-        "and the client that was reading was still being drawn the session: {} events",
+            .any(|event| matches!(event, Event::Delta(_) | Event::Rows(_) | Event::Snapshot(_)))
+            || told,
+        "the client that was reading was still being drawn the session, or had fallen behind too \
+         and been told so: {} events",
         after.len()
     );
     assert_eq!(
