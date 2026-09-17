@@ -58,6 +58,15 @@ pub const fn buffer(value: ActiveBuffer) -> ProjectedBuffer {
     }
 }
 
+/// Converts a buffer identity back, for a caller reading one buffer's rows out of the engine.
+#[must_use]
+pub const fn active_buffer(value: ProjectedBuffer) -> ActiveBuffer {
+    match value {
+        ProjectedBuffer::Primary => ActiveBuffer::Primary,
+        ProjectedBuffer::Alternate => ActiveBuffer::Alternate,
+    }
+}
+
 /// Converts a colour.
 #[must_use]
 pub const fn colour(value: kr_term::palette::Rgb) -> Rgb {

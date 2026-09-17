@@ -44,6 +44,7 @@ use kr_protocol::projection::{
     ProjectionSnapshot,
 };
 use kr_protocol::scalars::{Nullable, U64};
+use kr_term::grid::GridRow;
 use kr_term::palette::{Palette, PaletteSource, Rgb};
 use kr_term::snapshot::{ActiveBuffer, Delta, Snapshot, Viewport};
 use wire::Cost;
@@ -199,6 +200,30 @@ const ENVELOPE_RESERVE_ITEMS: usize = 1_024;
 /// so that the loop's end is a bound rather than a hope.
 const PAGE_FITTING_ATTEMPTS: usize = 4;
 
+/// How many of a buffer's rows an installation reads out of the engine at once.
+///
+/// A screen is as large as the session budget lets it be, so reading all of it and then converting
+/// it would hold the session twice: once as the engine's copy and once as the wire's. The rows are
+/// read a run at a time instead, and each run is given back as soon as it has been converted, so
+/// what the engine's side of the conversion holds is this many rows rather than a screen.
+const INSTALL_ROWS_AT_ONCE: usize = 16;
+
+/// Where an installation reads the rows it pages.
+///
+/// A bounded run at a time, because the caller holds what it has converted and the conversion is
+/// charged to a subscriber's queue: the two together are what bounds the memory an installation
+/// costs. An empty answer means the buffer holds no row at or after `first`.
+pub trait RowSource {
+    /// A bounded run of one buffer's rows, starting at the `first` visible row.
+    fn rows_from(&self, buffer: ProjectedBuffer, first: usize, max_rows: usize) -> Vec<GridRow>;
+}
+
+impl RowSource for kr_term::engine::Engine {
+    fn rows_from(&self, buffer: ProjectedBuffer, first: usize, max_rows: usize) -> Vec<GridRow> {
+        self.rows_within(wire::active_buffer(buffer), first, max_rows)
+    }
+}
+
 /// One event, with what it costs the subscriber's queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outgoing {
@@ -253,6 +278,11 @@ fn outgoing(event: ProjectionEvent) -> Outgoing {
 /// carries everything a screen is apart from its rows, and the pages carry the rows. The last page
 /// clears `more`, and a client that has not seen that page does not yet hold a whole screen.
 ///
+/// `snapshot` carries the state and `rows` hands out the rows, a bounded run at a time. Nothing
+/// here ever holds a whole screen: what the engine gives back is converted and released a run at a
+/// time, and what the conversion keeps is charged to `budget`, so the two together are what an
+/// installation costs whatever the session is holding.
+///
 /// # Errors
 ///
 /// Returns an error when a row's stable identifier is not a forward count, which this engine
@@ -263,6 +293,7 @@ pub fn install(
     reason: ProjectionResetReason,
     degraded: bool,
     budget: usize,
+    rows: &impl RowSource,
 ) -> Result<Update> {
     let generation = snapshot.projection_generation;
     let cursor = snapshot.output_cursor;
@@ -336,24 +367,32 @@ pub fn install(
     // why some of the session is missing from this screen. It is what the header says out loud.
     let mut cut = false;
     let mut held = 0_usize;
-    for (buffer, rows) in [
-        (wire::buffer(snapshot.active_buffer), &snapshot.rows),
-        (inactive_buffer, &snapshot.inactive_rows),
-    ] {
-        let mut kept: Vec<ProjectedRow> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut row = wire::row(row)?;
-            truncate_row(&mut row);
-            let cost = wire::row_cost(&row).bytes;
-            if cost > budget.saturating_sub(held) {
-                // The rows so far have reached the queue. What is left of it is what this row may
-                // have, and the rows after it get their envelope and nothing more.
-                let runs = row.runs.len();
-                truncate_row_to(&mut row, budget.saturating_sub(held), PAGE_ITEMS);
-                cut |= row.runs.len() != runs;
+    for buffer in [wire::buffer(snapshot.active_buffer), inactive_buffer] {
+        let mut kept: Vec<ProjectedRow> = Vec::new();
+        let mut first = 0_usize;
+        loop {
+            // A bounded run of the engine's own rows, converted and then dropped before the next
+            // run is asked for. This is the whole of what the engine's side of an installation
+            // holds, whatever the screen is.
+            let run = rows.rows_from(buffer, first, INSTALL_ROWS_AT_ONCE);
+            if run.is_empty() {
+                break;
             }
-            held = held.saturating_add(wire::row_cost(&row).bytes);
-            kept.push(row);
+            first = first.saturating_add(run.len());
+            for row in &run {
+                let mut row = wire::row(row)?;
+                truncate_row(&mut row);
+                let cost = wire::row_cost(&row).bytes;
+                if cost > budget.saturating_sub(held) {
+                    // The rows so far have reached the queue. What is left of it is what this row
+                    // may have, and the rows after it get their envelope and nothing more.
+                    let runs = row.runs.len();
+                    truncate_row_to(&mut row, budget.saturating_sub(held), PAGE_ITEMS);
+                    cut |= row.runs.len() != runs;
+                }
+                held = held.saturating_add(wire::row_cost(&row).bytes);
+                kept.push(row);
+            }
         }
         converted.push((buffer, kept));
     }
@@ -433,6 +472,10 @@ pub fn install(
             break;
         }
     }
+    // The pages hold the rows now, and what follows encodes them. Giving the conversion back here
+    // rather than at the end of this call is what keeps an installation to one copy of the screen
+    // at the moment there are bytes to hold as well.
+    drop(converted);
     if cut
         && let Some(Outgoing {
             event: ProjectionEvent::Snapshot(header),

@@ -438,13 +438,17 @@ impl TerminalEngine {
         budget: usize,
     ) -> Result<(crate::snapshot::Update, Filtered)> {
         let viewport = self.viewport_for(dimensions);
-        let (mut snapshot, settled) = self.engine.snapshot(viewport, now_ms);
+        // The state without its rows, and then the rows a bounded run at a time as the pages are
+        // built. Taking the whole screen first and paging it afterwards would hold the session
+        // twice over: once as the engine's copy of it and once as the wire's.
+        let (mut snapshot, settled) = self.engine.snapshot_without_rows(viewport, now_ms);
         let settled = self.collect(&settled, gate, now_ms);
         let mut viewport = viewport;
         viewport.top_row = self.engine.grid().visible_top_row();
         snapshot.viewport = viewport;
         let degraded = self.resident_state_truncated();
-        let update = crate::snapshot::install(&snapshot, viewport, reason, degraded, budget)?;
+        let update =
+            crate::snapshot::install(&snapshot, viewport, reason, degraded, budget, &self.engine)?;
         Ok((update, settled))
     }
 
