@@ -98,7 +98,7 @@ impl Destination {
                 detail: format!(
                     "{} is more than one name; a repository is created as one entry in the \
                      directory whose handle this host holds",
-                    request.name
+                    crate::git::redact(&request.name)
                 ),
             });
         }
@@ -155,7 +155,7 @@ impl Destination {
                     format!(
                         "{} is taken, and an isolated workspace is created rather than merged into \
                          something",
-                        self.path().display()
+                        crate::git::redact(&self.path().display().to_string())
                     )
                 } else {
                     format!("{} could not be created: {error}", self.path().display())
@@ -385,7 +385,7 @@ impl StagingSibling {
                 detail: format!(
                     "this operation staged its content in {expected} and {} now holds {}; nothing \
                      is removed",
-                    self.path.display(),
+                    crate::git::redact(&self.path.display().to_string()),
                     self.directory.identity()
                 ),
             });
@@ -513,7 +513,7 @@ pub fn publish(
             detail: format!(
                 "this operation staged the repository {} and {} now holds {}; nothing is published",
                 expected.identity,
-                staging.tree_path().display(),
+                crate::git::redact(&staging.tree_path().display().to_string()),
                 found.identity
             ),
         });
@@ -535,7 +535,7 @@ pub fn publish(
             detail: format!(
                 "the staged repository was {staged} and {} now holds {}; this host cannot say \
                  which publication landed",
-                destination.path().display(),
+                crate::git::redact(&destination.path().display().to_string()),
                 published.identity()
             ),
         });

@@ -491,8 +491,8 @@ impl RestrictedProfile {
                 return Err(ProjectError::StagingUnavailable {
                     detail: format!(
                         "{} must be empty for the restricted profile and it holds {}",
-                        directory.display(),
-                        entry.file_name().to_string_lossy()
+                        redact(&directory.display().to_string()),
+                        redact(&entry.file_name().to_string_lossy())
                     ),
                 });
             }

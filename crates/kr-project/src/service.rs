@@ -739,7 +739,10 @@ impl ProjectService {
                         "the daemon that started this operation ended before it published \
                          anything, so {} is untouched and this operation is closed; a new \
                          operation needs a new action identifier",
-                        destination.path().display()
+                        // The fragment, not the sentence: a path put through the rule leaves the
+                        // rest of the explanation legible, and replacing the whole reason at the
+                        // journal's write would take away the part that says what to do next.
+                        crate::git::redact(&destination.path().display().to_string())
                     ),
                 },
                 OperationState::Failed,
@@ -816,7 +819,7 @@ impl ProjectService {
                             "neither {} nor this operation's staging directory holds the object \
                              that was staged, so this host cannot say whether the publication \
                              landed",
-                            destination.path().display()
+                            crate::git::redact(&destination.path().display().to_string())
                         ),
                     },
                     OperationState::Unknown,
@@ -839,7 +842,7 @@ impl ProjectService {
             return Err(ProjectError::OutcomeUnknown {
                 detail: format!(
                     "{} holds {} and the staged repository was {identity}",
-                    path.display(),
+                    crate::git::redact(&path.display().to_string()),
                     opened.identity().work_tree
                 ),
             });
@@ -1319,7 +1322,7 @@ impl ProjectService {
             return Err(ProjectError::OutcomeUnknown {
                 detail: format!(
                     "{} holds {} and the staged repository was {identity}",
-                    path.display(),
+                    crate::git::redact(&path.display().to_string()),
                     opened.identity().work_tree
                 ),
             });
@@ -1550,7 +1553,7 @@ impl ProjectService {
                         detail: format!(
                             "{} exists, and an isolated workspace is created rather than merged \
                              into something",
-                            destination.path().display()
+                            crate::git::redact(&destination.path().display().to_string())
                         ),
                     });
                 }
@@ -2180,7 +2183,7 @@ impl ProjectService {
                 detail: format!(
                     "this host recorded no filesystem identity for the workspace at {}, so it \
                      will not remove what is there; the directory is left for a person to look at",
-                    path.display()
+                    crate::git::redact(&path.display().to_string())
                 ),
             });
         };
@@ -2199,7 +2202,7 @@ impl ProjectService {
                 detail: format!(
                     "this workspace was recorded as {expected} and {} now holds {}; nothing is \
                      removed",
-                    path.display(),
+                    crate::git::redact(&path.display().to_string()),
                     here.identity()
                 ),
             });
@@ -2605,14 +2608,14 @@ fn check_destination(
                 Err(ProjectError::Destination {
                     detail: format!(
                         "{} holds no checkout to adopt",
-                        destination.path().display()
+                        crate::git::redact(&destination.path().display().to_string())
                     ),
                 })
             }
             DestinationState::Occupied => Err(ProjectError::Destination {
                 detail: format!(
                     "{} is not a directory, so there is no checkout to adopt",
-                    destination.path().display()
+                    crate::git::redact(&destination.path().display().to_string())
                 ),
             }),
         },
@@ -2625,7 +2628,7 @@ fn check_destination(
                     "{} already exists, and nothing is ever merged into an existing destination; \
                      adopt the checkout that is there by choosing the existing-checkout flow, or \
                      name a destination that does not exist",
-                    destination.path().display()
+                    crate::git::redact(&destination.path().display().to_string())
                 ),
             }),
         },

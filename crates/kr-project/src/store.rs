@@ -46,7 +46,7 @@ use crate::identity::RepositoryIdentity;
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// What an inclusion records for a path whose outcome it has not established.
 pub const PROGRESS_PLANNED: &str = "planned";
@@ -496,8 +496,13 @@ impl Store {
             // earlier build moved a store to version 2 while adding only some of them. So the
             // step runs for every version below the current one and adds whatever is missing,
             // rather than trusting a version number to describe a shape.
+            //
+            // Version 4 is the version this host started putting a reason through the rule at the
+            // write. A store at 3 has the right columns and the wrong contents, which is why the
+            // version moves on for a change that adds no column at all.
             Some(version) if version < SCHEMA_VERSION => {
                 add_missing_columns(&transaction)?;
+                protect_recorded_reasons(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_version SET version = ?1",
@@ -1264,7 +1269,7 @@ impl Store {
                 let change_set: Option<Vec<u8>> = row.get(2)?;
                 Ok(RetainedRow {
                     kind: retained_kind_of(&kind),
-                    detail: row.get(1)?,
+                    detail: detail_column(row, 1)?,
                     change_set_id: change_set
                         .as_deref()
                         .and_then(uuid_of)
@@ -1666,7 +1671,7 @@ impl Store {
                 let change_set: Option<Vec<u8>> = row.get(2)?;
                 Ok(RetainedRow {
                     kind: retained_kind_of(&kind),
-                    detail: row.get(1)?,
+                    detail: detail_column(row, 1)?,
                     change_set_id: change_set
                         .as_deref()
                         .and_then(uuid_of)
@@ -1735,7 +1740,7 @@ impl Store {
                         subject: subject.as_deref().and_then(uuid_of),
                         result: row.get(5)?,
                         error_code: row.get(6)?,
-                        error_detail: row.get(7)?,
+                        error_detail: optional_detail_column(row, 7)?,
                         recorded_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(8)?)),
                     })
                 },
@@ -1856,7 +1861,7 @@ impl Store {
                     subject: subject.as_deref().and_then(uuid_of),
                     result: row.get(5)?,
                     error_code: row.get(6)?,
-                    error_detail: row.get(7)?,
+                    error_detail: optional_detail_column(row, 7)?,
                     recorded_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(8)?)),
                 })
             })
@@ -2055,6 +2060,54 @@ const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, ori
 /// Every one of them is nullable and means "not recorded", which is what an older row holds
 /// anyway: a staging directory an earlier build created has no recorded identity, and the cleanup
 /// leaves such a name alone rather than deleting whatever now holds it.
+fn protect_recorded_reasons(transaction: &Transaction<'_>) -> Result<()> {
+    // A store written before the rule existed holds whatever that build composed. Reading one
+    // applies the rule on the way out, so nothing unprotected reaches a caller either way; this
+    // rewrites the columns as well, so the file itself stops holding it. Both, because a reader
+    // outside this build reads the file rather than going through this code.
+    //
+    // The rule leaves its own output alone, so this is safe to run over a store that has already
+    // been through it. What it does *not* rewrite is `actions.result`: that is the canonical
+    // encoding of a typed answer rather than prose, and rewriting it would mean decoding every
+    // method's result type here. No build of this service has been released, so the only stores
+    // that can hold one are development journals, and the handoff records that.
+    for (table, column) in [
+        ("operations", "detail"),
+        ("workspaces", "detail"),
+        ("workspace_retained", "detail"),
+        ("actions", "error_detail"),
+    ] {
+        let mut statement = transaction
+            .prepare(&format!(
+                "SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
+            ))
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(ProjectError::store)?;
+        let mut rewritten: Vec<(i64, String)> = Vec::new();
+        for row in mapped {
+            let (rowid, detail) = row.map_err(ProjectError::store)?;
+            let protected = crate::git::redact(&detail);
+            if protected != detail {
+                rewritten.push((rowid, protected));
+            }
+        }
+        drop(statement);
+        for (rowid, protected) in rewritten {
+            transaction
+                .execute(
+                    &format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2"),
+                    params![protected, rowid],
+                )
+                .map_err(ProjectError::store)?;
+        }
+    }
+    Ok(())
+}
+
 fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
     // Every nullable column this build reads that some earlier shape of this schema did not have.
     // The list is the whole of them rather than the ones added last: a store written by *any*
@@ -2199,7 +2252,7 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
             }),
             _ => None,
         },
-        detail: row.get(21)?,
+        detail: optional_detail_column(row, 21)?,
         started_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(22)?)),
         ended_at_ms: row
             .get::<_, Option<i64>>(23)?
@@ -2376,13 +2429,33 @@ fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRow> {
             }),
             _ => None,
         },
-        detail: row.get(18)?,
+        detail: optional_detail_column(row, 18)?,
         retention: retention.as_deref().map(retention_of),
         created_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(20)?)),
         removed_at_ms: row
             .get::<_, Option<i64>>(21)?
             .map(|stamp| TimestampMs::new(u64_of(stamp))),
     })
+}
+
+/// Reads one free-text reason out of a stored row, through the rule.
+///
+/// The rule leaves its own output alone, so a reason written under it comes back exactly as it was
+/// written and the caller and the journal hold the same message. What this is *for* is a reason a
+/// build before the rule existed wrote: the column holds whatever that build composed, and reading
+/// it is the last place this host can put it through the rule before it reaches anybody.
+fn detail_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
+    Ok(crate::git::redact(&row.get::<_, String>(index)?))
+}
+
+/// Reads one optional free-text reason out of a stored row, through the rule.
+fn optional_detail_column(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<String>> {
+    Ok(row
+        .get::<_, Option<String>>(index)?
+        .map(|detail| crate::git::redact(&detail)))
 }
 
 /// Reads a principal out of a stored row, reporting a row this build cannot read.
@@ -3191,6 +3264,40 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .expect("the version reads");
         assert_eq!(version, SCHEMA_VERSION);
+        drop(store);
+        // A store an earlier build wrote whose columns are all there and whose reasons are not
+        // protected. The version moves on, and the reasons are rewritten.
+        let unprotected = directory.path().join("unprotected.sqlite");
+        let earlier = Connection::open(&unprotected).expect("the earlier store opens");
+        earlier
+            .execute_batch(EARLIEST)
+            .expect("the earliest shape is written for it");
+        earlier
+            .execute_batch(
+                "INSERT INTO operations (action_id, actor_id, environment_id,
+                                         project_repository_id, method, state, destination_state,
+                                         parent_path, destination_name, detail, started_at_ms)
+                 VALUES (x'01', 'a', x'02', x'03', 'project.clone', 'failed', 'absent', '/p',
+                         'access_token=STOREDSECRET',
+                         'so /p/access_token=STOREDSECRET is untouched', 1);
+                 UPDATE schema_version SET version = 3;",
+            )
+            .expect("an unprotected reason is written");
+        drop(earlier);
+        let store = Store::open(&unprotected, environment()).expect("this build opens it");
+        let kept: String = store
+            .connection
+            .query_row("SELECT detail FROM operations", [], |row| row.get(0))
+            .expect("the reason reads");
+        assert!(
+            !kept.contains("STOREDSECRET"),
+            "an earlier build's reason is rewritten in the file: {kept}"
+        );
+        assert!(kept.contains("does-not-repeat"), "{kept}");
+        // The whole reason goes, because a build that did not put the path through the rule left
+        // nothing to tell the path from the sentence around it. A reason *this* build composes
+        // keeps its words, because the fragment is replaced before the sentence is built, and
+        // `the_rule_leaves_its_own_output_alone` is where that is asserted.
         drop(store);
         // The shape a *partial* migration left: an earlier build moved a store to version 2 while
         // adding only some of the columns, so the version number does not describe the shape.

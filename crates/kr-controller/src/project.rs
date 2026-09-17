@@ -70,7 +70,10 @@ impl ProjectModule {
             detail: "the project service could not be opened".to_owned(),
         })?
         .map_err(|error| ControllerError::RegistryUnavailable {
-            detail: error.to_string(),
+            // This one is printed on the daemon's own standard error at startup as well as
+            // answered with, and it can name a state directory a caller chose, so it goes through
+            // the same rule as every other message this service produces.
+            detail: kr_project::git::redact(&error.to_string()),
         })?;
         Ok(Self {
             service: Arc::new(service),

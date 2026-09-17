@@ -1707,6 +1707,24 @@ fn a_workspace_holding_a_populated_submodule_is_kept_rather_than_removed() {
         "the host says the submodule is work it has not read: {:?}",
         answer.retained
     );
+    // And that reason is a *successful* answer's field, read back out of the journal, so what a
+    // caller sent is not in it and what this host wrote is.
+    let read: kr_protocol::project::WorkspaceReadResult = fixture
+        .service()
+        .workspace_read(&WorkspaceReadParams { workspace_id })
+        .expect("the workspace reads");
+    for item in &read.workspace.retained {
+        assert!(
+            !item.detail.contains("submodule-holder/vendor"),
+            "a path in a retained reason is not repeated as it was: {:?}",
+            item.detail
+        );
+        assert!(
+            item.detail.contains("does not look inside"),
+            "and this host's own words are: {:?}",
+            item.detail
+        );
+    }
     assert!(
         planted.parent.join("vendor/child/a.txt").is_file(),
         "nothing inside the submodule was touched"

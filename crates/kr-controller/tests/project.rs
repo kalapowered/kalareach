@@ -649,6 +649,15 @@ async fn a_retained_failure_carries_none_of_what_the_caller_sent() {
         "which says what was taken out: {}",
         repeated.message
     );
+    assert_eq!(
+        repeated.message, refusal.message,
+        "and the journal holds the same message the caller was answered with"
+    );
+    assert!(
+        refusal.message.contains("is not a branch name"),
+        "which still says what was wrong: {}",
+        refusal.message
+    );
     let _ = host.stop().await;
 }
 
