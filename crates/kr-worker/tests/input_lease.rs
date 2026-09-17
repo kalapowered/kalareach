@@ -2075,7 +2075,9 @@ async fn a_discarded_prefix_takes_its_authority_deadline_with_it() {
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
     let deadline = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 1_000;
 
-    let next_epoch = {
+    // One boundary for all of it. The recogniser's own timer would otherwise release the prefix
+    // before the takeover, and this test is about what the takeover discards.
+    {
         let mut session = runtime.session();
         // Four bytes of a paste delimiter, which the recogniser holds rather than forwards.
         let accepted = session
@@ -2085,19 +2087,13 @@ async fn a_discarded_prefix_takes_its_authority_deadline_with_it() {
             accepted.held_prefix_bytes, 4,
             "the recogniser is holding a partial delimiter"
         );
-        runtime.flush_locked(&mut session);
         // The next actor takes the lease, which discards that prefix.
         let taken = session
             .acquire_input(second, connection(), None)
             .expect("the keys move");
-        runtime.flush_locked(&mut session);
-        taken.lease.epoch.get()
-    };
-
-    // The grant behind the discarded prefix runs out. It has nothing left to fence.
-    clock.advance(Duration::from_secs(5));
-    {
-        let mut session = runtime.session();
+        let next_epoch = taken.lease.epoch.get();
+        // The grant behind the discarded prefix runs out. It has nothing left to fence.
+        clock.advance(Duration::from_secs(5));
         session
             .write_input(second, next_epoch, 0, b"kr-next", None, Instant::now())
             .expect("accepted");
@@ -2143,6 +2139,8 @@ async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
     let early = now + 1_000;
     let late = now + 600_000;
 
+    // One boundary for all of it: the recogniser's own timer takes the same lock, so it cannot
+    // release the held byte before this test has said what the clock reads.
     {
         let mut session = runtime.session();
         let accepted = session
@@ -2158,29 +2156,23 @@ async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
             (6, 1),
             "the delimiter goes and one byte of the next one is held"
         );
-        runtime.flush_locked(&mut session);
-    }
-    retained_within(&runtime, PASTE_START, Duration::from_secs(10)).await;
-
-    // The first write's authority runs out. The byte still held is not its byte.
-    clock.advance(Duration::from_secs(5));
-    {
-        let mut session = runtime.session();
+        // The first write's authority runs out. The delimiter it completed goes with it; the byte
+        // still held is not its byte.
+        clock.advance(Duration::from_secs(5));
         let released =
             session.expire_paste_prefix(Instant::now() + std::time::Duration::from_secs(1));
         assert_eq!(released, 1, "the held byte is released by its own deadline");
         runtime.flush_locked(&mut session);
     }
-    let seen = retained_within(
-        &runtime,
-        b"\x1b[200~\x1b",
-        std::time::Duration::from_secs(10),
-    )
-    .await;
+    let seen = retained_within(&runtime, b"kr-ready.\x1b", Duration::from_secs(10)).await;
     assert!(
-        contains(&seen, b"\x1b[200~\x1b"),
+        contains(&seen, b"kr-ready.\x1b"),
         "a prefix made of the second write's bytes is admitted by the second write's \
          authority: {seen:?}"
+    );
+    assert!(
+        !contains(&seen, PASTE_START),
+        "and the delimiter the first write's authority admitted is not: {seen:?}"
     );
 
     runtime.close(ClosureReason::CloseRequested).1.release();
