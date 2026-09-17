@@ -15,6 +15,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The plugin runtime's tests run real components. A run that has not built them would skip those
+  # cases with a printed reason, which is right on a developer's machine and wrong here: the build
+  # step below is part of this job, so an absent component is a failure.
+  KR_REQUIRE_PLUGIN_FIXTURES: "1"
   # Section 27 puts every test artefact in one platform-resolved directory and asks for a release
   # run's evidence to be retained. Each performance measurement writes its host, its figure and its
   # verdict here before it asserts anything, so a run the target failed on keeps the number.
@@ -37,6 +41,12 @@ jobs:
           rustc --version
           cargo --version
 
+      # The test components are compiled to wasm32-wasip2 and are not committed: Rust embeds build
+      # paths in a component's custom sections, so two machines produce different bytes for the same
+      # source and a committed artefact could not be checked.
+      - name: Install the component target
+        run: rustup target add wasm32-wasip2
+
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -45,7 +55,11 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+            fixtures/plugins/components/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'fixtures/plugins/components/Cargo.lock') }}
+
+      - name: Build the test components
+        run: bash scripts/build-plugin-fixtures.sh
 
       - name: Format
         run: cargo fmt --all -- --check

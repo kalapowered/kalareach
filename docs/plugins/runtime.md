@@ -1,0 +1,272 @@
+# Running a plugin component
+
+`docs/plugins/README.md` says what a package is and what its component may do. This is the other
+side of the same contract: where a component actually runs, what bounds it, and what happens when it
+misbehaves.
+
+A component runs in `kr-plugin-host`, one process per environment, started when a binding first
+needs one. A worker never links the engine. It registers a binding with that process and keeps its
+own ledger, so a component that traps costs its binding and nothing else.
+
+```text
+kr-controller ──start job──▶ service manager ──▶ kr-plugin-host ──▶ component instance
+      │                                               ▲
+      └──rendezvous, descriptor─────────────────────── │
+                                                       │
+kr-worker ──register, deliver, call, unbind ───────────┘
+```
+
+## Why a separate process
+
+A worker owns a shell, a pseudo-terminal, an approval ledger and a person's session. A component is
+vendor code compiled from a catalogue. Putting the second inside the first would make a trap in
+somebody's arithmetic a risk to somebody's work.
+
+With the split:
+
+- a plugin-host crash invalidates rich bindings and kills no worker;
+- no request is lost, because requests live in the worker's broker and were never in the other
+  process;
+- a control-daemon restart does not interrupt a binding, because the host is its own job;
+- an environment whose shells never use a component has no plugin process at all.
+
+The last one is worth stating plainly: nothing here starts until an application that uses a component
+has been matched. An idle shell costs no engine, no instance, no compiled cache and no threads.
+
+## The engine
+
+Wasmtime 48.0.2, pinned to that exact release. The pin is part of the compiled-code cache key rather
+than a convenience: an artefact one engine produced is not one another engine can load.
+
+`wasmtime-wasi` is not linked. The linker holds four interfaces, all from the SDK's WIT package:
+
+| Interface | What it offers |
+| --- | --- |
+| `source-events` | the immutable bytes behind a handle this call was given, and their provenance |
+| `upstream` | facts about the bound execution, and no function that sends |
+| `attachments` | completed attachment handles, never bytes, never an upload |
+| `document` | nodes from the closed union, bounded per call |
+
+There is no filesystem, network, process, environment, clock or random import to grant, because
+there is nothing to grant it from.
+
+## The import check
+
+Before a component is instantiated, its own type is inspected and every import is compared with that
+list. An import outside it is refused with the import named, so a publisher sees which one:
+
+```text
+the component imports wasi:filesystem/types@0.2.9, which is not one of the four plugin host
+interfaces; a component has no filesystem, network, process, environment, clock or random access
+```
+
+The check runs on the compiled component, not on the manifest. A manifest says what a publisher
+declared; the component type says what the code asks for.
+
+### Building a component that passes it
+
+This matters more than it looks, because the default way to build a Rust component does not pass.
+`cargo build --target wasm32-wasip2` against the standard library produces a component that imports
+`wasi:cli/environment`, `wasi:cli/exit`, `wasi:io/streams`, `wasi:clocks/monotonic-clock` and
+several more, whether or not a line of the source calls them: they come from the standard library's
+own start-up and panic paths.
+
+A component that imports only the contract is `no_std` with `alloc`, and supplies four things of its
+own: a global allocator, a panic handler, `cabi_realloc` and `memcmp`. The test components under
+`fixtures/plugins/components/` are built that way, and `fixtures/plugins/components/support/` is the
+twenty lines that supply them.
+
+## What each call may spend
+
+Two bounds per call, measuring different things.
+
+| Export | Elapsed deadline | Instruction allowance |
+| --- | --- | --- |
+| `bind` | none of its own; runs under the compilation budget | the setup allowance |
+| `observe` | 10 ms | 10 × the fuel rate |
+| `prepare-action` | 10 ms | 10 × the fuel rate |
+| `decode-request` | 50 ms | 50 × the fuel rate |
+| `encode-response` | 50 ms | 50 × the fuel rate |
+| `snapshot` | 100 ms | 100 × the fuel rate |
+| `checkpoint` | 100 ms | 100 × the fuel rate |
+| `restore` | 100 ms | 100 × the fuel rate |
+
+The deadline is enforced with Wasmtime's epoch interruption. A thread advances the engine's epoch
+once a millisecond while a call is in flight, and sleeps when none is, so a host serving idle shells
+has no thread waking a thousand times a second on its behalf.
+
+The instruction allowance is enforced with fuel. **Fuel is a work bound, not a measurement of
+processor time.** The two are not competitors: the deadline is what stops an ordinary call that is
+taking too long, and fuel is the ceiling on how much work one call can ever do, which holds even
+when a loaded machine delivers the epoch late. The failure says which bound ran out, and a fuel
+exhaustion is never described as a duration.
+
+### Per instance
+
+| Bound | Value |
+| --- | --- |
+| Linear memory | 64 MiB |
+| Output per call | 1 MiB |
+| Largest single document node | 1 MiB less 8 KiB |
+| Tables | 32, of at most 100 000 elements |
+| Linear memories | 8 |
+| Core instances | 64 |
+
+A node is bounded below the call budget because the service protocol carries one node per frame on a
+control stream whose frames are 1 MiB including their envelope. A component with more to say emits
+more nodes, which is what the node union is for.
+
+A refused allocation is recorded rather than only returned, so the failure can name the resource. A
+component that asked for a gigabyte and one that divided by zero both arrive as traps, and without
+the record they would produce the same disabled reason.
+
+## The observation queue
+
+One bounded queue per binding, 4 MiB. Offering an event to it never waits and never runs a
+component: the producer hands over the bytes and carries on, whatever the component is doing. That
+is the structural form of section 11's rule that PTY draining, terminal-query responses and the
+presentation queues never wait for an observation callback.
+
+Overflow is explicit. The oldest observations are evicted, a gap naming how many events and bytes
+went is reported, and the component is asked for a fresh snapshot before anything it emits is
+trusted again.
+
+An authoritative native request is never evicted to make room for anything. If one cannot be
+admitted even after every ordinary observation has gone, the admission is refused instead: the
+broker still holds the request and its proven native path, and what is unavailable is the rich
+interpretation of it rather than the request. A dropped request would be a decision nobody made.
+
+## Faults
+
+Three faults within one minute disable the binding, with the reason a person reads.
+
+A fault is a trap, an exhausted bound, a refused allocation, an attempt to emit past the output
+budget, or a handle the call was not given. A component that returns `refused`, `unreadable`,
+`not-permitted` or `exhausted` has *answered*: it read the input and declined, and that is never a
+fault. Nor is a slow compilation, and nor is a caller's own deadline.
+
+The window is measured on the machine's continuous clock, which counts a suspend. A laptop that
+faults twice, sleeps for an hour and faults once more has faulted three times in an hour.
+
+A trap is terminal for a component instance: the component model admits no further entry into one.
+So a faulted instance is replaced from the component that is already compiled, `bind` runs again,
+and the binding asks for a snapshot, because the replacement has no presentation state. That is what
+makes the first two faults survivable rather than merely counted.
+
+## Compilation
+
+Lazily, at binding preparation, on a background pool, under its own budget:
+
+| Bound | Value |
+| --- | --- |
+| Largest component compiled | 16 MiB |
+| Compilation budget | 30 s |
+| Concurrent compilations | 2 |
+| Queued compilations | 8 |
+
+A component past the size bound is refused before any work starts. A compile that finishes outside
+its budget has its result discarded and reports the figure. A pool whose queue is full refuses the
+next request rather than starting a hundred compiles.
+
+No call deadline contains a compile. The two steps are separate in the API for that reason: a
+component is compiled, and only then is an instance created and a call budget started. Each pool
+thread lowers its own scheduling priority when it starts; what that means is the platform's answer,
+and a platform that declines is not a failure, because the compile still runs off the hot path.
+
+## The compiled-code cache
+
+Compiled machine code is filed under three things, all three necessary:
+
+| Part | Why |
+| --- | --- |
+| the Wasm digest | different code compiles to different machine code |
+| the engine's compatibility identity | a different engine expects a different artefact |
+| the target | machine code for one instruction set is not machine code for another |
+
+A serialised component is machine code. Reading one back is equivalent to loading a shared library,
+so it is done only for an artefact this host compiled itself, and "this host compiled it" is
+established by the manifest beside it, which records:
+
+- the digest of the Wasm the caller is asking for, so an artefact filed under one component cannot
+  be served for another;
+- the engine's compatibility identity and the target;
+- the artefact's own digest and length, checked against the bytes on disk;
+- a marker saying it was produced by compiling validated Wasm in this process.
+
+A downloaded native-code artefact therefore cannot become a cache entry: it has no manifest, and a
+forged manifest still has to match a digest the caller supplied from the package it verified. The
+directory is owner-only on top of that. An entry that fails any check is removed and the component is
+compiled again, because a refused entry is a reason to recompile rather than a reason to refuse the
+binding.
+
+## The service
+
+One process per environment, `kr-plugin-host`, started by the control daemon through the same
+supervisor trait a worker is started through: a launchd job, a systemd transient user service, or a
+detached process, in each case its own job outside the daemon's kill tree.
+
+### What proves which process is answering
+
+Four things, none of which substitutes for another:
+
+| Proof | Who provides it | What it settles |
+| --- | --- | --- |
+| the owner-only runtime directory | the filesystem | another user cannot reach the socket |
+| peer credentials | the kernel | the caller on the socket is this user |
+| the rendezvous | the host, once at startup | this process is the one the launcher started |
+| a verification challenge | the host, on demand | the process answering this endpoint is that one, now |
+
+The host generates an Ed25519 keypair at startup and keeps the private half in memory for its whole
+life. It is never written to disk, placed in an argument vector or put in an environment variable, so
+nothing that is not that process can answer for it even with full access to the runtime directory.
+
+The launcher records the process identity the service manager reported *before* the host connects,
+and compares it with the connecting peer and with what the claim says. Exactly one rendezvous per
+reservation succeeds, and each launch has a rendezvous address of its own, named after its
+reservation, so a claim can never arrive on an address two launches meant.
+
+On success the launcher publishes an owner-only descriptor at `plugin-host.json` in the environment's
+runtime directory. A worker reads it, challenges the process behind the endpoint, and talks to that
+process directly. Nothing in the descriptor is acted on before the challenge: a filename and a
+process identifier are hints.
+
+### What a worker sends
+
+KR-CBOR-1 objects in the host's own length-delimited frames, one closed union in each direction.
+Every request carries a number the response echoes, because the host also sends document nodes,
+gaps, faults and disabled notices as they happen: a frame with a `reply_to` is somebody's answer, and
+a frame without one is news.
+
+| Request | What it does |
+| --- | --- |
+| `hello` | opens the connection and names the protocol |
+| `verify` | asks the host to sign a fresh challenge |
+| `register_binding` | compile the component, instantiate it, call `bind` |
+| `event` | offer one scoped source event to the binding's queue |
+| `snapshot` | ask the component for a fresh document |
+| `checkpoint` | take the component's own resumable state |
+| `restore` | restore it |
+| `unbind` | remove the binding and its instance |
+| `health` | ask what the host is doing |
+
+A component's bytes travel as a location rather than as a payload: a control frame is bounded at
+1 MiB and a component may be sixteen times that. The worker sends the payload's path and the digest
+it verified against the catalogue, and the host checks the file against that digest before compiling
+anything. The path has to be inside the packages directory the host was started with; one outside it
+is refused by name.
+
+## Where the broker fits
+
+Nothing here decides whether an effect happens.
+
+`prepare-action` returns a plan. `decode-request` returns a projection. `encode-response` returns
+bytes. In each case the broker then checks the actor, the grant, the binding revision and the
+declared effect class, and claims and dispatches. Pending and dispatch state lives in the worker's
+broker ledger, never in a component and never in the plugin host, which is why a plugin-host crash
+cannot destroy an approval ledger.
+
+The broker itself, the gateway, the native proxy and action tokens are a separate piece of work. What
+it builds on is the API in `crates/kr-plugin-runtime`: prepare a binding, offer events to its queue,
+invoke a control, ask for an interpretation, take a checkpoint, unbind. Every one of those is
+asynchronous and carries the caller's own deadline, so nothing on the terminal path can end up behind
+a component.

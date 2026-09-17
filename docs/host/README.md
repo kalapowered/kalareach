@@ -123,6 +123,22 @@ A launchd job's standard error goes to `<state>/environments/<prefix>/jobs/<labe
 worker that fails before its rendezvous has no terminal, no connection and no journal yet, so that
 file is the only place its diagnosis can go.
 
+### The plugin runtime
+
+A worker is not the only thing whose lifetime belongs to the platform. Components run in
+`kr-plugin-host`, one process per environment, started through the same supervisor as its own job
+outside the daemon's kill tree, and started only when a binding first needs one: an environment
+whose shells never use a component has no plugin process at all.
+
+It reports itself on a rendezvous endpoint of its own, signed with a keypair it generated at startup
+and keeps in memory, and the daemon publishes an owner-only descriptor at `plugin-host.json` beside
+the worker descriptors. Workers read it, challenge the process behind the endpoint, register their
+bindings and keep their own ledgers. Nothing durable lives in that process, so its death invalidates
+rich bindings, kills no worker and loses no request; a worker notices, re-registers, and carries on.
+
+`docs/plugins/runtime.md` has the execution model, the per-instance limits, the compiled-code cache
+and the protocol.
+
 ## Creating a session
 
 1. The daemon records the reservation durably: the actor, the create token, the immutable payload

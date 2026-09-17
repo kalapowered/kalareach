@@ -417,6 +417,9 @@ elapsed execution with deadlines; fuel bounds work, it is not a CPU-time measure
 Queue overflow produces an explicit gap and a fresh snapshot. It never drops an authoritative
 request, because a dropped request is a decision nobody made.
 
+`docs/plugins/runtime.md` says how these bounds are enforced, what a component may import, how a
+component is built so it imports only that, and what happens after a fault.
+
 Per repository, set at enrolment before the first fetch:
 
 | Budget | Default |
