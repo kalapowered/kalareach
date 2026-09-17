@@ -2814,7 +2814,7 @@
         },
         {
           "const": "windows_interactive",
-          "description": "Windows: the interactive logon session a per-user host agent starts workers in.",
+          "description": "Windows: the interactive logon session a worker runs in.",
           "type": "string"
         },
         {
@@ -5735,7 +5735,7 @@
         },
         {
           "const": "windows_execution_state",
-          "description": "Windows: an execution-state request made by the per-user host agent.",
+          "description": "Windows: an execution-state request held for as long as the process that made it lives.",
           "type": "string"
         },
         {

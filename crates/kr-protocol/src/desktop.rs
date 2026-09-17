@@ -58,7 +58,7 @@ pub enum DesktopSessionKind {
     MacosSecuritySession,
     /// Linux: the login-manager session the user's graphical login runs in.
     LinuxLogind,
-    /// Windows: the interactive logon session a per-user host agent starts workers in.
+    /// Windows: the interactive logon session a worker runs in.
     WindowsInteractive,
     /// No graphical login session was named. A headless user context reads this way.
     None,
@@ -675,7 +675,7 @@ pub enum InhibitionMechanism {
     MacosPowerAssertion,
     /// Linux: a login-manager sleep inhibitor held for as long as its holder lives.
     LinuxLogindInhibitor,
-    /// Windows: an execution-state request made by the per-user host agent.
+    /// Windows: an execution-state request held for as long as the process that made it lives.
     WindowsExecutionState,
     /// This host has no facility for it.
     None,
