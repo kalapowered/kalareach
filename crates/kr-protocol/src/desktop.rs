@@ -80,19 +80,20 @@ impl DesktopSessionKind {
 /// What the login-session generation was read from.
 ///
 /// The generation is the part of a desktop identity that distinguishes two logins which happen to
-/// share a platform session number. Each platform answers it differently, and naming the source
-/// keeps the value comparable only with another value from the same source on the same host.
+/// share a platform session number. Every platform answers it the same way, through the process
+/// that owns the login session, and each names a different process. The source is recorded because
+/// the value is only ever comparable with another value from the same source on the same host.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DesktopGenerationSource {
-    /// macOS: the kernel's start value for the process that created the login session.
+    /// macOS: the kernel's start value for the process that created the Aqua login session.
     MacosSessionCreator,
-    /// Linux: the login manager's record of when the session started, in microseconds.
-    LinuxSessionRealtime,
-    /// Windows: the logon session's authentication identifier.
-    WindowsLogonSession,
+    /// Linux: the kernel's start value for the login session's leader process.
+    LinuxSessionLeader,
+    /// Windows: the kernel's start value for the interactive session's logon process.
+    WindowsSessionLogon,
     /// The platform offered no generation. The identifier and the boot identity carry the identity
     /// alone, which is sound only where the platform does not reuse a session number within a
     /// boot.
@@ -105,8 +106,8 @@ impl DesktopGenerationSource {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MacosSessionCreator => "macos_session_creator",
-            Self::LinuxSessionRealtime => "linux_session_realtime",
-            Self::WindowsLogonSession => "windows_logon_session",
+            Self::LinuxSessionLeader => "linux_session_leader",
+            Self::WindowsSessionLogon => "windows_session_logon",
             Self::Unavailable => "unavailable",
         }
     }
@@ -769,6 +770,50 @@ impl SleepInhibitionState {
     }
 }
 
+/// The host power setting as it is kept on disk.
+///
+/// The setting is per-user host configuration rather than a wire message: the owner chooses it
+/// once, through setup or through the command line, and the control daemon reads it. Its format
+/// has one definition, here, because both the daemon that reads it and the command that writes it
+/// have to agree about what a file that says nothing means — and what it means is off.
+pub mod setting {
+    use super::SleepInhibitionSetting;
+
+    /// The file the setting is kept in, inside the environment's own state directory.
+    pub const FILE_NAME: &str = "power.json";
+
+    /// The key the setting is written under.
+    pub const KEY: &str = "sleep_inhibition";
+
+    /// The longest setting file this host reads.
+    ///
+    /// The document holds one choice. A file larger than this is not one of ours, and reading it
+    /// would be reading something else.
+    pub const MAX_LEN: u64 = 4_096;
+
+    /// Returns the setting a file's contents ask for.
+    ///
+    /// Anything this build does not recognise reads as off. An unrecognised file is not consent:
+    /// the setting exists because the owner chose it, so the absence of a choice is the absence of
+    /// the setting.
+    #[must_use]
+    pub fn parse(contents: &[u8]) -> SleepInhibitionSetting {
+        serde_json::from_slice::<serde_json::Value>(contents)
+            .ok()
+            .as_ref()
+            .and_then(|document| document.get(KEY))
+            .and_then(serde_json::Value::as_str)
+            .and_then(SleepInhibitionSetting::from_wire)
+            .unwrap_or(SleepInhibitionSetting::Off)
+    }
+
+    /// Returns the file contents that record one setting.
+    #[must_use]
+    pub fn document(setting: SleepInhibitionSetting) -> String {
+        format!("{{\n  \"{KEY}\": \"{}\"\n}}\n", setting.as_str())
+    }
+}
+
 /// Whether a per-user service survives the user logging out, on this platform.
 ///
 /// The answer is a platform fact, not a preference, and it is reported rather than assumed. Setup
@@ -939,6 +984,31 @@ mod tests {
         assert!(line.contains("mains_only"), "{line}");
         assert!(line.contains("requests it has not answered"), "{line}");
         assert!(line.contains("KalaReach pending work"), "{line}");
+    }
+
+    #[test]
+    fn a_setting_file_round_trips_and_anything_else_reads_as_off() {
+        for chosen in [
+            SleepInhibitionSetting::Off,
+            SleepInhibitionSetting::MainsOnly,
+            SleepInhibitionSetting::BatteryToo,
+        ] {
+            let document = setting::document(chosen);
+            assert_eq!(setting::parse(document.as_bytes()), chosen);
+        }
+        for damaged in [
+            b"".as_slice(),
+            b"not a document".as_slice(),
+            b"{}".as_slice(),
+            b"{\"sleep_inhibition\": \"always\"}".as_slice(),
+            b"{\"sleep_inhibition\": true}".as_slice(),
+        ] {
+            assert_eq!(
+                setting::parse(damaged),
+                SleepInhibitionSetting::Off,
+                "a file this build does not recognise is not consent"
+            );
+        }
     }
 
     #[test]

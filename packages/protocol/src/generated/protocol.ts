@@ -3401,7 +3401,7 @@ export interface DesktopContext {
    * What the generation was read from.
    */
   generation_source:
-    'macos_session_creator' | 'linux_session_realtime' | 'windows_logon_session' | 'unavailable'
+    'macos_session_creator' | 'linux_session_leader' | 'windows_session_logon' | 'unavailable'
   /**
    * Whether this context has the login session's graphical access.
    *
@@ -3487,7 +3487,7 @@ export interface DesktopContext1 {
    * What the generation was read from.
    */
   generation_source:
-    'macos_session_creator' | 'linux_session_realtime' | 'windows_logon_session' | 'unavailable'
+    'macos_session_creator' | 'linux_session_leader' | 'windows_session_logon' | 'unavailable'
   /**
    * Whether this context has the login session's graphical access.
    *

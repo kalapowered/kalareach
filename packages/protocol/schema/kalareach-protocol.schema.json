@@ -2769,21 +2769,21 @@
       "type": "object"
     },
     "DesktopGenerationSource": {
-      "description": "What the login-session generation was read from.\n\nThe generation is the part of a desktop identity that distinguishes two logins which happen to\nshare a platform session number. Each platform answers it differently, and naming the source\nkeeps the value comparable only with another value from the same source on the same host.",
+      "description": "What the login-session generation was read from.\n\nThe generation is the part of a desktop identity that distinguishes two logins which happen to\nshare a platform session number. Every platform answers it the same way, through the process\nthat owns the login session, and each names a different process. The source is recorded because\nthe value is only ever comparable with another value from the same source on the same host.",
       "oneOf": [
         {
           "const": "macos_session_creator",
-          "description": "macOS: the kernel's start value for the process that created the login session.",
+          "description": "macOS: the kernel's start value for the process that created the Aqua login session.",
           "type": "string"
         },
         {
-          "const": "linux_session_realtime",
-          "description": "Linux: the login manager's record of when the session started, in microseconds.",
+          "const": "linux_session_leader",
+          "description": "Linux: the kernel's start value for the login session's leader process.",
           "type": "string"
         },
         {
-          "const": "windows_logon_session",
-          "description": "Windows: the logon session's authentication identifier.",
+          "const": "windows_session_logon",
+          "description": "Windows: the kernel's start value for the interactive session's logon process.",
           "type": "string"
         },
         {
