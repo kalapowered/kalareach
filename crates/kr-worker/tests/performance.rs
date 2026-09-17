@@ -1035,7 +1035,7 @@ async fn attach_samples(
                     let painted = kr_client::projection::paint::install(
                         held,
                         kr_client::projection::paint::Window::of(held),
-                        kr_client::projection::paint::Keyboard::Withhold,
+                        kr_client::projection::paint::Keyboard::NOTHING,
                     );
                     return !painted.bytes.is_empty();
                 }

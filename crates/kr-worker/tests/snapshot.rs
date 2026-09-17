@@ -1094,6 +1094,84 @@ async fn a_resize_draws_the_owners_fresh_screen_for_its_new_window() {
     );
 }
 
+/// KR-REQ-08.83: succession moves the size, and every remaining client is drawn for its own window.
+///
+/// The owner leaving is a resize nobody asked for: the next attachment in the order becomes the
+/// owner and its size becomes the session's. A client that was not told would keep drawing a screen
+/// of the size that left, and for an idle application nothing would ever correct it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn succession_draws_the_remaining_client_for_the_size_it_inherits() {
+    let host = host("printf 'before the succession\r\n'; sleep 20").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Two claiming attachments with no declared profile: the first owns the size, the second is
+    // next in the order, and both are projected because nothing qualifies either for the stream.
+    let owner = attach_claiming(&host, Dimensions::new(100, 30), None).await;
+    let mut next = attach_claiming(&host, Dimensions::new(70, 20), None).await;
+    let installed = collect_until_installed(&mut next.client, Duration::from_secs(5)).await;
+    let first = installed
+        .iter()
+        .find_map(|event| match event {
+            Event::Snapshot(header) => Some(header.as_ref()),
+            _ => None,
+        })
+        .expect("a screen");
+    assert_eq!(
+        first.dimensions,
+        Dimensions::new(100, 30),
+        "the session is the first owner's size while it is here"
+    );
+
+    // The owner leaves, asked for by a third connection. It has to be a third: a request and the
+    // notifications share one connection, and a client waiting for its own answer reads past
+    // whatever arrived while it waited.
+    let mut elsewhere = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let detached: kr_protocol::attachment::SessionDetachResult = elsewhere
+        .mutate(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::attachment::SessionDetachParams {
+                attachment_id: owner.attachment_id,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the detach succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        detached.geometry.dimensions,
+        Dimensions::new(70, 20),
+        "the size the survivor claimed is the session's now"
+    );
+
+    let after = collect_until_installed(&mut next.client, Duration::from_secs(5)).await;
+    assert!(
+        after.iter().any(|event| matches!(event, Event::Reset(reset)
+                if reset.reason == ProjectionResetReason::Geometry)),
+        "the survivor is told the geometry moved: {after:?}"
+    );
+    let header = after
+        .iter()
+        .find_map(|event| match event {
+            Event::Snapshot(header) => Some(header.as_ref()),
+            _ => None,
+        })
+        .expect("a fresh screen");
+    assert_eq!(
+        header.dimensions,
+        Dimensions::new(70, 20),
+        "and the screen it is given is the session's new size"
+    );
+    assert_eq!(
+        (header.viewport.columns.get(), header.viewport.rows.get()),
+        (70, 20),
+        "drawn for the window it has"
+    );
+}
+
 /// KR-REQ-08.44: the palette's provenance is recorded at creation and succession never moves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_palette_source_is_recorded_at_creation_and_succession_does_not_change_it() {
@@ -1175,33 +1253,28 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
         seen.len()
     );
 
+    // The queue for the client that is not reading has filled, which is the condition this test is
+    // about. The session knows, and it is asked rather than the client's own socket being read:
+    // reading from that client is the one thing that would let the read loop off the hook.
     let mut slow = slow;
-    let theirs = collect(&mut slow.client, Duration::from_secs(4)).await;
+    let overflowed = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut seen = false;
+        while std::time::Instant::now() < deadline {
+            if host
+                .runtime
+                .session()
+                .is_resynchronising(slow.attachment_id)
+            {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        seen
+    };
     assert!(
-        theirs.iter().any(|event| matches!(event, Event::Resync(_))),
-        "and the slow one was told to resynchronise rather than being waited for: {} events",
-        theirs.len()
-    );
-    let marker = theirs
-        .iter()
-        .find_map(|event| match event {
-            Event::Resync(marker) => Some(marker),
-            _ => None,
-        })
-        .expect("a marker");
-    assert_eq!(
-        marker.reason,
-        kr_protocol::recovery::ResyncReason::SendQueueFull,
-        "and it says why"
-    );
-
-    // The promise is about what happens *after* that queue fills, so the test measures from there:
-    // the session's own read loop must keep going while this client is still not reading, and the
-    // client that is reading must keep being served.
-    assert!(
-        host.runtime
-            .session()
-            .is_resynchronising(slow.attachment_id),
+        overflowed,
         "the session is holding this subscriber's place rather than waiting for it"
     );
     let at_overflow = host.runtime.session().output_cursor();
@@ -1230,6 +1303,44 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
         "the client that was reading was still being drawn the session, or had fallen behind too \
          and been told so: {} events",
         after.len()
+    );
+
+    // Only now is the silent client read, and what it finds is the marker rather than a hole it
+    // was never told about.
+    let theirs = collect(&mut slow.client, Duration::from_secs(4)).await;
+    let marker = theirs
+        .iter()
+        .find_map(|event| match event {
+            Event::Resync(marker) => Some(*marker),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("the slow client was told to resynchronise rather than waited for: {theirs:?}")
+        });
+    assert_eq!(
+        marker.reason,
+        kr_protocol::recovery::ResyncReason::SendQueueFull,
+        "and it says why"
+    );
+
+    // And it recovers: a client that asks again is given a whole screen, which is what the marker
+    // is for. Being told to resynchronise and then never being served would be the same hole by
+    // another name.
+    let again = resubscribe(&host, &mut slow, marker.cursor.get()).await;
+    let _ = again;
+    let recovered = collect_until_installed(&mut slow.client, Duration::from_secs(10)).await;
+    assert!(
+        recovered
+            .iter()
+            .any(|event| matches!(event, Event::Snapshot(_))),
+        "it is given a fresh screen: {} events",
+        recovered.len()
+    );
+    assert!(
+        recovered
+            .iter()
+            .any(|event| matches!(event, Event::Rows(page) if !page.more)),
+        "and the screen completes, so it is holding one"
     );
     assert_eq!(
         host.runtime.state(),

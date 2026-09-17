@@ -348,6 +348,7 @@ pub fn install(
         inactive_oldest,
     );
     let mut cut = false;
+    let mut margin = 0_usize;
     for _ in 0..PAGE_FITTING_ATTEMPTS {
         let carried: usize = pages
             .iter()
@@ -358,26 +359,37 @@ pub fn install(
         }
         if row_count == 0 {
             // Nothing left to give up: this queue cannot hold a header and a single empty page.
-            // The screen is still built, and the publish refuses it and tells the client that its
-            // queue is full, which is exactly what has happened.
+            // Only a client that asked for a queue smaller than one message can be here, and the
+            // publish tells it that its queue is full, which is exactly what has happened.
             break;
         }
-        // What the pages cost with no rows in them is the part of the budget the rows cannot have.
+        // What the pages cost with their rows emptied *and still counted*: each page's own fields,
+        // the length of an array of this many rows, and every row's own envelope. Taken from the
+        // pages as they are rather than from a page with no rows at all, because a longer array
+        // carries a longer length and an estimate that ignored that would leave the screen a byte
+        // or two over the bound however many passes were spent on it.
         let envelopes: usize = pages
             .iter()
             .map(|page| {
-                let empty = ProjectionRowPage {
-                    rows: Vec::new(),
+                let hollow = ProjectionRowPage {
+                    rows: page.rows.iter().map(hollow_row).collect(),
                     ..page.clone()
                 };
-                wire::measure(&empty).map_or(0, |cost| cost.bytes)
+                wire::measure(&hollow).map_or(0, |cost| cost.bytes)
             })
             .sum();
         let room = budget.saturating_sub(fixed.saturating_add(envelopes));
-        let share = room / row_count;
+        // A byte less on every pass, so a second pass cannot ask for exactly what the first one
+        // did: cutting the rows can change how they divide into pages, and the answer has to
+        // shrink rather than settle.
+        let share = (room / row_count).saturating_sub(margin);
+        margin = margin.saturating_add(1);
+        let mut anything_left = false;
         for (_, rows) in &mut converted {
             for row in rows {
-                truncate_row_to(row, share, PAGE_ITEMS);
+                let envelope = wire::row_cost(&hollow_row(row)).bytes;
+                truncate_row_to(row, envelope.saturating_add(share), PAGE_ITEMS);
+                anything_left |= !row.runs.is_empty();
             }
         }
         cut = true;
@@ -389,8 +401,9 @@ pub fn install(
             oldest,
             inactive_oldest,
         );
-        if share == 0 {
-            // The rows are already empty. Another pass would cut nothing further.
+        if !anything_left {
+            // Every row is empty. There is nothing further to cut, and the pages are as small as a
+            // screen of this many rows can be.
             break;
         }
     }
@@ -414,6 +427,20 @@ pub fn install(
         events,
         base: Base { cursor, generation },
     })
+}
+
+/// The same row with nothing in it, which is what its envelope costs.
+///
+/// Marked truncated, because a row that ends up like this in a screen that had to be cut is a row
+/// whose content was given up, and a client is told that rather than shown a short row that looks
+/// like the application's.
+fn hollow_row(row: &ProjectedRow) -> ProjectedRow {
+    ProjectedRow {
+        row: row.row,
+        soft_wrapped: row.soft_wrapped,
+        truncated: true,
+        runs: Vec::new(),
+    }
 }
 
 /// Builds the pages of both buffers, each inside every page bound.

@@ -50,20 +50,38 @@ pub struct ProjectedDisplay {
 }
 
 impl ProjectedDisplay {
-    /// A terminal showing nothing yet, whose keyboard protocols may be installed.
+    /// A terminal showing nothing yet, whose keyboard protocols may both be installed.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            keyboard: Keyboard::EVERYTHING,
+            ..Self::default()
+        }
     }
 
-    /// A terminal whose keyboard protocols are not this attachment's to change.
+    /// A terminal whose keyboard protocols are not this attachment's to change at all.
     ///
-    /// What `--no-probe` chooses: nobody was allowed to ask this terminal what it had negotiated,
-    /// so nothing installs a protocol that nothing could put back.
+    /// What `--no-probe` on a terminal the host will not let type chooses: nobody was allowed to
+    /// ask this terminal what it had negotiated, and nobody is going to type into it either, so
+    /// nothing installs a protocol that nothing could put back and nothing would use.
     #[must_use]
     pub fn without_the_keyboard() -> Self {
         Self {
-            keyboard: Keyboard::Withhold,
+            keyboard: Keyboard::NOTHING,
+            ..Self::default()
+        }
+    }
+
+    /// A terminal showing nothing yet, with each keyboard protocol decided on its own terms.
+    ///
+    /// `level` is whether the person at this terminal can type, because the `modifyOtherKeys` level
+    /// is the encoding the host advertises for them and `CSI > 4 m` puts any terminal back to its
+    /// own. `flags` is whether this terminal reported its Kitty flags, because nothing else could
+    /// put those back.
+    #[must_use]
+    pub fn with_keyboard(level: bool, flags: bool) -> Self {
+        Self {
+            keyboard: Keyboard { level, flags },
             ..Self::default()
         }
     }

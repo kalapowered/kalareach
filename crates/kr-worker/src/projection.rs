@@ -857,6 +857,57 @@ mod projection_tests {
             header.degraded,
             "and the client is told that what it is holding is not all of the session"
         );
+        // And at every budget, not only at the one this test picked. The interesting failures are
+        // at the boundaries: a budget that fits the rows and not the pages they divide into, and
+        // one that fits neither. The smallest installation there is - every row emptied - is what
+        // a budget below it gets, and the publish then tells the client its queue is full.
+        let smallest: usize = engine
+            .projection_install(
+                dimensions(80, 24),
+                ProjectionResetReason::Attached,
+                LaneGate::default(),
+                0,
+                0,
+            )
+            .expect("a snapshot")
+            .0
+            .events
+            .iter()
+            .map(|outgoing| outgoing.bytes)
+            .sum();
+        for divisor in [1_usize, 2, 3, 5, 8, 13, 21, 34, 55] {
+            let budget = (total / divisor).max(1);
+            let (tried, _) = engine
+                .projection_install(
+                    dimensions(80, 24),
+                    ProjectionResetReason::Attached,
+                    LaneGate::default(),
+                    0,
+                    budget,
+                )
+                .expect("a snapshot");
+            let carried: usize = tried.events.iter().map(|outgoing| outgoing.bytes).sum();
+            assert!(
+                carried <= budget || budget < smallest,
+                "a budget of {budget} carries {carried} bytes, and the smallest screen this \
+                 session can be sent is {smallest}"
+            );
+            let complete = tried
+                .events
+                .iter()
+                .filter(|outgoing| {
+                    matches!(
+                        &outgoing.event,
+                        kr_protocol::projection::ProjectionEvent::Rows(page) if !page.more
+                    )
+                })
+                .count();
+            assert_eq!(
+                complete, 1,
+                "and whatever it carries is a whole screen: one page clears `more`"
+            );
+        }
+
         let pages: Vec<&kr_protocol::projection::ProjectionRowPage> = update
             .events
             .iter()

@@ -223,17 +223,14 @@ pub async fn run(
     // The terminal's size can change while the attachment runs. The session is told, so the
     // application sees the resize the way it would in any other terminal.
     let mut resized = window_changes();
-    // What this terminal shows while it is projected. A terminal that did not report its own
-    // keyboard negotiation installs no protocol of the session's, because nothing could put back
-    // what installing one would take away: the cleanup writes back what the terminal *said*, and a
-    // terminal that said nothing would be left in whatever the session was using. That is the
-    // answer for `--no-probe`, which asks nothing, and equally for a profile whose questions do not
-    // include the keyboard, because nothing can be required of a terminal that never promised it.
-    let mut display = if probe.keyboard.is_known() {
-        crate::render::ProjectedDisplay::new()
-    } else {
-        crate::render::ProjectedDisplay::without_the_keyboard()
-    };
+    // What this terminal shows while it is projected, with each keyboard protocol decided on its
+    // own terms. The `modifyOtherKeys` level goes in when the person here can type, because that is
+    // the encoding the host advertises for them and `CSI > 4 m` puts any terminal back to the level
+    // it started with. The Kitty flags go in only when this terminal reported its own, because
+    // nothing else could put those back and a person left in an encoding their shell does not
+    // expect is the failure they cannot work around.
+    let mut display =
+        crate::render::ProjectedDisplay::with_keyboard(epoch.is_some(), keyboard.kitty.is_some());
     let outcome = drive(
         &mut client,
         descriptor,

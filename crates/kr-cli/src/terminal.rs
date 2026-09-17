@@ -600,7 +600,6 @@ mod unix {
             // Before the first byte of the first question. From here until the terminator this
             // terminal's stream is one a late reply can arrive on, and a process that dies in
             // between leaves this record as the only thing that knows.
-            let recorded = super::mark_contaminated(self);
             let read = self.ask(&mut session, &request, started);
             // `Now` again, for the same reason: the exchange ends at the terminator, and anything
             // the person typed after it is still in the terminal's queue and is still theirs.
@@ -629,24 +628,17 @@ mod unix {
                     // the keys the person pressed during it go nowhere rather than into an
                     // application that was never given them. They are owed the number, and they
                     // are owed the truth about the record that makes a retry here refuse itself.
-                    let unprotected = if recorded {
+                    // Buffered rather than typed: what the exchange was holding is whatever
+                    // arrived and was not an answer, which is usually the person's own typing and
+                    // can be the first half of a reply that never finished.
+                    let buffered = if discarded == 0 {
                         String::new()
                     } else {
-                        "; this host could not record that this terminal was asked, so a retry \
-                         here will not refuse itself and a fresh terminal is the only safe one"
-                            .to_owned()
-                    };
-                    let keys = if discarded == 0 {
-                        String::new()
-                    } else {
-                        format!(
-                            "; {discarded} bytes you typed during the exchange were not \
-                             delivered"
-                        )
+                        format!("; {discarded} buffered bytes were discarded")
                     };
                     Err(CliError::TerminalProbeFailed(format!(
                         "{error}; attach again in a fresh terminal, where no reply to this \
-                         exchange can still arrive{keys}{unprotected}"
+                         exchange can still arrive{buffered}"
                     )))
                 }
             }

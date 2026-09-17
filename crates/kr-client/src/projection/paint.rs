@@ -182,22 +182,40 @@ pub struct Painted {
     pub comparison: Comparison,
 }
 
-/// Whether this destination's keyboard protocols may be changed at all.
+/// Which of this destination's keyboard protocols may be changed, and why.
+///
+/// The two are not one decision, because they cannot be put back the same way.
+///
+/// * `modifyOtherKeys` is a *level*, and `CSI > 4 m` with no parameter returns a terminal to the
+///   level it started with, whoever asked it nothing. So it may be installed on any destination
+///   whose person can type: the host advertises that encoding for an `xterm`-named terminal
+///   whatever the probe asked, and holds the input lease to it, so a client that installed nothing
+///   would leave the application reading legacy keys from a terminal the host had promised would
+///   send more. On a destination whose person *cannot* type - no input lease - installing it buys
+///   nothing and changes a terminal nobody asked about, so it is not installed.
+/// * The Kitty protocol's flags have no such sequence, and nothing can ask a terminal how deep its
+///   stack is. They may be installed only on a destination that reported its own flags, because
+///   nothing else could put them back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Keyboard {
-    /// The session's negotiation is installed, because this destination said what it had before
-    /// anything touched it and can therefore be put back exactly.
-    #[default]
-    Install,
-    /// The Kitty keyboard flags are left alone, because nobody was allowed to ask this destination
-    /// what it had and nothing else can put back what an install would take away. The
-    /// `modifyOtherKeys` level is still installed, because `CSI > 4 m` returns a terminal to its
-    /// own initial value whether or not anybody read it first, and the host advertises that
-    /// encoding for an `xterm`-named terminal whatever the probe asked.
-    ///
-    /// This is what an attachment that asked its terminal nothing is served: the conservative
-    /// profile is one that does not touch what it cannot put back.
-    Withhold,
+pub struct Keyboard {
+    /// Whether the session's `modifyOtherKeys` level may be installed.
+    pub level: bool,
+    /// Whether the session's Kitty keyboard flags may be installed.
+    pub flags: bool,
+}
+
+impl Keyboard {
+    /// Both protocols: a destination that reported its flags and a person who can type.
+    pub const EVERYTHING: Self = Self {
+        level: true,
+        flags: true,
+    };
+
+    /// Neither: a destination nobody was allowed to ask, whose person cannot type either.
+    pub const NOTHING: Self = Self {
+        level: false,
+        flags: false,
+    };
 }
 
 /// Draws the whole screen.
@@ -554,29 +572,37 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Installs the keyboard negotiation, when this destination's protocols are ours to change.
+    /// Installs the keyboard negotiation, protocol by protocol.
+    ///
+    /// The two are not symmetrical, so they are not decided together. `modifyOtherKeys` is a level
+    /// whose initial value the terminal itself can return to - `CSI > 4 m` with no parameter is
+    /// exactly that, and it is the first thing a cleanup writes - so the session's level is
+    /// installed on any destination. It has to be: the host advertises that encoding for an
+    /// `xterm`-named terminal whatever the probe asked, and holds the input lease to it, so a
+    /// client that installed nothing would leave the application reading legacy keys from a
+    /// terminal the host had promised would send more.
+    ///
+    /// The Kitty protocol has no "back to what you had" sequence, and nothing can ask a terminal
+    /// how deep its stack is, so flags installed on a destination nobody was allowed to ask could
+    /// not be put back. Those are withheld, and the fact is reported.
     fn keyboard(&mut self) {
-        if self.keyboard == Keyboard::Withhold {
-            // Nobody was allowed to ask this destination what it had negotiated, so nothing here
-            // changes it: a level or a flag installed now could not be put back, and a person left
-            // in an encoding their shell does not expect is the failure they cannot work around.
-            let negotiated = &self.screen.keyboard;
-            let flags = match self.screen.active_buffer {
-                ProjectedBuffer::Primary => &negotiated.primary,
-                ProjectedBuffer::Alternate => &negotiated.alternate,
-            };
-            if negotiated.modify_other_keys.get() != 0 || flags.flags.0.is_some() {
-                self.comparison.keyboard_withheld = true;
-            }
-            return;
-        }
         let negotiated = self.screen.keyboard.clone();
-        let level = negotiated.modify_other_keys.get();
-        self.csi(format!(">4;{level}m").as_bytes());
         let buffer = match self.screen.active_buffer {
             ProjectedBuffer::Primary => &negotiated.primary,
             ProjectedBuffer::Alternate => &negotiated.alternate,
         };
+        if self.keyboard.level {
+            let level = negotiated.modify_other_keys.get();
+            self.csi(format!(">4;{level}m").as_bytes());
+        } else if negotiated.modify_other_keys.get() != 0 {
+            self.comparison.keyboard_withheld = true;
+        }
+        if !self.keyboard.flags {
+            if buffer.flags.0.is_some() {
+                self.comparison.keyboard_withheld = true;
+            }
+            return;
+        }
         // An absolute state rather than a push, because a stack entry written here could be taken
         // off by an application inside the session and the pop would then land on somebody else's.
         let flags = buffer.flags.0.map_or(0, |flags| flags.get());
@@ -1200,6 +1226,13 @@ enum Width {
     /// against a destination that actually disagrees rather than against the renderer's own
     /// measurement of its own output.
     Joining,
+    /// A destination that draws every non-ASCII glyph one cell wider than the pinned model says.
+    ///
+    /// This is the East Asian Ambiguous disagreement, which a terminal takes a side on by
+    /// configuration: the pinned model gives `α` one cell and a terminal set up for CJK widths
+    /// gives it two. Nothing a renderer can ask settles it, so what it owes is a bound on the
+    /// damage: the glyph itself may be drawn over, and nothing after it may move.
+    Widening,
 }
 
 /// A model of the terminal a frame is drawn into.
@@ -1444,7 +1477,10 @@ impl Destination {
     fn segment(&self, text: &str) -> Vec<(String, usize)> {
         let mut out: Vec<(String, usize)> = Vec::new();
         for cluster in clusters(text) {
-            let width = usize::try_from(cluster.cells).unwrap_or(0);
+            let mut width = usize::try_from(cluster.cells).unwrap_or(0);
+            if self.width == Width::Widening && !cluster.text.is_ascii() && width > 0 {
+                width += 1;
+            }
             if self.width == Width::Joining
                 && let Some(last) = out.last_mut()
                 && last.0.ends_with('\u{200d}')
@@ -1713,12 +1749,12 @@ mod fixtures {
             let passes = [
                 (
                     "installed",
-                    install(&screen, window, Keyboard::Install),
+                    install(&screen, window, Keyboard::EVERYTHING),
                     Destination::new(lines, columns),
                 ),
                 (
                     "updated on a terminal that disagrees",
-                    update(&screen, window, &visible, true, Keyboard::Install),
+                    update(&screen, window, &visible, true, Keyboard::EVERYTHING),
                     Destination::hostile(lines, columns),
                 ),
             ];
@@ -1871,7 +1907,7 @@ mod fixtures {
             g1: "Ascii".to_owned(),
             shift_out: false,
         };
-        let painted = install(&screen, window, Keyboard::Install);
+        let painted = install(&screen, window, Keyboard::EVERYTHING);
         let mut destination = Destination::new(1, 6);
         // A destination a previous direct presentation left in the graphics set.
         destination.g0 = '0';
@@ -1900,7 +1936,7 @@ mod fixtures {
         let (mut screen, window) = screen_of(&case);
         // The session's screen is thirty rows and this attachment was anchored to four of them.
         screen.dimensions = kr_protocol::session::Dimensions::new(8, 30);
-        let painted = install(&screen, window, Keyboard::Install);
+        let painted = install(&screen, window, Keyboard::EVERYTHING);
         assert_eq!(
             painted.comparison.rows_unreachable, 26,
             "the rows this window has no room for are counted"
@@ -1930,7 +1966,7 @@ mod fixtures {
             "cursor": {"column": 0, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
         });
         let (screen, window) = screen_of(&case);
-        let painted = install(&screen, window, Keyboard::Withhold);
+        let painted = install(&screen, window, Keyboard::NOTHING);
         assert_eq!(
             painted.comparison.clusters_replaced, 1,
             "the mark is reported as a cluster this frame could not carry"
@@ -1950,6 +1986,57 @@ mod fixtures {
         );
     }
 
+    /// KR-REQ-08.40 and KR-ACC-023: a destination that draws a glyph wider than the profile says
+    /// loses that glyph's own cell and nothing else.
+    ///
+    /// The East Asian Ambiguous width is a side a terminal takes by configuration: the pinned model
+    /// gives `α` one cell, a terminal set up for CJK widths gives it two, and nothing a renderer
+    /// may ask settles it - the profile pins the model, and a terminal that disagrees is outside
+    /// the profile and is projected for that reason. What the renderer owes is a bound on the
+    /// damage, and this is it: every cell after the disagreement is the canonical one, nothing is
+    /// written past the last column, and nothing scrolls.
+    #[test]
+    fn a_destination_that_draws_wider_than_the_profile_loses_only_that_cell() {
+        let case = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 0, "rows": 2, "columns": 10},
+            "rows": [
+                {"row": 0, "soft_wrapped": false, "runs": [
+                    {"column": 0, "cells": 6, "text": "a\u{3b1}b\u{3b1}cd"}]},
+                {"row": 1, "soft_wrapped": false, "runs": [
+                    {"column": 8, "cells": 2, "text": "\u{3b1}z"}]}
+            ],
+            "cursor": {"column": 6, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (screen, window) = screen_of(&case);
+        let painted = install(&screen, window, Keyboard::NOTHING);
+        let mut destination = Destination::new(2, 10);
+        destination.width = Width::Widening;
+        destination.feed(&painted.bytes);
+        assert!(
+            !destination.overflowed,
+            "nothing was written past the last column, even where the last cell of a row is one \
+             this destination draws wider"
+        );
+        assert!(!destination.scrolled, "and nothing scrolled it");
+        // Every cell the disagreement did not fall inside holds its canonical content. The cells
+        // the wide drawing covered are the glyph's own and the one after it, and the one after it
+        // is written again from its own absolute address, so it ends up canonical too.
+        assert_eq!(
+            destination.cells[0][0], "a",
+            "the cells before it are its own"
+        );
+        assert_eq!(
+            destination.cells[0][2], "b",
+            "the cell after a widened glyph is the canonical one, because it was addressed"
+        );
+        assert_eq!(destination.cells[0][4], "c");
+        assert_eq!(destination.cells[0][5], "d");
+        assert_eq!(
+            destination.cells[1][9], "z",
+            "and a widened glyph at the end of a row does not push its neighbour off it"
+        );
+    }
+
     /// KR-REQ-08.40: a panned window places the cursor on the line that holds its row.
     #[test]
     fn a_panned_window_places_the_cursor_on_the_right_line() {
@@ -1964,7 +2051,7 @@ mod fixtures {
             "cursor": {"column": 2, "row": 1, "visible": true, "style": 1, "pending_wrap": false}
         });
         let (screen, window) = screen_of(&case);
-        let painted = install(&screen, window, Keyboard::Install);
+        let painted = install(&screen, window, Keyboard::EVERYTHING);
         let mut destination = Destination::new(3, 8);
         destination.feed(&painted.bytes);
         assert_eq!(
@@ -1981,7 +2068,7 @@ mod fixtures {
     #[test]
     fn a_frame_installs_the_sessions_own_region_after_its_last_row() {
         let (screen, window) = screen_with_a_region();
-        let painted = install(&screen, window, Keyboard::Install);
+        let painted = install(&screen, window, Keyboard::EVERYTHING);
         assert!(
             !painted.comparison.geometry_withheld,
             "a destination showing the whole grid can carry the geometry"
@@ -2026,7 +2113,7 @@ mod fixtures {
         let (mut screen, window) = screen_with_a_region();
         // The grid is wider than the window: this destination is showing a part of it.
         screen.dimensions = kr_protocol::session::Dimensions::new(12, 4);
-        let painted = install(&screen, window, Keyboard::Install);
+        let painted = install(&screen, window, Keyboard::EVERYTHING);
         assert!(
             painted.comparison.geometry_withheld,
             "the projection reports what it could not carry"
@@ -2073,8 +2160,8 @@ mod fixtures {
         });
         let (screen, window) = screen_of(&case);
         for painted in [
-            install(&screen, window, Keyboard::Install),
-            update(&screen, window, &[0], false, Keyboard::Install),
+            install(&screen, window, Keyboard::EVERYTHING),
+            update(&screen, window, &[0], false, Keyboard::EVERYTHING),
         ] {
             assert!(
                 painted
@@ -2202,7 +2289,7 @@ mod safety {
         // fresh one: a restoration that emits only rendering operations, emitting one that copies.
         let hostile = "ordinary\u{1b}\\\u{1b}]52;c;c2VjcmV0\u{7}";
         let screen = screen(hostile, "text", None);
-        let painted = install(&screen, Window::of(&screen), Keyboard::Install);
+        let painted = install(&screen, Window::of(&screen), Keyboard::EVERYTHING);
         let bytes = painted.bytes;
         assert!(
             !contains(&bytes, b"\x1b]52"),
@@ -2237,7 +2324,7 @@ mod safety {
             "before\u{7}after",
             Some("https://example.invalid/\u{1b}\\\u{1b}]52;c;c2VjcmV0\u{7}"),
         );
-        let painted = install(&screen, Window::of(&screen), Keyboard::Install);
+        let painted = install(&screen, Window::of(&screen), Keyboard::EVERYTHING);
         let bytes = painted.bytes;
         assert!(
             !contains(&bytes, b"\x1b]52"),
@@ -2282,7 +2369,7 @@ mod safety {
             .modes
             .insert((super::super::ProjectedModeSpelling::Dec, 1049), true);
         screen.keypad_application = true;
-        let painted = install(&screen, Window::of(&screen), Keyboard::Install);
+        let painted = install(&screen, Window::of(&screen), Keyboard::EVERYTHING);
         let bytes = painted.bytes;
         for mode in [&b"\x1b[?1006h"[..], b"\x1b[?1000h", b"\x1b[?2004h"] {
             assert!(
@@ -2307,16 +2394,40 @@ mod safety {
             String::from_utf8_lossy(&bytes)
         );
 
-        // And withheld from a terminal nobody was allowed to ask about.
-        let withheld = install(&screen, Window::of(&screen), Keyboard::Withhold);
+        // The two protocols part company on a terminal that reported neither. A person who can
+        // type still gets the `modifyOtherKeys` level, because `CSI > 4 m` puts any terminal back
+        // to its own initial value and the host advertises that encoding for an `xterm`-named
+        // terminal whatever the probe asked. The Kitty flags are withheld, because nothing could
+        // put those back.
+        let typing = install(
+            &screen,
+            Window::of(&screen),
+            Keyboard {
+                level: true,
+                flags: false,
+            },
+        );
+        assert!(
+            contains(&typing.bytes, b"\x1b[>4;"),
+            "the level is installed for a terminal whose person can type: {:?}",
+            String::from_utf8_lossy(&typing.bytes)
+        );
+        assert!(
+            !contains(&typing.bytes, b"\x1b[="),
+            "and the Kitty flags are not, because they could not be put back"
+        );
+
+        // And on a terminal nobody asked and nobody can type into, neither protocol is touched.
+        let withheld = install(&screen, Window::of(&screen), Keyboard::NOTHING);
         assert!(
             !contains(&withheld.bytes, b"\x1b[>4;"),
-            "nothing of the keyboard is changed on a terminal that was never asked"
+            "nothing of the keyboard is changed: {:?}",
+            String::from_utf8_lossy(&withheld.bytes)
         );
         assert!(!contains(&withheld.bytes, b"\x1b[="));
         assert!(
             contains(&withheld.bytes, b"\x1b[?1006h"),
-            "but the mouse modes still are, because those are not the keyboard's"
+            "the mouse modes still are, because those are not the keyboard's"
         );
     }
 

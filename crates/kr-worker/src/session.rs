@@ -960,6 +960,11 @@ impl Session {
             self.attachments.restore_geometry(&previous);
             return Err(error);
         }
+        if change.resize_required && self.state.is_running() {
+            // Succession moved the size, so every remaining client's screen is at the old one.
+            // After the table, because the screen each is given is drawn for the window it has.
+            self.reinstall_every_subscriber(ProjectionResetReason::Geometry);
+        }
         Ok(SessionDetachResult {
             attachment_id,
             geometry: change.state,
@@ -1037,6 +1042,10 @@ impl Session {
             self.attachments.restore_geometry(&previous);
             return Err(error);
         }
+        if change.resize_required && self.state.is_running() {
+            // The claim moved the size, so every client's screen is at the old one.
+            self.reinstall_every_subscriber(ProjectionResetReason::Geometry);
+        }
         Ok(change.state)
     }
 
@@ -1087,6 +1096,9 @@ impl Session {
                 self.attachments.restore_geometry(&previous);
                 return Err(error);
             }
+            // The new owner's size is the session's now, so every client's screen is at the old
+            // one. After the transfer, because each screen is drawn for the window its client has.
+            self.reinstall_every_subscriber(ProjectionResetReason::Geometry);
         } else {
             // The size did not move, so nothing above resynchronised anybody - and every
             // attachment's picture of who owns the size and at which epoch has still changed.
