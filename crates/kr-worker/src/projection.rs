@@ -827,6 +827,24 @@ mod projection_tests {
             total <= budget,
             "the whole screen fits the queue it has to pass through: {total} bytes against {budget}"
         );
+        // And exactly at the boundary, which is where an installation measured by its rows alone
+        // would overflow: the pages themselves cost something, and a budget that fits the rows but
+        // not the pages would be refused, resynchronised and refused again.
+        let (tight, _) = engine
+            .projection_install(
+                dimensions(80, 24),
+                ProjectionResetReason::Attached,
+                LaneGate::default(),
+                0,
+                total,
+            )
+            .expect("a snapshot");
+        let carried: usize = tight.events.iter().map(|outgoing| outgoing.bytes).sum();
+        assert!(
+            carried <= total,
+            "a budget of exactly what the last screen cost still carries a whole screen: \
+             {carried} against {total}"
+        );
         let header = update
             .events
             .iter()

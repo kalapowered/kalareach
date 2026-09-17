@@ -192,6 +192,13 @@ const ENVELOPE_RESERVE: usize = 8 * 1024;
 /// What the notification around a payload costs in values, with room to spare.
 const ENVELOPE_RESERVE_ITEMS: usize = 1_024;
 
+/// How many times an installation is measured, cut and paged again to fit a subscriber's queue.
+///
+/// Two would do: the first pass learns what the pages cost and the second cuts the rows to what is
+/// left. A third answers a cut that changed how the rows divide into pages, and a fourth is there
+/// so that the loop's end is a bound rather than a hope.
+const PAGE_FITTING_ATTEMPTS: usize = 4;
+
 /// One event, with what it costs the subscriber's queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outgoing {
@@ -326,33 +333,102 @@ pub fn install(
         converted.push((buffer, rows));
     }
     // A screen has to arrive whole or not at all: a client that holds some of the pages holds no
-    // screen and draws nothing. So a screen larger than this subscriber's own send queue is cut to
-    // fit it and said to be cut, rather than being refused, resynchronised and refused again.
-    let mut rows_total = Cost::default();
-    let mut row_count = 0_usize;
-    for (_, rows) in &converted {
-        for row in rows {
-            rows_total.absorb(wire::row_cost(row));
-            row_count += 1;
+    // screen and draws nothing. So the whole installation is measured against this subscriber's own
+    // send queue - the reset, the header and every page as it will be sent - and a screen larger
+    // than the queue it has to cross is cut to fit and said to be cut, rather than being refused,
+    // resynchronised and refused again. The pages are built, measured and built again, because how
+    // much the pages themselves cost depends on how the rows divide between them.
+    let row_count: usize = converted.iter().map(|(_, rows)| rows.len()).sum();
+    let mut pages = paged(
+        snapshot,
+        &converted,
+        generation,
+        cursor,
+        oldest,
+        inactive_oldest,
+    );
+    let mut cut = false;
+    for _ in 0..PAGE_FITTING_ATTEMPTS {
+        let carried: usize = pages
+            .iter()
+            .map(|page| wire::measure(page).map_or(PAGE_BYTES, |cost| cost.bytes))
+            .sum();
+        if fixed.saturating_add(carried) <= budget {
+            break;
         }
-    }
-    let room = budget.saturating_sub(fixed);
-    let cut = row_count > 0 && rows_total.bytes > room;
-    if cut {
+        if row_count == 0 {
+            // Nothing left to give up: this queue cannot hold a header and a single empty page.
+            // The screen is still built, and the publish refuses it and tells the client that its
+            // queue is full, which is exactly what has happened.
+            break;
+        }
+        // What the pages cost with no rows in them is the part of the budget the rows cannot have.
+        let envelopes: usize = pages
+            .iter()
+            .map(|page| {
+                let empty = ProjectionRowPage {
+                    rows: Vec::new(),
+                    ..page.clone()
+                };
+                wire::measure(&empty).map_or(0, |cost| cost.bytes)
+            })
+            .sum();
+        let room = budget.saturating_sub(fixed.saturating_add(envelopes));
         let share = room / row_count;
         for (_, rows) in &mut converted {
             for row in rows {
                 truncate_row_to(row, share, PAGE_ITEMS);
             }
         }
-        if let Some(Outgoing {
+        cut = true;
+        pages = paged(
+            snapshot,
+            &converted,
+            generation,
+            cursor,
+            oldest,
+            inactive_oldest,
+        );
+        if share == 0 {
+            // The rows are already empty. Another pass would cut nothing further.
+            break;
+        }
+    }
+    if cut
+        && let Some(Outgoing {
             event: ProjectionEvent::Snapshot(header),
             ..
         }) = events.get_mut(1)
-        {
-            header.degraded = true;
-        }
+    {
+        header.degraded = true;
     }
+    if let Some(last) = pages.last_mut() {
+        last.more = false;
+    }
+    events.extend(
+        pages
+            .into_iter()
+            .map(|page| outgoing(ProjectionEvent::Rows(page))),
+    );
+    Ok(Update {
+        events,
+        base: Base { cursor, generation },
+    })
+}
+
+/// Builds the pages of both buffers, each inside every page bound.
+///
+/// Separate from [`install`] because the pages are built more than once: how much a page costs
+/// depends on how the rows divide between them, so a screen that has to be cut to fit a queue is
+/// measured, cut and paged again.
+fn paged(
+    snapshot: &Snapshot,
+    converted: &[(ProjectedBuffer, Vec<ProjectedRow>)],
+    generation: u64,
+    cursor: u64,
+    oldest: U64,
+    inactive_oldest: U64,
+) -> Vec<ProjectionRowPage> {
     let mut pages = Vec::new();
     for (buffer, rows) in converted {
         // Retention belongs to a buffer, so each buffer's pages carry its own. The engine reports
@@ -360,16 +436,16 @@ pub fn install(
         // Labelling one buffer's pages with the other's would tell a client to give up rows that
         // are the whole of that screen, or to keep rows that are gone, and which of those it is
         // changes with every buffer switch.
-        let (page_oldest, page_evicted) = if buffer == wire::buffer(snapshot.active_buffer) {
+        let (page_oldest, page_evicted) = if *buffer == wire::buffer(snapshot.active_buffer) {
             (oldest, snapshot.evicted)
         } else {
             (inactive_oldest, snapshot.inactive_evicted)
         };
-        for page in paginate(rows) {
+        for page in paginate(rows.clone()) {
             pages.push(ProjectionRowPage {
                 projection_generation: U64::new(generation),
                 output_cursor: U64::new(cursor),
-                buffer,
+                buffer: *buffer,
                 rows: page,
                 oldest_retained_row: page_oldest,
                 evicted: page_evicted,
@@ -390,18 +466,7 @@ pub fn install(
             more: true,
         });
     }
-    if let Some(last) = pages.last_mut() {
-        last.more = false;
-    }
-    events.extend(
-        pages
-            .into_iter()
-            .map(|page| outgoing(ProjectionEvent::Rows(page))),
-    );
-    Ok(Update {
-        events,
-        base: Base { cursor, generation },
-    })
+    pages
 }
 
 /// What one client is owed right now.
