@@ -366,18 +366,19 @@ pub fn input_context(terminal: &ControllingTerminal) -> kr_term::probe::InputCon
 /// stream may still deliver a reply. [`clear_contamination`] removes it once the terminator has
 /// arrived, which is the only thing that proves nothing else is coming.
 ///
-/// Best effort on purpose: a host whose runtime directory cannot be written is a host that cannot
-/// record anything, and refusing the attach over that would be refusing it for the wrong reason.
-/// What the record buys is the *next* attempt, and its absence costs that attempt nothing it did
-/// not already have.
-pub fn mark_contaminated(terminal: &ControllingTerminal) {
+/// Returns whether the record was written. A host whose runtime directory cannot be written, or a
+/// terminal with no name to record it under, cannot be recorded; refusing the attach over that
+/// would be refusing it for the wrong reason, so the exchange goes ahead and a failure says that a
+/// retry here is not protected. What the record buys is the *next* attempt, and a person who is
+/// told it is missing can choose a fresh terminal themselves.
+pub fn mark_contaminated(terminal: &ControllingTerminal) -> bool {
     let Some(path) = contamination_marker(terminal) else {
-        return;
+        return false;
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, b"a probe on this terminal did not finish\n");
+    std::fs::write(&path, b"a probe on this terminal did not finish\n").is_ok()
 }
 
 /// Clears the record, once an exchange has finished and no reply can still be in flight.
@@ -599,9 +600,8 @@ mod unix {
             // Before the first byte of the first question. From here until the terminator this
             // terminal's stream is one a late reply can arrive on, and a process that dies in
             // between leaves this record as the only thing that knows.
-            super::mark_contaminated(self);
+            let recorded = super::mark_contaminated(self);
             let read = self.ask(&mut session, &request, started);
-            let typed = session.typed().to_vec();
             // `Now` again, for the same reason: the exchange ends at the terminator, and anything
             // the person typed after it is still in the terminal's queue and is still theirs.
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Now, &saved).map_err(
@@ -609,6 +609,9 @@ mod unix {
             )?;
             read?;
             let elapsed = elapsed_ms(started);
+            // Counted before the exchange is consumed, because a failure reports what it cost and
+            // a success delivers it.
+            let discarded = session.typing_len();
             match session.finish(elapsed) {
                 Ok(outcome) => {
                     // The terminator arrived, so nothing else is coming and this stream is clean
@@ -622,13 +625,28 @@ mod unix {
                     Ok(probe)
                 }
                 Err(error) => {
-                    // The exchange failed. What the person typed during it is still theirs, and the
-                    // failure says so: this attach ends, and the bytes go nowhere rather than into
-                    // an application that was never given the keys.
-                    let _ = typed;
+                    // The exchange failed, so this attach ends and nothing is delivered anywhere:
+                    // the keys the person pressed during it go nowhere rather than into an
+                    // application that was never given them. They are owed the number, and they
+                    // are owed the truth about the record that makes a retry here refuse itself.
+                    let unprotected = if recorded {
+                        String::new()
+                    } else {
+                        "; this host could not record that this terminal was asked, so a retry \
+                         here will not refuse itself and a fresh terminal is the only safe one"
+                            .to_owned()
+                    };
+                    let keys = if discarded == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            "; {discarded} bytes you typed during the exchange were not \
+                             delivered"
+                        )
+                    };
                     Err(CliError::TerminalProbeFailed(format!(
                         "{error}; attach again in a fresh terminal, where no reply to this \
-                         exchange can still arrive"
+                         exchange can still arrive{keys}{unprotected}"
                     )))
                 }
             }
@@ -644,21 +662,55 @@ mod unix {
             request: &[u8],
             started: std::time::Instant,
         ) -> Result<()> {
-            use std::io::{Read as _, Write as _};
-
-            let mut handle = &self.handle;
-            handle
-                .write_all(request)
-                .and_then(|()| handle.flush())
+            // The questions are written against the same clock as the answers. A blocking write
+            // cannot be bounded by looking at the time afterwards, so the terminal is put into
+            // non-blocking mode for the exchange: a write that cannot take everything comes back
+            // rather than waiting, and the loop below decides whether there is any of the second
+            // left to try again with. Section 8's deadline is for the whole exchange, and this is
+            // the half of it a check after the fact cannot enforce.
+            let blocking = rustix::fs::fcntl_getfl(&self.handle).map_err(|error| {
+                CliError::Terminal(format!("read the terminal's flags: {error}"))
+            })?;
+            rustix::fs::fcntl_setfl(&self.handle, blocking | rustix::fs::OFlags::NONBLOCK)
                 .map_err(|error| {
-                    CliError::Terminal(format!("ask the terminal what it is: {error}"))
+                    CliError::Terminal(format!("stop the terminal blocking: {error}"))
                 })?;
-            // The write is inside the deadline too. A terminal that cannot take the questions has
-            // already spent part of the one second the whole exchange has, and the reads that
-            // follow get what is left of it rather than a second of their own.
-            if elapsed_ms(started) > kr_term::probe::PROBE_DEADLINE_MS {
-                return Ok(());
+            let answer = self.exchange(session, request, started);
+            // Back to whatever the terminal was, whatever happened: the person's own shell reads
+            // this descriptor after the attachment ends.
+            let _ = rustix::fs::fcntl_setfl(&self.handle, blocking);
+            answer
+        }
+
+        /// The exchange itself, with the terminal in non-blocking mode.
+        fn exchange(
+            &self,
+            session: &mut kr_term::probe::ProbeSession,
+            request: &[u8],
+            started: std::time::Instant,
+        ) -> Result<()> {
+            use std::io::Read as _;
+
+            let mut written = 0_usize;
+            while written < request.len() {
+                if elapsed_ms(started) > kr_term::probe::PROBE_DEADLINE_MS {
+                    return Ok(());
+                }
+                match rustix::io::write(&self.handle, &request[written..]) {
+                    Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Ok(taken) => written += taken,
+                    Err(rustix::io::Errno::AGAIN) => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(rustix::io::Errno::INTR) => {}
+                    Err(error) => {
+                        return Err(CliError::Terminal(format!(
+                            "ask the terminal what it is: {error}"
+                        )));
+                    }
+                }
             }
+            let mut handle = &self.handle;
             let mut buffer = [0_u8; 256];
             loop {
                 let elapsed = elapsed_ms(started);
@@ -675,6 +727,10 @@ mod unix {
                     // Nothing has arrived yet. A moment's wait, rather than a spin that would
                     // read a thousand times for every answer.
                     Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // The same thing said another way, now that the descriptor does not wait.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                     Ok(read) => {
                         if session
                             .observe(&buffer[..read], elapsed_ms(started))
