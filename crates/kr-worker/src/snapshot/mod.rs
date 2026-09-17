@@ -529,12 +529,12 @@ pub fn minimum_install(
     rows: &impl RowSource,
 ) -> Result<usize> {
     // A queue of nothing: every row is emptied as it is converted, which is what the smallest
-    // installation is. The reason is the one every first installation carries; it costs the same
-    // whichever it is.
+    // installation is. The reason is the one that spells longest on the wire, because this figure
+    // is a bound and a reset carrying a longer reason must still fit under it.
     Ok(install(
         snapshot,
         viewport,
-        ProjectionResetReason::Attached,
+        ProjectionResetReason::longest(),
         true,
         0,
         rows,

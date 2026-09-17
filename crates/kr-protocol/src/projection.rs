@@ -662,6 +662,26 @@ pub enum ProjectionResetReason {
 }
 
 impl ProjectionResetReason {
+    /// Every reason, which a caller measuring what a reset can cost walks.
+    pub const ALL: &'static [Self] = &[
+        Self::Attached,
+        Self::BufferSwitch,
+        Self::Geometry,
+        Self::ReplayGap,
+        Self::Repaint,
+        Self::HistoryEvicted,
+    ];
+
+    /// The reason whose wire string is longest, which is what a reset costs at most.
+    #[must_use]
+    pub fn longest() -> Self {
+        Self::ALL
+            .iter()
+            .copied()
+            .max_by_key(|reason| reason.as_str().len())
+            .unwrap_or(Self::Attached)
+    }
+
     /// Returns the stable wire string.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
