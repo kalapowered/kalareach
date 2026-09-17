@@ -24,6 +24,7 @@
 //!   whose transitions a consumer replays, so it carries no outbox row of its own: what a consumer
 //!   replays is the state the claim was opened beside.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use kr_protocol::error::ErrorCode;
@@ -46,7 +47,7 @@ use crate::identity::RepositoryIdentity;
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// What an inclusion records for a path whose outcome it has not established.
 pub const PROGRESS_PLANNED: &str = "planned";
@@ -415,9 +416,12 @@ impl Store {
                      workspace_id  BLOB NOT NULL,
                      kind          TEXT NOT NULL,
                      detail        TEXT NOT NULL,
-                     change_set_id BLOB,
-                     PRIMARY KEY (workspace_id, kind, detail)
+                     change_set_id BLOB
                  );
+                 CREATE UNIQUE INDEX IF NOT EXISTS workspace_retained_item
+                     ON workspace_retained (
+                         workspace_id, kind, detail, COALESCE(change_set_id, x'')
+                     );
                  CREATE TABLE IF NOT EXISTS operations (
                      action_id             BLOB PRIMARY KEY,
                      actor_id              TEXT NOT NULL,
@@ -499,9 +503,12 @@ impl Store {
             //
             // Version 4 is the version this host started putting a reason through the rule at the
             // write. A store at 3 has the right columns and the wrong contents, which is why the
-            // version moves on for a change that adds no column at all.
+            // version moves on for a change that adds no column at all. Version 5 is where a
+            // retained item stopped being identified by its reason alone, so that protecting a
+            // reason cannot make two items one.
             Some(version) if version < SCHEMA_VERSION => {
                 add_missing_columns(&transaction)?;
+                rebuild_retained_items(&transaction)?;
                 protect_recorded_reasons(&transaction)?;
                 transaction
                     .execute(
@@ -1260,7 +1267,8 @@ impl Store {
         let mut statement = transaction
             .prepare(
                 "SELECT kind, detail, change_set_id FROM workspace_retained
-                  WHERE workspace_id = ?1 ORDER BY kind, detail",
+                  WHERE workspace_id = ?1
+                  ORDER BY kind, detail, COALESCE(change_set_id, x'')",
             )
             .map_err(ProjectError::store)?;
         let mapped = statement
@@ -1581,9 +1589,13 @@ impl Store {
         }
         transaction
             .execute(
+                // A retained item is its kind, its reason and the change set it names: recording
+                // the same one twice changes nothing, and a second pin is a second item even when
+                // the two reasons read alike.
                 "INSERT INTO workspace_retained (workspace_id, kind, detail, change_set_id)
                  VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (workspace_id, kind, detail) DO UPDATE SET change_set_id = ?4",
+                 ON CONFLICT (workspace_id, kind, detail, COALESCE(change_set_id, x''))
+                     DO NOTHING",
                 params![
                     workspace_id.get().as_bytes().to_vec(),
                     retained_kind_text(item.kind),
@@ -1662,7 +1674,8 @@ impl Store {
             .connection
             .prepare(
                 "SELECT kind, detail, change_set_id FROM workspace_retained
-                  WHERE workspace_id = ?1 ORDER BY kind, detail",
+                  WHERE workspace_id = ?1
+                  ORDER BY kind, detail, COALESCE(change_set_id, x'')",
             )
             .map_err(ProjectError::store)?;
         let mapped = statement
@@ -2055,11 +2068,7 @@ const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, ori
      git_dir_device, git_dir_file_id, work_tree_device, work_tree_file_id, display_path, \
      remote_name, remote_transport, remote_url, remote_provider, remote_broker, created_at_ms";
 
-/// Adds the columns a store written by an earlier build does not have.
-///
-/// Every one of them is nullable and means "not recorded", which is what an older row holds
-/// anyway: a staging directory an earlier build created has no recorded identity, and the cleanup
-/// leaves such a name alone rather than deleting whatever now holds it.
+/// Puts the free-text reasons a store already holds through the rule.
 fn protect_recorded_reasons(transaction: &Transaction<'_>) -> Result<()> {
     // A store written before the rule existed holds whatever that build composed. Reading one
     // applies the rule on the way out, so nothing unprotected reaches a caller either way; this
@@ -2067,14 +2076,11 @@ fn protect_recorded_reasons(transaction: &Transaction<'_>) -> Result<()> {
     // outside this build reads the file rather than going through this code.
     //
     // The rule leaves its own output alone, so this is safe to run over a store that has already
-    // been through it. What it does *not* rewrite is `actions.result`: that is the canonical
-    // encoding of a typed answer rather than prose, and rewriting it would mean decoding every
-    // method's result type here. No build of this service has been released, so the only stores
-    // that can hold one are development journals, and the handoff records that.
+    // been through it. `workspace_retained.detail` is not here because protecting it can make two
+    // rows one: [`rebuild_retained_items`] rewrites that table, where the collision is decided.
     for (table, column) in [
         ("operations", "detail"),
         ("workspaces", "detail"),
-        ("workspace_retained", "detail"),
         ("actions", "error_detail"),
     ] {
         let mut statement = transaction
@@ -2108,6 +2114,97 @@ fn protect_recorded_reasons(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Rewrites the retained items of a store an earlier build wrote, keeping every pin.
+///
+/// Until version 5 a retained item was identified by its reason alone, so protecting a reason
+/// could give one item the key another already had. A valid earlier store can hold both a reason
+/// as it was composed and the same reason protected: one build wrote the first and the next build
+/// wrote the second, both under the same schema version. Rewriting the first onto the second's key
+/// would refuse the whole upgrade, and an upgrade refused at every start is a daemon that never
+/// serves.
+///
+/// What the collision means is that the two rows are one item said two ways, so they merge. What
+/// must not merge with them is a *different* pin, which is why the change set is part of what
+/// identifies an item from version 5 on: two pins whose reasons are the same text are two pins,
+/// and this keeps both. Nothing is replaced and nothing is dropped except a row another row is
+/// identical to.
+fn rebuild_retained_items(transaction: &Transaction<'_>) -> Result<()> {
+    /// One retained row as the earlier shape held it: the workspace, the kind, the reason and the
+    /// change set it names.
+    type Held = (Vec<u8>, String, String, Option<Vec<u8>>);
+
+    let mut statement = transaction
+        .prepare("SELECT workspace_id, kind, detail, change_set_id FROM workspace_retained")
+        .map_err(ProjectError::store)?;
+    let mapped = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        })
+        .map_err(ProjectError::store)?;
+    let mut held = Vec::new();
+    for row in mapped {
+        held.push(row.map_err(ProjectError::store)?);
+    }
+    drop(statement);
+    // The new shape is built beside the old one and takes its name at the end, because SQLite
+    // cannot take a primary key off a table in place. The whole of it is inside the migration's
+    // one transaction, so a store is never left holding half of each.
+    transaction
+        .execute_batch(
+            "CREATE TABLE workspace_retained_rebuilt (
+                 workspace_id  BLOB NOT NULL,
+                 kind          TEXT NOT NULL,
+                 detail        TEXT NOT NULL,
+                 change_set_id BLOB
+             );",
+        )
+        .map_err(ProjectError::store)?;
+    let mut carried: HashSet<Held> = HashSet::new();
+    for (workspace_id, kind, detail, change_set_id) in held {
+        let protected = crate::git::redact(&detail);
+        let key = (
+            workspace_id.clone(),
+            kind.clone(),
+            protected.clone(),
+            change_set_id.clone(),
+        );
+        // Two rows that are the same item after the rule are one row. Two rows that differ in
+        // their change set are two items whatever their reasons say, and both are written.
+        if !carried.insert(key) {
+            continue;
+        }
+        transaction
+            .execute(
+                "INSERT INTO workspace_retained_rebuilt
+                     (workspace_id, kind, detail, change_set_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![workspace_id, kind, protected, change_set_id],
+            )
+            .map_err(ProjectError::store)?;
+    }
+    transaction
+        .execute_batch(
+            "DROP TABLE workspace_retained;
+             ALTER TABLE workspace_retained_rebuilt RENAME TO workspace_retained;
+             CREATE UNIQUE INDEX workspace_retained_item
+                 ON workspace_retained (
+                     workspace_id, kind, detail, COALESCE(change_set_id, x'')
+                 );",
+        )
+        .map_err(ProjectError::store)?;
+    Ok(())
+}
+
+/// Adds the columns a store written by an earlier build does not have.
+///
+/// Every one of them is nullable and means "not recorded", which is what an older row holds
+/// anyway: a staging directory an earlier build created has no recorded identity, and the cleanup
+/// leaves such a name alone rather than deleting whatever now holds it.
 fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
     // Every nullable column this build reads that some earlier shape of this schema did not have.
     // The list is the whole of them rather than the ones added last: a store written by *any*
@@ -2654,6 +2751,29 @@ mod tests {
 
     fn environment() -> EnvironmentId {
         EnvironmentId::new(Uuid::from_bytes([7; 16]))
+    }
+
+    fn workspace_row(id: u8) -> WorkspaceRow {
+        WorkspaceRow {
+            workspace_id: WorkspaceId::new(Uuid::from_bytes([id; 16])),
+            project_repository_id: ProjectRepositoryId::new(Uuid::from_bytes([2; 16])),
+            environment_id: environment(),
+            label: "held".to_owned(),
+            kind: WorkspaceKind::Isolated,
+            isolation: Some(IsolationMechanism::GitWorktree),
+            policy: InclusionPolicy::base_only(),
+            state: WorkspaceState::Ready,
+            base_revision: "a".repeat(40),
+            base_change_set_id: None,
+            identity: None,
+            display_path: "/tmp/held".to_owned(),
+            staging_name: None,
+            staging_identity: None,
+            detail: None,
+            retention: None,
+            created_at_ms: TimestampMs::new(1),
+            removed_at_ms: None,
+        }
     }
 
     fn operation(action: u8, project: u8) -> OperationRow {
@@ -3353,6 +3473,117 @@ mod tests {
         assert_eq!(
             tables, 0,
             "a store this build refuses is left exactly as it was found"
+        );
+    }
+
+    #[test]
+    fn a_reason_and_the_same_reason_protected_are_one_item_while_two_pins_stay_two() {
+        // Until version 5 a retained item was identified by its reason, so a store could hold the
+        // same reason twice: as one build composed it, and as the next build wrote it through the
+        // rule. Both were valid under schema version 3. Rewriting the first onto the second's text
+        // asked for a key the second already had, the upgrade rolled back, and the daemon refused
+        // to start again at every attempt. The reasons merge and the pins do not.
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("retained.sqlite");
+        let raw = "/p/access_token=RETAINEDSECRET holds work this host has not read";
+        let protected = crate::git::redact(raw);
+        assert_ne!(protected, raw, "the reason is one the rule replaces");
+        let workspace = Uuid::from_bytes([31; 16]).as_bytes().to_vec();
+        let first_pin = Uuid::from_bytes([32; 16]).as_bytes().to_vec();
+        let second_pin = Uuid::from_bytes([33; 16]).as_bytes().to_vec();
+        let earlier = Connection::open(&path).expect("the earlier store opens");
+        earlier
+            .execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (3);
+                 CREATE TABLE workspace_retained (
+                     workspace_id  BLOB NOT NULL,
+                     kind          TEXT NOT NULL,
+                     detail        TEXT NOT NULL,
+                     change_set_id BLOB,
+                     PRIMARY KEY (workspace_id, kind, detail)
+                 );",
+            )
+            .expect("the earlier shape is written");
+        for (kind, detail, pin) in [
+            ("pinned_change_set", raw, Some(first_pin.clone())),
+            (
+                "pinned_change_set",
+                protected.as_str(),
+                Some(second_pin.clone()),
+            ),
+            ("dirty_content", raw, None),
+            ("dirty_content", protected.as_str(), None),
+        ] {
+            earlier
+                .execute(
+                    "INSERT INTO workspace_retained (workspace_id, kind, detail, change_set_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![workspace.clone(), kind, detail, pin],
+                )
+                .expect("the earlier rows are written");
+        }
+        drop(earlier);
+        let store = Store::open(&path, environment()).expect("this build opens it");
+        let version: i64 = store
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("the version reads");
+        assert_eq!(version, SCHEMA_VERSION);
+        let held = store
+            .retained(WorkspaceId::new(Uuid::from_bytes([31; 16])))
+            .expect("what it holds reads");
+        assert_eq!(
+            held.len(),
+            3,
+            "the two reasons merge and the two pins stay: {held:?}"
+        );
+        for item in &held {
+            assert_eq!(item.detail, protected, "every reason is the protected one");
+            assert!(!item.detail.contains("RETAINEDSECRET"), "{item:?}");
+        }
+        let pins: Vec<_> = held
+            .iter()
+            .filter(|item| item.kind == RetainedKind::PinnedChangeSet)
+            .filter_map(|item| item.change_set_id.map(|id| id.get().as_bytes().to_vec()))
+            .collect();
+        assert!(
+            pins.contains(&first_pin) && pins.contains(&second_pin),
+            "no pin is replaced by another: {pins:?}"
+        );
+        // And the item's identity from here on includes its change set, so recording one of them
+        // again is not a second row and a third pin is not a replacement.
+        let mut store = store;
+        store
+            .begin_workspace(&workspace_row(31), None)
+            .expect("the workspace row exists for the retention check");
+        store
+            .retain(
+                WorkspaceId::new(Uuid::from_bytes([31; 16])),
+                &RetainedRow {
+                    kind: RetainedKind::PinnedChangeSet,
+                    detail: raw.to_owned(),
+                    change_set_id: Some(ChangeSetId::new(Uuid::from_bytes([32; 16]))),
+                },
+            )
+            .expect("the same pin records again");
+        store
+            .retain(
+                WorkspaceId::new(Uuid::from_bytes([31; 16])),
+                &RetainedRow {
+                    kind: RetainedKind::PinnedChangeSet,
+                    detail: raw.to_owned(),
+                    change_set_id: Some(ChangeSetId::new(Uuid::from_bytes([34; 16]))),
+                },
+            )
+            .expect("a third pin records");
+        let held = store
+            .retained(WorkspaceId::new(Uuid::from_bytes([31; 16])))
+            .expect("what it holds reads");
+        assert_eq!(
+            held.len(),
+            4,
+            "one more item, not one more row each: {held:?}"
         );
     }
 
