@@ -667,6 +667,54 @@ fn an_interrupted_publication_is_reconciled_against_the_create_token() {
         !sibling.exists(),
         "the sibling the publication came out of is removed"
     );
+    // The same publication with *no* recorded identity for the sibling: the publication still
+    // completes, and the directory is left for a person rather than removed on a name alone.
+    std::fs::create_dir_all(sibling.join("tree")).expect("the sibling is back again");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE operations SET state = 'publishing', ended_at_ms = NULL,
+                    staging_device = NULL, staging_file_id = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![cloned.operation.action_id.get().as_bytes().to_vec()],
+        )
+        .expect("the row is publishing again with no recorded staging identity");
+    journal
+        .execute(
+            "DELETE FROM projects WHERE project_repository_id = ?1",
+            rusqlite::params![
+                cloned
+                    .project
+                    .project_repository_id
+                    .get()
+                    .as_bytes()
+                    .to_vec()
+            ],
+        )
+        .expect("the repository row is gone again");
+    drop(journal);
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs once more");
+    assert_eq!(recovery.publications_completed, 1);
+    assert!(
+        sibling.join("tree").is_dir(),
+        "a sibling with no recorded identity is left where it is"
+    );
+    assert_eq!(
+        replacement
+            .project_read(&ProjectReadParams {
+                project_repository_id: cloned.project.project_repository_id,
+            })
+            .expect("the repository is there")
+            .project
+            .state,
+        ProjectState::Ready,
+        "and the publication is still completed"
+    );
     let read = replacement
         .project_read(&ProjectReadParams {
             project_repository_id: cloned.project.project_repository_id,

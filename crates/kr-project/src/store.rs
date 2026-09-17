@@ -339,7 +339,13 @@ impl Store {
     }
 
     fn migrate(&mut self) -> Result<()> {
-        self.connection
+        // One transaction for the whole upgrade, because section 24 asks for a transactional
+        // migration: the tables this build needs, the columns an earlier shape did not have, and
+        // the version that describes them all land together or none of them does. A store is
+        // never left saying it is at a version whose shape it does not have, and a store this
+        // build refuses is left exactly as it was found.
+        let transaction = self.connection.transaction().map_err(ProjectError::store)?;
+        transaction
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
                  CREATE TABLE IF NOT EXISTS projects (
@@ -468,14 +474,13 @@ impl Store {
                  );",
             )
             .map_err(ProjectError::store)?;
-        let recorded: Option<i64> = self
-            .connection
+        let recorded: Option<i64> = transaction
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .optional()
             .map_err(ProjectError::store)?;
         match recorded {
             None => {
-                self.connection
+                transaction
                     .execute(
                         "INSERT INTO schema_version (version) VALUES (?1)",
                         params![SCHEMA_VERSION],
@@ -492,10 +497,6 @@ impl Store {
             // step runs for every version below the current one and adds whatever is missing,
             // rather than trusting a version number to describe a shape.
             Some(version) if version < SCHEMA_VERSION => {
-                // One transaction: the columns and the version they describe land together or
-                // neither does, so a store is never left saying it is at a version whose columns
-                // it does not have.
-                let transaction = self.connection.transaction().map_err(ProjectError::store)?;
                 add_missing_columns(&transaction)?;
                 transaction
                     .execute(
@@ -503,9 +504,11 @@ impl Store {
                         params![SCHEMA_VERSION],
                     )
                     .map_err(ProjectError::store)?;
-                transaction.commit().map_err(ProjectError::store)?;
             }
             Some(version) => {
+                // The transaction is dropped without committing, so a store this build cannot
+                // read is left exactly as it was: nothing this migration would have created is
+                // there afterwards.
                 return Err(ProjectError::StoreUnavailable {
                     detail: format!(
                         "this project store is at schema version {version}; this build reads \
@@ -514,7 +517,7 @@ impl Store {
                 });
             }
         }
-        Ok(())
+        transaction.commit().map_err(ProjectError::store)
     }
 
     /// Returns the environment this store belongs to.
@@ -2002,7 +2005,6 @@ const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, ori
      git_dir_device, git_dir_file_id, work_tree_device, work_tree_file_id, display_path, \
      remote_name, remote_transport, remote_url, remote_provider, remote_broker, created_at_ms";
 
-/// The columns a workspace row is read from.
 /// Adds the columns a store written by an earlier build does not have.
 ///
 /// Every one of them is nullable and means "not recorded", which is what an older row holds
@@ -2040,6 +2042,7 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The columns a workspace row is read from.
 const WORKSPACE_COLUMNS: &str = "workspace_id, project_repository_id, environment_id, label, \
      kind, isolation, dirty_files, untracked_files, submodules, binary_files, \
      generated_artefacts, state, base_revision, base_change_set_id, tree_device, tree_file_id, \

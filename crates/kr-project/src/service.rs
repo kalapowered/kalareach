@@ -681,7 +681,17 @@ impl ProjectService {
             .staging_name
             .as_deref()
             .and_then(|name| StagingSibling::open(&destination, name).ok());
-        let unopened = named.is_some() && staging.is_none();
+        // A name this host could not open is either a name nothing holds or one it could not look
+        // at, and the two are different answers. Absence is confirmed through the parent's own
+        // handle: nothing there means nothing to account for, and anything else means a path a
+        // person should see.
+        let unopened = match (row.staging_name.as_deref(), staging.is_some()) {
+            (Some(name), false) => RelativeName::parse(name)
+                .ok()
+                .and_then(|name| destination.parent().occupied(&name).ok())
+                .unwrap_or(true),
+            _ => false,
+        };
         let Some(staged) = row.staged_identity else {
             // Nothing was published, because the identity a publication needs was never recorded.
             // The destination is untouched, so the staged content is removed and the operation is

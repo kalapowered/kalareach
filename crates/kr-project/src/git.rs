@@ -1457,6 +1457,11 @@ pub fn redact(text: &str) -> String {
         let (head, after) = rest.split_at(marker + 3);
         out.push_str(head);
         // The authority ends at the first of these; user information ends at an `@` before it.
+        // It also ends where the *next* URL's scheme begins, because the first `/` after this
+        // authority can belong to the next URL rather than to this one: in
+        // `https://host,https://user:token@other/x` the first slash is the one in the second
+        // URL's `://`, and reading it as the end of this authority would leave the rest of the
+        // message, credential and all, copied verbatim.
         let end = after
             .find(|character: char| {
                 matches!(
@@ -1464,7 +1469,8 @@ pub fn redact(text: &str) -> String {
                     '/' | '?' | '#' | ' ' | '\t' | '\n' | '\r' | '"' | '\''
                 )
             })
-            .unwrap_or(after.len());
+            .unwrap_or(after.len())
+            .min(next_scheme(after));
         let (authority, tail) = after.split_at(end);
         // The scheme decides whether a bare user name is a secret. A token is often the *user* of
         // an https URL (`https://TOKEN:x-oauth-basic@host`, and `https://TOKEN@host`), so the whole
@@ -1744,6 +1750,14 @@ mod tests {
             !redacted.contains("VERYSECRET"),
             "a second URL with a query of its own is still redacted: {redacted}"
         );
+        // A first URL with no path at all: the first slash in the text belongs to the *second*
+        // URL's own `://`, so the authority scan has to stop before it.
+        let redacted = super::redact("https://a.invalid,https://user:VERYSECRET@b.invalid/x?q=1");
+        assert!(
+            !redacted.contains("VERYSECRET"),
+            "a second URL is found even when the first has no path: {redacted}"
+        );
+        assert!(redacted.contains("a.invalid"), "{redacted}");
         // Text that holds no URL is returned as it is.
         assert_eq!(super::redact("no url here"), "no url here");
     }
