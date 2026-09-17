@@ -3,13 +3,14 @@
 use std::process::ExitCode;
 
 use clap::Parser as _;
-use kr_cli::cli::{Cli, Command};
+use kr_cli::cli::{Cli, Command, HostCommand};
 use kr_cli::error::{CliError, Result};
 use kr_cli::resolve::{SessionSelector, find, open_controller, open_worker};
 use kr_cli::session::AttachOptions;
 use kr_cli::terminal::ControllingTerminal;
 use kr_cli::{build_id, report};
 use kr_ipc::paths::HostPaths;
+use kr_protocol::desktop::{SleepInhibitionSetting, setting};
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::hostinfo::{HostDoctorResult, HostInfoResult};
 use kr_protocol::ids::{ActionId, EnvironmentId, SessionEpoch, SessionId};
@@ -111,6 +112,21 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Some(chosen) => (Some(chosen.palette), chosen.typed),
                 None => (None, Vec::new()),
             };
+            let mut client = open_controller(&environment.paths, build_id()).await?;
+            // The execution context is this host's own unless the command chose one. The
+            // presentation is not consulted: an invisible session runs where a visible one would,
+            // and it keeps that desktop's access.
+            let info: HostInfoResult = typed(client.request(Method::HostInfo, &()).await?)?;
+            let profile = arguments
+                .execution
+                .chosen()
+                .unwrap_or(info.default_worker_profile);
+            if !cli.json {
+                println!(
+                    "{}",
+                    report::execution_context_line(profile, arguments.execution.chosen().is_some())
+                );
+            }
             let dimensions = match presentation {
                 Presentation::Attach => {
                     // The creating terminal's size is registered before the shell starts, so the
@@ -133,7 +149,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                         .map(|path| path.display().to_string())
                 })),
                 dimensions: Nullable(dimensions),
-                worker_profile: worker_profile(presentation),
+                worker_profile: profile,
                 environment_snapshot: snapshot(),
                 // Chosen here, before anything connects, because a probe of this terminal is part
                 // of choosing it and a session's palette is fixed at creation.
@@ -143,7 +159,6 @@ async fn run(cli: Cli) -> Result<Completion> {
             // being asked for its colours has nowhere to go but that attachment. A creation that
             // fails on the way owes them the count rather than losing it in silence.
             let mut undelivered = kr_cli::session::UndeliveredTyping::new(typed_while_asking.len());
-            let mut client = open_controller(&environment.paths, build_id()).await?;
             let outcome = client
                 .mutate(
                     Method::SessionCreate,
@@ -183,6 +198,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                             Err(error) => serde_json::json!(error.to_string()),
                         },
                     );
+                    object.insert(
+                        "execution_context_chosen".to_owned(),
+                        serde_json::json!(arguments.execution.chosen().is_some()),
+                    );
                 }
                 print_json(&document);
             } else {
@@ -190,6 +209,8 @@ async fn run(cli: Cli) -> Result<Completion> {
                     "created session {} ({})",
                     created.session.display_number, created.session.session_id
                 );
+                // The receipt, not the request: what the session was actually created with.
+                println!("{}", report::desktop_line(&created.session));
                 println!(
                     "shell mode {}: Ctrl-D at the prompt follows {}'s own behaviour; kr detach always works",
                     created.session.shell_mode.as_str(),
@@ -391,10 +412,33 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Err(error) => return Err(error),
             };
+            // What this host is keeping itself awake for belongs in a status read: a machine
+            // that will not sleep is something a person should be able to see the reason for.
+            let power = match open_controller(&environment.paths, build_id()).await {
+                Ok(mut client) => {
+                    typed::<HostInfoResult>(client.request(Method::HostInfo, &()).await?)
+                        .ok()
+                        .map(|info| info.power)
+                }
+                Err(_) => None,
+            };
             if cli.json {
-                print_json(&report::session(&summary));
+                let mut document = report::session(&summary);
+                if let Some(object) = document.as_object_mut() {
+                    object.insert(
+                        "power".to_owned(),
+                        power
+                            .as_ref()
+                            .map_or(serde_json::Value::Null, report::power),
+                    );
+                }
+                print_json(&document);
             } else {
                 println!("{}", report::session_line(&summary));
+                println!("{}", report::desktop_line(&summary));
+                if let Some(power) = power.as_ref() {
+                    println!("{}", power.describe());
+                }
                 if let Some(closure) = summary.closure.as_ref() {
                     println!(
                         "closed: {} ({})",
@@ -440,6 +484,11 @@ async fn run(cli: Cli) -> Result<Completion> {
                     "environment {} generation {} ({} of {} sessions)",
                     info.environment_id, info.generation, info.live_sessions, info.session_limit
                 );
+                println!(
+                    "sessions are created in the {} execution context by default",
+                    info.default_worker_profile.as_str()
+                );
+                println!("{}", info.power.describe());
                 print!("{}", report::doctor_lines(&checks));
                 if arguments.verbose {
                     // The detail of every check, including the ones that passed, and the remedy
@@ -462,6 +511,49 @@ async fn run(cli: Cli) -> Result<Completion> {
                 )))
             }
         }
+        Command::Host(arguments) => match arguments.command {
+            HostCommand::Power(power) => {
+                let environment = kr_cli::resolve::select(&paths, None)?;
+                // Changing the setting writes this user's own host configuration. Nothing else
+                // about the host changes: no service is installed, no privilege is obtained, and
+                // the daemon reads the choice the next time it asks itself the question.
+                if let Some(chosen) = power.set.as_deref() {
+                    let chosen = SleepInhibitionSetting::from_wire(chosen).ok_or_else(|| {
+                        CliError::Usage(format!(
+                            "{chosen} is not a power setting: choose off, mains_only or \
+                             battery_too"
+                        ))
+                    })?;
+                    let file = environment.paths.state_dir().join(setting::FILE_NAME);
+                    kr_ipc::paths::write_owner_only_file(
+                        &file,
+                        setting::document(chosen).as_bytes(),
+                    )
+                    .map_err(CliError::Ipc)?;
+                }
+                // The daemon is asked what the setting is now doing, because the setting alone is
+                // a choice rather than a state: what is held depends on the work and the power
+                // source as well.
+                let mut client = open_controller(&environment.paths, build_id()).await?;
+                let info: HostInfoResult = typed(client.request(Method::HostInfo, &()).await?)?;
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "ok": true,
+                        "environment_id": environment.environment_id.to_string(),
+                        "power": report::power(&info.power),
+                    }));
+                } else {
+                    println!("{}", info.power.describe());
+                    if info.power.setting == SleepInhibitionSetting::Off {
+                        println!(
+                            "kr host power --set mains_only keeps this host awake for work it has \
+                             admitted, while it is on mains power"
+                        );
+                    }
+                }
+                Ok(Completion::Done)
+            }
+        },
     }
 }
 
@@ -725,19 +817,6 @@ fn parse_environment(named: Option<&str>) -> Result<Option<EnvironmentId>> {
                 .map_err(|_| CliError::Usage(format!("{text} is not an environment identifier")))
         })
         .transpose()
-}
-
-/// Returns the execution context a session created this way is bound to.
-const fn worker_profile(presentation: Presentation) -> kr_protocol::identity::WorkerProfile {
-    match presentation {
-        // A session with a terminal on it belongs to the desktop that terminal is part of, and
-        // closes with reason `desktop_lost` when that login session ends.
-        Presentation::Attach | Presentation::Terminal => {
-            kr_protocol::identity::WorkerProfile::DesktopBound
-        }
-        // A session created with no terminal outlives a logout.
-        Presentation::Invisible => kr_protocol::identity::WorkerProfile::HeadlessUser,
-    }
 }
 
 fn session_target(environment_id: EnvironmentId, session_id: SessionId) -> ActionTarget {

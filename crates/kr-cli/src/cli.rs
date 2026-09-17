@@ -55,6 +55,44 @@ pub enum Command {
     AgentTools(AgentToolsArguments),
     /// Run read-only diagnostics.
     Doctor(DoctorArguments),
+    /// Inspect or change this host's own settings.
+    Host(HostArguments),
+}
+
+/// `kr host`.
+#[derive(Debug, Args)]
+pub struct HostArguments {
+    /// What to inspect or change.
+    #[command(subcommand)]
+    pub command: HostCommand,
+}
+
+/// One `kr host` operation.
+#[derive(Debug, Subcommand)]
+pub enum HostCommand {
+    /// Show or change whether this host keeps itself awake for work it has admitted.
+    Power(PowerArguments),
+}
+
+/// `kr host power`.
+#[derive(Debug, Args)]
+pub struct PowerArguments {
+    /// The choice to make: `off`, `mains_only` or `battery_too`. Without it, the current setting
+    /// and what it is doing are shown and nothing changes.
+    #[arg(long)]
+    pub set: Option<String>,
+}
+
+/// Which execution context a new session runs in.
+#[derive(Debug, Args)]
+#[group(multiple = false)]
+pub struct Execution {
+    /// Run in this host's current desktop. The session closes when that desktop's login ends.
+    #[arg(long)]
+    pub desktop: bool,
+    /// Run in this host's headless user context, with no inherited graphical access.
+    #[arg(long)]
+    pub headless: bool,
 }
 
 /// `kr question`.
@@ -174,6 +212,10 @@ pub struct NewArguments {
     /// How the session is presented. These are mutually exclusive.
     #[command(flatten)]
     pub presentation: Presentation,
+    /// Which execution context the session runs in. These are mutually exclusive, and this host's
+    /// own default is used when neither is given.
+    #[command(flatten)]
+    pub execution: Execution,
     /// The environment to create in.
     #[arg(long)]
     pub environment: Option<String>,
@@ -262,6 +304,23 @@ pub struct DoctorArguments {
     /// Reserved for a future individual repair. Diagnostics are read-only by default.
     #[arg(long)]
     pub verbose: bool,
+}
+
+impl Execution {
+    /// Returns the execution context this command asked for, or none for the host's own default.
+    ///
+    /// The presentation is not an input. Where a session is shown and where its processes run are
+    /// different questions, and `--invisible` answers only the first.
+    #[must_use]
+    pub const fn chosen(&self) -> Option<kr_protocol::identity::WorkerProfile> {
+        if self.desktop {
+            return Some(kr_protocol::identity::WorkerProfile::DesktopBound);
+        }
+        if self.headless {
+            return Some(kr_protocol::identity::WorkerProfile::HeadlessUser);
+        }
+        None
+    }
 }
 
 impl Presentation {
@@ -359,6 +418,59 @@ mod tests {
             arguments.presentation.resolve(true).expect("defaults"),
             kr_protocol::session::Presentation::Attach
         );
+    }
+
+    #[test]
+    fn the_execution_context_is_chosen_separately_from_the_presentation() {
+        let parsed = Cli::try_parse_from(["kr", "new", "--invisible"]).expect("parses");
+        let Command::New(arguments) = parsed.command else {
+            panic!("new");
+        };
+        assert!(
+            arguments.execution.chosen().is_none(),
+            "an invisible session takes this host's own execution context, not a headless one"
+        );
+
+        let parsed =
+            Cli::try_parse_from(["kr", "new", "--invisible", "--desktop"]).expect("parses");
+        let Command::New(arguments) = parsed.command else {
+            panic!("new");
+        };
+        assert_eq!(
+            arguments.execution.chosen(),
+            Some(kr_protocol::identity::WorkerProfile::DesktopBound),
+            "the two flags are about different things and combine"
+        );
+        assert_eq!(
+            arguments
+                .presentation
+                .resolve(false)
+                .expect("a presentation was given"),
+            kr_protocol::session::Presentation::Invisible
+        );
+
+        assert!(
+            Cli::try_parse_from(["kr", "new", "--desktop", "--headless"]).is_err(),
+            "a session runs in one execution context"
+        );
+    }
+
+    #[test]
+    fn the_power_setting_is_shown_without_an_argument_and_changed_with_one() {
+        let parsed = Cli::try_parse_from(["kr", "host", "power"]).expect("parses");
+        let Command::Host(arguments) = parsed.command else {
+            panic!("host");
+        };
+        let HostCommand::Power(power) = arguments.command;
+        assert!(power.set.is_none(), "showing the setting changes nothing");
+
+        let parsed =
+            Cli::try_parse_from(["kr", "host", "power", "--set", "mains_only"]).expect("parses");
+        let Command::Host(arguments) = parsed.command else {
+            panic!("host");
+        };
+        let HostCommand::Power(power) = arguments.command;
+        assert_eq!(power.set.as_deref(), Some("mains_only"));
     }
 
     #[test]
