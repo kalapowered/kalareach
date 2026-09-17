@@ -47,6 +47,14 @@ use crate::pairing::{
     RevocationAcknowledgement, RevocationRequest, SignedClientBundle, SignedHostBundle,
 };
 use crate::preauth::{PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult};
+use crate::project::{
+    InclusionPreview, OperationRecord, ProjectAdoptParams, ProjectAdoptResult, ProjectCloneParams,
+    ProjectCloneResult, ProjectInitParams, ProjectInitResult, ProjectListParams, ProjectListResult,
+    ProjectOperationCancelParams, ProjectOperationCancelResult, ProjectReadParams,
+    ProjectReadResult, ProjectSummary, WorkspaceCreateParams, WorkspaceCreateResult,
+    WorkspaceListParams, WorkspaceListResult, WorkspaceReadParams, WorkspaceReadResult,
+    WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceSummary,
+};
 use crate::push::{
     PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest, PushInstallationBinding,
     PushRegistrationAnswer, PushRegistrationChallenge, PushRequest, PushSenderRecord,
@@ -289,6 +297,31 @@ pub fn protocol_schema() -> Value {
         "upload_finish_result" => UploadFinishResult,
         "upload_status_params" => UploadStatusParams,
         "upload_status_result" => UploadStatusResult,
+        // Project repositories and workspaces, appended for the same reason.
+        "inclusion_preview" => InclusionPreview,
+        "operation_record" => OperationRecord,
+        "project_adopt_params" => ProjectAdoptParams,
+        "project_adopt_result" => ProjectAdoptResult,
+        "project_clone_params" => ProjectCloneParams,
+        "project_clone_result" => ProjectCloneResult,
+        "project_init_params" => ProjectInitParams,
+        "project_init_result" => ProjectInitResult,
+        "project_list_params" => ProjectListParams,
+        "project_list_result" => ProjectListResult,
+        "project_operation_cancel_params" => ProjectOperationCancelParams,
+        "project_operation_cancel_result" => ProjectOperationCancelResult,
+        "project_read_params" => ProjectReadParams,
+        "project_read_result" => ProjectReadResult,
+        "project_summary" => ProjectSummary,
+        "workspace_create_params" => WorkspaceCreateParams,
+        "workspace_create_result" => WorkspaceCreateResult,
+        "workspace_list_params" => WorkspaceListParams,
+        "workspace_list_result" => WorkspaceListResult,
+        "workspace_read_params" => WorkspaceReadParams,
+        "workspace_read_result" => WorkspaceReadResult,
+        "workspace_remove_params" => WorkspaceRemoveParams,
+        "workspace_remove_result" => WorkspaceRemoveResult,
+        "workspace_summary" => WorkspaceSummary,
     }
     properties.insert(
         "identifiers".to_owned(),

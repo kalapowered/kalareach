@@ -42,6 +42,7 @@
 //! | [`archive`] | Backup key wraps, manifests, descriptors and recovery material |
 //! | [`account`] | Membership leases and the organisation policy-signing authority chain |
 //! | [`digest`] | The mutation payload digest |
+//! | [`project`] | Project repositories, workspaces, inclusion previews and repository operations |
 //! | [`limits`] | Protocol defaults |
 //! | [`local`] | The local IPC handshake and the control-stream message union |
 //! | [`identity`] | Boot, process-start and worker-profile identities |
@@ -109,6 +110,7 @@ pub mod mailbox;
 pub mod method;
 pub mod pairing;
 pub mod preauth;
+pub mod project;
 pub mod push;
 pub mod receipt;
 pub mod recovery;
