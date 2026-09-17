@@ -34,6 +34,8 @@ pub enum ProbeItem {
     Background,
     /// Which Kitty keyboard flags the terminal supports.
     KittyKeyboard,
+    /// Which `modifyOtherKeys` level the terminal has negotiated.
+    ModifyOtherKeys,
     /// Whether the terminal reports synchronised output.
     SynchronisedOutput,
     /// Primary device attributes, which is always asked last and always terminates the exchange.
@@ -49,18 +51,21 @@ impl ProbeItem {
             Self::Foreground => b"\x1b]10;?\x1b\\",
             Self::Background => b"\x1b]11;?\x1b\\",
             Self::KittyKeyboard => b"\x1b[?u",
+            Self::ModifyOtherKeys => b"\x1b[?4m",
             Self::SynchronisedOutput => b"\x1b[?2026$p",
             Self::DeviceAttributes => b"\x1b[c",
         }
     }
 }
 
-/// Every question a probe may ask, in the order they are written.
+/// The questions this build's own profile asks, in the order they are written.
 ///
 /// Device attributes is last and is the terminator; nothing may be added after it. A caller passes
-/// the subset its qualified profile needs, and every question it asks must be answered: a terminal
-/// that stays silent on one of them is not probe-qualified for that profile and belongs on the
-/// `--no-probe` path with a saved or conservative profile.
+/// the subset its qualified profile needs — any subset of [`ProbeItem`], not only of this list —
+/// and every question it asks must be answered: a terminal that stays silent on one of them is not
+/// probe-qualified for that profile and belongs on the `--no-probe` path with a saved or
+/// conservative profile. A reply to something the caller did not ask is still recorded, because a
+/// terminal that volunteers one has told the truth about itself either way.
 pub const PROBE_SET: &[ProbeItem] = &[
     ProbeItem::Version,
     ProbeItem::Foreground,
@@ -94,6 +99,8 @@ pub enum ProbeAnswer {
     Colour(Rgb),
     /// Kitty keyboard flags.
     KittyFlags(u8),
+    /// The `modifyOtherKeys` level.
+    ModifyOtherKeysLevel(u8),
     /// A mode report status.
     ModeStatus(u16),
     /// Primary device attributes parameters.
@@ -118,6 +125,7 @@ pub struct ProbeSession {
     lexer: Lexer,
     buffered: usize,
     complete: bool,
+    typed: Vec<u8>,
 }
 
 impl ProbeSession {
@@ -154,6 +162,7 @@ impl ProbeSession {
             lexer: Lexer::new(),
             buffered: 0,
             complete: false,
+            typed: Vec::new(),
         };
         Ok((session, request))
     }
@@ -183,6 +192,12 @@ impl ProbeSession {
         self.lexer.feed(bytes, &mut events);
         for event in &events {
             let Some((item, answer)) = interpret(event) else {
+                // Not an answer to anything this exchange asked, which makes it the person's. It is
+                // kept, in the order it arrived, rather than discarded or passed off as a reply:
+                // section 8 requires the replies never to enter the application's input and the
+                // person's own typing never to be mistaken for one, so the two are separated here
+                // instead of by scanning the stream afterwards for anything reply-shaped.
+                self.typed.extend_from_slice(event.bytes.as_ref());
                 continue;
             };
             // Nothing after the terminator is an answer. The terminator is what proves no earlier
@@ -190,6 +205,7 @@ impl ProbeSession {
             // else or a terminal answering out of order, and neither is evidence about a
             // capability.
             if self.complete {
+                self.typed.extend_from_slice(event.bytes.as_ref());
                 continue;
             }
             self.answers.insert(item, answer);
@@ -233,7 +249,17 @@ impl ProbeSession {
         }
         Ok(ProbeOutcome {
             answers: self.answers,
+            typed: self.typed,
         })
+    }
+
+    /// What the person typed while the terminal was being asked, in the order they typed it.
+    ///
+    /// Available on a failed exchange too, because a failure does not make their keystrokes
+    /// somebody else's.
+    #[must_use]
+    pub fn typed(&self) -> &[u8] {
+        &self.typed
     }
 
     /// Whether the terminator has arrived.
@@ -261,6 +287,7 @@ impl ProbeSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeOutcome {
     answers: BTreeMap<ProbeItem, ProbeAnswer>,
+    typed: Vec<u8>,
 }
 
 impl ProbeOutcome {
@@ -280,6 +307,21 @@ impl ProbeOutcome {
     #[must_use]
     pub fn asked(&self) -> Vec<ProbeItem> {
         self.answers.keys().copied().collect()
+    }
+
+    /// What the person typed while the terminal was being asked, in the order they typed it.
+    ///
+    /// These are the first bytes the attachment forwards. They never entered the terminal's input
+    /// and they were never mistaken for a reply.
+    #[must_use]
+    pub fn typed(&self) -> &[u8] {
+        &self.typed
+    }
+
+    /// Takes the person's typing, leaving the answers.
+    #[must_use]
+    pub fn into_typed(self) -> Vec<u8> {
+        self.typed
     }
 
     /// The session palette this probe supports, when the terminal shared its colours.
@@ -376,6 +418,23 @@ fn interpret(event: &Event) -> Option<(ProbeItem, ProbeAnswer)> {
                     Some((
                         ProbeItem::KittyKeyboard,
                         ProbeAnswer::KittyFlags(u8::try_from(flags).unwrap_or(0)),
+                    ))
+                }
+                // xterm answers `CSI ? 4 m` with `CSI > 4 ; level m`.
+                (Some(b'>'), b'm') if csi.intermediates.is_empty() => {
+                    if csi.number(0) != Some(4) || csi.numbers.len() != 2 {
+                        return None;
+                    }
+                    let level = csi.number(1)?;
+                    // The protocol defines three levels. Anything else is not a level this profile
+                    // can record, and guessing one would mean encoding keys the application does
+                    // not read.
+                    if !(0..=2).contains(&level) {
+                        return None;
+                    }
+                    Some((
+                        ProbeItem::ModifyOtherKeys,
+                        ProbeAnswer::ModifyOtherKeysLevel(u8::try_from(level).unwrap_or(0)),
                     ))
                 }
                 // A DECRQM reply is DECRPM: `CSI ? mode ; status $ y`.
