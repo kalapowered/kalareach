@@ -85,6 +85,8 @@ suites=(
   "kr-controller:barrier|a revocation announced while a worker is isolated, the dispatch lease, and a mutation whose admission lapses while it waits for a store lock"
   "kr-worker:backpressure|a client that stops reading is resynchronised and holds the read loop up for nobody"
   "kr-worker:session|a real shell, its closure, and the input lease"
+  "kr-worker:fence|the root editor's fence over a real endpoint: the hold, the detach, the attribution and the launch transaction"
+  "kr-controller:shell|which shell a create may launch, what it is labelled as, and the guarded startup entries"
   "kr-controller:contracts|the two contracts the transport names: a revocable registration and a durable commit that outlives its caller"
   "kr-controller:envelope|what the daemon accepts on its client endpoint"
   "kr-controller:project|real repositories through the daemon: a clone, an adoption, a workspace with its inclusion preview, a verified download into it, and a daemon killed mid-clone whose destination is untouched"

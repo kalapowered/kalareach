@@ -45,7 +45,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `docs/transport/` | The transport reference |
 | `docs/plugins/` | The plugin reference |
 | `docs/terminal/` | The terminal reference |
-| `docs/shell-integration/` | The root-editor bridge contract for shell packages, and what each managed package changes |
+| `docs/shell-integration/` | The root-editor bridge contract for shell packages, the host side of it, and what each managed package changes |
 | `docs/releases/` | How the generated packages are released, and how a consumer pins one |
 | `docs/transfer/` | The transfer reference |
 | `docs/project/` | The project reference |

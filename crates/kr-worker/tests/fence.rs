@@ -420,12 +420,13 @@ async fn only_the_launched_root_shell_registers_and_only_on_its_own_endpoint() {
     let wired = wired().await;
     // The registration succeeded in the harness. A second connection with the same proof is
     // refused, because this session already has a registered root integration.
-    let session = wired.runtime.session();
-    let registration = session
-        .root_integration()
-        .expect("the handshake was recorded")
-        .clone();
-    drop(session);
+    let registration = {
+        let session = wired.runtime.session();
+        session
+            .root_integration()
+            .expect("the handshake was recorded")
+            .clone()
+    };
     assert_eq!(registration.shell.kind, ShellKind::Zsh);
     assert_eq!(registration.shell.editor_abi, "zle-5.9");
 
@@ -515,15 +516,16 @@ async fn an_unanswered_exchange_releases_the_held_input_and_says_the_editor_was_
         ),
         "the exchange timed out: {withheld:?}"
     );
-    let session = wired.runtime.session();
-    let driver = session.fence().expect("a driver");
-    assert_eq!(
-        driver.state(),
-        FenceState::Unfenced,
-        "the editor stays unfenced"
-    );
-    assert!(driver.held().is_empty(), "nothing is still held");
-    drop(session);
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert_eq!(
+            driver.state(),
+            FenceState::Unfenced,
+            "the editor stays unfenced"
+        );
+        assert!(driver.held().is_empty(), "nothing is still held");
+    }
     wired.close().await;
 }
 
@@ -1112,17 +1114,18 @@ async fn a_live_session_that_loses_its_hooks_stops_attributing_and_stops_install
         "a live session is not closed by it"
     );
     let _ = wired.runtime.apply_fence_effects(effects);
-    let session = wired.runtime.session();
-    let driver = session.fence().expect("a driver");
-    assert!(!driver.phase().permits_launch());
-    assert!(!driver.phase().permits_attribution());
-    assert!(!driver.phase().retains_fence());
-    assert!(
-        driver.phase().consumes_eligible_eof(),
-        "the pre-EOF hook stays fail-safe"
-    );
-    assert!(driver.fence().is_none(), "the fence went with the hooks");
-    drop(session);
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert!(!driver.phase().permits_launch());
+        assert!(!driver.phase().permits_attribution());
+        assert!(!driver.phase().retains_fence());
+        assert!(
+            driver.phase().consumes_eligible_eof(),
+            "the pre-EOF hook stays fail-safe"
+        );
+        assert!(driver.fence().is_none(), "the fence went with the hooks");
+    }
     wired.close().await;
 }
 

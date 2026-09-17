@@ -24,6 +24,10 @@ scenarios live in `fixtures/shell-bridge/`, and the state machine is a pure libr
 readings as arguments and returns actions, so the worker drives it with real sockets and the
 scenarios drive it with numbers.
 
+[host.md](host.md) is the other half: what the worker does with these rules. Where the endpoint is
+and who may open it, how a bridge is admitted, what the phases permit, what drives the machine, what
+a launch actually goes through, and the guarded startup entries `kr shell` writes.
+
 ## The bridge endpoint
 
 The worker listens on one endpoint per session inside its own owner-only runtime directory. On Unix

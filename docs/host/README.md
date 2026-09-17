@@ -213,6 +213,29 @@ The create token is the request's action identifier. A retry with the same paylo
 same reservation; the same token with a different payload is refused rather than becoming a second
 session. A lost reply never causes a second launch.
 
+### Which shell, and what the session claims
+
+A create request names a shell mode, and the two modes are different promises rather than degrees of
+the same one.
+
+**Managed** launches a KalaReach-qualified package: the exact binary its reader patch was built
+into, with the flags that package declares. The daemon resolves the package before it records a
+reservation, so a shell no package qualifies is `SHELL_INTEGRATION_UNSUPPORTED` by name rather than a
+session that closes itself a moment later, and a command line rather than an executable is refused
+the same way. Step 6 changes for a managed session: the worker binds the root-editor endpoint
+*before* the shell starts, because the address and a one-time secret travel to it in its own
+environment, and it reports itself ready only after the integration has qualified, which is after the
+user's startup files have run. An integration that fails before that closes the session that was
+being created and records why; an explicit compatibility retry is a new create request.
+
+**`native_compat`** launches the selected stock shell. It keeps create, attach, detach, close,
+transfer and terminal presentation, and it claims none of the managed editor: Ctrl-D follows that
+shell's own behaviour and can close the session, a launch installs no command, and `kr detach`
+remains available. It is an explicit choice and never an automatic substitution for a managed
+request that could not be served.
+
+[docs/shell-integration/host.md](../shell-integration/host.md) describes the endpoint, the handshake,
+the phases, the launch transaction and the guarded startup entries `kr shell` writes.
 ## The desktop a session runs on
 
 Where a session is shown and where its processes run are different questions. `kr new --invisible`
