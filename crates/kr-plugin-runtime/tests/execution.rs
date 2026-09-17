@@ -1347,3 +1347,44 @@ fn the_budgets_come_from_the_published_limits() {
         kr_plugin_sdk::limits::INSTANCE_MEMORY_BYTES
     );
 }
+
+// A component that spends most of a call and still answers: the shape a test about what happens
+// *while* a component is running needs, because a component that faults is one that is soon
+// disabled and no longer running at all.
+#[test]
+fn a_slow_component_spends_its_call_and_still_answers() {
+    let Some(wasm) = components::component("slow-observe") else {
+        return;
+    };
+    let (_directory, mut instance) = bound(&wasm, "slow-observe");
+
+    let mut spent = Vec::new();
+    for _ in 0..(FAULTS_BEFORE_DISABLE + 5) {
+        let started = std::time::Instant::now();
+        let outcome = instance.observe(components::scrape("se-1", "output"));
+        spent.push(started.elapsed());
+        outcome
+            .result
+            .expect("the call did not fault")
+            .expect("the component did not decline");
+        assert!(
+            !outcome.nodes.is_empty(),
+            "the call drew nothing, so nothing can see that it happened"
+        );
+    }
+
+    // Long enough to be worth queueing against, and short enough that it is not the deadline
+    // stopping it: a call the deadline stopped would be a fault, and there were none.
+    let longest = spent.iter().max().copied().unwrap_or_default();
+    assert!(
+        longest < core::time::Duration::from_millis(10),
+        "the slowest call took {longest:?}, which is the observe deadline rather than the work"
+    );
+    // And it is work rather than nothing: a component that returned at once would not keep a
+    // binding's thread occupied, which is the whole reason this fixture exists.
+    let total: core::time::Duration = spent.iter().sum();
+    assert!(
+        total > core::time::Duration::from_millis(1),
+        "eight calls took {total:?} between them"
+    );
+}

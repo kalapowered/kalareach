@@ -46,6 +46,7 @@ sandboxed=(
     memory-hog
     oversized-output
     slow-compile
+    slow-observe
     well-behaved
 )
 ambient=(

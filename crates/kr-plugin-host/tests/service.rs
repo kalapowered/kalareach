@@ -27,7 +27,7 @@ use kr_plugin_runtime::runtime::host::{
 };
 use kr_plugin_runtime::service::client::{PluginClient, new_binding_id};
 use kr_plugin_runtime::service::launcher::{self, HostLaunchPlan, HostStartOutcome, host_endpoint};
-use kr_plugin_runtime::service::protocol::{ComponentSource, HostDescriptor};
+use kr_plugin_runtime::service::protocol::{ComponentSource, HostDescriptor, Notice};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::identity::PluginIdentity;
 use kr_plugin_sdk::version::PackageVersion;
@@ -864,13 +864,15 @@ async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request()
 
 // KR-REQ-11.39: the terminal path is never behind a component.
 //
-// Three things, all of them measured and all of them while the component is running rather than
-// merely after it has been asked to: output the shell produced after the call began, a device
-// query the host answered while the call was running, and handing observations to the runtime by
-// the path a worker's terminal loop actually uses.
+// Everything here is measured, and everything is measured *while* a component is inside a call
+// rather than merely after one was asked for. The component is the slow one: it spends most of
+// every observe deadline and then answers, so a queue of observations against it is a component
+// continuously running, with no fault and no disabling. A component that faulted would be disabled
+// after three calls, and the window this test measures would be a window with nothing running in
+// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs() {
-    let Some(stuck) = component("infinite-loop") else {
+    let Some(slow) = component("slow-observe") else {
         return;
     };
     let host = Host::create();
@@ -881,32 +883,31 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     let mut terminal = session.attach().await;
 
     let started = host.start_plugin_host().await;
-    let plugin = host.plugin_client().await;
-    let stuck_component = host.install("infinite-loop", &stuck);
+    let mut plugin = host.plugin_client().await;
+    let installed = host.install("slow-observe", &slow);
     let binding = new_binding_id();
     plugin
         .register(
             binding,
-            &identity("infinite-loop", stuck_component.digest),
-            &facts("infinite-loop"),
+            &identity("slow-observe", installed.digest),
+            &facts("slow-observe"),
             "/bin/sh",
-            &stuck_component,
+            &installed,
         )
         .await
-        .expect("the stuck binding registers");
+        .expect("the slow binding registers");
 
     // Where the session had got to before the component was given anything to do. Everything
     // asserted below has to be newer than this.
     let before = collect(&mut terminal, Duration::from_millis(400)).await;
     let before = String::from_utf8_lossy(&before).into_owned();
     let high_water = highest_line(&before).expect("the shell is producing numbered output");
-    let answers_before = before.matches("answered-").count();
 
-    // Enough observations that the binding's thread is inside the component for the whole window
-    // below: this component never returns, so every one of them runs until its own deadline stops
-    // it. They are handed over by the path a worker's terminal loop uses, which waits for nothing.
+    // Enough observations to keep the binding's thread inside the component for the whole window
+    // below. They are handed over by the path a worker's terminal loop uses, which waits for
+    // nothing: no frame is written and no answer is read.
     let mut handed = Vec::new();
-    for index in 0..200 {
+    for index in 0..400 {
         let offered = std::time::Instant::now();
         let handoff = plugin.offer(binding, &scrape(&format!("se-{index}"), "output"));
         handed.push(offered.elapsed());
@@ -925,10 +926,31 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         "handing an observation over took {slowest:?}, so the terminal path waited on the runtime"
     );
 
-    // Now, while the component is running, the session has to keep producing and the host has to
-    // keep answering the shell's questions. A shell that was not answered would stop at its `dd`
-    // and produce no higher-numbered line at all.
-    let during = collect(&mut terminal, Duration::from_millis(1_500)).await;
+    // The component is inside a call once it has drawn something for an observation. Waiting for
+    // that is what makes the window below a window with a component running in it.
+    let entered = std::time::Instant::now();
+    let mut observed = false;
+    while !observed && entered.elapsed() < Duration::from_secs(10) {
+        match tokio::time::timeout(Duration::from_millis(200), plugin.notice()).await {
+            Ok(Some(Notice::Document { call, .. })) if call == "observe" => observed = true,
+            Ok(Some(Notice::Disabled { reason, .. })) => {
+                panic!("the binding disabled itself before the window: {reason}")
+            }
+            Ok(Some(Notice::Fault { detail, .. })) => {
+                panic!("the component faulted before the window: {detail}")
+            }
+            Ok(Some(Notice::Document { .. }) | Some(Notice::Gap { .. })) | Ok(None) | Err(_) => {}
+        }
+    }
+    assert!(observed, "the component never entered an observation");
+
+    // Now, with the component running, the session has to keep producing and the host has to keep
+    // answering the shell's questions. A shell that was not answered would stop at its `dd` and
+    // produce no higher-numbered line at all.
+    // Shorter than the work queued against the component, so the component is inside a call for
+    // the whole of it rather than for part of it.
+    let window = std::time::Instant::now();
+    let during = collect(&mut terminal, Duration::from_millis(800)).await;
     let during = String::from_utf8_lossy(&during).into_owned();
     let after = highest_line(&during).unwrap_or(0);
     assert!(
@@ -939,10 +961,42 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     let answers = during.matches("answered-").count();
     assert!(
         answers > 0 && during.contains("[?6"),
-        "the host answered no device query while a component was running ({answers} answers, \
-         {} before)",
-        answers_before
+        "the host answered no device query while a component was running ({answers} answers)"
     );
+
+    assert!(
+        window.elapsed() >= Duration::from_millis(800),
+        "the window was shorter than it was asked to be"
+    );
+
+    // And the component was still inside a call when that window closed, rather than having
+    // finished its work partway through and left the rest of the window measuring nothing. A
+    // document for an observation arriving now is a component that is still working through the
+    // queue this test put in front of it.
+    let still = std::time::Instant::now();
+    let mut running = false;
+    while !running && still.elapsed() < Duration::from_secs(5) {
+        match tokio::time::timeout(Duration::from_millis(200), plugin.notice()).await {
+            Ok(Some(Notice::Document { call, .. })) if call == "observe" => running = true,
+            Ok(Some(Notice::Disabled { reason, .. })) => {
+                panic!("the binding disabled itself during the window: {reason}")
+            }
+            Ok(Some(Notice::Fault { detail, .. })) => {
+                panic!("the component faulted during the window: {detail}")
+            }
+            Ok(Some(Notice::Document { .. }) | Some(Notice::Gap { .. })) | Ok(None) | Err(_) => {}
+        }
+    }
+    assert!(
+        running,
+        "the component had stopped working before the window closed"
+    );
+    let health = plugin.health().await.expect("a health report");
+    assert_eq!(
+        health.live_bindings, 1,
+        "the binding did not last the window this test measured"
+    );
+    assert_eq!(health.connection_bindings, 1);
 
     // And what the terminal produced goes to the runtime by the same handoff, which is what a
     // worker's observation path does with its output.

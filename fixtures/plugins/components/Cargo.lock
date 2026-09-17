@@ -122,6 +122,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-fixture-slow-observe"
+version = "0.1.0"
+dependencies = [
+ "kr-fixture-support",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "kr-fixture-support"
 version = "0.1.0"
 dependencies = [

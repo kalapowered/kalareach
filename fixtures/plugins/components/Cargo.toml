@@ -12,6 +12,7 @@ members = [
     "memory-hog",
     "oversized-output",
     "slow-compile",
+    "slow-observe",
     "support",
     "well-behaved",
 ]
