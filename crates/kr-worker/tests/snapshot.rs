@@ -48,7 +48,7 @@ const SMALLER: (u64, u64) = (40, 10);
 struct Host {
     _temp: kr_ipc::testing::TempHost,
     _service: Arc<WorkerService>,
-    _runtime: Arc<SessionRuntime>,
+    runtime: Arc<SessionRuntime>,
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
@@ -150,7 +150,7 @@ async fn host_with(
     Host {
         _temp: temp,
         _service: service,
-        _runtime: runtime,
+        runtime,
         session_id,
         environment_id,
         endpoint,
@@ -889,9 +889,12 @@ async fn the_palette_source_is_recorded_at_creation_and_succession_does_not_chan
 async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() {
     // A queue small enough that a screen and a few updates fill it, and an application producing
     // output steadily. The slow client never reads; the quick one does.
+    // The stream outlasts this test on purpose: what it proves is that the session keeps reading
+    // *after* the slow client's queue fills, and an application that had stopped printing by then
+    // would prove it by standing still.
     let host = host_with(
-        "i=0; while [ $i -lt 400 ]; do printf 'line %d of a steady stream\\r\\n' $i; i=$((i+1)); \
-         sleep 0.01; done; sleep 20",
+        "i=0; while [ $i -lt 3000 ]; do printf 'line %d of a steady stream\\r\\n' $i; \
+         i=$((i+1)); sleep 0.01; done; sleep 20",
         Dimensions::new(CANONICAL.0, CANONICAL.1),
         None,
         16 * 1024,
@@ -932,7 +935,36 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
         kr_protocol::recovery::ResyncReason::SendQueueFull,
         "and it says why"
     );
-    let _ = slow.attachment_id;
+
+    // The promise is about what happens *after* that queue fills, so the test measures from there:
+    // the session's own read loop must keep going while this client is still not reading, and the
+    // client that is reading must keep being served.
+    assert!(
+        host.runtime
+            .session()
+            .is_resynchronising(slow.attachment_id),
+        "the session is holding this subscriber's place rather than waiting for it"
+    );
+    let at_overflow = host.runtime.session().output_cursor();
+    let after = collect(&mut quick.client, Duration::from_secs(3)).await;
+    let afterwards = host.runtime.session().output_cursor();
+    assert!(
+        afterwards > at_overflow,
+        "the terminal was still being read after the queue filled: the output cursor stood at \
+         {at_overflow} and is at {afterwards}"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|event| matches!(event, Event::Delta(_) | Event::Rows(_) | Event::Snapshot(_))),
+        "and the client that was reading was still being drawn the session: {} events",
+        after.len()
+    );
+    assert_eq!(
+        host.runtime.state(),
+        kr_protocol::session::SessionState::Live,
+        "while the session itself carried on"
+    );
 }
 
 /// KR-REQ-08.83: the viewport names the first row of the visible page, which a scroll moves.

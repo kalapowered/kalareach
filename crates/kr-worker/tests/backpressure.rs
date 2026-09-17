@@ -130,8 +130,8 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     tokio::spawn(Arc::clone(&service).serve(listener));
 
     // Two clients over the real endpoint. Neither knows about the other.
-    let slow = attached(&endpoint, environment_id, session_id).await;
-    let quick = attached(&endpoint, environment_id, session_id).await;
+    let (slow, slow_id) = attached(&endpoint, environment_id, session_id).await;
+    let (quick, _) = attached(&endpoint, environment_id, session_id).await;
 
     // One of them reads as fast as it can, and says what ended its stream.
     let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -184,6 +184,46 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         "the client that kept reading received output while the other was not reading: \
          {advances} arrivals and {counted} batches in ten seconds, on {}",
         finished(&draining)
+    );
+
+    // The moment the promise is actually about. Everything above could have happened before the
+    // silent client's queue filled; what section 9 requires is that the read loop keeps going
+    // *after* it has. So the test waits for the overflow itself, which the session knows about,
+    // and then measures again from there.
+    let overflowed = {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut seen = false;
+        while Instant::now() < deadline {
+            if runtime.session().is_resynchronising(slow_id) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        seen
+    };
+    assert!(
+        overflowed,
+        "the queue for the client that stopped reading filled, which is the condition this test \
+         is about: {} batches reached the other one, on {}",
+        received.load(std::sync::atomic::Ordering::Relaxed),
+        finished(&draining)
+    );
+    let at_overflow = runtime.session().output_cursor();
+    let read_at_overflow = received.load(std::sync::atomic::Ordering::Relaxed);
+    let advances_after = progress(&received, Duration::from_secs(5)).await;
+    let afterwards = runtime.session().output_cursor();
+    assert!(
+        afterwards > at_overflow,
+        "and the pseudo-terminal was still being read afterwards: the output cursor stood at \
+         {at_overflow} when the queue filled and is at {afterwards} five seconds later, on {}",
+        finished(&draining)
+    );
+    assert!(
+        received.load(std::sync::atomic::Ordering::Relaxed) > read_at_overflow
+            || draining.is_finished(),
+        "and output still reached the client that was reading, or that client had fallen behind \
+         too and been told so: {advances_after} arrivals after the overflow"
     );
 
     // The session is still running: the one that stopped reading held nothing up.
@@ -322,7 +362,7 @@ async fn attached(
     endpoint: &kr_ipc::paths::Endpoint,
     environment_id: kr_protocol::ids::EnvironmentId,
     session_id: SessionId,
-) -> LocalClient {
+) -> (LocalClient, kr_protocol::ids::AttachmentId) {
     let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
@@ -369,5 +409,5 @@ async fn attached(
         .await
         .expect("the call reaches the worker")
         .expect("the subscription succeeds");
-    client
+    (client, attached.attachment.attachment_id)
 }
